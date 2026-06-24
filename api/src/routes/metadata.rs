@@ -2470,16 +2470,21 @@ mod tests {
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
+    };
     use aruna_core::metadata::{
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
     };
     use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
+    use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
     use aruna_operations::metadata::projector::replay_metadata_event_log;
@@ -2491,6 +2496,10 @@ mod tests {
     };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -3428,6 +3437,84 @@ mod tests {
         assert!(authorized.iter().any(|name| name.contains("Lazy Private")));
     }
 
+    #[tokio::test]
+    async fn distributed_query_forwards_validated_bearer_token_for_remote_private_metadata() {
+        let test = setup_distributed_metadata_access_state().await;
+        let token_auth: AuthContext =
+            crate::auth::handle_token(test.coordinator.state.as_ref(), &test.valid_bearer_token)
+                .await
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(token_auth, test.auth);
+
+        let authorized = query_remote_metadata_names(
+            &test,
+            Some(token_auth.clone()),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            )),
+        )
+        .await;
+        assert_eq!(authorized.nodes_queried, 1);
+        assert_eq!(authorized.nodes_failed, 0);
+        assert_contains_dataset_name(&authorized.names, "Remote Public Dataset");
+        assert_contains_dataset_name(&authorized.names, "Remote Private Dataset");
+
+        let anonymous = query_remote_metadata_names(&test, None, None).await;
+        assert_eq!(anonymous.nodes_failed, 0);
+        assert_contains_dataset_name(&anonymous.names, "Remote Public Dataset");
+        assert_excludes_dataset_name(&anonymous.names, "Remote Private Dataset");
+
+        let authenticated_without_forwardable_token =
+            query_remote_metadata_names(&test, Some(token_auth.clone()), None).await;
+        assert_eq!(authenticated_without_forwardable_token.nodes_failed, 0);
+        assert_contains_dataset_name(
+            &authenticated_without_forwardable_token.names,
+            "Remote Public Dataset",
+        );
+        assert_excludes_dataset_name(
+            &authenticated_without_forwardable_token.names,
+            "Remote Private Dataset",
+        );
+
+        let oversized_non_forwardable_token = query_remote_metadata_names(
+            &test,
+            Some(token_auth.clone()),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "x".repeat(4097),
+            )),
+        )
+        .await;
+        assert_eq!(oversized_non_forwardable_token.nodes_failed, 0);
+        assert_contains_dataset_name(
+            &oversized_non_forwardable_token.names,
+            "Remote Public Dataset",
+        );
+        assert_excludes_dataset_name(
+            &oversized_non_forwardable_token.names,
+            "Remote Private Dataset",
+        );
+
+        assert!(
+            crate::auth::handle_token(test.coordinator.state.as_ref(), "not-a-jwt")
+                .await
+                .is_err()
+        );
+        let invalid_forwarded_token = query_remote_metadata_names(
+            &test,
+            Some(token_auth),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test("not-a-jwt")),
+        )
+        .await;
+        assert_eq!(invalid_forwarded_token.nodes_queried, 1);
+        assert_eq!(invalid_forwarded_token.nodes_failed, 1);
+        assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Public Dataset");
+        assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Private Dataset");
+
+        test.shutdown().await;
+    }
+
     #[test]
     fn deduplicates_search_hits_across_replicas() {
         let hits = deduplicate_search_hits(
@@ -3464,6 +3551,312 @@ mod tests {
         assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
         assert_eq!(hits[0].score, 0.8);
         assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
+    }
+
+    struct DistributedMetadataAccessState {
+        auth: AuthContext,
+        valid_bearer_token: String,
+        coordinator: DistributedMetadataNode,
+        remote: DistributedMetadataNode,
+    }
+
+    impl DistributedMetadataAccessState {
+        async fn shutdown(self) {
+            self.coordinator.net.shutdown().await;
+            self.remote.net.shutdown().await;
+        }
+    }
+
+    struct DistributedMetadataNode {
+        _node_dir: TempDir,
+        net: NetHandle,
+        state: Arc<ServerState>,
+    }
+
+    struct QueryNamesResult {
+        names: Vec<String>,
+        nodes_queried: usize,
+        nodes_failed: usize,
+    }
+
+    async fn setup_distributed_metadata_access_state() -> DistributedMetadataAccessState {
+        let realm_signing_key = test_realm_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+        let coordinator = spawn_distributed_metadata_node(realm_id).await;
+        let remote = spawn_distributed_metadata_node(realm_id).await;
+        let nodes = [&coordinator, &remote];
+
+        coordinator
+            .net
+            .add_peer_addr(remote.net.endpoint_addr())
+            .await;
+        remote
+            .net
+            .add_peer_addr(coordinator.net.endpoint_addr())
+            .await;
+        install_distributed_realm_config(&nodes, realm_id).await;
+        for node in nodes {
+            install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
+        }
+
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        create_test_metadata_document(
+            remote.state.clone(),
+            auth.clone(),
+            group_id,
+            "datasets/remote-public",
+            "Remote Public Dataset",
+            true,
+        )
+        .await;
+        create_test_metadata_document(
+            remote.state.clone(),
+            auth.clone(),
+            group_id,
+            "datasets/remote-private",
+            "Remote Private Dataset",
+            false,
+        )
+        .await;
+        drain_metadata_background(remote.state.as_ref()).await;
+
+        let valid_bearer_token =
+            sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+
+        DistributedMetadataAccessState {
+            auth,
+            valid_bearer_token,
+            coordinator,
+            remote,
+        }
+    }
+
+    async fn spawn_distributed_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
+        let node_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            node_dir.path().join("metadata"),
+            net.node_id(),
+            storage_handle.clone(),
+            Some(net.clone()),
+            Some(net.irokle_node()),
+            Some(net.irokle_database()),
+        )
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: Some(TaskHandle::new()),
+        });
+        initialize_net_incoming(context.clone());
+        let state = Arc::new(
+            ServerState::new(
+                context,
+                realm_id,
+                net.node_id(),
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        );
+
+        DistributedMetadataNode {
+            _node_dir: node_dir,
+            net,
+            state,
+        }
+    }
+
+    async fn install_distributed_realm_config(
+        nodes: &[&DistributedMetadataNode],
+        realm_id: RealmId,
+    ) {
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        for node in nodes {
+            config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+        }
+
+        for node in nodes {
+            let actor = Actor {
+                node_id: node.net.node_id(),
+                user_id: aruna_core::UserId::nil(realm_id),
+                realm_id,
+            };
+            write_doc(
+                &node.state.get_ctx(),
+                REALM_CONFIG_KEYSPACE,
+                (*realm_id.as_bytes()).into(),
+                config.to_bytes(&actor).unwrap().into(),
+            )
+            .await;
+            node.net
+                .refresh_realm_peers_from_document(&config)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn install_metadata_auth_documents(
+        node: &DistributedMetadataNode,
+        realm_id: RealmId,
+        user_id: aruna_core::UserId,
+        group_id: Ulid,
+    ) {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "distributed-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let context = node.state.get_ctx();
+
+        write_doc(
+            &context,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &context,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &context,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    async fn create_test_metadata_document(
+        state: Arc<ServerState>,
+        auth: AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+        public: bool,
+    ) {
+        let _ = create_metadata_document(
+            State(state),
+            Extension(Some(auth)),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: group_id.to_string(),
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    description: "Remote metadata access fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn query_remote_metadata_names(
+        test: &DistributedMetadataAccessState,
+        auth: Option<AuthContext>,
+        bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    ) -> QueryNamesResult {
+        let (results, fanout) = run_query_distributed(
+            test.coordinator.state.as_ref(),
+            auth,
+            bearer_token,
+            None,
+            "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+            Some(MetadataQueryMode::Distributed),
+            Some(vec![test.remote.net.node_id()]),
+        )
+        .await
+        .unwrap();
+        let MetadataQueryResults::Solutions(rows) = results else {
+            panic!("expected SELECT solutions");
+        };
+        QueryNamesResult {
+            names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
+            nodes_queried: fanout.nodes_queried,
+            nodes_failed: fanout.nodes_failed,
+        }
+    }
+
+    fn assert_contains_dataset_name(names: &[String], expected: &str) {
+        assert!(
+            names.iter().any(|name| name.contains(expected)),
+            "expected {names:?} to contain {expected:?}"
+        );
+    }
+
+    fn assert_excludes_dataset_name(names: &[String], unexpected: &str) {
+        assert!(
+            !names.iter().any(|name| name.contains(unexpected)),
+            "expected {names:?} not to contain {unexpected:?}"
+        );
+    }
+
+    fn test_realm_signing_key() -> SigningKey {
+        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
+        SigningKey::generate(&mut rng)
+    }
+
+    fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_string(),
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        }
+    }
+
+    fn sign_test_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
+        let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        encode(
+            &Header::new(Algorithm::EdDSA),
+            claims,
+            &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn setup_state() -> TestState {
