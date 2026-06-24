@@ -1918,11 +1918,13 @@ async fn apply_user_admin_document_operation_to_storage(
     if !matches!(
         event.op,
         AdminDocumentOperation::UserNameSet { .. }
+            | AdminDocumentOperation::UserSubjectIdAdded { .. }
+            | AdminDocumentOperation::UserSubjectIdRemoved { .. }
             | AdminDocumentOperation::UserAttributeSet { .. }
             | AdminDocumentOperation::UserAttributeRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "admin document operation sync only supports user name and attribute updates"
+            "admin document operation sync only supports user name, subject, and attribute updates"
                 .to_string(),
         ));
     }
@@ -1979,12 +1981,13 @@ async fn apply_user_admin_document_operation_to_storage(
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
 
-    let stale_conflict_deletes =
+    let mut deletes =
         stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
-    if !stale_conflict_deletes.is_empty() {
-        storage_batch_delete_to(storage, stale_conflict_deletes).await?;
-    }
-    storage_batch_write_to(storage, writes).await
+    deletes.extend(stale_subject_index_deletes(
+        previous_user.as_ref(),
+        Some(&user),
+    ));
+    storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
 }
 
 async fn apply_group_authorization_admin_document_operation_to_storage(
@@ -2266,6 +2269,25 @@ fn materialize_user_admin_document_operation(
             if !reducer_state.conflicts.contains_key("user.name") {
                 if let Some(name) = reducer_state.materialized_user_name() {
                     user.name = name;
+                }
+            }
+        }
+        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
+        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+            let path = format!("user.subject_ids.{subject_id}");
+            let materialized_subject_id = if reducer_state.conflicts.contains_key(&path) {
+                None
+            } else {
+                reducer_state
+                    .user_subject_ids
+                    .get(subject_id)
+                    .and_then(|version| version.value.clone())
+            };
+
+            user.subject_ids.retain(|candidate| candidate != subject_id);
+            if let Some(materialized_subject_id) = materialized_subject_id {
+                if !user.subject_ids.contains(&materialized_subject_id) {
+                    user.subject_ids.push(materialized_subject_id);
                 }
             }
         }
@@ -3230,6 +3252,122 @@ mod tests {
             )
             .await,
             Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_subject_add_admin_operation_creates_user_and_subject_index() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let user_id = UserId::local(Ulid::from_parts(10, 1), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id,
+            realm_id,
+        };
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(11, 1),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::UserSubjectIdAdded {
+                subject_id: "subject-created".to_string(),
+            },
+        };
+
+        apply_user_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            event,
+        )
+        .await
+        .expect("subject add applies");
+
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user exists");
+        let user = User::from_bytes(&stored_user).expect("user decodes");
+        assert_eq!(user.subject_ids, vec!["subject-created".to_string()]);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("subject-created")
+            )
+            .await,
+            Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_subject_remove_admin_operation_deletes_stale_subject_index() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let user_id = UserId::local(Ulid::from_parts(12, 1), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id,
+            realm_id,
+        };
+        let original = User {
+            user_id,
+            name: "Alice".to_string(),
+            subject_ids: vec!["subject-removed".to_string()],
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![
+                (
+                    USER_KEYSPACE.to_string(),
+                    user_id.to_bytes().into(),
+                    original.to_bytes(&actor).expect("user serializes").into(),
+                ),
+                (
+                    USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                    subject_index_key("subject-removed"),
+                    subject_index_value(user_id),
+                ),
+            ],
+        )
+        .await
+        .expect("original user and index write");
+
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(13, 1),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::UserSubjectIdRemoved {
+                subject_id: "subject-removed".to_string(),
+            },
+        };
+        apply_user_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            event,
+        )
+        .await
+        .expect("subject remove applies");
+
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user exists");
+        let user = User::from_bytes(&stored_user).expect("user decodes");
+        assert!(user.subject_ids.is_empty());
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("subject-removed")
+            )
+            .await,
+            None
         );
     }
 
