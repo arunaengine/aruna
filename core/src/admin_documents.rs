@@ -5,7 +5,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{Actor, RealmId};
-use crate::types::{GroupId, UserId};
+use crate::types::{GroupId, RoleId, UserId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDocumentClock {
@@ -51,6 +51,9 @@ pub enum AdminDocumentTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentOperation {
+    GroupRoleAdded { role_id: RoleId },
+    GroupRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
+    GroupRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
     UserAttributeSet { key: String, value: String },
     UserAttributeRemoved { key: String },
     UserNameSet { name: String },

@@ -8,6 +8,7 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentTarget,
 };
+use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
 };
@@ -23,7 +24,7 @@ pub enum AdminDocumentApplyStatus {
 pub enum AdminDocumentReducerError {
     #[error("admin document event target does not match reducer state")]
     TargetMismatch,
-    #[error("admin document reducer supports only user targets in this slice")]
+    #[error("admin document event operation is not supported for target")]
     UnsupportedTarget,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeValidationError),
@@ -80,9 +81,6 @@ impl AdminDocumentReducerState {
         if event.target != self.target {
             return Err(AdminDocumentReducerError::TargetMismatch);
         }
-        if !matches!(event.target, AdminDocumentTarget::User { .. }) {
-            return Err(AdminDocumentReducerError::UnsupportedTarget);
-        }
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
@@ -90,25 +88,61 @@ impl AdminDocumentReducerState {
             return Ok(AdminDocumentApplyStatus::StaleOriginSequence);
         }
 
-        match &event.op {
-            AdminDocumentOperation::UserNameSet { name } => {
+        match (&event.target, &event.op) {
+            (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupRoleAdded { role_id },
+            ) => {
+                self.apply_group_role(event, role_id, Some(role_id.to_string()));
+            }
+            (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+            ) => {
+                self.apply_group_role_user_assignment(
+                    event,
+                    role_id,
+                    user_id,
+                    Some(user_id.to_string()),
+                );
+            }
+            (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+            ) => {
+                self.apply_group_role_user_assignment(event, role_id, user_id, None);
+            }
+            (AdminDocumentTarget::User { .. }, AdminDocumentOperation::UserNameSet { name }) => {
                 self.apply_user_name(event, name);
             }
-            AdminDocumentOperation::UserSubjectIdAdded { subject_id } => {
+            (
+                AdminDocumentTarget::User { .. },
+                AdminDocumentOperation::UserSubjectIdAdded { subject_id },
+            ) => {
                 self.apply_user_subject_id(event, subject_id, Some(subject_id.clone()));
             }
-            AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+            (
+                AdminDocumentTarget::User { .. },
+                AdminDocumentOperation::UserSubjectIdRemoved { subject_id },
+            ) => {
                 self.apply_user_subject_id(event, subject_id, None);
             }
-            AdminDocumentOperation::UserAttributeSet { key, value } => {
+            (
+                AdminDocumentTarget::User { .. },
+                AdminDocumentOperation::UserAttributeSet { key, value },
+            ) => {
                 validate_user_attribute_key(key)?;
                 validate_user_attribute_value(key, value)?;
                 self.apply_user_attribute(event, key, Some(value.clone()));
             }
-            AdminDocumentOperation::UserAttributeRemoved { key } => {
+            (
+                AdminDocumentTarget::User { .. },
+                AdminDocumentOperation::UserAttributeRemoved { key },
+            ) => {
                 validate_user_attribute_key(key)?;
                 self.apply_user_attribute(event, key, None);
             }
+            _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
         self.applied_event_ids.insert(event.event_id);
@@ -117,12 +151,20 @@ impl AdminDocumentReducerState {
     }
 
     pub fn materialized_user_name(&self) -> Option<String> {
+        if !matches!(&self.target, AdminDocumentTarget::User { .. }) {
+            return None;
+        }
+
         self.user_name
             .as_ref()
             .and_then(|version| version.value.clone())
     }
 
     pub fn materialized_user_subject_ids(&self) -> BTreeSet<String> {
+        if !matches!(&self.target, AdminDocumentTarget::User { .. }) {
+            return BTreeSet::new();
+        }
+
         self.user_subject_ids
             .values()
             .filter_map(|version| version.value.clone())
@@ -130,6 +172,10 @@ impl AdminDocumentReducerState {
     }
 
     pub fn materialized_user_attributes(&self) -> BTreeMap<String, String> {
+        if !matches!(&self.target, AdminDocumentTarget::User { .. }) {
+            return BTreeMap::new();
+        }
+
         self.user_attributes
             .iter()
             .filter_map(|(key, version)| {
@@ -139,6 +185,47 @@ impl AdminDocumentReducerState {
                     .map(|value| (key.clone(), value.clone()))
             })
             .collect()
+    }
+
+    pub fn materialized_group_roles(&self) -> BTreeSet<RoleId> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| version.value.as_ref().map(|_| path))
+            .filter_map(|path| group_role_id_from_path(path))
+            .collect()
+    }
+
+    pub fn materialized_group_role_user_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return BTreeMap::new();
+        }
+
+        let active_roles = self.materialized_group_roles();
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let role_id = group_role_user_assignment_role_id_from_path(path)?;
+                let user_id = version
+                    .value
+                    .as_ref()
+                    .and_then(|value| UserId::from_string(value).ok())?;
+
+                active_roles
+                    .contains(&role_id)
+                    .then_some((role_id, user_id))
+            })
+            .fold(BTreeMap::new(), |mut assignments, (role_id, user_id)| {
+                assignments
+                    .entry(role_id)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(user_id);
+                assignments
+            })
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -185,6 +272,45 @@ impl AdminDocumentReducerState {
             }
             None => {
                 self.user_attributes.remove(key);
+            }
+        }
+    }
+
+    fn apply_group_role(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        value: Option<String>,
+    ) {
+        let path = group_role_path(role_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_group_role_user_assignment(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        user_id: &UserId,
+        value: Option<String>,
+    ) {
+        let path = group_role_user_assignment_path(role_id, user_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
             }
         }
     }
@@ -267,6 +393,31 @@ fn user_subject_id_path(subject_id: &str) -> String {
     format!("user.subject_ids.{subject_id}")
 }
 
+fn group_role_path(role_id: &RoleId) -> String {
+    format!("group.roles.{role_id}")
+}
+
+fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+    format!("group.roles.{role_id}.assigned_users.{user_id}")
+}
+
+fn group_role_id_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("group.roles.")?;
+
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+
+    Ulid::from_string(role_id).ok()
+}
+
+fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    let path = path.strip_prefix("group.roles.")?;
+    let (role_id, _) = path.split_once(".assigned_users.")?;
+
+    Ulid::from_string(role_id).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -277,6 +428,7 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use crate::structs::{Actor, RealmId};
+    use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
     use std::collections::{BTreeMap, BTreeSet};
@@ -290,8 +442,20 @@ mod tests {
         RealmId::from_bytes([9u8; 32])
     }
 
+    fn group_id() -> GroupId {
+        Ulid::from_bytes([7u8; 16])
+    }
+
+    fn role_id(seed: u8) -> RoleId {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn user_id_with_seed(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), realm_id())
+    }
+
     fn user_id() -> UserId {
-        UserId::local(Ulid::from_bytes([8u8; 16]), realm_id())
+        user_id_with_seed(8)
     }
 
     fn actor(origin_node_id: NodeId) -> Actor {
@@ -306,6 +470,12 @@ mod tests {
         AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id: user_id() })
     }
 
+    fn group_state() -> AdminDocumentReducerState {
+        AdminDocumentReducerState::new(AdminDocumentTarget::Group {
+            group_id: group_id(),
+        })
+    }
+
     fn event(
         event_seed: u8,
         origin_node_id: NodeId,
@@ -316,6 +486,26 @@ mod tests {
         AdminDocumentEvent {
             event_id: Ulid::from_bytes([event_seed; 16]),
             target: AdminDocumentTarget::User { user_id: user_id() },
+            origin_node_id,
+            origin_seq,
+            observed,
+            actor: actor(origin_node_id),
+            op,
+        }
+    }
+
+    fn group_event(
+        event_seed: u8,
+        origin_node_id: NodeId,
+        origin_seq: u64,
+        observed: AdminDocumentClock,
+        op: AdminDocumentOperation,
+    ) -> AdminDocumentEvent {
+        AdminDocumentEvent {
+            event_id: Ulid::from_bytes([event_seed; 16]),
+            target: AdminDocumentTarget::Group {
+                group_id: group_id(),
+            },
             origin_node_id,
             origin_seq,
             observed,
@@ -370,6 +560,46 @@ mod tests {
             AdminDocumentOperation::UserSubjectIdRemoved {
                 subject_id: subject_id.to_string(),
             },
+        )
+    }
+
+    fn add_group_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleAdded { role_id },
+        )
+    }
+
+    fn assign_group_role_user(
+        event_seed: u8,
+        origin_seed: u8,
+        role_id: RoleId,
+        user_id: UserId,
+    ) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+        )
+    }
+
+    fn remove_group_role_user_assignment(
+        event_seed: u8,
+        origin_seed: u8,
+        role_id: RoleId,
+        user_id: UserId,
+    ) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
         )
     }
 
@@ -635,5 +865,128 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some("Bob"))
         );
+    }
+
+    #[test]
+    fn group_role_and_user_assignment_materialize() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state.apply(&add_group_role(1, 1, role_id)).unwrap();
+        state
+            .apply(&assign_group_role_user(2, 2, role_id, user_id))
+            .unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state.materialized_group_role_user_assignments(),
+            BTreeMap::from([(role_id, BTreeSet::from([user_id]))])
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn group_role_user_assignment_is_hidden_until_role_exists() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state
+            .apply(&assign_group_role_user(1, 1, role_id, user_id))
+            .unwrap();
+
+        assert!(state.materialized_group_roles().is_empty());
+        assert!(state.materialized_group_role_user_assignments().is_empty());
+
+        state.apply(&add_group_role(2, 2, role_id)).unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state.materialized_group_role_user_assignments(),
+            BTreeMap::from([(role_id, BTreeSet::from([user_id]))])
+        );
+    }
+
+    #[test]
+    fn observed_group_role_user_assignment_removal_clears_assignment() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+        let assignment_origin = node(2);
+        let assignment = group_event(
+            2,
+            assignment_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+        );
+        let removal = group_event(
+            3,
+            node(3),
+            1,
+            AdminDocumentClock::default().with_observed(assignment_origin, 1),
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+        );
+
+        state.apply(&add_group_role(1, 1, role_id)).unwrap();
+        state.apply(&assignment).unwrap();
+        state.apply(&removal).unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert!(state.materialized_group_role_user_assignments().is_empty());
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_group_role_user_assignment_add_remove_conflict_fails_closed() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state.apply(&add_group_role(1, 1, role_id)).unwrap();
+        state
+            .apply(&assign_group_role_user(2, 2, role_id, user_id))
+            .unwrap();
+        state
+            .apply(&remove_group_role_user_assignment(3, 3, role_id, user_id))
+            .unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert!(state.materialized_group_role_user_assignments().is_empty());
+        let conflict = state
+            .conflicts
+            .get(&format!("group.roles.{role_id}.assigned_users.{user_id}"))
+            .expect("conflict is recorded");
+        let expected_user_id = user_id.to_string();
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(expected_user_id.as_str()))
+        );
+        assert!(conflict.values.iter().any(|value| value.value.is_none()));
+    }
+
+    #[test]
+    fn user_operation_is_rejected_for_group_target_without_state_change() {
+        let mut state = group_state();
+        let before = state.clone();
+        let event = group_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserNameSet {
+                name: "Alice".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::UnsupportedTarget)
+        );
+        assert_eq!(state, before);
     }
 }
