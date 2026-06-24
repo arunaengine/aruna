@@ -298,16 +298,239 @@ pub enum IrokleEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::DocumentSyncTarget;
+    use super::{DocumentSyncEvent, DocumentSyncTarget};
+    use crate::TopicId;
+    use crate::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    };
+    use crate::structs::RealmId;
+    use crate::types::UserId;
+    use irokle::Event as _;
     use ulid::Ulid;
+
+    fn test_ulid(seed: u8) -> Ulid {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn test_realm(seed: u8) -> RealmId {
+        RealmId::from_bytes([seed; 32])
+    }
+
+    fn graph_topic_ulid(graph_iri: &str) -> Ulid {
+        let hash = blake3::hash(graph_iri.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash.as_bytes()[..16]);
+        Ulid::from_bytes(bytes)
+    }
+
+    fn graph_lifecycle_key(graph_iri: &str) -> Vec<u8> {
+        blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec()
+    }
+
+    #[test]
+    fn document_sync_target_domain_topic_mapping_is_stable() {
+        let group_id = test_ulid(1);
+        let realm_id = test_realm(2);
+        let user_id = UserId::new(test_ulid(3), realm_id);
+        let document_id = test_ulid(4);
+        let event_id = test_ulid(5);
+        let graph_iri = "https://example.com/graphs/stable";
+
+        let cases = [
+            (
+                DocumentSyncTarget::Group { group_id },
+                TopicId::group(group_id),
+            ),
+            (
+                DocumentSyncTarget::GroupAuthorization { group_id },
+                TopicId::group(group_id),
+            ),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                TopicId::realm(realm_id),
+            ),
+            (
+                DocumentSyncTarget::RealmConfig { realm_id },
+                TopicId::realm(realm_id),
+            ),
+            (
+                DocumentSyncTarget::User { user_id },
+                TopicId::users(realm_id),
+            ),
+            (
+                DocumentSyncTarget::MetadataRegistry {
+                    group_id,
+                    document_id,
+                },
+                TopicId::metadata(document_id),
+            ),
+            (
+                DocumentSyncTarget::MetadataCreateEvent {
+                    document_id,
+                    event_id,
+                },
+                TopicId::metadata(document_id),
+            ),
+            (
+                DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+                TopicId::metadata(document_id),
+            ),
+            (
+                DocumentSyncTarget::MetadataGraphLifecycle {
+                    graph_iri: graph_iri.to_string(),
+                },
+                TopicId::metadata(graph_topic_ulid(graph_iri)),
+            ),
+        ];
+
+        for (target, expected_topic) in cases {
+            assert_eq!(target.topic_id(), expected_topic, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn document_sync_target_storage_mapping_is_stable() {
+        let group_id = test_ulid(1);
+        let realm_id = test_realm(2);
+        let user_id = UserId::new(test_ulid(3), realm_id);
+        let document_id = test_ulid(4);
+        let event_id = test_ulid(5);
+        let graph_iri = "https://example.com/graphs/stable";
+
+        let mut user_key = Vec::with_capacity(48);
+        user_key.extend_from_slice(realm_id.as_bytes());
+        user_key.extend_from_slice(&user_id.user_ulid.to_bytes());
+
+        let mut registry_key = Vec::with_capacity(32);
+        registry_key.extend_from_slice(&group_id.to_bytes());
+        registry_key.extend_from_slice(&document_id.to_bytes());
+
+        let mut event_key = Vec::with_capacity(32);
+        event_key.extend_from_slice(&document_id.to_bytes());
+        event_key.extend_from_slice(&event_id.to_bytes());
+
+        let cases = [
+            (
+                DocumentSyncTarget::Group { group_id },
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+            ),
+            (
+                DocumentSyncTarget::GroupAuthorization { group_id },
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+            ),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+            ),
+            (
+                DocumentSyncTarget::RealmConfig { realm_id },
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+            ),
+            (
+                DocumentSyncTarget::User { user_id },
+                USER_KEYSPACE,
+                user_key,
+            ),
+            (
+                DocumentSyncTarget::MetadataRegistry {
+                    group_id,
+                    document_id,
+                },
+                METADATA_INDEX_KEYSPACE,
+                registry_key,
+            ),
+            (
+                DocumentSyncTarget::MetadataCreateEvent {
+                    document_id,
+                    event_id,
+                },
+                METADATA_EVENT_LOG_KEYSPACE,
+                event_key,
+            ),
+            (
+                DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+                METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+                document_id.to_bytes().to_vec(),
+            ),
+            (
+                DocumentSyncTarget::MetadataGraphLifecycle {
+                    graph_iri: graph_iri.to_string(),
+                },
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+                graph_lifecycle_key(graph_iri),
+            ),
+        ];
+
+        for (target, expected_keyspace, expected_key) in cases {
+            assert_eq!(target.storage_keyspace(), expected_keyspace, "{target:?}");
+            assert_eq!(
+                target.storage_key().as_ref(),
+                expected_key.as_slice(),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn irokle_topic_mapping_scopes_variants_under_shared_domain_topics() {
+        let group_id = test_ulid(1);
+        let realm_id = test_realm(2);
+        let document_id = test_ulid(4);
+        let event_id = test_ulid(5);
+        let group = DocumentSyncTarget::Group { group_id };
+        let group_auth = DocumentSyncTarget::GroupAuthorization { group_id };
+        let realm_auth = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let realm_config = DocumentSyncTarget::RealmConfig { realm_id };
+        let registry = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        };
+        let create = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        };
+        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let user_a = DocumentSyncTarget::User {
+            user_id: UserId::new(test_ulid(6), realm_id),
+        };
+        let user_b = DocumentSyncTarget::User {
+            user_id: UserId::new(test_ulid(7), realm_id),
+        };
+
+        assert_eq!(group.topic_id(), group_auth.topic_id());
+        assert_ne!(group.irokle_topic_id(), group_auth.irokle_topic_id());
+
+        assert_eq!(realm_auth.topic_id(), realm_config.topic_id());
+        assert_ne!(realm_auth.irokle_topic_id(), realm_config.irokle_topic_id());
+
+        assert_eq!(registry.topic_id(), create.topic_id());
+        assert_eq!(registry.topic_id(), lifecycle.topic_id());
+        assert_ne!(registry.irokle_topic_id(), create.irokle_topic_id());
+        assert_ne!(registry.irokle_topic_id(), lifecycle.irokle_topic_id());
+        assert_ne!(create.irokle_topic_id(), lifecycle.irokle_topic_id());
+
+        assert_eq!(user_a.topic_id(), user_b.topic_id());
+        assert_ne!(user_a.irokle_topic_id(), user_b.irokle_topic_id());
+    }
+
+    #[test]
+    fn document_sync_event_type_id_is_stable() {
+        assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+    }
 
     #[test]
     fn metadata_document_lifecycle_target_is_document_scoped() {
-        let document_id = Ulid::new();
+        let document_id = test_ulid(4);
         let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let create = DocumentSyncTarget::MetadataCreateEvent {
             document_id,
-            event_id: Ulid::new(),
+            event_id: test_ulid(5),
         };
 
         assert_eq!(lifecycle.topic_id(), create.topic_id());
@@ -316,7 +539,7 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_topic_is_shared_by_upsert_and_delete() {
-        let document_id = Ulid::new();
+        let document_id = test_ulid(4);
         let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
