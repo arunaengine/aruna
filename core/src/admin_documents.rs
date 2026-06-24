@@ -64,7 +64,7 @@ pub enum AdminDocumentOperation {
     RealmRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDocumentEvent {
     pub event_id: Ulid,
     pub target: AdminDocumentTarget,

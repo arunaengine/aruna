@@ -3,7 +3,8 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+    DocumentSyncTarget,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
@@ -15,6 +16,7 @@ use aruna_core::storage_entries::{
     document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmId, User};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
 use aruna_core::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
@@ -29,6 +31,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 use crate::replicate_documents::replicate_documents_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
@@ -63,14 +68,20 @@ enum UpdateUserState {
     WriteUserAdminStateAndDocumentRevision {
         txn_id: TxnId,
         user: User,
+        admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
     DeleteStaleAdminConflicts {
         txn_id: TxnId,
         user: User,
+        admin_outbox_written: bool,
     },
     CommitTransaction {
         txn_id: TxnId,
+        user: User,
+        admin_outbox_written: bool,
+    },
+    ScheduleAdminDocumentOutboxDrain {
         user: User,
     },
     AnnounceUser {
@@ -313,7 +324,7 @@ impl UpdateUserOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(admin_target));
-        apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
         let previous_document_revision = revision_value
             .as_ref()
             .map(|value| {
@@ -344,11 +355,24 @@ impl UpdateUserOperation {
             &document_target,
             &document_revision,
         )?);
+        for event in &admin_events {
+            let record = new_outbox_record_with_id(
+                event.event_id,
+                self.input.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: event.clone(),
+                },
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.state = UpdateUserState::WriteUserAdminStateAndDocumentRevision {
             txn_id,
             user: user.clone(),
+            admin_outbox_written: !admin_events.is_empty(),
             stale_conflict_deletes,
         };
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -362,6 +386,7 @@ impl UpdateUserOperation {
         event: Event,
         txn_id: TxnId,
         user: User,
+        admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     ) -> Effects {
         let got = format!("{event:?}");
@@ -369,14 +394,18 @@ impl UpdateUserOperation {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };
         if !stale_conflict_deletes.is_empty() {
-            self.state = UpdateUserState::DeleteStaleAdminConflicts { txn_id, user };
+            self.state = UpdateUserState::DeleteStaleAdminConflicts {
+                txn_id,
+                user,
+                admin_outbox_written,
+            };
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                 deletes: stale_conflict_deletes,
                 txn_id: Some(txn_id),
             })];
         }
 
-        self.emit_commit_transaction(txn_id, user)
+        self.emit_commit_transaction(txn_id, user, admin_outbox_written)
     }
 
     fn handle_delete_stale_admin_conflicts(
@@ -384,21 +413,36 @@ impl UpdateUserOperation {
         event: Event,
         txn_id: TxnId,
         user: User,
+        admin_outbox_written: bool,
     ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
         };
 
-        self.emit_commit_transaction(txn_id, user)
+        self.emit_commit_transaction(txn_id, user, admin_outbox_written)
     }
 
-    fn emit_commit_transaction(&mut self, txn_id: TxnId, user: User) -> Effects {
-        self.state = UpdateUserState::CommitTransaction { txn_id, user };
+    fn emit_commit_transaction(
+        &mut self,
+        txn_id: TxnId,
+        user: User,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        self.state = UpdateUserState::CommitTransaction {
+            txn_id,
+            user,
+            admin_outbox_written,
+        };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn handle_commit_transaction(&mut self, event: Event, user: User) -> Effects {
+    fn handle_commit_transaction(
+        &mut self,
+        event: Event,
+        user: User,
+        admin_outbox_written: bool,
+    ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
@@ -406,6 +450,30 @@ impl UpdateUserOperation {
                 got,
             );
         };
+        if admin_outbox_written {
+            self.state = UpdateUserState::ScheduleAdminDocumentOutboxDrain { user };
+            return smallvec![schedule_outbox_drain_effect()];
+        }
+
+        self.emit_announce_user(user)
+    }
+
+    fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_announce_user(user),
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                self.fail(UpdateUserError::TopicAnnouncement(format!(
+                    "admin document outbox drain scheduling failed: {message}"
+                )))
+            }
+            other => self.unexpected_event(
+                "admin document outbox drain timer schedule",
+                format!("{other:?}"),
+            ),
+        }
+    }
+
+    fn emit_announce_user(&mut self, user: User) -> Effects {
         let user_id = user.user_id;
         self.state = UpdateUserState::AnnounceUser { user };
         let document = DocumentSyncTarget::User { user_id };
@@ -462,13 +530,29 @@ impl Operation for UpdateUserOperation {
             UpdateUserState::WriteUserAdminStateAndDocumentRevision {
                 txn_id,
                 user,
+                admin_outbox_written,
                 stale_conflict_deletes,
-            } => self.handle_write_user(event, txn_id, user, stale_conflict_deletes),
-            UpdateUserState::DeleteStaleAdminConflicts { txn_id, user } => {
-                self.handle_delete_stale_admin_conflicts(event, txn_id, user)
+            } => self.handle_write_user(
+                event,
+                txn_id,
+                user,
+                admin_outbox_written,
+                stale_conflict_deletes,
+            ),
+            UpdateUserState::DeleteStaleAdminConflicts {
+                txn_id,
+                user,
+                admin_outbox_written,
+            } => {
+                self.handle_delete_stale_admin_conflicts(event, txn_id, user, admin_outbox_written)
             }
-            UpdateUserState::CommitTransaction { user, .. } => {
-                self.handle_commit_transaction(event, user)
+            UpdateUserState::CommitTransaction {
+                user,
+                admin_outbox_written,
+                ..
+            } => self.handle_commit_transaction(event, user, admin_outbox_written),
+            UpdateUserState::ScheduleAdminDocumentOutboxDrain { user } => {
+                self.handle_schedule_admin_document_outbox_drain(event, user)
             }
             UpdateUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
             UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => smallvec![],
@@ -523,7 +607,8 @@ fn local_user_document_sync_change(
 fn apply_admin_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &UpdateUserInput,
-) -> Result<(), AdminDocumentReducerError> {
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    let mut events = Vec::new();
     for operation in admin_document_operations(input) {
         let observed = state.clock.clone();
         let event = AdminDocumentEvent {
@@ -536,9 +621,10 @@ fn apply_admin_reducer_updates(
             op: operation,
         };
         state.apply(&event)?;
+        events.push(event);
     }
 
-    Ok(())
+    Ok(events)
 }
 
 fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperation> {
@@ -608,7 +694,8 @@ mod tests {
     };
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
+        DocumentSyncOutboxRecord, DocumentSyncRevision, DocumentSyncTarget,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -618,10 +705,11 @@ mod tests {
         document_sync_revision_key,
     };
     use aruna_core::structs::{Actor, AuthContext, RealmId, User};
+    use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{TxnId, UserId};
     use aruna_core::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use ulid::Ulid;
@@ -784,7 +872,6 @@ mod tests {
         let (updated, reducer_state) = match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
-                assert_eq!(writes.len(), 3);
                 let user_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == USER_KEYSPACE)
@@ -798,6 +885,26 @@ mod tests {
                         .iter()
                         .all(|(keyspace, _, _)| keyspace != ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
                 );
+                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                    .iter()
+                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+                    .collect();
+                assert_eq!(outbox_records.len(), 4);
+                assert!(
+                    outbox_records
+                        .iter()
+                        .all(|record| record.target == document)
+                );
+                assert!(outbox_records.iter().any(|record| matches!(
+                    &record.event,
+                    DocumentSyncOutboxEvent::AdminOperation {
+                        event: aruna_core::admin_documents::AdminDocumentEvent {
+                            op: aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. },
+                            ..
+                        }
+                    }
+                )));
                 (
                     User::from_bytes(user_write.2.as_ref()).unwrap(),
                     postcard::from_bytes::<AdminDocumentReducerState>(
@@ -840,6 +947,12 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
+        }));
+        assert!(matches!(effects.first(), Some(Effect::Task(_))));
+
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
         }));
         assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
 

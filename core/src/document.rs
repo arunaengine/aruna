@@ -4,6 +4,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -74,6 +75,7 @@ pub struct DocumentSyncOutboxRecord {
 pub enum DocumentSyncOutboxEvent {
     Upsert { bytes: Vec<u8> },
     Delete,
+    AdminOperation { event: AdminDocumentEvent },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -116,6 +118,10 @@ pub enum DocumentSyncPublish {
         event_id: Ulid,
         target: DocumentSyncTarget,
     },
+    AdminOperation {
+        target: DocumentSyncTarget,
+        event: AdminDocumentEvent,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,7 +140,9 @@ impl DocumentSyncReconcileResult {
 impl DocumentSyncPublish {
     pub fn target(&self) -> &DocumentSyncTarget {
         match self {
-            Self::Upsert { target, .. } | Self::Delete { target, .. } => target,
+            Self::Upsert { target, .. }
+            | Self::Delete { target, .. }
+            | Self::AdminOperation { target, .. } => target,
         }
     }
 }
@@ -144,6 +152,7 @@ impl DocumentSyncOutboxEvent {
         match self {
             Self::Upsert { .. } => b"upsert",
             Self::Delete => b"delete",
+            Self::AdminOperation { .. } => b"admin-operation",
         }
     }
 }
@@ -301,18 +310,25 @@ pub enum DocumentSyncEvent {
         event_id: Ulid,
         target: DocumentSyncTarget,
     },
+    AdminOperation {
+        target: DocumentSyncTarget,
+        event: AdminDocumentEvent,
+    },
 }
 
 impl DocumentSyncEvent {
     pub fn target(&self) -> &DocumentSyncTarget {
         match self {
-            Self::Upsert { target, .. } | Self::Delete { target, .. } => target,
+            Self::Upsert { target, .. }
+            | Self::Delete { target, .. }
+            | Self::AdminOperation { target, .. } => target,
         }
     }
 
     pub fn event_id(&self) -> Ulid {
         match self {
             Self::Upsert { event_id, .. } | Self::Delete { event_id, .. } => *event_id,
+            Self::AdminOperation { event, .. } => event.event_id,
         }
     }
 }

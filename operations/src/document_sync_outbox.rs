@@ -22,8 +22,9 @@ use ulid::Ulid;
 // capacity rather than peer count.
 pub const OUTBOX_DRAIN_BATCH_SIZE: usize = 4 * aruna_net::irokle::IROKLE_BATCH_SYNC_TOPIC_LIMIT;
 
-// Keys order by kind then outbox id (a ULID), so drains are FIFO instead of
-// following the random blake3 topic id order; the topic stays in the value.
+// Keys order by kind then outbox id (a ULID), with admin operations additionally
+// ordered by origin sequence, so drains are FIFO instead of following the random
+// blake3 topic id order; the topic stays in the value.
 pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
     let mut bytes = b"document-sync-outbox-v1/".to_vec();
     bytes.extend_from_slice(event.kind());
@@ -33,6 +34,10 @@ pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
 
 pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
     let mut bytes = outbox_prefix(&record.event).to_vec();
+    if let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event {
+        bytes.extend_from_slice(event.origin_node_id.as_bytes());
+        bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
+    }
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
     ByteView::from(bytes)
 }
@@ -221,7 +226,11 @@ pub async fn restore_document_sync_outbox_timers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::RealmId;
+    use aruna_core::admin_documents::{
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    };
+    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::types::UserId;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -232,6 +241,26 @@ mod tests {
     fn target() -> DocumentSyncTarget {
         DocumentSyncTarget::RealmConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
+        }
+    }
+
+    fn user_admin_event(user_id: UserId, origin_seq: u64) -> DocumentSyncOutboxEvent {
+        DocumentSyncOutboxEvent::AdminOperation {
+            event: AdminDocumentEvent {
+                event_id: Ulid::from_parts(1, u128::from(origin_seq)),
+                target: AdminDocumentTarget::User { user_id },
+                origin_node_id: node(1),
+                origin_seq,
+                observed: AdminDocumentClock::default(),
+                actor: Actor {
+                    node_id: node(1),
+                    user_id,
+                    realm_id: user_id.realm_id,
+                },
+                op: AdminDocumentOperation::UserNameSet {
+                    name: format!("user-{origin_seq}"),
+                },
+            },
         }
     }
 
@@ -289,5 +318,23 @@ mod tests {
         newer.outbox_id = Ulid::from_parts(2, 0);
 
         assert!(outbox_key(&older) < outbox_key(&newer));
+    }
+
+    #[test]
+    fn admin_outbox_keys_order_by_origin_sequence() {
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let target = DocumentSyncTarget::User { user_id };
+        let mut earlier = new_outbox_record(
+            node(1),
+            target.clone(),
+            Vec::new(),
+            user_admin_event(user_id, 1),
+        );
+        earlier.outbox_id = Ulid::from_parts(2, 2);
+        let mut later =
+            new_outbox_record(node(1), target, Vec::new(), user_admin_event(user_id, 2));
+        later.outbox_id = Ulid::from_parts(1, 1);
+
+        assert!(outbox_key(&earlier) < outbox_key(&later));
     }
 }

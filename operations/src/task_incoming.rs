@@ -149,6 +149,12 @@ impl OperationsTaskHandler {
                     event_id: record.outbox_id,
                     target: record.target.clone(),
                 },
+                DocumentSyncOutboxEvent::AdminOperation { event } => {
+                    DocumentSyncPublish::AdminOperation {
+                        target: record.target.clone(),
+                        event,
+                    }
+                }
             };
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();

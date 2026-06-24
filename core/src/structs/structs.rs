@@ -183,7 +183,7 @@ impl TryFrom<TokenClaims> for AuthContext {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Actor {
     pub node_id: NodeId,
     pub user_id: UserId,

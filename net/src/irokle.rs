@@ -4,6 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
+use aruna_core::admin_document_reducer::{AdminDocumentApplyStatus, AdminDocumentReducerState};
+use aruna_core::admin_documents::{
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+};
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult,
     DocumentSyncTarget, IrokleEvent,
@@ -11,7 +15,7 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_REVISION_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE,
+    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE,
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
 };
 use aruna_core::metadata::{
@@ -19,16 +23,19 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::storage_entries::{
-    document_sync_revision_key, document_sync_revision_write_entry,
-    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
-    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
-    metadata_registry_write_entries, stale_subject_index_deletes, subject_index_writes,
+    admin_document_conflict_write_entries, admin_document_reducer_state_key,
+    admin_document_reducer_state_write_entry, document_sync_revision_key,
+    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
+    metadata_document_lifecycle_key, metadata_document_lifecycle_revision_change,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
+    metadata_registry_delete_entries, metadata_registry_write_entries,
+    stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
+    subject_index_writes,
 };
 use aruna_core::structs::{MetadataRegistryRecord, User};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::types::Value;
+use aruna_core::types::{UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
@@ -525,6 +532,9 @@ impl IrokleService {
             DocumentSyncEvent::Delete { event_id, target } => {
                 DocumentSyncPublish::Delete { event_id, target }
             }
+            DocumentSyncEvent::AdminOperation { target, event } => {
+                DocumentSyncPublish::AdminOperation { target, event }
+            }
         };
         let sync_peers = self.sync_peers(peers);
         self.allow_sync_peers(&sync_peers)?;
@@ -585,6 +595,9 @@ impl IrokleService {
                 },
                 DocumentSyncPublish::Delete { event_id, target } => {
                     DocumentSyncEvent::Delete { event_id, target }
+                }
+                DocumentSyncPublish::AdminOperation { target, event } => {
+                    DocumentSyncEvent::AdminOperation { target, event }
                 }
             };
             let target = event.target().clone();
@@ -1513,6 +1526,9 @@ impl IrokleService {
                 self.apply_upsert(target, bytes).await
             }
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
+            DocumentSyncEvent::AdminOperation { target, event } => {
+                apply_user_admin_document_operation_to_storage(&self.storage, target, event).await
+            }
         }
     }
 
@@ -1823,6 +1839,147 @@ async fn apply_metadata_document_lifecycle_to_storage(
         }
     }
     Ok(true)
+}
+
+async fn apply_user_admin_document_operation_to_storage(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let DocumentSyncTarget::User { user_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "admin document operation sync only supports user targets".to_string(),
+        ));
+    };
+    let AdminDocumentTarget::User {
+        user_id: event_user_id,
+    } = event.target.clone()
+    else {
+        return Err(NetError::Bootstrap(
+            "admin document operation payload target is not a user".to_string(),
+        ));
+    };
+    if event_user_id != user_id {
+        return Err(NetError::Bootstrap(format!(
+            "replicated user admin operation target {user_id} does not match payload user id {event_user_id}"
+        )));
+    }
+    if !matches!(
+        event.op,
+        AdminDocumentOperation::UserNameSet { .. }
+            | AdminDocumentOperation::UserAttributeSet { .. }
+            | AdminDocumentOperation::UserAttributeRemoved { .. }
+    ) {
+        return Err(NetError::Bootstrap(
+            "admin document operation sync only supports user name and attribute updates"
+                .to_string(),
+        ));
+    }
+
+    let previous_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&event.target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut reducer_state = previous_state
+        .clone()
+        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    let apply_status = reducer_state
+        .apply(&event)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if apply_status != AdminDocumentApplyStatus::Applied {
+        return Ok(());
+    }
+
+    let previous_user = storage_read_from(
+        storage,
+        document_target.storage_keyspace().to_string(),
+        document_target.storage_key(),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let user = materialize_user_admin_document_operation(
+        user_id,
+        previous_user.as_ref(),
+        &reducer_state,
+        &event,
+    );
+
+    let mut writes = vec![
+        (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            user.to_bytes(&event.actor)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        admin_document_reducer_state_write_entry(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    writes.extend(subject_index_writes(&user));
+    writes.extend(
+        admin_document_conflict_write_entries(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+
+    let stale_conflict_deletes =
+        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
+    if !stale_conflict_deletes.is_empty() {
+        storage_batch_delete_to(storage, stale_conflict_deletes).await?;
+    }
+    storage_batch_write_to(storage, writes).await
+}
+
+fn materialize_user_admin_document_operation(
+    user_id: UserId,
+    previous_user: Option<&User>,
+    reducer_state: &AdminDocumentReducerState,
+    event: &AdminDocumentEvent,
+) -> User {
+    let mut user = previous_user.cloned().unwrap_or_else(|| User {
+        user_id,
+        name: String::new(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    });
+
+    match &event.op {
+        AdminDocumentOperation::UserNameSet { .. } => {
+            if !reducer_state.conflicts.contains_key("user.name") {
+                if let Some(name) = reducer_state.materialized_user_name() {
+                    user.name = name;
+                }
+            }
+        }
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => {
+            let path = format!("user.attributes.{key}");
+            if !reducer_state.conflicts.contains_key(&path) {
+                match reducer_state
+                    .user_attributes
+                    .get(key)
+                    .and_then(|version| version.value.clone())
+                {
+                    Some(value) => {
+                        user.attributes.insert(key.clone(), value);
+                    }
+                    None => {
+                        user.attributes.remove(key);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    user
 }
 
 async fn metadata_document_lifecycle_write_entries_if_current(
@@ -2369,19 +2526,24 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::admin_documents::{
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    };
     use aruna_core::alpn::Alpn;
     use aruna_core::document::DocumentSyncChangeKind;
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
-        metadata_document_key, metadata_event_log_key, metadata_registry_key,
+        admin_document_reducer_state_key, metadata_document_key, metadata_event_log_key,
+        metadata_registry_key, subject_index_key, subject_index_value,
     };
-    use aruna_core::structs::RealmId;
-    use std::collections::BTreeMap;
+    use aruna_core::structs::{Actor, RealmId};
+    use std::collections::{BTreeMap, HashMap};
     use std::{env, process::Command};
     use tempfile::TempDir;
 
@@ -2591,6 +2753,83 @@ mod tests {
                 deleted_after_event_id,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn user_admin_operation_applies_reducer_state_and_materializes_user() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1, 1), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id,
+            realm_id,
+        };
+        let original = User {
+            user_id,
+            name: "Alice".to_string(),
+            subject_ids: vec!["subject-1".to_string()],
+            alias_user_ids: Default::default(),
+            attributes: HashMap::from([("department".to_string(), "physics".to_string())]),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                USER_KEYSPACE.to_string(),
+                user_id.to_bytes().into(),
+                original.to_bytes(&actor).expect("user serializes").into(),
+            )],
+        )
+        .await
+        .expect("original user writes");
+
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(2, 1),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::UserNameSet {
+                name: "Alice Updated".to_string(),
+            },
+        };
+        apply_user_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            event,
+        )
+        .await
+        .expect("admin operation applies");
+
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user exists");
+        let user = User::from_bytes(&stored_user).expect("user decodes");
+        assert_eq!(user.name, "Alice Updated");
+        assert_eq!(user.attributes["department"], "physics");
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&AdminDocumentTarget::User { user_id }),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_user_name().as_deref(),
+            Some("Alice Updated")
+        );
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("subject-1")
+            )
+            .await,
+            Some(subject_index_value(user_id))
+        );
     }
 
     async fn read_document_lifecycle_record(
