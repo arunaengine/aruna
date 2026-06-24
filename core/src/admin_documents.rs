@@ -53,6 +53,9 @@ pub enum AdminDocumentTarget {
 pub enum AdminDocumentOperation {
     UserAttributeSet { key: String, value: String },
     UserAttributeRemoved { key: String },
+    UserNameSet { name: String },
+    UserSubjectIdAdded { subject_id: String },
+    UserSubjectIdRemoved { subject_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

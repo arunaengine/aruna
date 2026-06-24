@@ -515,6 +515,8 @@ mod tests {
                 "user.attributes.title".to_string(),
                 conflict("user.attributes.title", 2, 3),
             )]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -576,6 +578,8 @@ mod tests {
                     conflict("user.attributes.title", 3, 4),
                 ),
             ]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
         };
 
         let entries = admin_document_conflict_write_entries(&state).unwrap();
@@ -618,6 +622,8 @@ mod tests {
                     conflict("user.attributes.title", 3, 4),
                 ),
             ]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
         };
         let current = AdminDocumentReducerState {
             conflicts: BTreeMap::from([(
