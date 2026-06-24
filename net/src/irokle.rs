@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{AdminDocumentApplyStatus, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult,
@@ -34,10 +34,10 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{
-    GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument, User,
+    GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument, Role, User,
 };
 use aruna_core::telemetry::duration_ms;
-use aruna_core::types::{TxnId, UserId, Value};
+use aruna_core::types::{RoleId, TxnId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
@@ -1936,8 +1936,29 @@ fn overlay_group_authorization_reducer_materialization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
+    overlay_group_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
+}
+
+fn overlay_group_authorization_role_assignment_reducer_materialization(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role_id: RoleId,
+) {
+    overlay_group_authorization_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        Some(role_id),
+    );
+}
+
+fn overlay_group_authorization_assignment_reducer_materialization(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    only_role_id: Option<RoleId>,
+) {
     for path in reducer_state.conflicts.keys() {
         if let Some((role_id, user_id)) = group_role_user_assignment_from_path(path)
+            && only_role_id.is_none_or(|only_role_id| only_role_id == role_id)
             && let Some(role) = auth_doc.roles.get_mut(&role_id)
         {
             role.assigned_users.remove(&user_id);
@@ -1948,6 +1969,9 @@ fn overlay_group_authorization_reducer_materialization(
         let Some((role_id, user_id)) = group_role_user_assignment_from_path(path) else {
             continue;
         };
+        if only_role_id.is_some_and(|only_role_id| only_role_id != role_id) {
+            continue;
+        }
         let Some(role) = auth_doc.roles.get_mut(&role_id) else {
             continue;
         };
@@ -1970,8 +1994,29 @@ fn overlay_realm_authorization_reducer_materialization(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
+    overlay_realm_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
+}
+
+fn overlay_realm_authorization_role_assignment_reducer_materialization(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role_id: RoleId,
+) {
+    overlay_realm_authorization_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        Some(role_id),
+    );
+}
+
+fn overlay_realm_authorization_assignment_reducer_materialization(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    only_role_id: Option<RoleId>,
+) {
     for path in reducer_state.conflicts.keys() {
         if let Some((role_id, user_id)) = realm_role_user_assignment_from_path(path)
+            && only_role_id.is_none_or(|only_role_id| only_role_id == role_id)
             && let Some(role) = auth_doc.roles.get_mut(&role_id)
         {
             role.assigned_users.remove(&user_id);
@@ -1982,6 +2027,9 @@ fn overlay_realm_authorization_reducer_materialization(
         let Some((role_id, user_id)) = realm_role_user_assignment_from_path(path) else {
             continue;
         };
+        if only_role_id.is_some_and(|only_role_id| only_role_id != role_id) {
+            continue;
+        }
         let Some(role) = auth_doc.roles.get_mut(&role_id) else {
             continue;
         };
@@ -2000,7 +2048,7 @@ fn overlay_realm_authorization_reducer_materialization(
     }
 }
 
-fn group_role_user_assignment_from_path(path: &str) -> Option<(aruna_core::types::RoleId, UserId)> {
+fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("group.roles.")?;
     let (role_id, user_id) = path.split_once(".assigned_users.")?;
     Some((
@@ -2009,7 +2057,7 @@ fn group_role_user_assignment_from_path(path: &str) -> Option<(aruna_core::types
     ))
 }
 
-fn realm_role_user_assignment_from_path(path: &str) -> Option<(aruna_core::types::RoleId, UserId)> {
+fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("realm.roles.")?;
     let (role_id, user_id) = path.split_once(".assigned_users.")?;
     Some((
@@ -2307,11 +2355,13 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     }
     if !matches!(
         event.op,
-        AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
+        AdminDocumentOperation::GroupRoleCreated { .. }
+            | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports role user assignment updates".to_string(),
+            "group admin operation sync only supports role creation and role user assignment updates"
+                .to_string(),
         ));
     }
 
@@ -2396,11 +2446,13 @@ async fn apply_realm_authorization_admin_document_operation_to_storage(
     }
     if !matches!(
         event.op,
-        AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
+        AdminDocumentOperation::RealmRoleCreated { .. }
+            | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm admin operation sync only supports role user assignment updates".to_string(),
+            "realm admin operation sync only supports role creation and role user assignment updates"
+                .to_string(),
         ));
     }
 
@@ -2466,6 +2518,11 @@ fn materialize_group_authorization_admin_document_operation(
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
 ) {
+    if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
+        materialize_group_authorization_role(auth_doc, reducer_state, role);
+        return;
+    }
+
     let (role_id, user_id) = match &event.op {
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
@@ -2493,11 +2550,56 @@ fn materialize_group_authorization_admin_document_operation(
     }
 }
 
+fn materialize_group_authorization_role(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role: &AdminDocumentRoleDefinition,
+) {
+    let role_path = group_role_path(&role.role_id);
+    if reducer_state.conflicts.contains_key(&role_path)
+        || !reducer_state
+            .materialized_group_roles()
+            .contains(&role.role_id)
+    {
+        auth_doc.roles.remove(&role.role_id);
+        return;
+    }
+
+    let assigned_users = auth_doc
+        .roles
+        .get(&role.role_id)
+        .map(|role| role.assigned_users.clone())
+        .unwrap_or_default();
+    auth_doc.roles.insert(
+        role.role_id,
+        Role {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+            assigned_users,
+        },
+    );
+    overlay_group_authorization_role_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        role.role_id,
+    );
+}
+
 fn materialize_realm_authorization_admin_document_operation(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
     event: &AdminDocumentEvent,
 ) {
+    if let AdminDocumentOperation::RealmRoleCreated { role } = &event.op {
+        materialize_realm_authorization_role(auth_doc, reducer_state, role);
+        return;
+    }
+
     let (role_id, user_id) = match &event.op {
         AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
@@ -2525,17 +2627,59 @@ fn materialize_realm_authorization_admin_document_operation(
     }
 }
 
-fn group_role_user_assignment_path(
-    role_id: &aruna_core::types::RoleId,
-    user_id: &UserId,
-) -> String {
+fn materialize_realm_authorization_role(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    role: &AdminDocumentRoleDefinition,
+) {
+    let role_path = realm_role_path(&role.role_id);
+    if reducer_state.conflicts.contains_key(&role_path)
+        || !reducer_state
+            .materialized_realm_roles()
+            .contains(&role.role_id)
+    {
+        auth_doc.roles.remove(&role.role_id);
+        return;
+    }
+
+    let assigned_users = auth_doc
+        .roles
+        .get(&role.role_id)
+        .map(|role| role.assigned_users.clone())
+        .unwrap_or_default();
+    auth_doc.roles.insert(
+        role.role_id,
+        Role {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+            assigned_users,
+        },
+    );
+    overlay_realm_authorization_role_assignment_reducer_materialization(
+        auth_doc,
+        reducer_state,
+        role.role_id,
+    );
+}
+
+fn group_role_path(role_id: &RoleId) -> String {
+    format!("group.roles.{role_id}")
+}
+
+fn realm_role_path(role_id: &RoleId) -> String {
+    format!("realm.roles.{role_id}")
+}
+
+fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("group.roles.{role_id}.assigned_users.{user_id}")
 }
 
-fn realm_role_user_assignment_path(
-    role_id: &aruna_core::types::RoleId,
-    user_id: &UserId,
-) -> String {
+fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("realm.roles.{role_id}.assigned_users.{user_id}")
 }
 
@@ -3237,7 +3381,8 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
-        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
+        AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
     use aruna_core::document::DocumentSyncChangeKind;
@@ -3420,6 +3565,19 @@ mod tests {
             name: "member".to_string(),
             permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
             assigned_users: assigned_users.into_iter().collect(),
+        }
+    }
+
+    fn test_admin_role_definition(
+        role_id: Ulid,
+        name: &str,
+        path: &str,
+        permission: Permission,
+    ) -> AdminDocumentRoleDefinition {
+        AdminDocumentRoleDefinition {
+            role_id,
+            name: name.to_string(),
+            permissions: BTreeMap::from([(path.to_string(), permission)]),
         }
     }
 
@@ -4177,6 +4335,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_role_create_admin_operation_bootstraps_auth_doc_and_overlays_assignments() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([12; 32]);
+        let group_id = Ulid::from_parts(31, 1);
+        let role_id = Ulid::from_parts(32, 2);
+        let assigned_user_id = UserId::local(Ulid::from_parts(33, 3), realm_id);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(34, 4), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(35, 5),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                    role_id,
+                    user_id: assigned_user_id,
+                },
+            ),
+        )
+        .await
+        .expect("assignment state applies before role exists");
+        storage_batch_delete_to(
+            &storage,
+            vec![(
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+            )],
+        )
+        .await
+        .expect("transient empty auth doc deletes");
+
+        let role = test_admin_role_definition(
+            role_id,
+            "Group data steward",
+            "/datasets/**",
+            Permission::WRITE,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(36, 6),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::GroupRoleCreated { role },
+            ),
+        )
+        .await
+        .expect("role create applies without pre-existing auth doc");
+
+        let auth_doc = read_group_auth_doc(&storage, group_id).await;
+        let auth_role = &auth_doc.roles[&role_id];
+        assert_eq!(auth_role.name, "Group data steward");
+        assert_eq!(
+            auth_role.permissions,
+            HashMap::from([("/datasets/**".to_string(), Permission::WRITE)])
+        );
+        assert_eq!(auth_role.assigned_users, HashSet::from([assigned_user_id]));
+
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert!(reducer_state.conflicts.is_empty());
+        assert_eq!(
+            reducer_state.materialized_group_roles(),
+            BTreeSet::from([role_id])
+        );
+        assert_eq!(
+            reducer_state.materialized_group_role_user_assignments(),
+            BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
+        );
+    }
+
+    #[tokio::test]
     async fn group_assignment_conflict_resolution_deletes_stale_conflict_and_materializes() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([11; 32]);
@@ -4452,6 +4700,95 @@ mod tests {
                 .get(&assignment_path)
                 .and_then(|version| version.value.clone()),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_role_create_admin_operation_bootstraps_auth_doc_and_overlays_assignments() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([13; 32]);
+        let role_id = Ulid::from_parts(41, 1);
+        let assigned_user_id = UserId::local(Ulid::from_parts(42, 2), realm_id);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(43, 3), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Realm { realm_id };
+        let document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(44, 4),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                    role_id,
+                    user_id: assigned_user_id,
+                },
+            ),
+        )
+        .await
+        .expect("assignment state applies before role exists");
+        storage_batch_delete_to(
+            &storage,
+            vec![(
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+            )],
+        )
+        .await
+        .expect("transient empty auth doc deletes");
+
+        let role = test_admin_role_definition(
+            role_id,
+            "Realm operator",
+            "/realm/admin/**",
+            Permission::WRITE,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(45, 5),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmRoleCreated { role },
+            ),
+        )
+        .await
+        .expect("role create applies without pre-existing auth doc");
+
+        let auth_doc = read_realm_auth_doc(&storage, realm_id).await;
+        let auth_role = &auth_doc.roles[&role_id];
+        assert_eq!(auth_role.name, "Realm operator");
+        assert_eq!(
+            auth_role.permissions,
+            HashMap::from([("/realm/admin/**".to_string(), Permission::WRITE)])
+        );
+        assert_eq!(auth_role.assigned_users, HashSet::from([assigned_user_id]));
+
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert!(reducer_state.conflicts.is_empty());
+        assert_eq!(
+            reducer_state.materialized_realm_roles(),
+            BTreeSet::from([role_id])
+        );
+        assert_eq!(
+            reducer_state.materialized_realm_role_user_assignments(),
+            BTreeMap::from([(role_id, BTreeSet::from([assigned_user_id]))])
         );
     }
 
