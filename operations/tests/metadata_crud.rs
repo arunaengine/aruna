@@ -6,13 +6,15 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_create_event_write_entry, metadata_document_key, metadata_event_log_prefix,
-    metadata_graph_lifecycle_write_entry, metadata_registry_key, metadata_registry_write_entries,
+    metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
+    metadata_document_key, metadata_event_log_prefix, metadata_graph_lifecycle_write_entry,
+    metadata_pending_projection_key, metadata_registry_key, metadata_registry_write_entries,
 };
 use aruna_core::structs::{Actor, MetadataRegistryRecord, RealmId};
 use aruna_net::{NetConfig, NetHandle};
@@ -28,8 +30,8 @@ use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
-    project_metadata_create_event_from_log, project_metadata_create_events,
-    replay_metadata_event_log, schedule_metadata_projection_retry,
+    drain_pending_metadata_projection_queue, project_metadata_create_event_from_log,
+    project_metadata_create_events, replay_metadata_event_log, schedule_metadata_projection_retry,
 };
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
@@ -369,6 +371,69 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
 }
 
 #[tokio::test]
+async fn pending_projection_marker_recovers_event_log_only_create()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/pending-marker-recovery",
+        "Pending Marker Recovery Dataset",
+    );
+    write_pending_create_event(&test, &create_event).await?;
+    assert!(pending_projection_marker_exists(&test, document_id, create_event.event_id).await?);
+
+    let drained = drain_pending_metadata_projection_queue(test.context.as_ref()).await?;
+
+    assert_eq!(drained.markers_examined, 1);
+    assert_eq!(drained.projected, 1);
+    assert!(!drained.has_more);
+    assert!(!pending_projection_marker_exists(&test, document_id, create_event.event_id).await?);
+    let listed = drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(listed, vec![record]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn targeted_projection_deletes_pending_projection_marker()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/pending-marker-delete",
+        "Pending Marker Delete Dataset",
+    );
+    write_pending_create_event(&test, &create_event).await?;
+
+    project_metadata_create_event_from_log(
+        test.context.as_ref(),
+        document_id,
+        create_event.event_id,
+    )
+    .await?;
+
+    assert!(!pending_projection_marker_exists(&test, document_id, create_event.event_id).await?);
+    let listed = drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(listed, vec![record]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn projection_queue_replay_is_idempotent_for_already_projected_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
@@ -630,6 +695,46 @@ async fn write_create_event(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         other => Err(format!("unexpected create event write result: {other:?}").into()),
+    }
+}
+
+async fn write_pending_create_event(
+    test: &TestContext,
+    create_event: &MetadataCreateEventRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writes = metadata_create_event_and_pending_projection_write_entries(create_event)?;
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected pending create event write result: {other:?}").into()),
+    }
+}
+
+async fn pending_projection_marker_exists(
+    test: &TestContext,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key: metadata_pending_projection_key(document_id, event_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected pending projection marker read: {other:?}").into()),
     }
 }
 

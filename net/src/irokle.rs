@@ -20,7 +20,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     document_sync_revision_key, document_sync_revision_write_entry,
-    metadata_create_event_write_entry, metadata_document_lifecycle_key,
+    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
     metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
     metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
     metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
@@ -1844,10 +1844,10 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     }
 
     let mut entries = match record {
-        MetadataDocumentLifecycleRecord::Upsert { event } => vec![
-            metadata_create_event_write_entry(event)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        ],
+        MetadataDocumentLifecycleRecord::Upsert { event } => {
+            metadata_create_event_and_pending_projection_write_entries(event)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        }
         MetadataDocumentLifecycleRecord::Delete { event } => {
             metadata_document_delete_write_entries(event)?
         }

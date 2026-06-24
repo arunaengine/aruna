@@ -7,6 +7,7 @@ pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
+pub const METADATA_PENDING_PROJECTION_KEYSPACE: &str = "metadata_pending_projection";
 pub const METADATA_DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecycle";
 pub const METADATA_GRAPH_LIFECYCLE_KEYSPACE: &str = "metadata_graph_lifecycle";
 pub const METADATA_GRAPH_PRUNE_JOB_KEYSPACE: &str = "metadata_graph_prune_jobs";

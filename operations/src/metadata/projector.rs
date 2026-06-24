@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
@@ -17,6 +17,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
+    metadata_pending_projection_delete_entry, metadata_pending_projection_target,
     metadata_registry_delete_entries,
 };
 use aruna_core::structs::{
@@ -41,7 +42,15 @@ use crate::sync_placement::{complete_authoritative_holders, sort_node_ids};
 use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
+const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
 pub const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingMetadataProjectionDrainResult {
+    pub markers_examined: usize,
+    pub projected: usize,
+    pub has_more: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum MetadataProjectionError {
@@ -140,6 +149,50 @@ pub async fn replay_metadata_event_log(
     }
 }
 
+pub async fn drain_pending_metadata_projection_queue(
+    context: &DriverContext,
+) -> Result<PendingMetadataProjectionDrainResult, MetadataProjectionError> {
+    let page = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: PENDING_PROJECTION_PAGE_SIZE,
+            txn_id: None,
+        })
+        .await;
+    let (values, next_start_after) = match page {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => (values, next_start_after),
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+
+    let mut targets = Vec::with_capacity(values.len());
+    for (key, _) in &values {
+        let Some(target) = metadata_pending_projection_target(key.as_ref()) else {
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                "invalid metadata pending projection marker key".to_string(),
+            ));
+        };
+        targets.push(target);
+    }
+    let markers_examined = targets.len();
+    let projected = project_metadata_create_events_from_log(context, targets).await?;
+    Ok(PendingMetadataProjectionDrainResult {
+        markers_examined,
+        projected,
+        has_more: next_start_after.is_some(),
+    })
+}
+
 pub async fn project_metadata_create_event_from_log(
     context: &DriverContext,
     document_id: Ulid,
@@ -233,12 +286,14 @@ pub async fn project_metadata_create_events(
     let mut repair_deletes = Vec::new();
     let mut repaired_records = Vec::new();
     let mut outboxes = Vec::new();
+    let mut pending_projection_delete_targets = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
 
     for event in events {
         let document_id = event.record.document_id;
+        pending_projection_delete_targets.insert((document_id, event.event_id));
         if metadata_graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache)
             .await?
         {
@@ -410,8 +465,38 @@ pub async fn project_metadata_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
+    delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
 
     Ok(projected)
+}
+
+async fn delete_pending_projection_markers(
+    context: &DriverContext,
+    targets: BTreeSet<(Ulid, Ulid)>,
+) -> Result<(), MetadataProjectionError> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let deletes = targets
+        .into_iter()
+        .map(|(document_id, event_id)| {
+            metadata_pending_projection_delete_entry(document_id, event_id)
+        })
+        .collect();
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 async fn expand_create_event_holders_cached(

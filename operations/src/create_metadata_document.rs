@@ -302,7 +302,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 }
             }
             CreateMetadataDocumentState::AppendCreateEvent => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(record) = self.record.clone() else {
                         return self
                             .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
@@ -357,13 +357,16 @@ mod tests {
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE};
+    use aruna_core::keyspaces::{
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+        METADATA_PENDING_PROJECTION_KEYSPACE,
+    };
     use aruna_core::metadata::{
         MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
         MetadataEvent, MetadataRequestDurability,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::storage_entries::metadata_event_log_prefix;
+    use aruna_core::storage_entries::{metadata_event_log_prefix, metadata_pending_projection_key};
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::{GroupId, Key};
     use ulid::Ulid;
@@ -426,19 +429,15 @@ mod tests {
     }
 
     fn assert_create_event_append(effects: &[Effect], document_id: Ulid, actor: &Actor) -> Key {
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id,
-            }),
-        ] = effects
-        else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects else {
             panic!("expected metadata create event append");
         };
-        assert_eq!(key_space, METADATA_EVENT_LOG_KEYSPACE);
         assert_eq!(txn_id, &None);
+        assert_eq!(writes.len(), 2);
+        let (_, key, value) = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
+            .expect("event log write exists");
         assert!(
             key.as_ref()
                 .starts_with(metadata_event_log_prefix(document_id).as_ref())
@@ -454,6 +453,16 @@ mod tests {
             event.payload,
             MetadataCreateEventPayload::Scaffold { .. }
         ));
+
+        let (_, marker_key, marker_value) = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == METADATA_PENDING_PROJECTION_KEYSPACE)
+            .expect("pending projection marker write exists");
+        assert_eq!(
+            marker_key,
+            &metadata_pending_projection_key(document_id, event.event_id)
+        );
+        assert!(marker_value.as_ref().is_empty());
 
         key.clone()
     }
@@ -502,8 +511,8 @@ mod tests {
             Some(&vec![actor.node_id])
         );
 
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: create_event_key,
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
         }));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
@@ -532,8 +541,8 @@ mod tests {
         assert_validation_effect(operation.start().as_slice(), document_id);
         let effects = operation.step(validation_result(document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: create_event_key,
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
         }));
 
         assert!(effects.is_empty());

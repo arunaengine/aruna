@@ -13,12 +13,13 @@ use aruna_core::metadata::{
     MetadataMaterializationStatusRecord,
 };
 pub use aruna_core::storage_entries::{
-    metadata_create_event_write_entry, metadata_document_key,
-    metadata_document_lifecycle_revision_write_entry, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
-    metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
+    metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
+    metadata_document_key, metadata_document_lifecycle_revision_write_entry,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_materialization_document_job_write_entry,
+    metadata_materialization_job_key, metadata_materialization_job_write_entry,
+    metadata_materialization_status_key, metadata_materialization_status_write_entry,
+    metadata_registry_key, metadata_registry_prefix,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -220,11 +221,8 @@ pub fn write_metadata_event_effect(
     event: &MetadataCreateEventRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = metadata_create_event_write_entry(event)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes: metadata_create_event_and_pending_projection_write_entries(event)?,
         txn_id,
     }))
 }

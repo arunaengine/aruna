@@ -28,8 +28,9 @@ use crate::metadata::materialization_queue::{
     restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
-    project_metadata_create_events_from_log, replay_metadata_event_log,
+    METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
+    project_metadata_create_events, project_metadata_create_events_from_log,
+    replay_metadata_event_log,
 };
 use crate::metadata::prune_queue::{
     METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER,
@@ -443,13 +444,33 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_metadata_projection_queue(&self) {
-        if let Err(error) = replay_metadata_event_log(&self.context).await {
-            warn!(error = ?error, "Failed to drain metadata projection queue");
-            self.reschedule_timer(
-                TaskKey::DrainMetadataProjectionQueue,
-                METADATA_PROJECTION_RETRY_AFTER,
-            )
-            .await;
+        match drain_pending_metadata_projection_queue(&self.context).await {
+            Ok(result) if result.has_more => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataProjectionQueue,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            }
+            Ok(result) if result.markers_examined == 0 => {
+                if let Err(error) = replay_metadata_event_log(&self.context).await {
+                    warn!(error = ?error, "Failed to replay metadata event log fallback");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataProjectionQueue,
+                        METADATA_PROJECTION_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = ?error, "Failed to drain metadata projection queue");
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataProjectionQueue,
+                    METADATA_PROJECTION_RETRY_AFTER,
+                )
+                .await;
+            }
         }
     }
 }

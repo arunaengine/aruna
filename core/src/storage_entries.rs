@@ -15,7 +15,8 @@ use crate::keyspaces::{
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -102,6 +103,21 @@ pub fn metadata_event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
     ByteView::from(bytes)
+}
+
+pub fn metadata_pending_projection_key(document_id: Ulid, event_id: Ulid) -> Key {
+    metadata_event_log_key(document_id, event_id)
+}
+
+pub fn metadata_pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
+    if key.len() != 32 {
+        return None;
+    }
+    let mut document_id = [0u8; 16];
+    document_id.copy_from_slice(&key[..16]);
+    let mut event_id = [0u8; 16];
+    event_id.copy_from_slice(&key[16..]);
+    Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
 }
 
 pub fn document_sync_revision_key(target: &DocumentSyncTarget) -> Key {
@@ -193,6 +209,35 @@ pub fn metadata_create_event_write_entry(
         metadata_event_log_key(event.record.document_id, event.event_id),
         postcard::to_allocvec(event)?.into(),
     ))
+}
+
+pub fn metadata_pending_projection_write_entry(
+    event: &MetadataCreateEventRecord,
+) -> (KeySpace, Key, Value) {
+    (
+        METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+        metadata_pending_projection_key(event.record.document_id, event.event_id),
+        ByteView::from(Vec::new()),
+    )
+}
+
+pub fn metadata_pending_projection_delete_entry(
+    document_id: Ulid,
+    event_id: Ulid,
+) -> (KeySpace, Key) {
+    (
+        METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+        metadata_pending_projection_key(document_id, event_id),
+    )
+}
+
+pub fn metadata_create_event_and_pending_projection_write_entries(
+    event: &MetadataCreateEventRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    Ok(vec![
+        metadata_create_event_write_entry(event)?,
+        metadata_pending_projection_write_entry(event),
+    ])
 }
 
 pub fn metadata_graph_lifecycle_write_entry(
