@@ -25,7 +25,10 @@ pub mod types;
 pub mod user_id;
 pub mod util;
 
-pub use document::{DocumentSyncEvent, DocumentSyncTarget, IrokleEffect, IrokleEvent};
+pub use document::{
+    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
+    DocumentSyncRevision, DocumentSyncTarget, IrokleEffect, IrokleEvent,
+};
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use metadata::*;

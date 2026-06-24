@@ -3,12 +3,14 @@ use ulid::Ulid;
 
 use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
 use crate::admin_documents::AdminDocumentTarget;
+use crate::document::{DocumentSyncChange, DocumentSyncTarget};
 use crate::errors::ConversionError;
 use crate::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
@@ -96,6 +98,16 @@ pub fn metadata_event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn document_sync_revision_key(target: &DocumentSyncTarget) -> Key {
+    let storage_key = target.storage_key();
+    let keyspace = target.storage_keyspace().as_bytes();
+    let mut bytes = Vec::with_capacity(keyspace.len() + 1 + storage_key.as_ref().len());
+    bytes.extend_from_slice(keyspace);
+    bytes.push(0);
+    bytes.extend_from_slice(storage_key.as_ref());
     ByteView::from(bytes)
 }
 
@@ -197,6 +209,17 @@ pub fn metadata_document_lifecycle_write_entry(
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
         metadata_document_lifecycle_key(record.document_id()),
         postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn document_sync_revision_write_entry(
+    target: &DocumentSyncTarget,
+    change: &DocumentSyncChange,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        document_sync_revision_key(target),
+        postcard::to_allocvec(change)?.into(),
     ))
 }
 
@@ -362,14 +385,21 @@ mod tests {
     use super::{
         admin_document_conflict_write_entries, admin_document_reducer_conflict_key,
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
-        admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+        admin_document_reducer_state_write_entry, document_sync_revision_key,
+        document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
     };
     use crate::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
         AdminDocumentReducerState,
     };
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
-    use crate::keyspaces::{ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE};
+    use crate::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    };
+    use crate::keyspaces::{
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE,
+    };
     use crate::structs::RealmId;
     use crate::{NodeId, UserId};
 
@@ -396,6 +426,15 @@ mod tests {
             event_id: Ulid::from_bytes([seed; 16]),
             origin_node_id: node(seed),
             origin_seq: u64::from(seed),
+        }
+    }
+
+    fn revision(seed: u8, generation: u64) -> DocumentSyncRevision {
+        DocumentSyncRevision {
+            generation,
+            event_id: Ulid::from_bytes([seed; 16]),
+            actor: node(seed),
+            updated_at_ms: u64::from(seed),
         }
     }
 
@@ -442,6 +481,38 @@ mod tests {
         assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
         assert_eq!(key, admin_document_reducer_state_key(&target));
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn document_sync_revision_write_entry_roundtrips() {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let base = revision(1, 1);
+        let change = DocumentSyncChange {
+            base: Some(base),
+            current: revision(2, 2),
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        let (keyspace, key, value) = document_sync_revision_write_entry(&target, &change).unwrap();
+        let decoded: DocumentSyncChange = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(key, document_sync_revision_key(&target));
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn document_sync_revision_keys_include_primary_keyspace() {
+        let group_id = Ulid::from_bytes([4; 16]);
+        let group = DocumentSyncTarget::Group { group_id };
+        let auth = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        assert_ne!(
+            document_sync_revision_key(&group),
+            document_sync_revision_key(&auth)
+        );
     }
 
     #[test]

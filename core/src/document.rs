@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -74,6 +76,35 @@ pub enum DocumentSyncOutboxEvent {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DocumentSyncRevision {
+    pub generation: u64,
+    pub event_id: Ulid,
+    pub actor: NodeId,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSyncChange {
+    pub base: Option<DocumentSyncRevision>,
+    pub current: DocumentSyncRevision,
+    pub kind: DocumentSyncChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentSyncChangeKind {
+    Upsert,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentSyncApplyDecision {
+    Apply,
+    SkipStale,
+    SkipTombstoned,
+    Conflict,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentSyncPublish {
     Upsert {
@@ -114,6 +145,46 @@ impl DocumentSyncOutboxEvent {
             Self::Upsert { .. } => b"upsert",
             Self::Delete => b"delete",
         }
+    }
+}
+
+pub fn compare_document_sync_revisions(
+    local: &DocumentSyncRevision,
+    remote: &DocumentSyncRevision,
+) -> Ordering {
+    local.cmp(remote)
+}
+
+pub fn document_sync_apply_decision(
+    local: Option<&DocumentSyncChange>,
+    incoming: &DocumentSyncChange,
+) -> DocumentSyncApplyDecision {
+    let Some(local) = local else {
+        return DocumentSyncApplyDecision::Apply;
+    };
+
+    if incoming.current == local.current {
+        return if incoming.kind == local.kind {
+            DocumentSyncApplyDecision::Apply
+        } else {
+            DocumentSyncApplyDecision::Conflict
+        };
+    }
+
+    if local.kind == DocumentSyncChangeKind::Delete
+        && incoming.kind == DocumentSyncChangeKind::Upsert
+        && incoming.base.as_ref() != Some(&local.current)
+    {
+        return DocumentSyncApplyDecision::SkipTombstoned;
+    }
+
+    match incoming.current.generation.cmp(&local.current.generation) {
+        Ordering::Less => DocumentSyncApplyDecision::SkipStale,
+        Ordering::Equal => DocumentSyncApplyDecision::Conflict,
+        Ordering::Greater if incoming.base.as_ref() == Some(&local.current) => {
+            DocumentSyncApplyDecision::Apply
+        }
+        Ordering::Greater => DocumentSyncApplyDecision::Conflict,
     }
 }
 
@@ -298,7 +369,14 @@ pub enum IrokleEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentSyncEvent, DocumentSyncTarget};
+    use std::cmp::Ordering;
+
+    use super::{
+        DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
+        DocumentSyncRevision, DocumentSyncTarget, compare_document_sync_revisions,
+        document_sync_apply_decision,
+    };
+    use crate::NodeId;
     use crate::TopicId;
     use crate::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -312,6 +390,33 @@ mod tests {
 
     fn test_ulid(seed: u8) -> Ulid {
         Ulid::from_bytes([seed; 16])
+    }
+
+    fn test_node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn revision(generation: u64, event_seed: u8, actor_seed: u8) -> DocumentSyncRevision {
+        DocumentSyncRevision {
+            generation,
+            event_id: test_ulid(event_seed),
+            actor: test_node(actor_seed),
+            updated_at_ms: u64::from(event_seed),
+        }
+    }
+
+    fn change(
+        kind: DocumentSyncChangeKind,
+        base: Option<DocumentSyncRevision>,
+        generation: u64,
+        event_seed: u8,
+        actor_seed: u8,
+    ) -> DocumentSyncChange {
+        DocumentSyncChange {
+            base,
+            current: revision(generation, event_seed, actor_seed),
+            kind,
+        }
     }
 
     fn test_realm(seed: u8) -> RealmId {
@@ -522,6 +627,82 @@ mod tests {
     #[test]
     fn document_sync_event_type_id_is_stable() {
         assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+    }
+
+    #[test]
+    fn document_sync_revision_comparator_is_stable() {
+        let older = revision(1, 9, 1);
+        let newer = revision(2, 1, 1);
+        let same_generation_a = revision(2, 1, 1);
+        let same_generation_b = revision(2, 2, 1);
+
+        assert_eq!(
+            compare_document_sync_revisions(&older, &newer),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_document_sync_revisions(&newer, &older),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_document_sync_revisions(&newer, &same_generation_a),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_document_sync_revisions(&same_generation_a, &same_generation_b),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn document_sync_apply_decision_applies_new_and_successor_changes() {
+        let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
+        let incoming = change(DocumentSyncChangeKind::Upsert, Some(local.current), 2, 2, 1);
+
+        assert_eq!(
+            document_sync_apply_decision(None, &local),
+            DocumentSyncApplyDecision::Apply
+        );
+        assert_eq!(
+            document_sync_apply_decision(Some(&local), &incoming),
+            DocumentSyncApplyDecision::Apply
+        );
+        assert_eq!(
+            document_sync_apply_decision(Some(&local), &local),
+            DocumentSyncApplyDecision::Apply
+        );
+    }
+
+    #[test]
+    fn document_sync_apply_decision_skips_stale_and_tombstoned_changes() {
+        let stale = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
+        let newer = change(DocumentSyncChangeKind::Upsert, Some(stale.current), 2, 2, 1);
+        let tombstone = change(DocumentSyncChangeKind::Delete, Some(stale.current), 2, 3, 1);
+
+        assert_eq!(
+            document_sync_apply_decision(Some(&newer), &stale),
+            DocumentSyncApplyDecision::SkipStale
+        );
+        assert_eq!(
+            document_sync_apply_decision(Some(&tombstone), &stale),
+            DocumentSyncApplyDecision::SkipTombstoned
+        );
+    }
+
+    #[test]
+    fn document_sync_apply_decision_conflicts_on_unobserved_changes() {
+        let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
+        let same_generation = change(DocumentSyncChangeKind::Upsert, None, 1, 2, 2);
+        let unobserved_newer = change(DocumentSyncChangeKind::Delete, None, 2, 3, 2);
+
+        assert_eq!(
+            document_sync_apply_decision(Some(&local), &same_generation),
+            DocumentSyncApplyDecision::Conflict
+        );
+        assert_eq!(
+            document_sync_apply_decision(Some(&local), &unobserved_newer),
+            DocumentSyncApplyDecision::Conflict
+        );
     }
 
     #[test]
