@@ -1702,8 +1702,7 @@ impl IrokleService {
             document_id,
         } = target
         {
-            return self
-                .storage_batch_delete(metadata_registry_delete_entries(group_id, document_id))
+            return apply_metadata_registry_delete_to_storage(&self.storage, group_id, document_id)
                 .await;
         }
         if let DocumentSyncTarget::User { user_id } = target {
@@ -1828,17 +1827,36 @@ async fn apply_metadata_document_lifecycle_to_storage(
     storage_batch_write_to(storage, writes).await?;
     if let MetadataDocumentLifecycleRecord::Delete { event } = record {
         if event.tombstone.is_deleted() {
-            storage_batch_delete_to(
+            apply_metadata_registry_delete_to_storage(
                 storage,
-                metadata_registry_delete_entries(
-                    event.tombstone.group_id,
-                    event.tombstone.document_id,
-                ),
+                event.tombstone.group_id,
+                event.tombstone.document_id,
             )
             .await?;
         }
     }
     Ok(true)
+}
+
+async fn apply_metadata_registry_delete_to_storage(
+    storage: &StorageHandle,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> Result<()> {
+    let Some(delete) = metadata_document_delete_in_storage(storage, document_id).await? else {
+        return Ok(());
+    };
+    if delete.tombstone.is_deleted()
+        && delete.tombstone.group_id == group_id
+        && delete.tombstone.document_id == document_id
+    {
+        storage_batch_delete_to(
+            storage,
+            metadata_registry_delete_entries(group_id, document_id),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn apply_admin_document_operation_to_storage(
@@ -3343,6 +3361,113 @@ mod tests {
         assert_eq!(primary, local);
         assert_eq!(document_index, local);
         assert_eq!(holders, local.holder_node_ids);
+    }
+
+    #[tokio::test]
+    async fn metadata_registry_delete_skips_without_lifecycle_tombstone() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(30, 1);
+        let document_id = Ulid::from_parts(31, 1);
+        let record = registry_record(
+            group_id,
+            document_id,
+            "datasets/kept",
+            100,
+            Ulid::from_parts(32, 1),
+        );
+        write_registry_record(&storage, &record).await;
+
+        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+            .await
+            .expect("registry delete skips without tombstone");
+
+        let primary = read_registry_record(
+            &storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await;
+        let document_index = read_registry_record(
+            &storage,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            metadata_document_key(document_id),
+        )
+        .await;
+        let holder_value = read_storage_value(
+            &storage,
+            METADATA_HOLDERS_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .expect("holder index exists");
+        let holders: Vec<NodeId> = postcard::from_bytes(&holder_value).expect("holders decode");
+
+        assert_eq!(primary, record);
+        assert_eq!(document_index, record);
+        assert_eq!(holders, record.holder_node_ids);
+    }
+
+    #[tokio::test]
+    async fn metadata_registry_delete_with_matching_lifecycle_tombstone_deletes_indexes() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(40, 1);
+        let document_id = Ulid::from_parts(41, 1);
+        let record = registry_record(
+            group_id,
+            document_id,
+            "datasets/deleted",
+            100,
+            Ulid::from_parts(42, 1),
+        );
+        write_registry_record(&storage, &record).await;
+        let lifecycle = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(43, 1),
+            record.last_event_id,
+        );
+        storage_batch_write_to(
+            &storage,
+            vec![
+                metadata_document_lifecycle_write_entry(&lifecycle)
+                    .expect("lifecycle entry builds"),
+            ],
+        )
+        .await
+        .expect("lifecycle tombstone writes");
+
+        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+            .await
+            .expect("registry delete applies with tombstone");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_INDEX_KEYSPACE,
+                metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_DOCUMENT_INDEX_KEYSPACE,
+                metadata_document_key(document_id),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_HOLDERS_KEYSPACE,
+                metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
