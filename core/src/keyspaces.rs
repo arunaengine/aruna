@@ -14,6 +14,8 @@ pub const METADATA_MATERIALIZATION_STATUS_KEYSPACE: &str = "metadata_materializa
 pub const METADATA_MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
 pub const METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE: &str =
     "metadata_materialization_document_jobs";
+pub const ADMIN_DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
+pub const ADMIN_DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const IROKLE_APPLIED_OPS_KEYSPACE: &str = "irokle_applied_ops";
 pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";

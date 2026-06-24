@@ -1,8 +1,11 @@
 use byteview::ByteView;
 use ulid::Ulid;
 
+use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
+use crate::admin_documents::AdminDocumentTarget;
 use crate::errors::ConversionError;
 use crate::keyspaces::{
+    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
     METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
     METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -119,6 +122,47 @@ pub fn metadata_materialization_job_key(record: &MetadataMaterializationJobRecor
     ByteView::from(bytes)
 }
 
+pub fn admin_document_target_key(target: &AdminDocumentTarget) -> Key {
+    ByteView::from(admin_document_target_key_bytes(target))
+}
+
+pub fn admin_document_reducer_state_key(target: &AdminDocumentTarget) -> Key {
+    admin_document_target_key(target)
+}
+
+pub fn admin_document_reducer_conflict_prefix(target: &AdminDocumentTarget) -> Key {
+    admin_document_target_key(target)
+}
+
+pub fn admin_document_reducer_conflict_key(target: &AdminDocumentTarget, path: &str) -> Key {
+    let mut bytes = admin_document_target_key_bytes(target);
+    bytes.extend_from_slice(path.as_bytes());
+    ByteView::from(bytes)
+}
+
+fn admin_document_target_key_bytes(target: &AdminDocumentTarget) -> Vec<u8> {
+    match target {
+        AdminDocumentTarget::Group { group_id } => {
+            let mut bytes = Vec::with_capacity(17);
+            bytes.push(b'g');
+            bytes.extend_from_slice(&group_id.to_bytes());
+            bytes
+        }
+        AdminDocumentTarget::Realm { realm_id } => {
+            let mut bytes = Vec::with_capacity(33);
+            bytes.push(b'r');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes
+        }
+        AdminDocumentTarget::User { user_id } => {
+            let mut bytes = Vec::with_capacity(49);
+            bytes.push(b'u');
+            bytes.extend_from_slice(&user_id.to_storage_key());
+            bytes
+        }
+    }
+}
+
 pub fn metadata_graph_prune_job_key(record: &MetadataGraphPruneJobRecord) -> Key {
     let mut bytes = Vec::with_capacity(40);
     bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
@@ -196,6 +240,77 @@ pub fn metadata_graph_prune_job_write_entry(
     ))
 }
 
+pub fn admin_document_reducer_state_write_entry(
+    state: &AdminDocumentReducerState,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&state.target),
+        postcard::to_allocvec(state)?.into(),
+    ))
+}
+
+pub fn admin_document_reducer_state_delete_entry(target: &AdminDocumentTarget) -> (KeySpace, Key) {
+    (
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(target),
+    )
+}
+
+pub fn admin_document_conflict_write_entry(
+    target: &AdminDocumentTarget,
+    conflict: &AdminDocumentConflict,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        admin_document_reducer_conflict_key(target, &conflict.path),
+        postcard::to_allocvec(conflict)?.into(),
+    ))
+}
+
+pub fn admin_document_conflict_write_entries(
+    state: &AdminDocumentReducerState,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    state
+        .conflicts
+        .values()
+        .map(|conflict| admin_document_conflict_write_entry(&state.target, conflict))
+        .collect()
+}
+
+pub fn admin_document_conflict_delete_entry(
+    target: &AdminDocumentTarget,
+    path: &str,
+) -> (KeySpace, Key) {
+    (
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        admin_document_reducer_conflict_key(target, path),
+    )
+}
+
+pub fn stale_admin_document_conflict_delete_entries(
+    previous: Option<&AdminDocumentReducerState>,
+    current: Option<&AdminDocumentReducerState>,
+) -> Vec<(KeySpace, Key)> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    let current_conflicts = current
+        .filter(|state| state.target == previous.target)
+        .map(|state| &state.conflicts);
+
+    previous
+        .conflicts
+        .keys()
+        .filter(|path| {
+            current_conflicts
+                .map(|conflicts| !conflicts.contains_key(*path))
+                .unwrap_or(true)
+        })
+        .map(|path| admin_document_conflict_delete_entry(&previous.target, path))
+        .collect()
+}
+
 pub fn metadata_registry_write_entries(
     record: &MetadataRegistryRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
@@ -236,4 +351,178 @@ pub fn metadata_registry_delete_entries(
             metadata_registry_key(group_id, document_id),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ulid::Ulid;
+
+    use super::{
+        admin_document_conflict_write_entries, admin_document_reducer_conflict_key,
+        admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
+        admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    };
+    use crate::admin_document_reducer::{
+        AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
+        AdminDocumentReducerState,
+    };
+    use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
+    use crate::keyspaces::{ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE};
+    use crate::structs::RealmId;
+    use crate::{NodeId, UserId};
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm_id(seed: u8) -> RealmId {
+        RealmId::from_bytes([seed; 32])
+    }
+
+    fn user_id(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), realm_id(seed + 1))
+    }
+
+    fn user_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::User {
+            user_id: user_id(seed),
+        }
+    }
+
+    fn dot(seed: u8) -> AdminDocumentDot {
+        AdminDocumentDot {
+            event_id: Ulid::from_bytes([seed; 16]),
+            origin_node_id: node(seed),
+            origin_seq: u64::from(seed),
+        }
+    }
+
+    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminDocumentConflict {
+        AdminDocumentConflict {
+            path: path.to_string(),
+            values: vec![
+                AdminDocumentConflictValue {
+                    value: Some(format!("value-{first_seed}")),
+                    dot: dot(first_seed),
+                },
+                AdminDocumentConflictValue {
+                    value: Some(format!("value-{second_seed}")),
+                    dot: dot(second_seed),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn admin_document_reducer_state_write_entry_roundtrips() {
+        let target = user_target(8);
+        let attr_dot = dot(1);
+        let state = AdminDocumentReducerState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
+            applied_event_ids: BTreeSet::from([attr_dot.event_id]),
+            user_attributes: BTreeMap::from([(
+                "department".to_string(),
+                AdminDocumentAttributeVersion {
+                    value: Some("biology".to_string()),
+                    dot: attr_dot,
+                },
+            )]),
+            conflicts: BTreeMap::from([(
+                "user.attributes.title".to_string(),
+                conflict("user.attributes.title", 2, 3),
+            )]),
+        };
+
+        let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
+        let decoded: AdminDocumentReducerState = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(key, admin_document_reducer_state_key(&target));
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn admin_document_conflict_entries_are_scoped_by_target_prefix() {
+        let target = user_target(8);
+        let other_target = user_target(9);
+        let state = AdminDocumentReducerState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default(),
+            applied_event_ids: BTreeSet::new(),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::from([
+                (
+                    "user.attributes.department".to_string(),
+                    conflict("user.attributes.department", 1, 2),
+                ),
+                (
+                    "user.attributes.title".to_string(),
+                    conflict("user.attributes.title", 3, 4),
+                ),
+            ]),
+        };
+
+        let entries = admin_document_conflict_write_entries(&state).unwrap();
+        let prefix = admin_document_reducer_conflict_prefix(&target);
+        let other_prefix = admin_document_reducer_conflict_prefix(&other_target);
+
+        assert_eq!(entries.len(), 2);
+        for (keyspace, key, value) in entries {
+            let decoded: AdminDocumentConflict = postcard::from_bytes(value.as_ref()).unwrap();
+
+            assert_eq!(keyspace, ADMIN_DOCUMENT_CONFLICT_KEYSPACE);
+            assert!(key.as_ref().starts_with(prefix.as_ref()));
+            assert!(!key.as_ref().starts_with(other_prefix.as_ref()));
+            assert_eq!(
+                &key.as_ref()[prefix.as_ref().len()..],
+                decoded.path.as_bytes()
+            );
+            assert_eq!(
+                key,
+                admin_document_reducer_conflict_key(&target, &decoded.path)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_admin_document_conflict_delete_entries_remove_only_missing_paths() {
+        let target = user_target(8);
+        let previous = AdminDocumentReducerState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default(),
+            applied_event_ids: BTreeSet::new(),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::from([
+                (
+                    "user.attributes.department".to_string(),
+                    conflict("user.attributes.department", 1, 2),
+                ),
+                (
+                    "user.attributes.title".to_string(),
+                    conflict("user.attributes.title", 3, 4),
+                ),
+            ]),
+        };
+        let current = AdminDocumentReducerState {
+            conflicts: BTreeMap::from([(
+                "user.attributes.title".to_string(),
+                conflict("user.attributes.title", 3, 4),
+            )]),
+            ..previous.clone()
+        };
+
+        let deletes = stale_admin_document_conflict_delete_entries(Some(&previous), Some(&current));
+
+        assert_eq!(
+            deletes,
+            vec![(
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                admin_document_reducer_conflict_key(&target, "user.attributes.department"),
+            )]
+        );
+        assert!(stale_admin_document_conflict_delete_entries(None, Some(&current)).is_empty());
+    }
 }
