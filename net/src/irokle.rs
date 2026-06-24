@@ -1936,7 +1936,50 @@ fn overlay_group_authorization_reducer_materialization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
+    overlay_group_authorization_role_reducer_materialization(auth_doc, reducer_state);
     overlay_group_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
+}
+
+fn overlay_group_authorization_role_reducer_materialization(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+) {
+    for path in reducer_state.conflicts.keys() {
+        if let Some(role_id) = group_role_from_path(path) {
+            auth_doc.roles.remove(&role_id);
+        }
+    }
+
+    for (path, version) in &reducer_state.user_subject_ids {
+        let Some(role_id) = group_role_from_path(path) else {
+            continue;
+        };
+        if reducer_state.conflicts.contains_key(path) {
+            auth_doc.roles.remove(&role_id);
+            continue;
+        }
+        let Some(role) = version
+            .value
+            .as_deref()
+            .and_then(|value| reducer_role_definition(value, role_id))
+        else {
+            continue;
+        };
+        let assigned_users = auth_doc
+            .roles
+            .get(&role_id)
+            .map(|role| role.assigned_users.clone())
+            .unwrap_or_default();
+        auth_doc.roles.insert(
+            role_id,
+            Role {
+                role_id,
+                name: role.name,
+                permissions: role.permissions.into_iter().collect(),
+                assigned_users,
+            },
+        );
+    }
 }
 
 fn overlay_group_authorization_role_assignment_reducer_materialization(
@@ -1994,7 +2037,50 @@ fn overlay_realm_authorization_reducer_materialization(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
+    overlay_realm_authorization_role_reducer_materialization(auth_doc, reducer_state);
     overlay_realm_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
+}
+
+fn overlay_realm_authorization_role_reducer_materialization(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+) {
+    for path in reducer_state.conflicts.keys() {
+        if let Some(role_id) = realm_role_from_path(path) {
+            auth_doc.roles.remove(&role_id);
+        }
+    }
+
+    for (path, version) in &reducer_state.user_subject_ids {
+        let Some(role_id) = realm_role_from_path(path) else {
+            continue;
+        };
+        if reducer_state.conflicts.contains_key(path) {
+            auth_doc.roles.remove(&role_id);
+            continue;
+        }
+        let Some(role) = version
+            .value
+            .as_deref()
+            .and_then(|value| reducer_role_definition(value, role_id))
+        else {
+            continue;
+        };
+        let assigned_users = auth_doc
+            .roles
+            .get(&role_id)
+            .map(|role| role.assigned_users.clone())
+            .unwrap_or_default();
+        auth_doc.roles.insert(
+            role_id,
+            Role {
+                role_id,
+                name: role.name,
+                permissions: role.permissions.into_iter().collect(),
+                assigned_users,
+            },
+        );
+    }
 }
 
 fn overlay_realm_authorization_role_assignment_reducer_materialization(
@@ -2064,6 +2150,27 @@ fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> 
         Ulid::from_string(role_id).ok()?,
         UserId::from_string(user_id).ok()?,
     ))
+}
+
+fn group_role_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("group.roles.")?;
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+    Ulid::from_string(role_id).ok()
+}
+
+fn realm_role_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("realm.roles.")?;
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+    Ulid::from_string(role_id).ok()
+}
+
+fn reducer_role_definition(value: &str, role_id: RoleId) -> Option<AdminDocumentRoleDefinition> {
+    let role = serde_json::from_str::<AdminDocumentRoleDefinition>(value).ok()?;
+    (role.role_id == role_id).then_some(role)
 }
 
 fn admin_document_target_for_legacy_upsert(
@@ -4001,6 +4108,288 @@ mod tests {
             read_realm_auth_doc(&storage, bootstrap_realm_id).await,
             bootstrap
         );
+    }
+
+    #[tokio::test]
+    async fn late_legacy_group_auth_upsert_keeps_reducer_role_body_and_drops_conflicted_role() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([25; 32]);
+        let group_id = Ulid::from_parts(130, 1);
+        let role_id = Ulid::from_parts(131, 1);
+        let conflicted_role_id = Ulid::from_parts(132, 1);
+        let assigned_user_id = UserId::local(Ulid::from_parts(133, 1), realm_id);
+        let legacy_user_id = UserId::local(Ulid::from_parts(134, 1), realm_id);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(135, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        let reducer_role = test_admin_role_definition(
+            role_id,
+            "Reduced group role",
+            "/group/reduced/**",
+            Permission::WRITE,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(136, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupRoleCreated { role: reducer_role },
+            ),
+        )
+        .await
+        .expect("group role create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(137, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                    role_id,
+                    user_id: assigned_user_id,
+                },
+            ),
+        )
+        .await
+        .expect("group assignment applies");
+
+        let conflict_actor_a = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(138, 1), realm_id),
+            realm_id,
+        );
+        let conflict_actor_b = test_actor(
+            10,
+            UserId::local(Ulid::from_parts(139, 1), realm_id),
+            realm_id,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(140, 1),
+                target.clone(),
+                &conflict_actor_a,
+                1,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: test_admin_role_definition(
+                        conflicted_role_id,
+                        "First conflicted group role",
+                        "/group/conflict-a/**",
+                        Permission::READ,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("first group conflict role applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(141, 1),
+                target.clone(),
+                &conflict_actor_b,
+                1,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: test_admin_role_definition(
+                        conflicted_role_id,
+                        "Second conflicted group role",
+                        "/group/conflict-b/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("second group conflict role applies");
+
+        let mut legacy_role = test_role(role_id, [legacy_user_id]);
+        legacy_role.name = "legacy group role".to_string();
+        legacy_role.permissions =
+            HashMap::from([("/group/legacy/**".to_string(), Permission::READ)]);
+        let mut legacy_conflicted_role = test_role(conflicted_role_id, [legacy_user_id]);
+        legacy_conflicted_role.name = "legacy conflicted group role".to_string();
+        let late_legacy = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([
+                (role_id, legacy_role),
+                (conflicted_role_id, legacy_conflicted_role),
+            ]),
+        };
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            document_target,
+            late_legacy
+                .to_bytes(&actor)
+                .expect("legacy group auth serializes"),
+        )
+        .await
+        .expect("late legacy group auth upsert merges with reducer state");
+
+        let merged = read_group_auth_doc(&storage, group_id).await;
+        let merged_role = &merged.roles[&role_id];
+        assert_eq!(merged_role.name, "Reduced group role");
+        assert_eq!(
+            merged_role.permissions,
+            HashMap::from([("/group/reduced/**".to_string(), Permission::WRITE)])
+        );
+        assert_eq!(
+            merged_role.assigned_users,
+            HashSet::from([legacy_user_id, assigned_user_id])
+        );
+        assert!(!merged.roles.contains_key(&conflicted_role_id));
+    }
+
+    #[tokio::test]
+    async fn late_legacy_realm_auth_upsert_keeps_reducer_role_body_and_drops_conflicted_role() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([26; 32]);
+        let role_id = Ulid::from_parts(142, 1);
+        let conflicted_role_id = Ulid::from_parts(143, 1);
+        let assigned_user_id = UserId::local(Ulid::from_parts(144, 1), realm_id);
+        let legacy_user_id = UserId::local(Ulid::from_parts(145, 1), realm_id);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(146, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Realm { realm_id };
+        let document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+
+        let reducer_role = test_admin_role_definition(
+            role_id,
+            "Reduced realm role",
+            "/realm/reduced/**",
+            Permission::WRITE,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(147, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmRoleCreated { role: reducer_role },
+            ),
+        )
+        .await
+        .expect("realm role create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(148, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                    role_id,
+                    user_id: assigned_user_id,
+                },
+            ),
+        )
+        .await
+        .expect("realm assignment applies");
+
+        let conflict_actor_a = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(149, 1), realm_id),
+            realm_id,
+        );
+        let conflict_actor_b = test_actor(
+            10,
+            UserId::local(Ulid::from_parts(150, 1), realm_id),
+            realm_id,
+        );
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(151, 1),
+                target.clone(),
+                &conflict_actor_a,
+                1,
+                AdminDocumentOperation::RealmRoleCreated {
+                    role: test_admin_role_definition(
+                        conflicted_role_id,
+                        "First conflicted realm role",
+                        "/realm/conflict-a/**",
+                        Permission::READ,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("first realm conflict role applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(152, 1),
+                target.clone(),
+                &conflict_actor_b,
+                1,
+                AdminDocumentOperation::RealmRoleCreated {
+                    role: test_admin_role_definition(
+                        conflicted_role_id,
+                        "Second conflicted realm role",
+                        "/realm/conflict-b/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("second realm conflict role applies");
+
+        let mut legacy_role = test_role(role_id, [legacy_user_id]);
+        legacy_role.name = "legacy realm role".to_string();
+        legacy_role.permissions =
+            HashMap::from([("/realm/legacy/**".to_string(), Permission::READ)]);
+        let mut legacy_conflicted_role = test_role(conflicted_role_id, [legacy_user_id]);
+        legacy_conflicted_role.name = "legacy conflicted realm role".to_string();
+        let late_legacy = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([
+                (role_id, legacy_role),
+                (conflicted_role_id, legacy_conflicted_role),
+            ]),
+            operation_restrictions: Default::default(),
+        };
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            document_target,
+            late_legacy
+                .to_bytes(&actor)
+                .expect("legacy realm auth serializes"),
+        )
+        .await
+        .expect("late legacy realm auth upsert merges with reducer state");
+
+        let merged = read_realm_auth_doc(&storage, realm_id).await;
+        let merged_role = &merged.roles[&role_id];
+        assert_eq!(merged_role.name, "Reduced realm role");
+        assert_eq!(
+            merged_role.permissions,
+            HashMap::from([("/realm/reduced/**".to_string(), Permission::WRITE)])
+        );
+        assert_eq!(
+            merged_role.assigned_users,
+            HashSet::from([legacy_user_id, assigned_user_id])
+        );
+        assert!(!merged.roles.contains_key(&conflicted_role_id));
     }
 
     #[tokio::test]

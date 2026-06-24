@@ -389,6 +389,7 @@ dependencies = [
  "postcard",
  "rand 0.10.1",
  "serde",
+ "serde_json",
  "smallvec",
  "tempfile",
  "thiserror",
