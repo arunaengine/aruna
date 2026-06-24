@@ -456,14 +456,8 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                self.emit_announce_group_doc(group, auth_doc)
-            }
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                self.fail(AddGroupRoleError::TopicAnnouncement(format!(
-                    "admin document outbox drain scheduling failed: {message}"
-                )))
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_group_doc(group, auth_doc),
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",

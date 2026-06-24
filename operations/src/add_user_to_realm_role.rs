@@ -414,12 +414,8 @@ impl AddUserToRealmRolesOperation {
         auth_doc: RealmAuthorizationDocument,
     ) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_announce_auth_doc(auth_doc),
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                self.fail(AddUserToRealmRolesError::TopicAnnouncement(format!(
-                    "admin document outbox drain scheduling failed: {message}"
-                )))
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_auth_doc(auth_doc),
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",

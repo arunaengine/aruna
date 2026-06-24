@@ -397,12 +397,8 @@ impl AddRealmRoleOperation {
         auth_doc: RealmAuthorizationDocument,
     ) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_announce_auth_doc(auth_doc),
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                self.fail(AddRealmRoleError::TopicAnnouncement(format!(
-                    "admin document outbox drain scheduling failed: {message}"
-                )))
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_auth_doc(auth_doc),
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
@@ -943,6 +939,56 @@ pub mod test {
                 auth_doc: expected_auth_doc,
             }
         );
+    }
+
+    #[test]
+    pub fn outbox_drain_scheduling_error_still_announces_auth_doc() {
+        let realm_id = aruna_core::structs::RealmId([6u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+        let role = Role {
+            role_id: Ulid::from_bytes([9u8; 16]),
+            name: "test_role".to_string(),
+            permissions: HashMap::from([(format!("/{realm_id}/admin"), Permission::WRITE)]),
+            assigned_users: HashSet::from([user_id]),
+        };
+        let auth_doc = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(role.role_id, role.clone())]),
+            operation_restrictions: HashMap::new(),
+        };
+        let mut operation = AddRealmRoleOperation::new(AddRealmRoleConfig {
+            actor,
+            realm_id,
+            role,
+        });
+        operation.state = AddRealmRoleState::ScheduleAdminDocumentOutboxDrain {
+            auth_doc: auth_doc.clone(),
+        };
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            message: "schedule failed".to_string(),
+        }));
+
+        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+        assert_eq!(
+            operation.state,
+            AddRealmRoleState::AnnounceAuthDoc {
+                auth_doc: auth_doc.clone(),
+            }
+        );
+
+        let effects = operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::DocumentSyncResult { result: Ok(()) },
+        ));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize().unwrap(), auth_doc);
     }
 
     fn conflict_dot(seed: u8, origin_seq: u64) -> AdminDocumentDot {

@@ -318,12 +318,8 @@ impl RegisterOrGetOidcUserOperation {
 
     fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_announce(user),
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                self.fail(RegisterOrGetOidcUserError::TopicAnnouncement(format!(
-                    "admin document outbox drain scheduling failed: {message}"
-                )))
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce(user),
             other => self.unexpected_event(
                 "admin document outbox drain timer schedule",
                 format!("{other:?}"),
