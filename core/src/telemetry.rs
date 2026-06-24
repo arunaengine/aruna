@@ -419,6 +419,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duration_ms_saturates_at_u64_max() {
+        assert_eq!(duration_ms(Duration::from_millis(42)), 42);
+        assert_eq!(duration_ms(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
     fn histogram_percentiles_use_bucket_bounds_capped_by_max() {
         let mut histogram = LatencyHistogram::default();
         for _ in 0..99 {

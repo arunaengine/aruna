@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::telemetry::{LatencyAggregator, record_stage};
+use aruna_core::telemetry::{LatencyAggregator, duration_ms, record_stage};
 use aruna_core::util::prefix_upper_bound;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -1787,10 +1787,6 @@ fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::IterResult { .. } => "iter_result",
         StorageEvent::Error { .. } => "error",
     }
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn iterate_page<R: Readable>(
