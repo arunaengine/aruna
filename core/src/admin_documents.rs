@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{Actor, RealmId};
+use crate::structs::{Actor, Permission, RealmId, Role};
 use crate::types::{GroupId, RoleId, UserId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,8 +50,36 @@ pub enum AdminDocumentTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDocumentRoleDefinition {
+    pub role_id: RoleId,
+    pub name: String,
+    pub permissions: BTreeMap<String, Permission>,
+}
+
+impl From<&Role> for AdminDocumentRoleDefinition {
+    fn from(role: &Role) -> Self {
+        Self {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl From<Role> for AdminDocumentRoleDefinition {
+    fn from(role: Role) -> Self {
+        Self::from(&role)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentOperation {
     GroupRoleAdded { role_id: RoleId },
+    GroupRoleCreated { role: AdminDocumentRoleDefinition },
     GroupRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
     GroupRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
     UserAttributeSet { key: String, value: String },
@@ -60,6 +88,7 @@ pub enum AdminDocumentOperation {
     UserSubjectIdAdded { subject_id: String },
     UserSubjectIdRemoved { subject_id: String },
     RealmRoleAdded { role_id: RoleId },
+    RealmRoleCreated { role: AdminDocumentRoleDefinition },
     RealmRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
     RealmRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
 }

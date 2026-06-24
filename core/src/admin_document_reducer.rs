@@ -6,7 +6,7 @@ use ulid::Ulid;
 
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
-    AdminDocumentTarget,
+    AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -97,6 +97,12 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupRoleCreated { role },
+            ) => {
+                self.apply_group_role(event, &role.role_id, Some(role_definition_value(role)));
+            }
+            (
+                AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
             ) => {
                 self.apply_group_role_user_assignment(
@@ -117,6 +123,12 @@ impl AdminDocumentReducerState {
                 AdminDocumentOperation::RealmRoleAdded { role_id },
             ) => {
                 self.apply_realm_role(event, role_id, Some(role_id.to_string()));
+            }
+            (
+                AdminDocumentTarget::Realm { .. },
+                AdminDocumentOperation::RealmRoleCreated { role },
+            ) => {
+                self.apply_realm_role(event, &role.role_id, Some(role_definition_value(role)));
             }
             (
                 AdminDocumentTarget::Realm { .. },
@@ -488,6 +500,10 @@ fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> boo
         || (event.origin_node_id == dot.origin_node_id && event.origin_seq > dot.origin_seq)
 }
 
+fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
+    serde_json::to_string(role).expect("admin document role definition serializes")
+}
+
 fn user_attribute_path(key: &str) -> String {
     format!("user.attributes.{key}")
 }
@@ -550,12 +566,13 @@ fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
 mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
-        USER_NAME_PATH,
+        USER_NAME_PATH, role_definition_value,
     };
     use crate::admin_documents::{
-        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+        AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
+        AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
-    use crate::structs::{Actor, RealmId};
+    use crate::structs::{Actor, Permission, RealmId};
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
@@ -576,6 +593,17 @@ mod tests {
 
     fn role_id(seed: u8) -> RoleId {
         Ulid::from_bytes([seed; 16])
+    }
+
+    fn role_definition(role_id: RoleId, name: &str) -> AdminDocumentRoleDefinition {
+        AdminDocumentRoleDefinition {
+            role_id,
+            name: name.to_string(),
+            permissions: BTreeMap::from([
+                ("/dataset/**".to_string(), Permission::READ),
+                ("/project/admin/**".to_string(), Permission::WRITE),
+            ]),
+        }
     }
 
     fn user_id_with_seed(seed: u8) -> UserId {
@@ -727,6 +755,20 @@ mod tests {
         )
     }
 
+    fn create_group_role(
+        event_seed: u8,
+        origin_seed: u8,
+        role: AdminDocumentRoleDefinition,
+    ) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleCreated { role },
+        )
+    }
+
     fn assign_group_role_user(
         event_seed: u8,
         origin_seed: u8,
@@ -764,6 +806,20 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmRoleAdded { role_id },
+        )
+    }
+
+    fn create_realm_role(
+        event_seed: u8,
+        origin_seed: u8,
+        role: AdminDocumentRoleDefinition,
+    ) -> AdminDocumentEvent {
+        realm_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmRoleCreated { role },
         )
     }
 
@@ -1099,6 +1155,78 @@ mod tests {
         assert_eq!(
             state.materialized_group_role_user_assignments(),
             BTreeMap::from([(role_id, BTreeSet::from([user_id]))])
+        );
+    }
+
+    #[test]
+    fn group_role_body_creation_materializes_role_id_and_records_body() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let role = role_definition(role_id, "Group admin");
+        let expected_value = role_definition_value(&role);
+
+        state.apply(&create_group_role(1, 1, role)).unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state
+                .user_subject_ids
+                .get(&format!("group.roles.{role_id}"))
+                .and_then(|version| version.value.as_deref()),
+            Some(expected_value.as_str())
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_role_body_creation_materializes_role_id_and_records_body() {
+        let mut state = realm_state();
+        let role_id = role_id(3);
+        let role = role_definition(role_id, "Realm admin");
+        let expected_value = role_definition_value(&role);
+
+        state.apply(&create_realm_role(1, 1, role)).unwrap();
+
+        assert_eq!(state.materialized_realm_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state
+                .user_subject_ids
+                .get(&format!("realm.roles.{role_id}"))
+                .and_then(|version| version.value.as_deref()),
+            Some(expected_value.as_str())
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn same_role_conflicting_body_recording() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let first = role_definition(role_id, "Group reader");
+        let second = role_definition(role_id, "Group writer");
+        let first_value = role_definition_value(&first);
+        let second_value = role_definition_value(&second);
+
+        state.apply(&create_group_role(1, 1, first)).unwrap();
+        state.apply(&create_group_role(2, 2, second)).unwrap();
+
+        assert!(state.materialized_group_roles().is_empty());
+        let conflict = state
+            .conflicts
+            .get(&format!("group.roles.{role_id}"))
+            .expect("conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(second_value.as_str()))
         );
     }
 
