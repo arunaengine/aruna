@@ -33,7 +33,7 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
     subject_index_writes,
 };
-use aruna_core::structs::{MetadataRegistryRecord, User};
+use aruna_core::structs::{GroupAuthorizationDocument, MetadataRegistryRecord, User};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
@@ -1527,7 +1527,7 @@ impl IrokleService {
             }
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
             DocumentSyncEvent::AdminOperation { target, event } => {
-                apply_user_admin_document_operation_to_storage(&self.storage, target, *event).await
+                apply_admin_document_operation_to_storage(&self.storage, target, *event).await
             }
         }
     }
@@ -1841,6 +1841,29 @@ async fn apply_metadata_document_lifecycle_to_storage(
     Ok(true)
 }
 
+async fn apply_admin_document_operation_to_storage(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    match (&document_target, &event.target) {
+        (DocumentSyncTarget::User { .. }, AdminDocumentTarget::User { .. }) => {
+            apply_user_admin_document_operation_to_storage(storage, document_target, event).await
+        }
+        (DocumentSyncTarget::GroupAuthorization { .. }, AdminDocumentTarget::Group { .. }) => {
+            apply_group_authorization_admin_document_operation_to_storage(
+                storage,
+                document_target,
+                event,
+            )
+            .await
+        }
+        _ => Err(NetError::Bootstrap(
+            "admin document operation target does not match document sync target".to_string(),
+        )),
+    }
+}
+
 async fn apply_user_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
@@ -1934,6 +1957,137 @@ async fn apply_user_admin_document_operation_to_storage(
         storage_batch_delete_to(storage, stale_conflict_deletes).await?;
     }
     storage_batch_write_to(storage, writes).await
+}
+
+async fn apply_group_authorization_admin_document_operation_to_storage(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let DocumentSyncTarget::GroupAuthorization { group_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "group admin operation sync only supports group authorization targets".to_string(),
+        ));
+    };
+    let AdminDocumentTarget::Group {
+        group_id: event_group_id,
+    } = event.target.clone()
+    else {
+        return Err(NetError::Bootstrap(
+            "admin document operation payload target is not a group".to_string(),
+        ));
+    };
+    if event_group_id != group_id {
+        return Err(NetError::Bootstrap(format!(
+            "replicated group admin operation target {group_id} does not match payload group id {event_group_id}"
+        )));
+    }
+    if !matches!(
+        event.op,
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
+            | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+    ) {
+        return Err(NetError::Bootstrap(
+            "group admin operation sync only supports role user assignment updates".to_string(),
+        ));
+    }
+
+    let previous_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&event.target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut reducer_state = previous_state
+        .clone()
+        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    let apply_status = reducer_state
+        .apply(&event)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if apply_status != AdminDocumentApplyStatus::Applied {
+        return Ok(());
+    }
+
+    let previous_auth_doc = storage_read_from(
+        storage,
+        document_target.storage_keyspace().to_string(),
+        document_target.storage_key(),
+    )
+    .await?
+    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut auth_doc = previous_auth_doc.unwrap_or_else(|| GroupAuthorizationDocument {
+        group_id,
+        roles: Default::default(),
+    });
+    materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
+
+    let mut writes = vec![
+        (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            auth_doc
+                .to_bytes(&event.actor)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        admin_document_reducer_state_write_entry(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    writes.extend(
+        admin_document_conflict_write_entries(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+
+    let stale_conflict_deletes =
+        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
+    if !stale_conflict_deletes.is_empty() {
+        storage_batch_delete_to(storage, stale_conflict_deletes).await?;
+    }
+    storage_batch_write_to(storage, writes).await
+}
+
+fn materialize_group_authorization_admin_document_operation(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    event: &AdminDocumentEvent,
+) {
+    let (role_id, user_id) = match &event.op {
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+            (role_id, user_id)
+        }
+        _ => return,
+    };
+    let path = group_role_user_assignment_path(role_id, user_id);
+    if reducer_state.conflicts.contains_key(&path) {
+        return;
+    }
+    let Some(role) = auth_doc.roles.get_mut(role_id) else {
+        return;
+    };
+    let assigned = reducer_state
+        .user_subject_ids
+        .get(&path)
+        .and_then(|version| version.value.as_deref())
+        .and_then(|value| UserId::from_string(value).ok())
+        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
+    if assigned {
+        role.assigned_users.insert(*user_id);
+    } else {
+        role.assigned_users.remove(user_id);
+    }
+}
+
+fn group_role_user_assignment_path(
+    role_id: &aruna_core::types::RoleId,
+    user_id: &UserId,
+) -> String {
+    format!("group.roles.{role_id}.assigned_users.{user_id}")
 }
 
 fn materialize_user_admin_document_operation(
@@ -2532,7 +2686,7 @@ mod tests {
     use aruna_core::alpn::Alpn;
     use aruna_core::document::DocumentSyncChangeKind;
     use aruna_core::keyspaces::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+        ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
         METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
         METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
         METADATA_INDEX_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
@@ -2542,8 +2696,8 @@ mod tests {
         admin_document_reducer_state_key, metadata_document_key, metadata_event_log_key,
         metadata_registry_key, subject_index_key, subject_index_value,
     };
-    use aruna_core::structs::{Actor, RealmId};
-    use std::collections::{BTreeMap, HashMap};
+    use aruna_core::structs::{Actor, GroupAuthorizationDocument, Permission, RealmId, Role};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
     use tempfile::TempDir;
 
@@ -2829,6 +2983,144 @@ mod tests {
             )
             .await,
             Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn group_assignment_admin_operation_materializes_auth_doc_and_reducer_state() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([9; 32]);
+        let group_id = Ulid::from_parts(1, 1);
+        let role_id = Ulid::from_parts(2, 2);
+        let assigned_user_id = UserId::local(Ulid::from_parts(3, 3), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id: UserId::local(Ulid::from_parts(4, 4), realm_id),
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "member".to_string(),
+                    permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
+                    assigned_users: HashSet::new(),
+                },
+            )]),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                AUTH_KEYSPACE.to_string(),
+                group_id.to_bytes().into(),
+                auth_doc
+                    .to_bytes(&actor)
+                    .expect("auth doc serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("auth doc writes");
+
+        let add_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(5, 5),
+            target: AdminDocumentTarget::Group { group_id },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: actor.clone(),
+            op: AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                role_id,
+                user_id: assigned_user_id,
+            },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            add_event,
+        )
+        .await
+        .expect("add assignment applies");
+
+        let stored_auth_doc =
+            read_storage_value(&storage, AUTH_KEYSPACE, group_id.to_bytes().into())
+                .await
+                .expect("auth doc exists");
+        let stored_auth_doc =
+            GroupAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+        assert!(
+            stored_auth_doc.roles[&role_id]
+                .assigned_users
+                .contains(&assigned_user_id)
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert!(reducer_state.conflicts.is_empty());
+        let assignment_path = group_role_user_assignment_path(&role_id, &assigned_user_id);
+        assert_eq!(
+            reducer_state
+                .user_subject_ids
+                .get(&assignment_path)
+                .and_then(|version| version.value.clone()),
+            Some(assigned_user_id.to_string())
+        );
+
+        let remove_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(6, 6),
+            target,
+            origin_node_id: actor.node_id,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+                role_id,
+                user_id: assigned_user_id,
+            },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            remove_event,
+        )
+        .await
+        .expect("remove assignment applies");
+
+        let stored_auth_doc =
+            read_storage_value(&storage, AUTH_KEYSPACE, group_id.to_bytes().into())
+                .await
+                .expect("auth doc exists");
+        let stored_auth_doc =
+            GroupAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+        assert!(
+            !stored_auth_doc.roles[&role_id]
+                .assigned_users
+                .contains(&assigned_user_id)
+        );
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&AdminDocumentTarget::Group { group_id }),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state
+                .user_subject_ids
+                .get(&assignment_path)
+                .and_then(|version| version.value.clone()),
+            None
         );
     }
 
