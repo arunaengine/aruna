@@ -584,16 +584,32 @@ impl InboundTaskHandler for OperationsTaskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document_sync_outbox::{outbox_key, read_outbox_record, write_outbox_effect};
-    use aruna_core::document::DocumentSyncOutboxEvent;
+    use crate::document_sync_outbox::{
+        outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
+    };
+    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
+    use aruna_tasks::{InboundTaskHandler, TaskHandle};
+    use async_trait::async_trait;
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
     use ulid::Ulid;
+
+    struct RecordingTaskHandler {
+        seen: mpsc::Sender<TaskKey>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for RecordingTaskHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            let _ = self.seen.send(key).await;
+        }
+    }
 
     fn node(seed: u8) -> aruna_core::NodeId {
         let mut bytes = [0u8; 32];
@@ -628,6 +644,56 @@ mod tests {
         }
     }
 
+    async fn write_outbox_record(
+        storage: &aruna_storage::StorageHandle,
+        record: &DocumentSyncOutboxRecord,
+    ) {
+        match storage
+            .send_effect(write_outbox_effect(record).expect("outbox effect"))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected outbox write event: {other:?}"),
+        }
+    }
+
+    async fn restore_document_sync_outbox_timer_and_receive_key(
+        storage: &aruna_storage::StorageHandle,
+    ) -> TaskKey {
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+
+        restore_document_sync_outbox_timers(storage, &task_handle).await;
+
+        tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("restored drain timer should fire")
+            .expect("recording handler should receive timer key")
+    }
+
+    #[tokio::test]
+    async fn restore_document_sync_outbox_timers_schedules_drain_when_outbox_has_records() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"restore durable work".to_vec(),
+            },
+        );
+        write_outbox_record(&storage, &record).await;
+
+        let restored_key = restore_document_sync_outbox_timer_and_receive_key(&storage).await;
+
+        assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
+    }
+
     #[tokio::test]
     async fn outbox_sync_error_retains_record_for_retry() {
         let temp_dir = tempdir().expect("temp dir");
@@ -651,13 +717,7 @@ mod tests {
         );
         let key = outbox_key(&record).to_vec();
 
-        match storage
-            .send_effect(write_outbox_effect(&record).expect("outbox effect"))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected outbox write event: {other:?}"),
-        }
+        write_outbox_record(&storage, &record).await;
 
         let outcome = handler
             .finish_sync_drain_subbatch(
@@ -676,6 +736,53 @@ mod tests {
             .await
             .expect("outbox record reads");
         assert_eq!(retained, Some(record));
+    }
+
+    #[tokio::test]
+    async fn retained_outbox_record_after_sync_failure_restores_drain_timer() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"retry after restart".to_vec(),
+            },
+        );
+        let key = outbox_key(&record).to_vec();
+        write_outbox_record(&storage, &record).await;
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                vec![key.clone()],
+                Event::Net(NetEvent::Irokle(IrokleEvent::Error {
+                    target: Some(record.target.clone()),
+                    error: "sync failed before all peers acknowledged".to_string(),
+                })),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+        assert!(outcome.retry_needed);
+        assert_eq!(
+            read_outbox_record(&storage, &key)
+                .await
+                .expect("outbox record reads"),
+            Some(record)
+        );
+
+        let restored_key = restore_document_sync_outbox_timer_and_receive_key(&storage).await;
+        assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
     }
 
     #[tokio::test]
