@@ -30,6 +30,7 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_me
 use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -261,7 +262,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let s3_server = S3Server::new(
         &config.s3_address,
         &config.s3_host,
-        driver_ctx,
+        driver_ctx.clone(),
         config.realm_id,
         config.node_id,
     )
@@ -296,5 +297,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    shutdown_runtime(driver_ctx.net_handle.as_ref(), &driver_ctx.storage_handle).await;
+
     Ok(())
+}
+
+async fn shutdown_runtime(net_handle: Option<&NetHandle>, storage_handle: &StorageHandle) {
+    if let Some(net_handle) = net_handle {
+        info!("Shutting down network services");
+        net_handle.shutdown().await;
+    }
+
+    if let Err(error) = storage_handle.sync_all().await {
+        error!(error = %error, "Failed to sync storage during shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use std::thread;
+
+    #[tokio::test]
+    async fn shutdown_runtime_syncs_storage_without_net() {
+        let (storage_handle, receiver) = StorageHandle::new();
+        let worker = thread::spawn(move || {
+            let (effect, response_tx, _span, _queued_at) = receiver
+                .recv()
+                .expect("shutdown should request storage sync_all");
+            assert!(matches!(effect, StorageEffect::SyncAll));
+            response_tx.send(StorageEvent::SyncAllFinished);
+        });
+
+        shutdown_runtime(None, &storage_handle).await;
+
+        worker.join().expect("storage responder should finish");
+    }
 }
