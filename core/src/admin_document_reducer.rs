@@ -8,6 +8,9 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentTarget,
 };
+use crate::user_update_validation::{
+    UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminDocumentApplyStatus {
@@ -22,6 +25,8 @@ pub enum AdminDocumentReducerError {
     TargetMismatch,
     #[error("admin document reducer supports only user targets in this slice")]
     UnsupportedTarget,
+    #[error(transparent)]
+    InvalidUserAttribute(#[from] UserAttributeValidationError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,9 +101,12 @@ impl AdminDocumentReducerState {
                 self.apply_user_subject_id(event, subject_id, None);
             }
             AdminDocumentOperation::UserAttributeSet { key, value } => {
+                validate_user_attribute_key(key)?;
+                validate_user_attribute_value(key, value)?;
                 self.apply_user_attribute(event, key, Some(value.clone()));
             }
             AdminDocumentOperation::UserAttributeRemoved { key } => {
+                validate_user_attribute_key(key)?;
                 self.apply_user_attribute(event, key, None);
             }
         }
@@ -261,11 +269,15 @@ fn user_subject_id_path(subject_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminDocumentApplyStatus, AdminDocumentReducerState, USER_NAME_PATH};
+    use super::{
+        AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
+        USER_NAME_PATH,
+    };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use crate::structs::{Actor, RealmId};
+    use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
     use std::collections::{BTreeMap, BTreeSet};
     use ulid::Ulid;
@@ -382,6 +394,34 @@ mod tests {
             ])
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn invalid_user_attribute_key_is_rejected_without_state_change() {
+        let mut state = user_state();
+        let before = state.clone();
+
+        assert_eq!(
+            state.apply(&set_attr(1, 1, "display name", "biology")),
+            Err(AdminDocumentReducerError::InvalidUserAttribute(
+                UserAttributeValidationError::InvalidKey("display name".to_string())
+            ))
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn invalid_user_attribute_value_is_rejected_without_state_change() {
+        let mut state = user_state();
+        let before = state.clone();
+
+        assert_eq!(
+            state.apply(&set_attr(1, 1, "department", "bio\nmedicine")),
+            Err(AdminDocumentReducerError::InvalidUserAttribute(
+                UserAttributeValidationError::InvalidValue("department".to_string())
+            ))
+        );
+        assert_eq!(state, before);
     }
 
     #[test]

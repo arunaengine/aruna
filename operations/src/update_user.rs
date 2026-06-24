@@ -6,6 +6,10 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmId, User};
 use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::user_update_validation::{
+    UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
+    validate_user_attribute_value,
+};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
@@ -15,9 +19,6 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::replicate_documents::replicate_documents_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
-const MAX_USER_ATTRIBUTES: usize = 128;
-const MAX_ATTRIBUTE_KEY_LEN: usize = 128;
-const MAX_ATTRIBUTE_VALUE_LEN: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateUserInput {
@@ -83,6 +84,16 @@ pub enum UpdateUserError {
     },
     #[error("update user did not finish")]
     NotFinished,
+}
+
+impl From<UserAttributeValidationError> for UpdateUserError {
+    fn from(error: UserAttributeValidationError) -> Self {
+        match error {
+            UserAttributeValidationError::InvalidKey(key) => Self::InvalidAttributeKey(key),
+            UserAttributeValidationError::InvalidValue(key) => Self::InvalidAttributeValue(key),
+            UserAttributeValidationError::TooManyAttributes => Self::TooManyAttributes,
+        }
+    }
 }
 
 impl UpdateUserOperation {
@@ -336,7 +347,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 
     let mut removals = HashSet::new();
     for key in &input.remove_attributes {
-        validate_attribute_key(key)?;
+        validate_user_attribute_key(key)?;
         removals.insert(key.clone());
     }
     for key in removals {
@@ -344,40 +355,19 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
     }
 
     for (key, value) in &input.set_attributes {
-        validate_attribute_key(key)?;
-        validate_attribute_value(key, value)?;
+        validate_user_attribute_key(key)?;
+        validate_user_attribute_value(key, value)?;
         user.attributes.insert(key.clone(), value.clone());
     }
 
-    if user.attributes.len() > MAX_USER_ATTRIBUTES {
-        return Err(UpdateUserError::TooManyAttributes);
-    }
+    validate_user_attribute_count(user.attributes.len())?;
 
-    Ok(())
-}
-
-fn validate_attribute_key(key: &str) -> Result<(), UpdateUserError> {
-    if key.is_empty()
-        || key.len() > MAX_ATTRIBUTE_KEY_LEN
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
-    {
-        return Err(UpdateUserError::InvalidAttributeKey(key.to_string()));
-    }
-    Ok(())
-}
-
-fn validate_attribute_value(key: &str, value: &str) -> Result<(), UpdateUserError> {
-    if value.len() > MAX_ATTRIBUTE_VALUE_LEN || value.chars().any(char::is_control) {
-        return Err(UpdateUserError::InvalidAttributeValue(key.to_string()));
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateUserInput, UpdateUserOperation};
+    use super::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
@@ -488,6 +478,23 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), updated);
+    }
+
+    #[test]
+    fn invalid_attribute_key_uses_update_user_error() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut input = input(realm_id, user_id, user_id);
+        input.remove_attributes = vec!["display name".to_string()];
+        input.set_attributes.clear();
+        let mut user = stored_user(user_id);
+
+        assert_eq!(
+            super::apply_updates(&mut user, &input),
+            Err(UpdateUserError::InvalidAttributeKey(
+                "display name".to_string()
+            ))
+        );
     }
 
     #[test]

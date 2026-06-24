@@ -23,6 +23,7 @@ pub mod telemetry;
 pub mod trace_context;
 pub mod types;
 pub mod user_id;
+pub mod user_update_validation;
 pub mod util;
 
 pub use document::{
