@@ -9,8 +9,8 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult,
-    DocumentSyncTarget, IrokleEvent,
+    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish,
+    DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent, document_sync_apply_decision,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -1572,15 +1572,33 @@ impl IrokleService {
 
     async fn apply_document_event(&self, event: DocumentSyncEvent) -> Result<()> {
         match event {
-            DocumentSyncEvent::Upsert { target, bytes, .. }
-            | DocumentSyncEvent::UpsertWithRevision { target, bytes, .. } => {
+            DocumentSyncEvent::Upsert { target, bytes, .. } => {
                 self.apply_upsert(target, bytes).await
             }
+            DocumentSyncEvent::UpsertWithRevision {
+                target,
+                bytes,
+                change,
+                ..
+            } => self.apply_upsert_with_revision(target, bytes, change).await,
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
             DocumentSyncEvent::AdminOperation { target, event } => {
                 apply_admin_document_operation_to_storage(&self.storage, target, *event).await
             }
         }
+    }
+
+    async fn apply_upsert_with_revision(
+        &self,
+        target: DocumentSyncTarget,
+        bytes: Vec<u8>,
+        change: DocumentSyncChange,
+    ) -> Result<()> {
+        if let DocumentSyncTarget::User { user_id } = target {
+            return apply_revisioned_user_upsert_to_storage(&self.storage, user_id, bytes, change)
+                .await;
+        }
+        self.apply_upsert(target, bytes).await
     }
 
     async fn apply_upsert(&self, target: DocumentSyncTarget, bytes: Vec<u8>) -> Result<()> {
@@ -1939,6 +1957,91 @@ async fn apply_merged_user_upsert_to_storage(
     storage_batch_delete_and_write_transactionally(
         storage,
         stale_subject_index_deletes(previous_user, Some(&user)),
+        writes,
+    )
+    .await
+}
+
+async fn apply_revisioned_user_upsert_to_storage(
+    storage: &StorageHandle,
+    user_id: UserId,
+    bytes: Vec<u8>,
+    change: DocumentSyncChange,
+) -> Result<()> {
+    if change.kind != aruna_core::document::DocumentSyncChangeKind::Upsert {
+        return Err(NetError::Bootstrap(
+            "revisioned user upsert must carry an upsert change".to_string(),
+        ));
+    }
+
+    let target = DocumentSyncTarget::User { user_id };
+    let mut user =
+        User::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if user.user_id != user_id {
+        return Err(NetError::Bootstrap(format!(
+            "replicated user document id {user_id} does not match payload user id {}",
+            user.user_id
+        )));
+    }
+
+    let local_change = storage_read_from(
+        storage,
+        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        document_sync_revision_key(&target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<DocumentSyncChange>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let previous_user = storage_read_from(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let admin_target = AdminDocumentTarget::User { user_id };
+    let reducer_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&admin_target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if let Some(reducer_state) = reducer_state.as_ref()
+        && reducer_state.target != admin_target
+    {
+        return Err(NetError::Bootstrap(
+            "revisioned user upsert reducer state target mismatch".to_string(),
+        ));
+    }
+
+    match document_sync_apply_decision(local_change.as_ref(), &change) {
+        DocumentSyncApplyDecision::Apply => {}
+        DocumentSyncApplyDecision::SkipStale
+        | DocumentSyncApplyDecision::SkipTombstoned
+        | DocumentSyncApplyDecision::Conflict => return Ok(()),
+    }
+
+    let primary_bytes = if let Some(reducer_state) = reducer_state.as_ref() {
+        overlay_user_reducer_materialization(&mut user, reducer_state);
+        postcard::to_allocvec(&user).map_err(|error| NetError::Bootstrap(error.to_string()))?
+    } else {
+        bytes
+    };
+    let mut writes = vec![target_write_entry(target.clone(), primary_bytes.into())];
+    writes.extend(subject_index_writes(&user));
+    writes.push(
+        document_sync_revision_write_entry(&target, &change)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+    storage_batch_delete_and_write_transactionally(
+        storage,
+        stale_subject_index_deletes(previous_user.as_ref(), Some(&user)),
         writes,
     )
     .await
@@ -3677,17 +3780,25 @@ mod tests {
         b"buffered restart contract payload".to_vec()
     }
 
-    fn revision_change() -> DocumentSyncChange {
+    fn revision_change_at(
+        base: Option<DocumentSyncRevision>,
+        generation: u64,
+        seq: u128,
+    ) -> DocumentSyncChange {
         DocumentSyncChange {
-            base: None,
+            base,
             current: DocumentSyncRevision {
-                generation: 1,
-                event_id: Ulid::from_parts(1_727_000_000_001, 43),
-                actor: node(77),
-                updated_at_ms: 1_727_000_000_002,
+                generation,
+                event_id: Ulid::from_parts(1_727_000_000_000 + generation, seq),
+                actor: node((seq % 200) as u8 + 1),
+                updated_at_ms: 1_727_000_000_100 + generation,
             },
             kind: DocumentSyncChangeKind::Upsert,
         }
+    }
+
+    fn revision_change() -> DocumentSyncChange {
+        revision_change_at(None, 1, 43)
     }
 
     async fn restart_endpoint() -> iroh::Endpoint {
@@ -3844,6 +3955,48 @@ mod tests {
             .await
             .expect("user exists");
         User::from_bytes(&value).expect("user decodes")
+    }
+
+    async fn read_user_revision(storage: &StorageHandle, user_id: UserId) -> DocumentSyncChange {
+        let target = DocumentSyncTarget::User { user_id };
+        let value = read_storage_value(
+            storage,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
+            document_sync_revision_key(&target),
+        )
+        .await
+        .expect("user revision exists");
+        postcard::from_bytes(&value).expect("user revision decodes")
+    }
+
+    fn test_user_doc(user_id: UserId, name: &str, subjects: &[&str]) -> User {
+        User {
+            user_id,
+            name: name.to_string(),
+            subject_ids: subjects.iter().map(|subject| subject.to_string()).collect(),
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        }
+    }
+
+    async fn write_user_with_revision(
+        storage: &StorageHandle,
+        user: &User,
+        actor: &Actor,
+        change: &DocumentSyncChange,
+    ) {
+        let target = DocumentSyncTarget::User {
+            user_id: user.user_id,
+        };
+        let mut writes = vec![target_write_entry(
+            target.clone(),
+            user.to_bytes(actor).expect("user serializes").into(),
+        )];
+        writes.extend(subject_index_writes(user));
+        writes.push(document_sync_revision_write_entry(&target, change).expect("revision writes"));
+        storage_batch_write_to(storage, writes)
+            .await
+            .expect("user and revision write");
     }
 
     async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> Group {
@@ -4082,6 +4235,195 @@ mod tests {
             )
             .await,
             Some(subject_index_value(bootstrap_user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn revisioned_user_successor_upsert_applies_and_writes_sidecar() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let user_id = UserId::local(Ulid::from_parts(201, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let local_change = revision_change_at(None, 1, 201);
+        let incoming_change = revision_change_at(Some(local_change.current), 2, 202);
+        let local = test_user_doc(user_id, "Local", &["old-subject"]);
+        write_user_with_revision(&storage, &local, &actor, &local_change).await;
+
+        let incoming = test_user_doc(user_id, "Incoming", &["new-subject"]);
+        apply_revisioned_user_upsert_to_storage(
+            &storage,
+            user_id,
+            incoming.to_bytes(&actor).expect("incoming serializes"),
+            incoming_change,
+        )
+        .await
+        .expect("successor revision applies");
+
+        assert_eq!(read_user_doc(&storage, user_id).await, incoming);
+        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("old-subject")
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("new-subject")
+            )
+            .await,
+            Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn revisioned_user_stale_upsert_skips_without_overwrite() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([32; 32]);
+        let user_id = UserId::local(Ulid::from_parts(202, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let local_change = revision_change_at(None, 2, 203);
+        let stale_change = revision_change_at(None, 1, 204);
+        let local = test_user_doc(user_id, "Local", &["local-subject"]);
+        write_user_with_revision(&storage, &local, &actor, &local_change).await;
+
+        let stale = test_user_doc(user_id, "Stale", &["stale-subject"]);
+        apply_revisioned_user_upsert_to_storage(
+            &storage,
+            user_id,
+            stale.to_bytes(&actor).expect("stale serializes"),
+            stale_change,
+        )
+        .await
+        .expect("stale revision is a successful skip");
+
+        assert_eq!(read_user_doc(&storage, user_id).await, local);
+        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("stale-subject")
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn revisioned_user_unbased_concurrent_upsert_skips_without_overwrite() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([33; 32]);
+        let user_id = UserId::local(Ulid::from_parts(203, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let local_change = revision_change_at(None, 1, 205);
+        let concurrent_change = revision_change_at(None, 2, 206);
+        let local = test_user_doc(user_id, "Local", &["local-subject"]);
+        write_user_with_revision(&storage, &local, &actor, &local_change).await;
+
+        let concurrent = test_user_doc(user_id, "Concurrent", &["concurrent-subject"]);
+        apply_revisioned_user_upsert_to_storage(
+            &storage,
+            user_id,
+            concurrent.to_bytes(&actor).expect("concurrent serializes"),
+            concurrent_change,
+        )
+        .await
+        .expect("conflicting revision is a successful skip");
+
+        assert_eq!(read_user_doc(&storage, user_id).await, local);
+        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("concurrent-subject")
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn revisioned_user_upsert_preserves_reducer_overlay() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([34; 32]);
+        let user_id = UserId::local(Ulid::from_parts(204, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let target = AdminDocumentTarget::User { user_id };
+        for (seq, op) in [
+            (
+                1,
+                AdminDocumentOperation::UserNameSet {
+                    name: "Reduced".to_string(),
+                },
+            ),
+            (
+                2,
+                AdminDocumentOperation::UserSubjectIdAdded {
+                    subject_id: "reduced-subject".to_string(),
+                },
+            ),
+            (
+                3,
+                AdminDocumentOperation::UserAttributeSet {
+                    key: "source".to_string(),
+                    value: "reducer".to_string(),
+                },
+            ),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                DocumentSyncTarget::User { user_id },
+                test_admin_event(
+                    Ulid::from_parts(2_000 + seq, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("admin user operation applies");
+        }
+
+        let mut incoming = test_user_doc(user_id, "Remote", &["remote-subject"]);
+        incoming.attributes = HashMap::from([
+            ("legacy-only".to_string(), "preserved".to_string()),
+            ("source".to_string(), "remote".to_string()),
+        ]);
+        let incoming_change = revision_change_at(None, 1, 207);
+        apply_revisioned_user_upsert_to_storage(
+            &storage,
+            user_id,
+            incoming.to_bytes(&actor).expect("incoming serializes"),
+            incoming_change,
+        )
+        .await
+        .expect("revisioned user upsert applies with reducer overlay");
+
+        let merged = read_user_doc(&storage, user_id).await;
+        assert_eq!(merged.name, "Reduced");
+        assert_eq!(merged.attributes["legacy-only"], "preserved");
+        assert_eq!(merged.attributes["source"], "reducer");
+        assert_eq!(
+            merged.subject_ids.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["remote-subject".to_string(), "reduced-subject".to_string()])
+        );
+        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("reduced-subject")
+            )
+            .await,
+            Some(subject_index_value(user_id))
         );
     }
 
