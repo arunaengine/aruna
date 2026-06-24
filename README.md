@@ -144,6 +144,17 @@ Onboarding only takes effect on a fresh data directory. Once a node has persiste
 
 For a ready-made multi-node onboarding flow, use `just test-deploy` instead of walking through the onboarding APIs manually.
 
+## Durability Configuration
+
+`ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and Irokle metadata state.
+
+| Value | Durability contract |
+| --- | --- |
+| `buffer` (default, alias `buffered`) | Flushes data to OS buffers before local Fjall persistence returns. This keeps write latency low and protects against an application crash, but recently acknowledged writes are not guaranteed after an OS crash or power loss. |
+| `sync_all` (aliases `sync`, `sync-all`, `syncall`) | Flushes data and metadata with `fsync` before local Fjall persistence returns. This gives stronger local crash durability at higher write latency. |
+
+The setting does not change replication, authorization, or RO-Crate semantics. Metadata requests marked `MetadataRequestDurability::WalAlreadyDurable` have already been accepted by the metadata event-log phase, so Craqle/Irokle projection flushes may be deferred. The event-log write and later projection flush still use the configured Fjall mode; `buffer` does not become fsync-durable because a request is WAL-first.
+
 ## License
 
 The API is licensed under either of

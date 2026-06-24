@@ -23,10 +23,20 @@ impl MetadataGraphPolicy {
     }
 }
 
+/// Durability policy for metadata backend mutations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataRequestDurability {
+    /// Persist the metadata backend before acknowledging the request.
+    ///
+    /// The local flush strength is controlled by `ARUNA_FJALL_PERSIST_MODE`:
+    /// `buffer` flushes to OS buffers, while `sync_all` waits for Fjall's
+    /// data-and-metadata fsync path.
     #[default]
     Durable,
+    /// Use when the metadata event has already been accepted by the WAL path.
+    ///
+    /// Craqle/Irokle projection persistence may be deferred, but this does not
+    /// upgrade the WAL write beyond the configured Fjall persist mode.
     WalAlreadyDurable,
 }
 
