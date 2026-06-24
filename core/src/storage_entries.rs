@@ -1,9 +1,12 @@
 use byteview::ByteView;
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
 use crate::admin_documents::AdminDocumentTarget;
-use crate::document::{DocumentSyncChange, DocumentSyncTarget};
+use crate::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+};
 use crate::errors::ConversionError;
 use crate::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -221,6 +224,45 @@ pub fn document_sync_revision_write_entry(
         document_sync_revision_key(target),
         postcard::to_allocvec(change)?.into(),
     ))
+}
+
+pub fn metadata_document_lifecycle_revision_change(
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+) -> DocumentSyncChange {
+    match record {
+        MetadataDocumentLifecycleRecord::Upsert { event } => DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: event.record.updated_at_ms,
+                event_id: event.event_id,
+                actor: event.node_id,
+                updated_at_ms: event.occurred_at_ms,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        },
+        MetadataDocumentLifecycleRecord::Delete { event } => DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: event.tombstone.updated_at_ms,
+                event_id: event.event_id,
+                actor: delete_actor,
+                updated_at_ms: event.tombstone.updated_at_ms,
+            },
+            kind: DocumentSyncChangeKind::Delete,
+        },
+    }
+}
+
+pub fn metadata_document_lifecycle_revision_write_entry(
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: record.document_id(),
+    };
+    let change = metadata_document_lifecycle_revision_change(record, delete_actor);
+    document_sync_revision_write_entry(&target, &change)
 }
 
 pub fn metadata_materialization_status_write_entry(

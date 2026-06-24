@@ -24,8 +24,8 @@ use crate::metadata::prune_queue::{
 };
 use crate::metadata::repository::{
     StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect, write_document_lifecycle_effect,
-    write_graph_lifecycle_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect,
+    write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
 
 #[derive(Debug, PartialEq)]
@@ -326,7 +326,11 @@ impl Operation for DeleteMetadataDocumentOperation {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
                     self.state = DeleteMetadataDocumentState::WriteDocumentLifecycle;
-                    match write_document_lifecycle_effect(document_lifecycle_record, Some(txn_id)) {
+                    match write_document_lifecycle_with_revision_effect(
+                        document_lifecycle_record,
+                        self.actor.node_id,
+                        Some(txn_id),
+                    ) {
                         Ok(effect) => smallvec![effect],
                         Err(error) => {
                             self.fail(DeleteMetadataDocumentError::ConversionError(error))
@@ -339,7 +343,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
             },
             DeleteMetadataDocumentState::WriteDocumentLifecycle => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
@@ -599,7 +603,12 @@ impl Operation for DeleteMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
+    use aruna_core::keyspaces::{
+        DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+    };
+    use aruna_core::storage_entries::document_sync_revision_key;
     use aruna_core::structs::RealmId;
 
     fn actor() -> aruna_core::structs::Actor {
@@ -712,6 +721,7 @@ mod tests {
         let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
+                key,
                 value,
                 txn_id: Some(write_txn_id),
                 ..
@@ -726,6 +736,50 @@ mod tests {
         assert_eq!(job.graph_iri, record.graph_iri);
         assert_eq!(job.attempts, 0);
         assert_eq!(job.last_error, None);
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: key.clone(),
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected document lifecycle revision batch, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+
+        let lifecycle = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                    .expect("lifecycle record decodes")
+            })
+            .expect("lifecycle write exists");
+        let MetadataDocumentLifecycleRecord::Delete { event } = lifecycle else {
+            panic!("expected delete lifecycle record");
+        };
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: record.document_id,
+        };
+        let (revision_key, revision): (_, DocumentSyncChange) = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, key, value)| {
+                (
+                    key,
+                    postcard::from_bytes(value).expect("revision sidecar decodes"),
+                )
+            })
+            .expect("revision sidecar write exists");
+        assert_eq!(revision_key, &document_sync_revision_key(&target));
+        assert_eq!(revision.current.event_id, event.event_id);
+        assert_eq!(revision.current.actor, actor.node_id);
+        assert_eq!(revision.current.generation, event.tombstone.updated_at_ms);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
     }
 
     #[test]

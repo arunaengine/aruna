@@ -1,4 +1,5 @@
-use aruna_core::document::DocumentSyncOutboxRecord;
+use aruna_core::NodeId;
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,11 +14,11 @@ use aruna_core::metadata::{
 };
 pub use aruna_core::storage_entries::{
     metadata_create_event_write_entry, metadata_document_key,
-    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
-    metadata_graph_lifecycle_write_entry, metadata_materialization_document_job_write_entry,
-    metadata_materialization_job_key, metadata_materialization_job_write_entry,
-    metadata_materialization_status_key, metadata_materialization_status_write_entry,
-    metadata_registry_key, metadata_registry_prefix,
+    metadata_document_lifecycle_revision_write_entry, metadata_document_lifecycle_write_entry,
+    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
+    metadata_materialization_job_write_entry, metadata_materialization_status_key,
+    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -176,6 +177,20 @@ pub fn write_document_lifecycle_effect(
     }))
 }
 
+pub fn write_document_lifecycle_with_revision_effect(
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes: vec![
+            metadata_document_lifecycle_write_entry(record)?,
+            metadata_document_lifecycle_revision_write_entry(record, delete_actor)?,
+        ],
+        txn_id,
+    }))
+}
+
 pub fn delete_holders_effect(
     group_id: GroupId,
     document_id: Ulid,
@@ -274,9 +289,31 @@ pub fn create_records_and_outbox_write_entries(
     ];
     if let Some(outbox) = outbox {
         writes.push(crate::document_sync_outbox::outbox_write_entry(outbox)?);
+        if let Some(revision) = document_lifecycle_revision_from_outbox(outbox)? {
+            writes.push(revision);
+        }
     }
 
     Ok(writes)
+}
+
+fn document_lifecycle_revision_from_outbox(
+    outbox: &DocumentSyncOutboxRecord,
+) -> Result<Option<(String, ByteView, ByteView)>, ConversionError> {
+    if !matches!(
+        &outbox.target,
+        DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+    ) {
+        return Ok(None);
+    }
+    let DocumentSyncOutboxEvent::Upsert { bytes } = &outbox.event else {
+        return Ok(None);
+    };
+    let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+    Ok(Some(metadata_document_lifecycle_revision_write_entry(
+        &lifecycle,
+        outbox.node_id,
+    )?))
 }
 
 pub fn write_create_records_outbox_and_materialization_effect(

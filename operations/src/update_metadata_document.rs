@@ -432,14 +432,17 @@ impl Operation for UpdateMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
+        DocumentSyncOutboxRecord,
+    };
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
         METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
         METADATA_MATERIALIZATION_STATUS_KEYSPACE,
     };
-    use aruna_core::storage_entries::metadata_registry_key;
+    use aruna_core::storage_entries::{document_sync_revision_key, metadata_registry_key};
     use aruna_core::structs::{Actor, RealmId};
 
     fn actor() -> Actor {
@@ -561,6 +564,7 @@ mod tests {
             METADATA_DOCUMENT_INDEX_KEYSPACE,
             METADATA_AUDIT_KEYSPACE,
             DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
             METADATA_MATERIALIZATION_STATUS_KEYSPACE,
             METADATA_MATERIALIZATION_JOB_KEYSPACE,
             METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
@@ -594,6 +598,21 @@ mod tests {
             outbox.event,
             DocumentSyncOutboxEvent::Upsert { .. }
         ));
+        let (revision_key, revision): (_, DocumentSyncChange) = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, key, value)| {
+                (
+                    key,
+                    postcard::from_bytes(value).expect("revision sidecar decodes"),
+                )
+            })
+            .expect("revision sidecar write exists");
+        assert_eq!(revision_key, &document_sync_revision_key(&outbox.target));
+        assert_eq!(revision.current.event_id, event.event_id);
+        assert_eq!(revision.current.actor, event.node_id);
+        assert_eq!(revision.current.generation, event.record.updated_at_ms);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
         event
     }
 
