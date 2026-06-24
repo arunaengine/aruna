@@ -232,7 +232,7 @@ pub async fn create_onboarding_secret(
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let record = OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
-        secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+        secret_hash: onboarding_secret.secret_hash(),
         mode: onboarding_secret.mode,
         expires_at,
         claimed_node_id: None,
@@ -347,7 +347,7 @@ pub async fn bootstrap_onboarding(
     let record = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
-            secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+            secret_hash: onboarding_secret.secret_hash(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),
@@ -369,7 +369,7 @@ pub async fn bootstrap_onboarding(
     let record = drive(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
-            secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+            secret_hash: onboarding_secret.secret_hash(),
             node_id: node_id.to_string(),
             now: now_timestamp(),
         }),

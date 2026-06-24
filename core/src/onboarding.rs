@@ -102,6 +102,10 @@ pub enum OnboardingSecretError {
 }
 
 impl OnboardingSecret {
+    pub fn secret_hash(&self) -> String {
+        blake3::hash(&self.secret).to_string()
+    }
+
     pub fn encode(&self) -> Result<String, OnboardingSecretError> {
         let bytes = postcard::to_allocvec(self)?;
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
@@ -222,6 +226,21 @@ mod tests {
         let encoded = secret.encode().unwrap();
         let decoded = OnboardingSecret::decode(&encoded).unwrap();
         assert_eq!(decoded, secret);
+    }
+
+    #[test]
+    fn onboarding_secret_hash_matches_existing_blake3_hex() {
+        let secret = OnboardingSecret {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            enrollment_id: Ulid::new(),
+            secret: [7u8; 32],
+            mode: OnboardingMode::Server,
+        };
+
+        assert_eq!(
+            secret.secret_hash(),
+            blake3::hash(&secret.secret).to_string()
+        );
     }
 
     #[test]

@@ -491,7 +491,7 @@ async fn register_admin(
 ) -> Result<User, ServerError> {
     let onboarding_secret =
         OnboardingSecret::decode(&onboarding_secret).map_err(|_| ServerError::Unauthorized)?;
-    let secret_hash = blake3::hash(&onboarding_secret.secret).to_string();
+    let secret_hash = onboarding_secret.secret_hash();
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
@@ -1293,7 +1293,7 @@ mod tests {
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {
                     enrollment_id: onboarding_secret.enrollment_id,
-                    secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+                    secret_hash: onboarding_secret.secret_hash(),
                     mode: OnboardingMode::Local,
                     expires_at: u64::MAX,
                     claimed_node_id: None,
