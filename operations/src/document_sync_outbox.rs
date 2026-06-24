@@ -246,7 +246,7 @@ mod tests {
 
     fn user_admin_event(user_id: UserId, origin_seq: u64) -> DocumentSyncOutboxEvent {
         DocumentSyncOutboxEvent::AdminOperation {
-            event: AdminDocumentEvent {
+            event: Box::new(AdminDocumentEvent {
                 event_id: Ulid::from_parts(1, u128::from(origin_seq)),
                 target: AdminDocumentTarget::User { user_id },
                 origin_node_id: node(1),
@@ -260,7 +260,7 @@ mod tests {
                 op: AdminDocumentOperation::UserNameSet {
                     name: format!("user-{origin_seq}"),
                 },
-            },
+            }),
         }
     }
 

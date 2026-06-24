@@ -75,7 +75,7 @@ pub struct DocumentSyncOutboxRecord {
 pub enum DocumentSyncOutboxEvent {
     Upsert { bytes: Vec<u8> },
     Delete,
-    AdminOperation { event: AdminDocumentEvent },
+    AdminOperation { event: Box<AdminDocumentEvent> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ pub enum DocumentSyncPublish {
     },
     AdminOperation {
         target: DocumentSyncTarget,
-        event: AdminDocumentEvent,
+        event: Box<AdminDocumentEvent>,
     },
 }
 
@@ -312,7 +312,7 @@ pub enum DocumentSyncEvent {
     },
     AdminOperation {
         target: DocumentSyncTarget,
-        event: AdminDocumentEvent,
+        event: Box<AdminDocumentEvent>,
     },
 }
 

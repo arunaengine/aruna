@@ -1527,7 +1527,7 @@ impl IrokleService {
             }
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
             DocumentSyncEvent::AdminOperation { target, event } => {
-                apply_user_admin_document_operation_to_storage(&self.storage, target, event).await
+                apply_user_admin_document_operation_to_storage(&self.storage, target, *event).await
             }
         }
     }

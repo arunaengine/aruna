@@ -362,7 +362,7 @@ impl UpdateUserOperation {
                 document_target.clone(),
                 Vec::new(),
                 DocumentSyncOutboxEvent::AdminOperation {
-                    event: event.clone(),
+                    event: Box::new(event.clone()),
                 },
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -899,11 +899,11 @@ mod tests {
                 assert!(outbox_records.iter().any(|record| matches!(
                     &record.event,
                     DocumentSyncOutboxEvent::AdminOperation {
-                        event: aruna_core::admin_documents::AdminDocumentEvent {
-                            op: aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. },
-                            ..
-                        }
-                    }
+                        event
+                    } if matches!(
+                        &event.op,
+                        aruna_core::admin_documents::AdminDocumentOperation::UserNameSet { .. }
+                    )
                 )));
                 (
                     User::from_bytes(user_write.2.as_ref()).unwrap(),
