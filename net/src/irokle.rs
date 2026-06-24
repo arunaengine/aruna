@@ -2369,6 +2369,7 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::alpn::Alpn;
     use aruna_core::document::DocumentSyncChangeKind;
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -2381,7 +2382,12 @@ mod tests {
     };
     use aruna_core::structs::RealmId;
     use std::collections::BTreeMap;
+    use std::{env, process::Command};
     use tempfile::TempDir;
+
+    const IROKLE_RESTART_CHILD_PATH_ENV: &str = "ARUNA_NET_IROKLE_RESTART_CHILD_PATH";
+    const IROKLE_RESTART_CHILD_TEST: &str =
+        "irokle::tests::buffered_irokle_publish_restart_child_process";
 
     fn peer(seed: u8) -> PeerId {
         node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
@@ -2403,6 +2409,66 @@ mod tests {
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         (dir, storage)
+    }
+
+    fn storage_at(path: &Path) -> StorageHandle {
+        aruna_storage::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
+            .expect("storage opens")
+    }
+
+    fn restart_target() -> DocumentSyncTarget {
+        DocumentSyncTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([99; 32]),
+        }
+    }
+
+    fn restart_event_id() -> Ulid {
+        Ulid::from_parts(1_727_000_000_000, 42)
+    }
+
+    fn restart_payload() -> Vec<u8> {
+        b"buffered restart contract payload".to_vec()
+    }
+
+    async fn restart_endpoint() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[91; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![Alpn::Irokle.as_bytes().to_vec()])
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind address"),
+            )
+            .expect("endpoint bind address configures")
+            .bind()
+            .await
+            .expect("endpoint binds")
+    }
+
+    async fn open_restart_service(root: &Path, storage_name: &str) -> IrokleService {
+        IrokleService::open_with_persist_policy(
+            restart_endpoint().await,
+            storage_at(&root.join(storage_name)),
+            root.join("irokle"),
+            &[],
+            vec![Alpn::Irokle.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("Irokle service opens")
+    }
+
+    fn run_irokle_restart_child(root: &Path) {
+        let status = Command::new(env::current_exe().expect("test binary path"))
+            .arg(IROKLE_RESTART_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(IROKLE_RESTART_CHILD_PATH_ENV, root)
+            .status()
+            .expect("restart child process should run");
+
+        assert!(status.success(), "restart child process failed: {status}");
     }
 
     fn registry_record(
@@ -2568,6 +2634,63 @@ mod tests {
             actor_clock: irokle_crate::ActorClock::default(),
             actor_tips: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn buffered_irokle_publish_restart_child_process() {
+        let Ok(root) = env::var(IROKLE_RESTART_CHILD_PATH_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        runtime.block_on(async {
+            let service = open_restart_service(&root, "child-storage").await;
+            let target = restart_target();
+            let event = service
+                .publish_document(
+                    restart_event_id(),
+                    target.clone(),
+                    restart_payload(),
+                    Vec::new(),
+                )
+                .await;
+
+            assert_eq!(event, IrokleEvent::DocumentPublished { target });
+        });
+
+        // Skip Rust destructors so the parent verifies the restart contract, not shutdown cleanup.
+        std::process::exit(0);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_irokle_publish_survives_buffered_process_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let target = restart_target();
+
+        run_irokle_restart_child(root);
+
+        let service = open_restart_service(root, "parent-storage").await;
+        let topic = service
+            .node()
+            .open_topic::<DocumentSyncEvent>(target.irokle_topic_id())
+            .expect("published topic reopens after restart");
+        let history = topic
+            .history(HistoryOrder::OldestFirst)
+            .expect("published history reads after restart");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].event,
+            DocumentSyncEvent::Upsert {
+                event_id: restart_event_id(),
+                target,
+                bytes: restart_payload(),
+            }
+        );
+
+        service.shutdown().await;
     }
 
     #[tokio::test]
