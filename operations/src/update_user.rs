@@ -2,14 +2,17 @@ use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumen
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    admin_document_reducer_state_write_entry, document_sync_revision_key,
+    document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmId, User};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
@@ -17,8 +20,9 @@ use aruna_core::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_count, validate_user_attribute_key,
     validate_user_attribute_value,
 };
-use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, USER_KEYSPACE};
+use aruna_core::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
+use chrono::Utc;
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -53,10 +57,10 @@ enum UpdateUserState {
     Init,
     Auth,
     StartTransaction,
-    ReadUserAndAdminState {
+    ReadUserAdminStateAndDocumentRevision {
         txn_id: TxnId,
     },
-    WriteUserAndAdminState {
+    WriteUserAdminStateAndDocumentRevision {
         txn_id: TxnId,
         user: User,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
@@ -218,10 +222,13 @@ impl UpdateUserOperation {
         let Some(target_user_id) = self.target_user_id else {
             return self.fail(UpdateUserError::UserNotFound);
         };
-        let target = AdminDocumentTarget::User {
+        let admin_target = AdminDocumentTarget::User {
             user_id: target_user_id,
         };
-        self.state = UpdateUserState::ReadUserAndAdminState { txn_id };
+        let document_target = DocumentSyncTarget::User {
+            user_id: target_user_id,
+        };
+        self.state = UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
                 (
@@ -230,26 +237,44 @@ impl UpdateUserOperation {
                 ),
                 (
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-                    admin_document_reducer_state_key(&target),
+                    admin_document_reducer_state_key(&admin_target),
+                ),
+                (
+                    DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                    document_sync_revision_key(&document_target),
                 ),
             ],
             txn_id: Some(txn_id),
         })]
     }
 
-    fn handle_read_user_and_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn handle_read_user_admin_state_and_document_revision(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+    ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
-        let [(_, user_value), (_, reducer_state_value)] = values.as_slice() else {
+        let [
+            (_, user_value),
+            (_, reducer_state_value),
+            (_, revision_value),
+        ] = values.as_slice()
+        else {
             return self.unexpected_event(
-                "Event::Storage(StorageEvent::BatchReadResult) with user and admin state values",
+                "Event::Storage(StorageEvent::BatchReadResult) with user, admin state, and document revision values",
                 got,
             );
         };
 
-        match self.emit_write_user(txn_id, user_value.clone(), reducer_state_value.clone()) {
+        match self.emit_write_user(
+            txn_id,
+            user_value.clone(),
+            reducer_state_value.clone(),
+            revision_value.clone(),
+        ) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
         }
@@ -260,6 +285,7 @@ impl UpdateUserOperation {
         txn_id: TxnId,
         user_value: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
+        revision_value: Option<ByteView>,
     ) -> Result<Effects, UpdateUserError> {
         let current = user_value.ok_or(UpdateUserError::UserNotFound)?;
         let mut user = User::from_bytes(&current)?;
@@ -268,7 +294,7 @@ impl UpdateUserOperation {
         }
 
         apply_updates(&mut user, &self.input)?;
-        let target = AdminDocumentTarget::User {
+        let admin_target = AdminDocumentTarget::User {
             user_id: user.user_id,
         };
         let previous_reducer_state = reducer_state_value
@@ -280,14 +306,26 @@ impl UpdateUserOperation {
             .transpose()?;
         if previous_reducer_state
             .as_ref()
-            .is_some_and(|state| state.target != target)
+            .is_some_and(|state| state.target != admin_target)
         {
             return Err(AdminDocumentReducerError::TargetMismatch.into());
         }
         let mut reducer_state = previous_reducer_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+            .unwrap_or_else(|| AdminDocumentReducerState::new(admin_target));
         apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
+        let previous_document_revision = revision_value
+            .as_ref()
+            .map(|value| {
+                postcard::from_bytes::<DocumentSyncChange>(value.as_ref())
+                    .map_err(ConversionError::from)
+            })
+            .transpose()?;
+        let document_target = DocumentSyncTarget::User {
+            user_id: user.user_id,
+        };
+        let document_revision =
+            local_user_document_sync_change(previous_document_revision.as_ref(), &self.input.actor);
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -302,9 +340,13 @@ impl UpdateUserOperation {
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
+        writes.push(document_sync_revision_write_entry(
+            &document_target,
+            &document_revision,
+        )?);
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
-        self.state = UpdateUserState::WriteUserAndAdminState {
+        self.state = UpdateUserState::WriteUserAdminStateAndDocumentRevision {
             txn_id,
             user: user.clone(),
             stale_conflict_deletes,
@@ -414,10 +456,10 @@ impl Operation for UpdateUserOperation {
         match self.state.clone() {
             UpdateUserState::Auth => self.handle_auth_result(event),
             UpdateUserState::StartTransaction => self.handle_start_transaction(event),
-            UpdateUserState::ReadUserAndAdminState { txn_id } => {
-                self.handle_read_user_and_admin_state(event, txn_id)
+            UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id } => {
+                self.handle_read_user_admin_state_and_document_revision(event, txn_id)
             }
-            UpdateUserState::WriteUserAndAdminState {
+            UpdateUserState::WriteUserAdminStateAndDocumentRevision {
                 txn_id,
                 user,
                 stale_conflict_deletes,
@@ -443,14 +485,38 @@ impl Operation for UpdateUserOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            UpdateUserState::ReadUserAndAdminState { txn_id }
-            | UpdateUserState::WriteUserAndAdminState { txn_id, .. }
+            UpdateUserState::ReadUserAdminStateAndDocumentRevision { txn_id }
+            | UpdateUserState::WriteUserAdminStateAndDocumentRevision { txn_id, .. }
             | UpdateUserState::DeleteStaleAdminConflicts { txn_id, .. }
             | UpdateUserState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],
         }
+    }
+}
+
+fn current_timestamp_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
+}
+
+fn local_user_document_sync_change(
+    previous_change: Option<&DocumentSyncChange>,
+    actor: &Actor,
+) -> DocumentSyncChange {
+    let updated_at_ms = current_timestamp_ms();
+    let minimum_generation = previous_change
+        .map(|change| change.current.generation.saturating_add(1))
+        .unwrap_or_default();
+    DocumentSyncChange {
+        base: previous_change.map(|change| change.current),
+        current: DocumentSyncRevision {
+            generation: updated_at_ms.max(minimum_generation),
+            event_id: Ulid::new(),
+            actor: actor.node_id,
+            updated_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
     }
 }
 
@@ -541,16 +607,21 @@ mod tests {
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
+        document_sync_revision_key,
     };
     use aruna_core::structs::{Actor, AuthContext, RealmId, User};
     use aruna_core::types::{TxnId, UserId};
     use aruna_core::{
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, USER_KEYSPACE,
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use ulid::Ulid;
@@ -608,6 +679,15 @@ mod tests {
             event_id: Ulid::from_bytes([seed; 16]),
             origin_node_id: node(seed),
             origin_seq: u64::from(seed),
+        }
+    }
+
+    fn document_revision(seed: u8, generation: u64) -> DocumentSyncRevision {
+        DocumentSyncRevision {
+            generation,
+            event_id: Ulid::from_bytes([seed; 16]),
+            actor: node(seed),
+            updated_at_ms: generation,
         }
     }
 
@@ -676,14 +756,17 @@ mod tests {
         let txn_id = TxnId::new();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let target = AdminDocumentTarget::User { user_id };
+        let document = DocumentSyncTarget::User { user_id };
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchRead { reads, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
-                assert_eq!(reads.len(), 2);
+                assert_eq!(reads.len(), 3);
                 assert_eq!(reads[0].0, USER_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
                 assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
                 assert_eq!(reads[1].1, admin_document_reducer_state_key(&target));
+                assert_eq!(reads[2].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
+                assert_eq!(reads[2].1, document_sync_revision_key(&document));
             }
             other => panic!("unexpected read effect: {other:?}"),
         }
@@ -695,12 +778,13 @@ mod tests {
                     Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
                 ),
                 (admin_document_reducer_state_key(&target), None),
+                (document_sync_revision_key(&document), None),
             ],
         }));
         let (updated, reducer_state) = match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
-                assert_eq!(writes.len(), 2);
+                assert_eq!(writes.len(), 3);
                 let user_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == USER_KEYSPACE)
@@ -767,12 +851,82 @@ mod tests {
     }
 
     #[test]
+    fn writes_document_sync_revision_sidecar_with_user_update() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let original = stored_user(user_id);
+        let request = input(realm_id, user_id, user_id);
+        let expected_actor = request.actor.clone();
+        let mut operation = UpdateUserOperation::new(request);
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let document_target = DocumentSyncTarget::User { user_id };
+        let previous_revision = DocumentSyncChange {
+            base: None,
+            current: document_revision(21, 42),
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        operation.start();
+        let txn_id = TxnId::new();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    user_id.to_bytes().into(),
+                    Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
+                ),
+                (admin_document_reducer_state_key(&admin_target), None),
+                (
+                    document_sync_revision_key(&document_target),
+                    Some(postcard::to_allocvec(&previous_revision).unwrap().into()),
+                ),
+            ],
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected user update batch write, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        let user_write = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == USER_KEYSPACE)
+            .expect("user write is included");
+        let updated = User::from_bytes(user_write.2.as_ref()).unwrap();
+        assert_eq!(updated.name, "Alice Updated");
+
+        let (revision_key, revision): (_, DocumentSyncChange) = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, key, value)| {
+                (
+                    key,
+                    postcard::from_bytes(value).expect("revision sidecar decodes"),
+                )
+            })
+            .expect("revision sidecar write exists");
+        assert_eq!(revision_key, &document_sync_revision_key(&document_target));
+        assert_eq!(revision.base, Some(previous_revision.current));
+        assert_eq!(revision.current.actor, expected_actor.node_id);
+        assert!(revision.current.generation > previous_revision.current.generation);
+        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+    }
+
+    #[test]
     fn writes_reducer_state_and_conflicts_with_user_update_transaction() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
         let previous_state = reducer_state_with_conflicts(user_id);
         let target = AdminDocumentTarget::User { user_id };
+        let document = DocumentSyncTarget::User { user_id };
         let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
 
         operation.start();
@@ -789,6 +943,7 @@ mod tests {
                     admin_document_reducer_state_key(&target),
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 ),
+                (document_sync_revision_key(&document), None),
             ],
         }));
 
