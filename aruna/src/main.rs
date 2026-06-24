@@ -297,15 +297,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    shutdown_runtime(driver_ctx.net_handle.as_ref(), &driver_ctx.storage_handle).await;
+    shutdown_runtime(
+        driver_ctx.net_handle.as_ref(),
+        driver_ctx.metadata_handle.as_ref(),
+        &driver_ctx.storage_handle,
+    )
+    .await;
 
     Ok(())
 }
 
-async fn shutdown_runtime(net_handle: Option<&NetHandle>, storage_handle: &StorageHandle) {
+async fn shutdown_runtime(
+    net_handle: Option<&NetHandle>,
+    metadata_handle: Option<&MetadataHandle>,
+    storage_handle: &StorageHandle,
+) {
     if let Some(net_handle) = net_handle {
         info!("Shutting down network services");
         net_handle.shutdown().await;
+    }
+
+    if let Some(metadata_handle) = metadata_handle {
+        info!("Flushing metadata persistence");
+        if let Err(error) = metadata_handle.flush_persistence().await {
+            error!(error = %error, "Failed to flush metadata persistence during shutdown");
+        }
     }
 
     if let Err(error) = storage_handle.sync_all().await {
@@ -331,7 +347,7 @@ mod tests {
             response_tx.send(StorageEvent::SyncAllFinished);
         });
 
-        shutdown_runtime(None, &storage_handle).await;
+        shutdown_runtime(None, None, &storage_handle).await;
 
         worker.join().expect("storage responder should finish");
     }

@@ -1104,6 +1104,13 @@ impl MetadataHandle {
             .map_err(metadata_error_from_craqle)
     }
 
+    pub async fn flush_persistence(&self) -> Result<(), MetadataError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || flush_metadata_persistence(&inner, "shutdown", None))
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    }
+
     #[tracing::instrument(
         name = "metadata.query.remote",
         level = "debug",
@@ -2074,6 +2081,18 @@ fn flush_irokle_journal(
     }
 }
 
+fn flush_metadata_persistence(
+    inner: &MetadataInner,
+    effect_name: &'static str,
+    graph_iri: Option<&str>,
+) -> Result<(), MetadataError> {
+    inner
+        .node
+        .persist_fjall()
+        .map_err(metadata_error_from_craqle)?;
+    flush_irokle_journal(inner, effect_name, graph_iri)
+}
+
 fn metadata_effect_persists_irokle(effect: &MetadataEffect) -> bool {
     match effect {
         MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => {
@@ -2210,14 +2229,7 @@ fn run_deferred_metadata_flush(
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| -> Result<(), MetadataError> {
-        inner
-            .node
-            .persist_fjall()
-            .map_err(metadata_error_from_craqle)?;
-        flush_irokle_journal(inner, effect_name, graph_iri)?;
-        Ok(())
-    });
+    let result = span.in_scope(|| flush_metadata_persistence(inner, effect_name, graph_iri));
     record_elapsed(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -4085,6 +4097,56 @@ mod tests {
 
         assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
         assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
+    }
+
+    #[tokio::test]
+    async fn flush_persistence_succeeds_without_irokle_database() {
+        let (_storage_dir, storage) = auth_storage();
+        let metadata_dir = tempdir().expect("metadata dir");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(1),
+            storage,
+            None,
+            None,
+            None,
+            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        )
+        .expect("metadata handle opens");
+
+        metadata_handle
+            .flush_persistence()
+            .await
+            .expect("metadata persistence flushes");
+    }
+
+    #[tokio::test]
+    async fn flush_persistence_succeeds_with_configured_irokle_database() {
+        let (_storage_dir, storage) = auth_storage();
+        let metadata_dir = tempdir().expect("metadata dir");
+        let irokle_dir = tempdir().expect("irokle dir");
+        let irokle_db =
+            fjall::OptimisticTxDatabase::builder(irokle_dir.path().to_str().expect("irokle path"))
+                .manual_journal_persist(true)
+                .open()
+                .expect("irokle db opens");
+        let metadata_handle = MetadataHandle::new_with_options(
+            metadata_dir.path(),
+            node_id_from_seed(2),
+            storage,
+            None,
+            None,
+            Some(irokle_db),
+            MetadataHandleOptions::default()
+                .with_search_storage(MetadataSearchStorage::Memory)
+                .with_irokle_persist_policy(FjallPersistPolicy::SyncAll),
+        )
+        .expect("metadata handle opens");
+
+        metadata_handle
+            .flush_persistence()
+            .await
+            .expect("metadata and irokle persistence flush");
     }
 
     #[tokio::test]
