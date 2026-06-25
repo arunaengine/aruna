@@ -13,10 +13,10 @@ use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
+use aruna_core::structs::{Actor, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -207,9 +207,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             user_id: UserId::nil(config.realm_id),
                             realm_id: config.realm_id,
                         },
+                        target_node_id: config.node_id,
+                        target_node_kind: RealmNodeKind::Management,
                         bootstrap_peers: config.peer_nodes.clone(),
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
+                        create_if_missing: true,
+                        reject_kind_mismatch: false,
                     }),
                     driver_ctx.as_ref(),
                 )

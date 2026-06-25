@@ -2,17 +2,15 @@ use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingSecret, OnboardingSecretRecord,
     bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
-use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, AuthContext, DEFAULT_METADATA_REPLICATION_FACTOR, Permission, RealmNodeKind,
+};
 use aruna_core::types::UserId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::consume_onboarding_secret::{
@@ -25,6 +23,9 @@ use aruna_operations::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::ensure_realm_config::{
+    EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
+};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
@@ -38,7 +39,6 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
-use byteview::ByteView;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
     aead::{Aead, AeadCore, OsRng as CryptoOsRng},
@@ -498,13 +498,14 @@ async fn ensure_realm_node(
     for _ in 0..REALM_NODE_UPDATE_RETRIES {
         match ensure_realm_node_once(state, node_id, mode).await {
             Ok(()) => return Ok(()),
-            Err(ServerError::InternalError(message))
-                if message == StorageError::TransactionConflict.to_string() =>
-            {
-                last_conflict = Some(message);
+            Err(EnsureRealmConfigError::StorageError(StorageError::TransactionConflict)) => {
+                last_conflict = Some(StorageError::TransactionConflict.to_string());
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(EnsureRealmConfigError::NodeKindMismatch { .. }) => {
+                return Err(ServerError::BadRequest);
+            }
+            Err(error) => return Err(ServerError::InternalError(error.to_string())),
         }
     }
 
@@ -517,137 +518,33 @@ async fn ensure_realm_node_once(
     state: &Arc<ServerState>,
     node_id: NodeId,
     mode: OnboardingMode,
-) -> ServerResult<()> {
+) -> Result<(), EnsureRealmConfigError> {
     let realm_id = state.get_realm_id();
-    let key = ByteView::from(*realm_id.as_bytes());
-    let ctx = state.get_ctx();
-    let txn_id = match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            return Err(ServerError::InternalError(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let current = match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => value,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(
-                "realm config document missing".to_string(),
-            ));
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let mut document = match RealmConfigDocument::from_bytes(&current) {
-        Ok(document) => document,
-        Err(error) => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-    };
     let kind = match mode {
         OnboardingMode::Management => RealmNodeKind::Management,
         OnboardingMode::Server => RealmNodeKind::Server,
         OnboardingMode::Local => RealmNodeKind::Local,
     };
-    let node_id_string = node_id.to_string();
-    if let Some(existing) = document
-        .nodes
-        .iter()
-        .find(|node| node.node_id == node_id_string)
-        && existing.kind != kind
-    {
-        abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-        return Err(ServerError::BadRequest);
-    }
-    document.ensure_node(node_id, kind);
 
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: UserId::nil(realm_id),
-        realm_id,
-    };
-    let value = match document.reconcile_bytes(Some(&current), &actor) {
-        Ok(value) => value,
-        Err(error) => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-    };
+    drive(
+        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            target_node_id: node_id,
+            target_node_kind: kind,
+            bootstrap_peers: Vec::new(),
+            default_metadata_replication_factor: DEFAULT_METADATA_REPLICATION_FACTOR,
+            create_if_missing: false,
+            reject_kind_mismatch: true,
+        }),
+        &state.get_ctx(),
+    )
+    .await?;
 
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key,
-            value: ByteView::from(value),
-            txn_id: Some(txn_id),
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
-            return Err(ServerError::InternalError(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-async fn abort_realm_node_update<H: Handle>(storage: &H, txn_id: Ulid) {
-    let _ = storage
-        .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
-        .await;
+    Ok(())
 }
 
 fn now_timestamp() -> u64 {
@@ -770,15 +667,20 @@ mod tests {
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
+    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+    use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
         bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
-    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId};
+    use aruna_core::storage_entries::admin_document_reducer_state_key;
+    use aruna_core::structs::{
+        Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -959,6 +861,28 @@ mod tests {
             other => panic!("unexpected realm config read result: {other:?}"),
         };
         assert!(config.has_node(bootstrap_node_id));
+
+        let reducer_state = match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                key: admin_document_reducer_state_key(&AdminDocumentTarget::RealmConfig {
+                    realm_id,
+                }),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => postcard::from_bytes::<AdminDocumentReducerState>(&bytes).unwrap(),
+            other => panic!("unexpected realm config reducer state read result: {other:?}"),
+        };
+        assert_eq!(
+            reducer_state.materialized_realm_config_nodes()[&bootstrap_node_id],
+            RealmNodeKind::Server
+        );
 
         net_handle.shutdown().await;
     }

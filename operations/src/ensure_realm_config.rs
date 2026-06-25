@@ -31,8 +31,12 @@ use crate::document_sync_outbox::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
     pub actor: Actor,
+    pub target_node_id: NodeId,
+    pub target_node_kind: RealmNodeKind,
     pub bootstrap_peers: Vec<NodeId>,
     pub default_metadata_replication_factor: u32,
+    pub create_if_missing: bool,
+    pub reject_kind_mismatch: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +80,10 @@ pub enum EnsureRealmConfigError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    #[error("realm config document missing")]
+    RealmConfigNotFound,
+    #[error("realm config node {node_id} already exists with a different kind")]
+    NodeKindMismatch { node_id: NodeId },
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("topic announcement failed: {0}")]
@@ -143,12 +151,24 @@ impl EnsureRealmConfigOperation {
         };
         let mut document = match document_value.as_deref() {
             Some(value) => RealmConfigDocument::from_bytes(value)?,
-            None => RealmConfigDocument::new(
+            None if self.config.create_if_missing => RealmConfigDocument::new(
                 self.config.actor.realm_id,
                 Vec::new(),
                 self.config.default_metadata_replication_factor,
             ),
+            None => return Err(EnsureRealmConfigError::RealmConfigNotFound),
         };
+
+        if self.config.reject_kind_mismatch {
+            let target_node_id = self.config.target_node_id.to_string();
+            if document.nodes.iter().any(|node| {
+                node.node_id == target_node_id && node.kind != self.config.target_node_kind
+            }) {
+                return Err(EnsureRealmConfigError::NodeKindMismatch {
+                    node_id: self.config.target_node_id,
+                });
+            }
+        }
 
         let target = self.admin_target();
         let previous_reducer_state = reducer_state_value
@@ -171,8 +191,8 @@ impl EnsureRealmConfigOperation {
         let admin_event = apply_realm_config_node_ensure(
             &mut reducer_state,
             &self.config.actor,
-            self.config.actor.node_id,
-            RealmNodeKind::Management,
+            self.config.target_node_id,
+            self.config.target_node_kind.clone(),
         )?;
         overlay_realm_config_reducer_materialization(&mut document, &reducer_state);
 
@@ -540,7 +560,10 @@ mod tests {
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
     use ulid::Ulid;
 
-    use super::{EnsureRealmConfigConfig, EnsureRealmConfigOperation, realm_config_node_path};
+    use super::{
+        EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
+        realm_config_node_path,
+    };
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -556,9 +579,13 @@ mod tests {
 
     fn config(actor: Actor, factor: u32) -> EnsureRealmConfigConfig {
         EnsureRealmConfigConfig {
+            target_node_id: actor.node_id,
+            target_node_kind: RealmNodeKind::Management,
             actor,
             bootstrap_peers: Vec::new(),
             default_metadata_replication_factor: factor,
+            create_if_missing: true,
+            reject_kind_mismatch: false,
         }
     }
 
@@ -679,5 +706,36 @@ mod tests {
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
         assert_eq!(stored.nodes.len(), 1);
         assert!(stored.has_node(actor.node_id));
+    }
+
+    #[test]
+    fn rejects_existing_node_kind_mismatch_when_configured() {
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let actor = actor(8, realm_id);
+        let target_node_id = node(7);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(target_node_id, RealmNodeKind::Management);
+
+        let mut operation = EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            target_node_id,
+            target_node_kind: RealmNodeKind::Server,
+            reject_kind_mismatch: true,
+            ..config(actor.clone(), 3)
+        });
+        operation.txn_id = Some(TxnId::new());
+
+        let error = operation
+            .emit_write_document_and_admin_state(
+                Some(document.to_bytes(&actor).unwrap().into()),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            EnsureRealmConfigError::NodeKindMismatch {
+                node_id: target_node_id
+            }
+        );
     }
 }
