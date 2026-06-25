@@ -209,7 +209,6 @@ pub async fn process_metadata_graph_tombstones(
 
         if let Some(metadata_handle) = metadata_handle.as_ref() {
             metadata_handle.remove_visible_registry_record(tombstone.document_id);
-            metadata_handle.remove_cached_accepted_create(tombstone.document_id);
         }
         crate::metadata::visible_registry::remove_visible_registry_record(
             context,
@@ -712,8 +711,6 @@ mod tests {
         .await
         .expect("visible registry fills");
         assert_eq!(stale.as_ref(), &vec![record.clone()]);
-        metadata_handle.cache_accepted_create(record.clone());
-
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
             record.realm_id,
@@ -730,11 +727,6 @@ mod tests {
         let processed = process_metadata_graph_tombstones(&context, vec![tombstone.clone()]).await;
 
         assert_eq!(processed.enqueued, 1);
-        assert!(
-            metadata_handle
-                .cached_accepted_create(record.document_id)
-                .is_none()
-        );
         let listed = crate::metadata::visible_registry::list_visible_registry_records_for_group(
             &context,
             record.group_id,

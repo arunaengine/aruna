@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -67,7 +67,6 @@ const REALM_CONFIG_SCAN_PAGE_SIZE: usize = 128;
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
-const ACCEPTED_CREATE_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 pub struct MetadataHandle {
@@ -125,7 +124,6 @@ struct MetadataInner {
     irokle_db: Option<fjall::OptimisticTxDatabase>,
     irokle_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
-    accepted_create_cache: Mutex<AcceptedCreateCache>,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
@@ -196,43 +194,6 @@ impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
             .await
             .insert(issuer_pubkey.to_string(), decoding_key.clone());
         Ok(decoding_key)
-    }
-}
-
-#[derive(Default)]
-struct AcceptedCreateCache {
-    by_document: HashMap<Ulid, MetadataRegistryRecord>,
-    order: VecDeque<Ulid>,
-}
-
-impl AcceptedCreateCache {
-    fn insert(&mut self, record: MetadataRegistryRecord) {
-        if !self.by_document.contains_key(&record.document_id) {
-            self.order.push_back(record.document_id);
-        }
-        self.by_document.insert(record.document_id, record);
-        while self.by_document.len() > ACCEPTED_CREATE_CACHE_CAPACITY {
-            let Some(document_id) = self.order.pop_front() else {
-                break;
-            };
-            self.by_document.remove(&document_id);
-        }
-    }
-
-    fn get(&self, document_id: Ulid) -> Option<MetadataRegistryRecord> {
-        self.by_document.get(&document_id).cloned()
-    }
-
-    fn list_group(&self, group_id: ulid::Ulid) -> Vec<MetadataRegistryRecord> {
-        self.by_document
-            .values()
-            .filter(|record| record.group_id == group_id)
-            .cloned()
-            .collect()
-    }
-
-    fn remove(&mut self, document_id: Ulid) {
-        self.by_document.remove(&document_id);
     }
 }
 
@@ -598,48 +559,12 @@ impl MetadataHandle {
                 irokle_db,
                 irokle_persist_policy: metadata_options.irokle_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
-                accepted_create_cache: Mutex::new(AcceptedCreateCache::default()),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
             }),
         })
-    }
-
-    pub fn cache_accepted_create(&self, record: MetadataRegistryRecord) {
-        self.inner
-            .accepted_create_cache
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .insert(record);
-    }
-
-    pub fn cached_accepted_create(&self, document_id: Ulid) -> Option<MetadataRegistryRecord> {
-        self.inner
-            .accepted_create_cache
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .get(document_id)
-    }
-
-    pub fn cached_accepted_creates_for_group(
-        &self,
-        group_id: ulid::Ulid,
-    ) -> Vec<MetadataRegistryRecord> {
-        self.inner
-            .accepted_create_cache
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .list_group(group_id)
-    }
-
-    pub fn remove_cached_accepted_create(&self, document_id: Ulid) {
-        self.inner
-            .accepted_create_cache
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .remove(document_id);
     }
 
     pub fn upsert_visible_registry_record(&self, record: MetadataRegistryRecord) {

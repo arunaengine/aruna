@@ -606,7 +606,6 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
         .metadata_handle
         .as_ref()
         .expect("metadata handle installed");
-    metadata_handle.cache_accepted_create(record.clone());
     metadata_handle.upsert_visible_registry_records(std::slice::from_ref(&record));
     write_tombstone(&test, &record).await?;
 
@@ -619,11 +618,6 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 
     assert_eq!(projected, 0);
     assert_projection_absent(&test, &record).await?;
-    assert!(
-        metadata_handle
-            .cached_accepted_create(document_id)
-            .is_none()
-    );
     let visible =
         aruna_operations::metadata::visible_registry::list_visible_registry_records_for_group(
             test.context.as_ref(),

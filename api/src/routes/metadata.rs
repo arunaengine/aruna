@@ -518,9 +518,6 @@ pub async fn create_metadata_document(
     .await
     .map_err(map_create_metadata_error)?;
     let result = created.record;
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        metadata_handle.cache_accepted_create(result.clone());
-    }
     wake_metadata_create_projection(ctx, result.document_id, created.event_id);
 
     Ok((
@@ -670,9 +667,6 @@ pub async fn delete_metadata_document(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        metadata_handle.remove_cached_accepted_create(document_id);
-    }
     visible_registry::remove_visible_registry_record(ctx.as_ref(), record.group_id, document_id);
 
     Ok(StatusCode::NO_CONTENT)
@@ -1329,43 +1323,18 @@ async fn load_group_metadata_records(
     // keyed per group so a small group's listing stays independent of the
     // realm-wide corpus size; the registry scan only runs as a cold-cache
     // fallback when the fill fails.
-    let mut records =
-        match visible_registry::list_visible_registry_records_for_group(ctx.as_ref(), group_id)
-            .await
-        {
-            Ok(group_records) => group_records.as_ref().clone(),
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "visible registry cache fill failed, falling back to registry scan"
-                );
-                drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
-                    .await
-                    .map_err(|err| ServerError::InternalError(err.to_string()))?
-            }
-        };
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        merge_cached_metadata_records(
-            &mut records,
-            metadata_handle.cached_accepted_creates_for_group(group_id),
-        );
+    match visible_registry::list_visible_registry_records_for_group(ctx.as_ref(), group_id).await {
+        Ok(group_records) => Ok(group_records.as_ref().clone()),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "visible registry cache fill failed, falling back to registry scan"
+            );
+            drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
+                .await
+                .map_err(|err| ServerError::InternalError(err.to_string()))
+        }
     }
-    Ok(records)
-}
-
-fn merge_cached_metadata_records(
-    records: &mut Vec<MetadataRegistryRecord>,
-    cached: Vec<MetadataRegistryRecord>,
-) {
-    let existing = records
-        .iter()
-        .map(|record| record.document_id)
-        .collect::<HashSet<_>>();
-    records.extend(
-        cached
-            .into_iter()
-            .filter(|record| !existing.contains(&record.document_id)),
-    );
 }
 
 async fn build_metadata_list_response(
@@ -1650,12 +1619,7 @@ async fn load_metadata_record_by_document(
         .await;
     match parse_registry_read(event) {
         Ok(Some(record)) => Ok(record),
-        Ok(None) => state
-            .get_ctx()
-            .metadata_handle
-            .as_ref()
-            .and_then(|metadata_handle| metadata_handle.cached_accepted_create(document_id))
-            .ok_or(ServerError::NotFound),
+        Ok(None) => Err(ServerError::NotFound),
         Err(crate::routes::metadata::ReadError::Storage(error)) => {
             Err(ServerError::InternalError(error.to_string()))
         }
@@ -2521,6 +2485,8 @@ mod tests {
     #[tokio::test]
     async fn public_metadata_routes_support_create_list_export_and_query() {
         let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        let projection_key = metadata_projection_batch_key(&ctx);
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -2539,7 +2505,31 @@ mod tests {
         )
         .await
         .unwrap();
+        let (_, pending_targets) =
+            take_metadata_projection_batch(projection_key).expect("metadata projection scheduled");
+        assert_eq!(pending_targets.len(), 1);
 
+        let document_id = created.summary.document_id.clone();
+
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
+
+        let fetched = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(matches!(fetched, Err(ServerError::NotFound)));
+
+        drain_metadata_background(test.state.as_ref()).await;
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
             Extension(None),
@@ -2551,8 +2541,6 @@ mod tests {
         assert_eq!(listed.documents.len(), 1);
         assert_eq!(listed.documents[0].document_id, created.summary.document_id);
 
-        let document_id = created.summary.document_id.clone();
-        drain_metadata_background(test.state.as_ref()).await;
         let paged_jsonld = format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -2820,13 +2808,6 @@ mod tests {
         .unwrap();
         drain_metadata_background(test.state.as_ref()).await;
 
-        // Drop the accepted-create overlay so the listing below can only come
-        // from the visible-registry cache fill.
-        let document_id = parse_document_id(&created.summary.document_id).unwrap();
-        ctx.metadata_handle
-            .as_ref()
-            .unwrap()
-            .remove_cached_accepted_create(document_id);
         visible_registry::invalidate_visible_registry(ctx.as_ref());
 
         let (_, Json(listed)) = list_metadata_documents(
@@ -2996,6 +2977,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
@@ -3120,6 +3102,8 @@ mod tests {
     #[tokio::test]
     async fn export_returns_service_unavailable_while_materialization_pending() {
         let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        let projection_key = metadata_projection_batch_key(&ctx);
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -3138,8 +3122,22 @@ mod tests {
         )
         .await
         .unwrap();
+        let (_, pending_targets) =
+            take_metadata_projection_batch(projection_key).expect("metadata projection scheduled");
 
-        // No drain_metadata_background: the craqle graph does not exist yet.
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id.clone()),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::NotFound)));
+
+        let projected = project_metadata_create_events_from_log(ctx.as_ref(), pending_targets)
+            .await
+            .unwrap();
+        assert_eq!(projected, 1);
         let result = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),
@@ -3149,7 +3147,10 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
 
-        drain_metadata_background(test.state.as_ref()).await;
+        let materialized = process_metadata_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(materialized.processed, 1);
         let result = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),

@@ -422,7 +422,6 @@ pub async fn project_metadata_create_events(
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
             for record in &repaired_records {
                 metadata_handle.remove_visible_registry_record(record.document_id);
-                metadata_handle.remove_cached_accepted_create(record.document_id);
             }
         }
         for record in &repaired_records {
