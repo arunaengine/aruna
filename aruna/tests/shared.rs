@@ -395,30 +395,40 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
     group_id: &str,
     path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/users/credentials"))
-        .bearer_auth(bearer_token)
-        .json(&CreateS3CredentialsRequest {
-            group_id: group_id.to_string(),
-            expires_in_seconds: Some(600),
-            path_restrictions,
-        })
-        .send()
-        .await?;
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
 
-    if response.status() != StatusCode::CREATED {
-        return Err(std::io::Error::other(format!(
-            "unexpected create credentials status: {}",
-            response.status()
-        ))
-        .into());
+    loop {
+        let response = client
+            .post(format!("{base_url}/api/v1/users/credentials"))
+            .bearer_auth(bearer_token)
+            .json(&CreateS3CredentialsRequest {
+                group_id: group_id.to_string(),
+                expires_in_seconds: Some(600),
+                path_restrictions: path_restrictions.clone(),
+            })
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::CREATED {
+            let response: CreateS3CredentialsResponse = response.json().await?;
+            return Ok(S3Credentials {
+                access_key_id: response.access_key_id,
+                access_secret: response.access_secret,
+            });
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "unexpected create credentials status after retry: {} body={}",
+                status, body
+            ))
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
     }
-
-    let response: CreateS3CredentialsResponse = response.json().await?;
-    Ok(S3Credentials {
-        access_key_id: response.access_key_id,
-        access_secret: response.access_secret,
-    })
 }
 
 pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {

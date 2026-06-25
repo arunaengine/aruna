@@ -248,6 +248,74 @@ impl DocumentSyncService {
         self.flush_database()
     }
 
+    pub fn allow_document_sync_peers(
+        &self,
+        targets: &[DocumentSyncTarget],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let sync_peers = self.sync_peers(peers);
+        if sync_peers.is_empty() {
+            return Ok(());
+        }
+        self.allow_sync_peers(&sync_peers)?;
+
+        let mut seen_topics = BTreeSet::new();
+        for target in targets {
+            let topic_id = target.sync_topic_id();
+            if !seen_topics.insert(topic_id) {
+                continue;
+            }
+
+            let state = self
+                .node
+                .storage()
+                .topic_state(&topic_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .ok_or_else(|| {
+                    NetError::Bootstrap(format!(
+                        "document sync topic {topic_id} for target {target:?} is missing"
+                    ))
+                })?;
+
+            if state.event_type_id != DocumentSyncEvent::TYPE_ID {
+                return Err(NetError::Bootstrap(format!(
+                    "Document sync topic {topic_id} has event type {}, expected {}",
+                    state.event_type_id,
+                    DocumentSyncEvent::TYPE_ID
+                )));
+            }
+
+            let missing_peers = sync_peers
+                .iter()
+                .copied()
+                .filter(|peer| !state.members.contains(peer))
+                .collect::<Vec<_>>();
+            if missing_peers.is_empty() {
+                continue;
+            }
+
+            let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
+            let oplog = Oplog::with_storage(self.node.storage().clone());
+            for peer in missing_peers {
+                oplog
+                    .create_control_op(
+                        topic_id,
+                        actor_id,
+                        TopicControl::AddPeer { peer },
+                        self.node.signer(),
+                    )
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            }
+            self.net.schedule_topic_recheck(topic_id)?;
+        }
+
+        self.flush_database()
+    }
+
     /// Notes a live inbound document sync connection so the resync scheduler retries
     /// the peer immediately. The connection itself is not pooled for outbound
     /// reuse: streams opened over it toward the original dialer would never be
@@ -1699,24 +1767,6 @@ impl DocumentSyncService {
     async fn storage_batch_write(&self, writes: Vec<(String, ByteView, Value)>) -> Result<()> {
         storage_batch_write_to(&self.storage, writes).await
     }
-
-    async fn storage_delete(&self, key_space: String, key: ByteView) -> Result<()> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::Delete {
-                key_space,
-                key,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
-            other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying document sync delete: {other:?}"
-            ))),
-        }
-    }
 }
 
 fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, ByteView, Value) {
@@ -1789,56 +1839,6 @@ fn group_reducer_materialized_group(
     })
 }
 
-fn overlay_group_authorization_reducer_materialization(
-    auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    overlay_group_authorization_role_reducer_materialization(auth_doc, reducer_state);
-    overlay_group_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
-}
-
-fn overlay_group_authorization_role_reducer_materialization(
-    auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    for path in reducer_state.conflicts.keys() {
-        if let Some(role_id) = group_role_from_path(path) {
-            auth_doc.roles.remove(&role_id);
-        }
-    }
-
-    for (path, version) in &reducer_state.user_subject_ids {
-        let Some(role_id) = group_role_from_path(path) else {
-            continue;
-        };
-        if reducer_state.conflicts.contains_key(path) {
-            auth_doc.roles.remove(&role_id);
-            continue;
-        }
-        let Some(role) = version
-            .value
-            .as_deref()
-            .and_then(|value| reducer_role_definition(value, role_id))
-        else {
-            continue;
-        };
-        let assigned_users = auth_doc
-            .roles
-            .get(&role_id)
-            .map(|role| role.assigned_users.clone())
-            .unwrap_or_default();
-        auth_doc.roles.insert(
-            role_id,
-            Role {
-                role_id,
-                name: role.name,
-                permissions: role.permissions.into_iter().collect(),
-                assigned_users,
-            },
-        );
-    }
-}
-
 fn overlay_group_authorization_role_assignment_reducer_materialization(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -1887,56 +1887,6 @@ fn overlay_group_authorization_assignment_reducer_materialization(
         {
             role.assigned_users.insert(user_id);
         }
-    }
-}
-
-fn overlay_realm_authorization_reducer_materialization(
-    auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    overlay_realm_authorization_role_reducer_materialization(auth_doc, reducer_state);
-    overlay_realm_authorization_assignment_reducer_materialization(auth_doc, reducer_state, None);
-}
-
-fn overlay_realm_authorization_role_reducer_materialization(
-    auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    for path in reducer_state.conflicts.keys() {
-        if let Some(role_id) = realm_role_from_path(path) {
-            auth_doc.roles.remove(&role_id);
-        }
-    }
-
-    for (path, version) in &reducer_state.user_subject_ids {
-        let Some(role_id) = realm_role_from_path(path) else {
-            continue;
-        };
-        if reducer_state.conflicts.contains_key(path) {
-            auth_doc.roles.remove(&role_id);
-            continue;
-        }
-        let Some(role) = version
-            .value
-            .as_deref()
-            .and_then(|value| reducer_role_definition(value, role_id))
-        else {
-            continue;
-        };
-        let assigned_users = auth_doc
-            .roles
-            .get(&role_id)
-            .map(|role| role.assigned_users.clone())
-            .unwrap_or_default();
-        auth_doc.roles.insert(
-            role_id,
-            Role {
-                role_id,
-                name: role.name,
-                permissions: role.permissions.into_iter().collect(),
-                assigned_users,
-            },
-        );
     }
 }
 
@@ -2102,14 +2052,6 @@ fn group_role_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
-fn realm_role_from_path(path: &str) -> Option<RoleId> {
-    let role_id = path.strip_prefix("realm.roles.")?;
-    if role_id.contains(".assigned_users.") {
-        return None;
-    }
-    Ulid::from_string(role_id).ok()
-}
-
 fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.nodes.")?;
     NodeId::from_str(node_id).ok()
@@ -2117,11 +2059,6 @@ fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
 
 fn realm_config_oidc_provider_from_path(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.oidc_providers.")
-}
-
-fn reducer_role_definition(value: &str, role_id: RoleId) -> Option<AdminDocumentRoleDefinition> {
-    let role = serde_json::from_str::<AdminDocumentRoleDefinition>(value).ok()?;
-    (role.role_id == role_id).then_some(role)
 }
 
 fn admin_document_target_for_reduced_document(
@@ -3727,23 +3664,6 @@ mod tests {
         .expect("restart payload serializes")
     }
 
-    fn revision_change_at(
-        base: Option<DocumentSyncRevision>,
-        generation: u64,
-        seq: u128,
-    ) -> DocumentSyncChange {
-        DocumentSyncChange {
-            base,
-            current: DocumentSyncRevision {
-                generation,
-                event_id: Ulid::from_parts(1_727_000_000_000 + generation, seq),
-                actor: node((seq % 200) as u8 + 1),
-                updated_at_ms: 1_727_000_000_100 + generation,
-            },
-            kind: DocumentSyncChangeKind::Upsert,
-        }
-    }
-
     fn revision_change() -> DocumentSyncChange {
         DocumentSyncChange {
             base: None,
@@ -3782,19 +3702,6 @@ mod tests {
             restart_endpoint().await,
             storage_at(&root.join(storage_name)),
             root.join("document-sync"),
-            &[],
-            vec![Alpn::DocumentSync.as_bytes().to_vec()],
-            irokle_crate::net::IrohRuntimeConfig::default(),
-            FjallPersistPolicy::Buffer,
-        )
-        .expect("document sync service opens")
-    }
-
-    async fn open_test_service(root: &Path, storage_name: &str, seed: u8) -> DocumentSyncService {
-        DocumentSyncService::open_with_persist_policy(
-            test_endpoint(seed).await,
-            storage_at(&root.join(storage_name)),
-            root.join(format!("document-sync-{seed}")),
             &[],
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),

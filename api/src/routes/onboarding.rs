@@ -383,12 +383,14 @@ pub async fn bootstrap_onboarding(
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     ensure_realm_node(&state, node_id, record.mode).await?;
     let ctx = state.get_ctx();
-    if let Some(net_handle) = ctx.net_handle.as_ref() {
-        net_handle
-            .reload_realm_peers()
-            .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    }
+    let net_handle = ctx
+        .net_handle
+        .clone()
+        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
+    net_handle
+        .reload_realm_peers()
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let replication_ctx = ctx.clone();
     let realm_id = state.get_realm_id();
     let local_node_id = state.get_node_id();
@@ -428,7 +430,11 @@ pub async fn bootstrap_onboarding(
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    net_handle
+        .allow_document_sync_peers(&onboarding_sync_ticket.payload.documents, vec![node_id])
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let onboarding_sync_ticket = onboarding_sync_ticket
         .encode()
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
@@ -669,8 +675,12 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::AdminDocumentTarget;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect, DocumentSyncNetEvent,
+        DocumentSyncPublish, DocumentSyncRevision,
+    };
+    use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+    use aruna_core::events::{Event, NetEvent, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
@@ -777,7 +787,68 @@ mod tests {
             .await,
         );
 
+        seed_onboarding_document_topics(&state, node_id).await;
+
         (state, realm_id, node_id, user_id, net_handle, tempdir)
+    }
+
+    async fn seed_onboarding_document_topics(state: &Arc<ServerState>, node_id: iroh::PublicKey) {
+        let ctx = state.get_ctx();
+        let ticket = state.issue_onboarding_sync_ticket(node_id).await.unwrap();
+        let mut documents = Vec::with_capacity(ticket.payload.documents.len());
+
+        for (index, target) in ticket.payload.documents.into_iter().enumerate() {
+            let bytes = match ctx
+                .storage_handle
+                .send_effect(Effect::Storage(StorageEffect::Read {
+                    key_space: target.storage_keyspace().to_string(),
+                    key: target.storage_key(),
+                    txn_id: None,
+                }))
+                .await
+            {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(bytes), ..
+                }) => bytes.to_vec(),
+                other => {
+                    panic!("unexpected document read result while seeding sync topic: {other:?}")
+                }
+            };
+            let event_id = Ulid::from_parts(1_727_000_000_000, index as u128 + 1);
+            documents.push(DocumentSyncPublish::Upsert {
+                event_id,
+                target,
+                bytes,
+                change: DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: 1,
+                        event_id,
+                        actor: state.get_node_id(),
+                        updated_at_ms: 1_727_000_000_000 + index as u64,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                },
+            });
+        }
+
+        let event = ctx
+            .net_handle
+            .as_ref()
+            .unwrap()
+            .send_effect(Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::PublishDocuments {
+                    documents,
+                    peers: Vec::new(),
+                },
+            )))
+            .await;
+        match event {
+            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                ..
+            })) => {}
+            other => panic!("unexpected document sync publish result: {other:?}"),
+        }
     }
 
     #[tokio::test]

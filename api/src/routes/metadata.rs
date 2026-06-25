@@ -2886,7 +2886,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_realm_nodes_reflects_new_presence_without_stale_cache() {
-        let realm_id = RealmId([31u8; 32]);
+        let realm_id = test_realm_id(31);
         let coordinator = spawn_distributed_metadata_node(realm_id).await;
         let remote = spawn_distributed_metadata_node(realm_id).await;
 
@@ -3904,6 +3904,14 @@ mod tests {
         SigningKey::generate(&mut rng)
     }
 
+    fn test_realm_id(seed: u8) -> RealmId {
+        RealmId::from_bytes(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
     fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         TokenClaims {
@@ -3934,7 +3942,7 @@ mod tests {
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let realm_id = aruna_core::structs::RealmId([3u8; 32]);
+        let realm_id = test_realm_id(3);
         let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
         let actor = Actor {
             node_id,
@@ -4033,7 +4041,7 @@ mod tests {
         let (storage_handle, receiver) = storage::StorageHandle::new();
         drop(receiver);
 
-        let realm_id = RealmId([3u8; 32]);
+        let realm_id = test_realm_id(3);
         let node_id = iroh::SecretKey::from_bytes(&[14u8; 32]).public();
         Arc::new(
             ServerState::new(

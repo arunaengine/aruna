@@ -209,7 +209,7 @@ pub fn bootstrap_issuer_proof_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
+    use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket, credential_hash};
     use crate::document::DocumentSyncTarget;
     use crate::structs::RealmId;
     use ed25519_dalek::SigningKey;

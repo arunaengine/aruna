@@ -168,7 +168,6 @@ impl AnnounceTopicOperation {
                 document,
                 bytes: self.document_bytes.take(),
             });
-            return;
         }
     }
 

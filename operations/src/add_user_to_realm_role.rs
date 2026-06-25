@@ -1071,7 +1071,8 @@ pub mod test {
             key: TaskKey::DrainDocumentSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
     }
 
     #[tokio::test]
