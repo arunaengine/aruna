@@ -10,7 +10,7 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use crate::structs::RealmNodeKind;
+use crate::structs::{OidcProviderConfig, RealmNodeKind};
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
@@ -186,6 +186,22 @@ impl AdminDocumentReducerState {
             ) => {
                 self.apply_realm_config_node(event, node_id, kind);
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+            ) => {
+                self.apply_realm_config_oidc_provider(
+                    event,
+                    &provider.id,
+                    Some(oidc_provider_value(provider)),
+                );
+            }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigOidcProviderRemoved { provider_id },
+            ) => {
+                self.apply_realm_config_oidc_provider(event, provider_id, None);
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -331,6 +347,25 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
+    pub fn materialized_realm_config_oidc_providers(&self) -> BTreeMap<String, OidcProviderConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let provider_id = realm_config_oidc_provider_id_from_path(path)?;
+                let provider = version
+                    .value
+                    .as_deref()
+                    .and_then(oidc_provider_from_value)?;
+
+                (provider.id == provider_id).then(|| (provider_id.to_string(), provider))
+            })
+            .collect()
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -457,6 +492,25 @@ impl AdminDocumentReducerState {
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, Some(realm_node_kind_value(kind))) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_realm_config_oidc_provider(
+        &mut self,
+        event: &AdminDocumentEvent,
+        provider_id: &str,
+        value: Option<String>,
+    ) {
+        let path = realm_config_oidc_provider_path(provider_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -650,6 +704,14 @@ fn realm_config_node_path(node_id: &NodeId) -> String {
     format!("realm_config.nodes.{node_id}")
 }
 
+fn realm_config_oidc_provider_path(provider_id: &str) -> String {
+    format!("realm_config.oidc_providers.{provider_id}")
+}
+
+fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
+    serde_json::to_string(provider).expect("admin document OIDC provider config serializes")
+}
+
 fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
     match kind {
         RealmNodeKind::Management => "management",
@@ -698,6 +760,14 @@ fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
     NodeId::from_str(node_id).ok()
 }
 
+fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("realm_config.oidc_providers.")
+}
+
+fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
+    serde_json::from_str(value).ok()
+}
+
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
     match value {
         "management" => Some(RealmNodeKind::Management),
@@ -711,13 +781,13 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
 mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
-        USER_NAME_PATH, role_definition_value,
+        USER_NAME_PATH, oidc_provider_value, role_definition_value,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
-    use crate::structs::{Actor, Permission, RealmId, RealmNodeKind};
+    use crate::structs::{Actor, OidcProviderConfig, Permission, RealmId, RealmNodeKind};
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
@@ -748,6 +818,17 @@ mod tests {
                 ("/dataset/**".to_string(), Permission::READ),
                 ("/project/admin/**".to_string(), Permission::WRITE),
             ]),
+        }
+    }
+
+    fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: format!("https://issuer.example/{issuer_suffix}"),
+            audience: "aruna".to_string(),
+            discovery_url: format!(
+                "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
+            ),
         }
     }
 
@@ -1036,6 +1117,20 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+        )
+    }
+
+    fn upsert_oidc_provider(
+        event_seed: u8,
+        origin_seed: u8,
+        provider: OidcProviderConfig,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
         )
     }
 
@@ -1699,6 +1794,93 @@ mod tests {
     }
 
     #[test]
+    fn realm_config_disjoint_oidc_providers_merge_deterministically() {
+        let mut state = realm_config_state();
+        let first = oidc_provider("default", "one");
+        let second = oidc_provider("partner", "two");
+
+        state
+            .apply(&upsert_oidc_provider(1, 1, first.clone()))
+            .unwrap();
+        state
+            .apply(&upsert_oidc_provider(2, 2, second.clone()))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_oidc_providers(),
+            BTreeMap::from([
+                ("default".to_string(), first),
+                ("partner".to_string(), second),
+            ])
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_realm_config_same_oidc_provider_different_body_conflicts_fail_closed() {
+        let mut state = realm_config_state();
+        let first = oidc_provider("default", "one");
+        let second = oidc_provider("default", "two");
+        let first_value = oidc_provider_value(&first);
+        let second_value = oidc_provider_value(&second);
+
+        state.apply(&upsert_oidc_provider(1, 1, first)).unwrap();
+        state.apply(&upsert_oidc_provider(2, 2, second)).unwrap();
+
+        assert!(
+            !state
+                .materialized_realm_config_oidc_providers()
+                .contains_key("default")
+        );
+        let conflict = state
+            .conflicts
+            .get("realm_config.oidc_providers.default")
+            .expect("conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+        );
+    }
+
+    #[test]
+    fn observed_realm_config_oidc_provider_remove_removes_provider() {
+        let mut state = realm_config_state();
+        let provider = oidc_provider("default", "one");
+        let upsert_origin = node(1);
+        let upsert = realm_config_event(
+            1,
+            upsert_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+        );
+        let removal = realm_config_event(
+            2,
+            node(2),
+            1,
+            AdminDocumentClock::default().with_observed(upsert_origin, 1),
+            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+                provider_id: "default".to_string(),
+            },
+        );
+
+        state.apply(&upsert).unwrap();
+        state.apply(&removal).unwrap();
+
+        assert!(state.materialized_realm_config_oidc_providers().is_empty());
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
     fn user_operation_is_rejected_for_group_target_without_state_change() {
         let mut state = group_state();
         let before = state.clone();
@@ -1709,6 +1891,27 @@ mod tests {
             AdminDocumentClock::default(),
             AdminDocumentOperation::UserNameSet {
                 name: "Alice".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::UnsupportedTarget)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn oidc_provider_operation_is_rejected_for_non_realm_config_target_without_state_change() {
+        let mut state = user_state();
+        let before = state.clone();
+        let event = event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                provider: oidc_provider("default", "one"),
             },
         );
 

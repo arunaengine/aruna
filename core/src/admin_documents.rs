@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{Actor, Permission, RealmId, RealmNodeKind, Role};
+use crate::structs::{Actor, OidcProviderConfig, Permission, RealmId, RealmNodeKind, Role};
 use crate::types::{GroupId, RoleId, UserId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,13 +127,19 @@ pub enum AdminDocumentOperation {
         node_id: NodeId,
         kind: RealmNodeKind,
     },
+    RealmConfigOidcProviderUpserted {
+        provider: OidcProviderConfig,
+    },
+    RealmConfigOidcProviderRemoved {
+        provider_id: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
-    use crate::structs::{Permission, RealmId, RealmNodeKind};
+    use crate::structs::{OidcProviderConfig, Permission, RealmId, RealmNodeKind};
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
@@ -159,6 +165,15 @@ mod tests {
             role_id,
             name: "admin".to_string(),
             permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),
+        }
+    }
+
+    fn oidc_provider(id: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: format!("https://issuer.example/{id}"),
+            audience: "aruna".to_string(),
+            discovery_url: format!("https://issuer.example/{id}/.well-known/openid-configuration"),
         }
     }
 
@@ -251,6 +266,18 @@ mod tests {
                 },
                 13,
             ),
+            (
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    provider: oidc_provider("default"),
+                },
+                14,
+            ),
+            (
+                AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+                    provider_id: "default".to_string(),
+                },
+                15,
+            ),
         ];
 
         for (op, discriminant) in operations {
@@ -292,6 +319,22 @@ mod tests {
         };
 
         assert_eq!(postcard_roundtrip(operation.clone()), operation);
+    }
+
+    #[test]
+    fn realm_config_oidc_provider_operations_roundtrip() {
+        let operations = [
+            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                provider: oidc_provider("default"),
+            },
+            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+                provider_id: "default".to_string(),
+            },
+        ];
+
+        for operation in operations {
+            assert_eq!(postcard_roundtrip(operation.clone()), operation);
+        }
     }
 }
 
