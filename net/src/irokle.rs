@@ -70,6 +70,7 @@ pub const IROKLE_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const IROKLE_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const IROKLE_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const IROKLE_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const USER_NAME_PATH: &str = "user.name";
 const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
 const GROUP_REALM_ID_PATH: &str = "group.realm_id";
 const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
@@ -1854,6 +1855,35 @@ async fn apply_legacy_admin_document_upsert_to_storage(
                 )));
             }
             let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
+                if group_metadata_conflicted(reducer_state) {
+                    let Some(previous_group) = storage_read_from(
+                        storage,
+                        target.storage_keyspace().to_string(),
+                        target.storage_key(),
+                    )
+                    .await?
+                    .map(|bytes| Group::from_bytes(&bytes))
+                    .transpose()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    else {
+                        return Ok(());
+                    };
+                    if previous_group.group_id != group_id {
+                        return Err(NetError::Bootstrap(format!(
+                            "stored group document id {group_id} does not match payload group id {}",
+                            previous_group.group_id
+                        )));
+                    }
+                    if reducer_state
+                        .conflicts
+                        .contains_key(GROUP_DISPLAY_NAME_PATH)
+                    {
+                        group.display_name = previous_group.display_name;
+                    }
+                    if reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH) {
+                        group.realm_id = previous_group.realm_id;
+                    }
+                }
                 overlay_group_reducer_materialization(&mut group, reducer_state);
                 postcard::to_allocvec(&group)
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?
@@ -2091,9 +2121,9 @@ fn overlay_user_reducer_materialization(
     user: &mut User,
     reducer_state: &AdminDocumentReducerState,
 ) {
-    if !reducer_state.conflicts.contains_key("user.name")
-        && let Some(name) = reducer_state.materialized_user_name()
-    {
+    if reducer_state.conflicts.contains_key(USER_NAME_PATH) {
+        user.name.clear();
+    } else if let Some(name) = reducer_state.materialized_user_name() {
         user.name = name;
     }
 
@@ -2172,15 +2202,18 @@ fn overlay_group_role_set_reducer_materialization(
     }
 }
 
+fn group_metadata_conflicted(reducer_state: &AdminDocumentReducerState) -> bool {
+    reducer_state
+        .conflicts
+        .contains_key(GROUP_DISPLAY_NAME_PATH)
+        || reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+}
+
 fn group_reducer_materialized_group(
     group_id: Ulid,
     reducer_state: &AdminDocumentReducerState,
 ) -> Option<Group> {
-    if reducer_state
-        .conflicts
-        .contains_key(GROUP_DISPLAY_NAME_PATH)
-        || reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
-    {
+    if group_metadata_conflicted(reducer_state) {
         return None;
     }
 
@@ -3384,9 +3417,9 @@ fn materialize_user_admin_document_operation(
 
     match &event.op {
         AdminDocumentOperation::UserNameSet { .. } => {
-            if !reducer_state.conflicts.contains_key("user.name")
-                && let Some(name) = reducer_state.materialized_user_name()
-            {
+            if reducer_state.conflicts.contains_key(USER_NAME_PATH) {
+                user.name.clear();
+            } else if let Some(name) = reducer_state.materialized_user_name() {
                 user.name = name;
             }
         }
@@ -3412,7 +3445,9 @@ fn materialize_user_admin_document_operation(
         AdminDocumentOperation::UserAttributeSet { key, .. }
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
             let path = format!("user.attributes.{key}");
-            if !reducer_state.conflicts.contains_key(&path) {
+            if reducer_state.conflicts.contains_key(&path) {
+                user.attributes.remove(key);
+            } else {
                 match reducer_state
                     .user_attributes
                     .get(key)
@@ -4308,6 +4343,67 @@ mod tests {
             actor: actor.clone(),
             op,
         }
+    }
+
+    async fn apply_conflicting_user_name_and_attribute(
+        storage: &StorageHandle,
+        user_id: UserId,
+        realm_id: RealmId,
+    ) -> Actor {
+        let actor_a = test_actor(8, user_id, realm_id);
+        let actor_b = test_actor(9, user_id, realm_id);
+        let target = AdminDocumentTarget::User { user_id };
+        for (seq, actor, origin_seq, op) in [
+            (
+                1,
+                &actor_a,
+                1,
+                AdminDocumentOperation::UserNameSet {
+                    name: "Alice".to_string(),
+                },
+            ),
+            (
+                2,
+                &actor_b,
+                1,
+                AdminDocumentOperation::UserNameSet {
+                    name: "Mallory".to_string(),
+                },
+            ),
+            (
+                3,
+                &actor_a,
+                2,
+                AdminDocumentOperation::UserAttributeSet {
+                    key: "department".to_string(),
+                    value: "physics".to_string(),
+                },
+            ),
+            (
+                4,
+                &actor_b,
+                2,
+                AdminDocumentOperation::UserAttributeSet {
+                    key: "department".to_string(),
+                    value: "malware".to_string(),
+                },
+            ),
+        ] {
+            apply_admin_document_operation_to_storage(
+                storage,
+                DocumentSyncTarget::User { user_id },
+                test_admin_event(
+                    Ulid::from_parts(2_500 + seq, 1),
+                    target.clone(),
+                    actor,
+                    origin_seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("conflicting user admin operation applies");
+        }
+        actor_a
     }
 
     async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> User {
@@ -5627,6 +5723,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_name_and_attribute_conflicts_fail_closed_incrementally() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([44; 32]);
+        let user_id = UserId::local(Ulid::from_parts(210, 1), realm_id);
+        let target = AdminDocumentTarget::User { user_id };
+
+        apply_conflicting_user_name_and_attribute(&storage, user_id, realm_id).await;
+
+        let user = read_user_doc(&storage, user_id).await;
+        assert_eq!(user.name, "");
+        assert!(!user.attributes.contains_key("department"));
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(&target, USER_NAME_PATH),
+            )
+            .await
+            .is_some()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(&target, "user.attributes.department"),
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_conflict_overlays_fail_closed_for_legacy_and_revisioned_upserts() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([45; 32]);
+        let user_id = UserId::local(Ulid::from_parts(211, 1), realm_id);
+        let actor = apply_conflicting_user_name_and_attribute(&storage, user_id, realm_id).await;
+
+        let mut legacy = test_user_doc(user_id, "Legacy attacker", &["legacy-subject"]);
+        legacy.attributes = HashMap::from([
+            ("department".to_string(), "legacy-attacker".to_string()),
+            ("legacy-only".to_string(), "preserved".to_string()),
+        ]);
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            legacy.to_bytes(&actor).expect("legacy user serializes"),
+        )
+        .await
+        .expect("legacy conflict overlay applies");
+
+        let merged = read_user_doc(&storage, user_id).await;
+        assert_eq!(merged.name, "");
+        assert!(!merged.attributes.contains_key("department"));
+        assert_eq!(merged.attributes["legacy-only"], "preserved");
+
+        let mut revisioned = test_user_doc(user_id, "Revisioned attacker", &["revisioned-subject"]);
+        revisioned.attributes = HashMap::from([
+            ("department".to_string(), "revisioned-attacker".to_string()),
+            ("revisioned-only".to_string(), "preserved".to_string()),
+        ]);
+        let incoming_change = revision_change_at(None, 1, 212);
+        apply_revisioned_user_upsert_to_storage(
+            &storage,
+            user_id,
+            revisioned
+                .to_bytes(&actor)
+                .expect("revisioned user serializes"),
+            incoming_change,
+        )
+        .await
+        .expect("revisioned conflict overlay applies");
+
+        let merged = read_user_doc(&storage, user_id).await;
+        assert_eq!(merged.name, "");
+        assert!(!merged.attributes.contains_key("department"));
+        assert_eq!(merged.attributes["revisioned-only"], "preserved");
+        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
+    }
+
+    #[tokio::test]
     async fn revisioned_user_successor_upsert_applies_and_writes_sidecar() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([31; 32]);
@@ -6086,6 +6263,120 @@ mod tests {
         assert_eq!(merged.display_name, "Reduced group");
         assert_eq!(merged.realm_id, realm_id);
         assert_eq!(merged.roles, HashSet::from([role_id]));
+    }
+
+    #[tokio::test]
+    async fn late_legacy_group_upsert_does_not_override_conflicted_group_metadata() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([46; 32]);
+        let conflicting_realm_id = RealmId::from_bytes([47; 32]);
+        let legacy_realm_id = RealmId::from_bytes([48; 32]);
+        let group_id = Ulid::from_parts(220, 1);
+        let role_id = Ulid::from_parts(221, 1);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(222, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(223, 1), conflicting_realm_id),
+            conflicting_realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(224, 1),
+                target.clone(),
+                &actor_a,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Safe group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("first group create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(225, 1),
+                target.clone(),
+                &actor_b,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id: conflicting_realm_id,
+                    display_name: "Conflicting group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("conflicting group create applies");
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(&target, GROUP_DISPLAY_NAME_PATH),
+            )
+            .await
+            .is_some()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(&target, GROUP_REALM_ID_PATH),
+            )
+            .await
+            .is_some()
+        );
+
+        let late_legacy = Group {
+            display_name: "Late legacy group".to_string(),
+            group_id,
+            realm_id: legacy_realm_id,
+            roles: HashSet::from([role_id]),
+        };
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::Group { group_id },
+            late_legacy
+                .to_bytes(&actor_a)
+                .expect("legacy group serializes"),
+        )
+        .await
+        .expect("late legacy group upsert applies without conflicted metadata");
+
+        let merged = read_group_doc(&storage, group_id).await;
+        assert_eq!(merged.display_name, "Safe group");
+        assert_eq!(merged.realm_id, realm_id);
+        assert_eq!(merged.roles, HashSet::from([role_id]));
+
+        storage_batch_delete_to(
+            &storage,
+            vec![(GROUP_KEYSPACE.to_string(), group_id.to_bytes().into())],
+        )
+        .await
+        .expect("group doc deletes");
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::Group { group_id },
+            late_legacy
+                .to_bytes(&actor_a)
+                .expect("legacy group serializes"),
+        )
+        .await
+        .expect("legacy conflict payload without safe group is ignored");
+        assert_eq!(
+            read_storage_value(&storage, GROUP_KEYSPACE, group_id.to_bytes().into()).await,
+            None
+        );
     }
 
     #[tokio::test]
