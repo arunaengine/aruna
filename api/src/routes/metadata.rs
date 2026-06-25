@@ -1210,6 +1210,7 @@ pub async fn search_metadata(
         params.q,
         limit,
         params.mode,
+        None,
     )
     .await?;
     Ok((
@@ -2180,6 +2181,7 @@ async fn run_search_distributed(
     query: String,
     limit: usize,
     mode: Option<MetadataQueryMode>,
+    target_nodes: Option<Vec<aruna_core::NodeId>>,
 ) -> ServerResult<(Vec<MetadataSearchHit>, DistributedFanout)> {
     let span = Span::current();
     let total_started = Instant::now();
@@ -2218,10 +2220,20 @@ async fn run_search_distributed(
             }
         }
         MetadataQueryMode::Distributed => {
-            let discovery_started = Instant::now();
-            let nodes =
-                aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state)).await?;
-            record_api_elapsed(&span, "discovery_ms", discovery_started);
+            let nodes = match target_nodes {
+                Some(nodes) => {
+                    span.record("discovery_ms", 0u64);
+                    deduplicate_node_ids(nodes)
+                }
+                None => {
+                    let discovery_started = Instant::now();
+                    let nodes =
+                        aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
+                            .await?;
+                    record_api_elapsed(&span, "discovery_ms", discovery_started);
+                    nodes
+                }
+            };
             span.record("node_count", nodes.len() as u64);
             fanout.nodes_queried = nodes.len();
             let fanout_started = Instant::now();
@@ -3564,6 +3576,28 @@ mod tests {
         test.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn distributed_search_without_forwarded_token_reads_remote_public_metadata_only() {
+        let test = setup_distributed_metadata_access_state().await;
+        test.remote
+            .state
+            .get_ctx()
+            .metadata_handle
+            .as_ref()
+            .unwrap()
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let anonymous = search_remote_metadata_paths(&test, None, None).await;
+        assert_eq!(anonymous.nodes_queried, 1);
+        assert_eq!(anonymous.nodes_failed, 0);
+        assert_contains_search_path(&anonymous.paths, "datasets/remote-public");
+        assert_excludes_search_path(&anonymous.paths, "datasets/remote-private");
+
+        test.shutdown().await;
+    }
+
     #[test]
     fn deduplicates_search_hits_across_replicas() {
         let hits = deduplicate_search_hits(
@@ -3624,6 +3658,12 @@ mod tests {
 
     struct QueryNamesResult {
         names: Vec<String>,
+        nodes_queried: usize,
+        nodes_failed: usize,
+    }
+
+    struct SearchPathsResult {
+        paths: Vec<String>,
         nodes_queried: usize,
         nodes_failed: usize,
     }
@@ -3865,6 +3905,30 @@ mod tests {
         }
     }
 
+    async fn search_remote_metadata_paths(
+        test: &DistributedMetadataAccessState,
+        auth: Option<AuthContext>,
+        bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    ) -> SearchPathsResult {
+        let (hits, fanout) = run_search_distributed(
+            test.coordinator.state.as_ref(),
+            auth,
+            bearer_token,
+            None,
+            "Remote".to_string(),
+            10,
+            Some(MetadataQueryMode::Distributed),
+            Some(vec![test.remote.net.node_id()]),
+        )
+        .await
+        .unwrap();
+        SearchPathsResult {
+            paths: hits.into_iter().map(|hit| hit.document_path).collect(),
+            nodes_queried: fanout.nodes_queried,
+            nodes_failed: fanout.nodes_failed,
+        }
+    }
+
     fn assert_contains_dataset_name(names: &[String], expected: &str) {
         assert!(
             names.iter().any(|name| name.contains(expected)),
@@ -3876,6 +3940,20 @@ mod tests {
         assert!(
             !names.iter().any(|name| name.contains(unexpected)),
             "expected {names:?} not to contain {unexpected:?}"
+        );
+    }
+
+    fn assert_contains_search_path(paths: &[String], expected: &str) {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "expected {paths:?} to contain {expected:?}"
+        );
+    }
+
+    fn assert_excludes_search_path(paths: &[String], unexpected: &str) {
+        assert!(
+            !paths.iter().any(|path| path == unexpected),
+            "expected {paths:?} not to contain {unexpected:?}"
         );
     }
 
