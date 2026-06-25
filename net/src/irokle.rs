@@ -70,6 +70,8 @@ pub const IROKLE_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const IROKLE_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const IROKLE_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const IROKLE_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
+const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
@@ -2353,6 +2355,23 @@ fn overlay_realm_config_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
 ) {
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_METADATA_REPLICATION_PATH)
+        && let Some(metadata_replication) =
+            reducer_state.materialized_realm_config_metadata_replication()
+    {
+        config.metadata_replication = metadata_replication;
+    }
+
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_DISCOVERY_PATH)
+        && let Some(discovery) = reducer_state.materialized_realm_config_discovery()
+    {
+        config.discovery = discovery;
+    }
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -3051,9 +3070,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         AdminDocumentOperation::RealmConfigNodeEnsured { .. }
             | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
             | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
+            | AdminDocumentOperation::RealmConfigSettingsSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure and OIDC provider updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, and settings updates"
                 .to_string(),
         ));
     }
@@ -4012,8 +4032,8 @@ mod tests {
         metadata_registry_key, subject_index_key, subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, OidcProviderConfig, Permission,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        Actor, Group, GroupAuthorizationDocument, MetadataReplicationConfig, OidcProviderConfig,
+        Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
         RealmNodeKind, Role, StaticRealmEndpoint,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -4368,6 +4388,15 @@ mod tests {
         }
     }
 
+    fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscoveryConfig {
+        RealmDiscoveryConfig::Static {
+            endpoints: vec![StaticRealmEndpoint {
+                node_id: node(node_seed).to_string(),
+                endpoint_addr: endpoint_addr.to_string(),
+            }],
+        }
+    }
+
     async fn read_registry_record(
         storage: &StorageHandle,
         key_space: &str,
@@ -4574,6 +4603,327 @@ mod tests {
         assert_eq!(
             reducer_state.materialized_realm_config_nodes()[&reducer_node],
             RealmNodeKind::Management
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_config_settings_admin_op_materializes_existing_config() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([48; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_370, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let legacy_provider = test_oidc_provider("legacy", "legacy-settings");
+        let seed_node = node(20);
+        let mut seed_config = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 3);
+        seed_config.discovery = test_discovery(21, "https://legacy-settings.example:443");
+        seed_config.ensure_node(seed_node, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let metadata_replication = MetadataReplicationConfig::new(9);
+        let discovery = test_discovery(22, "https://reducer-settings.example:443");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_371, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: metadata_replication.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config settings apply");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.metadata_replication, metadata_replication);
+        assert_eq!(config.discovery, discovery);
+        assert_eq!(config.oidc_providers, vec![legacy_provider]);
+        assert_eq!(
+            realm_config_nodes(&config),
+            realm_config_nodes(&seed_config)
+        );
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_metadata_replication(),
+            Some(metadata_replication)
+        );
+        assert_eq!(
+            reducer_state.materialized_realm_config_discovery(),
+            Some(discovery)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_realm_config_settings_ops_store_state_and_conflicts_without_config_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([49; 32]);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_380, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_381, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let first_metadata = MetadataReplicationConfig::new(5);
+        let second_metadata = MetadataReplicationConfig::new(7);
+        let discovery = test_discovery(23, "https://missing-settings.example:443");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_382, 1),
+                target.clone(),
+                &actor_a,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: first_metadata,
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("first realm config settings op applies without config doc");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_383, 1),
+                target.clone(),
+                &actor_b,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: second_metadata,
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("conflicting realm config settings op applies without config doc");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .is_none()
+        );
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_metadata_replication(),
+            None
+        );
+        assert_eq!(
+            reducer_state.materialized_realm_config_discovery(),
+            Some(discovery)
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(
+                    &target,
+                    REALM_CONFIG_METADATA_REPLICATION_PATH,
+                ),
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_legacy_realm_config_upsert_preserves_reducer_settings() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([50; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_390, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let metadata_replication = MetadataReplicationConfig::new(11);
+        let discovery = test_discovery(24, "https://reducer-late-settings.example:443");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_391, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: metadata_replication.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config settings apply without config doc");
+
+        let legacy_provider = test_oidc_provider("legacy", "legacy-late-settings");
+        let legacy_node = node(25);
+        let mut late_legacy = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 3);
+        late_legacy.discovery = test_discovery(26, "https://legacy-late-settings.example:443");
+        late_legacy.ensure_node(legacy_node, RealmNodeKind::Server);
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            document_target,
+            late_legacy
+                .to_bytes(&actor)
+                .expect("legacy realm config serializes"),
+        )
+        .await
+        .expect("late legacy realm config upsert overlays reducer settings");
+
+        let merged = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(merged.metadata_replication, metadata_replication);
+        assert_eq!(merged.discovery, discovery);
+        assert_eq!(merged.oidc_providers, vec![legacy_provider]);
+        assert_eq!(
+            realm_config_nodes(&merged),
+            BTreeMap::from([(legacy_node.to_string(), RealmNodeKind::Server)])
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_realm_config_settings_conflict_withholds_conflicted_metadata() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([51; 32]);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_400, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(1_401, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let first_metadata = MetadataReplicationConfig::new(5);
+        let second_metadata = MetadataReplicationConfig::new(7);
+        let discovery = test_discovery(27, "https://conflict-settings.example:443");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_402, 1),
+                target.clone(),
+                &actor_a,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: first_metadata.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("first realm config settings op applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_403, 1),
+                target.clone(),
+                &actor_b,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: second_metadata.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("conflicting realm config settings op applies");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.metadata_replication, first_metadata);
+        assert_ne!(config.metadata_replication, second_metadata);
+        assert_eq!(config.discovery, discovery);
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_metadata_replication(),
+            None
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(
+                    &target,
+                    REALM_CONFIG_METADATA_REPLICATION_PATH,
+                ),
+            )
+            .await
+            .is_some()
         );
     }
 
