@@ -1,14 +1,13 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_KEYSPACE;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
-use aruna_core::structs::{Realm, RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::get_realm_description::{
+    GetRealmDescriptionError, GetRealmDescriptionOperation,
+};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -346,29 +345,16 @@ fn map_realm_info_response(
 }
 
 async fn load_realm_description(state: &ServerState) -> ServerResult<Option<String>> {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: REALM_KEYSPACE.to_string(),
-            key: state.get_realm_id().as_bytes().to_vec().into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Realm::from_bytes(&bytes)
-            .map(|realm| Some(realm.description))
-            .map_err(|error| ServerError::InternalError(error.to_string())),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
+    drive(
+        GetRealmDescriptionOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_realm_description_error)
+}
+
+fn map_realm_description_error(error: GetRealmDescriptionError) -> ServerError {
+    ServerError::InternalError(error.to_string())
 }
 
 async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_core::NodeId> {

@@ -12,164 +12,7 @@ const PATTERNS: &[&str] = &[
     "NetEffect::",
 ];
 
-const ALLOWLIST: &[(&str, usize, &str, &str)] = &[
-    (
-        "src/routes/users.rs",
-        259,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/users.rs",
-        290,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/users.rs",
-        327,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/users.rs",
-        355,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/users.rs",
-        1107,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/users.rs",
-        1197,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/users.rs",
-        1467,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/users.rs",
-        1619,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1331,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1352,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Read {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1433,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1458,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1484,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1512,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/s3/s3_service.rs",
-        1524,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/staging.rs",
-        596,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/onboarding.rs",
-        851,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/onboarding.rs",
-        868,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/info.rs",
-        352,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/info.rs",
-        780,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Read {",
-    ),
-    (
-        "src/routes/connectors.rs",
-        405,
-        "send_effect",
-        ".send_effect(read_connector_secret_effect(connector_id, None))",
-    ),
-    (
-        "src/routes/connectors.rs",
-        718,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/metadata.rs",
-        2768,
-        "send_effect",
-        "match ctx.storage_handle.send_effect(effect).await {",
-    ),
-    (
-        "src/routes/metadata.rs",
-        2775,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::BatchDelete {",
-    ),
-    (
-        "src/routes/metadata.rs",
-        4005,
-        "send_effect|StorageEffect::",
-        ".send_effect(Effect::Storage(StorageEffect::Write {",
-    ),
-    (
-        "src/routes/metadata.rs",
-        4024,
-        "send_storage_effect|StorageEffect::",
-        ".send_storage_effect(StorageEffect::Read {",
-    ),
-];
+const ALLOWLIST: &[(&str, usize, &str, &str)] = &[];
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GuardMatch {
@@ -191,7 +34,7 @@ fn api_routes_and_s3_direct_side_effects_stay_allowlisted() {
     if !unexpected.is_empty() || !stale.is_empty() {
         panic!(
             "API direct side-effect orchestration allowlist drifted. \
-             Refactor new matches out of api routes/S3, or update the temporary allowlist.\n\n\
+             Refactor production matches out of api routes/S3 instead of extending the allowlist.\n\n\
              Unexpected matches:\n{}\nStale allowlist entries:\n{}",
             format_matches(&unexpected),
             format_matches(&stale),
@@ -249,24 +92,62 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
         .to_string_lossy()
         .replace('\\', "/");
 
-    contents
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
+    let mut matches = Vec::new();
+    let mut pending_cfg_test = false;
+    let mut test_module_depth = None;
+    let mut brace_depth = 0usize;
+
+    for (index, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        let starts_cfg_test = trimmed == "#[cfg(test)]";
+        let starts_test_module = pending_cfg_test && is_module_declaration(trimmed);
+        let in_test_module = test_module_depth.is_some() || starts_test_module;
+
+        if !in_test_module {
             let patterns = PATTERNS
                 .iter()
                 .copied()
                 .filter(|pattern| line.contains(pattern))
                 .collect::<Vec<_>>();
 
-            (!patterns.is_empty()).then(|| GuardMatch {
-                path: relative_path.clone(),
-                line: index + 1,
-                patterns: patterns.join("|"),
-                text: line.trim().to_owned(),
-            })
-        })
-        .collect()
+            if !patterns.is_empty() {
+                matches.push(GuardMatch {
+                    path: relative_path.clone(),
+                    line: index + 1,
+                    patterns: patterns.join("|"),
+                    text: line.trim().to_owned(),
+                });
+            }
+        }
+
+        let previous_depth = brace_depth;
+        brace_depth = brace_depth
+            .saturating_add(line.matches('{').count())
+            .saturating_sub(line.matches('}').count());
+
+        if starts_test_module {
+            test_module_depth = Some(previous_depth);
+        }
+        if test_module_depth.is_some_and(|depth| brace_depth <= depth) {
+            test_module_depth = None;
+        }
+
+        if starts_cfg_test {
+            pending_cfg_test = true;
+        } else if pending_cfg_test
+            && !trimmed.is_empty()
+            && !trimmed.starts_with("#[")
+            && !trimmed.starts_with("//")
+        {
+            pending_cfg_test = false;
+        }
+    }
+
+    matches
+}
+
+fn is_module_declaration(line: &str) -> bool {
+    (line.starts_with("mod test") || line.starts_with("mod tests")) && line.contains('{')
 }
 
 fn format_matches(matches: &[&GuardMatch]) -> String {

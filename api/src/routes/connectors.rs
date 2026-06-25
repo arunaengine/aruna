@@ -6,7 +6,6 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::handle::Handle;
 use aruna_core::structs::{AuthContext, Permission, SourceConnector, SourceConnectorKind};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::connectors::create_source_connector::{
@@ -18,14 +17,14 @@ use aruna_operations::connectors::delete_source_connector::{
 use aruna_operations::connectors::get_source_connector::{
     GetSourceConnectorError, GetSourceConnectorInput, GetSourceConnectorOperation,
 };
+use aruna_operations::connectors::has_secret_config::{
+    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
+};
 use aruna_operations::connectors::list_source_connectors::{
     ListSourceConnectorsError, ListSourceConnectorsInput, ListSourceConnectorsOperation,
 };
 use aruna_operations::connectors::replace_source_connector::{
     ReplaceSourceConnectorError, ReplaceSourceConnectorInput, ReplaceSourceConnectorOperation,
-};
-use aruna_operations::connectors::repository::{
-    parse_connector_secret_read, read_connector_secret_effect,
 };
 use aruna_operations::driver::drive;
 use axum::extract::{Path, State};
@@ -399,15 +398,16 @@ async fn connector_has_secret_config(
     state: &ServerState,
     connector_id: Ulid,
 ) -> ServerResult<bool> {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_effect(read_connector_secret_effect(connector_id, None))
-        .await;
+    drive(
+        ConnectorHasSecretConfigOperation::new(connector_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_connector_secret_config_error)
+}
 
-    parse_connector_secret_read(event)
-        .map(|secret| secret.is_some())
-        .map_err(|err| ServerError::InternalError(err.to_string()))
+fn map_connector_secret_config_error(error: ConnectorHasSecretConfigError) -> ServerError {
+    ServerError::InternalError(error.to_string())
 }
 
 fn map_connector_response(

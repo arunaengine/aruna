@@ -1,19 +1,19 @@
 use crate::auth::{OidcIdentity, bearer_token};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, Role, User,
 };
-use aruna_core::{AUTH_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::drive;
+use aruna_operations::ensure_canonical_user_token_subject::{
+    EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
+};
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
 use aruna_operations::get_user::{GetUserInput, GetUserOperation};
@@ -22,6 +22,10 @@ use aruna_operations::inspect_onboarding_secret::{
 };
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
+use aruna_operations::read_realm_authorization::{
+    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
+};
+use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
@@ -29,7 +33,6 @@ use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use byteview::ByteView;
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -253,125 +256,48 @@ async fn ensure_canonical_user_token_subject(
     state: &Arc<ServerState>,
     user_id: UserId,
 ) -> ServerResult<()> {
-    let ctx = state.get_ctx();
-    let user = match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => User::from_bytes(&bytes)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            return Err(ServerError::Unauthorized);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            return Err(ServerError::InternalError(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    if user.user_id != user_id {
-        return Err(ServerError::Unauthorized);
-    }
-
-    for subject_id in &user.subject_ids {
-        match ctx
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                key: ByteView::from(subject_id.as_bytes().to_vec()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => {
-                let indexed_user_id = UserId::from_storage_key(&bytes)
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-                if indexed_user_id != user_id {
-                    return Err(ServerError::Forbidden);
-                }
-            }
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                return Err(ServerError::Forbidden);
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(ServerError::InternalError(error.to_string()));
-            }
-            other => {
-                return Err(ServerError::InternalError(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
+    drive(
+        EnsureCanonicalUserTokenSubjectOperation::new(user_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_canonical_subject_error)
 }
 
 async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
-            txn_id: None,
-        }))
+    drive(ReadUserDocumentOperation::new(user_id), &state.get_ctx())
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => {
-            User::from_bytes(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(ServerError::NotFound),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
+        .map_err(map_read_user_document_error)
 }
 
 async fn read_realm_authorization(
     state: &ServerState,
 ) -> ServerResult<Option<RealmAuthorizationDocument>> {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key: ByteView::from(state.get_realm_id().as_bytes().to_vec()),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => RealmAuthorizationDocument::from_bytes(&bytes)
-            .map(Some)
-            .map_err(|error| ServerError::InternalError(error.to_string())),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
+    drive(
+        ReadRealmAuthorizationOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_read_realm_authorization_error)
+}
+
+fn map_canonical_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> ServerError {
+    match error {
+        EnsureCanonicalUserTokenSubjectError::Unauthorized => ServerError::Unauthorized,
+        EnsureCanonicalUserTokenSubjectError::Forbidden => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
     }
+}
+
+fn map_read_user_document_error(error: ReadUserDocumentError) -> ServerError {
+    match error {
+        ReadUserDocumentError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+fn map_read_realm_authorization_error(error: ReadRealmAuthorizationError) -> ServerError {
+    ServerError::InternalError(error.to_string())
 }
 
 fn collect_user_realm_roles(
