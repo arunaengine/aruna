@@ -388,41 +388,45 @@ async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Res
 
     let public_a = visibility_record(group_id, "datasets/search-public-a", true);
     let public_b = visibility_record(group_id, "datasets/search-public-b", true);
-    let private = visibility_record(group_id, "datasets/search-private", false);
-    let deleted = visibility_record(group_id, "datasets/search-deleted", true);
-    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::new());
+    let mut records = vec![public_a.clone(), public_b.clone()];
+    let mut private_graphs = Vec::new();
+    let mut deleted_records = Vec::new();
+    let mut unregistered_graphs = Vec::new();
 
-    create_crate(
-        &harness,
-        &private.graph_iri,
-        &repeated_search_name(marker, "private", 32),
-    )
-    .await?;
-    create_crate(
-        &harness,
-        &deleted.graph_iri,
-        &repeated_search_name(marker, "deleted", 32),
-    )
-    .await?;
-    create_crate(
-        &harness,
-        &unregistered_iri,
-        &repeated_search_name(marker, "unregistered", 32),
-    )
-    .await?;
+    for index in 0..24 {
+        let private = visibility_record(
+            group_id,
+            &format!("datasets/search-private-{index:02}"),
+            false,
+        );
+        let private_name = repeated_search_name(marker, &format!("private-{index:02}"), 32);
+        create_crate(&harness, &private.graph_iri, &private_name).await?;
+        private_graphs.push(private.graph_iri.clone());
+        records.push(private);
+
+        let deleted = visibility_record(
+            group_id,
+            &format!("datasets/search-deleted-{index:02}"),
+            true,
+        );
+        let deleted_name = repeated_search_name(marker, &format!("deleted-{index:02}"), 32);
+        create_crate(&harness, &deleted.graph_iri, &deleted_name).await?;
+        deleted_records.push(deleted.clone());
+        records.push(deleted);
+
+        let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::new());
+        let unregistered_name =
+            repeated_search_name(marker, &format!("unregistered-{index:02}"), 32);
+        create_crate(&harness, &unregistered_iri, &unregistered_name).await?;
+        unregistered_graphs.push(unregistered_iri);
+    }
+
     create_crate(&harness, &public_a.graph_iri, &format!("public a {marker}")).await?;
     create_crate(&harness, &public_b.graph_iri, &format!("public b {marker}")).await?;
-    write_registry_records(
-        &harness,
-        &[
-            public_a.clone(),
-            public_b.clone(),
-            private.clone(),
-            deleted.clone(),
-        ],
-    )
-    .await?;
-    write_deleted_lifecycle(&harness, &deleted).await?;
+    write_registry_records(&harness, &records).await?;
+    for deleted in &deleted_records {
+        write_deleted_lifecycle(&harness, deleted).await?;
+    }
 
     harness.handle.flush_search_updates().await?;
     let hits = search_graph_iris(&harness, None, None, marker, 2).await?;
@@ -430,9 +434,13 @@ async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Res
     assert_eq!(hits.len(), 2, "search should fill the visible limit");
     assert!(hits.contains(&public_a.graph_iri));
     assert!(hits.contains(&public_b.graph_iri));
-    assert!(!hits.contains(&private.graph_iri));
-    assert!(!hits.contains(&deleted.graph_iri));
-    assert!(!hits.contains(&unregistered_iri));
+    for graph_iri in private_graphs
+        .iter()
+        .chain(deleted_records.iter().map(|record| &record.graph_iri))
+        .chain(unregistered_graphs.iter())
+    {
+        assert!(!hits.contains(graph_iri));
+    }
     Ok(())
 }
 
@@ -443,16 +451,21 @@ async fn search_honors_explicit_graph_filter_before_visible_limit() -> Result<()
     let group_id = harness.group_id;
 
     let inside = visibility_record(group_id, "datasets/search-filter-inside", true);
-    let outside = visibility_record(group_id, "datasets/search-filter-outside", true);
+    let mut records = vec![inside.clone()];
 
-    create_crate(
-        &harness,
-        &outside.graph_iri,
-        &repeated_search_name(marker, "outside", 32),
-    )
-    .await?;
+    for index in 0..70 {
+        let outside = visibility_record(
+            group_id,
+            &format!("datasets/search-filter-outside-{index:02}"),
+            true,
+        );
+        let outside_name = repeated_search_name(marker, &format!("outside-{index:02}"), 32);
+        create_crate(&harness, &outside.graph_iri, &outside_name).await?;
+        records.push(outside);
+    }
+
     create_crate(&harness, &inside.graph_iri, &format!("inside {marker}")).await?;
-    write_registry_records(&harness, &[inside.clone(), outside.clone()]).await?;
+    write_registry_records(&harness, &records).await?;
 
     harness.handle.flush_search_updates().await?;
     let hits = search_graph_iris(

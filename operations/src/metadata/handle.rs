@@ -33,9 +33,9 @@ use async_trait::async_trait;
 use byteview::ByteView;
 use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
-    Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
-    CraqleOptions, CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId,
-    GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
+    Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
+    CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
+    CreateEntityRequest, GraphId, GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
 };
 use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
@@ -582,7 +582,10 @@ impl MetadataHandle {
         let actor = ActorId::from_bytes(*node_id.as_bytes());
         let options = CraqleOptions::new()
             .with_actor(actor)
-            .with_search_storage(metadata_options.search_storage.into());
+            .with_search_storage(metadata_options.search_storage.into())
+            .with_graph_store_persist_mode(craqle_fjall_persist_mode(
+                metadata_options.irokle_persist_policy,
+            ));
         let options = match irokle_node {
             Some(irokle_node) => options.with_irokle(irokle_node, CraqleIrokleOptions::new()),
             None => options,
@@ -3171,6 +3174,13 @@ fn craqle_request_durability(durability: MetadataRequestDurability) -> CraqleReq
     }
 }
 
+fn craqle_fjall_persist_mode(policy: FjallPersistPolicy) -> CraqleFjallPersistMode {
+    match policy {
+        FjallPersistPolicy::Buffer => CraqleFjallPersistMode::Buffer,
+        FjallPersistPolicy::SyncAll => CraqleFjallPersistMode::SyncAll,
+    }
+}
+
 fn craqle_graph_policy(policy: MetadataGraphPolicy) -> GraphPolicy {
     GraphPolicy {
         public: policy.public,
@@ -3703,11 +3713,14 @@ async fn search_local_graphs(
         .map(|record| (record.graph_iri.clone(), record))
         .collect();
     let allowed_graphs = by_graph.keys().cloned().collect::<HashSet<_>>();
+    let mut search_graphs = allowed_graphs.iter().cloned().collect::<Vec<_>>();
+    search_graphs.sort_unstable();
+    let graph_ids = graph_ids(&search_graphs);
 
     let search_span = debug_span!(
         "metadata.backend.craqle.search",
         lazy = false,
-        graph_count = allowed_graphs.len() as u64,
+        graph_count = graph_ids.len() as u64,
         query_len = query.len() as u64,
         limit = limit as u64,
         elapsed_ms = field::Empty,
@@ -3722,12 +3735,9 @@ async fn search_local_graphs(
             let authorizer = AllowedGraphAuthorizer {
                 graph_iris: allowed_graphs,
             };
-            // Craqle currently lacks a public multi-graph filtered search API;
-            // this is the earliest available authorization hook before its
-            // public search limit, with the Aruna mapping below kept defensive.
             let hits = inner
                 .node
-                .search(&authorizer, &query, limit)
+                .search_graphs(&authorizer, &graph_ids, &query, limit)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
             let mut visible = hits
                 .into_iter()
@@ -4199,6 +4209,11 @@ mod tests {
         )
         .expect("metadata handle opens");
 
+        assert_eq!(
+            metadata_handle.inner.node.graph_store_persist_mode(),
+            CraqleFjallPersistMode::Buffer
+        );
+
         metadata_handle
             .flush_persistence()
             .await
@@ -4227,6 +4242,11 @@ mod tests {
                 .with_irokle_persist_policy(FjallPersistPolicy::SyncAll),
         )
         .expect("metadata handle opens");
+
+        assert_eq!(
+            metadata_handle.inner.node.graph_store_persist_mode(),
+            CraqleFjallPersistMode::SyncAll
+        );
 
         metadata_handle
             .flush_persistence()
