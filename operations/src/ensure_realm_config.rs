@@ -60,6 +60,9 @@ enum EnsureRealmConfigState {
     DeleteStaleAdminConflicts {
         document: RealmConfigDocument,
     },
+    CommitNoop {
+        document: RealmConfigDocument,
+    },
     CommitTransaction {
         document: RealmConfigDocument,
     },
@@ -188,6 +191,18 @@ impl EnsureRealmConfigOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+        if previous_reducer_state.as_ref().is_some_and(|state| {
+            realm_config_node_ensure_is_noop(
+                &document,
+                state,
+                &self.config.target_node_id,
+                &self.config.target_node_kind,
+            )
+        }) {
+            self.output = Some(Ok(document.clone()));
+            return Ok(self.emit_commit_noop(document));
+        }
+
         let admin_event = apply_realm_config_node_ensure(
             &mut reducer_state,
             &self.config.actor,
@@ -231,6 +246,14 @@ impl EnsureRealmConfigOperation {
             writes,
             txn_id: Some(txn_id),
         })])
+    }
+
+    fn emit_commit_noop(&mut self, document: RealmConfigDocument) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(EnsureRealmConfigError::MissingTransaction);
+        };
+        self.state = EnsureRealmConfigState::CommitNoop { document };
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
@@ -340,6 +363,18 @@ impl Operation for EnsureRealmConfigOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            },
+            EnsureRealmConfigState::CommitNoop { .. } => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
+                    self.state = EnsureRealmConfigState::Finish;
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             EnsureRealmConfigState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -523,6 +558,31 @@ fn overlay_realm_config_reducer_materialization(
     }
 }
 
+fn realm_config_node_ensure_is_noop(
+    document: &RealmConfigDocument,
+    reducer_state: &AdminDocumentReducerState,
+    node_id: &NodeId,
+    kind: &RealmNodeKind,
+) -> bool {
+    let path = realm_config_node_path(node_id);
+    !reducer_state.conflicts.contains_key(&path)
+        && reducer_state
+            .materialized_realm_config_nodes()
+            .get(node_id)
+            .is_some_and(|materialized_kind| materialized_kind == kind)
+        && realm_config_document_has_node_kind(document, node_id, kind)
+}
+
+fn realm_config_document_has_node_kind(
+    document: &RealmConfigDocument,
+    node_id: &NodeId,
+    kind: &RealmNodeKind,
+) -> bool {
+    let node_id = node_id.to_string();
+    let mut matches = document.nodes.iter().filter(|node| node.node_id == node_id);
+    matches.next().is_some_and(|node| node.kind == *kind) && matches.all(|node| node.kind == *kind)
+}
+
 fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
     let node_id = node_id.to_string();
     config.nodes.retain(|node| node.node_id != node_id);
@@ -543,7 +603,8 @@ mod tests {
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
     use aruna_core::admin_documents::{
-        AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget,
+        AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
+        AdminDocumentTarget,
     };
     use aruna_core::document::{
         DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
@@ -706,6 +767,61 @@ mod tests {
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
         assert_eq!(stored.nodes.len(), 1);
         assert!(stored.has_node(actor.node_id));
+    }
+
+    #[test]
+    fn repeated_ensure_does_not_write_admin_outbox_event() {
+        let realm_id = RealmId::from_bytes([10; 32]);
+        let actor = actor(10, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut previous_state = AdminDocumentReducerState::new(target.clone());
+        previous_state
+            .apply(&AdminDocumentEvent {
+                event_id: Ulid::from_bytes([10; 16]),
+                target,
+                origin_node_id: actor.node_id,
+                origin_seq: 1,
+                observed: AdminDocumentClock::default(),
+                actor: actor.clone(),
+                op: AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: actor.node_id,
+                    kind: RealmNodeKind::Management,
+                },
+            })
+            .unwrap();
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+
+        let mut operation = EnsureRealmConfigOperation::new(config(actor.clone(), 3));
+        let txn_id = TxnId::new();
+        operation.txn_id = Some(txn_id);
+        let effects = operation
+            .emit_write_document_and_admin_state(
+                Some(document.to_bytes(&actor).unwrap().into()),
+                Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            effects.first(),
+            Some(&Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id
+            }))
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Storage(StorageEffect::BatchWrite { writes, .. })
+                if writes
+                    .iter()
+                    .any(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        )));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap(), document);
     }
 
     #[test]

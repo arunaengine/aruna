@@ -2959,28 +2959,28 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let mut config = previous_config
-        .unwrap_or_else(|| RealmConfigDocument::default_for_realm(realm_id, Vec::new()));
-    if config.realm_id != realm_id {
-        return Err(NetError::Bootstrap(format!(
-            "stored realm config document id {realm_id} does not match payload realm id {}",
-            config.realm_id
-        )));
-    }
-    overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
-
-    let mut writes = vec![
-        (
+    let mut writes = Vec::new();
+    if let Some(mut config) = previous_config {
+        if config.realm_id != realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "stored realm config document id {realm_id} does not match payload realm id {}",
+                config.realm_id
+            )));
+        }
+        overlay_realm_config_reducer_materialization(&mut config, &reducer_state);
+        writes.push((
             document_target.storage_keyspace().to_string(),
             document_target.storage_key(),
             config
                 .to_bytes(&event.actor)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .into(),
-        ),
+        ));
+    }
+    writes.push(
         admin_document_reducer_state_write_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    ];
+    );
     writes.extend(
         admin_document_conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -4267,6 +4267,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_realm_config_admin_op_stores_reducer_state_without_config_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([40; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_290, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let reducer_node = node(10);
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_291, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: reducer_node,
+                    kind: RealmNodeKind::Management,
+                },
+            ),
+        )
+        .await
+        .expect("realm config node ensure applies without config doc");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .is_none()
+        );
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_nodes()[&reducer_node],
+            RealmNodeKind::Management
+        );
+    }
+
+    #[tokio::test]
     async fn realm_config_node_ensure_admin_ops_merge_nodes() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([41; 32]);
@@ -4279,6 +4333,20 @@ mod tests {
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
         let first_node = node(11);
         let second_node = node(12);
+
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
 
         for (seq, node_id, kind) in [
             (1, first_node, RealmNodeKind::Management),
@@ -4401,6 +4469,20 @@ mod tests {
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
         let conflicted_node = node(15);
+
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
 
         apply_admin_document_operation_to_storage(
             &storage,
