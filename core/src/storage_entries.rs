@@ -5,15 +5,16 @@ use crate::NodeId;
 use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
+    DocumentSyncTarget,
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-    DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     USER_SUBJECT_INDEX_KEYSPACE,
@@ -121,6 +122,14 @@ pub fn metadata_pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
 }
 
 pub fn document_sync_revision_key(target: &DocumentSyncTarget) -> Key {
+    document_sync_target_sidecar_key(target)
+}
+
+pub fn document_sync_conflict_key(target: &DocumentSyncTarget) -> Key {
+    document_sync_target_sidecar_key(target)
+}
+
+fn document_sync_target_sidecar_key(target: &DocumentSyncTarget) -> Key {
     let storage_key = target.storage_key();
     let keyspace = target.storage_keyspace().as_bytes();
     let mut bytes = Vec::with_capacity(keyspace.len() + 1 + storage_key.as_ref().len());
@@ -274,6 +283,17 @@ pub fn document_sync_revision_write_entry(
         DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
         document_sync_revision_key(target),
         postcard::to_allocvec(change)?.into(),
+    ))
+}
+
+pub fn document_sync_conflict_write_entry(
+    target: &DocumentSyncTarget,
+    conflict: &DocumentSyncConflict,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_SYNC_CONFLICT_KEYSPACE.to_string(),
+        document_sync_conflict_key(target),
+        postcard::to_allocvec(conflict)?.into(),
     ))
 }
 
@@ -478,7 +498,8 @@ mod tests {
     use super::{
         admin_document_conflict_write_entries, admin_document_reducer_conflict_key,
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
-        admin_document_reducer_state_write_entry, document_sync_revision_key,
+        admin_document_reducer_state_write_entry, document_sync_conflict_key,
+        document_sync_conflict_write_entry, document_sync_revision_key,
         document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
     };
     use crate::admin_document_reducer::{
@@ -487,11 +508,12 @@ mod tests {
     };
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
+        DocumentSyncTarget,
     };
     use crate::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_REVISION_KEYSPACE,
+        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
     };
     use crate::structs::RealmId;
     use crate::{NodeId, UserId};
@@ -637,6 +659,38 @@ mod tests {
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, document_sync_revision_key(&target));
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn document_sync_conflict_write_entry_roundtrips() {
+        let target = DocumentSyncTarget::User {
+            user_id: user_id(8),
+        };
+        let local_change = DocumentSyncChange {
+            base: None,
+            current: revision(1, 1),
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+        let incoming_change = DocumentSyncChange {
+            base: None,
+            current: revision(2, 2),
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+        let conflict = DocumentSyncConflict {
+            target: target.clone(),
+            local_change: Some(local_change),
+            local_bytes: Some(vec![1, 2]),
+            incoming_change,
+            incoming_bytes: vec![3, 4],
+        };
+
+        let (keyspace, key, value) =
+            document_sync_conflict_write_entry(&target, &conflict).unwrap();
+        let decoded: DocumentSyncConflict = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, DOCUMENT_SYNC_CONFLICT_KEYSPACE);
+        assert_eq!(key, document_sync_conflict_key(&target));
+        assert_eq!(decoded, conflict);
     }
 
     #[test]

@@ -10,8 +10,9 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish,
-    DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent, document_sync_apply_decision,
+    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncConflict, DocumentSyncEvent,
+    DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent,
+    document_sync_apply_decision,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -25,14 +26,14 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, document_sync_revision_key,
-    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
-    metadata_document_lifecycle_key, metadata_document_lifecycle_revision_change,
-    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
-    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
-    metadata_registry_delete_entries, metadata_registry_write_entries,
-    stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
-    subject_index_writes,
+    admin_document_reducer_state_write_entry, document_sync_conflict_write_entry,
+    document_sync_revision_key, document_sync_revision_write_entry,
+    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
+    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
+    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
+    metadata_registry_write_entries, stale_admin_document_conflict_delete_entries,
+    stale_subject_index_deletes, subject_index_writes,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument,
@@ -2009,15 +2010,17 @@ async fn apply_revisioned_user_upsert_to_storage(
     .map(|bytes| postcard::from_bytes::<DocumentSyncChange>(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let previous_user = storage_read_from(
+    let previous_user_bytes = storage_read_from(
         storage,
         target.storage_keyspace().to_string(),
         target.storage_key(),
     )
-    .await?
-    .map(|bytes| User::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    .await?;
+    let previous_user = previous_user_bytes
+        .as_ref()
+        .map(|bytes| User::from_bytes(bytes.as_ref()))
+        .transpose()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let admin_target = AdminDocumentTarget::User { user_id };
     let reducer_state = storage_read_from(
         storage,
@@ -2038,9 +2041,26 @@ async fn apply_revisioned_user_upsert_to_storage(
 
     match document_sync_apply_decision(local_change.as_ref(), &change) {
         DocumentSyncApplyDecision::Apply => {}
-        DocumentSyncApplyDecision::SkipStale
-        | DocumentSyncApplyDecision::SkipTombstoned
-        | DocumentSyncApplyDecision::Conflict => return Ok(()),
+        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => {
+            return Ok(());
+        }
+        DocumentSyncApplyDecision::Conflict => {
+            let conflict = DocumentSyncConflict {
+                target: target.clone(),
+                local_change,
+                local_bytes: previous_user_bytes.map(|bytes| bytes.as_ref().to_vec()),
+                incoming_change: change,
+                incoming_bytes: bytes,
+            };
+            return storage_batch_write_to(
+                storage,
+                vec![
+                    document_sync_conflict_write_entry(&target, &conflict)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                ],
+            )
+            .await;
+        }
     }
 
     let primary_bytes = if let Some(reducer_state) = reducer_state.as_ref() {
@@ -3974,20 +3994,22 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
-    use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
+    use aruna_core::document::{
+        DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
+    };
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
-        USER_SUBJECT_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-        metadata_document_key, metadata_event_log_key, metadata_registry_key, subject_index_key,
-        subject_index_value,
+        document_sync_conflict_key, metadata_document_key, metadata_event_log_key,
+        metadata_registry_key, subject_index_key, subject_index_value,
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, OidcProviderConfig, Permission,
@@ -4230,6 +4252,20 @@ mod tests {
         .await
         .expect("user revision exists");
         postcard::from_bytes(&value).expect("user revision decodes")
+    }
+
+    async fn read_user_conflict(
+        storage: &StorageHandle,
+        user_id: UserId,
+    ) -> Option<DocumentSyncConflict> {
+        let target = DocumentSyncTarget::User { user_id };
+        read_storage_value(
+            storage,
+            DOCUMENT_SYNC_CONFLICT_KEYSPACE,
+            document_sync_conflict_key(&target),
+        )
+        .await
+        .map(|value| postcard::from_bytes(&value).expect("user conflict decodes"))
     }
 
     fn test_user_doc(user_id: UserId, name: &str, subjects: &[&str]) -> User {
@@ -5259,10 +5295,11 @@ mod tests {
             .await,
             None
         );
+        assert_eq!(read_user_conflict(&storage, user_id).await, None);
     }
 
     #[tokio::test]
-    async fn revisioned_user_unbased_concurrent_upsert_skips_without_overwrite() {
+    async fn revisioned_user_unbased_concurrent_upsert_records_conflict_without_overwrite() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([33; 32]);
         let user_id = UserId::local(Ulid::from_parts(203, 1), realm_id);
@@ -5292,6 +5329,20 @@ mod tests {
             )
             .await,
             None
+        );
+        let conflict = read_user_conflict(&storage, user_id)
+            .await
+            .expect("conflict sidecar exists");
+        assert_eq!(conflict.target, DocumentSyncTarget::User { user_id });
+        assert_eq!(conflict.local_change, Some(local_change));
+        assert_eq!(
+            conflict.local_bytes,
+            Some(local.to_bytes(&actor).expect("local serializes"))
+        );
+        assert_eq!(conflict.incoming_change, concurrent_change);
+        assert_eq!(
+            conflict.incoming_bytes,
+            concurrent.to_bytes(&actor).expect("concurrent serializes")
         );
     }
 

@@ -101,6 +101,15 @@ pub struct DocumentSyncChange {
     pub kind: DocumentSyncChangeKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSyncConflict {
+    pub target: DocumentSyncTarget,
+    pub local_change: Option<DocumentSyncChange>,
+    pub local_bytes: Option<Vec<u8>>,
+    pub incoming_change: DocumentSyncChange,
+    pub incoming_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentSyncChangeKind {
     Upsert,
