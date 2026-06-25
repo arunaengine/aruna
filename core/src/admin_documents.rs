@@ -140,6 +140,10 @@ pub enum AdminDocumentOperation {
         metadata_replication: MetadataReplicationConfig,
         discovery: RealmDiscoveryConfig,
     },
+    GroupCreated {
+        realm_id: RealmId,
+        display_name: String,
+    },
 }
 
 #[cfg(test)]
@@ -207,6 +211,7 @@ mod tests {
     fn admin_document_operation_postcard_discriminants_preserve_legacy_order() {
         let role_id = role_id(1);
         let user_id = user_id(2);
+        let realm_id = RealmId::from_bytes([9; 32]);
         let operations = [
             (AdminDocumentOperation::GroupRoleAdded { role_id }, 0),
             (
@@ -297,6 +302,13 @@ mod tests {
                 },
                 16,
             ),
+            (
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Engineering".to_string(),
+                },
+                17,
+            ),
         ];
 
         for (op, discriminant) in operations {
@@ -363,6 +375,16 @@ mod tests {
             discovery: RealmDiscoveryConfig::Static {
                 endpoints: Vec::new(),
             },
+        };
+
+        assert_eq!(postcard_roundtrip(operation.clone()), operation);
+    }
+
+    #[test]
+    fn group_created_operation_roundtrips() {
+        let operation = AdminDocumentOperation::GroupCreated {
+            realm_id: RealmId::from_bytes([9; 32]),
+            display_name: "Engineering".to_string(),
         };
 
         assert_eq!(postcard_roundtrip(operation.clone()), operation);

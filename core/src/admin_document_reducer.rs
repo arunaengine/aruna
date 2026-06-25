@@ -11,7 +11,7 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmNodeKind,
+    MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -94,6 +94,15 @@ impl AdminDocumentReducerState {
         }
 
         match (&event.target, &event.op) {
+            (
+                AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name,
+                },
+            ) => {
+                self.apply_group_created(event, realm_id, display_name);
+            }
             (
                 AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupRoleAdded { role_id },
@@ -256,6 +265,27 @@ impl AdminDocumentReducerState {
                     .map(|value| (key.clone(), value.clone()))
             })
             .collect()
+    }
+
+    pub fn materialized_group_display_name(&self) -> Option<String> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(GROUP_DISPLAY_NAME_PATH)
+            .and_then(|version| version.value.clone())
+    }
+
+    pub fn materialized_group_realm_id(&self) -> Option<RealmId> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(GROUP_REALM_ID_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| RealmId::from_base64(value).ok())
     }
 
     pub fn materialized_group_roles(&self) -> BTreeSet<RoleId> {
@@ -445,6 +475,33 @@ impl AdminDocumentReducerState {
             }
             None => {
                 self.user_attributes.remove(key);
+            }
+        }
+    }
+
+    fn apply_group_created(
+        &mut self,
+        event: &AdminDocumentEvent,
+        realm_id: &RealmId,
+        display_name: &str,
+    ) {
+        self.apply_group_field(
+            event,
+            GROUP_DISPLAY_NAME_PATH,
+            Some(display_name.to_string()),
+        );
+        self.apply_group_field(event, GROUP_REALM_ID_PATH, Some(realm_id.to_string()));
+    }
+
+    fn apply_group_field(&mut self, event: &AdminDocumentEvent, path: &str, value: Option<String>) {
+        let current = self.user_subject_ids.get(path).cloned();
+
+        match self.reduce_value(event, path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path.to_string(), version);
+            }
+            None => {
+                self.user_subject_ids.remove(path);
             }
         }
     }
@@ -721,6 +778,8 @@ impl AdminDocumentReducerState {
 }
 
 const USER_NAME_PATH: &str = "user.name";
+const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
+const GROUP_REALM_ID_PATH: &str = "group.realm_id";
 const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
 const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
@@ -871,9 +930,9 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
 mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
-        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH,
-        metadata_replication_value, oidc_provider_value, realm_discovery_value,
-        role_definition_value,
+        GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH,
+        REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, metadata_replication_value,
+        oidc_provider_value, realm_discovery_value, role_definition_value,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -893,8 +952,12 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    fn realm_id_with_seed(seed: u8) -> RealmId {
+        RealmId::from_bytes([seed; 32])
+    }
+
     fn realm_id() -> RealmId {
-        RealmId::from_bytes([9u8; 32])
+        realm_id_with_seed(9)
     }
 
     fn group_id() -> GroupId {
@@ -1088,6 +1151,24 @@ mod tests {
             AdminDocumentClock::default(),
             AdminDocumentOperation::UserSubjectIdRemoved {
                 subject_id: subject_id.to_string(),
+            },
+        )
+    }
+
+    fn create_group(
+        event_seed: u8,
+        origin_seed: u8,
+        display_name: &str,
+        realm_id: RealmId,
+    ) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name: display_name.to_string(),
             },
         )
     }
@@ -1509,6 +1590,121 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some("Bob"))
         );
+    }
+
+    #[test]
+    fn group_created_materializes_display_name_and_realm_id() {
+        let mut state = group_state();
+        let realm_id = realm_id();
+
+        state
+            .apply(&create_group(1, 1, "Engineering", realm_id))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_group_display_name().as_deref(),
+            Some("Engineering")
+        );
+        assert_eq!(state.materialized_group_realm_id(), Some(realm_id));
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn group_created_display_name_conflict_withholds_only_display_name() {
+        let mut state = group_state();
+        let realm_id = realm_id();
+
+        state
+            .apply(&create_group(1, 1, "Engineering", realm_id))
+            .unwrap();
+        state
+            .apply(&create_group(2, 2, "Research", realm_id))
+            .unwrap();
+
+        assert_eq!(state.materialized_group_display_name(), None);
+        assert_eq!(state.materialized_group_realm_id(), Some(realm_id));
+        assert!(!state.conflicts.contains_key(GROUP_REALM_ID_PATH));
+
+        let conflict = state
+            .conflicts
+            .get(GROUP_DISPLAY_NAME_PATH)
+            .expect("display name conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some("Engineering"))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some("Research"))
+        );
+    }
+
+    #[test]
+    fn group_created_realm_id_conflict_withholds_only_realm_id() {
+        let mut state = group_state();
+        let first_realm_id = realm_id_with_seed(9);
+        let second_realm_id = realm_id_with_seed(10);
+        let first_realm_value = first_realm_id.to_string();
+        let second_realm_value = second_realm_id.to_string();
+
+        state
+            .apply(&create_group(1, 1, "Engineering", first_realm_id))
+            .unwrap();
+        state
+            .apply(&create_group(2, 2, "Engineering", second_realm_id))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_group_display_name().as_deref(),
+            Some("Engineering")
+        );
+        assert_eq!(state.materialized_group_realm_id(), None);
+        assert!(!state.conflicts.contains_key(GROUP_DISPLAY_NAME_PATH));
+
+        let conflict = state
+            .conflicts
+            .get(GROUP_REALM_ID_PATH)
+            .expect("realm id conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(first_realm_value.as_str()))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(second_realm_value.as_str()))
+        );
+    }
+
+    #[test]
+    fn group_created_operation_is_rejected_for_non_group_target_without_state_change() {
+        let mut state = user_state();
+        let before = state.clone();
+        let event = event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupCreated {
+                realm_id: realm_id(),
+                display_name: "Engineering".to_string(),
+            },
+        );
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::UnsupportedTarget)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
