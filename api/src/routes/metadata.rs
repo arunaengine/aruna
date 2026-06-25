@@ -301,6 +301,18 @@ pub enum MetadataQueryMode {
     Distributed,
 }
 
+#[derive(Debug)]
+struct MetadataFanoutScope {
+    mode: Option<MetadataQueryMode>,
+    target_nodes: Option<Vec<aruna_core::NodeId>>,
+}
+
+impl MetadataFanoutScope {
+    fn new(mode: Option<MetadataQueryMode>, target_nodes: Option<Vec<aruna_core::NodeId>>) -> Self {
+        Self { mode, target_nodes }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataQueryResponse {
     #[serde(flatten)]
@@ -1080,8 +1092,10 @@ pub async fn query_metadata_document(
         bearer_token,
         Some(vec![record.graph_iri.clone()]),
         request.query,
-        request.mode,
-        Some(document_replica_query_nodes(&record, state.get_node_id())),
+        MetadataFanoutScope::new(
+            request.mode,
+            Some(document_replica_query_nodes(&record, state.get_node_id())),
+        ),
     )
     .await?;
     let serialize_started = Instant::now();
@@ -1136,8 +1150,7 @@ pub async fn query_all_metadata(
         bearer_token,
         None,
         request.query,
-        request.mode,
-        None,
+        MetadataFanoutScope::new(request.mode, None),
     )
     .await?;
     let serialize_started = Instant::now();
@@ -1178,8 +1191,7 @@ pub async fn search_metadata(
         None,
         params.q,
         limit,
-        params.mode,
-        None,
+        MetadataFanoutScope::new(params.mode, None),
     )
     .await?;
     Ok((
@@ -1848,8 +1860,7 @@ async fn metadata_fanout_nodes(
 
 async fn run_metadata_fanout<T>(
     state: &ServerState,
-    mode: Option<MetadataQueryMode>,
-    target_nodes: Option<Vec<aruna_core::NodeId>>,
+    scope: MetadataFanoutScope,
     operation: MetadataFanoutOperation,
     local_call: MetadataNodeCall<T>,
     remote_call: MetadataNodeCall<T>,
@@ -1860,6 +1871,7 @@ where
     T: Send + 'static,
 {
     let span = Span::current();
+    let MetadataFanoutScope { mode, target_nodes } = scope;
     ensure_supported_query_mode(&mode)?;
     match mode.unwrap_or(MetadataQueryMode::Distributed) {
         MetadataQueryMode::Local => {
@@ -1976,9 +1988,9 @@ fn map_metadata_internal_error(error: MetadataError) -> ServerError {
 #[tracing::instrument(
     name = "metadata.api.query_distributed",
     level = "debug",
-    skip(state, auth, query, target_nodes),
+    skip(state, auth, query, scope),
     fields(
-        mode = ?mode,
+        mode = ?scope.mode,
         query_len = query.len() as u64,
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         node_count = field::Empty,
@@ -1993,8 +2005,7 @@ async fn run_query_distributed(
     bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     graph_iris: Option<Vec<String>>,
     query: String,
-    mode: Option<MetadataQueryMode>,
-    target_nodes: Option<Vec<aruna_core::NodeId>>,
+    scope: MetadataFanoutScope,
 ) -> ServerResult<(MetadataQueryResults, MetadataFanoutStats)> {
     let span = Span::current();
     let total_started = Instant::now();
@@ -2043,8 +2054,7 @@ async fn run_query_distributed(
     });
     let (parts, fanout_stats) = run_metadata_fanout(
         state,
-        mode,
-        target_nodes,
+        scope,
         MetadataFanoutOperation::Query,
         local_call,
         remote_call,
@@ -2069,9 +2079,9 @@ async fn run_query_distributed(
 #[tracing::instrument(
     name = "metadata.api.search_distributed",
     level = "debug",
-    skip(state, auth, query, target_nodes),
+    skip(state, auth, query, scope),
     fields(
-        mode = ?mode,
+        mode = ?scope.mode,
         query_len = query.len() as u64,
         limit = limit as u64,
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
@@ -2088,8 +2098,7 @@ async fn run_search_distributed(
     graph_iris: Option<Vec<String>>,
     query: String,
     limit: usize,
-    mode: Option<MetadataQueryMode>,
-    target_nodes: Option<Vec<aruna_core::NodeId>>,
+    scope: MetadataFanoutScope,
 ) -> ServerResult<(Vec<MetadataSearchHit>, MetadataFanoutStats)> {
     let span = Span::current();
     let total_started = Instant::now();
@@ -2138,8 +2147,7 @@ async fn run_search_distributed(
     });
     let (node_hits, fanout_stats) = run_metadata_fanout(
         state,
-        mode,
-        target_nodes,
+        scope,
         MetadataFanoutOperation::Search,
         local_call,
         remote_call,
@@ -3765,8 +3773,10 @@ mod tests {
             bearer_token,
             None,
             "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            Some(MetadataQueryMode::Distributed),
-            Some(vec![test.remote.net.node_id()]),
+            MetadataFanoutScope::new(
+                Some(MetadataQueryMode::Distributed),
+                Some(vec![test.remote.net.node_id()]),
+            ),
         )
         .await
         .unwrap();
@@ -3792,8 +3802,10 @@ mod tests {
             None,
             "Remote".to_string(),
             10,
-            Some(MetadataQueryMode::Distributed),
-            Some(vec![test.remote.net.node_id()]),
+            MetadataFanoutScope::new(
+                Some(MetadataQueryMode::Distributed),
+                Some(vec![test.remote.net.node_id()]),
+            ),
         )
         .await
         .unwrap();
