@@ -1842,6 +1842,9 @@ async fn apply_legacy_admin_document_upsert_to_storage(
             "legacy admin upsert reducer state target mismatch".to_string(),
         ));
     }
+    if reducer_state.is_some() {
+        return Ok(());
+    }
 
     match target {
         DocumentSyncTarget::Group { group_id } => {
@@ -4997,7 +5000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_config_upsert_preserves_reducer_settings() {
+    async fn late_legacy_realm_config_upsert_skips_with_state_and_bootstraps_without_state() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([50; 32]);
         let actor = test_actor(
@@ -5026,6 +5029,7 @@ mod tests {
         )
         .await
         .expect("realm config settings apply and bootstrap config doc");
+        let reduced = read_realm_config_doc(&storage, realm_id).await;
 
         let legacy_provider = test_oidc_provider("legacy", "legacy-late-settings");
         let legacy_node = node(25);
@@ -5040,15 +5044,32 @@ mod tests {
                 .expect("legacy realm config serializes"),
         )
         .await
-        .expect("late legacy realm config upsert overlays reducer settings");
+        .expect("late legacy realm config upsert skips with reducer state");
 
-        let merged = read_realm_config_doc(&storage, realm_id).await;
-        assert_eq!(merged.metadata_replication, metadata_replication);
-        assert_eq!(merged.discovery, discovery);
-        assert_eq!(merged.oidc_providers, vec![legacy_provider]);
+        assert_eq!(read_realm_config_doc(&storage, realm_id).await, reduced);
+
+        let bootstrap_realm_id = RealmId::from_bytes([53; 32]);
+        let bootstrap_node = node(27);
+        let bootstrap_provider = test_oidc_provider("bootstrap", "bootstrap-legacy-settings");
+        let mut bootstrap =
+            RealmConfigDocument::new(bootstrap_realm_id, vec![bootstrap_provider], 6);
+        bootstrap.discovery = test_discovery(28, "https://bootstrap-legacy.example:443");
+        bootstrap.ensure_node(bootstrap_node, RealmNodeKind::Server);
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::RealmConfig {
+                realm_id: bootstrap_realm_id,
+            },
+            bootstrap
+                .to_bytes(&actor)
+                .expect("bootstrap realm config serializes"),
+        )
+        .await
+        .expect("bootstrap legacy realm config applies");
+
         assert_eq!(
-            realm_config_nodes(&merged),
-            BTreeMap::from([(legacy_node.to_string(), RealmNodeKind::Server)])
+            read_realm_config_doc(&storage, bootstrap_realm_id).await,
+            bootstrap
         );
     }
 
@@ -5380,7 +5401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_config_upsert_preserves_reducer_oidc_provider() {
+    async fn late_legacy_realm_config_upsert_skips_after_reducer_oidc_provider() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([46; 32]);
         let actor = test_actor(
@@ -5412,30 +5433,22 @@ mod tests {
         let late_legacy = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 7);
         apply_legacy_admin_document_upsert_to_storage(
             &storage,
-            document_target,
+            document_target.clone(),
             late_legacy
                 .to_bytes(&actor)
                 .expect("legacy realm config serializes"),
         )
         .await
-        .expect("late legacy realm config upsert overlays reducer state");
+        .expect("late legacy realm config upsert skips with reducer state");
 
-        let merged = read_realm_config_doc(&storage, realm_id).await;
-        assert_eq!(
-            merged.metadata_replication,
-            late_legacy.metadata_replication
-        );
-        assert_eq!(merged.discovery, late_legacy.discovery);
-        assert_eq!(
-            realm_config_nodes(&merged),
-            realm_config_nodes(&late_legacy)
-        );
-        assert_eq!(
-            realm_config_oidc_providers(&merged),
-            BTreeMap::from([
-                ("legacy".to_string(), legacy_provider),
-                ("reducer".to_string(), reducer_provider),
-            ])
+        assert!(
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -5493,7 +5506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_config_upsert_preserves_reducer_node() {
+    async fn late_legacy_realm_config_upsert_skips_after_reducer_node() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([42; 32]);
         let actor = test_actor(
@@ -5543,27 +5556,22 @@ mod tests {
         late_legacy.ensure_node(legacy_node, RealmNodeKind::Server);
         apply_legacy_admin_document_upsert_to_storage(
             &storage,
-            document_target,
+            document_target.clone(),
             late_legacy
                 .to_bytes(&actor)
                 .expect("legacy realm config serializes"),
         )
         .await
-        .expect("late legacy realm config upsert overlays reducer state");
+        .expect("late legacy realm config upsert skips with reducer state");
 
-        let merged = read_realm_config_doc(&storage, realm_id).await;
-        assert_eq!(
-            merged.metadata_replication,
-            late_legacy.metadata_replication
-        );
-        assert_eq!(merged.oidc_providers, late_legacy.oidc_providers);
-        assert_eq!(merged.discovery, late_legacy.discovery);
-        assert_eq!(
-            realm_config_nodes(&merged),
-            BTreeMap::from([
-                (legacy_node.to_string(), RealmNodeKind::Server),
-                (reducer_node.to_string(), RealmNodeKind::Management),
-            ])
+        assert!(
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -5647,7 +5655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_user_upsert_merges_with_reducer_state_and_bootstraps_without_state() {
+    async fn legacy_user_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([21; 32]);
         let user_id = UserId::local(Ulid::from_parts(100, 1), realm_id);
@@ -5700,6 +5708,7 @@ mod tests {
             .await
             .expect("admin user operation applies");
         }
+        let reduced = read_user_doc(&storage, user_id).await;
 
         let alias_user_id = UserId::local(Ulid::from_parts(102, 1), realm_id);
         let late_legacy = User {
@@ -5719,18 +5728,9 @@ mod tests {
             late_legacy.to_bytes(&actor).expect("legacy serializes"),
         )
         .await
-        .expect("late legacy upsert merges with reducer state");
+        .expect("late legacy user upsert skips with reducer state");
 
-        let merged = read_user_doc(&storage, user_id).await;
-        assert_eq!(merged.name, "Reduced");
-        assert_eq!(merged.alias_user_ids, HashSet::from([alias_user_id]));
-        assert_eq!(
-            merged.subject_ids.iter().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["legacy-subject".to_string(), "reduced-subject".to_string()])
-        );
-        assert_eq!(merged.attributes["legacy-only"], "preserved");
-        assert_eq!(merged.attributes["source"], "reducer");
-        assert!(!merged.attributes.contains_key("removed"));
+        assert_eq!(read_user_doc(&storage, user_id).await, reduced);
         assert_eq!(
             read_storage_value(
                 &storage,
@@ -5738,7 +5738,7 @@ mod tests {
                 subject_index_key("legacy-subject")
             )
             .await,
-            Some(subject_index_value(user_id))
+            None
         );
         assert_eq!(
             read_storage_value(
@@ -5825,11 +5825,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_conflict_overlays_fail_closed_for_legacy_and_revisioned_upserts() {
+    async fn user_conflict_overlays_fail_closed_for_legacy_skip_and_revisioned_upserts() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([45; 32]);
         let user_id = UserId::local(Ulid::from_parts(211, 1), realm_id);
         let actor = apply_conflicting_user_name_and_attribute(&storage, user_id, realm_id).await;
+        let reduced = read_user_doc(&storage, user_id).await;
 
         let mut legacy = test_user_doc(user_id, "Legacy attacker", &["legacy-subject"]);
         legacy.attributes = HashMap::from([
@@ -5842,12 +5843,11 @@ mod tests {
             legacy.to_bytes(&actor).expect("legacy user serializes"),
         )
         .await
-        .expect("legacy conflict overlay applies");
+        .expect("legacy conflict upsert skips with reducer state");
 
-        let merged = read_user_doc(&storage, user_id).await;
-        assert_eq!(merged.name, "");
-        assert!(!merged.attributes.contains_key("department"));
-        assert_eq!(merged.attributes["legacy-only"], "preserved");
+        let skipped = read_user_doc(&storage, user_id).await;
+        assert_eq!(skipped, reduced);
+        assert!(!skipped.attributes.contains_key("legacy-only"));
 
         let mut revisioned = test_user_doc(user_id, "Revisioned attacker", &["revisioned-subject"]);
         revisioned.attributes = HashMap::from([
@@ -6078,7 +6078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_group_auth_upsert_merges_with_reducer_state_and_bootstraps_without_state() {
+    async fn legacy_group_auth_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([22; 32]);
         let group_id = Ulid::from_parts(110, 1);
@@ -6105,6 +6105,7 @@ mod tests {
         )
         .await
         .expect("group assignment reducer state writes");
+        let reduced = read_group_auth_doc(&storage, group_id).await;
 
         let legacy_user_id = UserId::local(Ulid::from_parts(118, 1), realm_id);
         let mut legacy_role = test_role(role_id, [legacy_user_id]);
@@ -6122,14 +6123,9 @@ mod tests {
                 .expect("legacy group auth serializes"),
         )
         .await
-        .expect("late legacy group auth upsert merges with reducer state");
+        .expect("late legacy group auth upsert skips with reducer state");
 
-        let merged = read_group_auth_doc(&storage, group_id).await;
-        let merged_role = &merged.roles[&role_id];
-        assert_eq!(merged_role.name, legacy_role.name);
-        assert_eq!(merged_role.permissions, legacy_role.permissions);
-        assert!(merged_role.assigned_users.contains(&assigned_user_id));
-        assert!(merged_role.assigned_users.contains(&legacy_user_id));
+        assert_eq!(read_group_auth_doc(&storage, group_id).await, reduced);
 
         let bootstrap_group_id = Ulid::from_parts(114, 1);
         let bootstrap_role_id = Ulid::from_parts(115, 1);
@@ -6262,7 +6258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_group_upsert_after_group_created_preserves_reducer_metadata_and_roles() {
+    async fn late_legacy_group_upsert_skips_after_group_created_and_bootstraps_without_state() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([37; 32]);
         let legacy_realm_id = RealmId::from_bytes([38; 32]);
@@ -6312,6 +6308,7 @@ mod tests {
         )
         .await
         .expect("role create applies");
+        let reduced = read_group_doc(&storage, group_id).await;
 
         let late_legacy = Group {
             display_name: "Late legacy group".to_string(),
@@ -6327,16 +6324,38 @@ mod tests {
                 .expect("legacy group serializes"),
         )
         .await
-        .expect("late legacy group upsert overlays reducer state");
+        .expect("late legacy group upsert skips with reducer state");
 
-        let merged = read_group_doc(&storage, group_id).await;
-        assert_eq!(merged.display_name, "Reduced group");
-        assert_eq!(merged.realm_id, realm_id);
-        assert_eq!(merged.roles, HashSet::from([role_id]));
+        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
+
+        let bootstrap_group_id = Ulid::from_parts(203, 1);
+        let bootstrap_role_id = Ulid::from_parts(204, 1);
+        let bootstrap = Group {
+            display_name: "Bootstrap legacy group".to_string(),
+            group_id: bootstrap_group_id,
+            realm_id,
+            roles: HashSet::from([bootstrap_role_id]),
+        };
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::Group {
+                group_id: bootstrap_group_id,
+            },
+            bootstrap
+                .to_bytes(&actor)
+                .expect("bootstrap group serializes"),
+        )
+        .await
+        .expect("bootstrap legacy group applies");
+
+        assert_eq!(
+            read_group_doc(&storage, bootstrap_group_id).await,
+            bootstrap
+        );
     }
 
     #[tokio::test]
-    async fn late_legacy_group_upsert_does_not_override_conflicted_group_metadata() {
+    async fn late_legacy_group_upsert_skips_with_conflicted_group_metadata() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([46; 32]);
         let conflicting_realm_id = RealmId::from_bytes([47; 32]);
@@ -6406,6 +6425,7 @@ mod tests {
             .await
             .is_some()
         );
+        let reduced = read_group_doc(&storage, group_id).await;
 
         let late_legacy = Group {
             display_name: "Late legacy group".to_string(),
@@ -6421,12 +6441,9 @@ mod tests {
                 .expect("legacy group serializes"),
         )
         .await
-        .expect("late legacy group upsert applies without conflicted metadata");
+        .expect("late legacy group upsert skips with reducer state");
 
-        let merged = read_group_doc(&storage, group_id).await;
-        assert_eq!(merged.display_name, "Safe group");
-        assert_eq!(merged.realm_id, realm_id);
-        assert_eq!(merged.roles, HashSet::from([role_id]));
+        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
 
         storage_batch_delete_to(
             &storage,
@@ -6608,7 +6625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_group_upsert_overlays_reducer_role_set_and_conflicts() {
+    async fn late_legacy_group_upsert_skips_with_reducer_role_state_and_conflicts() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([29; 32]);
         let group_id = Ulid::from_parts(180, 1);
@@ -6709,16 +6726,16 @@ mod tests {
                 .expect("legacy group serializes"),
         )
         .await
-        .expect("late legacy group upsert overlays reducer state");
+        .expect("late legacy group upsert skips with reducer state");
 
-        let merged = read_group_doc(&storage, group_id).await;
-        assert_eq!(merged.display_name, late_legacy.display_name);
-        assert_eq!(merged.realm_id, realm_id);
-        assert_eq!(merged.roles, HashSet::from([legacy_role_id, role_id]));
+        assert_eq!(
+            read_storage_value(&storage, GROUP_KEYSPACE, group_id.to_bytes().into()).await,
+            None
+        );
     }
 
     #[tokio::test]
-    async fn legacy_realm_auth_upsert_merges_with_reducer_state_and_bootstraps_without_state() {
+    async fn legacy_realm_auth_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([23; 32]);
         let role_id = Ulid::from_parts(120, 1);
@@ -6744,6 +6761,7 @@ mod tests {
         )
         .await
         .expect("realm assignment reducer state writes");
+        let reduced = read_realm_auth_doc(&storage, realm_id).await;
 
         let legacy_user_id = UserId::local(Ulid::from_parts(126, 1), realm_id);
         let mut legacy_role = test_role(role_id, [legacy_user_id]);
@@ -6762,14 +6780,9 @@ mod tests {
                 .expect("legacy realm auth serializes"),
         )
         .await
-        .expect("late legacy realm auth upsert merges with reducer state");
+        .expect("late legacy realm auth upsert skips with reducer state");
 
-        let merged = read_realm_auth_doc(&storage, realm_id).await;
-        let merged_role = &merged.roles[&role_id];
-        assert_eq!(merged_role.name, legacy_role.name);
-        assert_eq!(merged_role.permissions, legacy_role.permissions);
-        assert!(merged_role.assigned_users.contains(&assigned_user_id));
-        assert!(merged_role.assigned_users.contains(&legacy_user_id));
+        assert_eq!(read_realm_auth_doc(&storage, realm_id).await, reduced);
 
         let bootstrap_realm_id = RealmId::from_bytes([24; 32]);
         let bootstrap_role_id = Ulid::from_parts(123, 1);
@@ -6801,7 +6814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_group_auth_upsert_keeps_reducer_role_body_and_drops_conflicted_role() {
+    async fn late_legacy_group_auth_upsert_skips_with_reducer_role_state_and_conflicts() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([25; 32]);
         let group_id = Ulid::from_parts(130, 1);
@@ -6903,6 +6916,7 @@ mod tests {
         )
         .await
         .expect("second group conflict role applies");
+        let reduced = read_group_auth_doc(&storage, group_id).await;
 
         let mut legacy_role = test_role(role_id, [legacy_user_id]);
         legacy_role.name = "legacy group role".to_string();
@@ -6925,24 +6939,13 @@ mod tests {
                 .expect("legacy group auth serializes"),
         )
         .await
-        .expect("late legacy group auth upsert merges with reducer state");
+        .expect("late legacy group auth upsert skips with reducer state");
 
-        let merged = read_group_auth_doc(&storage, group_id).await;
-        let merged_role = &merged.roles[&role_id];
-        assert_eq!(merged_role.name, "Reduced group role");
-        assert_eq!(
-            merged_role.permissions,
-            HashMap::from([("/group/reduced/**".to_string(), Permission::WRITE)])
-        );
-        assert_eq!(
-            merged_role.assigned_users,
-            HashSet::from([legacy_user_id, assigned_user_id])
-        );
-        assert!(!merged.roles.contains_key(&conflicted_role_id));
+        assert_eq!(read_group_auth_doc(&storage, group_id).await, reduced);
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_auth_upsert_keeps_reducer_role_body_and_drops_conflicted_role() {
+    async fn late_legacy_realm_auth_upsert_skips_with_reducer_role_state_and_conflicts() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([26; 32]);
         let role_id = Ulid::from_parts(142, 1);
@@ -7043,6 +7046,7 @@ mod tests {
         )
         .await
         .expect("second realm conflict role applies");
+        let reduced = read_realm_auth_doc(&storage, realm_id).await;
 
         let mut legacy_role = test_role(role_id, [legacy_user_id]);
         legacy_role.name = "legacy realm role".to_string();
@@ -7066,20 +7070,9 @@ mod tests {
                 .expect("legacy realm auth serializes"),
         )
         .await
-        .expect("late legacy realm auth upsert merges with reducer state");
+        .expect("late legacy realm auth upsert skips with reducer state");
 
-        let merged = read_realm_auth_doc(&storage, realm_id).await;
-        let merged_role = &merged.roles[&role_id];
-        assert_eq!(merged_role.name, "Reduced realm role");
-        assert_eq!(
-            merged_role.permissions,
-            HashMap::from([("/realm/reduced/**".to_string(), Permission::WRITE)])
-        );
-        assert_eq!(
-            merged_role.assigned_users,
-            HashSet::from([legacy_user_id, assigned_user_id])
-        );
-        assert!(!merged.roles.contains_key(&conflicted_role_id));
+        assert_eq!(read_realm_auth_doc(&storage, realm_id).await, reduced);
     }
 
     #[tokio::test]
