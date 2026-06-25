@@ -196,6 +196,12 @@ impl ClaimInitialRealmAdminOperation {
         {
             return Ok(self.abort_already_claimed(txn_id));
         }
+        if previous_reducer_state
+            .as_ref()
+            .is_some_and(|state| reducer_has_realm_admin_role_conflict(state, role.role_id))
+        {
+            return Ok(self.abort_already_claimed(txn_id));
+        }
 
         let mut reducer_state = previous_reducer_state
             .clone()
@@ -299,6 +305,16 @@ impl Operation for ClaimInitialRealmAdminOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         let event = match event {
+            Event::Storage(StorageEvent::Error { error })
+                if matches!(
+                    self.state,
+                    ClaimInitialRealmAdminState::CommitTransaction { .. }
+                ) =>
+            {
+                self.state = ClaimInitialRealmAdminState::Error;
+                self.output = Some(Err(error.into()));
+                return smallvec![];
+            }
             Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
             other => other,
         };
@@ -470,13 +486,20 @@ fn reducer_has_realm_admin_assignment(state: &AdminDocumentReducerState, role_id
         .is_some_and(|users| !users.is_empty())
 }
 
+fn reducer_has_realm_admin_role_conflict(
+    state: &AdminDocumentReducerState,
+    role_id: RoleId,
+) -> bool {
+    state.conflicts.contains_key(&realm_role_path(role_id))
+}
+
 fn apply_admin_reducer_updates(
     state: &mut AdminDocumentReducerState,
     actor: &Actor,
     role: &Role,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
     let mut admin_events = Vec::new();
-    if !state.materialized_realm_roles().contains(&role.role_id) {
+    if should_seed_realm_admin_role(state, role.role_id) {
         let event = apply_admin_reducer_operation(
             state,
             actor,
@@ -497,6 +520,15 @@ fn apply_admin_reducer_updates(
     admin_events.push(event);
 
     Ok(admin_events)
+}
+
+fn should_seed_realm_admin_role(state: &AdminDocumentReducerState, role_id: RoleId) -> bool {
+    !state.materialized_realm_roles().contains(&role_id)
+        && !state.conflicts.contains_key(&realm_role_path(role_id))
+}
+
+fn realm_role_path(role_id: RoleId) -> String {
+    format!("realm.roles.{role_id}")
 }
 
 fn apply_admin_reducer_operation(
@@ -544,19 +576,21 @@ fn materialize_realm_admin_assignment(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation, ClaimInitialRealmAdminResult,
-        ClaimInitialRealmAdminState,
+        ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+        ClaimInitialRealmAdminResult, ClaimInitialRealmAdminState,
     };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{
-        AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+        AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
+        AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::Event;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmAuthorizationDocument, RealmId, Role};
@@ -634,6 +668,24 @@ mod tests {
         (auth_doc, role)
     }
 
+    fn realm_admin_event(
+        event_seed: u8,
+        actor: Actor,
+        op: AdminDocumentOperation,
+    ) -> AdminDocumentEvent {
+        AdminDocumentEvent {
+            event_id: Ulid::from_bytes([event_seed; 16]),
+            target: AdminDocumentTarget::Realm {
+                realm_id: actor.realm_id,
+            },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: Default::default(),
+            actor,
+            op,
+        }
+    }
+
     #[test]
     fn writes_reducer_state_and_admin_outbox() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -709,6 +761,82 @@ mod tests {
         assert_eq!(
             operation.output,
             Some(Ok(ClaimInitialRealmAdminResult::AlreadyClaimed))
+        );
+    }
+
+    #[test]
+    fn reducer_role_body_conflict_aborts_without_admin_outbox() {
+        let realm_id = RealmId::from_bytes([21u8; 32]);
+        let claiming_actor = actor(realm_id, 22, 23);
+        let (auth_doc, role) = auth_doc_and_admin_role(realm_id);
+        let mut previous_state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::Realm { realm_id });
+        let mut first_role = AdminDocumentRoleDefinition::from(&role);
+        first_role.name = "first conflicted realm admin".to_string();
+        let mut second_role = AdminDocumentRoleDefinition::from(&role);
+        second_role.name = "second conflicted realm admin".to_string();
+        previous_state
+            .apply(&realm_admin_event(
+                24,
+                actor(realm_id, 25, 26),
+                AdminDocumentOperation::RealmRoleCreated { role: first_role },
+            ))
+            .unwrap();
+        previous_state
+            .apply(&realm_admin_event(
+                27,
+                actor(realm_id, 28, 29),
+                AdminDocumentOperation::RealmRoleCreated { role: second_role },
+            ))
+            .unwrap();
+
+        let mut operation = ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+            actor: claiming_actor.clone(),
+        });
+        let txn_id = TxnId::new();
+        let effects = operation
+            .emit_write_auth_doc_and_admin_state(
+                txn_id,
+                Some(auth_doc.to_bytes(&claiming_actor).unwrap().into()),
+                Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        );
+        assert_eq!(
+            operation.output,
+            Some(Ok(ClaimInitialRealmAdminResult::AlreadyClaimed))
+        );
+    }
+
+    #[test]
+    fn commit_storage_conflict_preserves_original_error_without_abort() {
+        let realm_id = RealmId::from_bytes([31u8; 32]);
+        let actor = actor(realm_id, 32, 33);
+        let (auth_doc, _) = auth_doc_and_admin_role(realm_id);
+        let txn_id = TxnId::new();
+        let mut operation =
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput { actor });
+        operation.state = ClaimInitialRealmAdminState::CommitTransaction {
+            txn_id,
+            auth_doc,
+            admin_outbox_written: false,
+        };
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, ClaimInitialRealmAdminState::Error);
+        assert_eq!(
+            operation.output,
+            Some(Err(ClaimInitialRealmAdminError::StorageError(
+                StorageError::TransactionConflict
+            )))
         );
     }
 
