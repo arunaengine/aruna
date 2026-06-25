@@ -142,6 +142,15 @@ impl CreateGroupOperation {
         let mut admin_events = Vec::new();
         let roles = sorted_roles(auth_doc);
 
+        admin_events.push(apply_admin_reducer_operation(
+            &mut reducer_state,
+            &self.config.actor,
+            AdminDocumentOperation::GroupCreated {
+                realm_id: self.config.actor.realm_id,
+                display_name: self.config.display_name.clone(),
+            },
+        )?);
+
         for role in &roles {
             admin_events.push(apply_admin_reducer_operation(
                 &mut reducer_state,
@@ -652,6 +661,14 @@ mod test {
             reducer_state.materialized_group_roles(),
             auth_doc.roles.keys().copied().collect::<BTreeSet<_>>()
         );
+        assert_eq!(
+            reducer_state.materialized_group_display_name().as_deref(),
+            Some(group.display_name.as_str())
+        );
+        assert_eq!(
+            reducer_state.materialized_group_realm_id(),
+            Some(group.realm_id)
+        );
         assert!(reducer_state.conflicts.is_empty());
 
         let admin_role = auth_doc
@@ -664,7 +681,7 @@ mod test {
                 .contains(&actor.user_id)
         );
 
-        assert_eq!(outbox_records.len(), auth_doc.roles.len() + 1);
+        assert_eq!(outbox_records.len(), auth_doc.roles.len() + 2);
         assert!(outbox_records.iter().all(|record| {
             record.target
                 == (DocumentSyncTarget::GroupAuthorization {
@@ -678,7 +695,14 @@ mod test {
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect::<Vec<_>>();
-        let role_names = events[..auth_doc.roles.len()]
+        assert!(matches!(
+            &events.first().unwrap().op,
+            AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name,
+            } if *realm_id == group.realm_id && display_name == &group.display_name
+        ));
+        let role_names = events[1..=auth_doc.roles.len()]
             .iter()
             .map(|event| match &event.op {
                 AdminDocumentOperation::GroupRoleCreated { role } => role.name.as_str(),
@@ -696,13 +720,17 @@ mod test {
             AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
                 if *role_id == admin_role.role_id && *user_id == actor.user_id
         ));
-        assert!(events[..auth_doc.roles.len()].iter().all(|event| matches!(
-            &event.op,
-            AdminDocumentOperation::GroupRoleCreated { role }
-                if auth_doc.roles.get(&role.role_id).is_some_and(|source| {
-                    role == &AdminDocumentRoleDefinition::from(source)
-                })
-        )));
+        assert!(
+            events[1..=auth_doc.roles.len()]
+                .iter()
+                .all(|event| matches!(
+                    &event.op,
+                    AdminDocumentOperation::GroupRoleCreated { role }
+                        if auth_doc.roles.get(&role.role_id).is_some_and(|source| {
+                            role == &AdminDocumentRoleDefinition::from(source)
+                        })
+                ))
+        );
     }
 
     #[test]
@@ -780,6 +808,7 @@ mod test {
             result.0.roles,
             result.1.roles.keys().copied().collect::<HashSet<_>>()
         );
+        assert_eq!(result.0.roles.len(), 3);
         assert!(
             result
                 .0
