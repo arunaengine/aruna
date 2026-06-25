@@ -60,8 +60,6 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
-const REALM_CONFIG_SCAN_PAGE_SIZE: usize = 128;
-
 // Unbiased per-call-kind craqle latency histograms; every backend call is
 // recorded, not just the ones above the slow-call threshold.
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
@@ -897,72 +895,54 @@ impl MetadataHandle {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => {
-                match ensure_remote_metadata_peer_is_configured(&self.inner.storage_handle, peer)
-                    .await
+            } => match authorize_remote_metadata_peer(
+                &self.inner.auth_validation,
+                &self.inner.storage_handle,
+                peer,
+                auth_token,
+            )
+            .await
+            {
+                Ok(auth_context) => match query_local_graphs(
+                    self.inner.clone(),
+                    Some(auth_context),
+                    graph_iris,
+                    sparql,
+                )
+                .await
                 {
-                    Ok(()) => {
-                        match remote_metadata_auth_context(&self.inner.auth_validation, auth_token)
-                            .await
-                        {
-                            Ok(auth_context) => {
-                                match query_local_graphs(
-                                    self.inner.clone(),
-                                    auth_context,
-                                    graph_iris,
-                                    sparql,
-                                )
-                                .await
-                                {
-                                    Ok(results) => {
-                                        MetadataTransportMessage::QueryResults { results }
-                                    }
-                                    Err(error) => {
-                                        MetadataTransportMessage::Reject(error.to_string())
-                                    }
-                                }
-                            }
-                            Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-                        }
-                    }
+                    Ok(results) => MetadataTransportMessage::QueryResults { results },
                     Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-                }
-            }
+                },
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
                 graph_iris,
                 query,
                 limit,
-            } => {
-                match ensure_remote_metadata_peer_is_configured(&self.inner.storage_handle, peer)
-                    .await
+            } => match authorize_remote_metadata_peer(
+                &self.inner.auth_validation,
+                &self.inner.storage_handle,
+                peer,
+                auth_token,
+            )
+            .await
+            {
+                Ok(auth_context) => match search_local_graphs(
+                    self.inner.clone(),
+                    Some(auth_context),
+                    graph_iris,
+                    query,
+                    limit,
+                )
+                .await
                 {
-                    Ok(()) => {
-                        match remote_metadata_auth_context(&self.inner.auth_validation, auth_token)
-                            .await
-                        {
-                            Ok(auth_context) => {
-                                match search_local_graphs(
-                                    self.inner.clone(),
-                                    auth_context,
-                                    graph_iris,
-                                    query,
-                                    limit,
-                                )
-                                .await
-                                {
-                                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                                    Err(error) => {
-                                        MetadataTransportMessage::Reject(error.to_string())
-                                    }
-                                }
-                            }
-                            Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-                        }
-                    }
+                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
                     Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-                }
-            }
+                },
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::Reject(_) => {
@@ -1153,71 +1133,79 @@ impl MetadataHandle {
 async fn remote_metadata_auth_context<S>(
     state: &S,
     auth_token: Option<MetadataAuthToken>,
-) -> Result<Option<AuthContext>, MetadataError>
+) -> Result<AuthContext, MetadataError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
     let Some(auth_token) = auth_token else {
-        return Ok(None);
+        return Err(MetadataError::Backend(
+            "missing metadata auth token".to_string(),
+        ));
     };
     let MetadataAuthToken::Bearer(token) = auth_token;
     validate_aruna_bearer_token(state, token.as_str())
         .await
-        .map(Some)
         .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
 }
 
-async fn ensure_remote_metadata_peer_is_configured(
+async fn authorize_remote_metadata_peer<S>(
+    state: &S,
     storage_handle: &StorageHandle,
     peer: NodeId,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<AuthContext, MetadataError>
+where
+    S: ArunaBearerTokenValidationState + ?Sized,
+{
+    let auth_context = remote_metadata_auth_context(state, auth_token).await?;
+    ensure_remote_metadata_peer_is_configured_for_realm(
+        storage_handle,
+        peer,
+        auth_context.realm_id,
+    )
+    .await?;
+    Ok(auth_context)
+}
+
+async fn ensure_remote_metadata_peer_is_configured_for_realm(
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+    realm_id: RealmId,
 ) -> Result<(), MetadataError> {
-    let mut start_after = None;
-
-    loop {
-        let event = storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.map(IterStart::After),
-                limit: REALM_CONFIG_SCAN_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataError::Backend(format!(
-                    "realm config scan failed: {error}"
-                )));
-            }
-            other => {
-                return Err(MetadataError::Backend(format!(
-                    "unexpected realm config scan result: {other:?}"
-                )));
-            }
-        };
-
-        for (_, bytes) in values {
+    match storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
             if document.has_node(peer) {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(MetadataError::InvalidInput(format!(
+                    "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
+                )))
             }
         }
-
-        let Some(cursor) = next_start_after else {
-            return Err(MetadataError::InvalidInput(format!(
-                "remote metadata peer `{peer}` is not configured in any realm"
-            )));
-        };
-        start_after = Some(cursor);
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Err(MetadataError::InvalidInput(format!(
+                "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
+            )))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Backend(format!(
+            "realm config read failed for `{realm_id}`: {error}"
+        ))),
+        other => Err(MetadataError::Backend(format!(
+            "unexpected realm config read result for `{realm_id}`: {other:?}"
+        ))),
     }
 }
-
 async fn load_metadata_auth_state<T>(
     storage_handle: &StorageHandle,
     key: &[u8],
@@ -4072,33 +4060,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_metadata_peer_gate_accepts_configured_peer() {
+    async fn remote_metadata_peer_gate_accepts_valid_peer_in_auth_realm() {
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
         let (_dir, storage) = auth_storage();
-        let realm_id = RealmId([11u8; 32]);
         let configured_peer = node_id_from_seed(12);
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
         persist_realm_config(&storage, realm_id, &[configured_peer]).await;
+        let state = MetadataAuthValidationState::new(storage.clone());
 
-        ensure_remote_metadata_peer_is_configured(&storage, configured_peer)
-            .await
-            .expect("configured peer accepted");
+        let auth = authorize_remote_metadata_peer(
+            &state,
+            &storage,
+            configured_peer,
+            Some(MetadataAuthToken::bearer(token).unwrap()),
+        )
+        .await
+        .expect("configured peer accepted");
+
+        assert_eq!(auth.user_id, user_id);
+        assert_eq!(auth.realm_id, realm_id);
     }
 
     #[tokio::test]
-    async fn remote_metadata_peer_gate_rejects_unknown_peer() {
+    async fn remote_metadata_peer_gate_rejects_peer_from_wrong_realm() {
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
         let (_dir, storage) = auth_storage();
-        let realm_id = RealmId([21u8; 32]);
-        let configured_peer = node_id_from_seed(22);
-        let unknown_peer = node_id_from_seed(23);
-        persist_realm_config(&storage, realm_id, &[configured_peer]).await;
+        let wrong_realm_id = RealmId([21u8; 32]);
+        let wrong_realm_peer = node_id_from_seed(22);
+        let auth_realm_peer = node_id_from_seed(23);
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
+        persist_realm_config(&storage, realm_id, &[auth_realm_peer]).await;
+        let state = MetadataAuthValidationState::new(storage.clone());
 
-        let error = ensure_remote_metadata_peer_is_configured(&storage, unknown_peer)
-            .await
-            .expect_err("unknown peer rejected");
+        let error = authorize_remote_metadata_peer(
+            &state,
+            &storage,
+            wrong_realm_peer,
+            Some(MetadataAuthToken::bearer(token).unwrap()),
+        )
+        .await
+        .expect_err("wrong realm peer rejected");
 
         assert_eq!(
             error,
             MetadataError::InvalidInput(format!(
-                "remote metadata peer `{unknown_peer}` is not configured in any realm"
+                "remote metadata peer `{wrong_realm_peer}` is not configured in realm `{realm_id}`"
             ))
         );
     }
@@ -4119,7 +4138,6 @@ mod tests {
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
                 .await
-                .unwrap()
                 .unwrap();
 
         assert_eq!(auth.user_id, user_id);
@@ -4148,7 +4166,6 @@ mod tests {
         let auth =
             remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
                 .await
-                .unwrap()
                 .unwrap();
 
         assert_eq!(auth.user_id, user_id);
@@ -4188,15 +4205,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_metadata_auth_keeps_missing_token_anonymous() {
+    async fn remote_metadata_auth_rejects_missing_token() {
         let (_dir, storage) = auth_storage();
         let state = MetadataAuthValidationState::new(storage);
 
-        assert!(
+        assert_eq!(
             remote_metadata_auth_context(&state, None)
                 .await
-                .unwrap()
-                .is_none()
+                .expect_err("missing token rejected"),
+            MetadataError::Backend("missing metadata auth token".to_string())
         );
     }
 
