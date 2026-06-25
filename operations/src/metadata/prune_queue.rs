@@ -208,7 +208,7 @@ pub async fn process_metadata_graph_tombstones(
         }
 
         if let Some(metadata_handle) = metadata_handle.as_ref() {
-            metadata_handle.remove_visible_registry_record(tombstone.document_id);
+            metadata_handle.remove_cached_registry_record(tombstone.document_id);
         }
 
         if let Err(error) =
@@ -700,9 +700,9 @@ mod tests {
         .await;
         metadata_handle.expire_visibility_caches();
         let stale = metadata_handle
-            .list_visible_registry_records_for_group(record.group_id)
+            .list_cached_registry_records_for_group(record.group_id)
             .await
-            .expect("visible registry fills");
+            .expect("registry cache fills");
         assert_eq!(stale.as_ref(), &vec![record.clone()]);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
@@ -721,9 +721,9 @@ mod tests {
 
         assert_eq!(processed.enqueued, 1);
         let listed = metadata_handle
-            .list_visible_registry_records_for_group(record.group_id)
+            .list_cached_registry_records_for_group(record.group_id)
             .await
-            .expect("visible registry reads");
+            .expect("registry cache reads");
         assert!(listed.is_empty());
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);

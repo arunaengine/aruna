@@ -31,9 +31,8 @@ use jsonwebtoken::DecodingKey;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa_swagger_ui::SwaggerUi;
@@ -41,7 +40,6 @@ use utoipa_swagger_ui::SwaggerUi;
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
-const METADATA_REALM_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ServerState {
@@ -63,20 +61,6 @@ pub struct ServerState {
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     interface_state: Arc<RwLock<InterfaceRuntimeState>>,
-    metadata_realm_nodes_cache:
-        Arc<Mutex<HashMap<MetadataRealmNodesCacheKey, MetadataRealmNodesCacheEntry>>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct MetadataRealmNodesCacheKey {
-    realm_id: [u8; 32],
-    local_node_id: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
-struct MetadataRealmNodesCacheEntry {
-    nodes: Vec<NodeId>,
-    expires_at: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -142,7 +126,6 @@ impl ServerState {
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
             initial_admin_claim,
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
-            metadata_realm_nodes_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         state.persist_trusted_realms().await;
         state
@@ -203,34 +186,10 @@ impl ServerState {
     }
 
     pub async fn load_metadata_realm_nodes(&self) -> Vec<NodeId> {
-        let cache_key = MetadataRealmNodesCacheKey {
-            realm_id: *self.realm_id.as_bytes(),
-            local_node_id: *self.node_id.as_bytes(),
-        };
-        let now = Instant::now();
-        if let Some(nodes) = {
-            let mut cache = self
-                .metadata_realm_nodes_cache
-                .lock()
-                .unwrap_or_else(|lock| lock.into_inner());
-            match cache.get(&cache_key) {
-                Some(entry) if entry.expires_at > now => Some(entry.nodes.clone()),
-                Some(_) => {
-                    cache.remove(&cache_key);
-                    None
-                }
-                None => None,
-            }
-        } {
-            return nodes;
-        }
-
-        let mut discovery_succeeded = true;
         let nodes = match drive(GetRealmNodesOperation::new(self.realm_id), &self.driver_ctx).await
         {
             Ok(nodes) => nodes,
             Err(error) => {
-                discovery_succeeded = false;
                 warn!(
                     error = %error,
                     "realm node discovery failed, using best-effort local-only metadata results"
@@ -241,19 +200,6 @@ impl ServerState {
         let mut nodes = nodes.into_iter().collect::<Vec<_>>();
         if !nodes.contains(&self.node_id) {
             nodes.push(self.node_id);
-        }
-        if discovery_succeeded {
-            let mut cache = self
-                .metadata_realm_nodes_cache
-                .lock()
-                .unwrap_or_else(|lock| lock.into_inner());
-            cache.insert(
-                cache_key,
-                MetadataRealmNodesCacheEntry {
-                    nodes: nodes.clone(),
-                    expires_at: Instant::now() + METADATA_REALM_NODES_CACHE_TTL,
-                },
-            );
         }
         nodes
     }

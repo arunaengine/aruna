@@ -246,7 +246,7 @@ pub async fn update_metadata_document(
 ) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
     let updated = drive(operation, context).await?;
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.upsert_visible_registry_record(updated.clone());
+        metadata_handle.upsert_cached_registry_record(updated.clone());
     }
     Ok(updated)
 }

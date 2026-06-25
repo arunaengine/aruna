@@ -16,7 +16,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::projector::wake_metadata_create_projection;
+use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -282,7 +282,9 @@ pub async fn create_metadata_document(
     context: Arc<DriverContext>,
 ) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
     let created = drive(operation, context.as_ref()).await?;
-    wake_metadata_create_projection(context, created.record.document_id, created.event_id);
+    schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(created)
 }
 

@@ -255,7 +255,7 @@ pub async fn delete_metadata_document(
 ) -> Result<(), DeleteMetadataDocumentError> {
     drive(operation, context).await?;
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.remove_visible_registry_record(document_id);
+        metadata_handle.remove_cached_registry_record(document_id);
     }
     Ok(())
 }

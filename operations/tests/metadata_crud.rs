@@ -31,7 +31,8 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
     drain_pending_metadata_projection_queue, project_metadata_create_event_from_log,
-    project_metadata_create_events, replay_metadata_event_log, schedule_metadata_projection_retry,
+    project_metadata_create_events, replay_metadata_event_log,
+    schedule_pending_metadata_projection_drain,
 };
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
@@ -353,7 +354,7 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
     .await?;
     assert!(before_recovery.is_empty());
 
-    schedule_metadata_projection_retry(test.context.as_ref(), Duration::ZERO).await?;
+    schedule_pending_metadata_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
     initialize_task_incoming(test.context.clone(), TaskHandle::new()).await;
 
     wait_for_projected_record(&test, group_id, &record).await?;
@@ -600,10 +601,10 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
         .as_ref()
         .expect("metadata handle installed");
     let warm = metadata_handle
-        .list_visible_registry_records_for_group(group_id)
+        .list_cached_registry_records_for_group(group_id)
         .await?;
     assert_eq!(warm.as_ref(), &vec![record.clone()]);
-    metadata_handle.upsert_visible_registry_records(std::slice::from_ref(&record));
+    metadata_handle.upsert_cached_registry_records(std::slice::from_ref(&record));
     write_tombstone(&test, &record).await?;
 
     let projected = project_metadata_create_events(
@@ -616,7 +617,7 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
     assert_eq!(projected, 0);
     assert_projection_absent(&test, &record).await?;
     let visible = metadata_handle
-        .list_visible_registry_records_for_group(group_id)
+        .list_cached_registry_records_for_group(group_id)
         .await?;
     assert!(visible.is_empty());
     Ok(())

@@ -612,29 +612,29 @@ impl MetadataHandle {
         })
     }
 
-    pub fn upsert_visible_registry_record(&self, record: MetadataRegistryRecord) {
+    pub fn upsert_cached_registry_record(&self, record: MetadataRegistryRecord) {
         self.inner
             .visibility_cache
             .upsert_registry_records(std::slice::from_ref(&record));
     }
 
-    pub fn upsert_visible_registry_records(&self, records: &[MetadataRegistryRecord]) {
+    pub fn upsert_cached_registry_records(&self, records: &[MetadataRegistryRecord]) {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
-    pub fn remove_visible_registry_record(&self, document_id: Ulid) {
+    pub fn remove_cached_registry_record(&self, document_id: Ulid) {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);
     }
 
-    pub async fn list_visible_registry_records(
+    pub async fn list_cached_registry_records(
         &self,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
         list_local_registry_records(self.inner.clone()).await
     }
 
-    pub async fn list_visible_registry_records_for_group(
+    pub async fn list_cached_registry_records_for_group(
         &self,
         group_id: GroupId,
     ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {

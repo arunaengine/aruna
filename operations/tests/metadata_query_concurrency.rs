@@ -590,7 +590,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
     write_registry_records(&harness, std::slice::from_ref(&late_record)).await?;
     harness
         .handle
-        .upsert_visible_registry_record(late_record.clone());
+        .upsert_cached_registry_record(late_record.clone());
     let names = query_names_as(&harness, None).await?;
     assert!(contains_name(&names, "probe late"));
 

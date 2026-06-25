@@ -189,9 +189,9 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
 
     // Cold fill of the handle-owned list-path registry cache over the same storage.
     let list_fill_started = Instant::now();
-    let listed = handle.list_visible_registry_records().await?;
+    let listed = handle.list_cached_registry_records().await?;
     println!(
-        "visible registry cold fill: {:?} ({} records)",
+        "registry cache cold fill: {:?} ({} records)",
         list_fill_started.elapsed(),
         listed.len()
     );

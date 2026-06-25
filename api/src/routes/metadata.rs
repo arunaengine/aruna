@@ -1219,14 +1219,14 @@ async fn load_group_metadata_records(
     // group's listing stays independent of the realm-wide corpus size.
     if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
         match metadata_handle
-            .list_visible_registry_records_for_group(group_id)
+            .list_cached_registry_records_for_group(group_id)
             .await
         {
             Ok(group_records) => return Ok(group_records.as_ref().clone()),
             Err(error) => {
                 warn!(
                     error = %error,
-                    "visible registry cache fill failed, falling back to registry scan"
+                    "metadata registry cache fill failed, falling back to registry scan"
                 );
             }
         }
@@ -2307,14 +2307,16 @@ mod tests {
     };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::announce_realm_presence::{
+        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
     use aruna_operations::metadata::projector::{
-        drain_metadata_projection_batch, metadata_projection_batch_key,
-        project_metadata_create_events_from_log, replay_metadata_event_log,
-        take_metadata_projection_batch, wake_metadata_create_projection,
+        drain_pending_metadata_projection_queue, replay_metadata_event_log,
+        schedule_pending_metadata_projection_drain,
     };
     use aruna_operations::metadata::prune_queue::{
         metadata_graph_prune_jobs_exist, process_metadata_graph_tombstones,
@@ -2343,8 +2345,6 @@ mod tests {
     #[tokio::test]
     async fn public_metadata_routes_support_create_list_export_and_query() {
         let test = setup_state().await;
-        let ctx = test.state.get_ctx();
-        let projection_key = metadata_projection_batch_key(&ctx);
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -2363,9 +2363,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, pending_targets) =
-            take_metadata_projection_batch(projection_key).expect("metadata projection scheduled");
-        assert_eq!(pending_targets.len(), 1);
 
         let document_id = created.summary.document_id.clone();
 
@@ -2642,7 +2639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_metadata_documents_serves_records_from_visible_registry_cache() {
+    async fn list_metadata_documents_serves_records_from_handle_registry_cache() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
         ctx.metadata_handle
@@ -2658,7 +2655,7 @@ mod tests {
                     group_id: test.group_id.to_string(),
                     path: "datasets/cache-served".to_string(),
                     name: "Cache Served Dataset".to_string(),
-                    description: "Served from the visible registry cache".to_string(),
+                    description: "Served from the handle registry cache".to_string(),
                     date_published: "2026-01-01".to_string(),
                     license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
                     public: true,
@@ -2706,7 +2703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_document_lifecycle_tombstone_hides_stale_visible_registry_listing() {
+    async fn inbound_document_lifecycle_tombstone_hides_stale_registry_listing() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
         ctx.metadata_handle
@@ -2809,17 +2806,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_batch_failure_persists_projection_retry() {
+    async fn pending_projection_drain_timer_is_persisted() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        let key = metadata_projection_batch_key(&ctx);
 
-        wake_metadata_create_projection(ctx.clone(), Ulid::new(), Ulid::new());
-        drain_metadata_projection_batch(key).await;
+        schedule_pending_metadata_projection_drain(ctx.as_ref(), Duration::ZERO)
+            .await
+            .expect("projection drain scheduled");
 
         let timer = read_persisted_task_timer(ctx.as_ref(), &TaskKey::DrainMetadataProjectionQueue)
             .await
-            .expect("projection retry timer persisted");
+            .expect("projection drain timer persisted");
         assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
     }
 
@@ -2892,6 +2889,73 @@ mod tests {
         let nodes = load_realm_nodes(state.as_ref()).await.unwrap();
 
         assert_eq!(nodes, vec![state.get_node_id()]);
+    }
+
+    #[tokio::test]
+    async fn load_realm_nodes_reflects_new_presence_without_stale_cache() {
+        let realm_id = RealmId([31u8; 32]);
+        let coordinator = spawn_distributed_metadata_node(realm_id).await;
+        let remote = spawn_distributed_metadata_node(realm_id).await;
+
+        coordinator
+            .net
+            .add_peer_addr(remote.net.endpoint_addr())
+            .await;
+        remote
+            .net
+            .add_peer_addr(coordinator.net.endpoint_addr())
+            .await;
+
+        let initial = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+        assert_eq!(initial, vec![coordinator.net.node_id()]);
+
+        let remote_ctx = remote.state.get_ctx();
+        let mut announced = false;
+        let mut last_announce_error = None;
+        for _ in 0..10 {
+            match drive(
+                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    realm_id,
+                    node_id: remote.net.node_id(),
+                    schedule_refresh: false,
+                }),
+                remote_ctx.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    announced = true;
+                    break;
+                }
+                Err(error) => {
+                    last_announce_error = Some(format!("{error:?}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if !announced {
+            coordinator.net.shutdown().await;
+            remote.net.shutdown().await;
+            panic!(
+                "remote realm presence was not announced: {}",
+                last_announce_error.unwrap_or_else(|| "no attempts".to_string())
+            );
+        }
+
+        let mut discovered = Vec::new();
+        for _ in 0..10 {
+            discovered = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+            if discovered.contains(&remote.net.node_id()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(discovered.contains(&coordinator.net.node_id()));
+        assert!(discovered.contains(&remote.net.node_id()));
+
+        coordinator.net.shutdown().await;
+        remote.net.shutdown().await;
     }
 
     #[test]
@@ -2982,7 +3046,6 @@ mod tests {
     async fn export_returns_service_unavailable_while_materialization_pending() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        let projection_key = metadata_projection_batch_key(&ctx);
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -3001,8 +3064,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, pending_targets) =
-            take_metadata_projection_batch(projection_key).expect("metadata projection scheduled");
 
         let result = export_metadata_rocrate(
             State(test.state.clone()),
@@ -3013,10 +3074,11 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ServerError::NotFound)));
 
-        let projected = project_metadata_create_events_from_log(ctx.as_ref(), pending_targets)
+        let projected = drain_pending_metadata_projection_queue(ctx.as_ref())
             .await
             .unwrap();
-        assert_eq!(projected, 1);
+        assert_eq!(projected.markers_examined, 1);
+        assert_eq!(projected.projected, 1);
         let result = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),
@@ -3963,7 +4025,12 @@ mod tests {
 
     async fn drain_metadata_background(state: &ServerState) {
         let ctx = state.get_ctx();
-        replay_metadata_event_log(ctx.as_ref()).await.unwrap();
+        let drained = drain_pending_metadata_projection_queue(ctx.as_ref())
+            .await
+            .unwrap();
+        if drained.markers_examined == 0 {
+            replay_metadata_event_log(ctx.as_ref()).await.unwrap();
+        }
         process_metadata_materialization_batch(ctx.as_ref())
             .await
             .unwrap();

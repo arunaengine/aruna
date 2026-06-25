@@ -6,7 +6,7 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
-    project_metadata_create_events_from_log, schedule_metadata_projection_retry,
+    project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
@@ -352,7 +352,7 @@ async fn project_inbound_metadata_create_events(
 
 async fn schedule_projection_retry(context: &DriverContext) {
     if let Err(error) =
-        schedule_metadata_projection_retry(context, METADATA_PROJECTION_RETRY_AFTER).await
+        schedule_pending_metadata_projection_drain(context, METADATA_PROJECTION_RETRY_AFTER).await
     {
         warn!(error = ?error, "Failed to schedule metadata projection retry");
     }
