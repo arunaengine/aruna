@@ -70,6 +70,8 @@ pub const IROKLE_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const IROKLE_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const IROKLE_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const IROKLE_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
+const GROUP_REALM_ID_PATH: &str = "group.realm_id";
 const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
 const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
@@ -1852,7 +1854,7 @@ async fn apply_legacy_admin_document_upsert_to_storage(
                 )));
             }
             let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-                overlay_group_role_set_reducer_materialization(&mut group, reducer_state);
+                overlay_group_reducer_materialization(&mut group, reducer_state);
                 postcard::to_allocvec(&group)
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?
             } else {
@@ -2134,6 +2136,27 @@ fn overlay_user_reducer_materialization(
     }
 }
 
+fn overlay_group_reducer_materialization(
+    group: &mut Group,
+    reducer_state: &AdminDocumentReducerState,
+) {
+    if !reducer_state
+        .conflicts
+        .contains_key(GROUP_DISPLAY_NAME_PATH)
+        && let Some(display_name) = reducer_state.materialized_group_display_name()
+    {
+        group.display_name = display_name;
+    }
+
+    if !reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+        && let Some(realm_id) = reducer_state.materialized_group_realm_id()
+    {
+        group.realm_id = realm_id;
+    }
+
+    overlay_group_role_set_reducer_materialization(group, reducer_state);
+}
+
 fn overlay_group_role_set_reducer_materialization(
     group: &mut Group,
     reducer_state: &AdminDocumentReducerState,
@@ -2147,6 +2170,29 @@ fn overlay_group_role_set_reducer_materialization(
             group.roles.remove(&role_id);
         }
     }
+}
+
+fn group_reducer_materialized_group(
+    group_id: Ulid,
+    reducer_state: &AdminDocumentReducerState,
+) -> Option<Group> {
+    if reducer_state
+        .conflicts
+        .contains_key(GROUP_DISPLAY_NAME_PATH)
+        || reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+    {
+        return None;
+    }
+
+    Some(Group {
+        display_name: reducer_state.materialized_group_display_name()?,
+        group_id,
+        realm_id: reducer_state.materialized_group_realm_id()?,
+        roles: reducer_state
+            .materialized_group_roles()
+            .into_iter()
+            .collect(),
+    })
 }
 
 fn overlay_group_authorization_reducer_materialization(
@@ -2820,27 +2866,34 @@ async fn apply_user_admin_document_operation_to_storage(
     storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
 }
 
-async fn group_role_set_write_entry_for_existing_group(
+async fn group_write_entry_from_reducer(
     storage: &StorageHandle,
     group_id: Ulid,
     reducer_state: &AdminDocumentReducerState,
 ) -> Result<Option<(String, ByteView, Value)>> {
     let target = DocumentSyncTarget::Group { group_id };
-    let Some(bytes) =
-        storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await?
-    else {
-        return Ok(None);
-    };
-    let mut group =
-        Group::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if group.group_id != group_id {
-        return Err(NetError::Bootstrap(format!(
-            "stored group document id {group_id} does not match payload group id {}",
-            group.group_id
-        )));
-    }
+    let group =
+        match storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await? {
+            Some(bytes) => {
+                let mut group = Group::from_bytes(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                if group.group_id != group_id {
+                    return Err(NetError::Bootstrap(format!(
+                        "stored group document id {group_id} does not match payload group id {}",
+                        group.group_id
+                    )));
+                }
+                overlay_group_reducer_materialization(&mut group, reducer_state);
+                group
+            }
+            None => {
+                let Some(group) = group_reducer_materialized_group(group_id, reducer_state) else {
+                    return Ok(None);
+                };
+                group
+            }
+        };
 
-    overlay_group_role_set_reducer_materialization(&mut group, reducer_state);
     Ok(Some(target_write_entry(
         target,
         postcard::to_allocvec(&group)
@@ -2874,13 +2927,14 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     }
     if !matches!(
         &event.op,
-        AdminDocumentOperation::GroupRoleAdded { .. }
+        AdminDocumentOperation::GroupCreated { .. }
+            | AdminDocumentOperation::GroupRoleAdded { .. }
             | AdminDocumentOperation::GroupRoleCreated { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports role seeds, role creation, and role user assignment updates"
+            "group admin operation sync only supports group creation, role seeds, role creation, and role user assignment updates"
                 .to_string(),
         ));
     }
@@ -2918,11 +2972,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         roles: Default::default(),
     });
     materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
-    let group_write = if matches!(&event.op, AdminDocumentOperation::GroupRoleCreated { .. }) {
-        group_role_set_write_entry_for_existing_group(storage, group_id, &reducer_state).await?
-    } else {
-        None
-    };
+    let group_write = group_write_entry_from_reducer(storage, group_id, &reducer_state).await?;
 
     let mut writes = vec![
         (
@@ -5860,6 +5910,182 @@ mod tests {
             read_group_auth_doc(&storage, bootstrap_group_id).await,
             bootstrap
         );
+    }
+
+    #[tokio::test]
+    async fn group_created_admin_operation_bootstraps_missing_group_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([35; 32]);
+        let group_id = Ulid::from_parts(190, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(191, 1), realm_id),
+            realm_id,
+        );
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            test_admin_event(
+                Ulid::from_parts(192, 1),
+                AdminDocumentTarget::Group { group_id },
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Reduced group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("group create applies");
+
+        assert_eq!(
+            read_group_doc(&storage, group_id).await,
+            Group {
+                display_name: "Reduced group".to_string(),
+                group_id,
+                realm_id,
+                roles: HashSet::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn group_role_create_admin_operation_after_group_created_updates_group_roles() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([36; 32]);
+        let group_id = Ulid::from_parts(193, 1);
+        let role_id = Ulid::from_parts(194, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(195, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(196, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Reduced group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("group create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(197, 1),
+                target,
+                &actor,
+                2,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: test_admin_role_definition(
+                        role_id,
+                        "Reduced group role",
+                        "/group/reduced/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("role create applies");
+
+        assert_eq!(
+            read_group_doc(&storage, group_id).await.roles,
+            HashSet::from([role_id])
+        );
+        assert!(
+            read_group_auth_doc(&storage, group_id)
+                .await
+                .roles
+                .contains_key(&role_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_legacy_group_upsert_after_group_created_preserves_reducer_metadata_and_roles() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([37; 32]);
+        let legacy_realm_id = RealmId::from_bytes([38; 32]);
+        let group_id = Ulid::from_parts(198, 1);
+        let role_id = Ulid::from_parts(199, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(200, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(201, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Reduced group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("group create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(202, 1),
+                target,
+                &actor,
+                2,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: test_admin_role_definition(
+                        role_id,
+                        "Reduced group role",
+                        "/group/reduced/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("role create applies");
+
+        let late_legacy = Group {
+            display_name: "Late legacy group".to_string(),
+            group_id,
+            realm_id: legacy_realm_id,
+            roles: HashSet::new(),
+        };
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            DocumentSyncTarget::Group { group_id },
+            late_legacy
+                .to_bytes(&actor)
+                .expect("legacy group serializes"),
+        )
+        .await
+        .expect("late legacy group upsert overlays reducer state");
+
+        let merged = read_group_doc(&storage, group_id).await;
+        assert_eq!(merged.display_name, "Reduced group");
+        assert_eq!(merged.realm_id, realm_id);
+        assert_eq!(merged.roles, HashSet::from([role_id]));
     }
 
     #[tokio::test]
