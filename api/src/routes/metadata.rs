@@ -30,7 +30,6 @@ use aruna_operations::metadata::repository::{
     parse_materialization_status_read, parse_registry_read, read_materialization_status_effect,
     read_registry_by_document_effect,
 };
-use aruna_operations::metadata::visible_registry;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation,
@@ -667,7 +666,7 @@ pub async fn delete_metadata_document(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    visible_registry::remove_visible_registry_record(ctx.as_ref(), record.group_id, document_id);
+    remove_visible_registry_record(&state, document_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1317,24 +1316,28 @@ async fn load_group_metadata_records(
     group_id: Ulid,
 ) -> ServerResult<Vec<MetadataRegistryRecord>> {
     let ctx = state.get_ctx();
-    // Listing is eventually consistent by design: the visible-registry cache is
-    // incrementally updated on local writes (projection upserts, updates,
-    // deletes), serves stale snapshots while a background refill runs, and is
-    // keyed per group so a small group's listing stays independent of the
-    // realm-wide corpus size; the registry scan only runs as a cold-cache
-    // fallback when the fill fails.
-    match visible_registry::list_visible_registry_records_for_group(ctx.as_ref(), group_id).await {
-        Ok(group_records) => Ok(group_records.as_ref().clone()),
-        Err(error) => {
-            warn!(
-                error = %error,
-                "visible registry cache fill failed, falling back to registry scan"
-            );
-            drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
-                .await
-                .map_err(|err| ServerError::InternalError(err.to_string()))
+    // Listing is eventually consistent by design: the handle-owned visibility
+    // cache is incrementally updated on local writes, serves stale snapshots
+    // while a background refill runs, and is keyed per group so a small
+    // group's listing stays independent of the realm-wide corpus size.
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        match metadata_handle
+            .list_visible_registry_records_for_group(group_id)
+            .await
+        {
+            Ok(group_records) => return Ok(group_records.as_ref().clone()),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "visible registry cache fill failed, falling back to registry scan"
+                );
+            }
         }
     }
+
+    drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
 async fn build_metadata_list_response(
@@ -1665,7 +1668,13 @@ fn upsert_visible_registry_record(state: &ServerState, record: &MetadataRegistry
     if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
         metadata_handle.upsert_visible_registry_record(record.clone());
     }
-    visible_registry::upsert_visible_registry_records(ctx.as_ref(), std::slice::from_ref(record));
+}
+
+fn remove_visible_registry_record(state: &ServerState, document_id: Ulid) {
+    let ctx = state.get_ctx();
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        metadata_handle.remove_visible_registry_record(document_id);
+    }
 }
 
 async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<Value> {
@@ -2787,7 +2796,10 @@ mod tests {
     async fn list_metadata_documents_serves_records_from_visible_registry_cache() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        visible_registry::invalidate_visible_registry(ctx.as_ref());
+        ctx.metadata_handle
+            .as_ref()
+            .expect("metadata handle installed")
+            .expire_visibility_caches();
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -2808,7 +2820,10 @@ mod tests {
         .unwrap();
         drain_metadata_background(test.state.as_ref()).await;
 
-        visible_registry::invalidate_visible_registry(ctx.as_ref());
+        ctx.metadata_handle
+            .as_ref()
+            .expect("metadata handle installed")
+            .expire_visibility_caches();
 
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
@@ -2845,7 +2860,10 @@ mod tests {
     async fn inbound_document_lifecycle_tombstone_hides_stale_visible_registry_listing() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        visible_registry::invalidate_visible_registry(ctx.as_ref());
+        ctx.metadata_handle
+            .as_ref()
+            .expect("metadata handle installed")
+            .expire_visibility_caches();
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),

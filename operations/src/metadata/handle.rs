@@ -205,6 +205,7 @@ struct MetadataVisibilityCache {
 struct RegistryCacheEntry {
     records: BTreeMap<Ulid, MetadataRegistryRecord>,
     snapshot: Option<Arc<Vec<MetadataRegistryRecord>>>,
+    group_snapshots: HashMap<GroupId, Arc<Vec<MetadataRegistryRecord>>>,
     expires_at: Instant,
 }
 
@@ -213,6 +214,21 @@ impl RegistryCacheEntry {
         self.snapshot
             .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
             .clone()
+    }
+
+    fn group_snapshot(&mut self, group_id: GroupId) -> Arc<Vec<MetadataRegistryRecord>> {
+        if let Some(records) = self.group_snapshots.get(&group_id) {
+            return records.clone();
+        }
+        let records = Arc::new(
+            self.records
+                .values()
+                .filter(|record| record.group_id == group_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        self.group_snapshots.insert(group_id, records.clone());
+        records
     }
 }
 
@@ -265,6 +281,20 @@ impl MetadataVisibilityCache {
             .map(|entry| (entry.snapshot(), entry.expires_at > now))
     }
 
+    fn registry_records_for_group_any(
+        &self,
+        group_id: GroupId,
+    ) -> Option<(Arc<Vec<MetadataRegistryRecord>>, bool)> {
+        let now = Instant::now();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        registry
+            .as_mut()
+            .map(|entry| (entry.group_snapshot(group_id), entry.expires_at > now))
+    }
+
     #[cfg(test)]
     fn store_registry_records(&self, records: Arc<Vec<MetadataRegistryRecord>>) {
         let map: BTreeMap<_, _> = records
@@ -278,6 +308,7 @@ impl MetadataVisibilityCache {
         *registry = Some(RegistryCacheEntry {
             records: map,
             snapshot: Some(records),
+            group_snapshots: HashMap::new(),
             expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
         });
     }
@@ -321,6 +352,7 @@ impl MetadataVisibilityCache {
         *registry = Some(RegistryCacheEntry {
             records: map,
             snapshot: Some(records),
+            group_snapshots: HashMap::new(),
             expires_at,
         });
         true
@@ -429,8 +461,13 @@ impl MetadataVisibilityCache {
         let Some(entry) = registry.as_mut() else {
             return;
         };
+        let mut touched_groups = HashSet::new();
         for update in updates {
             entry.records.insert(update.document_id, update.clone());
+            touched_groups.insert(update.group_id);
+        }
+        for group_id in touched_groups {
+            entry.group_snapshots.remove(&group_id);
         }
         entry.snapshot = None;
     }
@@ -444,7 +481,8 @@ impl MetadataVisibilityCache {
         let Some(entry) = registry.as_mut() else {
             return;
         };
-        if entry.records.remove(&document_id).is_some() {
+        if let Some(removed) = entry.records.remove(&document_id) {
+            entry.group_snapshots.remove(&removed.group_id);
             entry.snapshot = None;
         }
     }
@@ -458,13 +496,22 @@ impl MetadataVisibilityCache {
         let Some(entry) = registry.as_mut() else {
             return;
         };
-        let before = entry.records.len();
+        let removed_groups = entry
+            .records
+            .values()
+            .filter(|record| record.graph_iri == graph_iri)
+            .map(|record| record.group_id)
+            .collect::<HashSet<_>>();
+        if removed_groups.is_empty() {
+            return;
+        }
         entry
             .records
             .retain(|_, record| record.graph_iri != graph_iri);
-        if entry.records.len() != before {
-            entry.snapshot = None;
+        for group_id in removed_groups {
+            entry.group_snapshots.remove(&group_id);
         }
+        entry.snapshot = None;
     }
 
     fn remove_lifecycle_entry(&self, graph_iri: &str) {
@@ -579,6 +626,19 @@ impl MetadataHandle {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);
+    }
+
+    pub async fn list_visible_registry_records(
+        &self,
+    ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+        list_local_registry_records(self.inner.clone()).await
+    }
+
+    pub async fn list_visible_registry_records_for_group(
+        &self,
+        group_id: GroupId,
+    ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+        list_local_registry_records_for_group(self.inner.clone(), group_id).await
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -3219,6 +3279,69 @@ async fn list_local_registry_records(
     }
 }
 
+#[tracing::instrument(
+    name = "metadata.registry.list_local_group",
+    level = "debug",
+    skip(inner),
+    fields(
+        group_id = %group_id,
+        cache_hit = field::Empty,
+        stale = field::Empty,
+        record_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+async fn list_local_registry_records_for_group(
+    inner: Arc<MetadataInner>,
+    group_id: GroupId,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+    match inner
+        .visibility_cache
+        .registry_records_for_group_any(group_id)
+    {
+        Some((records, fresh)) => {
+            if !fresh {
+                spawn_visibility_cache_refill(inner.clone());
+            }
+            span.record("cache_hit", true);
+            span.record("stale", !fresh);
+            span.record("record_count", records.len() as u64);
+            record_elapsed(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+        None => {
+            let _fill = inner
+                .visibility_cache
+                .registry_fill
+                .clone()
+                .lock_owned()
+                .await;
+            if let Some((records, true)) = inner
+                .visibility_cache
+                .registry_records_for_group_any(group_id)
+            {
+                span.record("cache_hit", true);
+                span.record("stale", false);
+                span.record("record_count", records.len() as u64);
+                record_elapsed(&span, "elapsed_ms", started);
+                return Ok(records);
+            }
+            span.record("cache_hit", false);
+            fill_visibility_caches(&inner).await?;
+            let records = inner
+                .visibility_cache
+                .registry_records_for_group_any(group_id)
+                .map(|(records, _)| records)
+                .unwrap_or_else(|| Arc::new(Vec::new()));
+            span.record("record_count", records.len() as u64);
+            record_elapsed(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+    }
+}
+
 // Single-flight background refill; readers keep being served the stale entry
 // until the new Arc is swapped in.
 fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
@@ -3304,6 +3427,7 @@ async fn fill_visibility_caches(
             )
         })
         .collect::<Vec<_>>();
+    records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
     inner.visibility_cache.store_visibility_fill(
         records.clone(),
@@ -4388,6 +4512,40 @@ mod tests {
         let records = cache.registry_records().expect("cache entry");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].document_id, kept.document_id);
+    }
+
+    #[test]
+    fn group_snapshots_are_scoped_and_invalidate_per_group() {
+        let group_a = Ulid::new();
+        let group_b = Ulid::new();
+        let mut record_a = registry_record("datasets/a");
+        record_a.group_id = group_a;
+        let mut record_b = registry_record("datasets/b");
+        record_b.group_id = group_b;
+        let cache = filled_cache(vec![record_a.clone(), record_b.clone()]);
+
+        let (listed_a, fresh) = cache
+            .registry_records_for_group_any(group_a)
+            .expect("group A snapshot exists");
+        assert!(fresh);
+        assert_eq!(listed_a.as_ref(), &vec![record_a.clone()]);
+
+        let mut added_b = registry_record("datasets/b2");
+        added_b.group_id = group_b;
+        cache.upsert_registry_records(std::slice::from_ref(&added_b));
+        let (listed_a_again, _) = cache
+            .registry_records_for_group_any(group_a)
+            .expect("group A snapshot still exists");
+        assert!(Arc::ptr_eq(&listed_a, &listed_a_again));
+
+        let mut added_a = registry_record("datasets/a2");
+        added_a.group_id = group_a;
+        cache.upsert_registry_records(std::slice::from_ref(&added_a));
+        let (listed_a_after, _) = cache
+            .registry_records_for_group_any(group_a)
+            .expect("group A snapshot refreshes");
+        assert_eq!(listed_a_after.len(), 2);
+        assert!(!Arc::ptr_eq(&listed_a, &listed_a_after));
     }
 
     #[test]

@@ -4,7 +4,6 @@ pub mod projector;
 mod protocol;
 pub mod prune_queue;
 pub mod repository;
-pub mod visible_registry;
 
 use std::sync::Arc;
 
@@ -23,9 +22,6 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>) {
             && let Err(error) = handle.warm_caches().await
         {
             warn!(error = %error, "Metadata visibility cache warmup failed");
-        }
-        if let Err(error) = visible_registry::list_visible_registry_records(&context).await {
-            warn!(error = %error, "Visible registry cache warmup failed");
         }
     });
 }

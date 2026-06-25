@@ -210,11 +210,6 @@ pub async fn process_metadata_graph_tombstones(
         if let Some(metadata_handle) = metadata_handle.as_ref() {
             metadata_handle.remove_visible_registry_record(tombstone.document_id);
         }
-        crate::metadata::visible_registry::remove_visible_registry_record(
-            context,
-            tombstone.group_id,
-            tombstone.document_id,
-        );
 
         if let Err(error) =
             enqueue_metadata_graph_prune_job(context, tombstone.graph_iri.clone()).await
@@ -703,13 +698,11 @@ mod tests {
             metadata_registry_write_entries(&record).expect("registry entries"),
         )
         .await;
-        crate::metadata::visible_registry::invalidate_visible_registry(&context);
-        let stale = crate::metadata::visible_registry::list_visible_registry_records_for_group(
-            &context,
-            record.group_id,
-        )
-        .await
-        .expect("visible registry fills");
+        metadata_handle.expire_visibility_caches();
+        let stale = metadata_handle
+            .list_visible_registry_records_for_group(record.group_id)
+            .await
+            .expect("visible registry fills");
         assert_eq!(stale.as_ref(), &vec![record.clone()]);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
@@ -727,12 +720,10 @@ mod tests {
         let processed = process_metadata_graph_tombstones(&context, vec![tombstone.clone()]).await;
 
         assert_eq!(processed.enqueued, 1);
-        let listed = crate::metadata::visible_registry::list_visible_registry_records_for_group(
-            &context,
-            record.group_id,
-        )
-        .await
-        .expect("visible registry reads");
+        let listed = metadata_handle
+            .list_visible_registry_records_for_group(record.group_id)
+            .await
+            .expect("visible registry reads");
         assert!(listed.is_empty());
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);

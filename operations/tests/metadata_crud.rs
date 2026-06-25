@@ -594,18 +594,15 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
         "Deleted Repair Dataset",
     );
     write_registry_rows(&test, &record).await?;
-    let warm =
-        aruna_operations::metadata::visible_registry::list_visible_registry_records_for_group(
-            test.context.as_ref(),
-            group_id,
-        )
-        .await?;
-    assert_eq!(warm.as_ref(), &vec![record.clone()]);
     let metadata_handle = test
         .context
         .metadata_handle
         .as_ref()
         .expect("metadata handle installed");
+    let warm = metadata_handle
+        .list_visible_registry_records_for_group(group_id)
+        .await?;
+    assert_eq!(warm.as_ref(), &vec![record.clone()]);
     metadata_handle.upsert_visible_registry_records(std::slice::from_ref(&record));
     write_tombstone(&test, &record).await?;
 
@@ -618,11 +615,8 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 
     assert_eq!(projected, 0);
     assert_projection_absent(&test, &record).await?;
-    let visible =
-        aruna_operations::metadata::visible_registry::list_visible_registry_records_for_group(
-            test.context.as_ref(),
-            group_id,
-        )
+    let visible = metadata_handle
+        .list_visible_registry_records_for_group(group_id)
         .await?;
     assert!(visible.is_empty());
     Ok(())

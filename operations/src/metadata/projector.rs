@@ -424,13 +424,6 @@ pub async fn project_metadata_create_events(
                 metadata_handle.remove_visible_registry_record(record.document_id);
             }
         }
-        for record in &repaired_records {
-            crate::metadata::visible_registry::remove_visible_registry_record(
-                context,
-                record.group_id,
-                record.document_id,
-            );
-        }
     }
 
     if !writes.is_empty() {
@@ -453,10 +446,6 @@ pub async fn project_metadata_create_events(
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
             metadata_handle.upsert_visible_registry_records(&projected_records);
         }
-        crate::metadata::visible_registry::upsert_visible_registry_records(
-            context,
-            &projected_records,
-        );
     }
     if !outboxes.is_empty() {
         schedule_outbox_drain(context).await?;

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -12,10 +11,6 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::metadata_registry_key;
 use aruna_core::structs::{MetadataRegistryRecord, RealmId};
 use aruna_core::types::GroupId;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::visible_registry::{
-    invalidate_visible_registry, list_visible_registry_records,
-};
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
@@ -154,7 +149,7 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
     let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
 
     {
-        let handle = Arc::new(open_handle(metadata_dir.path(), &storage)?);
+        let handle = std::sync::Arc::new(open_handle(metadata_dir.path(), &storage)?);
         let group_id = Ulid::new();
 
         let seed_started = Instant::now();
@@ -192,17 +187,9 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
     let cold = timed_query(&handle, "first query (true cold)").await?;
     let warm = timed_query(&handle, "second query (warm)").await?;
 
-    // Cold fill of the list-path registry cache over the same storage.
-    let context = DriverContext {
-        storage_handle: storage.clone(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-    };
-    invalidate_visible_registry(&context);
+    // Cold fill of the handle-owned list-path registry cache over the same storage.
     let list_fill_started = Instant::now();
-    let listed = list_visible_registry_records(&context).await?;
+    let listed = handle.list_visible_registry_records().await?;
     println!(
         "visible registry cold fill: {:?} ({} records)",
         list_fill_started.elapsed(),
