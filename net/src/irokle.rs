@@ -1750,19 +1750,8 @@ impl IrokleService {
             return apply_metadata_registry_delete_to_storage(&self.storage, group_id, document_id)
                 .await;
         }
-        if let DocumentSyncTarget::User { user_id } = target {
-            let target = DocumentSyncTarget::User { user_id };
-            let previous = self
-                .storage_read(target.storage_keyspace().to_string(), target.storage_key())
-                .await?
-                .map(|bytes| User::from_bytes(&bytes))
-                .transpose()
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
-            if let Some(previous) = previous {
-                deletes.extend(stale_subject_index_deletes(Some(&previous), None));
-            }
-            return self.storage_batch_delete(deletes).await;
+        if apply_legacy_admin_document_delete_to_storage(&self.storage, target.clone()).await? {
+            return Ok(());
         }
         self.storage_delete(target.storage_keyspace().to_string(), target.storage_key())
             .await
@@ -1812,10 +1801,60 @@ impl IrokleService {
             ))),
         }
     }
+}
 
-    async fn storage_batch_delete(&self, deletes: Vec<(String, ByteView)>) -> Result<()> {
-        storage_batch_delete_to(&self.storage, deletes).await
+async fn apply_legacy_admin_document_delete_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+) -> Result<bool> {
+    let Some(admin_target) = admin_document_target_for_legacy_upsert(&target) else {
+        return Ok(false);
+    };
+    let reducer_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&admin_target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if let Some(reducer_state) = reducer_state.as_ref()
+        && reducer_state.target != admin_target
+    {
+        return Err(NetError::Bootstrap(
+            "legacy admin delete reducer state target mismatch".to_string(),
+        ));
     }
+    if reducer_state.is_some() {
+        return Ok(true);
+    }
+
+    if let DocumentSyncTarget::User { user_id } = target {
+        let target = DocumentSyncTarget::User { user_id };
+        let previous = storage_read_from(
+            storage,
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+        )
+        .await?
+        .map(|bytes| User::from_bytes(&bytes))
+        .transpose()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
+        if let Some(previous) = previous {
+            deletes.extend(stale_subject_index_deletes(Some(&previous), None));
+        }
+        storage_batch_delete_to(storage, deletes).await?;
+        return Ok(true);
+    }
+
+    storage_batch_delete_to(
+        storage,
+        vec![(target.storage_keyspace().to_string(), target.storage_key())],
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn apply_legacy_admin_document_upsert_to_storage(
@@ -6074,6 +6113,209 @@ mod tests {
             )
             .await,
             Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_delete_skips_with_reducer_state_and_preserves_user_indexes() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([54; 32]);
+        let actor_user_id = UserId::local(Ulid::from_parts(1_500, 1), realm_id);
+        let actor = test_actor(8, actor_user_id, realm_id);
+
+        let user_id = UserId::local(Ulid::from_parts(1_501, 1), realm_id);
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::User { user_id },
+            test_admin_event(
+                Ulid::from_parts(1_502, 1),
+                AdminDocumentTarget::User { user_id },
+                &actor,
+                1,
+                AdminDocumentOperation::UserSubjectIdAdded {
+                    subject_id: "reducer-subject".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("user reducer op applies");
+        let reduced_user = read_user_doc(&storage, user_id).await;
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(
+                &storage,
+                DocumentSyncTarget::User { user_id },
+            )
+            .await
+            .expect("legacy user delete skips")
+        );
+        assert_eq!(read_user_doc(&storage, user_id).await, reduced_user);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("reducer-subject"),
+            )
+            .await,
+            Some(subject_index_value(user_id))
+        );
+
+        let group_id = Ulid::from_parts(1_503, 1);
+        let group_role_id = Ulid::from_parts(1_504, 1);
+        let group_target = AdminDocumentTarget::Group { group_id };
+        let group_document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            group_document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_505, 1),
+                group_target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Reducer group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("group create applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            group_document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_506, 1),
+                group_target,
+                &actor,
+                2,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: test_admin_role_definition(
+                        group_role_id,
+                        "Reducer group role",
+                        "/group/reducer/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("group role create applies");
+        let reduced_group = read_group_doc(&storage, group_id).await;
+        let reduced_group_auth = read_group_auth_doc(&storage, group_id).await;
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(
+                &storage,
+                DocumentSyncTarget::Group { group_id },
+            )
+            .await
+            .expect("legacy group delete skips")
+        );
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(&storage, group_document_target)
+                .await
+                .expect("legacy group auth delete skips")
+        );
+        assert_eq!(read_group_doc(&storage, group_id).await, reduced_group);
+        assert_eq!(
+            read_group_auth_doc(&storage, group_id).await,
+            reduced_group_auth
+        );
+
+        let realm_role_id = Ulid::from_parts(1_507, 1);
+        let realm_target = AdminDocumentTarget::Realm { realm_id };
+        let realm_document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            realm_document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_508, 1),
+                realm_target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmRoleCreated {
+                    role: test_admin_role_definition(
+                        realm_role_id,
+                        "Reducer realm role",
+                        "/realm/reducer/**",
+                        Permission::WRITE,
+                    ),
+                },
+            ),
+        )
+        .await
+        .expect("realm role create applies");
+        let reduced_realm_auth = read_realm_auth_doc(&storage, realm_id).await;
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(&storage, realm_document_target)
+                .await
+                .expect("legacy realm auth delete skips")
+        );
+        assert_eq!(
+            read_realm_auth_doc(&storage, realm_id).await,
+            reduced_realm_auth
+        );
+
+        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let config_document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            config_document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_509, 1),
+                config_target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(4),
+                    discovery: test_discovery(30, "https://delete-fence.example:443"),
+                },
+            ),
+        )
+        .await
+        .expect("realm config settings apply");
+        let reduced_config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(&storage, config_document_target)
+                .await
+                .expect("legacy realm config delete skips")
+        );
+        assert_eq!(
+            read_realm_config_doc(&storage, realm_id).await,
+            reduced_config
+        );
+
+        let bootstrap_user_id = UserId::local(Ulid::from_parts(1_510, 1), realm_id);
+        let bootstrap_user = test_user_doc(bootstrap_user_id, "Bootstrap", &["bootstrap-subject"]);
+        apply_user_upsert_to_storage(
+            &storage,
+            bootstrap_user.clone(),
+            bootstrap_user
+                .to_bytes(&actor)
+                .expect("bootstrap user serializes"),
+        )
+        .await
+        .expect("bootstrap user writes");
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(
+                &storage,
+                DocumentSyncTarget::User {
+                    user_id: bootstrap_user_id,
+                },
+            )
+            .await
+            .expect("legacy user delete applies without reducer state")
+        );
+        assert_eq!(
+            read_storage_value(&storage, USER_KEYSPACE, bootstrap_user_id.to_bytes().into()).await,
+            None
+        );
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("bootstrap-subject"),
+            )
+            .await,
+            None
         );
     }
 
