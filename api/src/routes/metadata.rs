@@ -282,7 +282,7 @@ pub struct SparqlQueryRequest {
     ///
     /// `local` runs only against metadata indexed on the current node.
     /// `distributed` fans out to all known realm nodes for all-metadata queries,
-    /// or to the document's registry holder nodes for document-scoped queries,
+    /// or to the document's registry replica nodes for document-scoped queries,
     /// and merges the results.
     /// Distributed mode is best-effort and may return partial results if realm
     /// node discovery or remote requests fail.
@@ -1033,7 +1033,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry holder nodes and merges the results. Distributed mode is best-effort and may return partial results if holder requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replica nodes and merges the results. Distributed mode is best-effort and may return partial results if replica requests fail. Omitting `mode` defaults to `distributed`.",
         examples(
             (
                 "DocumentAsk" = (
