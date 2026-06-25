@@ -1,16 +1,27 @@
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 use crate::replicate_documents::replicate_documents_effect;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::admin_documents::{
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
-use aruna_core::types::Effects;
+use aruna_core::storage_entries::{
+    admin_document_conflict_write_entries, admin_document_reducer_state_write_entry,
+};
+use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Role};
+use aruna_core::task::TaskEvent;
+use aruna_core::types::{Effects, Key, UserId, Value};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use tracing::trace;
+use tracing::{trace, warn};
 use ulid::Ulid;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,13 +67,19 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
     fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = Ulid::new();
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+            self.config.actor.user_id,
+            self.config.actor.realm_id,
+            group_id,
+        );
         let group = Group {
-            roles: HashSet::new(),
+            roles: auth_doc.roles.keys().copied().collect(),
             display_name: self.config.display_name.clone(),
             group_id,
             realm_id: self.config.actor.realm_id,
         };
 
+        self.auth_doc = Some(auth_doc);
         self.group = Some(group.clone());
 
         trace!(
@@ -87,30 +104,115 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.emit_auth_doc", level = "debug", skip(self), fields(state = ?self.state))]
     fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateGroupError> {
-        self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
+        let txn_id = self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
         let group_id = self
             .group
             .as_ref()
             .ok_or(CreateGroupError::GroupNotFound)?
             .group_id;
-
-        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
-            self.config.actor.user_id,
-            self.config.actor.realm_id,
-            group_id,
-        );
-
-        self.auth_doc = Some(auth_doc.clone());
+        let auth_doc = self
+            .auth_doc
+            .as_ref()
+            .ok_or(CreateGroupError::AuthDocNotFound)?;
 
         let key = group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.config.actor)?.into();
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: self.txn_id,
+        let mut writes = vec![(AUTH_KEYSPACE.to_string(), key, value)];
+        writes.extend(self.admin_reducer_seed_writes()?);
+
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
         })])
+    }
+
+    fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
+        let group_id = self
+            .group
+            .as_ref()
+            .ok_or(CreateGroupError::GroupNotFound)?
+            .group_id;
+        let auth_doc = self
+            .auth_doc
+            .as_ref()
+            .ok_or(CreateGroupError::AuthDocNotFound)?;
+        let target = AdminDocumentTarget::Group { group_id };
+        let mut reducer_state = AdminDocumentReducerState::new(target);
+        let mut admin_events = Vec::new();
+        let roles = sorted_roles(auth_doc);
+
+        for role in &roles {
+            admin_events.push(apply_admin_reducer_operation(
+                &mut reducer_state,
+                &self.config.actor,
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: AdminDocumentRoleDefinition::from(*role),
+                },
+            )?);
+        }
+
+        let admin_role = roles
+            .iter()
+            .find(|role| role.name == "admin")
+            .ok_or(CreateGroupError::AdminRoleNotFound)?;
+        for user_id in sorted_user_ids(&admin_role.assigned_users) {
+            admin_events.push(apply_admin_reducer_operation(
+                &mut reducer_state,
+                &self.config.actor,
+                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                    role_id: admin_role.role_id,
+                    user_id,
+                },
+            )?);
+        }
+
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let mut writes = vec![admin_document_reducer_state_write_entry(&reducer_state)?];
+        for event in admin_events {
+            let record = new_outbox_record_with_id(
+                event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(event),
+                },
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
+        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
+
+        Ok(writes)
+    }
+
+    fn emit_legacy_document_replication(&mut self) -> Effects {
+        if let Some(group) = &self.group
+            && self.auth_doc.is_some()
+        {
+            self.state = CreateGroupState::ReplicateDocuments;
+            trace!(
+                event = "group.create.announce_group",
+                group_id = %group.group_id,
+                realm_id = %group.realm_id,
+                user_id = %self.config.actor.user_id,
+                "Announcing group"
+            );
+            smallvec![replicate_documents_effect(
+                self.config.actor.realm_id,
+                self.config.actor.node_id,
+                vec![
+                    DocumentSyncTarget::Group {
+                        group_id: group.group_id,
+                    },
+                    DocumentSyncTarget::GroupAuthorization {
+                        group_id: group.group_id,
+                    },
+                ],
+            )]
+        } else {
+            self.fail(CreateGroupError::GroupNotFound)
+        }
     }
 
     #[tracing::instrument(name = "group.create.fail", level = "debug", skip(self), fields(state = ?self.state, error = %err))]
@@ -194,10 +296,10 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.handle_auth_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_create_roles(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CreateRoles,
-                "Event::Storage(StorageEvent::WriteResult)",
+                "Event::Storage(StorageEvent::BatchWriteResult)",
                 got,
             );
         };
@@ -221,31 +323,28 @@ impl CreateGroupOperation {
             );
         };
 
-        if let Some(group) = &self.group
-            && self.auth_doc.is_some()
-        {
-            self.state = CreateGroupState::ReplicateDocuments;
-            trace!(
-                event = "group.create.announce_group",
-                group_id = %group.group_id,
-                realm_id = %group.realm_id,
-                user_id = %self.config.actor.user_id,
-                "Announcing group"
-            );
-            smallvec![replicate_documents_effect(
-                self.config.actor.realm_id,
-                self.config.actor.node_id,
-                vec![
-                    DocumentSyncTarget::Group {
-                        group_id: group.group_id,
-                    },
-                    DocumentSyncTarget::GroupAuthorization {
-                        group_id: group.group_id,
-                    },
-                ],
-            )]
+        if self.group.is_some() && self.auth_doc.is_some() {
+            self.state = CreateGroupState::ScheduleDocumentSyncOutboxDrain;
+            smallvec![schedule_outbox_drain_effect()]
         } else {
             self.fail(CreateGroupError::GroupNotFound)
+        }
+    }
+
+    fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                self.emit_legacy_document_replication()
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(error = %message, "Failed to schedule document sync outbox drain; continuing with legacy group creation replication");
+                self.emit_legacy_document_replication()
+            }
+            other => self.unexpected_event(
+                CreateGroupState::ScheduleDocumentSyncOutboxDrain,
+                "Event::Task(TaskEvent::TimerScheduled)",
+                format!("{other:?}"),
+            ),
         }
     }
 
@@ -282,6 +381,41 @@ impl CreateGroupOperation {
     }
 }
 
+fn apply_admin_reducer_operation(
+    state: &mut AdminDocumentReducerState,
+    actor: &Actor,
+    op: AdminDocumentOperation,
+) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+    let observed = state.clock.clone();
+    let event = AdminDocumentEvent {
+        event_id: Ulid::new(),
+        target: state.target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: observed.sequence_for(&actor.node_id) + 1,
+        observed,
+        actor: actor.clone(),
+        op,
+    };
+    state.apply(&event)?;
+    Ok(event)
+}
+
+fn sorted_roles(auth_doc: &GroupAuthorizationDocument) -> Vec<&Role> {
+    let mut roles: Vec<_> = auth_doc.roles.values().collect();
+    roles.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.role_id.cmp(&right.role_id))
+    });
+    roles
+}
+
+fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
+    let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
+    user_ids.sort();
+    user_ids
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CreateGroupState {
     Init,
@@ -289,6 +423,7 @@ pub enum CreateGroupState {
     CreateGroup,
     CreateRoles,
     CommitTransaction,
+    ScheduleDocumentSyncOutboxDrain,
     ReplicateDocuments,
     Finish,
     Error,
@@ -300,8 +435,14 @@ pub enum CreateGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("document sync failed: {0}")]
     DocumentSync(String),
+    #[error("No auth doc found")]
+    AuthDocNotFound,
+    #[error("No admin role found")]
+    AdminRoleNotFound,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -342,6 +483,9 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
+            CreateGroupState::ScheduleDocumentSyncOutboxDrain => {
+                self.handle_schedule_document_sync_outbox_drain(event)
+            }
             CreateGroupState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
@@ -375,12 +519,221 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
-    use aruna_core::structs::Actor;
+    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+    use aruna_core::admin_documents::{
+        AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    };
+    use aruna_core::document::{
+        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
+    };
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
+    };
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
+    use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+    use aruna_core::types::{Key, KeySpace, TxnId, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use std::collections::{BTreeSet, HashSet};
+    use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[node_seed; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([user_seed; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn config(actor: Actor) -> CreateGroupConfig {
+        CreateGroupConfig {
+            actor,
+            display_name: "Test group".to_string(),
+        }
+    }
+
+    fn batch_writes(effects: &[Effect], txn_id: TxnId) -> &Vec<(KeySpace, Key, Value)> {
+        match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(*effect_txn_id, Some(txn_id));
+                writes
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+
+    fn write_values<'a>(writes: &'a [(KeySpace, Key, Value)], keyspace: &str) -> Vec<&'a Value> {
+        writes
+            .iter()
+            .filter(|(candidate, _, _)| candidate == keyspace)
+            .map(|(_, _, value)| value)
+            .collect()
+    }
+
+    fn operation_ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateGroupOperation {
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
+            actor.user_id,
+            actor.realm_id,
+            Ulid::from_bytes([9; 16]),
+        );
+        let group = Group {
+            display_name: "Test group".to_string(),
+            group_id: auth_doc.group_id,
+            realm_id: actor.realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+        };
+        let mut operation = CreateGroupOperation::new(config(actor));
+        operation.txn_id = Some(txn_id);
+        operation.group = Some(group);
+        operation.auth_doc = Some(auth_doc);
+        operation.state = super::CreateGroupState::CommitTransaction;
+        operation
+    }
+
+    #[test]
+    fn seeds_group_reducer_state_and_admin_outbox_in_order() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::new();
+        let mut operation = CreateGroupOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+
+        let group_effects = operation.emit_create_group().unwrap();
+        let group = operation.group.as_ref().unwrap().clone();
+        let auth_doc = operation.auth_doc.as_ref().unwrap().clone();
+        match group_effects.first().unwrap() {
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id: effect_txn_id,
+                ..
+            }) => {
+                assert_eq!(key_space, GROUP_KEYSPACE);
+                assert_eq!(*effect_txn_id, Some(txn_id));
+                let stored_group = Group::from_bytes(value.as_ref()).unwrap();
+                assert_eq!(
+                    stored_group.roles,
+                    auth_doc.roles.keys().copied().collect::<HashSet<_>>()
+                );
+                assert!(!stored_group.roles.is_empty());
+            }
+            other => panic!("unexpected group write effect: {other:?}"),
+        }
+
+        let effects = operation.emit_create_auth_doc().unwrap();
+        let writes = batch_writes(&effects, txn_id);
+        let target = AdminDocumentTarget::Group {
+            group_id: group.group_id,
+        };
+        let reducer_state = postcard::from_bytes::<AdminDocumentReducerState>(
+            write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
+        )
+        .unwrap();
+        let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        let stored_auth =
+            GroupAuthorizationDocument::from_bytes(write_values(writes, AUTH_KEYSPACE)[0].as_ref())
+                .unwrap();
+
+        assert_eq!(stored_auth, auth_doc);
+        assert_eq!(reducer_state.target, target);
+        assert_eq!(
+            reducer_state.materialized_group_roles(),
+            auth_doc.roles.keys().copied().collect::<BTreeSet<_>>()
+        );
+        assert!(reducer_state.conflicts.is_empty());
+
+        let admin_role = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "admin")
+            .unwrap();
+        assert!(
+            reducer_state.materialized_group_role_user_assignments()[&admin_role.role_id]
+                .contains(&actor.user_id)
+        );
+
+        assert_eq!(outbox_records.len(), auth_doc.roles.len() + 1);
+        assert!(outbox_records.iter().all(|record| {
+            record.target
+                == (DocumentSyncTarget::GroupAuthorization {
+                    group_id: group.group_id,
+                })
+        }));
+        let events = outbox_records
+            .iter()
+            .map(|record| match &record.event {
+                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                other => panic!("unexpected outbox event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let role_names = events[..auth_doc.roles.len()]
+            .iter()
+            .map(|event| match &event.op {
+                AdminDocumentOperation::GroupRoleCreated { role } => role.name.as_str(),
+                other => panic!("unexpected role seed event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(role_names, vec!["admin", "user", "viewer"]);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.target, target);
+            assert_eq!(event.origin_seq, index as u64 + 1);
+            assert_eq!(event.observed.sequence_for(&actor.node_id), index as u64);
+        }
+        assert!(matches!(
+            &events.last().unwrap().op,
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+                if *role_id == admin_role.role_id && *user_id == actor.user_id
+        ));
+        assert!(events[..auth_doc.roles.len()].iter().all(|event| matches!(
+            &event.op,
+            AdminDocumentOperation::GroupRoleCreated { role }
+                if auth_doc.roles.get(&role.role_id).is_some_and(|source| {
+                    role == &AdminDocumentRoleDefinition::from(source)
+                })
+        )));
+    }
+
+    #[test]
+    fn schedules_outbox_drain_before_legacy_replication_and_continues_on_error() {
+        let realm_id = RealmId::from_bytes([5; 32]);
+        let actor = actor(realm_id, 6, 7);
+        let txn_id = TxnId::new();
+        let mut operation = operation_ready_to_schedule(actor, txn_id);
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(
+            operation.state,
+            super::CreateGroupState::ScheduleDocumentSyncOutboxDrain
+        );
+        assert_eq!(
+            effects.first(),
+            Some(&Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::ZERO,
+            }))
+        );
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            message: "schedule failed".to_string(),
+        }));
+        assert_eq!(operation.state, super::CreateGroupState::ReplicateDocuments);
+        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+    }
 
     #[tokio::test]
     pub async fn test_group_creation() {
@@ -423,6 +776,10 @@ mod test {
         let result = drive(group_operation, &context).await.unwrap();
         assert_eq!(result.0.display_name, group_config.display_name);
         assert_eq!(result.0.realm_id, group_config.actor.realm_id);
+        assert_eq!(
+            result.0.roles,
+            result.1.roles.keys().copied().collect::<HashSet<_>>()
+        );
         assert!(
             result
                 .0
