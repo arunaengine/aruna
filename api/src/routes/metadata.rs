@@ -34,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1073,18 +1074,18 @@ pub async fn query_metadata_document(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
     ensure_record_materialized_for_graph_read(&state, &record).await?;
-    let (results, fanout) = run_query_distributed(
+    let (results, fanout_stats) = run_query_distributed(
         &state,
         auth,
         bearer_token,
         Some(vec![record.graph_iri.clone()]),
         request.query,
         request.mode,
-        Some(document_query_target_nodes(&record, state.get_node_id())),
+        Some(document_replica_query_nodes(&record, state.get_node_id())),
     )
     .await?;
     let serialize_started = Instant::now();
-    let response = map_query_results(results, fanout)?;
+    let response = map_query_results(results, fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
     Ok((StatusCode::OK, Json(response)))
 }
@@ -1129,7 +1130,7 @@ pub async fn query_all_metadata(
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     ensure_supported_query_form(&request.query)?;
-    let (results, fanout) = run_query_distributed(
+    let (results, fanout_stats) = run_query_distributed(
         &state,
         auth,
         bearer_token,
@@ -1140,7 +1141,7 @@ pub async fn query_all_metadata(
     )
     .await?;
     let serialize_started = Instant::now();
-    let response = map_query_results(results, fanout)?;
+    let response = map_query_results(results, fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
     Ok((StatusCode::OK, Json(response)))
 }
@@ -1170,7 +1171,7 @@ pub async fn search_metadata(
         return Err(ServerError::BadRequest);
     }
     let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let (hits, fanout) = run_search_distributed(
+    let (hits, fanout_stats) = run_search_distributed(
         &state,
         auth,
         bearer_token,
@@ -1185,8 +1186,8 @@ pub async fn search_metadata(
         StatusCode::OK,
         Json(MetadataSearchResponse {
             hits: hits.into_iter().map(map_search_hit).collect(),
-            nodes_queried: fanout.nodes_queried,
-            nodes_failed: fanout.nodes_failed,
+            nodes_queried: fanout_stats.nodes_queried,
+            nodes_failed: fanout_stats.nodes_failed,
         }),
     ))
 }
@@ -1681,7 +1682,7 @@ fn ensure_supported_query_form(query: &str) -> ServerResult<()> {
 
 fn map_query_results(
     results: MetadataQueryResults,
-    fanout: DistributedFanout,
+    fanout_stats: MetadataFanoutStats,
 ) -> ServerResult<MetadataQueryResponse> {
     let result = match results {
         MetadataQueryResults::Solutions(rows) => MetadataQueryResult::Solutions(
@@ -1694,8 +1695,8 @@ fn map_query_results(
     };
     Ok(MetadataQueryResponse {
         result,
-        nodes_queried: fanout.nodes_queried,
-        nodes_failed: fanout.nodes_failed,
+        nodes_queried: fanout_stats.nodes_queried,
+        nodes_failed: fanout_stats.nodes_failed,
     })
 }
 
@@ -1711,11 +1712,11 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     Ok(state.load_metadata_realm_nodes().await)
 }
 
-fn document_query_target_nodes(
+fn document_replica_query_nodes(
     record: &MetadataRegistryRecord,
     local_node_id: aruna_core::NodeId,
 ) -> Vec<aruna_core::NodeId> {
-    let nodes = deduplicate_node_ids(record.holder_node_ids.clone());
+    let nodes = deduplicate_fanout_nodes(record.holder_node_ids.clone());
     if nodes.is_empty() {
         vec![local_node_id]
     } else {
@@ -1723,7 +1724,7 @@ fn document_query_target_nodes(
     }
 }
 
-fn deduplicate_node_ids(nodes: Vec<aruna_core::NodeId>) -> Vec<aruna_core::NodeId> {
+fn deduplicate_fanout_nodes(nodes: Vec<aruna_core::NodeId>) -> Vec<aruna_core::NodeId> {
     let mut seen = HashSet::with_capacity(nodes.len());
     nodes
         .into_iter()
@@ -1735,6 +1736,241 @@ fn metadata_auth_token_from_carrier(
     carrier: Option<&ValidatedArunaBearerTokenCarrier>,
 ) -> Option<MetadataAuthToken> {
     carrier.and_then(|carrier| MetadataAuthToken::bearer(carrier.as_str()).ok())
+}
+
+type MetadataNodeCall<T> =
+    Arc<dyn Fn(aruna_core::NodeId) -> BoxFuture<'static, Result<T, MetadataError>> + Send + Sync>;
+
+#[derive(Clone, Copy)]
+enum MetadataFanoutOperation {
+    Query,
+    Search,
+}
+
+impl MetadataFanoutOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Search => "search",
+        }
+    }
+
+    fn timeout_error(self) -> MetadataError {
+        MetadataError::Backend(format!(
+            "distributed metadata {} node timed out after {}ms",
+            self.label(),
+            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
+        ))
+    }
+}
+
+fn metadata_fanout_node_span(
+    operation: MetadataFanoutOperation,
+    node_id: aruna_core::NodeId,
+    local: bool,
+) -> Span {
+    match operation {
+        MetadataFanoutOperation::Query => debug_span!(
+            "metadata.api.query_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::Search => debug_span!(
+            "metadata.api.search_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+    }
+}
+
+async fn run_metadata_fanout_node<T>(
+    operation: MetadataFanoutOperation,
+    node_id: aruna_core::NodeId,
+    local: bool,
+    local_call: MetadataNodeCall<T>,
+    remote_call: MetadataNodeCall<T>,
+    record_result: fn(&Span, &Result<T, MetadataError>),
+    record_stage_detail: bool,
+) -> Result<T, MetadataError> {
+    let node_span = metadata_fanout_node_span(operation, node_id, local);
+    let node_started = Instant::now();
+    // The coordinator's own partition runs in-process like mode=local; only
+    // remote partitions go over the wire and carry the per-node timeout.
+    let result = if local {
+        local_call(node_id).instrument(node_span.clone()).await
+    } else {
+        match tokio::time::timeout(
+            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+            remote_call(node_id).instrument(node_span.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(operation.timeout_error()),
+        }
+    };
+    let elapsed = record_elapsed_ms(&node_span, "elapsed_ms", node_started);
+    if record_stage_detail {
+        aruna_core::telemetry::record_stage_detail(
+            "fanout_node",
+            || short_display_id(node_id),
+            elapsed,
+        );
+    }
+    record_result(&node_span, &result);
+    result
+}
+
+async fn metadata_fanout_nodes(
+    state: &ServerState,
+    span: &Span,
+    target_nodes: Option<Vec<aruna_core::NodeId>>,
+) -> ServerResult<Vec<aruna_core::NodeId>> {
+    match target_nodes {
+        Some(nodes) => {
+            span.record("discovery_ms", 0u64);
+            Ok(deduplicate_fanout_nodes(nodes))
+        }
+        None => {
+            let discovery_started = Instant::now();
+            let nodes =
+                aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state)).await?;
+            record_elapsed_ms(span, "discovery_ms", discovery_started);
+            Ok(nodes)
+        }
+    }
+}
+
+async fn run_metadata_fanout<T>(
+    state: &ServerState,
+    mode: Option<MetadataQueryMode>,
+    target_nodes: Option<Vec<aruna_core::NodeId>>,
+    operation: MetadataFanoutOperation,
+    local_call: MetadataNodeCall<T>,
+    remote_call: MetadataNodeCall<T>,
+    record_result: fn(&Span, &Result<T, MetadataError>),
+    map_local_error: fn(MetadataError) -> ServerError,
+) -> ServerResult<(Vec<T>, MetadataFanoutStats)>
+where
+    T: Send + 'static,
+{
+    let span = Span::current();
+    ensure_supported_query_mode(&mode)?;
+    match mode.unwrap_or(MetadataQueryMode::Distributed) {
+        MetadataQueryMode::Local => {
+            let local_node_id = state.get_node_id();
+            let result = run_metadata_fanout_node(
+                operation,
+                local_node_id,
+                true,
+                local_call,
+                remote_call,
+                record_result,
+                false,
+            )
+            .await;
+            let fanout_stats = MetadataFanoutStats {
+                nodes_queried: 1,
+                nodes_failed: 0,
+            };
+            match result {
+                Ok(result) => Ok((vec![result], fanout_stats)),
+                Err(error) => Err(map_local_error(error)),
+            }
+        }
+        MetadataQueryMode::Distributed => {
+            let nodes = metadata_fanout_nodes(state, &span, target_nodes).await?;
+            span.record("node_count", nodes.len() as u64);
+            let mut fanout_stats = MetadataFanoutStats {
+                nodes_queried: nodes.len(),
+                nodes_failed: 0,
+            };
+            let fanout_started = Instant::now();
+            let local_node_id = state.get_node_id();
+            let mut node_iter = nodes.into_iter().enumerate();
+            let mut pending = FuturesUnordered::new();
+            let mut node_parts = Vec::new();
+
+            loop {
+                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
+                    let Some((node_index, node_id)) = node_iter.next() else {
+                        break;
+                    };
+                    let local_call = local_call.clone();
+                    let remote_call = remote_call.clone();
+                    let local = node_id == local_node_id;
+                    pending.push(async move {
+                        let result = run_metadata_fanout_node(
+                            operation,
+                            node_id,
+                            local,
+                            local_call,
+                            remote_call,
+                            record_result,
+                            true,
+                        )
+                        .await;
+                        (node_index, node_id, result)
+                    });
+                }
+
+                let Some((node_index, node_id, result)) = pending.next().await else {
+                    break;
+                };
+                match result {
+                    Ok(result) => node_parts.push((node_index, result)),
+                    Err(error) => {
+                        fanout_stats.nodes_failed += 1;
+                        warn!(
+                            node_id = ?node_id,
+                            operation = operation.label(),
+                            error = %error,
+                            "distributed metadata skipped failed node result"
+                        );
+                    }
+                }
+            }
+
+            node_parts.sort_by_key(|(node_index, _)| *node_index);
+            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
+            Ok((
+                node_parts.into_iter().map(|(_, result)| result).collect(),
+                fanout_stats,
+            ))
+        }
+    }
+}
+
+fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, MetadataError>) {
+    match result {
+        Ok(result) => {
+            span.record("result", metadata_query_result_kind(result));
+        }
+        Err(_) => {
+            span.record("result", "error");
+        }
+    }
+}
+
+fn record_search_node_result(span: &Span, result: &Result<Vec<MetadataSearchHit>, MetadataError>) {
+    match result {
+        Ok(hits) => {
+            span.record("result", "ok");
+            span.record("hit_count", hits.len() as u64);
+        }
+        Err(_) => {
+            span.record("result", "error");
+        }
+    }
+}
+
+fn map_metadata_internal_error(error: MetadataError) -> ServerError {
+    ServerError::InternalError(error.to_string())
 }
 
 #[tracing::instrument(
@@ -1759,10 +1995,9 @@ async fn run_query_distributed(
     query: String,
     mode: Option<MetadataQueryMode>,
     target_nodes: Option<Vec<aruna_core::NodeId>>,
-) -> ServerResult<(MetadataQueryResults, DistributedFanout)> {
+) -> ServerResult<(MetadataQueryResults, MetadataFanoutStats)> {
     let span = Span::current();
     let total_started = Instant::now();
-    ensure_supported_query_mode(&mode)?;
     let handle = state
         .get_ctx()
         .metadata_handle
@@ -1775,143 +2010,48 @@ async fn run_query_distributed(
     };
     let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
-    let mut parts = Vec::new();
-    let mut fanout = DistributedFanout::default();
-    match mode.unwrap_or(MetadataQueryMode::Distributed) {
-        MetadataQueryMode::Local => {
-            let node_span = debug_span!(
-                "metadata.api.query_node",
-                peer = ?state.get_node_id(),
-                local = true,
-                elapsed_ms = field::Empty,
-                result = field::Empty,
-            );
-            let node_started = Instant::now();
-            let result = handle
-                .query_authorized_local(auth, graph_iris, query)
-                .instrument(node_span.clone())
-                .await;
-            record_elapsed_ms(&node_span, "elapsed_ms", node_started);
-            fanout.nodes_queried = 1;
-            match result {
-                Ok(result) => {
-                    node_span.record("result", metadata_query_result_kind(&result));
-                    parts.push(result);
-                }
-                Err(error) => {
-                    node_span.record("result", "error");
-                    return Err(map_metadata_event_error(error));
-                }
-            }
+    let local_call: MetadataNodeCall<MetadataQueryResults> = Arc::new({
+        let handle = handle.clone();
+        let auth = auth.clone();
+        let graph_iris = graph_iris.clone();
+        let query = query.clone();
+        move |_| {
+            let handle = handle.clone();
+            let auth = auth.clone();
+            let graph_iris = graph_iris.clone();
+            let query = query.clone();
+            async move { handle.query_authorized_local(auth, graph_iris, query).await }.boxed()
         }
-        MetadataQueryMode::Distributed => {
-            let nodes = match target_nodes {
-                Some(nodes) => {
-                    span.record("discovery_ms", 0u64);
-                    deduplicate_node_ids(nodes)
-                }
-                None => {
-                    let discovery_started = Instant::now();
-                    let nodes =
-                        aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
-                            .await?;
-                    record_elapsed_ms(&span, "discovery_ms", discovery_started);
-                    nodes
-                }
-            };
-            span.record("node_count", nodes.len() as u64);
-            fanout.nodes_queried = nodes.len();
-            let fanout_started = Instant::now();
-            let local_node_id = state.get_node_id();
-            let mut node_iter = nodes.into_iter().enumerate();
-            let mut pending = FuturesUnordered::new();
-            let mut node_parts = Vec::new();
-
-            loop {
-                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
-                    let Some((node_index, node_id)) = node_iter.next() else {
-                        break;
-                    };
-                    let handle = handle.clone();
-                    let auth = auth.clone();
-                    let auth_token = remote_auth_token.clone();
-                    let graph_iris = graph_iris.clone();
-                    let query = query.clone();
-                    let local = node_id == local_node_id;
-                    pending.push(async move {
-                        let node_span = debug_span!(
-                            "metadata.api.query_node",
-                            peer = ?node_id,
-                            local,
-                            elapsed_ms = field::Empty,
-                            result = field::Empty,
-                        );
-                        let node_started = Instant::now();
-                        // The coordinator's own partition runs in-process like
-                        // mode=local; only remote partitions go over the wire
-                        // and carry the per-node timeout.
-                        let result = if local {
-                            handle
-                                .query_authorized_local(auth, graph_iris, query)
-                                .instrument(node_span.clone())
-                                .await
-                        } else {
-                            match tokio::time::timeout(
-                                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
-                                handle
-                                    .request_remote_query_graphs(
-                                        node_id, auth_token, graph_iris, query,
-                                    )
-                                    .instrument(node_span.clone()),
-                            )
-                            .await
-                            {
-                                Ok(result) => result,
-                                Err(_) => Err(MetadataError::Backend(format!(
-                                    "distributed metadata query node timed out after {}ms",
-                                    METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
-                                ))),
-                            }
-                        };
-                        record_elapsed_ms(&node_span, "elapsed_ms", node_started);
-                        aruna_core::telemetry::record_stage_detail(
-                            "fanout_node",
-                            || short_display_id(node_id),
-                            node_started.elapsed(),
-                        );
-                        match &result {
-                            Ok(result) => {
-                                node_span.record("result", metadata_query_result_kind(result));
-                            }
-                            Err(_) => {
-                                node_span.record("result", "error");
-                            }
-                        }
-                        (node_index, node_id, result)
-                    });
-                }
-
-                let Some((node_index, node_id, result)) = pending.next().await else {
-                    break;
-                };
-                match result {
-                    Ok(result) => node_parts.push((node_index, result)),
-                    Err(error) => {
-                        fanout.nodes_failed += 1;
-                        warn!(
-                            node_id = ?node_id,
-                            error = %error,
-                            "distributed metadata query skipped failed node result"
-                        );
-                    }
-                }
+    });
+    let remote_call: MetadataNodeCall<MetadataQueryResults> = Arc::new({
+        let handle = handle.clone();
+        let auth_token = remote_auth_token.clone();
+        let graph_iris = graph_iris.clone();
+        let query = query.clone();
+        move |node_id| {
+            let handle = handle.clone();
+            let auth_token = auth_token.clone();
+            let graph_iris = graph_iris.clone();
+            let query = query.clone();
+            async move {
+                handle
+                    .request_remote_query_graphs(node_id, auth_token, graph_iris, query)
+                    .await
             }
-
-            node_parts.sort_by_key(|(node_index, _)| *node_index);
-            parts.extend(node_parts.into_iter().map(|(_, result)| result));
-            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
+            .boxed()
         }
-    }
+    });
+    let (parts, fanout_stats) = run_metadata_fanout(
+        state,
+        mode,
+        target_nodes,
+        MetadataFanoutOperation::Query,
+        local_call,
+        remote_call,
+        record_query_node_result,
+        map_metadata_event_error,
+    )
+    .await?;
 
     let result = aggregate_query_results(parts, query_form, select_limit);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
@@ -1923,13 +2063,13 @@ async fn run_query_distributed(
             span.record("result", "error");
         }
     }
-    result.map(|results| (results, fanout))
+    result.map(|results| (results, fanout_stats))
 }
 
 #[tracing::instrument(
     name = "metadata.api.search_distributed",
     level = "debug",
-    skip(state, auth, query),
+    skip(state, auth, query, target_nodes),
     fields(
         mode = ?mode,
         query_len = query.len() as u64,
@@ -1950,10 +2090,9 @@ async fn run_search_distributed(
     limit: usize,
     mode: Option<MetadataQueryMode>,
     target_nodes: Option<Vec<aruna_core::NodeId>>,
-) -> ServerResult<(Vec<MetadataSearchHit>, DistributedFanout)> {
+) -> ServerResult<(Vec<MetadataSearchHit>, MetadataFanoutStats)> {
     let span = Span::current();
     let total_started = Instant::now();
-    ensure_supported_query_mode(&mode)?;
     let handle = state
         .get_ctx()
         .metadata_handle
@@ -1961,143 +2100,58 @@ async fn run_search_distributed(
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
     let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
-    let mut hits = Vec::new();
-    let mut fanout = DistributedFanout::default();
-    match mode.unwrap_or(MetadataQueryMode::Distributed) {
-        MetadataQueryMode::Local => {
-            let node_span = debug_span!(
-                "metadata.api.search_node",
-                peer = ?state.get_node_id(),
-                local = true,
-                elapsed_ms = field::Empty,
-                hit_count = field::Empty,
-            );
-            let node_started = Instant::now();
-            let result = handle
-                .search_authorized_local(auth, graph_iris, query, limit)
-                .instrument(node_span.clone())
-                .await;
-            record_elapsed_ms(&node_span, "elapsed_ms", node_started);
-            fanout.nodes_queried = 1;
-            match result {
-                Ok(result) => {
-                    node_span.record("hit_count", result.len() as u64);
-                    hits.extend(result);
-                }
-                Err(error) => return Err(ServerError::InternalError(error.to_string())),
+    let local_call: MetadataNodeCall<Vec<MetadataSearchHit>> = Arc::new({
+        let handle = handle.clone();
+        let auth = auth.clone();
+        let graph_iris = graph_iris.clone();
+        let query = query.clone();
+        move |_| {
+            let handle = handle.clone();
+            let auth = auth.clone();
+            let graph_iris = graph_iris.clone();
+            let query = query.clone();
+            async move {
+                handle
+                    .search_authorized_local(auth, graph_iris, query, limit)
+                    .await
             }
+            .boxed()
         }
-        MetadataQueryMode::Distributed => {
-            let nodes = match target_nodes {
-                Some(nodes) => {
-                    span.record("discovery_ms", 0u64);
-                    deduplicate_node_ids(nodes)
-                }
-                None => {
-                    let discovery_started = Instant::now();
-                    let nodes =
-                        aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
-                            .await?;
-                    record_elapsed_ms(&span, "discovery_ms", discovery_started);
-                    nodes
-                }
-            };
-            span.record("node_count", nodes.len() as u64);
-            fanout.nodes_queried = nodes.len();
-            let fanout_started = Instant::now();
-            let local_node_id = state.get_node_id();
-            let mut node_iter = nodes.into_iter();
-            let mut pending = FuturesUnordered::new();
-
-            loop {
-                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
-                    let Some(node_id) = node_iter.next() else {
-                        break;
-                    };
-                    let handle = handle.clone();
-                    let auth = auth.clone();
-                    let auth_token = remote_auth_token.clone();
-                    let graph_iris = graph_iris.clone();
-                    let query = query.clone();
-                    let local = node_id == local_node_id;
-                    pending.push(async move {
-                        let node_span = debug_span!(
-                            "metadata.api.search_node",
-                            peer = ?node_id,
-                            local,
-                            elapsed_ms = field::Empty,
-                            hit_count = field::Empty,
-                            result = field::Empty,
-                        );
-                        let node_started = Instant::now();
-                        // The coordinator's own partition runs in-process like
-                        // mode=local; only remote partitions go over the wire
-                        // and carry the per-node timeout.
-                        let result = if local {
-                            handle
-                                .search_authorized_local(auth, graph_iris, query, limit)
-                                .instrument(node_span.clone())
-                                .await
-                        } else {
-                            match tokio::time::timeout(
-                                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
-                                handle
-                                    .request_remote_search_graphs(
-                                        node_id, auth_token, graph_iris, query, limit,
-                                    )
-                                    .instrument(node_span.clone()),
-                            )
-                            .await
-                            {
-                                Ok(result) => result,
-                                Err(_) => Err(MetadataError::Backend(format!(
-                                    "distributed metadata search node timed out after {}ms",
-                                    METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
-                                ))),
-                            }
-                        };
-                        record_elapsed_ms(&node_span, "elapsed_ms", node_started);
-                        aruna_core::telemetry::record_stage_detail(
-                            "fanout_node",
-                            || short_display_id(node_id),
-                            node_started.elapsed(),
-                        );
-                        match &result {
-                            Ok(result) => {
-                                node_span.record("result", "ok");
-                                node_span.record("hit_count", result.len() as u64);
-                            }
-                            Err(_) => {
-                                node_span.record("result", "error");
-                            }
-                        }
-                        (node_id, result)
-                    });
-                }
-
-                let Some((node_id, result)) = pending.next().await else {
-                    break;
-                };
-                match result {
-                    Ok(result) => hits.extend(result),
-                    Err(error) => {
-                        fanout.nodes_failed += 1;
-                        warn!(
-                            node_id = ?node_id,
-                            error = %error,
-                            "distributed metadata search skipped failed node result"
-                        );
-                    }
-                }
+    });
+    let remote_call: MetadataNodeCall<Vec<MetadataSearchHit>> = Arc::new({
+        let handle = handle.clone();
+        let auth_token = remote_auth_token.clone();
+        let graph_iris = graph_iris.clone();
+        let query = query.clone();
+        move |node_id| {
+            let handle = handle.clone();
+            let auth_token = auth_token.clone();
+            let graph_iris = graph_iris.clone();
+            let query = query.clone();
+            async move {
+                handle
+                    .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
+                    .await
             }
-            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
+            .boxed()
         }
-    }
+    });
+    let (node_hits, fanout_stats) = run_metadata_fanout(
+        state,
+        mode,
+        target_nodes,
+        MetadataFanoutOperation::Search,
+        local_call,
+        remote_call,
+        record_search_node_result,
+        map_metadata_internal_error,
+    )
+    .await?;
 
-    let hits = deduplicate_search_hits(hits, limit);
+    let hits = deduplicate_search_hits(node_hits.into_iter().flatten().collect(), limit);
     span.record("hit_count", hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok((hits, fanout))
+    Ok((hits, fanout_stats))
 }
 
 fn aggregate_query_results(
@@ -2169,6 +2223,8 @@ fn deduplicate_search_hits(hits: Vec<MetadataSearchHit>, limit: usize) -> Vec<Me
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.graph_iri.cmp(&right.graph_iri))
+            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
     });
     hits.truncate(limit);
     hits
@@ -2192,7 +2248,7 @@ enum QueryForm {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct DistributedFanout {
+struct MetadataFanoutStats {
     nodes_queried: usize,
     nodes_failed: usize,
 }
@@ -2831,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn document_query_target_nodes_use_deduplicated_holders() {
+    fn document_replica_query_nodes_use_deduplicated_replicas() {
         let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let document_id = Ulid::new();
@@ -2850,15 +2906,27 @@ mod tests {
         };
 
         assert_eq!(
-            document_query_target_nodes(&record, local_node_id),
+            document_replica_query_nodes(&record, local_node_id),
             vec![remote_node_id, local_node_id]
         );
 
-        let mut empty_holders = record;
-        empty_holders.holder_node_ids.clear();
+        let mut empty_replicas = record;
+        empty_replicas.holder_node_ids.clear();
         assert_eq!(
-            document_query_target_nodes(&empty_holders, local_node_id),
+            document_replica_query_nodes(&empty_replicas, local_node_id),
             vec![local_node_id]
+        );
+    }
+
+    #[test]
+    fn deduplicate_fanout_nodes_preserves_first_seen_order() {
+        let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
+        let third = iroh::SecretKey::from_bytes(&[33u8; 32]).public();
+
+        assert_eq!(
+            deduplicate_fanout_nodes(vec![first, second, first, third, second]),
+            vec![first, second, third]
         );
     }
 
@@ -3409,6 +3477,40 @@ mod tests {
         assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
     }
 
+    #[test]
+    fn search_hit_dedup_orders_equal_scores_stably() {
+        let hit = |document_id: &str, subject_iri: &str| MetadataSearchHit {
+            document_id: document_id.to_string(),
+            group_id: "01G".to_string(),
+            document_path: format!("datasets/{document_id}"),
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            subject_iri: subject_iri.to_string(),
+            score: 0.7,
+        };
+
+        let hits = deduplicate_search_hits(
+            vec![
+                hit("01B", "./file-b.txt"),
+                hit("01A", "./file-b.txt"),
+                hit("01A", "./file-a.txt"),
+            ],
+            10,
+        );
+
+        let keys = hits
+            .iter()
+            .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                ("https://w3id.org/aruna/01A", "./file-a.txt"),
+                ("https://w3id.org/aruna/01A", "./file-b.txt"),
+                ("https://w3id.org/aruna/01B", "./file-b.txt"),
+            ]
+        );
+    }
+
     struct DistributedMetadataAccessState {
         auth: AuthContext,
         valid_bearer_token: String,
@@ -3657,7 +3759,7 @@ mod tests {
         auth: Option<AuthContext>,
         bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     ) -> QueryNamesResult {
-        let (results, fanout) = run_query_distributed(
+        let (results, fanout_stats) = run_query_distributed(
             test.coordinator.state.as_ref(),
             auth,
             bearer_token,
@@ -3673,8 +3775,8 @@ mod tests {
         };
         QueryNamesResult {
             names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
-            nodes_queried: fanout.nodes_queried,
-            nodes_failed: fanout.nodes_failed,
+            nodes_queried: fanout_stats.nodes_queried,
+            nodes_failed: fanout_stats.nodes_failed,
         }
     }
 
