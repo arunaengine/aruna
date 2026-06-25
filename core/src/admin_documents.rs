@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{Actor, Permission, RealmId, Role};
+use crate::structs::{Actor, Permission, RealmId, RealmNodeKind, Role};
 use crate::types::{GroupId, RoleId, UserId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +47,7 @@ pub enum AdminDocumentTarget {
     Group { group_id: GroupId },
     Realm { realm_id: RealmId },
     User { user_id: UserId },
+    RealmConfig { realm_id: RealmId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,26 +79,62 @@ impl From<Role> for AdminDocumentRoleDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentOperation {
-    GroupRoleAdded { role_id: RoleId },
-    GroupRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
-    GroupRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
-    UserAttributeSet { key: String, value: String },
-    UserAttributeRemoved { key: String },
-    UserNameSet { name: String },
-    UserSubjectIdAdded { subject_id: String },
-    UserSubjectIdRemoved { subject_id: String },
-    RealmRoleAdded { role_id: RoleId },
-    RealmRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
-    RealmRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
-    GroupRoleCreated { role: AdminDocumentRoleDefinition },
-    RealmRoleCreated { role: AdminDocumentRoleDefinition },
+    GroupRoleAdded {
+        role_id: RoleId,
+    },
+    GroupRoleUserAssignmentAdded {
+        role_id: RoleId,
+        user_id: UserId,
+    },
+    GroupRoleUserAssignmentRemoved {
+        role_id: RoleId,
+        user_id: UserId,
+    },
+    UserAttributeSet {
+        key: String,
+        value: String,
+    },
+    UserAttributeRemoved {
+        key: String,
+    },
+    UserNameSet {
+        name: String,
+    },
+    UserSubjectIdAdded {
+        subject_id: String,
+    },
+    UserSubjectIdRemoved {
+        subject_id: String,
+    },
+    RealmRoleAdded {
+        role_id: RoleId,
+    },
+    RealmRoleUserAssignmentAdded {
+        role_id: RoleId,
+        user_id: UserId,
+    },
+    RealmRoleUserAssignmentRemoved {
+        role_id: RoleId,
+        user_id: UserId,
+    },
+    GroupRoleCreated {
+        role: AdminDocumentRoleDefinition,
+    },
+    RealmRoleCreated {
+        role: AdminDocumentRoleDefinition,
+    },
+    RealmConfigNodeEnsured {
+        node_id: NodeId,
+        kind: RealmNodeKind,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminDocumentOperation, AdminDocumentRoleDefinition};
-    use crate::structs::{Permission, RealmId};
-    use crate::types::{RoleId, UserId};
+    use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
+    use crate::NodeId;
+    use crate::structs::{Permission, RealmId, RealmNodeKind};
+    use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
@@ -105,8 +142,16 @@ mod tests {
         Ulid::from_bytes([seed; 16])
     }
 
+    fn group_id(seed: u8) -> GroupId {
+        Ulid::from_bytes([seed; 16])
+    }
+
     fn user_id(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([9; 32]))
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
     fn role_definition(role_id: RoleId) -> AdminDocumentRoleDefinition {
@@ -119,6 +164,18 @@ mod tests {
 
     fn postcard_discriminant(op: &AdminDocumentOperation) -> u8 {
         postcard::to_allocvec(op).expect("operation serializes")[0]
+    }
+
+    fn target_postcard_discriminant(target: &AdminDocumentTarget) -> u8 {
+        postcard::to_allocvec(target).expect("target serializes")[0]
+    }
+
+    fn postcard_roundtrip<T>(value: T) -> T
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        let bytes = postcard::to_allocvec(&value).expect("value serializes");
+        postcard::from_bytes(&bytes).expect("value deserializes")
     }
 
     #[test]
@@ -187,11 +244,54 @@ mod tests {
                 },
                 12,
             ),
+            (
+                AdminDocumentOperation::RealmConfigNodeEnsured {
+                    node_id: node(1),
+                    kind: RealmNodeKind::Management,
+                },
+                13,
+            ),
         ];
 
         for (op, discriminant) in operations {
             assert_eq!(postcard_discriminant(&op), discriminant);
         }
+    }
+
+    #[test]
+    fn admin_document_target_postcard_discriminants_preserve_legacy_order() {
+        let realm_id = RealmId::from_bytes([9; 32]);
+        let targets = [
+            (
+                AdminDocumentTarget::Group {
+                    group_id: group_id(1),
+                },
+                0,
+            ),
+            (AdminDocumentTarget::Realm { realm_id }, 1),
+            (
+                AdminDocumentTarget::User {
+                    user_id: user_id(2),
+                },
+                2,
+            ),
+            (AdminDocumentTarget::RealmConfig { realm_id }, 3),
+        ];
+
+        for (target, discriminant) in targets {
+            assert_eq!(target_postcard_discriminant(&target), discriminant);
+            assert_eq!(postcard_roundtrip(target.clone()), target);
+        }
+    }
+
+    #[test]
+    fn realm_config_node_ensured_operation_roundtrips() {
+        let operation = AdminDocumentOperation::RealmConfigNodeEnsured {
+            node_id: node(3),
+            kind: RealmNodeKind::Server,
+        };
+
+        assert_eq!(postcard_roundtrip(operation.clone()), operation);
     }
 }
 

@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
+use crate::structs::RealmNodeKind;
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
@@ -177,6 +180,12 @@ impl AdminDocumentReducerState {
                 validate_user_attribute_key(key)?;
                 self.apply_user_attribute(event, key, None);
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+            ) => {
+                self.apply_realm_config_node(event, node_id, kind);
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -304,6 +313,24 @@ impl AdminDocumentReducerState {
             })
     }
 
+    pub fn materialized_realm_config_nodes(&self) -> BTreeMap<NodeId, RealmNodeKind> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let node_id = realm_config_node_id_from_path(path)?;
+                let kind = version
+                    .value
+                    .as_deref()
+                    .and_then(realm_node_kind_from_value)?;
+                Some((node_id, kind))
+            })
+            .collect()
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -411,6 +438,25 @@ impl AdminDocumentReducerState {
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_realm_config_node(
+        &mut self,
+        event: &AdminDocumentEvent,
+        node_id: &NodeId,
+        kind: &RealmNodeKind,
+    ) {
+        let path = realm_config_node_path(node_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, Some(realm_node_kind_value(kind))) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -600,6 +646,19 @@ fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String
     format!("realm.roles.{role_id}.assigned_users.{user_id}")
 }
 
+fn realm_config_node_path(node_id: &NodeId) -> String {
+    format!("realm_config.nodes.{node_id}")
+}
+
+fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
+    match kind {
+        RealmNodeKind::Management => "management",
+        RealmNodeKind::Server => "server",
+        RealmNodeKind::Local => "local",
+    }
+    .to_string()
+}
+
 fn group_role_id_from_path(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("group.roles.")?;
 
@@ -634,6 +693,20 @@ fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
+fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
+    let node_id = path.strip_prefix("realm_config.nodes.")?;
+    NodeId::from_str(node_id).ok()
+}
+
+fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
+    match value {
+        "management" => Some(RealmNodeKind::Management),
+        "server" => Some(RealmNodeKind::Server),
+        "local" => Some(RealmNodeKind::Local),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -644,7 +717,7 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
-    use crate::structs::{Actor, Permission, RealmId};
+    use crate::structs::{Actor, Permission, RealmId, RealmNodeKind};
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
@@ -710,6 +783,12 @@ mod tests {
         })
     }
 
+    fn realm_config_state() -> AdminDocumentReducerState {
+        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        })
+    }
+
     fn event(
         event_seed: u8,
         origin_node_id: NodeId,
@@ -758,6 +837,26 @@ mod tests {
         AdminDocumentEvent {
             event_id: Ulid::from_bytes([event_seed; 16]),
             target: AdminDocumentTarget::Realm {
+                realm_id: realm_id(),
+            },
+            origin_node_id,
+            origin_seq,
+            observed,
+            actor: actor(origin_node_id),
+            op,
+        }
+    }
+
+    fn realm_config_event(
+        event_seed: u8,
+        origin_node_id: NodeId,
+        origin_seq: u64,
+        observed: AdminDocumentClock,
+        op: AdminDocumentOperation,
+    ) -> AdminDocumentEvent {
+        AdminDocumentEvent {
+            event_id: Ulid::from_bytes([event_seed; 16]),
+            target: AdminDocumentTarget::RealmConfig {
                 realm_id: realm_id(),
             },
             origin_node_id,
@@ -922,6 +1021,21 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+        )
+    }
+
+    fn ensure_realm_config_node(
+        event_seed: u8,
+        origin_seed: u8,
+        node_id: NodeId,
+        kind: RealmNodeKind,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
         )
     }
 
@@ -1453,6 +1567,135 @@ mod tests {
                 .any(|value| value.value.as_deref() == Some(expected_user_id.as_str()))
         );
         assert!(conflict.values.iter().any(|value| value.value.is_none()));
+    }
+
+    #[test]
+    fn realm_config_disjoint_nodes_merge_deterministically() {
+        let mut state = realm_config_state();
+        let first_node = node(11);
+        let second_node = node(12);
+
+        state
+            .apply(&ensure_realm_config_node(
+                1,
+                1,
+                first_node,
+                RealmNodeKind::Management,
+            ))
+            .unwrap();
+        state
+            .apply(&ensure_realm_config_node(
+                2,
+                2,
+                second_node,
+                RealmNodeKind::Server,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_nodes(),
+            BTreeMap::from([
+                (first_node, RealmNodeKind::Management),
+                (second_node, RealmNodeKind::Server),
+            ])
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_realm_config_same_node_different_kind_conflicts_fail_closed() {
+        let mut state = realm_config_state();
+        let config_node = node(11);
+
+        state
+            .apply(&ensure_realm_config_node(
+                1,
+                1,
+                config_node,
+                RealmNodeKind::Management,
+            ))
+            .unwrap();
+        state
+            .apply(&ensure_realm_config_node(
+                2,
+                2,
+                config_node,
+                RealmNodeKind::Server,
+            ))
+            .unwrap();
+
+        assert!(
+            !state
+                .materialized_realm_config_nodes()
+                .contains_key(&config_node)
+        );
+        let conflict = state
+            .conflicts
+            .get(&format!("realm_config.nodes.{config_node}"))
+            .expect("conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some("management"))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some("server"))
+        );
+    }
+
+    #[test]
+    fn observed_realm_config_node_update_replaces_conflict() {
+        let mut state = realm_config_state();
+        let config_node = node(11);
+        let first_origin = node(1);
+        let second_origin = node(2);
+        let first = realm_config_event(
+            1,
+            first_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: config_node,
+                kind: RealmNodeKind::Management,
+            },
+        );
+        let second = realm_config_event(
+            2,
+            second_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: config_node,
+                kind: RealmNodeKind::Server,
+            },
+        );
+        let replacement = realm_config_event(
+            3,
+            node(3),
+            1,
+            AdminDocumentClock::default()
+                .with_observed(first_origin, 1)
+                .with_observed(second_origin, 1),
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: config_node,
+                kind: RealmNodeKind::Local,
+            },
+        );
+
+        state.apply(&first).unwrap();
+        state.apply(&second).unwrap();
+        state.apply(&replacement).unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_nodes(),
+            BTreeMap::from([(config_node, RealmNodeKind::Local)])
+        );
+        assert!(state.conflicts.is_empty());
     }
 
     #[test]

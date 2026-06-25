@@ -191,6 +191,12 @@ fn admin_document_target_key_bytes(target: &AdminDocumentTarget) -> Vec<u8> {
             bytes.extend_from_slice(&user_id.to_storage_key());
             bytes
         }
+        AdminDocumentTarget::RealmConfig { realm_id } => {
+            let mut bytes = Vec::with_capacity(33);
+            bytes.push(b'c');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes
+        }
     }
 }
 
@@ -508,6 +514,18 @@ mod tests {
         }
     }
 
+    fn realm_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::Realm {
+            realm_id: realm_id(seed),
+        }
+    }
+
+    fn realm_config_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(seed),
+        }
+    }
+
     fn dot(seed: u8) -> AdminDocumentDot {
         AdminDocumentDot {
             event_id: Ulid::from_bytes([seed; 16]),
@@ -562,6 +580,35 @@ mod tests {
             )]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+        };
+
+        let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
+        let decoded: AdminDocumentReducerState = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, ADMIN_DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(key, admin_document_reducer_state_key(&target));
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn realm_config_admin_document_reducer_state_write_entry_roundtrips() {
+        let target = realm_config_target(8);
+        let attr_dot = dot(1);
+        let path = format!("realm_config.nodes.{}", node(4));
+        let state = AdminDocumentReducerState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
+            applied_event_ids: BTreeSet::from([attr_dot.event_id]),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+            user_name: None,
+            user_subject_ids: BTreeMap::from([(
+                path,
+                AdminDocumentAttributeVersion {
+                    value: Some("server".to_string()),
+                    dot: attr_dot,
+                },
+            )]),
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -647,6 +694,27 @@ mod tests {
                 admin_document_reducer_conflict_key(&target, &decoded.path)
             );
         }
+    }
+
+    #[test]
+    fn realm_config_admin_document_keys_are_scoped_from_realm_auth() {
+        let target = realm_config_target(8);
+        let realm_auth_target = realm_target(8);
+        let path = format!("realm_config.nodes.{}", node(4));
+        let state_key = admin_document_reducer_state_key(&target);
+        let conflict_prefix = admin_document_reducer_conflict_prefix(&target);
+        let conflict_key = admin_document_reducer_conflict_key(&target, &path);
+
+        assert_ne!(
+            state_key,
+            admin_document_reducer_state_key(&realm_auth_target)
+        );
+        assert_eq!(conflict_prefix, state_key);
+        assert!(conflict_key.as_ref().starts_with(conflict_prefix.as_ref()));
+        assert_eq!(
+            &conflict_key.as_ref()[conflict_prefix.as_ref().len()..],
+            path.as_bytes()
+        );
     }
 
     #[test]
