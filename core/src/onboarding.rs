@@ -1,4 +1,5 @@
 use crate::NodeId;
+use crate::auth::credential_hash;
 use crate::document::DocumentSyncTarget;
 use crate::structs::RealmId;
 use base64::Engine;
@@ -103,7 +104,7 @@ pub enum OnboardingSecretError {
 
 impl OnboardingSecret {
     pub fn secret_hash(&self) -> String {
-        blake3::hash(&self.secret).to_string()
+        credential_hash(self.secret)
     }
 
     pub fn encode(&self) -> Result<String, OnboardingSecretError> {
@@ -237,10 +238,7 @@ mod tests {
             mode: OnboardingMode::Server,
         };
 
-        assert_eq!(
-            secret.secret_hash(),
-            blake3::hash(&secret.secret).to_string()
-        );
+        assert_eq!(secret.secret_hash(), credential_hash(secret.secret));
     }
 
     #[test]

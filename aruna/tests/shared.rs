@@ -601,8 +601,8 @@ async fn spawn_joiner_node_with_mode(
             relay_method: RelayMethod::None,
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
-            irokle_storage_path: Some(config.irokle_storage_path.clone()),
-            irokle_runtime: Some(config.irokle_runtime),
+            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            document_sync_runtime: Some(config.document_sync_runtime),
             fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),
@@ -677,8 +677,8 @@ async fn initialize_context(
             net.node_id(),
             storage_handle.clone(),
             Some(net.clone()),
-            Some(net.irokle_node()),
-            Some(net.irokle_database()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
         )?)
     } else {
         None

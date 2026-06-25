@@ -74,7 +74,7 @@ pub struct MetadataHandle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetadataHandleOptions {
     pub search_storage: MetadataSearchStorage,
-    pub irokle_persist_policy: FjallPersistPolicy,
+    pub document_sync_persist_policy: FjallPersistPolicy,
     /// Size of the craqle mutation and read permit pools. Defaults to the
     /// host parallelism; set explicitly when cgroup limits make
     /// `available_parallelism` unrepresentative.
@@ -87,8 +87,8 @@ impl MetadataHandleOptions {
         self
     }
 
-    pub fn with_irokle_persist_policy(mut self, persist_policy: FjallPersistPolicy) -> Self {
-        self.irokle_persist_policy = persist_policy;
+    pub fn with_document_sync_persist_policy(mut self, persist_policy: FjallPersistPolicy) -> Self {
+        self.document_sync_persist_policy = persist_policy;
         self
     }
 
@@ -119,8 +119,8 @@ struct MetadataInner {
     storage_handle: StorageHandle,
     auth_validation: MetadataAuthValidationState,
     net_handle: Option<NetHandle>,
-    irokle_db: Option<fjall::OptimisticTxDatabase>,
-    irokle_persist_policy: FjallPersistPolicy,
+    document_sync_db: Option<fjall::OptimisticTxDatabase>,
+    document_sync_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
     craqle_permits: Arc<tokio::sync::Semaphore>,
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
@@ -556,16 +556,16 @@ impl MetadataHandle {
         node_id: NodeId,
         storage_handle: StorageHandle,
         net_handle: Option<NetHandle>,
-        irokle_node: Option<irokle::Irokle<irokle::FjallStorage>>,
-        irokle_db: Option<fjall::OptimisticTxDatabase>,
+        document_sync_node: Option<irokle::Irokle<irokle::FjallStorage>>,
+        document_sync_db: Option<fjall::OptimisticTxDatabase>,
     ) -> Result<Self, MetadataError> {
         Self::new_with_options(
             path,
             node_id,
             storage_handle,
             net_handle,
-            irokle_node,
-            irokle_db,
+            document_sync_node,
+            document_sync_db,
             MetadataHandleOptions::default(),
         )
     }
@@ -575,8 +575,8 @@ impl MetadataHandle {
         node_id: NodeId,
         storage_handle: StorageHandle,
         net_handle: Option<NetHandle>,
-        irokle_node: Option<irokle::Irokle<irokle::FjallStorage>>,
-        irokle_db: Option<fjall::OptimisticTxDatabase>,
+        document_sync_node: Option<irokle::Irokle<irokle::FjallStorage>>,
+        document_sync_db: Option<fjall::OptimisticTxDatabase>,
         metadata_options: MetadataHandleOptions,
     ) -> Result<Self, MetadataError> {
         let actor = ActorId::from_bytes(*node_id.as_bytes());
@@ -584,10 +584,12 @@ impl MetadataHandle {
             .with_actor(actor)
             .with_search_storage(metadata_options.search_storage.into())
             .with_graph_store_persist_mode(craqle_fjall_persist_mode(
-                metadata_options.irokle_persist_policy,
+                metadata_options.document_sync_persist_policy,
             ));
-        let options = match irokle_node {
-            Some(irokle_node) => options.with_irokle(irokle_node, CraqleIrokleOptions::new()),
+        let options = match document_sync_node {
+            Some(document_sync_node) => {
+                options.with_irokle(document_sync_node, CraqleIrokleOptions::new())
+            }
             None => options,
         };
         let node = CraqleNode::open_with_options(path, options)
@@ -604,8 +606,8 @@ impl MetadataHandle {
                 auth_validation: MetadataAuthValidationState::new(storage_handle.clone()),
                 storage_handle,
                 net_handle,
-                irokle_db,
-                irokle_persist_policy: metadata_options.irokle_persist_policy,
+                document_sync_db,
+                document_sync_persist_policy: metadata_options.document_sync_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
@@ -834,7 +836,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn reconcile_irokle(&self) -> Result<usize, MetadataError> {
+    pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
             .await
@@ -1145,7 +1147,7 @@ impl MetadataHandle {
             row_count = field::Empty,
             triple_count = field::Empty,
         )
-    )]
+        )]
     pub async fn request_remote_query_graphs(
         &self,
         node_id: NodeId,
@@ -1155,12 +1157,9 @@ impl MetadataHandle {
     ) -> Result<MetadataQueryResults, MetadataError> {
         let started = Instant::now();
         let span = Span::current();
-        let Some(net_handle) = self.inner.net_handle.clone() else {
-            record_error(&span, "metadata net handle missing");
-            return Err(MetadataError::HandleMissing);
-        };
-        let result = match send_request(
-            &net_handle,
+        let result = match send_remote_metadata_request(
+            &self.inner,
+            &span,
             node_id,
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
@@ -1211,12 +1210,9 @@ impl MetadataHandle {
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         let started = Instant::now();
         let span = Span::current();
-        let Some(net_handle) = self.inner.net_handle.clone() else {
-            record_error(&span, "metadata net handle missing");
-            return Err(MetadataError::HandleMissing);
-        };
-        let result = match send_request(
-            &net_handle,
+        let result = match send_remote_metadata_request(
+            &self.inner,
+            &span,
             node_id,
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
@@ -1328,6 +1324,21 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         ))),
     }
 }
+
+async fn send_remote_metadata_request(
+    inner: &MetadataInner,
+    span: &Span,
+    node_id: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataTransportMessage, MetadataError> {
+    let Some(net_handle) = inner.net_handle.clone() else {
+        record_error(span, "metadata net handle missing");
+        return Err(MetadataError::HandleMissing);
+    };
+
+    send_request(&net_handle, node_id, message).await
+}
+
 async fn load_metadata_auth_state<T>(
     storage_handle: &StorageHandle,
     key: &[u8],
@@ -1510,7 +1521,7 @@ async fn sync_graph_once(
     let graph_iri_for_blocking = graph_iri.clone();
     let peers_for_blocking = peers.clone();
     let setup_span = debug_span!(
-        "metadata.backend.craqle.ensure_irokle_topic",
+        "metadata.backend.craqle.ensure_document_sync_topic",
         graph_iri = %graph_iri_for_blocking,
         peer_count = peers_for_blocking.len() as u64,
         elapsed_ms = field::Empty,
@@ -1522,7 +1533,7 @@ async fn sync_graph_once(
         blocking_span.in_scope(|| {
             let graph = GraphId::new(&graph_iri_for_blocking);
             for peer in peers_for_blocking {
-                node.add_irokle_peer(&graph, irokle_peer_id(peer))?;
+                node.add_irokle_peer(&graph, document_sync_peer_id(peer))?;
             }
             node.ensure_irokle_topic(&graph)
         })
@@ -1541,7 +1552,7 @@ async fn sync_graph_once(
 
     let sync_started = Instant::now();
     net_handle
-        .sync_irokle_topic_with_peers(topic_id, peers)
+        .sync_document_topic_with_peers(topic_id, peers)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     record_elapsed_ms(&span, "network_sync_ms", sync_started);
@@ -1559,7 +1570,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportRoCratePage { .. }
     );
-    let persist_irokle_after_success = metadata_effect_persists_irokle(&effect);
+    let persist_document_sync_after_success = metadata_effect_persists_document_sync(&effect);
     let deferred_persist_after_success = metadata_effect_defers_persist(&effect);
     let node = inner.node.clone();
     let effect_span = debug_span!(
@@ -1838,7 +1849,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let started = Instant::now();
             let result = call_span
                 .in_scope(|| {
-                    node.add_irokle_peer(&GraphId::new(&graph_iri), irokle_peer_id(node_id))
+                    node.add_irokle_peer(&GraphId::new(&graph_iri), document_sync_peer_id(node_id))
                 })
                 .map(|_| MetadataEvent::GraphPeerAdded {
                     graph_iri: graph_iri.clone(),
@@ -2049,8 +2060,8 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         }
     });
 
-    let persist_error = if persist_irokle_after_success && result.is_ok() {
-        flush_irokle_journal(&inner, effect_name, graph_iri.as_deref()).err()
+    let persist_error = if persist_document_sync_after_success && result.is_ok() {
+        flush_document_sync_journal(&inner, effect_name, graph_iri.as_deref()).err()
     } else {
         None
     };
@@ -2084,24 +2095,24 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     event
 }
 
-fn flush_irokle_journal(
+fn flush_document_sync_journal(
     inner: &MetadataInner,
     effect_name: &'static str,
     graph_iri: Option<&str>,
 ) -> Result<(), MetadataError> {
-    let Some(db) = &inner.irokle_db else {
+    let Some(db) = &inner.document_sync_db else {
         return Ok(());
     };
     let span = debug_span!(
-        "metadata.backend.irokle.flush",
+        "metadata.backend.document_sync.flush",
         effect = effect_name,
         graph_iri = graph_iri.unwrap_or("<none>"),
-        mode = inner.irokle_persist_policy.label(),
+        mode = inner.document_sync_persist_policy.label(),
         elapsed_ms = field::Empty,
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(inner.irokle_persist_policy.as_fjall()));
+    let result = span.in_scope(|| db.persist(inner.document_sync_persist_policy.as_fjall()));
     record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -2111,7 +2122,7 @@ fn flush_irokle_journal(
         Err(error) => {
             record_error(&span, &error.to_string());
             Err(MetadataError::Backend(format!(
-                "failed to flush irokle journal: {error}"
+                "failed to flush document sync journal: {error}"
             )))
         }
     }
@@ -2126,23 +2137,23 @@ fn flush_metadata_persistence(
         .node
         .persist_fjall()
         .map_err(metadata_error_from_craqle)?;
-    flush_irokle_journal(inner, effect_name, graph_iri)
+    flush_document_sync_journal(inner, effect_name, graph_iri)
 }
 
-fn metadata_effect_persists_irokle(effect: &MetadataEffect) -> bool {
+fn metadata_effect_persists_document_sync(effect: &MetadataEffect) -> bool {
     match effect {
         MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => {
             false
         }
         MetadataEffect::CreateCrate { request } => {
-            metadata_request_persists_irokle(request.durability)
+            metadata_request_persists_document_sync(request.durability)
         }
         MetadataEffect::ApplyRoCrate { request } => {
-            metadata_request_persists_irokle(request.durability)
+            metadata_request_persists_document_sync(request.durability)
         }
         MetadataEffect::UpsertDataEntity { request }
         | MetadataEffect::UpsertContextualEntity { request } => {
-            metadata_request_persists_irokle(request.durability)
+            metadata_request_persists_document_sync(request.durability)
         }
         MetadataEffect::SetGraphPolicy { .. }
         | MetadataEffect::AddGraphPeer { .. }
@@ -2284,7 +2295,7 @@ fn run_deferred_metadata_flush(
     }
 }
 
-fn metadata_request_persists_irokle(durability: MetadataRequestDurability) -> bool {
+fn metadata_request_persists_document_sync(durability: MetadataRequestDurability) -> bool {
     matches!(durability, MetadataRequestDurability::Durable)
 }
 
@@ -3188,7 +3199,7 @@ fn craqle_graph_policy(policy: MetadataGraphPolicy) -> GraphPolicy {
     }
 }
 
-fn irokle_peer_id(node_id: NodeId) -> irokle::PeerId {
+fn document_sync_peer_id(node_id: NodeId) -> irokle::PeerId {
     irokle::PeerId::from_bytes(*node_id.as_bytes())
 }
 
@@ -3548,6 +3559,17 @@ async fn list_deleted_graph_iris(
     Ok((deleted, pages))
 }
 
+async fn list_registry_records_for_local_read(
+    inner: Arc<MetadataInner>,
+    span: &Span,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let registry_started = Instant::now();
+    let records = list_local_registry_records(inner).await?;
+    record_elapsed_ms(span, "registry_ms", registry_started);
+    span.record("registry_records", records.len() as u64);
+    Ok(records)
+}
+
 #[tracing::instrument(
     name = "metadata.query.local",
     level = "debug",
@@ -3575,10 +3597,7 @@ async fn query_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
 
-    let registry_started = Instant::now();
-    let records = list_local_registry_records(inner.clone()).await?;
-    record_elapsed_ms(&span, "registry_ms", registry_started);
-    span.record("registry_records", records.len() as u64);
+    let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
 
     let authorization_started = Instant::now();
     // Document-scoped queries keep the eager per-record selection; the
@@ -3690,10 +3709,7 @@ async fn search_local_graphs(
     let span = Span::current();
     let total_started = Instant::now();
 
-    let registry_started = Instant::now();
-    let records = list_local_registry_records(inner.clone()).await?;
-    record_elapsed_ms(&span, "registry_ms", registry_started);
-    span.record("registry_records", records.len() as u64);
+    let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
 
     let authorization_started = Instant::now();
     let allowed_records =
@@ -4178,24 +4194,30 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     #[test]
-    fn metadata_handle_options_default_to_buffered_irokle_persist() {
+    fn metadata_handle_options_default_to_buffered_document_sync_persist() {
         let options = MetadataHandleOptions::default();
 
-        assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::Buffer);
+        assert_eq!(
+            options.document_sync_persist_policy,
+            FjallPersistPolicy::Buffer
+        );
     }
 
     #[test]
-    fn metadata_handle_options_can_set_irokle_persist_policy() {
+    fn metadata_handle_options_can_set_document_sync_persist_policy() {
         let options = MetadataHandleOptions::default()
             .with_search_storage(MetadataSearchStorage::Memory)
-            .with_irokle_persist_policy(FjallPersistPolicy::SyncAll);
+            .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll);
 
         assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
-        assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
+        assert_eq!(
+            options.document_sync_persist_policy,
+            FjallPersistPolicy::SyncAll
+        );
     }
 
     #[tokio::test]
-    async fn flush_persistence_succeeds_without_irokle_database() {
+    async fn flush_persistence_succeeds_without_document_sync_database() {
         let (_storage_dir, storage) = auth_storage();
         let metadata_dir = tempdir().expect("metadata dir");
         let metadata_handle = MetadataHandle::new_with_options(
@@ -4221,25 +4243,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_persistence_succeeds_with_configured_irokle_database() {
+    async fn flush_persistence_succeeds_with_configured_document_sync_database() {
         let (_storage_dir, storage) = auth_storage();
         let metadata_dir = tempdir().expect("metadata dir");
-        let irokle_dir = tempdir().expect("irokle dir");
-        let irokle_db =
-            fjall::OptimisticTxDatabase::builder(irokle_dir.path().to_str().expect("irokle path"))
-                .manual_journal_persist(true)
-                .open()
-                .expect("irokle db opens");
+        let document_sync_dir = tempdir().expect("document sync dir");
+        let document_sync_db = fjall::OptimisticTxDatabase::builder(
+            document_sync_dir
+                .path()
+                .to_str()
+                .expect("document sync path"),
+        )
+        .manual_journal_persist(true)
+        .open()
+        .expect("document sync db opens");
         let metadata_handle = MetadataHandle::new_with_options(
             metadata_dir.path(),
             node_id_from_seed(2),
             storage,
             None,
             None,
-            Some(irokle_db),
+            Some(document_sync_db),
             MetadataHandleOptions::default()
                 .with_search_storage(MetadataSearchStorage::Memory)
-                .with_irokle_persist_policy(FjallPersistPolicy::SyncAll),
+                .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll),
         )
         .expect("metadata handle opens");
 
@@ -4251,7 +4277,7 @@ mod tests {
         metadata_handle
             .flush_persistence()
             .await
-            .expect("metadata and irokle persistence flush");
+            .expect("metadata and document sync persistence flush");
     }
 
     #[tokio::test]

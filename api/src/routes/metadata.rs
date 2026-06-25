@@ -35,10 +35,11 @@ use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
-use futures_util::stream::FuturesUnordered;
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Instrument, Span, debug_span, field, warn};
@@ -1753,6 +1754,19 @@ fn metadata_auth_token_from_carrier(
 type MetadataNodeCall<T> =
     Arc<dyn Fn(aruna_core::NodeId) -> BoxFuture<'static, Result<T, MetadataError>> + Send + Sync>;
 
+fn metadata_node_call<C, T, F, Fut>(context: C, call: F) -> MetadataNodeCall<T>
+where
+    C: Clone + Send + Sync + 'static,
+    T: Send + 'static,
+    F: Fn(C, aruna_core::NodeId) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<T, MetadataError>> + Send + 'static,
+{
+    Arc::new(move |node_id| {
+        let context = context.clone();
+        call(context, node_id).boxed()
+    })
+}
+
 #[derive(Clone, Copy)]
 enum MetadataFanoutOperation {
     Query,
@@ -1904,23 +1918,17 @@ where
             };
             let fanout_started = Instant::now();
             let local_node_id = state.get_node_id();
-            let mut node_iter = nodes.into_iter().enumerate();
-            let mut pending = FuturesUnordered::new();
             let mut node_parts = Vec::new();
 
-            loop {
-                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
-                    let Some((node_index, node_id)) = node_iter.next() else {
-                        break;
-                    };
+            let pending =
+                stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
                     let local_call = local_call.clone();
                     let remote_call = remote_call.clone();
-                    let local = node_id == local_node_id;
-                    pending.push(async move {
+                    async move {
                         let result = run_metadata_fanout_node(
                             operation,
                             node_id,
-                            local,
+                            node_id == local_node_id,
                             local_call,
                             remote_call,
                             record_result,
@@ -1928,12 +1936,12 @@ where
                         )
                         .await;
                         (node_index, node_id, result)
-                    });
-                }
+                    }
+                }))
+                .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
+            futures_util::pin_mut!(pending);
 
-                let Some((node_index, node_id, result)) = pending.next().await else {
-                    break;
-                };
+            while let Some((node_index, node_id, result)) = pending.next().await {
                 match result {
                     Ok(result) => node_parts.push((node_index, result)),
                     Err(error) => {
@@ -2021,37 +2029,30 @@ async fn run_query_distributed(
     };
     let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
-    let local_call: MetadataNodeCall<MetadataQueryResults> = Arc::new({
-        let handle = handle.clone();
-        let auth = auth.clone();
-        let graph_iris = graph_iris.clone();
-        let query = query.clone();
-        move |_| {
-            let handle = handle.clone();
-            let auth = auth.clone();
-            let graph_iris = graph_iris.clone();
-            let query = query.clone();
-            async move { handle.query_authorized_local(auth, graph_iris, query).await }.boxed()
-        }
-    });
-    let remote_call: MetadataNodeCall<MetadataQueryResults> = Arc::new({
-        let handle = handle.clone();
-        let auth_token = remote_auth_token.clone();
-        let graph_iris = graph_iris.clone();
-        let query = query.clone();
-        move |node_id| {
-            let handle = handle.clone();
-            let auth_token = auth_token.clone();
-            let graph_iris = graph_iris.clone();
-            let query = query.clone();
-            async move {
-                handle
-                    .request_remote_query_graphs(node_id, auth_token, graph_iris, query)
-                    .await
-            }
-            .boxed()
-        }
-    });
+    let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
+        (
+            handle.clone(),
+            auth.clone(),
+            graph_iris.clone(),
+            query.clone(),
+        ),
+        |(handle, auth, graph_iris, query), _| async move {
+            handle.query_authorized_local(auth, graph_iris, query).await
+        },
+    );
+    let remote_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
+        (
+            handle.clone(),
+            remote_auth_token.clone(),
+            graph_iris.clone(),
+            query.clone(),
+        ),
+        |(handle, auth_token, graph_iris, query), node_id| async move {
+            handle
+                .request_remote_query_graphs(node_id, auth_token, graph_iris, query)
+                .await
+        },
+    );
     let (parts, fanout_stats) = run_metadata_fanout(
         state,
         scope,
@@ -2109,42 +2110,34 @@ async fn run_search_distributed(
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
     let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
-    let local_call: MetadataNodeCall<Vec<MetadataSearchHit>> = Arc::new({
-        let handle = handle.clone();
-        let auth = auth.clone();
-        let graph_iris = graph_iris.clone();
-        let query = query.clone();
-        move |_| {
-            let handle = handle.clone();
-            let auth = auth.clone();
-            let graph_iris = graph_iris.clone();
-            let query = query.clone();
-            async move {
-                handle
-                    .search_authorized_local(auth, graph_iris, query, limit)
-                    .await
-            }
-            .boxed()
-        }
-    });
-    let remote_call: MetadataNodeCall<Vec<MetadataSearchHit>> = Arc::new({
-        let handle = handle.clone();
-        let auth_token = remote_auth_token.clone();
-        let graph_iris = graph_iris.clone();
-        let query = query.clone();
-        move |node_id| {
-            let handle = handle.clone();
-            let auth_token = auth_token.clone();
-            let graph_iris = graph_iris.clone();
-            let query = query.clone();
-            async move {
-                handle
-                    .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
-                    .await
-            }
-            .boxed()
-        }
-    });
+    let local_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
+        (
+            handle.clone(),
+            auth.clone(),
+            graph_iris.clone(),
+            query.clone(),
+            limit,
+        ),
+        |(handle, auth, graph_iris, query, limit), _| async move {
+            handle
+                .search_authorized_local(auth, graph_iris, query, limit)
+                .await
+        },
+    );
+    let remote_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
+        (
+            handle.clone(),
+            remote_auth_token.clone(),
+            graph_iris.clone(),
+            query.clone(),
+            limit,
+        ),
+        |(handle, auth_token, graph_iris, query, limit), node_id| async move {
+            handle
+                .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
+                .await
+        },
+    );
     let (node_hits, fanout_stats) = run_metadata_fanout(
         state,
         scope,
@@ -3692,8 +3685,8 @@ mod tests {
             net.node_id(),
             storage_handle.clone(),
             Some(net.clone()),
-            Some(net.irokle_node()),
-            Some(net.irokle_database()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
         )
         .unwrap();
         let context = Arc::new(DriverContext {

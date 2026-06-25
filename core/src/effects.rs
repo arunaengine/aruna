@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
-use crate::document::IrokleEffect;
+use crate::document::DocumentSyncEffect;
 use crate::id::NodeId;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
@@ -175,7 +175,7 @@ impl IterStart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
-    Irokle(IrokleEffect),
+    DocumentSync(DocumentSyncEffect),
     Stream(StreamEffect),
 }
 

@@ -46,7 +46,7 @@ The system is organized around **realms**. A realm is an organizational trust bo
 
 Each Aruna node exposes an **S3-compatible API**, so researchers can keep using the tools, scripts, workflow systems, and libraries they already have instead of learning a new storage protocol. Buckets are virtual collections that mix local data, replicated data, and references to remote resources. To a user, this looks like one coherent access point. Underneath, Aruna tracks where data actually lives, which permissions apply, and whether an object should be materialized locally or fetched on demand.
  
-Metadata is part of the core system, not an external catalog bolted on afterwards. Descriptions are stored as **RO-Crate JSON-LD**, so datasets, files, people, instruments, workflows, software, and process runs can be described in a shared format. These descriptions live in a CRDT-based triple store, which allows concurrent edits on different nodes and merges them without a single authority arbitrating the result. Management resources such as users and groups are synchronized through durable Irokle document topics, which lets nodes keep working through network outages and reconcile state once they reconnect.
+Metadata is part of the core system, not an external catalog bolted on afterwards. Descriptions are stored as **RO-Crate JSON-LD**, so datasets, files, people, instruments, workflows, software, and process runs can be described in a shared format. These descriptions live in a CRDT-based triple store, which allows concurrent edits on different nodes and merges them without a single authority arbitrating the result. Management resources such as users and groups are synchronized through durable document-sync topics, which lets nodes keep working through network outages and reconcile state once they reconnect.
  
 File contents go into a content-addressed blob layer. Objects are hashed with **BLAKE3**, making integrity checks and deduplication part of the storage model rather than a separate step. If the same file shows up under different paths or on different nodes, it is recognized by its content instead of its location. Replication uses Bao-tree verified streaming, so data can be checked incrementally as it arrives.
 
@@ -146,14 +146,14 @@ For a ready-made multi-node onboarding flow, use `just test-deploy` instead of w
 
 ## Durability Configuration
 
-`ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and Irokle metadata state.
+`ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and document-sync metadata state.
 
 | Value | Durability contract |
 | --- | --- |
 | `buffer` (default, alias `buffered`) | Flushes data to OS buffers before local Fjall persistence returns. This keeps write latency low and protects against an application crash, but recently acknowledged writes are not guaranteed after an OS crash or power loss. |
 | `sync_all` (aliases `sync`, `sync-all`, `syncall`) | Flushes data and metadata with `fsync` before local Fjall persistence returns. This gives stronger local crash durability at higher write latency. |
 
-The setting does not change replication, authorization, or RO-Crate semantics. Metadata requests marked `MetadataRequestDurability::WalAlreadyDurable` have already been accepted by the metadata event-log phase, so Craqle/Irokle projection flushes may be deferred. The event-log write and later projection flush still use the configured Fjall mode; `buffer` does not become fsync-durable because a request is WAL-first.
+The setting does not change replication, authorization, or RO-Crate semantics. Metadata requests marked `MetadataRequestDurability::WalAlreadyDurable` have already been accepted by the metadata event-log phase, so document-sync projection flushes may be deferred. The event-log write and later projection flush still use the configured Fjall mode; `buffer` does not become fsync-durable because a request is WAL-first.
 
 ## License
 

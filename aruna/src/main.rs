@@ -65,8 +65,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             relay_method: config.relay_method.clone(),
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
-            irokle_storage_path: Some(config.irokle_storage_path.clone()),
-            irokle_runtime: Some(config.irokle_runtime),
+            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            document_sync_runtime: Some(config.document_sync_runtime),
             fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),
@@ -81,11 +81,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.node_id,
         storage_handle.clone(),
         Some(net_handle.clone()),
-        Some(net_handle.irokle_node()),
-        Some(net_handle.irokle_database()),
+        Some(net_handle.document_sync_node()),
+        Some(net_handle.document_sync_database()),
         MetadataHandleOptions::default()
             .with_search_storage(config.metadata_search_storage)
-            .with_irokle_persist_policy(config.fjall_persist_policy),
+            .with_document_sync_persist_policy(config.fjall_persist_policy),
     )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {

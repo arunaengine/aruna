@@ -2,13 +2,13 @@ use crate::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
 };
-use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
+use aruna_core::document::{DocumentSyncNetEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
-use aruna_core::{IrokleEffect, NodeId, UserId};
+use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
@@ -148,10 +148,12 @@ async fn sync_document_from_peer(
     bootstrap_peer: NodeId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let document_for_error = document.clone();
-    let sync = net_handle.send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
-        target: document,
-        peers: vec![bootstrap_peer],
-    })));
+    let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
+        DocumentSyncEffect::SyncDocument {
+            target: document,
+            peers: vec![bootstrap_peer],
+        },
+    )));
     let event = tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, sync)
         .await
         .map_err(|_| {
@@ -162,10 +164,14 @@ async fn sync_document_from_peer(
         })?;
 
     match event {
-        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled { .. })) => Ok(()),
-        Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => Err(error.into()),
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            ..
+        })) => Ok(()),
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
+            Err(error.into())
+        }
         Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
-        other => Err(format!("unexpected irokle sync result: {other:?}").into()),
+        other => Err(format!("unexpected document sync result: {other:?}").into()),
     }
 }
 
@@ -190,7 +196,7 @@ pub async fn ensure_initial_local_onboarding_secret(
     };
     let record = aruna_core::onboarding::OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
-        secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+        secret_hash: onboarding_secret.secret_hash(),
         mode: OnboardingMode::Local,
         expires_at: u64::MAX,
         claimed_node_id: None,

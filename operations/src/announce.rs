@@ -20,6 +20,7 @@ use aruna_core::types::{Effects, Key, UserId};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::document_repository;
 use crate::document_sync_outbox::{

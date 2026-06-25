@@ -3,9 +3,10 @@
 
 mod connection_pool;
 pub mod dht;
+#[path = "irokle.rs"]
+pub mod document_sync;
 mod effect_handlers;
 pub mod error;
-pub mod irokle;
 pub mod streams;
 mod telemetry;
 
@@ -46,8 +47,8 @@ use tracing::{Instrument, Span, debug, warn};
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
+pub use document_sync::DocumentSyncService;
 pub use error::{NetError, Result};
-pub use irokle::IrokleService;
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
@@ -66,8 +67,8 @@ pub struct NetConfig {
     pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
-    pub irokle_storage_path: Option<PathBuf>,
-    pub irokle_runtime: Option<IrohRuntimeConfig>,
+    pub document_sync_storage_path: Option<PathBuf>,
+    pub document_sync_runtime: Option<IrohRuntimeConfig>,
     pub fjall_persist_policy: FjallPersistPolicy,
 }
 
@@ -269,8 +270,8 @@ impl Default for NetConfig {
             relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
             max_concurrent_uni_streams: None,
-            irokle_storage_path: None,
-            irokle_runtime: None,
+            document_sync_storage_path: None,
+            document_sync_runtime: None,
             fjall_persist_policy: FjallPersistPolicy::default(),
         }
     }
@@ -365,7 +366,7 @@ struct NetInner {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
-    irokle: Arc<IrokleService>,
+    document_sync: Arc<DocumentSyncService>,
     streams: Arc<StreamsService>,
     connection_pool: ConnectionPool,
     peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
@@ -408,7 +409,7 @@ impl NetHandle {
         let app_alpns = vec![
             Alpn::Dht.as_bytes().to_vec(),
             Alpn::Bao.as_bytes().to_vec(),
-            Alpn::Irokle.as_bytes().to_vec(),
+            Alpn::DocumentSync.as_bytes().to_vec(),
             Alpn::Metadata.as_bytes().to_vec(),
         ];
 
@@ -523,16 +524,19 @@ impl NetHandle {
             }
         }
 
-        let irokle_path = config.irokle_storage_path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("aruna-irokle-{}", ulid::Ulid::new()))
-        });
-        let irokle = Arc::new(IrokleService::open_with_persist_policy(
+        let document_sync_path = config
+            .document_sync_storage_path
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::new()))
+            });
+        let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
-            irokle_path,
+            document_sync_path,
             &realm_peer_nodes,
             app_alpns,
-            config.irokle_runtime.unwrap_or_default(),
+            config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
         )?);
 
@@ -545,7 +549,7 @@ impl NetHandle {
 
         let shutdown_for_effects = shutdown.clone();
         let dht_for_effects = dht.clone();
-        let irokle_for_effects = irokle.clone();
+        let document_sync_for_effects = document_sync.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -553,11 +557,11 @@ impl NetHandle {
                     maybe_effect = effect_rx.recv() => {
                         let Some((effect, response_tx, span)) = maybe_effect else { break };
                         let dht = dht_for_effects.clone();
-                        let irokle = irokle_for_effects.clone();
+                        let document_sync = document_sync_for_effects.clone();
                         tokio::spawn(async move {
                             let event = effect_handlers::handle_net_effect(
                                 &dht,
-                                &irokle,
+                                &document_sync,
                                 effect,
                             )
                             .await;
@@ -625,14 +629,14 @@ impl NetHandle {
         });
 
         let endpoint_for_accept = endpoint.clone();
-        let irokle_for_accept = irokle.clone();
+        let document_sync_for_accept = document_sync.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
             streams::run_accept_loop(
                 endpoint_for_accept,
                 dht_tx,
                 stream_tx,
-                irokle_for_accept,
+                document_sync_for_accept,
                 shutdown_for_accept,
             )
             .await;
@@ -683,7 +687,7 @@ impl NetHandle {
             realm_peers,
             dht_signed_authorized_nodes,
             dht,
-            irokle,
+            document_sync,
             streams,
             connection_pool,
             peer_connectivity,
@@ -709,38 +713,45 @@ impl NetHandle {
         local_endpoint_addr(&self.inner.endpoint, &self.inner.relay_method.relay_urls())
     }
 
-    pub fn irokle_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
-        self.inner.irokle.node()
+    pub fn document_sync_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
+        self.inner.document_sync.node()
     }
 
-    pub fn irokle_database(&self) -> fjall::OptimisticTxDatabase {
-        self.inner.irokle.database()
+    pub fn document_sync_database(&self) -> fjall::OptimisticTxDatabase {
+        self.inner.document_sync.database()
     }
 
-    pub async fn sync_irokle_topic_with_peers(
+    pub async fn sync_document_topic_with_peers(
         &self,
         topic_id: ::irokle::TopicId,
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
-            .irokle
+            .document_sync
             .sync_topic_with_peers(topic_id, peers)
             .await
     }
 
-    pub async fn handle_irokle_stream(
+    pub async fn handle_document_sync_stream(
         &self,
         stream: streams::BiStream,
         peer: NodeId,
     ) -> Result<Vec<::irokle::TopicId>> {
-        self.inner.irokle.handle_inbound_stream(stream, peer).await
+        self.inner
+            .document_sync
+            .handle_inbound_stream(stream, peer)
+            .await
     }
 
-    pub async fn reconcile_irokle_topics(
+    pub async fn reconcile_document_sync_topics(
         &self,
         topic_ids: Vec<::irokle::TopicId>,
     ) -> Result<DocumentSyncReconcileResult> {
-        let applied = self.inner.irokle.reconcile_irokle_topics(topic_ids).await?;
+        let applied = self
+            .inner
+            .document_sync
+            .reconcile_document_sync_topics(topic_ids)
+            .await?;
         if applied
             .targets
             .iter()
@@ -850,12 +861,12 @@ impl NetHandle {
         );
         if let Err(err) = self
             .inner
-            .irokle
+            .document_sync
             .refresh_potential_peer_nodes(peers.clone())
         {
             warn!(
                 error = %err,
-                "Failed to refresh Irokle potential peers from realm config"
+                "Failed to refresh document sync potential peers from realm config"
             );
         }
         for node_id in peers {
@@ -1033,7 +1044,7 @@ impl NetHandle {
         if let Err(err) = self.inner.dht.shutdown().await {
             warn!(error = %err, "DHT shutdown returned error");
         }
-        self.inner.irokle.shutdown().await;
+        self.inner.document_sync.shutdown().await;
         if let Err(err) = self.inner.connection_pool.shutdown().await {
             warn!(error = %err, "Connection pool shutdown returned error");
         }
@@ -2055,7 +2066,7 @@ impl Handle for NetHandle {
 fn net_handle_effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Net(NetEffect::Dht(_)) => "dht",
-        Effect::Net(NetEffect::Irokle(_)) => "irokle",
+        Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",

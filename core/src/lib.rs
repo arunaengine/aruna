@@ -27,8 +27,8 @@ pub mod user_update_validation;
 pub mod util;
 
 pub use document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
-    DocumentSyncRevision, DocumentSyncTarget, IrokleEffect, IrokleEvent,
+    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect,
+    DocumentSyncEvent, DocumentSyncNetEvent, DocumentSyncRevision, DocumentSyncTarget,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;

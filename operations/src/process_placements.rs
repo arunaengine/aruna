@@ -1,11 +1,11 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -14,8 +14,8 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_placement_with_authoritative_fallback, delete_placement_effect, missing_peer_count,
-    new_placement, placement_prefix, placement_satisfied, schedule_placement_retry_effect,
+    decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
+    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_effect,
     select_sync_peers, sort_node_ids, write_placement_effect,
 };
 use tracing::warn;
@@ -33,7 +33,7 @@ pub struct ProcessPlacementsOperation {
     config: PlacementConfig,
     state: PlacementState,
     realm_nodes: Vec<NodeId>,
-    records: Vec<PendingTopicPlacement>,
+    records: Vec<PendingDocumentPlacement>,
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
     retry_needed: bool,
@@ -234,15 +234,10 @@ impl Operation for ProcessPlacementsOperation {
                     let Some(value) = value else {
                         return self.fail(PlacementError::RealmConfigNotFound);
                     };
-                    let document = match RealmConfigDocument::from_bytes(&value) {
-                        Ok(document) => document,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    let mut nodes = match document.node_ids() {
+                    let nodes = match realm_nodes_from_config_bytes(&value) {
                         Ok(nodes) => nodes,
                         Err(error) => return self.fail(error.into()),
                     };
-                    sort_node_ids(&mut nodes);
                     self.realm_nodes = nodes;
                     self.emit_list_pending()
                 }
@@ -257,10 +252,7 @@ impl Operation for ProcessPlacementsOperation {
                     self.next_start_after = next_start_after;
                     self.records.clear();
                     for (_, value) in values.into_iter().rev() {
-                        let record = match decode_placement_with_authoritative_fallback(
-                            &value,
-                            self.config.local_node_id,
-                        ) {
+                        let record = match decode_placement(&value) {
                             Ok(record) => record,
                             Err(error) => {
                                 return self.fail(PlacementError::Decode(error.to_string()));
@@ -445,8 +437,7 @@ mod tests {
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected placement write");
         };
-        let record = decode_placement_with_authoritative_fallback(value.as_ref(), node(9))
-            .expect("placement decodes");
+        let record = decode_placement(value.as_ref()).expect("placement decodes");
         assert_eq!(record.authoritative_node_id, authoritative);
         assert_eq!(record.selected_peers, vec![node(2), node(3)]);
     }

@@ -19,7 +19,7 @@ use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::{IrokleEffect, IrokleEvent};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 
 #[derive(Clone, Debug)]
 pub struct DriverContext {
@@ -119,15 +119,16 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 net_handle.send_effect(Effect::Net(net_effect)).await
             } else {
                 match net_effect {
-                    aruna_core::effects::NetEffect::Irokle(IrokleEffect::PublishDocuments {
-                        documents,
-                        ..
-                    }) => Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished {
-                        targets: documents
-                            .into_iter()
-                            .map(|document| document.target().clone())
-                            .collect(),
-                    })),
+                    aruna_core::effects::NetEffect::DocumentSync(
+                        DocumentSyncEffect::PublishDocuments { documents, .. },
+                    ) => Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPublished {
+                            targets: documents
+                                .into_iter()
+                                .map(|document| document.target().clone())
+                                .collect(),
+                        },
+                    )),
                     _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
                 }
             }

@@ -1,10 +1,10 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -15,8 +15,8 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
     delete_placement_effect, desired_peer_count, desired_remote_peer_count, new_placement,
-    placement_satisfied, schedule_placement_retry_effect, select_sync_peers, sort_node_ids,
-    write_placement_effect,
+    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_effect,
+    select_sync_peers, sort_node_ids, write_placement_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +51,7 @@ enum ReplicateDocumentsState {
 
 #[derive(Debug, Clone, PartialEq)]
 enum PlacementAction {
-    Write(PendingTopicPlacement),
+    Write(PendingDocumentPlacement),
     Delete(DocumentSyncTarget),
 }
 
@@ -249,15 +249,10 @@ impl Operation for ReplicateDocumentsOperation {
                         self.realm_nodes.clear();
                         return self.emit_next_publish();
                     };
-                    let document = match RealmConfigDocument::from_bytes(&value) {
-                        Ok(document) => document,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    let mut nodes = match document.node_ids() {
+                    let nodes = match realm_nodes_from_config_bytes(&value) {
                         Ok(nodes) => nodes,
                         Err(error) => return self.fail(error.into()),
                     };
-                    sort_node_ids(&mut nodes);
                     self.realm_nodes = nodes;
                     self.emit_next_publish()
                 }

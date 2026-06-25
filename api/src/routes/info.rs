@@ -584,7 +584,7 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
     alpn.map(|alpn| match alpn {
         Alpn::Dht => "dht".to_string(),
         Alpn::Bao => "bao".to_string(),
-        Alpn::Irokle => "irokle".to_string(),
+        Alpn::DocumentSync => "document_sync".to_string(),
         Alpn::Metadata => "metadata".to_string(),
     })
 }

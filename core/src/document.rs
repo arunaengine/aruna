@@ -52,7 +52,7 @@ pub enum DocumentSyncTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingTopicPlacement {
+pub struct PendingDocumentPlacement {
     pub realm_id: RealmId,
     pub target: DocumentSyncTarget,
     pub desired_peer_count: usize,
@@ -283,7 +283,7 @@ impl DocumentSyncTarget {
         }
     }
 
-    pub fn irokle_topic_id(&self) -> irokle::TopicId {
+    pub fn sync_topic_id(&self) -> irokle::TopicId {
         let mut bytes = b"aruna-document-topic-v1".to_vec();
         bytes.extend_from_slice(&self.topic_id().to_bytes());
         match self {
@@ -361,7 +361,7 @@ impl DocumentSyncEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IrokleEffect {
+pub enum DocumentSyncEffect {
     PublishDocuments {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
@@ -377,7 +377,7 @@ pub enum IrokleEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IrokleEvent {
+pub enum DocumentSyncNetEvent {
     DocumentsPublished {
         targets: Vec<DocumentSyncTarget>,
     },
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn irokle_topic_mapping_scopes_variants_under_shared_domain_topics() {
+    fn document_sync_topic_mapping_scopes_variants_under_shared_domain_topics() {
         let group_id = test_ulid(1);
         let realm_id = test_realm(2);
         let document_id = test_ulid(4);
@@ -635,19 +635,19 @@ mod tests {
         };
 
         assert_eq!(group.topic_id(), group_auth.topic_id());
-        assert_ne!(group.irokle_topic_id(), group_auth.irokle_topic_id());
+        assert_ne!(group.sync_topic_id(), group_auth.sync_topic_id());
 
         assert_eq!(realm_auth.topic_id(), realm_config.topic_id());
-        assert_ne!(realm_auth.irokle_topic_id(), realm_config.irokle_topic_id());
+        assert_ne!(realm_auth.sync_topic_id(), realm_config.sync_topic_id());
 
         assert_eq!(registry.topic_id(), create.topic_id());
         assert_eq!(registry.topic_id(), lifecycle.topic_id());
-        assert_ne!(registry.irokle_topic_id(), create.irokle_topic_id());
-        assert_ne!(registry.irokle_topic_id(), lifecycle.irokle_topic_id());
-        assert_ne!(create.irokle_topic_id(), lifecycle.irokle_topic_id());
+        assert_ne!(registry.sync_topic_id(), create.sync_topic_id());
+        assert_ne!(registry.sync_topic_id(), lifecycle.sync_topic_id());
+        assert_ne!(create.sync_topic_id(), lifecycle.sync_topic_id());
 
         assert_eq!(user_a.topic_id(), user_b.topic_id());
-        assert_ne!(user_a.irokle_topic_id(), user_b.irokle_topic_id());
+        assert_ne!(user_a.sync_topic_id(), user_b.sync_topic_id());
     }
 
     #[test]
@@ -808,9 +808,6 @@ mod tests {
         let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
         assert_eq!(upsert_target.topic_id(), delete_target.topic_id());
-        assert_eq!(
-            upsert_target.irokle_topic_id(),
-            delete_target.irokle_topic_id()
-        );
+        assert_eq!(upsert_target.sync_topic_id(), delete_target.sync_topic_id());
     }
 }

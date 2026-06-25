@@ -35,7 +35,7 @@ pub enum MetadataRequestDurability {
     Durable,
     /// Use when the metadata event has already been accepted by the WAL path.
     ///
-    /// Craqle/Irokle projection persistence may be deferred, but this does not
+    /// Craqle/document-sync projection persistence may be deferred, but this does not
     /// upgrade the WAL write beyond the configured Fjall persist mode.
     WalAlreadyDurable,
 }

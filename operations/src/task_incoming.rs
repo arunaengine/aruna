@@ -9,7 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
-use aruna_core::{IrokleEffect, IrokleEvent};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -198,8 +198,8 @@ impl OperationsTaskHandler {
             let publish = async {
                 let publish_started = Instant::now();
                 let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::Irokle(
-                        IrokleEffect::PublishDocuments { documents, peers },
+                    .send_effect(Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::PublishDocuments { documents, peers },
                     )))
                     .await;
                 (event, publish_started.elapsed())
@@ -211,10 +211,14 @@ impl OperationsTaskHandler {
             publish_elapsed += publish_time;
             totals.merge(sync_outcome);
             match publish_event {
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished { .. })) => {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                    ..
+                })) => {
                     awaiting_sync = Some(subbatch);
                 }
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                    error, ..
+                })) => {
                     warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
                     totals.retry_needed = true;
                 }
@@ -274,8 +278,8 @@ impl OperationsTaskHandler {
         };
         let sync_started = Instant::now();
         let event = net_handle
-            .send_effect(Effect::Net(NetEffect::Irokle(
-                IrokleEffect::SyncDocuments {
+            .send_effect(Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::SyncDocuments {
                     targets: subbatch.targets,
                     peers: subbatch.peers,
                 },
@@ -294,7 +298,7 @@ impl OperationsTaskHandler {
         mut outcome: DrainSyncOutcome,
     ) -> DrainSyncOutcome {
         match event {
-            Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
+            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
                 targets,
                 metadata_create_events,
                 metadata_graph_tombstones,
@@ -324,7 +328,7 @@ impl OperationsTaskHandler {
                     outcome.retry_needed = true;
                 }
             }
-            Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
                 warn!(key = ?retry_key, error = %error, "Failed to sync document batch");
                 outcome.retry_needed = true;
             }
@@ -552,18 +556,19 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     return;
                 };
                 let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
-                        target,
-                        peers,
-                    })))
+                    .send_effect(Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::SyncDocument { target, peers },
+                    )))
                     .await;
                 match event {
-                    Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
-                        targets,
-                        metadata_create_events,
-                        metadata_graph_tombstones,
-                        ..
-                    })) => {
+                    Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsReconciled {
+                            targets,
+                            metadata_create_events,
+                            metadata_graph_tombstones,
+                            ..
+                        },
+                    )) => {
                         process_metadata_graph_tombstones(
                             self.context.as_ref(),
                             metadata_graph_tombstones,
@@ -583,7 +588,10 @@ impl InboundTaskHandler for OperationsTaskHandler {
                             return;
                         }
                     }
-                    Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                        error,
+                        ..
+                    })) => {
                         warn!(key = ?retry_key, error = %error, "Failed to process durable document sync timer event");
                         self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
                             .await;
@@ -799,7 +807,7 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 vec![key.clone()],
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     target: Some(record.target.clone()),
                     error: "only 1/2 peers synced".to_string(),
                 })),
@@ -843,7 +851,7 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 vec![key.clone()],
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     target: Some(record.target.clone()),
                     error: "sync failed before all peers acknowledged".to_string(),
                 })),
@@ -888,15 +896,17 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 Vec::new(),
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
-                    applied: 1,
-                    targets: vec![DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: Ulid::from_parts(20, 1),
-                    }],
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: vec![tombstone.clone()],
-                })),
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsReconciled {
+                        applied: 1,
+                        targets: vec![DocumentSyncTarget::MetadataCreateEvent {
+                            document_id,
+                            event_id: Ulid::from_parts(20, 1),
+                        }],
+                        metadata_create_events: Vec::new(),
+                        metadata_graph_tombstones: vec![tombstone.clone()],
+                    },
+                )),
                 DrainSyncOutcome::default(),
             )
             .await;

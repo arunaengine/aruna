@@ -162,7 +162,7 @@ fn build_context(
         None,
         MetadataHandleOptions::default()
             .with_search_storage(MetadataSearchStorage::Disk)
-            .with_irokle_persist_policy(FjallPersistPolicy::SyncAll),
+            .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll),
     )?;
     Ok((
         Arc::new(DriverContext {

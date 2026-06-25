@@ -600,7 +600,7 @@ async fn spawn_node_with(
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            irokle_storage_path: Some(dir.join("irokle")),
+            document_sync_storage_path: Some(dir.join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),
@@ -612,8 +612,8 @@ async fn spawn_node_with(
         net.node_id(),
         storage.clone(),
         Some(net.clone()),
-        Some(net.irokle_node()),
-        Some(net.irokle_database()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
     )?;
 
     let context = Arc::new(DriverContext {

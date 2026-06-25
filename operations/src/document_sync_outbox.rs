@@ -15,12 +15,13 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-// Sized so one single-flight drain run fills several full irokle topic-batch
+// Sized so one single-flight drain run fills several full document sync topic-batch
 // streams per peer instead of paying the per-run scan/projection/fan-out
 // setup for a half-filled one. Records group by peer set, and every peer in
 // the set receives every topic in the group, so the cap scales with stream
 // capacity rather than peer count.
-pub const OUTBOX_DRAIN_BATCH_SIZE: usize = 4 * aruna_net::irokle::IROKLE_BATCH_SYNC_TOPIC_LIMIT;
+pub const OUTBOX_DRAIN_BATCH_SIZE: usize =
+    4 * aruna_net::document_sync::DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT;
 
 // Keys order by kind then outbox id (a ULID), with admin operations additionally
 // ordered by origin sequence, so drains are FIFO instead of following the random

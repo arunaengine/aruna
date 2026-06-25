@@ -4,30 +4,30 @@ use aruna_core::events::{DhtEvent, NetEvent, StreamEvent};
 use aruna_core::id::{DhtKeyId, hex_prefix};
 use tracing::{trace, warn};
 
-use crate::{DhtHandle, IrokleService};
+use crate::{DhtHandle, DocumentSyncService};
 
 #[tracing::instrument(
     name = "net.effect",
     level = "debug",
-    skip(dht, irokle, effect),
+    skip(dht, document_sync, effect),
     fields(effect = net_effect_kind(&effect))
 )]
 pub async fn handle_net_effect(
     dht: &DhtHandle,
-    irokle: &IrokleService,
+    document_sync: &DocumentSyncService,
     effect: NetEffect,
 ) -> NetEvent {
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(dht, dht_effect).await,
-        NetEffect::Irokle(irokle_effect) => match irokle_effect {
-            aruna_core::IrokleEffect::PublishDocuments { documents, peers } => {
-                NetEvent::Irokle(irokle.publish_documents(documents, peers).await)
+        NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
+            aruna_core::DocumentSyncEffect::PublishDocuments { documents, peers } => {
+                NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::IrokleEffect::SyncDocument { target, peers } => {
-                NetEvent::Irokle(irokle.sync_document_event(target, peers).await)
+            aruna_core::DocumentSyncEffect::SyncDocument { target, peers } => {
+                NetEvent::DocumentSync(document_sync.sync_document_event(target, peers).await)
             }
-            aruna_core::IrokleEffect::SyncDocuments { targets, peers } => {
-                NetEvent::Irokle(irokle.sync_documents_event(targets, peers).await)
+            aruna_core::DocumentSyncEffect::SyncDocuments { targets, peers } => {
+                NetEvent::DocumentSync(document_sync.sync_documents_event(targets, peers).await)
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
@@ -114,7 +114,7 @@ async fn handle_stream_effect(effect: StreamEffect) -> NetEvent {
 fn net_effect_kind(effect: &NetEffect) -> &'static str {
     match effect {
         NetEffect::Dht(_) => "dht",
-        NetEffect::Irokle(_) => "irokle",
+        NetEffect::DocumentSync(_) => "document_sync",
         NetEffect::Stream(_) => "stream",
     }
 }

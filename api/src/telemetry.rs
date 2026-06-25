@@ -2,7 +2,7 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use aruna_core::structs::AuthContext;
-use aruna_core::telemetry::{LatencyAggregator, RequestStages};
+use aruna_core::telemetry::{LatencyAggregator, RequestStages, duration_ms};
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -92,8 +92,8 @@ pub async fn request_tracing_middleware(request: Request, next: Next) -> Respons
             method = %method,
             route = %route_key,
             status_code = response.status().as_u16(),
-            total_ms = aruna_core::telemetry::duration_ms(elapsed),
-            threshold_ms = aruna_core::telemetry::duration_ms(slow_request_threshold()),
+            total_ms = duration_ms(elapsed),
+            threshold_ms = duration_ms(slow_request_threshold()),
             stages = %stages.render(),
             "Slow HTTP request"
         );
@@ -166,7 +166,7 @@ pub fn emit_request_completed(
         );
     }
     let _guard = span.enter();
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let latency_ms = duration_ms(started.elapsed());
     match status_code {
         500.. => error!(
             event = "request.failed",

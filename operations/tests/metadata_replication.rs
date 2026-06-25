@@ -23,7 +23,7 @@ use aruna_core::structs::{
     Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
-use aruna_core::{IrokleEffect, IrokleEvent};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -363,14 +363,14 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     .await?;
     nodes[1]
         .net
-        .sync_irokle_topic_with_peers(
-            lifecycle_target.irokle_topic_id(),
+        .sync_document_topic_with_peers(
+            lifecycle_target.sync_topic_id(),
             vec![nodes[0].net.node_id()],
         )
         .await?;
     let delete_result = nodes[1]
         .net
-        .reconcile_irokle_topics(vec![lifecycle_target.irokle_topic_id()])
+        .reconcile_document_sync_topics(vec![lifecycle_target.sync_topic_id()])
         .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
@@ -388,11 +388,11 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     .await?;
     nodes[1]
         .net
-        .sync_irokle_topic_with_peers(stale_target.irokle_topic_id(), vec![nodes[0].net.node_id()])
+        .sync_document_topic_with_peers(stale_target.sync_topic_id(), vec![nodes[0].net.node_id()])
         .await?;
     let stale_result = nodes[1]
         .net
-        .reconcile_irokle_topics(vec![stale_target.irokle_topic_id()])
+        .reconcile_document_sync_topics(vec![stale_target.sync_topic_id()])
         .await?;
 
     assert!(stale_result.metadata_create_events.is_empty());
@@ -470,8 +470,8 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         net.node_id(),
         storage.clone(),
         Some(net.clone()),
-        Some(net.irokle_node()),
-        Some(net.irokle_database()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
     )?;
 
     let context = Arc::new(DriverContext {
@@ -537,8 +537,8 @@ async fn publish_document_to_peer(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
         .net
-        .send_effect(Effect::Net(NetEffect::Irokle(
-            IrokleEffect::PublishDocuments {
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::PublishDocuments {
                 documents: vec![DocumentSyncPublish::Upsert {
                     event_id,
                     target: target.clone(),
@@ -550,7 +550,9 @@ async fn publish_document_to_peer(
         )))
         .await
     {
-        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished { targets })) => {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+            targets,
+        })) => {
             assert_eq!(targets, vec![target]);
             Ok(())
         }

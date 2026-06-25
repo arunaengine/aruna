@@ -24,22 +24,22 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
-const METADATA_IROKLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-const METADATA_IROKLE_MAINTENANCE_JITTER_SECS: u64 = 15;
+const METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS: u64 = 15;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
     context: Arc<DriverContext>,
-    irokle_reconcile: Arc<IrokleReconcileCoalescer>,
+    document_sync_reconcile: Arc<DocumentSyncReconcileCoalescer>,
 }
 
 impl OperationsInboundHandler {
     fn new(context: Arc<DriverContext>) -> Self {
-        let irokle_reconcile = Arc::new(IrokleReconcileCoalescer::default());
-        spawn_reconcile_queue_gauge(Arc::downgrade(&irokle_reconcile));
+        let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
+        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
         Self {
             context,
-            irokle_reconcile,
+            document_sync_reconcile,
         }
     }
 }
@@ -47,18 +47,18 @@ impl OperationsInboundHandler {
 // Coalesces concurrent inbound reconcile triggers: one run in flight, all
 // further triggers fold their topic sets into a single queued re-run.
 #[derive(Debug, Default)]
-struct IrokleReconcileCoalescer {
-    state: Mutex<IrokleReconcileQueue>,
+struct DocumentSyncReconcileCoalescer {
+    state: Mutex<DocumentSyncReconcileQueue>,
 }
 
 #[derive(Debug, Default)]
-struct IrokleReconcileQueue {
+struct DocumentSyncReconcileQueue {
     running: bool,
     queued: BTreeSet<irokle::TopicId>,
     queued_since: Option<Instant>,
 }
 
-impl IrokleReconcileCoalescer {
+impl DocumentSyncReconcileCoalescer {
     fn trigger(self: &Arc<Self>, context: Arc<DriverContext>, topics: Vec<irokle::TopicId>) {
         {
             let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
@@ -87,7 +87,7 @@ impl IrokleReconcileCoalescer {
                     state.queued_since = None;
                     std::mem::take(&mut state.queued).into_iter().collect()
                 };
-                reconcile_inbound_irokle_topics(&context, batch).await;
+                reconcile_inbound_document_sync_topics(&context, batch).await;
             }
         });
     }
@@ -104,7 +104,7 @@ impl IrokleReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_reconcile_queue_gauge(coalescer: Weak<IrokleReconcileCoalescer>) {
+fn spawn_reconcile_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -132,7 +132,7 @@ fn spawn_reconcile_queue_gauge(coalescer: Weak<IrokleReconcileCoalescer>) {
     });
 }
 
-async fn reconcile_inbound_irokle_topics(
+async fn reconcile_inbound_document_sync_topics(
     context: &Arc<DriverContext>,
     topics: Vec<irokle::TopicId>,
 ) {
@@ -141,16 +141,16 @@ async fn reconcile_inbound_irokle_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let targets = match net_handle.reconcile_irokle_topics(topics).await {
+    let targets = match net_handle.reconcile_document_sync_topics(topics).await {
         Ok(targets) => targets,
         Err(err) => {
-            error!(error = ?err, "Failed to reconcile inbound irokle topics");
+            error!(error = ?err, "Failed to reconcile inbound document sync topics");
             return;
         }
     };
     let reconcile_elapsed = run_started.elapsed();
     let applied = targets.applied();
-    debug!(applied, "Reconciled inbound Irokle document events");
+    debug!(applied, "Reconciled inbound document sync events");
     if applied == 0 {
         return;
     }
@@ -165,7 +165,7 @@ async fn reconcile_inbound_irokle_topics(
             local_node_id: net_handle.node_id(),
         });
         if let Err(error) = drive(operation, context.as_ref()).await {
-            error!(error = ?error, "Failed to process pending topic placements after Irokle reconciliation");
+            error!(error = ?error, "Failed to process pending placements after document sync reconciliation");
         }
     }
     let project_started = Instant::now();
@@ -181,7 +181,7 @@ async fn reconcile_inbound_irokle_topics(
         project_ms = duration_ms(project_elapsed),
         prune_ms = duration_ms(prune_started.elapsed()),
         total_ms = duration_ms(run_started.elapsed()),
-        "Inbound Irokle reconcile summary"
+        "Inbound document sync reconcile summary"
     );
 }
 
@@ -194,7 +194,7 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 
     net_handle.set_inbound_handler(Arc::new(OperationsInboundHandler::new(context)));
     if let Some(metadata_handle) = metadata_handle {
-        schedule_periodic_metadata_irokle_maintenance(metadata_handle);
+        schedule_periodic_metadata_document_sync_maintenance(metadata_handle);
     }
 }
 
@@ -272,17 +272,17 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!("Cannot handle incoming bao stream without blob handle");
                     }
                 }
-                Alpn::Irokle => {
+                Alpn::DocumentSync => {
                     let Some(net_handle) = self.context.net_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound irokle stream without net handle");
+                        warn!(node_id = %node_id, "Dropping inbound document sync stream without net handle");
                         return;
                     };
-                    match net_handle.handle_irokle_stream(stream, node_id).await {
+                    match net_handle.handle_document_sync_stream(stream, node_id).await {
                         Ok(touched_topics) => {
-                            self.irokle_reconcile
+                            self.document_sync_reconcile
                                 .trigger(self.context.clone(), touched_topics);
                         }
-                        Err(err) => error!(error = ?err, "Failed to process inbound irokle stream"),
+                        Err(err) => error!(error = ?err, "Failed to process inbound document sync stream"),
                     }
                 }
                 Alpn::Metadata => {
@@ -322,7 +322,7 @@ async fn project_inbound_metadata_create_events(
         {
             error!(
                 error = ?error,
-                "Failed to project metadata create event batch after inbound Irokle reconciliation"
+                "Failed to project metadata create event batch after inbound document sync reconciliation"
             );
             schedule_projection_retry(context).await;
         }
@@ -344,7 +344,7 @@ async fn project_inbound_metadata_create_events(
     if let Err(error) = project_metadata_create_events_from_log(context, targets).await {
         error!(
             error = ?error,
-            "Failed to project metadata create event batch from log after inbound Irokle reconciliation"
+            "Failed to project metadata create event batch from log after inbound document sync reconciliation"
         );
         schedule_projection_retry(context).await;
     }
@@ -358,34 +358,34 @@ async fn schedule_projection_retry(context: &DriverContext) {
     }
 }
 
-fn schedule_periodic_metadata_irokle_maintenance(metadata_handle: MetadataHandle) {
+fn schedule_periodic_metadata_document_sync_maintenance(metadata_handle: MetadataHandle) {
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|now| now.subsec_nanos() as u64 % METADATA_IROKLE_MAINTENANCE_JITTER_SECS)
+            .map(|now| now.subsec_nanos() as u64 % METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS)
             .unwrap_or(0),
     );
     tokio::spawn(async move {
         let mut cycle = 0usize;
         loop {
-            sleep(METADATA_IROKLE_MAINTENANCE_INTERVAL + jitter).await;
+            sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter).await;
             cycle = cycle.saturating_add(1);
-            run_metadata_irokle_maintenance(&metadata_handle, "periodic", cycle).await;
+            run_metadata_document_sync_maintenance(&metadata_handle, "periodic", cycle).await;
         }
     });
 }
 
-async fn run_metadata_irokle_maintenance(
+async fn run_metadata_document_sync_maintenance(
     metadata_handle: &MetadataHandle,
     source: &'static str,
     attempt: usize,
 ) {
-    if let Err(error) = metadata_handle.reconcile_irokle().await {
+    if let Err(error) = metadata_handle.reconcile_document_sync().await {
         warn!(
             source,
             attempt,
             error = ?error,
-            "Craqle Irokle reconciliation failed"
+            "Metadata document sync reconciliation failed"
         );
     }
     match metadata_handle.prune_deleted_graphs().await {

@@ -2,14 +2,14 @@ use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
-use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    IROKLE_APPLIED_OPS_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
     REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
@@ -97,7 +97,7 @@ struct TopicStatusOutput {
     topic_id: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pending_placement: Option<JsonPendingTopicPlacement>,
+    pending_placement: Option<JsonPendingDocumentPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -105,7 +105,7 @@ struct TopicPlacementsOutput {
     database_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     topic_id: Option<String>,
-    placements: Vec<JsonPendingTopicPlacement>,
+    placements: Vec<JsonPendingDocumentPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -208,8 +208,8 @@ enum DecodedValue {
     NodeState {
         data: JsonPersistedNodeState,
     },
-    PendingTopicPlacement {
-        data: JsonPendingTopicPlacement,
+    PendingDocumentPlacement {
+        data: JsonPendingDocumentPlacement,
     },
     OnboardingSecretRecord {
         data: OnboardingSecretRecord,
@@ -506,14 +506,14 @@ impl Serialize for JsonPersistedNodeState {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct JsonPendingTopicPlacement(PendingTopicPlacement);
+struct JsonPendingDocumentPlacement(PendingDocumentPlacement);
 
-impl Serialize for JsonPendingTopicPlacement {
+impl Serialize for JsonPendingDocumentPlacement {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingTopicPlacement", 8)?;
+        let mut state = serializer.serialize_struct("PendingDocumentPlacement", 8)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
@@ -537,11 +537,11 @@ impl Serialize for JsonPendingTopicPlacement {
     }
 }
 
-fn placement_topic_id(placement: &PendingTopicPlacement) -> String {
-    placement.target.irokle_topic_id().to_string()
+fn placement_topic_id(placement: &PendingDocumentPlacement) -> String {
+    placement.target.sync_topic_id().to_string()
 }
 
-fn placement_missing_peer_count(placement: &PendingTopicPlacement) -> usize {
+fn placement_missing_peer_count(placement: &PendingDocumentPlacement) -> usize {
     let mut selected_peers = placement.selected_peers.clone();
     selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
     selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -1062,7 +1062,7 @@ fn defined_keyspaces() -> [&'static str; 33] {
         DHT_KEYSPACE,
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
-        IROKLE_APPLIED_OPS_KEYSPACE,
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
         METADATA_AUDIT_KEYSPACE,
         METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE,
@@ -1136,7 +1136,7 @@ fn topic_status_output(
     let pending_placement = load_pending_placements(database_path)?
         .into_iter()
         .find(|placement| placement_topic_id(placement) == topic_id)
-        .map(JsonPendingTopicPlacement);
+        .map(JsonPendingDocumentPlacement);
     let status = if pending_placement.is_some() {
         "under_replicated"
     } else {
@@ -1166,14 +1166,14 @@ fn topic_placements_output(
         topic_id: topic_id.map(str::to_string),
         placements: placements
             .into_iter()
-            .map(JsonPendingTopicPlacement)
+            .map(JsonPendingDocumentPlacement)
             .collect(),
     })
 }
 
 fn load_pending_placements(
     database_path: &str,
-) -> Result<Vec<PendingTopicPlacement>, ExplorerError> {
+) -> Result<Vec<PendingDocumentPlacement>, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let keyspace_names = db.list_keyspace_names();
     if !keyspace_names
@@ -1231,7 +1231,7 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | S3_BUCKET_KEYSPACE
         | S3_BUCKET_REPLICATION_KEYSPACE
         | API_STATE_KEYSPACE
-        | IROKLE_APPLIED_OPS_KEYSPACE
+        | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
         SYNC_PLACEMENT_KEYSPACE => raw_field(key),
@@ -1308,7 +1308,9 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_multipart_object_metadata_value(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
-        IROKLE_APPLIED_OPS_KEYSPACE => raw_value(value, Some("irokle applied op".to_string())),
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE => {
+            raw_value(value, Some("document sync applied op".to_string()))
+        }
         NODE_STATE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
@@ -1319,8 +1321,8 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         SYNC_PLACEMENT_KEYSPACE => decode_value_with(
             value,
             aruna_operations::sync_placement::decode_placement,
-            |data| DecodedValue::PendingTopicPlacement {
-                data: JsonPendingTopicPlacement(data),
+            |data| DecodedValue::PendingDocumentPlacement {
+                data: JsonPendingDocumentPlacement(data),
             },
         ),
         ONBOARDING_KEYSPACE => decode_value_with(
@@ -1493,8 +1495,8 @@ mod tests {
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        BUCKET_STATS_DB, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        IROKLE_APPLIED_OPS_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE,
         S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -1569,7 +1571,7 @@ mod tests {
             CRAQLE_TERMS_KEYSPACE.to_string(),
             DHT_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
-            IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
             METADATA_AUDIT_KEYSPACE.to_string(),
             METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
             METADATA_HOLDERS_KEYSPACE.to_string(),
@@ -1807,7 +1809,7 @@ mod tests {
             }
         );
         match decoded.value {
-            DecodedValue::PendingTopicPlacement { data } => {
+            DecodedValue::PendingDocumentPlacement { data } => {
                 assert_eq!(data.0.realm_id, realm_id);
                 assert_eq!(data.0.target, target);
                 assert_eq!(data.0.authoritative_node_id, authoritative_node_id);

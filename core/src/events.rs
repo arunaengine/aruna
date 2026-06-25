@@ -6,7 +6,7 @@ use crate::structs::{
     ResolvedSourceConnector, SourceMetadata,
 };
 use crate::{
-    document::IrokleEvent,
+    document::DocumentSyncNetEvent,
     errors::{AuthorizationError, DhtError, StorageError, StreamError},
     id::NodeId,
     task::TaskEvent,
@@ -147,7 +147,7 @@ pub enum StorageEvent {
 #[derive(Debug, PartialEq)]
 pub enum NetEvent {
     Dht(DhtEvent),
-    Irokle(IrokleEvent),
+    DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
     Error(NetError),
 }

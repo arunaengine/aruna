@@ -10,15 +10,15 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncPublish,
-    DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncNetEvent,
+    DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
-    IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -63,13 +63,13 @@ use crate::streams::BiStream;
 
 use ::irokle as irokle_crate;
 
-const IROKLE_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const DOCUMENT_SYNC_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 // Matches irokle's 1024-topic wire batches; the worst-case data stream sends
 // three messages per topic, staying under the peer's 4096-message stream cap.
-pub const IROKLE_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
-const IROKLE_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
-const IROKLE_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
-const IROKLE_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
+const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
+const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const USER_NAME_PATH: &str = "user.name";
 const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
 const GROUP_REALM_ID_PATH: &str = "group.realm_id";
@@ -85,7 +85,7 @@ struct PendingMetadataCreateApply {
 }
 
 #[derive(Clone)]
-pub struct IrokleService {
+pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
@@ -95,16 +95,16 @@ pub struct IrokleService {
     storage_path: PathBuf,
 }
 
-impl std::fmt::Debug for IrokleService {
+impl std::fmt::Debug for DocumentSyncService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IrokleService")
+        f.debug_struct("DocumentSyncService")
             .field("peer_id", &self.node.peer_id())
             .field("storage_path", &self.storage_path)
             .finish()
     }
 }
 
-impl IrokleService {
+impl DocumentSyncService {
     pub fn open(
         endpoint: iroh::Endpoint,
         storage: StorageHandle,
@@ -233,7 +233,7 @@ impl IrokleService {
     pub async fn shutdown(&self) {
         self.net.shutdown().await;
         if let Err(error) = self.db.persist(fjall::PersistMode::SyncAll) {
-            warn!(error = %error, "Failed to persist Irokle database on shutdown");
+            warn!(error = %error, "Failed to persist document sync database on shutdown");
         }
     }
 
@@ -248,7 +248,7 @@ impl IrokleService {
         self.flush_database()
     }
 
-    /// Notes a live inbound Irokle connection so the resync scheduler retries
+    /// Notes a live inbound document sync connection so the resync scheduler retries
     /// the peer immediately. The connection itself is not pooled for outbound
     /// reuse: streams opened over it toward the original dialer would never be
     /// accepted, because only connections accepted by our accept loop serve
@@ -292,12 +292,12 @@ impl IrokleService {
             write_ms = duration_ms(write_elapsed),
             flush_ms = duration_ms(flush_started.elapsed()),
             total_ms = duration_ms(stream_started.elapsed()),
-            "Inbound Irokle sync stream summary"
+            "Inbound document sync stream summary"
         );
         Ok(touched_topics)
     }
 
-    pub async fn reconcile_irokle_topics(
+    pub async fn reconcile_document_sync_topics(
         &self,
         topic_ids: Vec<irokle_crate::TopicId>,
     ) -> Result<DocumentSyncReconcileResult> {
@@ -308,29 +308,29 @@ impl IrokleService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
-    ) -> IrokleEvent {
+    ) -> DocumentSyncNetEvent {
         let targets = documents
             .iter()
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
         match self.publish_events(documents, peers).await {
-            Ok(()) => IrokleEvent::DocumentsPublished { targets },
-            Err(error) => IrokleEvent::Error {
+            Ok(()) => DocumentSyncNetEvent::DocumentsPublished { targets },
+            Err(error) => DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
         }
     }
 
-    pub async fn reconcile_documents_event(&self) -> IrokleEvent {
+    pub async fn reconcile_documents_event(&self) -> DocumentSyncNetEvent {
         match self.reconcile_documents().await {
-            Ok(result) => IrokleEvent::DocumentsReconciled {
+            Ok(result) => DocumentSyncNetEvent::DocumentsReconciled {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
                 metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
-            Err(error) => IrokleEvent::Error {
+            Err(error) => DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
@@ -341,11 +341,11 @@ impl IrokleService {
         &self,
         target: DocumentSyncTarget,
         peers: Vec<NodeId>,
-    ) -> IrokleEvent {
-        let topic_id = target.irokle_topic_id();
+    ) -> DocumentSyncNetEvent {
+        let topic_id = target.sync_topic_id();
         let sync_peers = self.sync_peers(peers);
         if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return IrokleEvent::Error {
+            return DocumentSyncNetEvent::Error {
                 target: Some(target),
                 error: error.to_string(),
             };
@@ -353,7 +353,7 @@ impl IrokleService {
         match self.has_topic(topic_id) {
             Ok(true) => {
                 if let Err(error) = self.sync_topic(topic_id, sync_peers).await {
-                    return IrokleEvent::Error {
+                    return DocumentSyncNetEvent::Error {
                         target: Some(target),
                         error: error.to_string(),
                     };
@@ -361,33 +361,33 @@ impl IrokleService {
             }
             Ok(false) => {
                 if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
-                    return IrokleEvent::Error {
+                    return DocumentSyncNetEvent::Error {
                         target: Some(target),
                         error: error.to_string(),
                     };
                 }
             }
             Err(error) => {
-                return IrokleEvent::Error {
+                return DocumentSyncNetEvent::Error {
                     target: Some(target),
                     error: error.to_string(),
                 };
             }
         }
         if let Err(error) = self.flush_database() {
-            return IrokleEvent::Error {
+            return DocumentSyncNetEvent::Error {
                 target: Some(target),
                 error: error.to_string(),
             };
         }
         match self.reconcile_document_topics([topic_id]).await {
-            Ok(result) => IrokleEvent::DocumentsReconciled {
+            Ok(result) => DocumentSyncNetEvent::DocumentsReconciled {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
                 metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
-            Err(error) => IrokleEvent::Error {
+            Err(error) => DocumentSyncNetEvent::Error {
                 target: Some(target),
                 error: error.to_string(),
             },
@@ -398,12 +398,12 @@ impl IrokleService {
         &self,
         targets: Vec<DocumentSyncTarget>,
         peers: Vec<NodeId>,
-    ) -> IrokleEvent {
+    ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
         let target_count = targets.len();
         let sync_peers = self.sync_peers(peers);
         if let Err(error) = self.allow_sync_peers(&sync_peers) {
-            return IrokleEvent::Error {
+            return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -412,7 +412,7 @@ impl IrokleService {
         let mut seen_topics = BTreeSet::new();
         let mut topics: Vec<(irokle_crate::TopicId, DocumentSyncTarget)> = Vec::new();
         for target in targets {
-            let topic_id = target.irokle_topic_id();
+            let topic_id = target.sync_topic_id();
             if !seen_topics.insert(topic_id) {
                 continue;
             }
@@ -421,7 +421,7 @@ impl IrokleService {
                 Ok(false) => {
                     if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await
                     {
-                        return IrokleEvent::Error {
+                        return DocumentSyncNetEvent::Error {
                             target: Some(target),
                             error: error.to_string(),
                         };
@@ -429,7 +429,7 @@ impl IrokleService {
                     topics.push((topic_id, target));
                 }
                 Err(error) => {
-                    return IrokleEvent::Error {
+                    return DocumentSyncNetEvent::Error {
                         target: Some(target),
                         error: error.to_string(),
                     };
@@ -444,7 +444,7 @@ impl IrokleService {
             .collect::<Vec<_>>();
         let peer_sync_started = Instant::now();
         if let Err(error) = self.sync_topics(topic_ids.clone(), sync_peers).await {
-            return IrokleEvent::Error {
+            return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -453,7 +453,7 @@ impl IrokleService {
 
         let flush_started = Instant::now();
         if let Err(error) = self.flush_database() {
-            return IrokleEvent::Error {
+            return DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             };
@@ -473,14 +473,14 @@ impl IrokleService {
                     total_ms = duration_ms(sync_started.elapsed()),
                     "Document sync batch summary"
                 );
-                IrokleEvent::DocumentsReconciled {
+                DocumentSyncNetEvent::DocumentsReconciled {
                     applied: result.applied(),
                     targets: result.targets,
                     metadata_create_events: result.metadata_create_events,
                     metadata_graph_tombstones: result.metadata_graph_tombstones,
                 }
             }
-            Err(error) => IrokleEvent::Error {
+            Err(error) => DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
             },
@@ -546,7 +546,7 @@ impl IrokleService {
                 }
             };
             let target = event.target().clone();
-            let topic_id = target.irokle_topic_id();
+            let topic_id = target.sync_topic_id();
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -572,7 +572,7 @@ impl IrokleService {
             fallback,
             existing = document_count - fast_path - fallback,
             total_ms = duration_ms(publish_started.elapsed()),
-            "Irokle publish batch breakdown"
+            "Document sync publish batch breakdown"
         );
         Ok(published)
     }
@@ -642,7 +642,10 @@ impl IrokleService {
         for (topic_id, clock) in published {
             let cursor_key = topic_cursor_key(topic_id);
             let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(IROKLE_APPLIED_OPS_KEYSPACE.to_string(), cursor_key.clone())
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    cursor_key.clone(),
+                )
                 .await?
             {
                 Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
@@ -653,7 +656,11 @@ impl IrokleService {
                 postcard::to_allocvec(&cursor)
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             );
-            writes.push((IROKLE_APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value));
+            writes.push((
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                cursor_key,
+                value,
+            ));
         }
         self.storage_batch_write(writes).await
     }
@@ -669,7 +676,7 @@ impl IrokleService {
         target: &DocumentSyncTarget,
         peers: &BTreeSet<PeerId>,
     ) -> Result<irokle_crate::TopicId> {
-        let topic_id = target.irokle_topic_id();
+        let topic_id = target.sync_topic_id();
         let mut genesis_error = None;
         for _ in 0..2 {
             if let Some(state) = self
@@ -680,7 +687,7 @@ impl IrokleService {
             {
                 if state.event_type_id != DocumentSyncEvent::TYPE_ID {
                     return Err(NetError::Bootstrap(format!(
-                        "Irokle topic {topic_id} has event type {}, expected {}",
+                        "Document sync topic {topic_id} has event type {}, expected {}",
                         state.event_type_id,
                         DocumentSyncEvent::TYPE_ID
                     )));
@@ -728,7 +735,7 @@ impl IrokleService {
         Err(NetError::Bootstrap(
             genesis_error
                 .map(|error| error.to_string())
-                .unwrap_or_else(|| format!("failed to ensure Irokle topic {topic_id}")),
+                .unwrap_or_else(|| format!("failed to ensure document sync topic {topic_id}")),
         ))
     }
 
@@ -796,7 +803,7 @@ impl IrokleService {
                         short_display_id(peer),
                         duration_ms(elapsed)
                     ));
-                    debug!(%peer, context = %context, "Synced Irokle document peer")
+                    debug!(%peer, context = %context, "Synced document peer")
                 }
                 Ok((peer, Err(error), elapsed)) => {
                     per_peer.push(format!(
@@ -804,13 +811,13 @@ impl IrokleService {
                         short_display_id(peer),
                         duration_ms(elapsed)
                     ));
-                    warn!(%peer, context = %context, error = %error, "Irokle peer sync failed; deferring to resync scheduler");
+                    warn!(%peer, context = %context, error = %error, "Document sync peer sync failed; deferring to resync scheduler");
                     if first_error.is_none() {
                         first_error = Some(error.to_string());
                     }
                 }
                 Err(error) => {
-                    warn!(context = %context, error = %error, "Irokle peer sync task failed");
+                    warn!(context = %context, error = %error, "Document sync peer sync task failed");
                     if first_error.is_none() {
                         first_error = Some(error.to_string());
                     }
@@ -825,7 +832,7 @@ impl IrokleService {
             failed = attempted - successes,
             total_ms = duration_ms(fanout_started.elapsed()),
             per_peer = %per_peer.join(","),
-            "Irokle peer fan-out summary"
+            "Document sync peer fan-out summary"
         );
         if successes != attempted {
             let detail = first_error.unwrap_or_else(|| "unknown sync error".to_string());
@@ -842,16 +849,25 @@ impl IrokleService {
         peers: BTreeSet<PeerId>,
     ) -> Result<()> {
         let net = self.net.clone();
-        Self::fan_out_peer_syncs(peers, format!("Irokle topic {topic_id}"), move |peer| {
-            let net = net.clone();
-            async move {
-                match timeout(IROKLE_PEER_SYNC_TIMEOUT, net.sync_peer_now(peer, topic_id)).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
-                    Err(_) => Err(NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT)),
+        Self::fan_out_peer_syncs(
+            peers,
+            format!("document sync topic {topic_id}"),
+            move |peer| {
+                let net = net.clone();
+                async move {
+                    match timeout(
+                        DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                        net.sync_peer_now(peer, topic_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
+                        Err(_) => Err(NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT)),
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -863,7 +879,7 @@ impl IrokleService {
         if topic_ids.is_empty() || peers.is_empty() {
             return Ok(());
         }
-        for chunk in topic_ids.chunks(IROKLE_BATCH_SYNC_TOPIC_LIMIT) {
+        for chunk in topic_ids.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
             self.sync_topic_batch(chunk, peers.clone()).await?;
         }
         Ok(())
@@ -881,7 +897,7 @@ impl IrokleService {
         let topic_ids = topic_ids.to_vec();
         Self::fan_out_peer_syncs(
             peers,
-            format!("Irokle topic batch of {} topics", topic_ids.len()),
+            format!("document sync topic batch of {} topics", topic_ids.len()),
             move |peer| {
                 let service = service.clone();
                 let topic_ids = topic_ids.clone();
@@ -916,11 +932,11 @@ impl IrokleService {
 
         let r1_io_started = Instant::now();
         let responses = timeout(
-            IROKLE_PEER_SYNC_TIMEOUT,
+            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
             self.net.sync_with(peer_addr.clone(), &initial_messages),
         )
         .await
-        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let r1_io = r1_io_started.elapsed();
         let r1_process_started = Instant::now();
@@ -941,7 +957,7 @@ impl IrokleService {
         let r1_process = r1_process_started.elapsed();
         if responded_topics.len() != known_topics.len() {
             return Err(NetError::Bootstrap(format!(
-                "peer {peer} responded for {}/{} Irokle batch topics",
+                "peer {peer} responded for {}/{} document sync batch topics",
                 responded_topics.len(),
                 known_topics.len()
             )));
@@ -965,11 +981,11 @@ impl IrokleService {
         let r2_message_count = sync_messages.len();
         let r2_io_started = Instant::now();
         let responses = timeout(
-            IROKLE_PEER_SYNC_TIMEOUT,
+            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
             self.net.sync_with(peer_addr.clone(), &sync_messages),
         )
         .await
-        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let r2_io = r2_io_started.elapsed();
         let r2_process_started = Instant::now();
@@ -985,18 +1001,18 @@ impl IrokleService {
         let fu_io_started = Instant::now();
         if !followup.is_empty() {
             let responses = timeout(
-                IROKLE_PEER_SYNC_TIMEOUT,
+                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
                 self.net.sync_with(peer_addr, &followup),
             )
             .await
-            .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
                     other => {
                         return Err(NetError::Bootstrap(format!(
-                            "unexpected Irokle batch ack response from {peer}: {other:?}"
+                            "unexpected document sync batch ack response from {peer}: {other:?}"
                         )));
                     }
                 }
@@ -1027,7 +1043,7 @@ impl IrokleService {
             match self.bootstrap_topic_from_peer(topic_id, *peer).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    warn!(%peer, %topic_id, error = %error, "Irokle document bootstrap attempt failed");
+                    warn!(%peer, %topic_id, error = %error, "Document sync bootstrap attempt failed");
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -1036,7 +1052,7 @@ impl IrokleService {
         }
         Err(first_error.unwrap_or_else(|| {
             NetError::Bootstrap(format!(
-                "no peers available to bootstrap Irokle topic {topic_id}"
+                "no peers available to bootstrap document sync topic {topic_id}"
             ))
         }))
     }
@@ -1048,14 +1064,14 @@ impl IrokleService {
     ) -> Result<()> {
         let peer_addr = peer_id_to_endpoint_addr(peer)?;
         let responses = timeout(
-            IROKLE_PEER_SYNC_TIMEOUT,
+            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
             self.net.sync_with(
                 peer_addr.clone(),
                 &[SyncMessage::Open(self.node.sync_open(topic_id))],
             ),
         )
         .await
-        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let summary = responses
             .into_iter()
@@ -1065,7 +1081,7 @@ impl IrokleService {
             })
             .ok_or_else(|| {
                 NetError::Bootstrap(format!(
-                    "peer {peer} did not return an Irokle summary for topic {topic_id}"
+                    "peer {peer} did not return a document sync summary for topic {topic_id}"
                 ))
             })?;
         if remote_summary_is_empty(&summary) {
@@ -1073,7 +1089,7 @@ impl IrokleService {
         }
         if summary.event_type_id.as_deref() != Some(DocumentSyncEvent::TYPE_ID) {
             return Err(NetError::Bootstrap(format!(
-                "peer {peer} advertised Irokle topic {topic_id} with unexpected event type {:?}",
+                "peer {peer} advertised document sync topic {topic_id} with unexpected event type {:?}",
                 summary.event_type_id
             )));
         }
@@ -1085,7 +1101,7 @@ impl IrokleService {
             actor_range_hints: Vec::new(),
         };
         let responses = timeout(
-            IROKLE_PEER_SYNC_TIMEOUT,
+            DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
             self.net.sync_with(
                 peer_addr.clone(),
                 &[
@@ -1095,7 +1111,7 @@ impl IrokleService {
             ),
         )
         .await
-        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
 
         let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
@@ -1113,7 +1129,7 @@ impl IrokleService {
                 }
                 other => {
                     return Err(NetError::Bootstrap(format!(
-                        "unexpected Irokle bootstrap response: {other:?}"
+                        "unexpected document sync bootstrap response: {other:?}"
                     )));
                 }
             }
@@ -1123,18 +1139,18 @@ impl IrokleService {
         }
         if followup.len() > 1 {
             let responses = timeout(
-                IROKLE_PEER_SYNC_TIMEOUT,
+                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
                 self.net.sync_with(peer_addr, &followup),
             )
             .await
-            .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
                     other => {
                         return Err(NetError::Bootstrap(format!(
-                            "unexpected Irokle bootstrap ack response: {other:?}"
+                            "unexpected document sync bootstrap ack response: {other:?}"
                         )));
                     }
                 }
@@ -1187,7 +1203,10 @@ impl IrokleService {
             }
             let cursor_key = topic_cursor_key(topic_id);
             let mut cursor: irokle_crate::ActorClock = match self
-                .storage_read(IROKLE_APPLIED_OPS_KEYSPACE.to_string(), cursor_key.clone())
+                .storage_read(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    cursor_key.clone(),
+                )
                 .await?
             {
                 Some(value) => postcard::from_bytes(value.as_ref()).unwrap_or_default(),
@@ -1208,12 +1227,12 @@ impl IrokleService {
             cursor.merge(&topic_clock);
             let mut deferred_creates = false;
             for event in events {
-                let target_topic_id = event.target().irokle_topic_id();
+                let target_topic_id = event.target().sync_topic_id();
                 if target_topic_id != topic_id {
                     warn!(
                         %topic_id,
                         %target_topic_id,
-                        "Skipping Irokle document event whose target does not match its topic"
+                        "Skipping document sync event whose target does not match its topic"
                     );
                     continue;
                 }
@@ -1317,13 +1336,17 @@ impl IrokleService {
             );
             if deferred_creates {
                 deferred_cursor_writes.push((
-                    IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
                     cursor_key,
                     value,
                 ));
             } else {
-                self.storage_write(IROKLE_APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value)
-                    .await?;
+                self.storage_write(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    cursor_key,
+                    value,
+                )
+                .await?;
             }
         }
         self.apply_metadata_create_batch(
@@ -1668,7 +1691,7 @@ impl IrokleService {
             Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
             other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle write: {other:?}"
+                "unexpected storage event while applying document sync write: {other:?}"
             ))),
         }
     }
@@ -1690,7 +1713,7 @@ impl IrokleService {
             Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
             other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle delete: {other:?}"
+                "unexpected storage event while applying document sync delete: {other:?}"
             ))),
         }
     }
@@ -3128,7 +3151,7 @@ async fn storage_read_from(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
-            "unexpected storage event while applying irokle read: {other:?}"
+            "unexpected storage event while applying document sync read: {other:?}"
         ))),
     }
 }
@@ -3147,7 +3170,7 @@ async fn storage_batch_write_to(
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
-            "unexpected storage event while applying irokle batch write: {other:?}"
+            "unexpected storage event while applying document sync batch write: {other:?}"
         ))),
     }
 }
@@ -3167,7 +3190,7 @@ async fn storage_batch_delete_and_write_transactionally(
         }
         other => {
             return Err(NetError::Dht(format!(
-                "unexpected storage event while starting irokle apply transaction: {other:?}"
+                "unexpected storage event while starting document sync apply transaction: {other:?}"
             )));
         }
     };
@@ -3204,7 +3227,7 @@ async fn storage_batch_delete_and_write_in_transaction(
             }
             other => {
                 return Err(NetError::Dht(format!(
-                    "unexpected storage event while applying irokle transactional batch delete: {other:?}"
+                    "unexpected storage event while applying document sync transactional batch delete: {other:?}"
                 )));
             }
         }
@@ -3223,7 +3246,7 @@ async fn storage_batch_delete_and_write_in_transaction(
         }
         other => {
             return Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle transactional batch write: {other:?}"
+                "unexpected storage event while applying document sync transactional batch write: {other:?}"
             )));
         }
     }
@@ -3235,7 +3258,7 @@ async fn storage_batch_delete_and_write_in_transaction(
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
-            "unexpected storage event while committing irokle apply transaction: {other:?}"
+            "unexpected storage event while committing document sync apply transaction: {other:?}"
         ))),
     }
 }
@@ -3254,7 +3277,7 @@ async fn storage_batch_delete_to(
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
-            "unexpected storage event while applying irokle batch delete: {other:?}"
+            "unexpected storage event while applying document sync batch delete: {other:?}"
         ))),
     }
 }
@@ -3303,14 +3326,14 @@ async fn read_inbound_sync_messages(
     let mut frame_index = 0usize;
     while let Some(frame) = read_next_inbound_sync_frame(recv, &mut bytes_read).await? {
         frame_index = frame_index.saturating_add(1);
-        if messages.len() >= IROKLE_INBOUND_SYNC_MESSAGE_LIMIT {
+        if messages.len() >= DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT {
             return Err(NetError::Stream(format!(
-                "Irokle sync stream exceeded {IROKLE_INBOUND_SYNC_MESSAGE_LIMIT} messages"
+                "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT} messages"
             )));
         }
         let message = decode_sync_message(&frame).map_err(|error| {
             NetError::Stream(format!(
-                "invalid Irokle sync message frame {frame_index} ({} bytes): {error}",
+                "invalid document sync message frame {frame_index} ({} bytes): {error}",
                 frame.len()
             ))
         })?;
@@ -3336,27 +3359,27 @@ async fn read_next_inbound_sync_frame(
     while read < len_buf.len() {
         let Some(n) = read_some_inbound_sync(recv, &mut len_buf[read..]).await? else {
             return Err(NetError::Stream(
-                "incomplete Irokle sync frame length".to_string(),
+                "incomplete document sync frame length".to_string(),
             ));
         };
         if n == 0 {
             return Err(NetError::Stream(
-                "incomplete Irokle sync frame length".to_string(),
+                "incomplete document sync frame length".to_string(),
             ));
         }
         read += n;
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > IROKLE_SYNC_FRAME_LEN_LIMIT {
+    if len > DOCUMENT_SYNC_FRAME_LEN_LIMIT {
         return Err(NetError::Stream(
-            "Irokle sync frame exceeds maximum length".to_string(),
+            "document sync frame exceeds maximum length".to_string(),
         ));
     }
     *bytes_read = bytes_read.saturating_add(4).saturating_add(len);
-    if *bytes_read > IROKLE_INBOUND_SYNC_STREAM_BYTES {
+    if *bytes_read > DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES {
         return Err(NetError::Stream(format!(
-            "Irokle sync stream exceeded {IROKLE_INBOUND_SYNC_STREAM_BYTES} bytes"
+            "document sync stream exceeded {DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES} bytes"
         )));
     }
 
@@ -3365,12 +3388,12 @@ async fn read_next_inbound_sync_frame(
     while payload_read < payload.len() {
         let Some(n) = read_some_inbound_sync(recv, &mut payload[payload_read..]).await? else {
             return Err(NetError::Stream(
-                "incomplete Irokle sync frame payload".to_string(),
+                "incomplete document sync frame payload".to_string(),
             ));
         };
         if n == 0 {
             return Err(NetError::Stream(
-                "incomplete Irokle sync frame payload".to_string(),
+                "incomplete document sync frame payload".to_string(),
             ));
         }
         payload_read += n;
@@ -3382,9 +3405,9 @@ async fn read_some_inbound_sync(
     recv: &mut iroh::endpoint::RecvStream,
     buf: &mut [u8],
 ) -> Result<Option<usize>> {
-    timeout(IROKLE_PEER_SYNC_TIMEOUT, recv.read(buf))
+    timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, recv.read(buf))
         .await
-        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
         .map_err(|error| NetError::Stream(error.to_string()))
 }
 
@@ -3396,9 +3419,9 @@ async fn write_inbound_sync_messages(
         let payload =
             encode_sync_message(message).map_err(|error| NetError::Stream(error.to_string()))?;
         let frame = encode_frame(&payload).map_err(|error| NetError::Stream(error.to_string()))?;
-        timeout(IROKLE_PEER_SYNC_TIMEOUT, send.write_all(&frame))
+        timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT, send.write_all(&frame))
             .await
-            .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
             .map_err(|error| NetError::Stream(error.to_string()))?;
     }
     send.finish()
@@ -3429,7 +3452,7 @@ fn process_batch_summary_responses(
                     warn!(
                         %peer,
                         topic_id = %remote.topic_id,
-                        "Skipping Irokle batch topic: peer returned mismatched fingerprint"
+                        "Skipping document sync batch topic: peer returned mismatched fingerprint"
                     );
                     failed_topics.insert(remote.topic_id);
                 }
@@ -3443,7 +3466,7 @@ fn process_batch_summary_responses(
                         %peer,
                         topic_id = %summary.topic_id,
                         event_type_id,
-                        "Skipping Irokle batch topic: peer advertised unexpected event type"
+                        "Skipping document sync batch topic: peer advertised unexpected event type"
                     );
                     failed_topics.insert(summary.topic_id);
                     continue;
@@ -3455,7 +3478,7 @@ fn process_batch_summary_responses(
                             %peer,
                             topic_id = %summary.topic_id,
                             error = %error,
-                            "Skipping Irokle batch topic: sync negotiation failed"
+                            "Skipping document sync batch topic: sync negotiation failed"
                         );
                         failed_topics.insert(summary.topic_id);
                         continue;
@@ -3482,7 +3505,7 @@ fn process_batch_summary_responses(
             }
             other => {
                 return Err(NetError::Bootstrap(format!(
-                    "unexpected Irokle batch sync response from {peer}: {other:?}"
+                    "unexpected document sync batch response from {peer}: {other:?}"
                 )));
             }
         }
@@ -3517,7 +3540,7 @@ fn process_batch_data_responses(
                             %peer,
                             topic_id = %topic_id,
                             error = %error,
-                            "Skipping Irokle batch topic: receiving sync data failed"
+                            "Skipping document sync batch topic: receiving sync data failed"
                         );
                         failed_topics.insert(topic_id);
                         continue;
@@ -3529,7 +3552,7 @@ fn process_batch_data_responses(
             }
             other => {
                 return Err(NetError::Bootstrap(format!(
-                    "unexpected Irokle batch data response from {peer}: {other:?}"
+                    "unexpected document sync batch data response from {peer}: {other:?}"
                 )));
             }
         }
@@ -3540,7 +3563,7 @@ fn process_batch_data_responses(
                 %peer,
                 topic_id = %ack.topic_id,
                 error = %error,
-                "Skipping Irokle batch topic: applying sync ack failed"
+                "Skipping document sync batch topic: applying sync ack failed"
             );
             failed_topics.insert(ack.topic_id);
         }
@@ -3573,7 +3596,7 @@ fn log_peer_batch_summary(
         fu_io_ms = duration_ms(fu_io),
         r2_messages,
         total_ms = duration_ms(total),
-        "Irokle peer batch sync round breakdown"
+        "Document sync peer batch sync round breakdown"
     );
 }
 
@@ -3587,10 +3610,10 @@ fn finish_batch_sync(
             %peer,
             failed = failed_topics.len(),
             total = known_topics.len(),
-            "Irokle batch sync failed for one or more topics"
+            "Document sync batch sync failed for one or more topics"
         );
         return Err(NetError::Bootstrap(format!(
-            "peer {peer}: {}/{} Irokle batch topics failed to sync",
+            "peer {peer}: {}/{} document sync batch topics failed to sync",
             failed_topics.len(),
             known_topics.len()
         )));
@@ -3631,11 +3654,11 @@ mod tests {
     use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+        METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
+        USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
@@ -3652,9 +3675,9 @@ mod tests {
     use std::{env, process::Command};
     use tempfile::TempDir;
 
-    const IROKLE_RESTART_CHILD_PATH_ENV: &str = "ARUNA_NET_IROKLE_RESTART_CHILD_PATH";
-    const IROKLE_RESTART_CHILD_TEST: &str =
-        "irokle::tests::buffered_irokle_publish_restart_child_process";
+    const DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV: &str = "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
+    const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
+        "document_sync::tests::buffered_document_sync_publish_restart_child_process";
 
     fn peer(seed: u8) -> PeerId {
         node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
@@ -3664,7 +3687,7 @@ mod tests {
         DocumentSyncTarget::RealmConfig {
             realm_id: RealmId::from_bytes([seed; 32]),
         }
-        .irokle_topic_id()
+        .sync_topic_id()
     }
 
     fn node(seed: u8) -> NodeId {
@@ -3738,7 +3761,7 @@ mod tests {
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
             .relay_mode(iroh::RelayMode::Disabled)
-            .alpns(vec![Alpn::Irokle.as_bytes().to_vec()])
+            .alpns(vec![Alpn::DocumentSync.as_bytes().to_vec()])
             .bind_addr(
                 "127.0.0.1:0"
                     .parse::<std::net::SocketAddr>()
@@ -3754,38 +3777,38 @@ mod tests {
         test_endpoint(91).await
     }
 
-    async fn open_restart_service(root: &Path, storage_name: &str) -> IrokleService {
-        IrokleService::open_with_persist_policy(
+    async fn open_restart_service(root: &Path, storage_name: &str) -> DocumentSyncService {
+        DocumentSyncService::open_with_persist_policy(
             restart_endpoint().await,
             storage_at(&root.join(storage_name)),
-            root.join("irokle"),
+            root.join("document-sync"),
             &[],
-            vec![Alpn::Irokle.as_bytes().to_vec()],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
         )
-        .expect("Irokle service opens")
+        .expect("document sync service opens")
     }
 
-    async fn open_test_service(root: &Path, storage_name: &str, seed: u8) -> IrokleService {
-        IrokleService::open_with_persist_policy(
+    async fn open_test_service(root: &Path, storage_name: &str, seed: u8) -> DocumentSyncService {
+        DocumentSyncService::open_with_persist_policy(
             test_endpoint(seed).await,
             storage_at(&root.join(storage_name)),
-            root.join(format!("irokle-{seed}")),
+            root.join(format!("document-sync-{seed}")),
             &[],
-            vec![Alpn::Irokle.as_bytes().to_vec()],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
         )
-        .expect("Irokle service opens")
+        .expect("document sync service opens")
     }
 
-    fn run_irokle_restart_child(root: &Path) {
+    fn run_document_sync_restart_child(root: &Path) {
         let status = Command::new(env::current_exe().expect("test binary path"))
-            .arg(IROKLE_RESTART_CHILD_TEST)
+            .arg(DOCUMENT_SYNC_RESTART_CHILD_TEST)
             .arg("--exact")
             .arg("--nocapture")
-            .env(IROKLE_RESTART_CHILD_PATH_ENV, root)
+            .env(DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV, root)
             .status()
             .expect("restart child process should run");
 
@@ -6202,8 +6225,8 @@ mod tests {
     }
 
     #[test]
-    fn buffered_irokle_publish_restart_child_process() {
-        let Ok(root) = env::var(IROKLE_RESTART_CHILD_PATH_ENV) else {
+    fn buffered_document_sync_publish_restart_child_process() {
+        let Ok(root) = env::var(DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV) else {
             return;
         };
         let root = PathBuf::from(root);
@@ -6226,7 +6249,7 @@ mod tests {
 
             assert_eq!(
                 event,
-                IrokleEvent::DocumentsPublished {
+                DocumentSyncNetEvent::DocumentsPublished {
                     targets: vec![target]
                 }
             );
@@ -6253,17 +6276,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_irokle_publish_survives_buffered_process_restart() {
+    async fn acknowledged_document_sync_publish_survives_buffered_process_restart() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path();
         let target = restart_target();
 
-        run_irokle_restart_child(root);
+        run_document_sync_restart_child(root);
 
         let service = open_restart_service(root, "parent-storage").await;
         let topic = service
             .node()
-            .open_topic::<DocumentSyncEvent>(target.irokle_topic_id())
+            .open_topic::<DocumentSyncEvent>(target.sync_topic_id())
             .expect("published topic reopens after restart");
         let history = topic
             .history(HistoryOrder::OldestFirst)
@@ -6289,7 +6312,7 @@ mod tests {
         let failed_peer = peer(2);
         let peers = BTreeSet::from([ok_peer, failed_peer]);
 
-        let error = IrokleService::fan_out_peer_syncs(
+        let error = DocumentSyncService::fan_out_peer_syncs(
             peers,
             "test document sync".to_string(),
             move |peer| async move {
@@ -6321,7 +6344,7 @@ mod tests {
         let NetError::Bootstrap(message) = error else {
             panic!("unexpected error: {error:?}");
         };
-        assert!(message.contains("1/2 Irokle batch topics failed"));
+        assert!(message.contains("1/2 document sync batch topics failed"));
     }
 
     #[test]

@@ -2,15 +2,15 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
 
 const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-rendezvous-v2";
 pub const DEFAULT_DOCUMENT_PEER_COUNT: usize = 3;
@@ -38,7 +38,7 @@ pub fn select_sync_peers(
         return Vec::new();
     }
 
-    let topic_id = target.irokle_topic_id().to_string();
+    let topic_id = target.sync_topic_id().to_string();
     let mut candidates = candidates
         .iter()
         .copied()
@@ -86,7 +86,7 @@ pub fn placement_prefix(realm_id: RealmId) -> Key {
 
 pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
     let mut bytes = realm_id.as_bytes().to_vec();
-    bytes.extend_from_slice(target.irokle_topic_id().to_string().as_bytes());
+    bytes.extend_from_slice(target.sync_topic_id().to_string().as_bytes());
     ByteView::from(bytes)
 }
 
@@ -96,11 +96,10 @@ pub fn new_placement(
     authoritative_node_id: NodeId,
     desired_peer_count: usize,
     mut selected_peers: Vec<NodeId>,
-) -> PendingTopicPlacement {
+) -> PendingDocumentPlacement {
     selected_peers.retain(|node_id| *node_id != authoritative_node_id);
-    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    selected_peers.dedup();
-    PendingTopicPlacement {
+    sort_node_ids(&mut selected_peers);
+    PendingDocumentPlacement {
         realm_id,
         target,
         desired_peer_count,
@@ -110,7 +109,7 @@ pub fn new_placement(
     }
 }
 
-pub fn missing_peer_count(record: &PendingTopicPlacement) -> usize {
+pub fn missing_peer_count(record: &PendingDocumentPlacement) -> usize {
     let mut selected_peers = record.selected_peers.clone();
     selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
     sort_node_ids(&mut selected_peers);
@@ -139,7 +138,9 @@ pub fn schedule_document_sync_effect(
     })
 }
 
-pub fn write_placement_effect(record: &PendingTopicPlacement) -> Result<Effect, postcard::Error> {
+pub fn write_placement_effect(
+    record: &PendingDocumentPlacement,
+) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
         key: placement_key(record.realm_id, &record.target),
@@ -166,21 +167,15 @@ pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId)
     })
 }
 
-pub fn decode_placement(value: &[u8]) -> Result<PendingTopicPlacement, postcard::Error> {
+pub fn decode_placement(value: &[u8]) -> Result<PendingDocumentPlacement, postcard::Error> {
     postcard::from_bytes(value)
 }
 
-pub fn decode_placement_with_authoritative_fallback(
-    value: &[u8],
-    authoritative_node_id: NodeId,
-) -> Result<PendingTopicPlacement, postcard::Error> {
-    match decode_placement(value) {
-        Ok(record) => Ok(record),
-        Err(error) => match postcard::from_bytes::<LegacyPendingTopicPlacement>(value) {
-            Ok(record) => Ok(record.into_pending(authoritative_node_id)),
-            Err(_) => Err(error),
-        },
-    }
+pub fn realm_nodes_from_config_bytes(value: &[u8]) -> Result<Vec<NodeId>, ConversionError> {
+    let document = RealmConfigDocument::from_bytes(value)?;
+    let mut nodes = document.node_ids()?;
+    sort_node_ids(&mut nodes);
+    Ok(nodes)
 }
 
 fn selector_score(topic_id: &[u8], candidate_node_id: NodeId) -> [u8; 32] {
@@ -198,31 +193,6 @@ pub fn sort_node_ids(nodes: &mut Vec<NodeId>) {
 
 fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
     left.as_bytes().cmp(right.as_bytes())
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct LegacyPendingTopicPlacement {
-    realm_id: RealmId,
-    target: DocumentSyncTarget,
-    desired_peer_count: usize,
-    selected_peers: Vec<NodeId>,
-    updated_at: u64,
-}
-
-impl LegacyPendingTopicPlacement {
-    fn into_pending(self, authoritative_node_id: NodeId) -> PendingTopicPlacement {
-        let mut selected_peers = self.selected_peers;
-        selected_peers.retain(|node_id| *node_id != authoritative_node_id);
-        sort_node_ids(&mut selected_peers);
-        PendingTopicPlacement {
-            realm_id: self.realm_id,
-            target: self.target,
-            desired_peer_count: self.desired_peer_count,
-            selected_peers,
-            updated_at: self.updated_at,
-            authoritative_node_id,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -404,27 +374,5 @@ mod tests {
 
         assert_eq!(placement.selected_peers, vec![node(9), node(8)]);
         assert_eq!(missing_peer_count(&placement), 0);
-    }
-
-    #[test]
-    fn legacy_pending_placement_decodes_with_local_as_authoritative() {
-        let realm_id = RealmId::from_bytes([7u8; 32]);
-        let authoritative = node(1);
-        let legacy = LegacyPendingTopicPlacement {
-            realm_id,
-            target: target(),
-            desired_peer_count: 3,
-            selected_peers: vec![node(2)],
-            updated_at: 42,
-        };
-        let bytes = postcard::to_allocvec(&legacy).expect("legacy placement serializes");
-
-        let placement = decode_placement_with_authoritative_fallback(&bytes, authoritative)
-            .expect("legacy placement decodes");
-
-        assert_eq!(placement.authoritative_node_id, authoritative);
-        assert_eq!(placement.selected_peers, vec![node(2)]);
-        assert_eq!(placement.updated_at, 42);
-        assert_eq!(missing_peer_count(&placement), 1);
     }
 }

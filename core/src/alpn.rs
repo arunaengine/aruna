@@ -5,8 +5,8 @@ pub enum Alpn {
     Dht,
     /// BAO content streaming protocol
     Bao,
-    /// Irokle durable topic sync protocol
-    Irokle,
+    /// Durable document sync protocol
+    DocumentSync,
     /// Metadata bootstrap protocol
     Metadata,
 }
@@ -16,7 +16,7 @@ impl Alpn {
         match self {
             Alpn::Dht => b"aruna/dht/1",
             Alpn::Bao => b"aruna/bao/1",
-            Alpn::Irokle => irokle::net::IROKLE_SYNC_ALPN,
+            Alpn::DocumentSync => irokle::net::IROKLE_SYNC_ALPN,
             Alpn::Metadata => b"aruna/metadata/1",
         }
     }
@@ -25,7 +25,7 @@ impl Alpn {
         match bytes {
             b"aruna/dht/1" => Some(Alpn::Dht),
             b"aruna/bao/1" => Some(Alpn::Bao),
-            irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::Irokle),
+            irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::DocumentSync),
             b"aruna/metadata/1" => Some(Alpn::Metadata),
             _ => None,
         }
@@ -37,9 +37,9 @@ impl std::fmt::Display for Alpn {
         match self {
             Alpn::Dht => write!(f, "aruna/dht/1"),
             Alpn::Bao => write!(f, "aruna/bao/1"),
-            Alpn::Irokle => match std::str::from_utf8(irokle::net::IROKLE_SYNC_ALPN) {
+            Alpn::DocumentSync => match std::str::from_utf8(irokle::net::IROKLE_SYNC_ALPN) {
                 Ok(value) => write!(f, "{value}"),
-                Err(_) => write!(f, "<invalid-irokle-alpn>"),
+                Err(_) => write!(f, "<invalid-document-sync-alpn>"),
             },
             Alpn::Metadata => write!(f, "aruna/metadata/1"),
         }
@@ -55,8 +55,8 @@ mod tests {
         assert_eq!(Alpn::from_bytes(Alpn::Dht.as_bytes()), Some(Alpn::Dht));
         assert_eq!(Alpn::from_bytes(Alpn::Bao.as_bytes()), Some(Alpn::Bao));
         assert_eq!(
-            Alpn::from_bytes(Alpn::Irokle.as_bytes()),
-            Some(Alpn::Irokle)
+            Alpn::from_bytes(Alpn::DocumentSync.as_bytes()),
+            Some(Alpn::DocumentSync)
         );
         assert_eq!(
             Alpn::from_bytes(Alpn::Metadata.as_bytes()),
