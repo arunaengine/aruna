@@ -2352,11 +2352,37 @@ fn overlay_realm_config_reducer_materialization(
         }
         config.ensure_node(node_id, kind);
     }
+
+    let materialized_providers = reducer_state.materialized_realm_config_oidc_providers();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(provider_id) = realm_config_oidc_provider_from_path(path) {
+            remove_realm_config_oidc_provider(config, provider_id);
+        }
+    }
+
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(provider_id) = realm_config_oidc_provider_from_path(path) else {
+            continue;
+        };
+        remove_realm_config_oidc_provider(config, provider_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(provider) = materialized_providers.get(provider_id) {
+            config.oidc_providers.push(provider.clone());
+        }
+    }
 }
 
 fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
     let node_id = node_id.to_string();
     config.nodes.retain(|node| node.node_id != node_id);
+}
+
+fn remove_realm_config_oidc_provider(config: &mut RealmConfigDocument, provider_id: &str) {
+    config
+        .oidc_providers
+        .retain(|provider| provider.id != provider_id);
 }
 
 fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
@@ -2396,6 +2422,10 @@ fn realm_role_from_path(path: &str) -> Option<RoleId> {
 fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.nodes.")?;
     NodeId::from_str(node_id).ok()
+}
+
+fn realm_config_oidc_provider_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("realm_config.oidc_providers.")
 }
 
 fn reducer_role_definition(value: &str, role_id: RoleId) -> Option<AdminDocumentRoleDefinition> {
@@ -2925,9 +2955,12 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     if !matches!(
         &event.op,
         AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+            | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
+            | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure updates".to_string(),
+            "realm config admin operation sync only supports node ensure and OIDC provider updates"
+                .to_string(),
         ));
     }
 
@@ -4203,6 +4236,27 @@ mod tests {
             .collect()
     }
 
+    fn realm_config_oidc_providers(
+        config: &RealmConfigDocument,
+    ) -> BTreeMap<String, OidcProviderConfig> {
+        config
+            .oidc_providers
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.clone()))
+            .collect()
+    }
+
+    fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: format!("https://issuer.example/{issuer_suffix}"),
+            audience: "aruna".to_string(),
+            discovery_url: format!(
+                "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
+            ),
+        }
+    }
+
     async fn read_registry_record(
         storage: &StorageHandle,
         key_space: &str,
@@ -4374,6 +4428,292 @@ mod tests {
                 (first_node.to_string(), RealmNodeKind::Management),
                 (second_node.to_string(), RealmNodeKind::Server),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_config_oidc_provider_admin_ops_merge_disjoint_updates() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([44; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(330, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let legacy = test_oidc_provider("legacy", "legacy");
+        let removed = test_oidc_provider("removed", "removed");
+        let first = test_oidc_provider("default", "one");
+        let second = test_oidc_provider("partner", "two");
+        let seed_node = node(16);
+        let mut seed_config =
+            RealmConfigDocument::new(realm_id, vec![legacy.clone(), removed.clone()], 5);
+        seed_config.discovery = RealmDiscoveryConfig::Static {
+            endpoints: vec![StaticRealmEndpoint {
+                node_id: seed_node.to_string(),
+                endpoint_addr: "https://seed.example:443".to_string(),
+            }],
+        };
+        seed_config.ensure_node(seed_node, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        for (seq, op) in [
+            (
+                1,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    provider: first.clone(),
+                },
+            ),
+            (
+                2,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    provider: second.clone(),
+                },
+            ),
+            (
+                3,
+                AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+                    provider_id: removed.id.clone(),
+                },
+            ),
+        ] {
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_330 + seq, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("realm config OIDC provider op applies");
+        }
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(
+            config.metadata_replication,
+            seed_config.metadata_replication
+        );
+        assert_eq!(config.discovery, seed_config.discovery);
+        assert_eq!(
+            realm_config_nodes(&config),
+            realm_config_nodes(&seed_config)
+        );
+        assert_eq!(
+            realm_config_oidc_providers(&config),
+            BTreeMap::from([
+                ("default".to_string(), first),
+                ("legacy".to_string(), legacy),
+                ("partner".to_string(), second),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_realm_config_oidc_provider_conflict_withholds_provider() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([45; 32]);
+        let actor_a = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(340, 1), realm_id),
+            realm_id,
+        );
+        let actor_b = test_actor(
+            9,
+            UserId::local(Ulid::from_parts(341, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let untouched = test_oidc_provider("untouched", "untouched");
+        let first = test_oidc_provider("default", "one");
+        let second = test_oidc_provider("default", "two");
+        let seed_config = RealmConfigDocument::new(
+            realm_id,
+            vec![test_oidc_provider("default", "seed"), untouched.clone()],
+            3,
+        );
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor_a)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_340, 1),
+                target.clone(),
+                &actor_a,
+                1,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider: first },
+            ),
+        )
+        .await
+        .expect("first realm config OIDC provider upsert applies");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target,
+            test_admin_event(
+                Ulid::from_parts(1_341, 1),
+                target.clone(),
+                &actor_b,
+                1,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider: second },
+            ),
+        )
+        .await
+        .expect("conflicting realm config OIDC provider upsert applies");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        let providers = realm_config_oidc_providers(&config);
+        assert!(!providers.contains_key("default"));
+        assert_eq!(providers.get("untouched"), Some(&untouched));
+        let path = "realm_config.oidc_providers.default".to_string();
+        assert!(
+            read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(&target, &path),
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_legacy_realm_config_upsert_preserves_reducer_oidc_provider() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([46; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(350, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let reducer_provider = test_oidc_provider("reducer", "reducer");
+        let legacy_provider = test_oidc_provider("legacy", "legacy");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_350, 1),
+                target,
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    provider: reducer_provider.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config OIDC provider upsert applies");
+
+        let late_legacy = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 7);
+        apply_legacy_admin_document_upsert_to_storage(
+            &storage,
+            document_target,
+            late_legacy
+                .to_bytes(&actor)
+                .expect("legacy realm config serializes"),
+        )
+        .await
+        .expect("late legacy realm config upsert overlays reducer state");
+
+        let merged = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(
+            merged.metadata_replication,
+            late_legacy.metadata_replication
+        );
+        assert_eq!(merged.discovery, late_legacy.discovery);
+        assert_eq!(
+            realm_config_nodes(&merged),
+            realm_config_nodes(&late_legacy)
+        );
+        assert_eq!(
+            realm_config_oidc_providers(&merged),
+            BTreeMap::from([
+                ("legacy".to_string(), legacy_provider),
+                ("reducer".to_string(), reducer_provider),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_realm_config_oidc_provider_op_stores_state_without_config_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([47; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(360, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let provider = test_oidc_provider("default", "missing");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_360, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    provider: provider.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config OIDC provider upsert applies without config doc");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                document_target.storage_keyspace(),
+                document_target.storage_key(),
+            )
+            .await
+            .is_none()
+        );
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_oidc_providers(),
+            BTreeMap::from([("default".to_string(), provider)])
         );
     }
 
