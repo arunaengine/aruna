@@ -457,7 +457,11 @@ impl AddGroupRoleOperation {
     ) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_group_doc(group, auth_doc),
+            | Event::Task(TaskEvent::Error { .. }) => {
+                self.state = AddGroupRoleState::Finish;
+                self.output = Some(Ok((group, auth_doc)));
+                smallvec![]
+            }
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
@@ -791,7 +795,7 @@ pub mod test {
         DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
@@ -1112,34 +1116,11 @@ pub mod test {
             key: TaskKey::DrainDocumentSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
-        let announce_group_doc = effects.first().unwrap();
-        assert!(matches!(announce_group_doc, Effect::SubOperation(_)));
-        assert_eq!(
-            add_role_operation.state,
-            AddGroupRoleState::AnnounceGroupDoc {
-                group: mutated_group.clone(),
-                auth_doc: mutated_auth_doc.clone(),
-            }
-        );
-
-        let effects =
-            add_role_operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: Ok(()),
-            }));
-        let announce_auth_doc = effects.first().unwrap();
-        assert!(matches!(announce_auth_doc, Effect::SubOperation(_)));
-        assert_eq!(
-            add_role_operation.state,
-            AddGroupRoleState::AnnounceAuthDoc {
-                group: mutated_group,
-                auth_doc: mutated_auth_doc,
-            }
-        );
-
-        let effects = add_role_operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::DocumentSyncResult { result: Ok(()) },
-        ));
         assert!(effects.is_empty());
         assert_eq!(add_role_operation.state, AddGroupRoleState::Finish);
+        assert_eq!(
+            add_role_operation.finalize().unwrap(),
+            (mutated_group, mutated_auth_doc)
+        );
     }
 }

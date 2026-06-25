@@ -8,7 +8,7 @@ use aruna_core::document::{
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, document_sync_revision_write_entry,
@@ -26,7 +26,6 @@ use ulid::Ulid;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::replicate_documents::replicate_documents_effect;
 use crate::user_subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
@@ -54,7 +53,6 @@ enum RegisterOrGetOidcUserState {
     WriteSubjectIndex { txn_id: TxnId, user: User },
     CommitTransaction { user: User, announce: bool },
     ScheduleAdminDocumentOutboxDrain { user: User },
-    AnnounceUser { user: User },
     Finish,
     Error,
 }
@@ -67,8 +65,6 @@ pub enum RegisterOrGetOidcUserError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
-    #[error("topic announcement failed: {0}")]
-    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -319,37 +315,11 @@ impl RegisterOrGetOidcUserOperation {
     fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce(user),
+            | Event::Task(TaskEvent::Error { .. }) => self.emit_finish(user),
             other => self.unexpected_event(
                 "admin document outbox drain timer schedule",
                 format!("{other:?}"),
             ),
-        }
-    }
-
-    fn emit_announce(&mut self, user: User) -> Effects {
-        let user_id = user.user_id;
-        self.state = RegisterOrGetOidcUserState::AnnounceUser { user };
-        let document = DocumentSyncTarget::User { user_id };
-        smallvec![replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![document],
-        )]
-    }
-
-    fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult { result })",
-                got,
-            );
-        };
-
-        match result {
-            Ok(_) => self.emit_finish(user),
-            Err(err) => self.fail(RegisterOrGetOidcUserError::TopicAnnouncement(err)),
         }
     }
 
@@ -396,9 +366,6 @@ impl Operation for RegisterOrGetOidcUserOperation {
             }
             RegisterOrGetOidcUserState::ScheduleAdminDocumentOutboxDrain { user } => {
                 self.handle_schedule_admin_document_outbox_drain(event, user)
-            }
-            RegisterOrGetOidcUserState::AnnounceUser { user } => {
-                self.handle_announce_user(event, user)
             }
             RegisterOrGetOidcUserState::Init
             | RegisterOrGetOidcUserState::Finish
@@ -499,7 +466,7 @@ mod tests {
         DocumentSyncOutboxRecord, DocumentSyncTarget,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
         admin_document_reducer_state_key, document_sync_revision_key,
@@ -678,11 +645,6 @@ mod tests {
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::DrainDocumentSyncOutbox,
             after: std::time::Duration::ZERO,
-        }));
-        assert!(matches!(effects.first().unwrap(), Effect::SubOperation(_)));
-
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-            result: Ok(()),
         }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), expected_user);

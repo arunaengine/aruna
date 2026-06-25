@@ -2126,6 +2126,8 @@ async fn apply_legacy_admin_document_delete_to_storage(
             "legacy admin delete reducer state target mismatch".to_string(),
         ));
     }
+    // Migration policy: legacy whole-document admin deletes are bootstrap-only.
+    // Once reducer state exists, reducer operations are authoritative for this target.
     if reducer_state.is_some() {
         return Ok(true);
     }
@@ -2184,6 +2186,9 @@ async fn apply_legacy_admin_document_upsert_to_storage(
             "legacy admin upsert reducer state target mismatch".to_string(),
         ));
     }
+    // Migration policy: legacy whole-document admin upserts are retained only to
+    // hydrate targets that have not seen reducer state yet. Late legacy payloads
+    // are skipped so operation streams stay authoritative after cutover.
     if reducer_state.is_some() {
         return Ok(());
     }

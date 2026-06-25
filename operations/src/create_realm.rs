@@ -5,7 +5,7 @@ use aruna_core::admin_documents::{
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
@@ -17,13 +17,11 @@ use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -217,24 +215,14 @@ impl CreateRealmOperation {
         Ok(writes)
     }
 
-    fn emit_legacy_document_replication(&mut self) -> Effects {
+    fn finish_after_outbox_schedule(&mut self) -> Effects {
         if let Some(realm) = &self.realm
-            && self.auth_doc.is_some()
+            && let Some(auth) = &self.auth_doc
             && self.config_doc.is_some()
         {
-            self.state = CreateRealmState::ReplicateDocuments;
-            smallvec![replicate_documents_effect(
-                self.config.actor.realm_id,
-                self.config.actor.node_id,
-                vec![
-                    DocumentSyncTarget::RealmAuthorization {
-                        realm_id: realm.realm_id,
-                    },
-                    DocumentSyncTarget::RealmConfig {
-                        realm_id: realm.realm_id,
-                    },
-                ],
-            )]
+            self.state = CreateRealmState::Finish;
+            self.output = Some(Ok((realm.clone(), auth.clone())));
+            smallvec![]
         } else {
             self.fail(CreateRealmError::RealmNotFound)
         }
@@ -367,43 +355,13 @@ impl CreateRealmOperation {
 
     fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                self.emit_legacy_document_replication()
-            }
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                warn!(error = %message, "Failed to schedule document sync outbox drain; continuing with legacy realm creation replication");
-                self.emit_legacy_document_replication()
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
+            Event::Task(TaskEvent::Error { .. }) => self.finish_after_outbox_schedule(),
             other => self.unexpected_event(
                 CreateRealmState::ScheduleDocumentSyncOutboxDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
                 format!("{other:?}"),
             ),
-        }
-    }
-
-    fn handle_replicate_documents(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                CreateRealmState::ReplicateDocuments,
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-
-        if let Err(error) = result {
-            return self.fail(CreateRealmError::DocumentSync(error));
-        }
-
-        if let Some(realm) = &self.realm
-            && let Some(auth) = &self.auth_doc
-        {
-            self.state = CreateRealmState::Finish;
-            self.output = Some(Ok((realm.clone(), auth.clone())));
-            smallvec![]
-        } else {
-            self.fail(CreateRealmError::RealmNotFound)
         }
     }
 }
@@ -417,7 +375,6 @@ pub enum CreateRealmState {
     CreateConfigDoc,
     CommitTransaction,
     ScheduleDocumentSyncOutboxDrain,
-    ReplicateDocuments,
     Finish,
     Error,
 }
@@ -430,8 +387,6 @@ pub enum CreateRealmError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
-    #[error("document sync failed: {0}")]
-    DocumentSync(String),
     #[error("authorization document not found")]
     AuthDocNotFound,
     #[error("realm config document not found")]
@@ -480,7 +435,6 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::ScheduleDocumentSyncOutboxDrain => {
                 self.handle_schedule_document_sync_outbox_drain(event)
             }
-            CreateRealmState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }
@@ -765,7 +719,7 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_before_legacy_replication_and_continues_on_error() {
+    fn schedules_outbox_drain_and_finishes_without_legacy_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::new();
@@ -790,8 +744,9 @@ mod test {
             key: Some(TaskKey::DrainDocumentSyncOutbox),
             message: "schedule failed".to_string(),
         }));
-        assert_eq!(operation.state, super::CreateRealmState::ReplicateDocuments);
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+        assert_eq!(operation.state, super::CreateRealmState::Finish);
+        assert!(effects.is_empty());
+        assert!(operation.output.as_ref().is_some_and(Result::is_ok));
     }
 
     #[tokio::test]

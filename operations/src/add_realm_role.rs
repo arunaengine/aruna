@@ -398,7 +398,11 @@ impl AddRealmRoleOperation {
     ) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_auth_doc(auth_doc),
+            | Event::Task(TaskEvent::Error { .. }) => {
+                self.state = AddRealmRoleState::Finish;
+                self.output = Some(Ok(auth_doc));
+                smallvec![]
+            }
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
@@ -932,17 +936,13 @@ pub mod test {
             key: TaskKey::DrainDocumentSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-        assert_eq!(
-            operation.state,
-            AddRealmRoleState::AnnounceAuthDoc {
-                auth_doc: expected_auth_doc,
-            }
-        );
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, AddRealmRoleState::Finish);
+        assert_eq!(operation.finalize().unwrap(), expected_auth_doc);
     }
 
     #[test]
-    pub fn outbox_drain_scheduling_error_still_announces_auth_doc() {
+    pub fn outbox_drain_scheduling_error_finishes_without_legacy_auth_doc() {
         let realm_id = aruna_core::structs::RealmId([6u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
         let actor = Actor {
@@ -975,19 +975,8 @@ pub mod test {
             message: "schedule failed".to_string(),
         }));
 
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-        assert_eq!(
-            operation.state,
-            AddRealmRoleState::AnnounceAuthDoc {
-                auth_doc: auth_doc.clone(),
-            }
-        );
-
-        let effects = operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::DocumentSyncResult { result: Ok(()) },
-        ));
-
         assert!(effects.is_empty());
+        assert_eq!(operation.state, AddRealmRoleState::Finish);
         assert_eq!(operation.finalize().unwrap(), auth_doc);
     }
 

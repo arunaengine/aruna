@@ -69,7 +69,6 @@ enum EnsureRealmConfigState {
     ScheduleDocumentSyncOutboxDrain {
         document: RealmConfigDocument,
     },
-    Announce,
     Replicate,
     Finish,
     Error,
@@ -264,21 +263,24 @@ impl EnsureRealmConfigOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn emit_announce(&mut self) -> Effects {
-        self.state = EnsureRealmConfigState::Announce;
+    fn emit_bootstrap_replication(&mut self) -> Effects {
+        // Retained legacy bootstrap: send the full realm config only to explicit
+        // bootstrap peers that may not have reducer state or realm membership yet.
+        self.replication_targets = self
+            .config
+            .bootstrap_peers
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.config.actor.node_id)
+            .collect();
+        if self.replication_targets.is_empty() {
+            self.state = EnsureRealmConfigState::Finish;
+            return smallvec![];
+        }
+
+        self.state = EnsureRealmConfigState::Replicate;
         let document = self.document_ref();
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.config.actor.node_id,
-                Some(document),
-            ),
-            |result| {
-                Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                })
-            },
-        ))]
+        emit_next_replication(&mut self.replication_targets, document)
     }
 
     fn fail(&mut self, error: EnsureRealmConfigError) -> Effects {
@@ -390,57 +392,15 @@ impl Operation for EnsureRealmConfigOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             EnsureRealmConfigState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_announce(),
+                Event::Task(TaskEvent::TimerScheduled { .. }) => self.emit_bootstrap_replication(),
                 Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule document sync outbox drain; continuing with legacy realm config replication");
-                    self.emit_announce()
+                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; continuing with explicit realm config bootstrap replication");
+                    self.emit_bootstrap_replication()
                 }
                 other => self.unexpected_event(
                     "document sync outbox drain timer schedule",
                     format!("{other:?}"),
                 ),
-            },
-            EnsureRealmConfigState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
-                    match result {
-                        Ok(()) => {
-                            self.replication_targets = self
-                                .config
-                                .bootstrap_peers
-                                .iter()
-                                .copied()
-                                .filter(|node_id| *node_id != self.config.actor.node_id)
-                                .collect();
-                            if self.replication_targets.is_empty() {
-                                self.state = EnsureRealmConfigState::Finish;
-                                smallvec![]
-                            } else {
-                                self.state = EnsureRealmConfigState::Replicate;
-                                let document = self.document_ref();
-                                emit_next_replication(&mut self.replication_targets, document)
-                            }
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "Failed to announce realm config; continuing best-effort");
-                            self.replication_targets = self
-                                .config
-                                .bootstrap_peers
-                                .iter()
-                                .copied()
-                                .filter(|node_id| *node_id != self.config.actor.node_id)
-                                .collect();
-                            if self.replication_targets.is_empty() {
-                                self.state = EnsureRealmConfigState::Finish;
-                                smallvec![]
-                            } else {
-                                self.state = EnsureRealmConfigState::Replicate;
-                                let document = self.document_ref();
-                                emit_next_replication(&mut self.replication_targets, document)
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             EnsureRealmConfigState::Replicate => match event {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
@@ -455,7 +415,7 @@ impl Operation for EnsureRealmConfigOperation {
                             }
                         }
                         Err(error) => {
-                            warn!(error = %error, "Failed to replicate realm config; continuing best-effort");
+                            warn!(error = %error, "Failed to replicate realm config bootstrap document; continuing best-effort");
                             if self.replication_targets.is_empty() {
                                 self.state = EnsureRealmConfigState::Finish;
                                 smallvec![]
@@ -610,7 +570,7 @@ mod tests {
         DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -618,12 +578,13 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
     use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
     use ulid::Ulid;
 
     use super::{
         EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
-        realm_config_node_path,
+        EnsureRealmConfigState, realm_config_node_path,
     };
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -822,6 +783,49 @@ mod tests {
         assert!(effects.is_empty());
         assert!(operation.is_complete());
         assert_eq!(operation.finalize().unwrap(), document);
+    }
+
+    #[test]
+    fn scheduled_admin_outbox_without_bootstrap_peers_finishes_without_whole_doc_replication() {
+        let realm_id = RealmId::from_bytes([11; 32]);
+        let actor = actor(11, realm_id);
+        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let mut operation = EnsureRealmConfigOperation::new(config(actor, 3));
+        operation.state = EnsureRealmConfigState::ScheduleDocumentSyncOutboxDrain { document };
+
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, EnsureRealmConfigState::Finish);
+    }
+
+    #[test]
+    fn scheduled_admin_outbox_retains_direct_bootstrap_replication_only() {
+        let realm_id = RealmId::from_bytes([12; 32]);
+        let actor = actor(12, realm_id);
+        let bootstrap_peer = node(13);
+        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let mut input = config(actor.clone(), 3);
+        input.bootstrap_peers = vec![actor.node_id, bootstrap_peer];
+        let mut operation = EnsureRealmConfigOperation::new(input);
+        operation.state = EnsureRealmConfigState::ScheduleDocumentSyncOutboxDrain { document };
+
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
+
+        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+        assert_eq!(operation.state, EnsureRealmConfigState::Replicate);
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, EnsureRealmConfigState::Finish);
     }
 
     #[test]

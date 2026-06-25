@@ -461,7 +461,11 @@ impl UpdateUserOperation {
     fn handle_schedule_admin_document_outbox_drain(&mut self, event: Event, user: User) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_user(user),
+            | Event::Task(TaskEvent::Error { .. }) => {
+                self.state = UpdateUserState::Finish;
+                self.output = Some(Ok(user));
+                smallvec![]
+            }
             other => self.unexpected_event(
                 "admin document outbox drain timer schedule",
                 format!("{other:?}"),
@@ -824,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn updates_user_attributes_and_announces() {
+    fn updates_user_attributes_and_queues_admin_operations() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
@@ -949,11 +953,6 @@ mod tests {
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::DrainDocumentSyncOutbox,
             after: std::time::Duration::ZERO,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-            result: Ok(()),
         }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), updated);

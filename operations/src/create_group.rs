@@ -1,7 +1,6 @@
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
-use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -9,7 +8,7 @@ use aruna_core::admin_documents::{
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
@@ -21,7 +20,7 @@ use aruna_core::types::{Effects, Key, UserId, Value};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use tracing::{trace, warn};
+use tracing::trace;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,30 +194,19 @@ impl CreateGroupOperation {
         Ok(writes)
     }
 
-    fn emit_legacy_document_replication(&mut self) -> Effects {
+    fn finish_after_outbox_schedule(&mut self) -> Effects {
         if let Some(group) = &self.group
-            && self.auth_doc.is_some()
+            && let Some(auth) = &self.auth_doc
         {
-            self.state = CreateGroupState::ReplicateDocuments;
             trace!(
-                event = "group.create.announce_group",
+                event = "group.create.completed",
                 group_id = %group.group_id,
                 realm_id = %group.realm_id,
-                user_id = %self.config.actor.user_id,
-                "Announcing group"
+                "Created group and queued admin document operations"
             );
-            smallvec![replicate_documents_effect(
-                self.config.actor.realm_id,
-                self.config.actor.node_id,
-                vec![
-                    DocumentSyncTarget::Group {
-                        group_id: group.group_id,
-                    },
-                    DocumentSyncTarget::GroupAuthorization {
-                        group_id: group.group_id,
-                    },
-                ],
-            )]
+            self.state = CreateGroupState::Finish;
+            self.output = Some(Ok((group.clone(), auth.clone())));
+            smallvec![]
         } else {
             self.fail(CreateGroupError::GroupNotFound)
         }
@@ -342,50 +330,13 @@ impl CreateGroupOperation {
 
     fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
         match event {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                self.emit_legacy_document_replication()
-            }
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                warn!(error = %message, "Failed to schedule document sync outbox drain; continuing with legacy group creation replication");
-                self.emit_legacy_document_replication()
-            }
+            Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_outbox_schedule(),
+            Event::Task(TaskEvent::Error { .. }) => self.finish_after_outbox_schedule(),
             other => self.unexpected_event(
                 CreateGroupState::ScheduleDocumentSyncOutboxDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
                 format!("{other:?}"),
             ),
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.handle_replicate", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_replicate_documents(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::ReplicateDocuments,
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-
-        if let Err(error) = result {
-            return self.fail(CreateGroupError::DocumentSync(error));
-        }
-
-        if let Some(group) = &self.group
-            && let Some(auth) = &self.auth_doc
-        {
-            trace!(
-                event = "group.create.completed",
-                group_id = %group.group_id,
-                realm_id = %group.realm_id,
-                "Created and replicated group"
-            );
-            self.state = CreateGroupState::Finish;
-            self.output = Some(Ok((group.clone(), auth.clone())));
-            smallvec![]
-        } else {
-            self.fail(CreateGroupError::GroupNotFound)
         }
     }
 }
@@ -433,7 +384,6 @@ pub enum CreateGroupState {
     CreateRoles,
     CommitTransaction,
     ScheduleDocumentSyncOutboxDrain,
-    ReplicateDocuments,
     Finish,
     Error,
 }
@@ -446,8 +396,6 @@ pub enum CreateGroupError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     AdminDocumentReducerError(#[from] AdminDocumentReducerError),
-    #[error("document sync failed: {0}")]
-    DocumentSync(String),
     #[error("No auth doc found")]
     AuthDocNotFound,
     #[error("No admin role found")]
@@ -495,7 +443,6 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::ScheduleDocumentSyncOutboxDrain => {
                 self.handle_schedule_document_sync_outbox_drain(event)
             }
-            CreateGroupState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
             }
@@ -734,7 +681,7 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_before_legacy_replication_and_continues_on_error() {
+    fn schedules_outbox_drain_and_finishes_without_legacy_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::new();
@@ -759,8 +706,9 @@ mod test {
             key: Some(TaskKey::DrainDocumentSyncOutbox),
             message: "schedule failed".to_string(),
         }));
-        assert_eq!(operation.state, super::CreateGroupState::ReplicateDocuments);
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+        assert_eq!(operation.state, super::CreateGroupState::Finish);
+        assert!(effects.is_empty());
+        assert!(operation.output.as_ref().is_some_and(Result::is_ok));
     }
 
     #[tokio::test]

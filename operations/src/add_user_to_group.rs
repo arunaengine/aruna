@@ -416,7 +416,11 @@ impl AddUserToGroupOperation {
     ) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_auth_doc(auth_doc),
+            | Event::Task(TaskEvent::Error { .. }) => {
+                self.state = AddUserToGroupState::Finish;
+                self.output = Some(Ok(auth_doc));
+                smallvec![]
+            }
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",

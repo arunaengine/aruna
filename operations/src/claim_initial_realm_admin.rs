@@ -413,7 +413,11 @@ impl Operation for ClaimInitialRealmAdminOperation {
             ClaimInitialRealmAdminState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
                 match event {
                     Event::Task(TaskEvent::TimerScheduled { .. })
-                    | Event::Task(TaskEvent::Error { .. }) => self.emit_announce_auth_doc(auth_doc),
+                    | Event::Task(TaskEvent::Error { .. }) => {
+                        self.state = ClaimInitialRealmAdminState::Finish;
+                        self.output = Some(Ok(ClaimInitialRealmAdminResult::Claimed(auth_doc)));
+                        smallvec![]
+                    }
                     other => self.unexpected_event(
                         "admin document outbox drain timer schedule",
                         format!("{other:?}"),
@@ -841,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_error_continues_to_announcement() {
+    fn scheduling_error_finishes_without_legacy_announcement() {
         let realm_id = RealmId::from_bytes([15u8; 32]);
         let actor = actor(realm_id, 16, 17);
         let (auth_doc, _) = auth_doc_and_admin_role(realm_id);
@@ -855,11 +859,10 @@ mod tests {
             key: Some(TaskKey::DrainDocumentSyncOutbox),
             message: "schedule failed".to_string(),
         }));
+        assert_eq!(operation.state, ClaimInitialRealmAdminState::Finish);
         assert_eq!(
-            operation.state,
-            ClaimInitialRealmAdminState::AnnounceAuthDoc {
-                auth_doc: auth_doc.clone(),
-            }
+            operation.output,
+            Some(Ok(ClaimInitialRealmAdminResult::Claimed(auth_doc)))
         );
     }
 

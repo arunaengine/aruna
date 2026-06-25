@@ -1893,6 +1893,55 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_group_role_user_assignments_converge_independent_of_order() {
+        let role_id = role_id(3);
+        let first_user_id = user_id_with_seed(4);
+        let second_user_id = user_id_with_seed(5);
+        let role_seed = add_group_role(1, 1, role_id);
+        let first_assignment = assign_group_role_user(2, 2, role_id, first_user_id);
+        let second_assignment = assign_group_role_user(3, 3, role_id, second_user_id);
+
+        let mut left = group_state();
+        left.apply(&role_seed).unwrap();
+        left.apply(&first_assignment).unwrap();
+        left.apply(&second_assignment).unwrap();
+
+        let mut right = group_state();
+        right.apply(&role_seed).unwrap();
+        right.apply(&second_assignment).unwrap();
+        right.apply(&first_assignment).unwrap();
+
+        let expected = BTreeMap::from([(role_id, BTreeSet::from([first_user_id, second_user_id]))]);
+        assert_eq!(left.materialized_group_role_user_assignments(), expected);
+        assert_eq!(right.materialized_group_role_user_assignments(), expected);
+        assert_eq!(left.conflicts, right.conflicts);
+        assert!(left.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_group_role_additions_converge_independent_of_order() {
+        let first_role = role_definition(role_id(3), "Group reader");
+        let second_role = role_definition(role_id(4), "Group writer");
+        let first = create_group_role(1, 1, first_role.clone());
+        let second = create_group_role(2, 2, second_role.clone());
+
+        let mut left = group_state();
+        left.apply(&first).unwrap();
+        left.apply(&second).unwrap();
+
+        let mut right = group_state();
+        right.apply(&second).unwrap();
+        right.apply(&first).unwrap();
+
+        let expected_roles = BTreeSet::from([first_role.role_id, second_role.role_id]);
+        assert_eq!(left.materialized_group_roles(), expected_roles);
+        assert_eq!(right.materialized_group_roles(), expected_roles);
+        assert_eq!(left.user_subject_ids, right.user_subject_ids);
+        assert!(left.conflicts.is_empty());
+        assert!(right.conflicts.is_empty());
+    }
+
+    #[test]
     fn concurrent_group_role_user_assignment_add_remove_conflict_fails_closed() {
         let mut state = group_state();
         let role_id = role_id(3);
@@ -2123,6 +2172,75 @@ mod tests {
             ])
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_realm_config_node_provider_and_settings_ops_converge_independent_of_order() {
+        let config_node = node(11);
+        let provider = oidc_provider("default", "one");
+        let metadata_replication = MetadataReplicationConfig::new(5);
+        let discovery = RealmDiscoveryConfig::Static {
+            endpoints: Vec::new(),
+        };
+        let node_event = ensure_realm_config_node(1, 1, config_node, RealmNodeKind::Management);
+        let provider_event = upsert_oidc_provider(2, 2, provider.clone());
+        let settings_event =
+            set_realm_config_settings(3, 3, metadata_replication.clone(), discovery.clone());
+
+        let mut left = realm_config_state();
+        left.apply(&node_event).unwrap();
+        left.apply(&provider_event).unwrap();
+        left.apply(&settings_event).unwrap();
+
+        let mut right = realm_config_state();
+        right.apply(&settings_event).unwrap();
+        right.apply(&provider_event).unwrap();
+        right.apply(&node_event).unwrap();
+
+        assert_eq!(left.user_subject_ids, right.user_subject_ids);
+        assert_eq!(
+            left.materialized_realm_config_nodes(),
+            BTreeMap::from([(config_node, RealmNodeKind::Management)])
+        );
+        assert_eq!(
+            left.materialized_realm_config_oidc_providers(),
+            BTreeMap::from([("default".to_string(), provider)])
+        );
+        assert_eq!(
+            left.materialized_realm_config_metadata_replication(),
+            Some(metadata_replication)
+        );
+        assert_eq!(left.materialized_realm_config_discovery(), Some(discovery));
+        assert!(left.conflicts.is_empty());
+        assert!(right.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_realm_config_settings_conflict_is_order_independent() {
+        let first_metadata = MetadataReplicationConfig::new(3);
+        let second_metadata = MetadataReplicationConfig::new(5);
+        let discovery = RealmDiscoveryConfig::Dynamic {
+            methods: Vec::new(),
+        };
+        let first = set_realm_config_settings(1, 1, first_metadata, discovery.clone());
+        let second = set_realm_config_settings(2, 2, second_metadata, discovery.clone());
+
+        let mut left = realm_config_state();
+        left.apply(&first).unwrap();
+        left.apply(&second).unwrap();
+
+        let mut right = realm_config_state();
+        right.apply(&second).unwrap();
+        right.apply(&first).unwrap();
+
+        assert_eq!(left.conflicts, right.conflicts);
+        assert_eq!(left.materialized_realm_config_metadata_replication(), None);
+        assert_eq!(right.materialized_realm_config_metadata_replication(), None);
+        assert_eq!(
+            left.materialized_realm_config_discovery(),
+            Some(discovery.clone())
+        );
+        assert_eq!(right.materialized_realm_config_discovery(), Some(discovery));
     }
 
     #[test]
