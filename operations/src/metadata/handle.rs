@@ -955,7 +955,7 @@ impl MetadataHandle {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => match authorize_remote_metadata_peer_if_token(
+            } => match authorize_remote_metadata_peer(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
                 peer,
@@ -979,7 +979,7 @@ impl MetadataHandle {
                 graph_iris,
                 query,
                 limit,
-            } => match authorize_remote_metadata_peer_if_token(
+            } => match authorize_remote_metadata_peer(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
                 peer,
@@ -1284,25 +1284,6 @@ where
     ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, peer_realm_id)
         .await?;
     Ok(auth_context)
-}
-
-async fn authorize_remote_metadata_peer_if_token<S>(
-    state: &S,
-    storage_handle: &StorageHandle,
-    peer: NodeId,
-    auth_token: Option<MetadataAuthToken>,
-) -> Result<Option<AuthContext>, MetadataError>
-where
-    S: ArunaBearerTokenValidationState + ?Sized,
-{
-    match auth_token {
-        Some(auth_token) => {
-            authorize_remote_metadata_peer(state, storage_handle, peer, Some(auth_token))
-                .await
-                .map(Some)
-        }
-        None => Ok(None),
-    }
 }
 
 async fn ensure_remote_metadata_peer_is_configured_for_realm(
