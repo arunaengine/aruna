@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{Actor, OidcProviderConfig, Permission, RealmId, RealmNodeKind, Role};
+use crate::structs::{
+    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind, Role,
+};
 use crate::types::{GroupId, RoleId, UserId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,13 +136,20 @@ pub enum AdminDocumentOperation {
     RealmConfigOidcProviderRemoved {
         provider_id: String,
     },
+    RealmConfigSettingsSet {
+        metadata_replication: MetadataReplicationConfig,
+        discovery: RealmDiscoveryConfig,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
-    use crate::structs::{OidcProviderConfig, Permission, RealmId, RealmNodeKind};
+    use crate::structs::{
+        MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind,
+    };
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
@@ -278,6 +288,15 @@ mod tests {
                 },
                 15,
             ),
+            (
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: MetadataReplicationConfig::new(3),
+                    discovery: RealmDiscoveryConfig::Static {
+                        endpoints: Vec::new(),
+                    },
+                },
+                16,
+            ),
         ];
 
         for (op, discriminant) in operations {
@@ -335,6 +354,18 @@ mod tests {
         for operation in operations {
             assert_eq!(postcard_roundtrip(operation.clone()), operation);
         }
+    }
+
+    #[test]
+    fn realm_config_settings_operation_roundtrips() {
+        let operation = AdminDocumentOperation::RealmConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: RealmDiscoveryConfig::Static {
+                endpoints: Vec::new(),
+            },
+        };
+
+        assert_eq!(postcard_roundtrip(operation.clone()), operation);
     }
 }
 

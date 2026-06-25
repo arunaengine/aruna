@@ -10,7 +10,9 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use crate::structs::{OidcProviderConfig, RealmNodeKind};
+use crate::structs::{
+    MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmNodeKind,
+};
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
     UserAttributeValidationError, validate_user_attribute_key, validate_user_attribute_value,
@@ -202,6 +204,15 @@ impl AdminDocumentReducerState {
             ) => {
                 self.apply_realm_config_oidc_provider(event, provider_id, None);
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication,
+                    discovery,
+                },
+            ) => {
+                self.apply_realm_config_settings(event, metadata_replication, discovery);
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -366,6 +377,30 @@ impl AdminDocumentReducerState {
             .collect()
     }
 
+    pub fn materialized_realm_config_metadata_replication(
+        &self,
+    ) -> Option<MetadataReplicationConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(metadata_replication_from_value)
+    }
+
+    pub fn materialized_realm_config_discovery(&self) -> Option<RealmDiscoveryConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_DISCOVERY_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(realm_discovery_from_value)
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -520,6 +555,42 @@ impl AdminDocumentReducerState {
         }
     }
 
+    fn apply_realm_config_settings(
+        &mut self,
+        event: &AdminDocumentEvent,
+        metadata_replication: &MetadataReplicationConfig,
+        discovery: &RealmDiscoveryConfig,
+    ) {
+        self.apply_realm_config_setting(
+            event,
+            REALM_CONFIG_METADATA_REPLICATION_PATH,
+            metadata_replication_value(metadata_replication),
+        );
+        self.apply_realm_config_setting(
+            event,
+            REALM_CONFIG_DISCOVERY_PATH,
+            realm_discovery_value(discovery),
+        );
+    }
+
+    fn apply_realm_config_setting(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: &str,
+        value: String,
+    ) {
+        let current = self.user_subject_ids.get(path).cloned();
+
+        match self.reduce_value(event, path, current, Some(value)) {
+            Some(version) => {
+                self.user_subject_ids.insert(path.to_string(), version);
+            }
+            None => {
+                self.user_subject_ids.remove(path);
+            }
+        }
+    }
+
     fn reduce_value(
         &mut self,
         event: &AdminDocumentEvent,
@@ -650,6 +721,8 @@ impl AdminDocumentReducerState {
 }
 
 const USER_NAME_PATH: &str = "user.name";
+const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
+const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -706,6 +779,15 @@ fn realm_config_node_path(node_id: &NodeId) -> String {
 
 fn realm_config_oidc_provider_path(provider_id: &str) -> String {
     format!("realm_config.oidc_providers.{provider_id}")
+}
+
+fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) -> String {
+    serde_json::to_string(metadata_replication)
+        .expect("admin document metadata replication config serializes")
+}
+
+fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
+    serde_json::to_string(discovery).expect("admin document realm discovery config serializes")
 }
 
 fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
@@ -768,6 +850,14 @@ fn oidc_provider_from_value(value: &str) -> Option<OidcProviderConfig> {
     serde_json::from_str(value).ok()
 }
 
+fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationConfig> {
+    serde_json::from_str(value).ok()
+}
+
+fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
+    serde_json::from_str(value).ok()
+}
+
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
     match value {
         "management" => Some(RealmNodeKind::Management),
@@ -781,13 +871,18 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
 mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
-        USER_NAME_PATH, oidc_provider_value, role_definition_value,
+        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH,
+        metadata_replication_value, oidc_provider_value, realm_discovery_value,
+        role_definition_value,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
-    use crate::structs::{Actor, OidcProviderConfig, Permission, RealmId, RealmNodeKind};
+    use crate::structs::{
+        Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
+        RealmId, RealmNodeKind,
+    };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
@@ -1131,6 +1226,24 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+        )
+    }
+
+    fn set_realm_config_settings(
+        event_seed: u8,
+        origin_seed: u8,
+        metadata_replication: MetadataReplicationConfig,
+        discovery: RealmDiscoveryConfig,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication,
+                discovery,
+            },
         )
     }
 
@@ -1881,6 +1994,140 @@ mod tests {
     }
 
     #[test]
+    fn realm_config_settings_materialize_metadata_replication_and_discovery() {
+        let mut state = realm_config_state();
+        let metadata_replication = MetadataReplicationConfig::new(5);
+        let discovery = RealmDiscoveryConfig::Static {
+            endpoints: Vec::new(),
+        };
+
+        state
+            .apply(&set_realm_config_settings(
+                1,
+                1,
+                metadata_replication.clone(),
+                discovery.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_metadata_replication(),
+            Some(metadata_replication)
+        );
+        assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_config_settings_metadata_conflict_withholds_only_metadata_replication() {
+        let mut state = realm_config_state();
+        let first_metadata = MetadataReplicationConfig::new(3);
+        let second_metadata = MetadataReplicationConfig::new(5);
+        let discovery = RealmDiscoveryConfig::Dynamic {
+            methods: Vec::new(),
+        };
+        let first_value = metadata_replication_value(&first_metadata);
+        let second_value = metadata_replication_value(&second_metadata);
+
+        state
+            .apply(&set_realm_config_settings(
+                1,
+                1,
+                first_metadata,
+                discovery.clone(),
+            ))
+            .unwrap();
+        state
+            .apply(&set_realm_config_settings(
+                2,
+                2,
+                second_metadata,
+                discovery.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(state.materialized_realm_config_metadata_replication(), None);
+        assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+        assert!(!state.conflicts.contains_key(REALM_CONFIG_DISCOVERY_PATH));
+        let conflict = state
+            .conflicts
+            .get(REALM_CONFIG_METADATA_REPLICATION_PATH)
+            .expect("conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+        );
+    }
+
+    #[test]
+    fn realm_config_settings_discovery_conflict_withholds_only_discovery() {
+        let mut state = realm_config_state();
+        let metadata_replication = MetadataReplicationConfig::new(3);
+        let first_discovery = RealmDiscoveryConfig::Static {
+            endpoints: Vec::new(),
+        };
+        let second_discovery = RealmDiscoveryConfig::Dynamic {
+            methods: Vec::new(),
+        };
+        let first_value = realm_discovery_value(&first_discovery);
+        let second_value = realm_discovery_value(&second_discovery);
+
+        state
+            .apply(&set_realm_config_settings(
+                1,
+                1,
+                metadata_replication.clone(),
+                first_discovery,
+            ))
+            .unwrap();
+        state
+            .apply(&set_realm_config_settings(
+                2,
+                2,
+                metadata_replication.clone(),
+                second_discovery,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_metadata_replication(),
+            Some(metadata_replication)
+        );
+        assert_eq!(state.materialized_realm_config_discovery(), None);
+        assert!(
+            !state
+                .conflicts
+                .contains_key(REALM_CONFIG_METADATA_REPLICATION_PATH)
+        );
+        let conflict = state
+            .conflicts
+            .get(REALM_CONFIG_DISCOVERY_PATH)
+            .expect("conflict is recorded");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+        );
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+        );
+    }
+
+    #[test]
     fn user_operation_is_rejected_for_group_target_without_state_change() {
         let mut state = group_state();
         let before = state.clone();
@@ -1912,6 +2159,30 @@ mod tests {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigOidcProviderUpserted {
                 provider: oidc_provider("default", "one"),
+            },
+        );
+
+        assert_eq!(
+            state.apply(&event),
+            Err(AdminDocumentReducerError::UnsupportedTarget)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn realm_config_settings_op_is_rejected_for_non_realm_config_target() {
+        let mut state = user_state();
+        let before = state.clone();
+        let event = event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: RealmDiscoveryConfig::Static {
+                    endpoints: Vec::new(),
+                },
             },
         );
 
