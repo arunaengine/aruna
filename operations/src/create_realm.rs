@@ -132,6 +132,10 @@ impl CreateRealmOperation {
 
     fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
         let realm_id = self.config.actor.realm_id;
+        let config_doc = self
+            .config_doc
+            .as_ref()
+            .ok_or(CreateRealmError::RealmConfigDocNotFound)?;
         let auth_doc = self
             .auth_doc
             .as_ref()
@@ -172,6 +176,14 @@ impl CreateRealmOperation {
                 AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
             )?);
         }
+        config_events.push(apply_admin_reducer_operation(
+            &mut config_state,
+            &self.config.actor,
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: config_doc.metadata_replication.clone(),
+                discovery: config_doc.discovery.clone(),
+            },
+        )?);
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -422,6 +434,8 @@ pub enum CreateRealmError {
     DocumentSync(String),
     #[error("authorization document not found")]
     AuthDocNotFound,
+    #[error("realm config document not found")]
+    RealmConfigDocNotFound,
     #[error("realm_admin role not found")]
     RealmAdminRoleNotFound,
     #[error("No transaction found")]
@@ -672,12 +686,20 @@ mod test {
         assert_eq!(materialized_providers.len(), 2);
         assert_eq!(materialized_providers.get("alpha"), Some(&alpha_provider));
         assert_eq!(materialized_providers.get("beta"), Some(&beta_provider));
+        assert_eq!(
+            config_state.materialized_realm_config_metadata_replication(),
+            Some(config_doc.metadata_replication.clone())
+        );
+        assert_eq!(
+            config_state.materialized_realm_config_discovery(),
+            Some(config_doc.discovery.clone())
+        );
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 4);
+        assert_eq!(outbox_records.len(), 5);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -691,20 +713,7 @@ mod test {
                             )
                 )
         }));
-        assert!(outbox_records.iter().any(|record| {
-            record.target == DocumentSyncTarget::RealmConfig { realm_id }
-                && matches!(
-                    &record.event,
-                    DocumentSyncOutboxEvent::AdminOperation { event }
-                        if event.target == config_target
-                            && matches!(
-                                &event.op,
-                                AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind }
-                                    if *node_id == actor.node_id && *kind == RealmNodeKind::Management
-                            )
-                )
-        }));
-        let provider_events = outbox_records
+        let config_events = outbox_records
             .iter()
             .filter_map(|record| {
                 if record.target != (DocumentSyncTarget::RealmConfig { realm_id }) {
@@ -719,17 +728,39 @@ mod test {
                     return None;
                 }
 
-                match &event.op {
-                    AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
-                        Some((provider.id.clone(), event.origin_seq))
-                    }
-                    _ => None,
-                }
+                Some((event.origin_seq, event.op.clone()))
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            provider_events,
-            vec![("alpha".to_string(), 2), ("beta".to_string(), 3)]
+            config_events,
+            vec![
+                (
+                    1,
+                    AdminDocumentOperation::RealmConfigNodeEnsured {
+                        node_id: actor.node_id,
+                        kind: RealmNodeKind::Management,
+                    },
+                ),
+                (
+                    2,
+                    AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                        provider: alpha_provider,
+                    },
+                ),
+                (
+                    3,
+                    AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                        provider: beta_provider,
+                    },
+                ),
+                (
+                    4,
+                    AdminDocumentOperation::RealmConfigSettingsSet {
+                        metadata_replication: config_doc.metadata_replication,
+                        discovery: config_doc.discovery,
+                    },
+                ),
+            ]
         );
     }
 
