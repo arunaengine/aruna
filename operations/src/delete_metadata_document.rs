@@ -19,6 +19,7 @@ use crate::document_sync_outbox::{
     new_outbox_record, new_outbox_record_with_id, schedule_outbox_drain_effect,
     write_outbox_effect_with_txn,
 };
+use crate::driver::{DriverContext, drive};
 use crate::metadata::prune_queue::{
     new_graph_prune_job, schedule_metadata_graph_prune_drain_effect, write_graph_prune_job_effect,
 };
@@ -245,6 +246,18 @@ impl DeleteMetadataDocumentOperation {
             got,
         })
     }
+}
+
+pub async fn delete_metadata_document(
+    operation: DeleteMetadataDocumentOperation,
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<(), DeleteMetadataDocumentError> {
+    drive(operation, context).await?;
+    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+        metadata_handle.remove_visible_registry_record(document_id);
+    }
+    Ok(())
 }
 
 impl Operation for DeleteMetadataDocumentOperation {

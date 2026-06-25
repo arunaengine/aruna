@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aruna_core::NodeId;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,6 +15,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::driver::{DriverContext, drive};
+use crate::metadata::projector::wake_metadata_create_projection;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +275,15 @@ impl CreateMetadataDocumentOperation {
             got,
         })
     }
+}
+
+pub async fn create_metadata_document(
+    operation: CreateMetadataDocumentOperation,
+    context: Arc<DriverContext>,
+) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
+    let created = drive(operation, context.as_ref()).await?;
+    wake_metadata_create_projection(context, created.record.document_id, created.event_id);
+    Ok(created)
 }
 
 impl Operation for CreateMetadataDocumentOperation {

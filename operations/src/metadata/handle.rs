@@ -955,7 +955,7 @@ impl MetadataHandle {
                 auth_token,
                 graph_iris,
                 sparql,
-            } => match authorize_remote_metadata_peer(
+            } => match authorize_remote_metadata_peer_if_token(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
                 peer,
@@ -979,7 +979,7 @@ impl MetadataHandle {
                 graph_iris,
                 query,
                 limit,
-            } => match authorize_remote_metadata_peer(
+            } => match authorize_remote_metadata_peer_if_token(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
                 peer,
@@ -1059,6 +1059,59 @@ impl MetadataHandle {
         limit: usize,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         search_local_graphs(self.inner.clone(), auth_context, graph_iris, query, limit).await
+    }
+
+    pub async fn export_rocrate_jsonld(&self, graph_iri: String) -> Result<String, MetadataError> {
+        match self
+            .send_metadata_effect(MetadataEffect::ExportRoCrate { graph_iri })
+            .await
+        {
+            Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => Ok(jsonld),
+            Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata export event: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn export_rocrate_summary_jsonld(
+        &self,
+        graph_iri: String,
+    ) -> Result<String, MetadataError> {
+        match self
+            .send_metadata_effect(MetadataEffect::ExportRoCrateSummary { graph_iri })
+            .await
+        {
+            Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => Ok(jsonld),
+            Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata summary event: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn export_rocrate_page(
+        &self,
+        graph_iri: String,
+        limit: usize,
+        offset: Option<usize>,
+        after: Option<String>,
+    ) -> Result<MetadataRoCratePage, MetadataError> {
+        match self
+            .send_metadata_effect(MetadataEffect::ExportRoCratePage {
+                graph_iri,
+                limit,
+                offset,
+                after,
+            })
+            .await
+        {
+            Event::Metadata(MetadataEvent::RoCratePageResult { page, .. }) => Ok(page),
+            Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata page event: {other:?}"
+            ))),
+        }
     }
 
     pub async fn flush_search_updates(&self) -> Result<(), MetadataError> {
@@ -1231,6 +1284,25 @@ where
     ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, peer_realm_id)
         .await?;
     Ok(auth_context)
+}
+
+async fn authorize_remote_metadata_peer_if_token<S>(
+    state: &S,
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<Option<AuthContext>, MetadataError>
+where
+    S: ArunaBearerTokenValidationState + ?Sized,
+{
+    match auth_token {
+        Some(auth_token) => {
+            authorize_remote_metadata_peer(state, storage_handle, peer, Some(auth_token))
+                .await
+                .map(Some)
+        }
+        None => Ok(None),
+    }
 }
 
 async fn ensure_remote_metadata_peer_is_configured_for_realm(

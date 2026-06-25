@@ -1,38 +1,31 @@
 use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::Event;
-use aruna_core::handle::Handle;
 use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataMaterializationState,
-    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_core::telemetry::duration_ms;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, create_metadata_document as run_create_metadata_document,
 };
-use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::delete_metadata_document::{
+    DeleteMetadataDocumentOperation, delete_metadata_document as run_delete_metadata_document,
+};
+use aruna_operations::driver::drive;
+use aruna_operations::get_metadata_document::{
+    is_metadata_record_materialized_for_graph_read,
+    load_metadata_record_by_document as load_metadata_record_by_document_from_operations,
+};
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::MetadataAuthToken;
-use aruna_operations::metadata::projector::{
-    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events_from_log,
-    schedule_metadata_projection_retry,
-};
-use aruna_operations::metadata::repository::{
-    parse_materialization_status_read, parse_registry_read, read_materialization_status_effect,
-    read_registry_by_document_effect,
-};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -44,7 +37,7 @@ use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
@@ -278,31 +271,6 @@ const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
 const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
-const METADATA_REALM_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
-const METADATA_PROJECTION_DEBOUNCE_AFTER: Duration = Duration::from_millis(100);
-
-static METADATA_REALM_NODES_CACHE: OnceLock<
-    Mutex<HashMap<RealmNodesCacheKey, RealmNodesCacheEntry>>,
-> = OnceLock::new();
-static METADATA_PROJECTION_BATCHES: OnceLock<Mutex<HashMap<[u8; 32], MetadataProjectionBatch>>> =
-    OnceLock::new();
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct RealmNodesCacheKey {
-    realm_id: [u8; 32],
-    local_node_id: [u8; 32],
-}
-
-struct RealmNodesCacheEntry {
-    nodes: Vec<aruna_core::NodeId>,
-    expires_at: Instant,
-}
-
-struct MetadataProjectionBatch {
-    ctx: Weak<DriverContext>,
-    pending: Vec<(Ulid, Ulid)>,
-    scheduled: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SparqlQueryRequest {
@@ -497,7 +465,7 @@ pub async fn create_metadata_document(
     ensure_metadata_write_scope(&state, &auth, group_id).await?;
 
     let ctx = state.get_ctx();
-    let created = drive(
+    let created = run_create_metadata_document(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
                 actor: Actor {
@@ -512,12 +480,11 @@ pub async fn create_metadata_document(
                 payload,
             },
         ),
-        ctx.as_ref(),
+        ctx,
     )
     .await
     .map_err(map_create_metadata_error)?;
     let result = created.record;
-    wake_metadata_create_projection(ctx, result.document_id, created.event_id);
 
     Ok((
         StatusCode::CREATED,
@@ -652,7 +619,7 @@ pub async fn delete_metadata_document(
     ensure_record_writable(&state, &auth, &record).await?;
 
     let ctx = state.get_ctx();
-    drive(
+    run_delete_metadata_document(
         DeleteMetadataDocumentOperation::new(
             Actor {
                 node_id: state.get_node_id(),
@@ -662,11 +629,11 @@ pub async fn delete_metadata_document(
             record.group_id,
             document_id,
         ),
-        &ctx,
+        ctx.as_ref(),
+        document_id,
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    remove_visible_registry_record(&state, document_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -849,7 +816,8 @@ pub async fn replace_metadata_rocrate(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -863,11 +831,10 @@ pub async fn replace_metadata_rocrate(
                 jsonld: serialize_jsonld_object(&request.rocrate)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
-    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -942,7 +909,8 @@ pub async fn add_metadata_data_entity(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -956,11 +924,10 @@ pub async fn add_metadata_data_entity(
                 jsonld: serialize_jsonld_entity(&entity)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
-    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -1031,7 +998,8 @@ pub async fn add_metadata_contextual_entity(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -1045,11 +1013,10 @@ pub async fn add_metadata_contextual_entity(
                 jsonld: serialize_jsonld_entity(&entity)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
-    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -1225,91 +1192,6 @@ pub async fn search_metadata(
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
-}
-
-fn metadata_projection_batch_key(ctx: &Arc<DriverContext>) -> [u8; 32] {
-    match ctx.net_handle.as_ref() {
-        Some(net) => *net.node_id().as_bytes(),
-        None => {
-            let mut key = [0u8; 32];
-            key[..8].copy_from_slice(&(Arc::as_ptr(ctx) as usize as u64).to_be_bytes());
-            key
-        }
-    }
-}
-
-fn wake_metadata_create_projection(ctx: Arc<DriverContext>, document_id: Ulid, event_id: Ulid) {
-    let key = metadata_projection_batch_key(&ctx);
-    let should_spawn = {
-        let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut batches = batches
-            .lock()
-            .expect("metadata projection batch mutex poisoned");
-        let batch = batches
-            .entry(key)
-            .or_insert_with(|| MetadataProjectionBatch {
-                ctx: Arc::downgrade(&ctx),
-                pending: Vec::new(),
-                scheduled: false,
-            });
-        batch.ctx = Arc::downgrade(&ctx);
-        batch.pending.push((document_id, event_id));
-        if batch.scheduled {
-            false
-        } else {
-            batch.scheduled = true;
-            true
-        }
-    };
-    if should_spawn {
-        tokio::spawn(async move {
-            tokio::time::sleep(METADATA_PROJECTION_DEBOUNCE_AFTER).await;
-            drain_metadata_projection_batch(key).await;
-        });
-    }
-}
-
-async fn drain_metadata_projection_batch(key: [u8; 32]) {
-    let Some((ctx, targets)) = take_metadata_projection_batch(key) else {
-        return;
-    };
-    if targets.is_empty() {
-        return;
-    }
-    if let Err(error) = project_metadata_create_events_from_log(ctx.as_ref(), targets).await {
-        warn!(error = ?error, "Failed to project metadata create event batch after create");
-        if let Err(error) =
-            schedule_metadata_projection_retry(ctx.as_ref(), METADATA_PROJECTION_RETRY_AFTER).await
-        {
-            warn!(error = ?error, "Failed to schedule metadata projection retry after create projection failure");
-        }
-    }
-}
-
-type ProjectionBatchTargets = (Arc<DriverContext>, Vec<(Ulid, Ulid)>);
-
-fn take_metadata_projection_batch(key: [u8; 32]) -> Option<ProjectionBatchTargets> {
-    let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut batches = batches
-        .lock()
-        .expect("metadata projection batch mutex poisoned");
-    let mut remove = false;
-    let result = batches.get_mut(&key).and_then(|batch| {
-        batch.scheduled = false;
-        let ctx = match batch.ctx.upgrade() {
-            Some(ctx) => ctx,
-            None => {
-                remove = true;
-                return None;
-            }
-        };
-        let targets = std::mem::take(&mut batch.pending);
-        Some((ctx, targets))
-    });
-    if remove {
-        batches.remove(&key);
-    }
-    result
 }
 
 async fn load_group_metadata_records(
@@ -1616,12 +1498,8 @@ async fn load_metadata_record_by_document(
     state: &ServerState,
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, None))
-        .await;
-    match parse_registry_read(event) {
+    let ctx = state.get_ctx();
+    match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
         Err(crate::routes::metadata::ReadError::Storage(error)) => {
@@ -1639,42 +1517,12 @@ async fn ensure_record_materialized_for_graph_read(
     state: &ServerState,
     record: &MetadataRegistryRecord,
 ) -> ServerResult<()> {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_effect(read_materialization_status_effect(record.document_id, None))
-        .await;
-    let status = match parse_materialization_status_read(event) {
-        Ok(status) => status,
-        Err(ReadError::Storage(error)) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        Err(ReadError::Conversion(error)) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-    };
-    let Some(status) = status else {
-        return Ok(());
-    };
-    if status.event_id == record.last_event_id
-        && !matches!(status.state, MetadataMaterializationState::Materialized)
-    {
-        return Err(ServerError::ServiceUnavailable);
-    }
-    Ok(())
-}
-
-fn upsert_visible_registry_record(state: &ServerState, record: &MetadataRegistryRecord) {
     let ctx = state.get_ctx();
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        metadata_handle.upsert_visible_registry_record(record.clone());
-    }
-}
-
-fn remove_visible_registry_record(state: &ServerState, document_id: Ulid) {
-    let ctx = state.get_ctx();
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        metadata_handle.remove_visible_registry_record(document_id);
+    match is_metadata_record_materialized_for_graph_read(ctx.as_ref(), record).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ServerError::ServiceUnavailable),
+        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.to_string())),
+        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.to_string())),
     }
 }
 
@@ -1684,18 +1532,11 @@ async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerRe
         .metadata_handle
         .clone()
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
-            graph_iri: graph_iri.to_string(),
-        }))
+    handle
+        .export_rocrate_jsonld(graph_iri.to_string())
         .await
-    {
-        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata export event: {other:?}"
-        ))),
-    }
+        .map_err(map_metadata_event_error)
+        .and_then(parse_jsonld)
 }
 
 async fn export_rocrate_summary_jsonld(
@@ -1707,18 +1548,11 @@ async fn export_rocrate_summary_jsonld(
         .metadata_handle
         .clone()
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrateSummary {
-            graph_iri: graph_iri.to_string(),
-        }))
+    handle
+        .export_rocrate_summary_jsonld(graph_iri.to_string())
         .await
-    {
-        Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata summary event: {other:?}"
-        ))),
-    }
+        .map_err(map_metadata_event_error)
+        .and_then(parse_jsonld)
 }
 
 async fn export_rocrate_page(
@@ -1735,21 +1569,15 @@ async fn export_rocrate_page(
         .metadata_handle
         .clone()
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCratePage {
-            graph_iri: graph_iri.to_string(),
-            offset: params.offset,
-            after: params.after.clone(),
+    handle
+        .export_rocrate_page(
+            graph_iri.to_string(),
             limit,
-        }))
+            params.offset,
+            params.after.clone(),
+        )
         .await
-    {
-        Event::Metadata(MetadataEvent::RoCratePageResult { page, .. }) => Ok(page),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata page event: {other:?}"
-        ))),
-    }
+        .map_err(map_metadata_event_error)
 }
 
 fn map_page_response(
@@ -1883,58 +1711,7 @@ fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
 }
 
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let cache_key = RealmNodesCacheKey {
-        realm_id: *state.get_realm_id().as_bytes(),
-        local_node_id: *state.get_node_id().as_bytes(),
-    };
-    let cache = METADATA_REALM_NODES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let now = Instant::now();
-    if let Some(nodes) = {
-        let mut cache = cache.lock().unwrap_or_else(|lock| lock.into_inner());
-        match cache.get(&cache_key) {
-            Some(entry) if entry.expires_at > now => Some(entry.nodes.clone()),
-            Some(_) => {
-                cache.remove(&cache_key);
-                None
-            }
-            None => None,
-        }
-    } {
-        return Ok(nodes);
-    }
-
-    let mut discovery_succeeded = true;
-    let nodes = match drive(
-        GetRealmNodesOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(nodes) => nodes,
-        Err(error) => {
-            discovery_succeeded = false;
-            warn!(
-                error = %error,
-                "realm node discovery failed, using best-effort local-only metadata results"
-            );
-            HashSet::new()
-        }
-    };
-    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-    if !nodes.contains(&state.get_node_id()) {
-        nodes.push(state.get_node_id());
-    }
-    if discovery_succeeded {
-        let mut cache = cache.lock().unwrap_or_else(|lock| lock.into_inner());
-        cache.insert(
-            cache_key,
-            RealmNodesCacheEntry {
-                nodes: nodes.clone(),
-                expires_at: Instant::now() + METADATA_REALM_NODES_CACHE_TTL,
-            },
-        );
-    }
-    Ok(nodes)
+    Ok(state.load_metadata_realm_nodes().await)
 }
 
 fn document_query_target_nodes(
@@ -2461,6 +2238,7 @@ mod tests {
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
     };
@@ -2478,7 +2256,11 @@ mod tests {
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-    use aruna_operations::metadata::projector::replay_metadata_event_log;
+    use aruna_operations::metadata::projector::{
+        drain_metadata_projection_batch, metadata_projection_batch_key,
+        project_metadata_create_events_from_log, replay_metadata_event_log,
+        take_metadata_projection_batch, wake_metadata_create_projection,
+    };
     use aruna_operations::metadata::prune_queue::{
         metadata_graph_prune_jobs_exist, process_metadata_graph_tombstones,
     };

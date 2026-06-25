@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -43,7 +44,20 @@ use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
+const METADATA_PROJECTION_DEBOUNCE_AFTER: Duration = Duration::from_millis(100);
 pub const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+static METADATA_PROJECTION_BATCHES: OnceLock<Mutex<HashMap<[u8; 32], MetadataProjectionBatch>>> =
+    OnceLock::new();
+
+struct MetadataProjectionBatch {
+    ctx: Weak<DriverContext>,
+    pending: Vec<(Ulid, Ulid)>,
+    scheduled: bool,
+}
+
+#[doc(hidden)]
+pub type ProjectionBatchTargets = (Arc<DriverContext>, Vec<(Ulid, Ulid)>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingMetadataProjectionDrainResult {
@@ -77,6 +91,92 @@ fn metadata_projection_drain_task_effect(after: Duration) -> TaskEffect {
 
 pub fn schedule_metadata_projection_drain_effect(after: Duration) -> Effect {
     Effect::Task(metadata_projection_drain_task_effect(after))
+}
+
+#[doc(hidden)]
+pub fn metadata_projection_batch_key(ctx: &Arc<DriverContext>) -> [u8; 32] {
+    match ctx.net_handle.as_ref() {
+        Some(net) => *net.node_id().as_bytes(),
+        None => {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&(Arc::as_ptr(ctx) as usize as u64).to_be_bytes());
+            key
+        }
+    }
+}
+
+pub fn wake_metadata_create_projection(ctx: Arc<DriverContext>, document_id: Ulid, event_id: Ulid) {
+    let key = metadata_projection_batch_key(&ctx);
+    let should_spawn = {
+        let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut batches = batches
+            .lock()
+            .expect("metadata projection batch mutex poisoned");
+        let batch = batches
+            .entry(key)
+            .or_insert_with(|| MetadataProjectionBatch {
+                ctx: Arc::downgrade(&ctx),
+                pending: Vec::new(),
+                scheduled: false,
+            });
+        batch.ctx = Arc::downgrade(&ctx);
+        batch.pending.push((document_id, event_id));
+        if batch.scheduled {
+            false
+        } else {
+            batch.scheduled = true;
+            true
+        }
+    };
+    if should_spawn {
+        tokio::spawn(async move {
+            tokio::time::sleep(METADATA_PROJECTION_DEBOUNCE_AFTER).await;
+            drain_metadata_projection_batch(key).await;
+        });
+    }
+}
+
+#[doc(hidden)]
+pub async fn drain_metadata_projection_batch(key: [u8; 32]) {
+    let Some((ctx, targets)) = take_metadata_projection_batch(key) else {
+        return;
+    };
+    if targets.is_empty() {
+        return;
+    }
+    if let Err(error) = project_metadata_create_events_from_log(ctx.as_ref(), targets).await {
+        tracing::warn!(error = ?error, "Failed to project metadata create event batch after create");
+        if let Err(error) =
+            schedule_metadata_projection_retry(ctx.as_ref(), METADATA_PROJECTION_RETRY_AFTER).await
+        {
+            tracing::warn!(error = ?error, "Failed to schedule metadata projection retry after create projection failure");
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn take_metadata_projection_batch(key: [u8; 32]) -> Option<ProjectionBatchTargets> {
+    let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut batches = batches
+        .lock()
+        .expect("metadata projection batch mutex poisoned");
+    let mut remove = false;
+    let result = batches.get_mut(&key).and_then(|batch| {
+        batch.scheduled = false;
+        let ctx = match batch.ctx.upgrade() {
+            Some(ctx) => ctx,
+            None => {
+                remove = true;
+                return None;
+            }
+        };
+        let targets = std::mem::take(&mut batch.pending);
+        Some((ctx, targets))
+    });
+    if remove {
+        batches.remove(&key);
+    }
+    result
 }
 
 pub async fn schedule_metadata_projection_retry(

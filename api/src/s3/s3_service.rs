@@ -12,14 +12,10 @@ use crate::s3::util::{
     s3_checksum_type_from_multipart,
 };
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BlobVersion, BlobVersionState, BucketInfo, Permission, RealmId, SourceMetadata,
-    UserAccess, VersionKey, blob_bucket_permission_path,
+    AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -50,6 +46,9 @@ use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
+use aruna_operations::s3::refresh_reference_metadata::{
+    ReferenceMetadataRefresh, refresh_reference_metadata,
+};
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -88,15 +87,6 @@ const S3_URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
-
-#[derive(Debug)]
-struct ReferenceMetadataRefresh {
-    bucket: String,
-    key: String,
-    version_id: ulid::Ulid,
-    metadata: SourceMetadata,
-    refreshed_at: SystemTime,
-}
 
 fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
     match range {
@@ -483,139 +473,6 @@ fn reference_metadata_refresh(
         metadata: result.source_metadata.clone()?,
         refreshed_at: result.last_refresh?,
     })
-}
-
-async fn refresh_reference_metadata(
-    context: Arc<DriverContext>,
-    refresh: ReferenceMetadataRefresh,
-) -> Result<(), String> {
-    let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id)
-        .to_bytes()
-        .map_err(|err| err.to_string())?;
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected start transaction event: {other:?}")),
-    };
-
-    let refreshed_value = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: version_key.clone().into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(err) => {
-                    abort_reference_refresh(&context, txn_id).await;
-                    return Err(err.to_string());
-                }
-            };
-            let BlobVersion {
-                created_at,
-                created_by,
-                state,
-            } = version;
-            let BlobVersionState::Reference {
-                source,
-                last_refresh,
-                ..
-            } = state
-            else {
-                abort_reference_refresh(&context, txn_id).await;
-                return Ok(());
-            };
-            if refresh.refreshed_at <= last_refresh {
-                None
-            } else {
-                Some(
-                    match BlobVersion::reference(
-                        source,
-                        refresh.metadata,
-                        created_at,
-                        created_by,
-                        refresh.refreshed_at,
-                    )
-                    .to_bytes()
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            abort_reference_refresh(&context, txn_id).await;
-                            return Err(err.to_string());
-                        }
-                    },
-                )
-            }
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_reference_refresh(&context, txn_id).await;
-            return Ok(());
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_reference_refresh(&context, txn_id).await;
-            return Err(error.to_string());
-        }
-        other => {
-            abort_reference_refresh(&context, txn_id).await;
-            return Err(format!("unexpected version read event: {other:?}"));
-        }
-    };
-
-    if let Some(refreshed_value) = refreshed_value {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: version_key.into(),
-                value: refreshed_value.into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                abort_reference_refresh(&context, txn_id).await;
-                return Err(error.to_string());
-            }
-            other => {
-                abort_reference_refresh(&context, txn_id).await;
-                return Err(format!("unexpected version write event: {other:?}"));
-            }
-        }
-    }
-
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_reference_refresh(&context, txn_id).await;
-            Err(error.to_string())
-        }
-        other => {
-            abort_reference_refresh(&context, txn_id).await;
-            Err(format!("unexpected commit event: {other:?}"))
-        }
-    }
-}
-
-async fn abort_reference_refresh(context: &DriverContext, txn_id: ulid::Ulid) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
 }
 
 #[async_trait::async_trait]
@@ -1357,10 +1214,15 @@ impl S3 for ArunaS3Service {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    };
     use aruna_core::structs::{
-        BackendLocation, BlobHeadKey, CurrentVersionPointer, PortableSourceDescriptor,
-        SourceConnectorKind, StagingStrategy, VersionSourceBinding,
+        BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
+        PortableSourceDescriptor, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
+        VersionSourceBinding,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;

@@ -14,5 +14,6 @@ pub mod list_objects_v2;
 pub mod list_user_access;
 pub mod put_bucket_replication;
 pub mod put_object;
+pub mod refresh_reference_metadata;
 pub mod revoke_user_access;
 pub mod upload_part;

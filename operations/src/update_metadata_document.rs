@@ -15,6 +15,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync_outbox::schedule_outbox_drain_effect;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
     schedule_metadata_materialization_drain_effect,
@@ -237,6 +238,17 @@ impl UpdateMetadataDocumentOperation {
             got,
         })
     }
+}
+
+pub async fn update_metadata_document(
+    operation: UpdateMetadataDocumentOperation,
+    context: &DriverContext,
+) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
+    let updated = drive(operation, context).await?;
+    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+        metadata_handle.upsert_visible_registry_record(updated.clone());
+    }
+    Ok(updated)
 }
 
 fn validate_entity_jsonld(jsonld: &str) -> Result<(), MetadataError> {

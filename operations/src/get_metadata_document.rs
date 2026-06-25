@@ -1,4 +1,5 @@
 use aruna_core::events::Event;
+use aruna_core::handle::Handle;
 use aruna_core::metadata::{
     MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent,
     MetadataMaterializationState,
@@ -10,10 +11,11 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::driver::DriverContext;
 use crate::metadata::repository::{
     StorageReadError, parse_graph_lifecycle_read, parse_materialization_status_read,
     parse_registry_read, read_graph_lifecycle_effect, read_materialization_status_effect,
-    read_registry_effect,
+    read_registry_by_document_effect, read_registry_effect,
 };
 
 #[derive(Debug, PartialEq)]
@@ -79,6 +81,32 @@ impl GetMetadataDocumentOperation {
             got,
         })
     }
+}
+
+pub async fn load_metadata_record_by_document(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
+    let event = context
+        .storage_handle
+        .send_effect(read_registry_by_document_effect(document_id, None))
+        .await;
+    parse_registry_read(event)
+}
+
+pub async fn is_metadata_record_materialized_for_graph_read(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<bool, StorageReadError> {
+    let event = context
+        .storage_handle
+        .send_effect(read_materialization_status_effect(record.document_id, None))
+        .await;
+    let Some(status) = parse_materialization_status_read(event)? else {
+        return Ok(true);
+    };
+    Ok(status.event_id != record.last_event_id
+        || matches!(status.state, MetadataMaterializationState::Materialized))
 }
 
 impl Operation for GetMetadataDocumentOperation {
