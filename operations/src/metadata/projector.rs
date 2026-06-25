@@ -16,7 +16,8 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
+    metadata_document_lifecycle_revision_change, metadata_event_log_key,
+    metadata_graph_lifecycle_key, metadata_materialization_status_key,
     metadata_pending_projection_delete_entry, metadata_pending_projection_target,
     metadata_registry_delete_entries,
 };
@@ -564,6 +565,7 @@ pub fn create_event_outbox_record(event: &MetadataCreateEventRecord) -> Document
     let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
+    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
@@ -574,6 +576,7 @@ pub fn create_event_outbox_record(event: &MetadataCreateEventRecord) -> Document
         event: DocumentSyncOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(&lifecycle)
                 .expect("metadata document lifecycle event serializes"),
+            change,
         },
         updated_at: event.occurred_at_ms / 1_000,
     }
@@ -832,7 +835,7 @@ mod tests {
                 document_id: event.record.document_id
             }
         );
-        let DocumentSyncOutboxEvent::Upsert { bytes } = outbox.event else {
+        let DocumentSyncOutboxEvent::Upsert { bytes, change } = outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
         let lifecycle: MetadataDocumentLifecycleRecord =
@@ -843,5 +846,10 @@ mod tests {
                 event: Box::new(event.clone())
             }
         );
+        assert_eq!(
+            change.kind,
+            aruna_core::document::DocumentSyncChangeKind::Upsert
+        );
+        assert_eq!(change.current.event_id, event.event_id);
     }
 }

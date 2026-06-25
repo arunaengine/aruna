@@ -304,7 +304,7 @@ fn document_lifecycle_revision_from_outbox(
     ) {
         return Ok(None);
     }
-    let DocumentSyncOutboxEvent::Upsert { bytes } = &outbox.event else {
+    let DocumentSyncOutboxEvent::Upsert { bytes, .. } = &outbox.event else {
         return Ok(None);
     };
     let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;

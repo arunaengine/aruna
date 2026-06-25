@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
+    DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -12,7 +15,10 @@ use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
     MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
 };
-use aruna_core::storage_entries::{metadata_create_event_write_entry, metadata_event_log_key};
+use aruna_core::storage_entries::{
+    metadata_create_event_write_entry, metadata_document_lifecycle_revision_change,
+    metadata_event_log_key,
+};
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
 };
@@ -532,20 +538,61 @@ async fn publish_document_to_peer(
     match node
         .net
         .send_effect(Effect::Net(NetEffect::Irokle(
-            IrokleEffect::PublishDocument {
-                event_id,
-                target: target.clone(),
-                bytes,
+            IrokleEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    change: document_change_for_publish(node.net.node_id(), &target, &bytes)?,
+                    bytes,
+                }],
                 peers: vec![peer],
             },
         )))
         .await
     {
-        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target: published })) => {
-            assert_eq!(published, target);
+        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished { targets })) => {
+            assert_eq!(targets, vec![target]);
             Ok(())
         }
         other => Err(format!("unexpected publish event: {other:?}").into()),
+    }
+}
+
+fn document_change_for_publish(
+    node_id: aruna_core::NodeId,
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> Result<DocumentSyncChange, Box<dyn std::error::Error>> {
+    match target {
+        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+            let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+            if lifecycle.document_id() != *document_id {
+                return Err("metadata document lifecycle target mismatch".into());
+            }
+            Ok(metadata_document_lifecycle_revision_change(
+                &lifecycle, node_id,
+            ))
+        }
+        DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        } => {
+            let record: MetadataCreateEventRecord = postcard::from_bytes(bytes)?;
+            if record.record.document_id != *document_id || record.event_id != *event_id {
+                return Err("metadata create-event target mismatch".into());
+            }
+            Ok(DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: record.record.updated_at_ms,
+                    event_id: record.event_id,
+                    actor: record.node_id,
+                    updated_at_ms: record.occurred_at_ms,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+            })
+        }
+        _ => Err("unsupported test publish target".into()),
     }
 }
 

@@ -1,4 +1,7 @@
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
+    DocumentSyncRevision, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
@@ -6,6 +9,7 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
@@ -16,8 +20,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync_outbox::{
-    new_outbox_record, new_outbox_record_with_id, schedule_outbox_drain_effect,
-    write_outbox_effect_with_txn,
+    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::prune_queue::{
@@ -153,6 +156,8 @@ impl DeleteMetadataDocumentOperation {
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
+        let change =
+            metadata_document_lifecycle_revision_change(lifecycle_record, self.actor.node_id);
         Ok(new_outbox_record_with_id(
             lifecycle_record.event_id(),
             self.actor.node_id,
@@ -160,7 +165,7 @@ impl DeleteMetadataDocumentOperation {
                 document_id: record.document_id,
             },
             record.holder_node_ids.clone(),
-            DocumentSyncOutboxEvent::Upsert { bytes },
+            DocumentSyncOutboxEvent::Upsert { bytes, change },
         ))
     }
 
@@ -186,13 +191,25 @@ impl DeleteMetadataDocumentOperation {
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        let outbox = new_outbox_record(
+        let outbox_id = Ulid::new();
+        let change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: lifecycle_record.updated_at_ms,
+                event_id: outbox_id,
+                actor: self.actor.node_id,
+                updated_at_ms: lifecycle_record.updated_at_ms,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+        let outbox = new_outbox_record_with_id(
+            outbox_id,
             self.actor.node_id,
             DocumentSyncTarget::MetadataGraphLifecycle {
                 graph_iri: lifecycle_record.graph_iri.clone(),
             },
             record.holder_node_ids.clone(),
-            DocumentSyncOutboxEvent::Upsert { bytes },
+            DocumentSyncOutboxEvent::Upsert { bytes, change },
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -212,14 +229,20 @@ impl DeleteMetadataDocumentOperation {
         record: &MetadataRegistryRecord,
         txn_id: Ulid,
     ) -> Result<Effects, DeleteMetadataDocumentError> {
-        let outbox = new_outbox_record(
+        let Some(lifecycle_record) = self.document_lifecycle_record.as_ref() else {
+            return Err(DeleteMetadataDocumentError::DocumentNotFound);
+        };
+        let change =
+            metadata_document_lifecycle_revision_change(lifecycle_record, self.actor.node_id);
+        let outbox = new_outbox_record_with_id(
+            lifecycle_record.event_id(),
             self.actor.node_id,
             DocumentSyncTarget::MetadataRegistry {
                 group_id: record.group_id,
                 document_id: record.document_id,
             },
             record.holder_node_ids.clone(),
-            DocumentSyncOutboxEvent::Delete,
+            DocumentSyncOutboxEvent::Delete { change },
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -681,9 +704,10 @@ mod tests {
                 document_id: record.document_id
             }
         );
-        let DocumentSyncOutboxEvent::Upsert { bytes } = outbox.event else {
+        let DocumentSyncOutboxEvent::Upsert { bytes, change } = outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
+        assert_eq!(change.kind, DocumentSyncChangeKind::Delete);
         let lifecycle: MetadataDocumentLifecycleRecord =
             postcard::from_bytes(&bytes).expect("lifecycle payload decodes");
         let MetadataDocumentLifecycleRecord::Delete { event } = lifecycle else {

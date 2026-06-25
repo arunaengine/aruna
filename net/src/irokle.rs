@@ -10,9 +10,8 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict,
-    DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
-    IrokleEvent, document_sync_apply_decision,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncPublish,
+    DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -27,14 +26,14 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, document_sync_conflict_write_entry,
-    document_sync_revision_key, document_sync_revision_write_entry,
-    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
-    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
-    metadata_registry_write_entries, stale_admin_document_conflict_delete_entries,
-    stale_subject_index_deletes, subject_index_writes,
+    admin_document_reducer_state_write_entry, document_sync_revision_key,
+    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
+    metadata_document_lifecycle_key, metadata_document_lifecycle_revision_change,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
+    metadata_registry_delete_entries, metadata_registry_write_entries,
+    stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
+    subject_index_writes,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument,
@@ -305,46 +304,6 @@ impl IrokleService {
         self.reconcile_document_topics(topic_ids).await
     }
 
-    pub async fn publish_document(
-        &self,
-        event_id: Ulid,
-        target: DocumentSyncTarget,
-        bytes: Vec<u8>,
-        peers: Vec<NodeId>,
-    ) -> IrokleEvent {
-        let event = DocumentSyncEvent::Upsert {
-            event_id,
-            target: target.clone(),
-            bytes,
-        };
-        match self.publish_event(event, peers).await {
-            Ok(()) => IrokleEvent::DocumentPublished { target },
-            Err(error) => IrokleEvent::Error {
-                target: Some(target),
-                error: error.to_string(),
-            },
-        }
-    }
-
-    pub async fn delete_document(
-        &self,
-        event_id: Ulid,
-        target: DocumentSyncTarget,
-        peers: Vec<NodeId>,
-    ) -> IrokleEvent {
-        let event = DocumentSyncEvent::Delete {
-            event_id,
-            target: target.clone(),
-        };
-        match self.publish_event(event, peers).await {
-            Ok(()) => IrokleEvent::DocumentDeleted { target },
-            Err(error) => IrokleEvent::Error {
-                target: Some(target),
-                error: error.to_string(),
-            },
-        }
-    }
-
     pub async fn publish_documents(
         &self,
         documents: Vec<DocumentSyncPublish>,
@@ -528,59 +487,6 @@ impl IrokleService {
         }
     }
 
-    async fn publish_event(&self, event: DocumentSyncEvent, peers: Vec<NodeId>) -> Result<()> {
-        let topic_id = event.target().irokle_topic_id();
-        let document = match event {
-            DocumentSyncEvent::Upsert {
-                event_id,
-                target,
-                bytes,
-            } => DocumentSyncPublish::Upsert {
-                event_id,
-                target,
-                bytes,
-            },
-            DocumentSyncEvent::UpsertWithRevision {
-                event_id,
-                target,
-                bytes,
-                change,
-            } => DocumentSyncPublish::UpsertWithRevision {
-                event_id,
-                target,
-                bytes,
-                change,
-            },
-            DocumentSyncEvent::Delete { event_id, target } => {
-                DocumentSyncPublish::Delete { event_id, target }
-            }
-            DocumentSyncEvent::DeleteWithRevision {
-                event_id,
-                target,
-                change,
-            } => DocumentSyncPublish::DeleteWithRevision {
-                event_id,
-                target,
-                change,
-            },
-            DocumentSyncEvent::AdminOperation { target, event } => {
-                DocumentSyncPublish::AdminOperation { target, event }
-            }
-        };
-        let sync_peers = self.sync_peers(peers);
-        self.allow_sync_peers(&sync_peers)?;
-        let service = self.clone();
-        let published = tokio::task::spawn_blocking(move || {
-            service.publish_events_blocking(vec![document], &sync_peers)
-        })
-        .await
-        .map_err(|error| NetError::Bootstrap(error.to_string()))??;
-        self.advance_topic_cursors(published).await?;
-        self.net.schedule_topic_recheck(topic_id)?;
-        self.flush_database()?;
-        Ok(())
-    }
-
     async fn publish_events(
         &self,
         documents: Vec<DocumentSyncPublish>,
@@ -619,30 +525,18 @@ impl IrokleService {
                     event_id,
                     target,
                     bytes,
+                    change,
                 } => DocumentSyncEvent::Upsert {
                     event_id,
                     target,
                     bytes,
-                },
-                DocumentSyncPublish::UpsertWithRevision {
-                    event_id,
-                    target,
-                    bytes,
-                    change,
-                } => DocumentSyncEvent::UpsertWithRevision {
-                    event_id,
-                    target,
-                    bytes,
                     change,
                 },
-                DocumentSyncPublish::Delete { event_id, target } => {
-                    DocumentSyncEvent::Delete { event_id, target }
-                }
-                DocumentSyncPublish::DeleteWithRevision {
+                DocumentSyncPublish::Delete {
                     event_id,
                     target,
                     change,
-                } => DocumentSyncEvent::DeleteWithRevision {
+                } => DocumentSyncEvent::Delete {
                     event_id,
                     target,
                     change,
@@ -1324,24 +1218,15 @@ impl IrokleService {
                     continue;
                 }
                 match event {
-                    event @ (DocumentSyncEvent::Upsert {
+                    event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
-                    }
-                    | DocumentSyncEvent::UpsertWithRevision {
-                        target: DocumentSyncTarget::MetadataCreateEvent { .. },
-                        ..
-                    }) => {
+                    } => {
                         let pending = self.pending_metadata_create_apply(event)?;
                         pending_metadata_creates.push(pending);
                         deferred_creates = true;
                     }
                     DocumentSyncEvent::Upsert {
-                        target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-                        bytes,
-                        ..
-                    }
-                    | DocumentSyncEvent::UpsertWithRevision {
                         target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
                         bytes,
                         ..
@@ -1394,11 +1279,6 @@ impl IrokleService {
                         }
                     }
                     DocumentSyncEvent::Upsert {
-                        target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
-                        bytes,
-                        ..
-                    }
-                    | DocumentSyncEvent::UpsertWithRevision {
                         target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
                         bytes,
                         ..
@@ -1517,15 +1397,6 @@ impl IrokleService {
                     },
                 bytes,
                 ..
-            }
-            | DocumentSyncEvent::UpsertWithRevision {
-                target:
-                    DocumentSyncTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: target_event_id,
-                    },
-                bytes,
-                ..
             } => (document_id, target_event_id, bytes),
             _ => unreachable!(
                 "metadata create apply helper is only called for metadata create upserts"
@@ -1605,18 +1476,14 @@ impl IrokleService {
 
     async fn apply_document_event(&self, event: DocumentSyncEvent) -> Result<()> {
         match event {
-            DocumentSyncEvent::Upsert { target, bytes, .. } => {
-                self.apply_upsert(target, bytes).await
-            }
-            DocumentSyncEvent::UpsertWithRevision {
+            DocumentSyncEvent::Upsert {
                 target,
                 bytes,
                 change,
                 ..
-            } => self.apply_upsert_with_revision(target, bytes, change).await,
-            DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
-            DocumentSyncEvent::DeleteWithRevision { target, change, .. } => {
-                self.apply_delete_with_revision(target, change).await
+            } => self.apply_upsert(target, bytes, change).await,
+            DocumentSyncEvent::Delete { target, change, .. } => {
+                self.apply_delete(target, change).await
             }
             DocumentSyncEvent::AdminOperation { target, event } => {
                 apply_admin_document_operation_to_storage(&self.storage, target, *event).await
@@ -1624,34 +1491,18 @@ impl IrokleService {
         }
     }
 
-    async fn apply_upsert_with_revision(
+    async fn apply_upsert(
         &self,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        _change: DocumentSyncChange,
     ) -> Result<()> {
-        if matches!(
-            target,
-            DocumentSyncTarget::User { .. }
-                | DocumentSyncTarget::Group { .. }
-                | DocumentSyncTarget::GroupAuthorization { .. }
-                | DocumentSyncTarget::RealmAuthorization { .. }
-                | DocumentSyncTarget::RealmConfig { .. }
-        ) {
-            return apply_revisioned_upsert_to_storage(&self.storage, target, bytes, change).await;
+        if admin_document_target_for_reduced_document(&target).is_some() {
+            return Err(NetError::Bootstrap(
+                "whole-document admin sync is unsupported; admin documents must sync as operations"
+                    .to_string(),
+            ));
         }
-        self.apply_upsert(target, bytes).await
-    }
-
-    async fn apply_delete_with_revision(
-        &self,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
-    ) -> Result<()> {
-        apply_revisioned_delete_to_storage(&self.storage, target, change).await
-    }
-
-    async fn apply_upsert(&self, target: DocumentSyncTarget, bytes: Vec<u8>) -> Result<()> {
         if let DocumentSyncTarget::MetadataCreateEvent {
             document_id,
             event_id,
@@ -1728,17 +1579,6 @@ impl IrokleService {
                 .await
                 .map(|_| ());
         }
-        if matches!(
-            target,
-            DocumentSyncTarget::Group { .. }
-                | DocumentSyncTarget::User { .. }
-                | DocumentSyncTarget::GroupAuthorization { .. }
-                | DocumentSyncTarget::RealmAuthorization { .. }
-                | DocumentSyncTarget::RealmConfig { .. }
-        ) {
-            return apply_legacy_admin_document_upsert_to_storage(&self.storage, target, bytes)
-                .await;
-        }
         self.storage_write(
             target.storage_keyspace().to_string(),
             target.storage_key(),
@@ -1775,7 +1615,16 @@ impl IrokleService {
         metadata_create_fenced_in_storage(&self.storage, event).await
     }
 
-    async fn apply_delete(&self, target: DocumentSyncTarget) -> Result<()> {
+    async fn apply_delete(
+        &self,
+        target: DocumentSyncTarget,
+        change: DocumentSyncChange,
+    ) -> Result<()> {
+        if change.kind != DocumentSyncChangeKind::Delete {
+            return Err(NetError::Bootstrap(
+                "document sync delete must carry a delete change".to_string(),
+            ));
+        }
         if let DocumentSyncTarget::MetadataGraphLifecycle { .. } = target {
             return Ok(());
         }
@@ -1790,14 +1639,15 @@ impl IrokleService {
             return apply_metadata_registry_delete_to_storage(&self.storage, group_id, document_id)
                 .await;
         }
-        if apply_legacy_admin_document_delete_to_storage(&self.storage, target.clone()).await? {
-            return Ok(());
+        if admin_document_target_for_reduced_document(&target).is_some() {
+            return Err(NetError::Bootstrap(
+                "whole-document admin sync is unsupported; admin documents must sync as operations"
+                    .to_string(),
+            ));
         }
-        if document_sync_revision_exists(&self.storage, &target).await? {
-            return Ok(());
-        }
-        self.storage_delete(target.storage_keyspace().to_string(), target.storage_key())
-            .await
+        Err(NetError::Bootstrap(
+            "document sync delete target is unsupported".to_string(),
+        ))
     }
 
     async fn storage_read(&self, key_space: String, key: ByteView) -> Result<Option<Value>> {
@@ -1846,679 +1696,12 @@ impl IrokleService {
     }
 }
 
-async fn apply_revisioned_upsert_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    bytes: Vec<u8>,
-    change: DocumentSyncChange,
-) -> Result<()> {
-    if change.kind != DocumentSyncChangeKind::Upsert {
-        return Err(NetError::Bootstrap(
-            "revisioned upsert must carry an upsert change".to_string(),
-        ));
-    }
-
-    if let DocumentSyncTarget::User { user_id } = target {
-        return apply_revisioned_user_upsert_to_storage(storage, user_id, bytes, change).await;
-    }
-    apply_revisioned_admin_document_upsert_to_storage(storage, target, bytes, change).await
-}
-
-async fn apply_revisioned_admin_document_upsert_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    bytes: Vec<u8>,
-    change: DocumentSyncChange,
-) -> Result<()> {
-    validate_admin_document_upsert(&target, &bytes)?;
-    if admin_document_reducer_state_exists(storage, &target).await? {
-        return Ok(());
-    }
-
-    let local_change = read_document_sync_change(storage, &target).await?;
-    let local_bytes = read_document_primary_bytes(storage, &target).await?;
-    match document_sync_apply_decision(local_change.as_ref(), &change) {
-        DocumentSyncApplyDecision::Apply => {
-            let writes = vec![
-                target_write_entry(target.clone(), bytes.into()),
-                document_sync_revision_write_entry(&target, &change)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            ];
-            storage_batch_write_to(storage, writes).await
-        }
-        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => Ok(()),
-        DocumentSyncApplyDecision::Conflict => {
-            write_document_sync_conflict(storage, target, local_change, local_bytes, change, bytes)
-                .await
-        }
-    }
-}
-
-async fn apply_revisioned_delete_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    change: DocumentSyncChange,
-) -> Result<()> {
-    if change.kind != DocumentSyncChangeKind::Delete {
-        return Err(NetError::Bootstrap(
-            "revisioned delete must carry a delete change".to_string(),
-        ));
-    }
-
-    if matches!(
-        target,
-        DocumentSyncTarget::MetadataGraphLifecycle { .. }
-            | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
-    ) {
-        return Ok(());
-    }
-    if let DocumentSyncTarget::MetadataRegistry {
-        group_id,
-        document_id,
-    } = target
-    {
-        return apply_metadata_registry_delete_to_storage(storage, group_id, document_id).await;
-    }
-
-    apply_revisioned_admin_document_delete_to_storage(storage, target, change).await
-}
-
-async fn apply_revisioned_admin_document_delete_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    change: DocumentSyncChange,
-) -> Result<()> {
-    if admin_document_target_for_legacy_upsert(&target).is_none() {
-        return Err(NetError::Bootstrap(
-            "revisioned delete target is not admin-reduced".to_string(),
-        ));
-    }
-    if admin_document_reducer_state_exists(storage, &target).await? {
-        return Ok(());
-    }
-
-    let local_change = read_document_sync_change(storage, &target).await?;
-    let local_bytes = read_document_primary_bytes(storage, &target).await?;
-    match document_sync_apply_decision(local_change.as_ref(), &change) {
-        DocumentSyncApplyDecision::Apply => {
-            let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
-            if matches!(target, DocumentSyncTarget::User { .. })
-                && let Some(previous) = local_bytes
-                    .as_ref()
-                    .map(|bytes| User::from_bytes(bytes.as_ref()))
-                    .transpose()
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            {
-                deletes.extend(stale_subject_index_deletes(Some(&previous), None));
-            }
-            let writes = vec![
-                document_sync_revision_write_entry(&target, &change)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-            ];
-            storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
-        }
-        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => Ok(()),
-        DocumentSyncApplyDecision::Conflict => {
-            write_document_sync_conflict(
-                storage,
-                target,
-                local_change,
-                local_bytes,
-                change,
-                Vec::new(),
-            )
-            .await
-        }
-    }
-}
-
-async fn admin_document_reducer_state_exists(
-    storage: &StorageHandle,
-    target: &DocumentSyncTarget,
-) -> Result<bool> {
-    let Some(admin_target) = admin_document_target_for_legacy_upsert(target) else {
-        return Ok(false);
-    };
-    let reducer_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&admin_target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if let Some(reducer_state) = reducer_state.as_ref()
-        && reducer_state.target != admin_target
-    {
-        return Err(NetError::Bootstrap(
-            "admin document reducer state target mismatch".to_string(),
-        ));
-    }
-    Ok(reducer_state.is_some())
-}
-
-async fn document_sync_revision_exists(
-    storage: &StorageHandle,
-    target: &DocumentSyncTarget,
-) -> Result<bool> {
-    Ok(read_document_sync_change(storage, target).await?.is_some())
-}
-
-async fn read_document_sync_change(
-    storage: &StorageHandle,
-    target: &DocumentSyncTarget,
-) -> Result<Option<DocumentSyncChange>> {
-    storage_read_from(
-        storage,
-        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-        document_sync_revision_key(target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<DocumentSyncChange>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
-async fn read_document_primary_bytes(
-    storage: &StorageHandle,
-    target: &DocumentSyncTarget,
-) -> Result<Option<Value>> {
-    storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await
-}
-
-async fn write_document_sync_conflict(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    local_change: Option<DocumentSyncChange>,
-    local_bytes: Option<Value>,
-    incoming_change: DocumentSyncChange,
-    incoming_bytes: Vec<u8>,
-) -> Result<()> {
-    let conflict = DocumentSyncConflict {
-        target: target.clone(),
-        local_change,
-        local_bytes: local_bytes.map(|bytes| bytes.as_ref().to_vec()),
-        incoming_change,
-        incoming_bytes,
-    };
-    storage_batch_write_to(
-        storage,
-        vec![
-            document_sync_conflict_write_entry(&target, &conflict)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        ],
-    )
-    .await
-}
-
-fn validate_admin_document_upsert(target: &DocumentSyncTarget, bytes: &[u8]) -> Result<()> {
-    match target {
-        DocumentSyncTarget::Group { group_id } => {
-            let group =
-                Group::from_bytes(bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if group.group_id != *group_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated group document id {group_id} does not match payload group id {}",
-                    group.group_id
-                )));
-            }
-        }
-        DocumentSyncTarget::GroupAuthorization { group_id } => {
-            let auth_doc = GroupAuthorizationDocument::from_bytes(bytes)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if auth_doc.group_id != *group_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated group authorization document id {group_id} does not match payload group id {}",
-                    auth_doc.group_id
-                )));
-            }
-        }
-        DocumentSyncTarget::RealmAuthorization { realm_id } => {
-            let auth_doc = RealmAuthorizationDocument::from_bytes(bytes)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if auth_doc.realm_id != *realm_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated realm authorization document id {realm_id} does not match payload realm id {}",
-                    auth_doc.realm_id
-                )));
-            }
-        }
-        DocumentSyncTarget::RealmConfig { realm_id } => {
-            let config = RealmConfigDocument::from_bytes(bytes)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if config.realm_id != *realm_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated realm config document id {realm_id} does not match payload realm id {}",
-                    config.realm_id
-                )));
-            }
-        }
-        _ => {
-            return Err(NetError::Bootstrap(
-                "revisioned admin upsert target is not admin-reduced".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn apply_legacy_admin_document_delete_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-) -> Result<bool> {
-    let Some(admin_target) = admin_document_target_for_legacy_upsert(&target) else {
-        return Ok(false);
-    };
-    let reducer_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&admin_target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if let Some(reducer_state) = reducer_state.as_ref()
-        && reducer_state.target != admin_target
-    {
-        return Err(NetError::Bootstrap(
-            "legacy admin delete reducer state target mismatch".to_string(),
-        ));
-    }
-    // Migration policy: legacy whole-document admin deletes are bootstrap-only.
-    // Once reducer state exists, reducer operations are authoritative for this target.
-    if reducer_state.is_some() {
-        return Ok(true);
-    }
-    if document_sync_revision_exists(storage, &target).await? {
-        return Ok(true);
-    }
-
-    if let DocumentSyncTarget::User { user_id } = target {
-        let target = DocumentSyncTarget::User { user_id };
-        let previous = storage_read_from(
-            storage,
-            target.storage_keyspace().to_string(),
-            target.storage_key(),
-        )
-        .await?
-        .map(|bytes| User::from_bytes(&bytes))
-        .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
-        if let Some(previous) = previous {
-            deletes.extend(stale_subject_index_deletes(Some(&previous), None));
-        }
-        storage_batch_delete_to(storage, deletes).await?;
-        return Ok(true);
-    }
-
-    storage_batch_delete_to(
-        storage,
-        vec![(target.storage_keyspace().to_string(), target.storage_key())],
-    )
-    .await?;
-    Ok(true)
-}
-
-async fn apply_legacy_admin_document_upsert_to_storage(
-    storage: &StorageHandle,
-    target: DocumentSyncTarget,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    let admin_target = admin_document_target_for_legacy_upsert(&target).ok_or_else(|| {
-        NetError::Bootstrap("legacy admin upsert target is not admin-reduced".to_string())
-    })?;
-    let reducer_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&admin_target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if let Some(reducer_state) = reducer_state.as_ref()
-        && reducer_state.target != admin_target
-    {
-        return Err(NetError::Bootstrap(
-            "legacy admin upsert reducer state target mismatch".to_string(),
-        ));
-    }
-    // Migration policy: legacy whole-document admin upserts are retained only to
-    // hydrate targets that have not seen reducer state yet. Late legacy payloads
-    // are skipped so operation streams stay authoritative after cutover.
-    if reducer_state.is_some() {
-        return Ok(());
-    }
-
-    match target {
-        DocumentSyncTarget::Group { group_id } => {
-            let target = DocumentSyncTarget::Group { group_id };
-            let mut group = Group::from_bytes(&bytes)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if group.group_id != group_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated group document id {group_id} does not match payload group id {}",
-                    group.group_id
-                )));
-            }
-            let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-                if group_metadata_conflicted(reducer_state) {
-                    let Some(previous_group) = storage_read_from(
-                        storage,
-                        target.storage_keyspace().to_string(),
-                        target.storage_key(),
-                    )
-                    .await?
-                    .map(|bytes| Group::from_bytes(&bytes))
-                    .transpose()
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                    else {
-                        return Ok(());
-                    };
-                    if previous_group.group_id != group_id {
-                        return Err(NetError::Bootstrap(format!(
-                            "stored group document id {group_id} does not match payload group id {}",
-                            previous_group.group_id
-                        )));
-                    }
-                    if reducer_state
-                        .conflicts
-                        .contains_key(GROUP_DISPLAY_NAME_PATH)
-                    {
-                        group.display_name = previous_group.display_name;
-                    }
-                    if reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH) {
-                        group.realm_id = previous_group.realm_id;
-                    }
-                }
-                overlay_group_reducer_materialization(&mut group, reducer_state);
-                postcard::to_allocvec(&group)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            } else {
-                bytes
-            };
-            storage_batch_write_to(storage, vec![target_write_entry(target, bytes.into())]).await
-        }
-        DocumentSyncTarget::User { user_id } => {
-            let mut user =
-                User::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            if user.user_id != user_id {
-                return Err(NetError::Bootstrap(format!(
-                    "replicated user document id {} does not match payload user id {}",
-                    user_id, user.user_id
-                )));
-            }
-            if let Some(reducer_state) = reducer_state.as_ref() {
-                let target = DocumentSyncTarget::User { user_id };
-                let previous_user = storage_read_from(
-                    storage,
-                    target.storage_keyspace().to_string(),
-                    target.storage_key(),
-                )
-                .await?
-                .map(|bytes| User::from_bytes(&bytes))
-                .transpose()
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                overlay_user_reducer_materialization(&mut user, reducer_state);
-                return apply_merged_user_upsert_to_storage(storage, previous_user.as_ref(), user)
-                    .await;
-            }
-            apply_user_upsert_to_storage(storage, user, bytes).await
-        }
-        DocumentSyncTarget::GroupAuthorization { group_id } => {
-            let target = DocumentSyncTarget::GroupAuthorization { group_id };
-            let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-                let mut auth_doc = GroupAuthorizationDocument::from_bytes(&bytes)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                if auth_doc.group_id != group_id {
-                    return Err(NetError::Bootstrap(format!(
-                        "replicated group authorization document id {group_id} does not match payload group id {}",
-                        auth_doc.group_id
-                    )));
-                }
-                overlay_group_authorization_reducer_materialization(&mut auth_doc, reducer_state);
-                postcard::to_allocvec(&auth_doc)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            } else {
-                bytes
-            };
-            storage_batch_write_to(storage, vec![target_write_entry(target, bytes.into())]).await
-        }
-        DocumentSyncTarget::RealmAuthorization { realm_id } => {
-            let target = DocumentSyncTarget::RealmAuthorization { realm_id };
-            let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-                let mut auth_doc = RealmAuthorizationDocument::from_bytes(&bytes)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                if auth_doc.realm_id != realm_id {
-                    return Err(NetError::Bootstrap(format!(
-                        "replicated realm authorization document id {realm_id} does not match payload realm id {}",
-                        auth_doc.realm_id
-                    )));
-                }
-                overlay_realm_authorization_reducer_materialization(&mut auth_doc, reducer_state);
-                postcard::to_allocvec(&auth_doc)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            } else {
-                bytes
-            };
-            storage_batch_write_to(storage, vec![target_write_entry(target, bytes.into())]).await
-        }
-        DocumentSyncTarget::RealmConfig { realm_id } => {
-            let target = DocumentSyncTarget::RealmConfig { realm_id };
-            let bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-                let mut config = RealmConfigDocument::from_bytes(&bytes)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                if config.realm_id != realm_id {
-                    return Err(NetError::Bootstrap(format!(
-                        "replicated realm config document id {realm_id} does not match payload realm id {}",
-                        config.realm_id
-                    )));
-                }
-                overlay_realm_config_reducer_materialization(&mut config, reducer_state);
-                postcard::to_allocvec(&config)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            } else {
-                bytes
-            };
-            storage_batch_write_to(storage, vec![target_write_entry(target, bytes.into())]).await
-        }
-        _ => Err(NetError::Bootstrap(
-            "legacy admin upsert target is not admin-reduced".to_string(),
-        )),
-    }
-}
-
 fn target_write_entry(target: DocumentSyncTarget, value: Value) -> (String, ByteView, Value) {
     (
         target.storage_keyspace().to_string(),
         target.storage_key(),
         value,
     )
-}
-
-async fn apply_merged_user_upsert_to_storage(
-    storage: &StorageHandle,
-    previous_user: Option<&User>,
-    user: User,
-) -> Result<()> {
-    let target = DocumentSyncTarget::User {
-        user_id: user.user_id,
-    };
-    let mut writes = vec![(
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-        postcard::to_allocvec(&user)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            .into(),
-    )];
-    writes.extend(subject_index_writes(&user));
-    storage_batch_delete_and_write_transactionally(
-        storage,
-        stale_subject_index_deletes(previous_user, Some(&user)),
-        writes,
-    )
-    .await
-}
-
-async fn apply_revisioned_user_upsert_to_storage(
-    storage: &StorageHandle,
-    user_id: UserId,
-    bytes: Vec<u8>,
-    change: DocumentSyncChange,
-) -> Result<()> {
-    if change.kind != aruna_core::document::DocumentSyncChangeKind::Upsert {
-        return Err(NetError::Bootstrap(
-            "revisioned user upsert must carry an upsert change".to_string(),
-        ));
-    }
-
-    let target = DocumentSyncTarget::User { user_id };
-    let mut user =
-        User::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if user.user_id != user_id {
-        return Err(NetError::Bootstrap(format!(
-            "replicated user document id {user_id} does not match payload user id {}",
-            user.user_id
-        )));
-    }
-
-    let local_change = storage_read_from(
-        storage,
-        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-        document_sync_revision_key(&target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<DocumentSyncChange>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let previous_user_bytes = storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?;
-    let previous_user = previous_user_bytes
-        .as_ref()
-        .map(|bytes| User::from_bytes(bytes.as_ref()))
-        .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    let admin_target = AdminDocumentTarget::User { user_id };
-    let reducer_state = storage_read_from(
-        storage,
-        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
-        admin_document_reducer_state_key(&admin_target),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if let Some(reducer_state) = reducer_state.as_ref()
-        && reducer_state.target != admin_target
-    {
-        return Err(NetError::Bootstrap(
-            "revisioned user upsert reducer state target mismatch".to_string(),
-        ));
-    }
-
-    match document_sync_apply_decision(local_change.as_ref(), &change) {
-        DocumentSyncApplyDecision::Apply => {}
-        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => {
-            return Ok(());
-        }
-        DocumentSyncApplyDecision::Conflict => {
-            let conflict = DocumentSyncConflict {
-                target: target.clone(),
-                local_change,
-                local_bytes: previous_user_bytes.map(|bytes| bytes.as_ref().to_vec()),
-                incoming_change: change,
-                incoming_bytes: bytes,
-            };
-            return storage_batch_write_to(
-                storage,
-                vec![
-                    document_sync_conflict_write_entry(&target, &conflict)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                ],
-            )
-            .await;
-        }
-    }
-
-    let primary_bytes = if let Some(reducer_state) = reducer_state.as_ref() {
-        overlay_user_reducer_materialization(&mut user, reducer_state);
-        postcard::to_allocvec(&user).map_err(|error| NetError::Bootstrap(error.to_string()))?
-    } else {
-        bytes
-    };
-    let mut writes = vec![target_write_entry(target.clone(), primary_bytes.into())];
-    writes.extend(subject_index_writes(&user));
-    writes.push(
-        document_sync_revision_write_entry(&target, &change)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-    );
-    storage_batch_delete_and_write_transactionally(
-        storage,
-        stale_subject_index_deletes(previous_user.as_ref(), Some(&user)),
-        writes,
-    )
-    .await
-}
-
-fn overlay_user_reducer_materialization(
-    user: &mut User,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    if reducer_state.conflicts.contains_key(USER_NAME_PATH) {
-        user.name.clear();
-    } else if let Some(name) = reducer_state.materialized_user_name() {
-        user.name = name;
-    }
-
-    for path in reducer_state.conflicts.keys() {
-        if let Some(subject_id) = path.strip_prefix("user.subject_ids.") {
-            user.subject_ids.retain(|candidate| candidate != subject_id);
-        }
-        if let Some(key) = path.strip_prefix("user.attributes.") {
-            user.attributes.remove(key);
-        }
-    }
-
-    for (subject_id, version) in &reducer_state.user_subject_ids {
-        let path = format!("user.subject_ids.{subject_id}");
-        user.subject_ids.retain(|candidate| candidate != subject_id);
-        if reducer_state.conflicts.contains_key(&path) {
-            continue;
-        }
-        if let Some(materialized_subject_id) = version.value.as_ref()
-            && !user.subject_ids.contains(materialized_subject_id)
-        {
-            user.subject_ids.push(materialized_subject_id.clone());
-        }
-    }
-
-    for (key, version) in &reducer_state.user_attributes {
-        let path = format!("user.attributes.{key}");
-        if reducer_state.conflicts.contains_key(&path) {
-            user.attributes.remove(key);
-            continue;
-        }
-        match version.value.as_ref() {
-            Some(value) => {
-                user.attributes.insert(key.clone(), value.clone());
-            }
-            None => {
-                user.attributes.remove(key);
-            }
-        }
-    }
 }
 
 fn overlay_group_reducer_materialization(
@@ -2918,7 +2101,7 @@ fn reducer_role_definition(value: &str, role_id: RoleId) -> Option<AdminDocument
     (role.role_id == role_id).then_some(role)
 }
 
-fn admin_document_target_for_legacy_upsert(
+fn admin_document_target_for_reduced_document(
     target: &DocumentSyncTarget,
 ) -> Option<AdminDocumentTarget> {
     match target {
@@ -2939,38 +2122,6 @@ fn admin_document_target_for_legacy_upsert(
         }),
         _ => None,
     }
-}
-
-async fn apply_user_upsert_to_storage(
-    storage: &StorageHandle,
-    user: User,
-    primary_bytes: Vec<u8>,
-) -> Result<()> {
-    let target = DocumentSyncTarget::User {
-        user_id: user.user_id,
-    };
-    let previous = storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?
-    .map(|bytes| User::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-
-    let deletes = stale_subject_index_deletes(previous.as_ref(), Some(&user));
-    if !deletes.is_empty() {
-        storage_batch_delete_to(storage, deletes).await?;
-    }
-
-    let mut writes = vec![(
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-        primary_bytes.into(),
-    )];
-    writes.extend(subject_index_writes(&user));
-    storage_batch_write_to(storage, writes).await
 }
 
 async fn apply_metadata_registry_upsert_to_storage(
@@ -4477,23 +3628,20 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
-    use aruna_core::document::{
-        DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-    };
+    use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
-        IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
-        USER_SUBJECT_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
-        document_sync_conflict_key, metadata_document_key, metadata_event_log_key,
-        metadata_registry_key, subject_index_key, subject_index_value,
+        metadata_document_key, metadata_event_log_key, metadata_registry_key, subject_index_key,
+        subject_index_value,
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, MetadataReplicationConfig, OidcProviderConfig,
@@ -4536,8 +3684,8 @@ mod tests {
     }
 
     fn restart_target() -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
-            realm_id: RealmId::from_bytes([99; 32]),
+        DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: "urn:aruna:restart-contract".to_string(),
         }
     }
 
@@ -4546,7 +3694,14 @@ mod tests {
     }
 
     fn restart_payload() -> Vec<u8> {
-        b"buffered restart contract payload".to_vec()
+        postcard::to_allocvec(&MetadataGraphLifecycleRecord::deleted(
+            "urn:aruna:restart-contract".to_string(),
+            RealmId::from_bytes([99; 32]),
+            Ulid::from_parts(99, 1),
+            Ulid::from_parts(99, 2),
+            1,
+        ))
+        .expect("restart payload serializes")
     }
 
     fn revision_change_at(
@@ -4567,7 +3722,16 @@ mod tests {
     }
 
     fn revision_change() -> DocumentSyncChange {
-        revision_change_at(None, 1, 43)
+        DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: restart_event_id(),
+                actor: node(43),
+                updated_at_ms: 1_727_000_000_101,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        }
     }
 
     async fn test_endpoint(seed: u8) -> iroh::Endpoint {
@@ -4802,69 +3966,6 @@ mod tests {
             .await
             .expect("user exists");
         User::from_bytes(&value).expect("user decodes")
-    }
-
-    async fn read_user_revision(storage: &StorageHandle, user_id: UserId) -> DocumentSyncChange {
-        let target = DocumentSyncTarget::User { user_id };
-        let value = read_storage_value(
-            storage,
-            DOCUMENT_SYNC_REVISION_KEYSPACE,
-            document_sync_revision_key(&target),
-        )
-        .await
-        .expect("user revision exists");
-        postcard::from_bytes(&value).expect("user revision decodes")
-    }
-
-    async fn read_user_conflict(
-        storage: &StorageHandle,
-        user_id: UserId,
-    ) -> Option<DocumentSyncConflict> {
-        let target = DocumentSyncTarget::User { user_id };
-        read_document_conflict(storage, &target).await
-    }
-
-    async fn read_document_conflict(
-        storage: &StorageHandle,
-        target: &DocumentSyncTarget,
-    ) -> Option<DocumentSyncConflict> {
-        read_storage_value(
-            storage,
-            DOCUMENT_SYNC_CONFLICT_KEYSPACE,
-            document_sync_conflict_key(target),
-        )
-        .await
-        .map(|value| postcard::from_bytes(&value).expect("document conflict decodes"))
-    }
-
-    fn test_user_doc(user_id: UserId, name: &str, subjects: &[&str]) -> User {
-        User {
-            user_id,
-            name: name.to_string(),
-            subject_ids: subjects.iter().map(|subject| subject.to_string()).collect(),
-            alias_user_ids: Default::default(),
-            attributes: Default::default(),
-        }
-    }
-
-    async fn write_user_with_revision(
-        storage: &StorageHandle,
-        user: &User,
-        actor: &Actor,
-        change: &DocumentSyncChange,
-    ) {
-        let target = DocumentSyncTarget::User {
-            user_id: user.user_id,
-        };
-        let mut writes = vec![target_write_entry(
-            target.clone(),
-            user.to_bytes(actor).expect("user serializes").into(),
-        )];
-        writes.extend(subject_index_writes(user));
-        writes.push(document_sync_revision_write_entry(&target, change).expect("revision writes"));
-        storage_batch_write_to(storage, writes)
-            .await
-            .expect("user and revision write");
     }
 
     async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> Group {
@@ -5371,80 +4472,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_config_upsert_skips_with_state_and_bootstraps_without_state() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([50; 32]);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(1_390, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::RealmConfig { realm_id };
-        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let metadata_replication = MetadataReplicationConfig::new(11);
-        let discovery = test_discovery(24, "https://reducer-late-settings.example:443");
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_391, 1),
-                target,
-                &actor,
-                1,
-                AdminDocumentOperation::RealmConfigSettingsSet {
-                    metadata_replication: metadata_replication.clone(),
-                    discovery: discovery.clone(),
-                },
-            ),
-        )
-        .await
-        .expect("realm config settings apply and bootstrap config doc");
-        let reduced = read_realm_config_doc(&storage, realm_id).await;
-
-        let legacy_provider = test_oidc_provider("legacy", "legacy-late-settings");
-        let legacy_node = node(25);
-        let mut late_legacy = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 3);
-        late_legacy.discovery = test_discovery(26, "https://legacy-late-settings.example:443");
-        late_legacy.ensure_node(legacy_node, RealmNodeKind::Server);
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            document_target,
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy realm config serializes"),
-        )
-        .await
-        .expect("late legacy realm config upsert skips with reducer state");
-
-        assert_eq!(read_realm_config_doc(&storage, realm_id).await, reduced);
-
-        let bootstrap_realm_id = RealmId::from_bytes([53; 32]);
-        let bootstrap_node = node(27);
-        let bootstrap_provider = test_oidc_provider("bootstrap", "bootstrap-legacy-settings");
-        let mut bootstrap =
-            RealmConfigDocument::new(bootstrap_realm_id, vec![bootstrap_provider], 6);
-        bootstrap.discovery = test_discovery(28, "https://bootstrap-legacy.example:443");
-        bootstrap.ensure_node(bootstrap_node, RealmNodeKind::Server);
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::RealmConfig {
-                realm_id: bootstrap_realm_id,
-            },
-            bootstrap
-                .to_bytes(&actor)
-                .expect("bootstrap realm config serializes"),
-        )
-        .await
-        .expect("bootstrap legacy realm config applies");
-
-        assert_eq!(
-            read_realm_config_doc(&storage, bootstrap_realm_id).await,
-            bootstrap
-        );
-    }
-
-    #[tokio::test]
     async fn concurrent_realm_config_settings_conflict_withholds_conflicted_metadata() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([51; 32]);
@@ -5772,58 +4799,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_legacy_realm_config_upsert_skips_after_reducer_oidc_provider() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([46; 32]);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(350, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::RealmConfig { realm_id };
-        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let reducer_provider = test_oidc_provider("reducer", "reducer");
-        let legacy_provider = test_oidc_provider("legacy", "legacy");
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_350, 1),
-                target,
-                &actor,
-                1,
-                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
-                    provider: reducer_provider.clone(),
-                },
-            ),
-        )
-        .await
-        .expect("realm config OIDC provider upsert applies");
-
-        let late_legacy = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 7);
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            document_target.clone(),
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy realm config serializes"),
-        )
-        .await
-        .expect("late legacy realm config upsert skips with reducer state");
-
-        assert!(
-            read_storage_value(
-                &storage,
-                document_target.storage_keyspace(),
-                document_target.storage_key(),
-            )
-            .await
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn missing_realm_config_oidc_provider_op_stores_state_without_config_doc() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([47; 32]);
@@ -5873,76 +4848,6 @@ mod tests {
         assert_eq!(
             reducer_state.materialized_realm_config_oidc_providers(),
             BTreeMap::from([("default".to_string(), provider)])
-        );
-    }
-
-    #[tokio::test]
-    async fn late_legacy_realm_config_upsert_skips_after_reducer_node() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([42; 32]);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(310, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::RealmConfig { realm_id };
-        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let reducer_node = node(13);
-        let legacy_node = node(14);
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_400, 1),
-                target,
-                &actor,
-                1,
-                AdminDocumentOperation::RealmConfigNodeEnsured {
-                    node_id: reducer_node,
-                    kind: RealmNodeKind::Management,
-                },
-            ),
-        )
-        .await
-        .expect("realm config node ensure applies");
-
-        let mut late_legacy = RealmConfigDocument::new(
-            realm_id,
-            vec![OidcProviderConfig {
-                id: "legacy-provider".to_string(),
-                issuer: "https://issuer.example".to_string(),
-                audience: "legacy-audience".to_string(),
-                discovery_url: "https://issuer.example/.well-known/openid-configuration"
-                    .to_string(),
-            }],
-            7,
-        );
-        late_legacy.discovery = RealmDiscoveryConfig::Static {
-            endpoints: vec![StaticRealmEndpoint {
-                node_id: legacy_node.to_string(),
-                endpoint_addr: "https://legacy.example:443".to_string(),
-            }],
-        };
-        late_legacy.ensure_node(legacy_node, RealmNodeKind::Server);
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            document_target.clone(),
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy realm config serializes"),
-        )
-        .await
-        .expect("late legacy realm config upsert skips with reducer state");
-
-        assert!(
-            read_storage_value(
-                &storage,
-                document_target.storage_keyspace(),
-                document_target.storage_key(),
-            )
-            .await
-            .is_none()
         );
     }
 
@@ -6026,144 +4931,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_user_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([21; 32]);
-        let user_id = UserId::local(Ulid::from_parts(100, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let target = AdminDocumentTarget::User { user_id };
-        for (seq, op) in [
-            (
-                1,
-                AdminDocumentOperation::UserNameSet {
-                    name: "Reduced".to_string(),
-                },
-            ),
-            (
-                2,
-                AdminDocumentOperation::UserSubjectIdAdded {
-                    subject_id: "reduced-subject".to_string(),
-                },
-            ),
-            (
-                3,
-                AdminDocumentOperation::UserSubjectIdRemoved {
-                    subject_id: "removed-subject".to_string(),
-                },
-            ),
-            (
-                4,
-                AdminDocumentOperation::UserAttributeSet {
-                    key: "source".to_string(),
-                    value: "reducer".to_string(),
-                },
-            ),
-            (
-                5,
-                AdminDocumentOperation::UserAttributeRemoved {
-                    key: "removed".to_string(),
-                },
-            ),
-        ] {
-            apply_admin_document_operation_to_storage(
-                &storage,
-                DocumentSyncTarget::User { user_id },
-                test_admin_event(
-                    Ulid::from_parts(1_000 + seq, 1),
-                    target.clone(),
-                    &actor,
-                    seq,
-                    op,
-                ),
-            )
-            .await
-            .expect("admin user operation applies");
-        }
-        let reduced = read_user_doc(&storage, user_id).await;
-
-        let alias_user_id = UserId::local(Ulid::from_parts(102, 1), realm_id);
-        let late_legacy = User {
-            user_id,
-            name: "Legacy".to_string(),
-            subject_ids: vec!["legacy-subject".to_string(), "removed-subject".to_string()],
-            alias_user_ids: HashSet::from([alias_user_id]),
-            attributes: HashMap::from([
-                ("legacy-only".to_string(), "preserved".to_string()),
-                ("removed".to_string(), "legacy".to_string()),
-                ("source".to_string(), "legacy".to_string()),
-            ]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::User { user_id },
-            late_legacy.to_bytes(&actor).expect("legacy serializes"),
-        )
-        .await
-        .expect("late legacy user upsert skips with reducer state");
-
-        assert_eq!(read_user_doc(&storage, user_id).await, reduced);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("legacy-subject")
-            )
-            .await,
-            None
-        );
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("reduced-subject")
-            )
-            .await,
-            Some(subject_index_value(user_id))
-        );
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("removed-subject")
-            )
-            .await,
-            None
-        );
-
-        let bootstrap_user_id = UserId::local(Ulid::from_parts(101, 1), realm_id);
-        let bootstrap_actor = test_actor(9, bootstrap_user_id, realm_id);
-        let bootstrap = User {
-            user_id: bootstrap_user_id,
-            name: "Bootstrap".to_string(),
-            subject_ids: vec!["bootstrap-subject".to_string()],
-            alias_user_ids: Default::default(),
-            attributes: Default::default(),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::User {
-                user_id: bootstrap_user_id,
-            },
-            bootstrap
-                .to_bytes(&bootstrap_actor)
-                .expect("bootstrap serializes"),
-        )
-        .await
-        .expect("bootstrap legacy user applies");
-
-        assert_eq!(read_user_doc(&storage, bootstrap_user_id).await, bootstrap);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("bootstrap-subject")
-            )
-            .await,
-            Some(subject_index_value(bootstrap_user_id))
-        );
-    }
-
-    #[tokio::test]
     async fn user_name_and_attribute_conflicts_fail_closed_incrementally() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([44; 32]);
@@ -6192,791 +4959,6 @@ mod tests {
             )
             .await
             .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn user_conflict_overlays_fail_closed_for_legacy_skip_and_revisioned_upserts() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([45; 32]);
-        let user_id = UserId::local(Ulid::from_parts(211, 1), realm_id);
-        let actor = apply_conflicting_user_name_and_attribute(&storage, user_id, realm_id).await;
-        let reduced = read_user_doc(&storage, user_id).await;
-
-        let mut legacy = test_user_doc(user_id, "Legacy attacker", &["legacy-subject"]);
-        legacy.attributes = HashMap::from([
-            ("department".to_string(), "legacy-attacker".to_string()),
-            ("legacy-only".to_string(), "preserved".to_string()),
-        ]);
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::User { user_id },
-            legacy.to_bytes(&actor).expect("legacy user serializes"),
-        )
-        .await
-        .expect("legacy conflict upsert skips with reducer state");
-
-        let skipped = read_user_doc(&storage, user_id).await;
-        assert_eq!(skipped, reduced);
-        assert!(!skipped.attributes.contains_key("legacy-only"));
-
-        let mut revisioned = test_user_doc(user_id, "Revisioned attacker", &["revisioned-subject"]);
-        revisioned.attributes = HashMap::from([
-            ("department".to_string(), "revisioned-attacker".to_string()),
-            ("revisioned-only".to_string(), "preserved".to_string()),
-        ]);
-        let incoming_change = revision_change_at(None, 1, 212);
-        apply_revisioned_user_upsert_to_storage(
-            &storage,
-            user_id,
-            revisioned
-                .to_bytes(&actor)
-                .expect("revisioned user serializes"),
-            incoming_change,
-        )
-        .await
-        .expect("revisioned conflict overlay applies");
-
-        let merged = read_user_doc(&storage, user_id).await;
-        assert_eq!(merged.name, "");
-        assert!(!merged.attributes.contains_key("department"));
-        assert_eq!(merged.attributes["revisioned-only"], "preserved");
-        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
-    }
-
-    #[tokio::test]
-    async fn revisioned_user_successor_upsert_applies_and_writes_sidecar() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([31; 32]);
-        let user_id = UserId::local(Ulid::from_parts(201, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let local_change = revision_change_at(None, 1, 201);
-        let incoming_change = revision_change_at(Some(local_change.current), 2, 202);
-        let local = test_user_doc(user_id, "Local", &["old-subject"]);
-        write_user_with_revision(&storage, &local, &actor, &local_change).await;
-
-        let incoming = test_user_doc(user_id, "Incoming", &["new-subject"]);
-        apply_revisioned_user_upsert_to_storage(
-            &storage,
-            user_id,
-            incoming.to_bytes(&actor).expect("incoming serializes"),
-            incoming_change,
-        )
-        .await
-        .expect("successor revision applies");
-
-        assert_eq!(read_user_doc(&storage, user_id).await, incoming);
-        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("old-subject")
-            )
-            .await,
-            None
-        );
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("new-subject")
-            )
-            .await,
-            Some(subject_index_value(user_id))
-        );
-    }
-
-    #[tokio::test]
-    async fn revisioned_user_stale_upsert_skips_without_overwrite() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([32; 32]);
-        let user_id = UserId::local(Ulid::from_parts(202, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let local_change = revision_change_at(None, 2, 203);
-        let stale_change = revision_change_at(None, 1, 204);
-        let local = test_user_doc(user_id, "Local", &["local-subject"]);
-        write_user_with_revision(&storage, &local, &actor, &local_change).await;
-
-        let stale = test_user_doc(user_id, "Stale", &["stale-subject"]);
-        apply_revisioned_user_upsert_to_storage(
-            &storage,
-            user_id,
-            stale.to_bytes(&actor).expect("stale serializes"),
-            stale_change,
-        )
-        .await
-        .expect("stale revision is a successful skip");
-
-        assert_eq!(read_user_doc(&storage, user_id).await, local);
-        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("stale-subject")
-            )
-            .await,
-            None
-        );
-        assert_eq!(read_user_conflict(&storage, user_id).await, None);
-    }
-
-    #[tokio::test]
-    async fn document_sync_fencing_legacy_admin_delete_skips_revisioned_user_and_indexes() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([55; 32]);
-        let user_id = UserId::local(Ulid::from_parts(1_520, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let local_change = revision_change_at(None, 2, 1_521);
-        let local = test_user_doc(user_id, "Revisioned", &["revisioned-subject"]);
-        write_user_with_revision(&storage, &local, &actor, &local_change).await;
-
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(
-                &storage,
-                DocumentSyncTarget::User { user_id },
-            )
-            .await
-            .expect("legacy delete skips revisioned user")
-        );
-
-        assert_eq!(read_user_doc(&storage, user_id).await, local);
-        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("revisioned-subject"),
-            )
-            .await,
-            Some(subject_index_value(user_id))
-        );
-    }
-
-    #[tokio::test]
-    async fn document_sync_fencing_skipped_stale_event_advances_applied_cursor() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let service = open_test_service(dir.path(), "cursor-storage", 92).await;
-        let storage = service.storage.clone();
-        let realm_id = RealmId::from_bytes([56; 32]);
-        let user_id = UserId::local(Ulid::from_parts(1_530, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let target = DocumentSyncTarget::User { user_id };
-        let local_change = revision_change_at(None, 2, 1_531);
-        let stale_change = revision_change_at(None, 1, 1_532);
-        let local = test_user_doc(user_id, "Fresh", &["fresh-subject"]);
-        write_user_with_revision(&storage, &local, &actor, &local_change).await;
-
-        service
-            .publish_events_blocking(
-                vec![DocumentSyncPublish::UpsertWithRevision {
-                    event_id: stale_change.current.event_id,
-                    target: target.clone(),
-                    bytes: test_user_doc(user_id, "Stale", &["stale-subject"])
-                        .to_bytes(&actor)
-                        .expect("stale user serializes"),
-                    change: stale_change,
-                }],
-                &BTreeSet::new(),
-            )
-            .expect("stale event publishes without advancing cursor");
-        service.flush_database().expect("irokle database flushes");
-
-        let topic_id = target.irokle_topic_id();
-        let first = service
-            .reconcile_irokle_topics(vec![topic_id])
-            .await
-            .expect("stale event reconciles");
-        assert_eq!(first.targets, vec![target.clone()]);
-        assert_eq!(read_user_doc(&storage, user_id).await, local);
-        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("stale-subject"),
-            )
-            .await,
-            None
-        );
-
-        let cursor_value = read_storage_value(
-            &storage,
-            IROKLE_APPLIED_OPS_KEYSPACE,
-            topic_cursor_key(topic_id),
-        )
-        .await
-        .expect("applied cursor exists");
-        let cursor: irokle_crate::ActorClock =
-            postcard::from_bytes(&cursor_value).expect("cursor decodes");
-        let topic_clock = service
-            .node()
-            .storage()
-            .actor_clock(&topic_id)
-            .expect("topic clock reads");
-        assert!(cursor.dominates(&topic_clock));
-
-        let second = service
-            .reconcile_irokle_topics(vec![topic_id])
-            .await
-            .expect("advanced cursor prevents replay");
-        assert!(second.targets.is_empty());
-        service.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn revisioned_user_unbased_concurrent_upsert_records_conflict_without_overwrite() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([33; 32]);
-        let user_id = UserId::local(Ulid::from_parts(203, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let local_change = revision_change_at(None, 1, 205);
-        let concurrent_change = revision_change_at(None, 2, 206);
-        let local = test_user_doc(user_id, "Local", &["local-subject"]);
-        write_user_with_revision(&storage, &local, &actor, &local_change).await;
-
-        let concurrent = test_user_doc(user_id, "Concurrent", &["concurrent-subject"]);
-        apply_revisioned_user_upsert_to_storage(
-            &storage,
-            user_id,
-            concurrent.to_bytes(&actor).expect("concurrent serializes"),
-            concurrent_change,
-        )
-        .await
-        .expect("conflicting revision is a successful skip");
-
-        assert_eq!(read_user_doc(&storage, user_id).await, local);
-        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("concurrent-subject")
-            )
-            .await,
-            None
-        );
-        let conflict = read_user_conflict(&storage, user_id)
-            .await
-            .expect("conflict sidecar exists");
-        assert_eq!(conflict.target, DocumentSyncTarget::User { user_id });
-        assert_eq!(conflict.local_change, Some(local_change));
-        assert_eq!(
-            conflict.local_bytes,
-            Some(local.to_bytes(&actor).expect("local serializes"))
-        );
-        assert_eq!(conflict.incoming_change, concurrent_change);
-        assert_eq!(
-            conflict.incoming_bytes,
-            concurrent.to_bytes(&actor).expect("concurrent serializes")
-        );
-    }
-
-    #[tokio::test]
-    async fn revisioned_user_upsert_preserves_reducer_overlay() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([34; 32]);
-        let user_id = UserId::local(Ulid::from_parts(204, 1), realm_id);
-        let actor = test_actor(8, user_id, realm_id);
-        let target = AdminDocumentTarget::User { user_id };
-        for (seq, op) in [
-            (
-                1,
-                AdminDocumentOperation::UserNameSet {
-                    name: "Reduced".to_string(),
-                },
-            ),
-            (
-                2,
-                AdminDocumentOperation::UserSubjectIdAdded {
-                    subject_id: "reduced-subject".to_string(),
-                },
-            ),
-            (
-                3,
-                AdminDocumentOperation::UserAttributeSet {
-                    key: "source".to_string(),
-                    value: "reducer".to_string(),
-                },
-            ),
-        ] {
-            apply_admin_document_operation_to_storage(
-                &storage,
-                DocumentSyncTarget::User { user_id },
-                test_admin_event(
-                    Ulid::from_parts(2_000 + seq, 1),
-                    target.clone(),
-                    &actor,
-                    seq,
-                    op,
-                ),
-            )
-            .await
-            .expect("admin user operation applies");
-        }
-
-        let mut incoming = test_user_doc(user_id, "Remote", &["remote-subject"]);
-        incoming.attributes = HashMap::from([
-            ("legacy-only".to_string(), "preserved".to_string()),
-            ("source".to_string(), "remote".to_string()),
-        ]);
-        let incoming_change = revision_change_at(None, 1, 207);
-        apply_revisioned_user_upsert_to_storage(
-            &storage,
-            user_id,
-            incoming.to_bytes(&actor).expect("incoming serializes"),
-            incoming_change,
-        )
-        .await
-        .expect("revisioned user upsert applies with reducer overlay");
-
-        let merged = read_user_doc(&storage, user_id).await;
-        assert_eq!(merged.name, "Reduced");
-        assert_eq!(merged.attributes["legacy-only"], "preserved");
-        assert_eq!(merged.attributes["source"], "reducer");
-        assert_eq!(
-            merged.subject_ids.iter().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["remote-subject".to_string(), "reduced-subject".to_string()])
-        );
-        assert_eq!(read_user_revision(&storage, user_id).await, incoming_change);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("reduced-subject")
-            )
-            .await,
-            Some(subject_index_value(user_id))
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_admin_delete_skips_with_reducer_state_and_preserves_user_indexes() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([54; 32]);
-        let actor_user_id = UserId::local(Ulid::from_parts(1_500, 1), realm_id);
-        let actor = test_actor(8, actor_user_id, realm_id);
-
-        let user_id = UserId::local(Ulid::from_parts(1_501, 1), realm_id);
-        apply_admin_document_operation_to_storage(
-            &storage,
-            DocumentSyncTarget::User { user_id },
-            test_admin_event(
-                Ulid::from_parts(1_502, 1),
-                AdminDocumentTarget::User { user_id },
-                &actor,
-                1,
-                AdminDocumentOperation::UserSubjectIdAdded {
-                    subject_id: "reducer-subject".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("user reducer op applies");
-        let reduced_user = read_user_doc(&storage, user_id).await;
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(
-                &storage,
-                DocumentSyncTarget::User { user_id },
-            )
-            .await
-            .expect("legacy user delete skips")
-        );
-        assert_eq!(read_user_doc(&storage, user_id).await, reduced_user);
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("reducer-subject"),
-            )
-            .await,
-            Some(subject_index_value(user_id))
-        );
-
-        let group_id = Ulid::from_parts(1_503, 1);
-        let group_role_id = Ulid::from_parts(1_504, 1);
-        let group_target = AdminDocumentTarget::Group { group_id };
-        let group_document_target = DocumentSyncTarget::GroupAuthorization { group_id };
-        apply_admin_document_operation_to_storage(
-            &storage,
-            group_document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_505, 1),
-                group_target.clone(),
-                &actor,
-                1,
-                AdminDocumentOperation::GroupCreated {
-                    realm_id,
-                    display_name: "Reducer group".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("group create applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            group_document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_506, 1),
-                group_target,
-                &actor,
-                2,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        group_role_id,
-                        "Reducer group role",
-                        "/group/reducer/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("group role create applies");
-        let reduced_group = read_group_doc(&storage, group_id).await;
-        let reduced_group_auth = read_group_auth_doc(&storage, group_id).await;
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(
-                &storage,
-                DocumentSyncTarget::Group { group_id },
-            )
-            .await
-            .expect("legacy group delete skips")
-        );
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(&storage, group_document_target)
-                .await
-                .expect("legacy group auth delete skips")
-        );
-        assert_eq!(read_group_doc(&storage, group_id).await, reduced_group);
-        assert_eq!(
-            read_group_auth_doc(&storage, group_id).await,
-            reduced_group_auth
-        );
-
-        let realm_role_id = Ulid::from_parts(1_507, 1);
-        let realm_target = AdminDocumentTarget::Realm { realm_id };
-        let realm_document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-        apply_admin_document_operation_to_storage(
-            &storage,
-            realm_document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_508, 1),
-                realm_target,
-                &actor,
-                1,
-                AdminDocumentOperation::RealmRoleCreated {
-                    role: test_admin_role_definition(
-                        realm_role_id,
-                        "Reducer realm role",
-                        "/realm/reducer/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("realm role create applies");
-        let reduced_realm_auth = read_realm_auth_doc(&storage, realm_id).await;
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(&storage, realm_document_target)
-                .await
-                .expect("legacy realm auth delete skips")
-        );
-        assert_eq!(
-            read_realm_auth_doc(&storage, realm_id).await,
-            reduced_realm_auth
-        );
-
-        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
-        let config_document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        apply_admin_document_operation_to_storage(
-            &storage,
-            config_document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(1_509, 1),
-                config_target,
-                &actor,
-                1,
-                AdminDocumentOperation::RealmConfigSettingsSet {
-                    metadata_replication: MetadataReplicationConfig::new(4),
-                    discovery: test_discovery(30, "https://delete-fence.example:443"),
-                },
-            ),
-        )
-        .await
-        .expect("realm config settings apply");
-        let reduced_config = read_realm_config_doc(&storage, realm_id).await;
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(&storage, config_document_target)
-                .await
-                .expect("legacy realm config delete skips")
-        );
-        assert_eq!(
-            read_realm_config_doc(&storage, realm_id).await,
-            reduced_config
-        );
-
-        let bootstrap_user_id = UserId::local(Ulid::from_parts(1_510, 1), realm_id);
-        let bootstrap_user = test_user_doc(bootstrap_user_id, "Bootstrap", &["bootstrap-subject"]);
-        apply_user_upsert_to_storage(
-            &storage,
-            bootstrap_user.clone(),
-            bootstrap_user
-                .to_bytes(&actor)
-                .expect("bootstrap user serializes"),
-        )
-        .await
-        .expect("bootstrap user writes");
-        assert!(
-            apply_legacy_admin_document_delete_to_storage(
-                &storage,
-                DocumentSyncTarget::User {
-                    user_id: bootstrap_user_id,
-                },
-            )
-            .await
-            .expect("legacy user delete applies without reducer state")
-        );
-        assert_eq!(
-            read_storage_value(&storage, USER_KEYSPACE, bootstrap_user_id.to_bytes().into()).await,
-            None
-        );
-        assert_eq!(
-            read_storage_value(
-                &storage,
-                USER_SUBJECT_INDEX_KEYSPACE,
-                subject_index_key("bootstrap-subject"),
-            )
-            .await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn document_sync_fencing_revisioned_admin_upsert_delete_skip_operation_authoritative_state()
-     {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([57; 32]);
-        let group_id = Ulid::from_parts(1_540, 1);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(1_541, 1), realm_id),
-            realm_id,
-        );
-        let reducer_target = AdminDocumentTarget::Group { group_id };
-        let document_target = DocumentSyncTarget::Group { group_id };
-        apply_admin_document_operation_to_storage(
-            &storage,
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            test_admin_event(
-                Ulid::from_parts(1_542, 1),
-                reducer_target,
-                &actor,
-                1,
-                AdminDocumentOperation::GroupCreated {
-                    realm_id,
-                    display_name: "Reducer group".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("group create reducer event applies");
-        let reduced = read_group_doc(&storage, group_id).await;
-
-        let stale_group = Group {
-            group_id,
-            realm_id,
-            display_name: "Stale document".to_string(),
-            roles: HashSet::from([Ulid::from_parts(1_543, 1)]),
-        };
-        apply_revisioned_upsert_to_storage(
-            &storage,
-            document_target.clone(),
-            stale_group
-                .to_bytes(&actor)
-                .expect("stale group serializes"),
-            revision_change_at(None, 1, 1_544),
-        )
-        .await
-        .expect("revisioned admin upsert skips reducer state");
-
-        let delete_change = DocumentSyncChange {
-            kind: DocumentSyncChangeKind::Delete,
-            ..revision_change_at(None, 2, 1_545)
-        };
-        apply_revisioned_delete_to_storage(&storage, document_target, delete_change)
-            .await
-            .expect("revisioned admin delete skips reducer state");
-
-        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
-        assert!(
-            read_storage_value(
-                &storage,
-                DOCUMENT_SYNC_CONFLICT_KEYSPACE,
-                document_sync_conflict_key(&DocumentSyncTarget::Group { group_id }),
-            )
-            .await
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn document_sync_fencing_revisioned_group_auth_conflict_sidecar_without_overwrite() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([58; 32]);
-        let group_id = Ulid::from_parts(1_550, 1);
-        let local_role_id = Ulid::from_parts(1_551, 1);
-        let incoming_role_id = Ulid::from_parts(1_552, 1);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(1_553, 1), realm_id),
-            realm_id,
-        );
-        let target = DocumentSyncTarget::GroupAuthorization { group_id };
-        let local_change = revision_change_at(None, 1, 1_554);
-        let concurrent_change = revision_change_at(None, 2, 1_555);
-        let local = GroupAuthorizationDocument {
-            group_id,
-            roles: HashMap::from([(local_role_id, test_role(local_role_id, std::iter::empty()))]),
-        };
-        storage_batch_write_to(
-            &storage,
-            vec![
-                target_write_entry(
-                    target.clone(),
-                    local
-                        .to_bytes(&actor)
-                        .expect("local auth serializes")
-                        .into(),
-                ),
-                document_sync_revision_write_entry(&target, &local_change)
-                    .expect("local revision writes"),
-            ],
-        )
-        .await
-        .expect("local auth doc and revision write");
-
-        let incoming = GroupAuthorizationDocument {
-            group_id,
-            roles: HashMap::from([(
-                incoming_role_id,
-                test_role(incoming_role_id, std::iter::empty()),
-            )]),
-        };
-        apply_revisioned_upsert_to_storage(
-            &storage,
-            target.clone(),
-            incoming.to_bytes(&actor).expect("incoming auth serializes"),
-            concurrent_change,
-        )
-        .await
-        .expect("concurrent group auth update records conflict");
-
-        assert_eq!(read_group_auth_doc(&storage, group_id).await, local);
-        let revision_value = read_storage_value(
-            &storage,
-            DOCUMENT_SYNC_REVISION_KEYSPACE,
-            document_sync_revision_key(&target),
-        )
-        .await
-        .expect("local revision remains");
-        assert_eq!(
-            postcard::from_bytes::<DocumentSyncChange>(&revision_value).expect("revision decodes"),
-            local_change
-        );
-        let conflict = read_document_conflict(&storage, &target)
-            .await
-            .expect("document conflict sidecar exists");
-        assert_eq!(conflict.target, target);
-        assert_eq!(conflict.local_change, Some(local_change));
-        assert_eq!(
-            conflict.local_bytes,
-            Some(local.to_bytes(&actor).expect("local auth serializes"))
-        );
-        assert_eq!(conflict.incoming_change, concurrent_change);
-        assert_eq!(
-            conflict.incoming_bytes,
-            incoming.to_bytes(&actor).expect("incoming auth serializes")
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_group_auth_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([22; 32]);
-        let group_id = Ulid::from_parts(110, 1);
-        let role_id = Ulid::from_parts(111, 1);
-        let assigned_user_id = UserId::local(Ulid::from_parts(112, 1), realm_id);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(113, 1), realm_id),
-            realm_id,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            test_admin_event(
-                Ulid::from_parts(117, 1),
-                AdminDocumentTarget::Group { group_id },
-                &actor,
-                1,
-                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
-                    role_id,
-                    user_id: assigned_user_id,
-                },
-            ),
-        )
-        .await
-        .expect("group assignment reducer state writes");
-        let reduced = read_group_auth_doc(&storage, group_id).await;
-
-        let legacy_user_id = UserId::local(Ulid::from_parts(118, 1), realm_id);
-        let mut legacy_role = test_role(role_id, [legacy_user_id]);
-        legacy_role.name = "legacy-member".to_string();
-        legacy_role.permissions = HashMap::from([("/legacy".to_string(), Permission::WRITE)]);
-        let late_legacy = GroupAuthorizationDocument {
-            group_id,
-            roles: HashMap::from([(role_id, legacy_role.clone())]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy group auth serializes"),
-        )
-        .await
-        .expect("late legacy group auth upsert skips with reducer state");
-
-        assert_eq!(read_group_auth_doc(&storage, group_id).await, reduced);
-
-        let bootstrap_group_id = Ulid::from_parts(114, 1);
-        let bootstrap_role_id = Ulid::from_parts(115, 1);
-        let bootstrap_user_id = UserId::local(Ulid::from_parts(116, 1), realm_id);
-        let bootstrap = GroupAuthorizationDocument {
-            group_id: bootstrap_group_id,
-            roles: HashMap::from([(
-                bootstrap_role_id,
-                test_role(bootstrap_role_id, [bootstrap_user_id]),
-            )]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::GroupAuthorization {
-                group_id: bootstrap_group_id,
-            },
-            bootstrap
-                .to_bytes(&actor)
-                .expect("bootstrap group auth serializes"),
-        )
-        .await
-        .expect("bootstrap legacy group auth applies");
-
-        assert_eq!(
-            read_group_auth_doc(&storage, bootstrap_group_id).await,
-            bootstrap
         );
     }
 
@@ -7079,215 +5061,6 @@ mod tests {
                 .await
                 .roles
                 .contains_key(&role_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn late_legacy_group_upsert_skips_after_group_created_and_bootstraps_without_state() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([37; 32]);
-        let legacy_realm_id = RealmId::from_bytes([38; 32]);
-        let group_id = Ulid::from_parts(198, 1);
-        let role_id = Ulid::from_parts(199, 1);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(200, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::Group { group_id };
-        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(201, 1),
-                target.clone(),
-                &actor,
-                1,
-                AdminDocumentOperation::GroupCreated {
-                    realm_id,
-                    display_name: "Reduced group".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("group create applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target,
-            test_admin_event(
-                Ulid::from_parts(202, 1),
-                target,
-                &actor,
-                2,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        role_id,
-                        "Reduced group role",
-                        "/group/reduced/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("role create applies");
-        let reduced = read_group_doc(&storage, group_id).await;
-
-        let late_legacy = Group {
-            display_name: "Late legacy group".to_string(),
-            group_id,
-            realm_id: legacy_realm_id,
-            roles: HashSet::new(),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::Group { group_id },
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy group serializes"),
-        )
-        .await
-        .expect("late legacy group upsert skips with reducer state");
-
-        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
-
-        let bootstrap_group_id = Ulid::from_parts(203, 1);
-        let bootstrap_role_id = Ulid::from_parts(204, 1);
-        let bootstrap = Group {
-            display_name: "Bootstrap legacy group".to_string(),
-            group_id: bootstrap_group_id,
-            realm_id,
-            roles: HashSet::from([bootstrap_role_id]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::Group {
-                group_id: bootstrap_group_id,
-            },
-            bootstrap
-                .to_bytes(&actor)
-                .expect("bootstrap group serializes"),
-        )
-        .await
-        .expect("bootstrap legacy group applies");
-
-        assert_eq!(
-            read_group_doc(&storage, bootstrap_group_id).await,
-            bootstrap
-        );
-    }
-
-    #[tokio::test]
-    async fn late_legacy_group_upsert_skips_with_conflicted_group_metadata() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([46; 32]);
-        let conflicting_realm_id = RealmId::from_bytes([47; 32]);
-        let legacy_realm_id = RealmId::from_bytes([48; 32]);
-        let group_id = Ulid::from_parts(220, 1);
-        let role_id = Ulid::from_parts(221, 1);
-        let actor_a = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(222, 1), realm_id),
-            realm_id,
-        );
-        let actor_b = test_actor(
-            9,
-            UserId::local(Ulid::from_parts(223, 1), conflicting_realm_id),
-            conflicting_realm_id,
-        );
-        let target = AdminDocumentTarget::Group { group_id };
-        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(224, 1),
-                target.clone(),
-                &actor_a,
-                1,
-                AdminDocumentOperation::GroupCreated {
-                    realm_id,
-                    display_name: "Safe group".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("first group create applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target,
-            test_admin_event(
-                Ulid::from_parts(225, 1),
-                target.clone(),
-                &actor_b,
-                1,
-                AdminDocumentOperation::GroupCreated {
-                    realm_id: conflicting_realm_id,
-                    display_name: "Conflicting group".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("conflicting group create applies");
-        assert!(
-            read_storage_value(
-                &storage,
-                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
-                admin_document_reducer_conflict_key(&target, GROUP_DISPLAY_NAME_PATH),
-            )
-            .await
-            .is_some()
-        );
-        assert!(
-            read_storage_value(
-                &storage,
-                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
-                admin_document_reducer_conflict_key(&target, GROUP_REALM_ID_PATH),
-            )
-            .await
-            .is_some()
-        );
-        let reduced = read_group_doc(&storage, group_id).await;
-
-        let late_legacy = Group {
-            display_name: "Late legacy group".to_string(),
-            group_id,
-            realm_id: legacy_realm_id,
-            roles: HashSet::from([role_id]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::Group { group_id },
-            late_legacy
-                .to_bytes(&actor_a)
-                .expect("legacy group serializes"),
-        )
-        .await
-        .expect("late legacy group upsert skips with reducer state");
-
-        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
-
-        storage_batch_delete_to(
-            &storage,
-            vec![(GROUP_KEYSPACE.to_string(), group_id.to_bytes().into())],
-        )
-        .await
-        .expect("group doc deletes");
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::Group { group_id },
-            late_legacy
-                .to_bytes(&actor_a)
-                .expect("legacy group serializes"),
-        )
-        .await
-        .expect("legacy conflict payload without safe group is ignored");
-        assert_eq!(
-            read_storage_value(&storage, GROUP_KEYSPACE, group_id.to_bytes().into()).await,
-            None
         );
     }
 
@@ -7447,457 +5220,6 @@ mod tests {
                 .roles
                 .contains_key(&role_id)
         );
-    }
-
-    #[tokio::test]
-    async fn late_legacy_group_upsert_skips_with_reducer_role_state_and_conflicts() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([29; 32]);
-        let group_id = Ulid::from_parts(180, 1);
-        let role_id = Ulid::from_parts(181, 1);
-        let conflicted_role_id = Ulid::from_parts(182, 1);
-        let legacy_role_id = Ulid::from_parts(183, 1);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(184, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::Group { group_id };
-        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
-
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(185, 1),
-                target.clone(),
-                &actor,
-                1,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        role_id,
-                        "Reduced group role",
-                        "/group/reduced/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("role create applies");
-
-        let conflict_actor_a = test_actor(
-            9,
-            UserId::local(Ulid::from_parts(186, 1), realm_id),
-            realm_id,
-        );
-        let conflict_actor_b = test_actor(
-            10,
-            UserId::local(Ulid::from_parts(187, 1), realm_id),
-            realm_id,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(188, 1),
-                target.clone(),
-                &conflict_actor_a,
-                1,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "First conflicted role",
-                        "/group/conflict-a/**",
-                        Permission::READ,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("first conflict role applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target,
-            test_admin_event(
-                Ulid::from_parts(189, 1),
-                target,
-                &conflict_actor_b,
-                1,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "Second conflicted role",
-                        "/group/conflict-b/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("second conflict role applies");
-
-        let late_legacy = Group {
-            display_name: "Late legacy group".to_string(),
-            group_id,
-            realm_id,
-            roles: HashSet::from([legacy_role_id, conflicted_role_id]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::Group { group_id },
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy group serializes"),
-        )
-        .await
-        .expect("late legacy group upsert skips with reducer state");
-
-        assert_eq!(
-            read_storage_value(&storage, GROUP_KEYSPACE, group_id.to_bytes().into()).await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_realm_auth_upsert_skips_with_reducer_state_and_bootstraps_without_state() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([23; 32]);
-        let role_id = Ulid::from_parts(120, 1);
-        let assigned_user_id = UserId::local(Ulid::from_parts(121, 1), realm_id);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(122, 1), realm_id),
-            realm_id,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            test_admin_event(
-                Ulid::from_parts(125, 1),
-                AdminDocumentTarget::Realm { realm_id },
-                &actor,
-                1,
-                AdminDocumentOperation::RealmRoleUserAssignmentAdded {
-                    role_id,
-                    user_id: assigned_user_id,
-                },
-            ),
-        )
-        .await
-        .expect("realm assignment reducer state writes");
-        let reduced = read_realm_auth_doc(&storage, realm_id).await;
-
-        let legacy_user_id = UserId::local(Ulid::from_parts(126, 1), realm_id);
-        let mut legacy_role = test_role(role_id, [legacy_user_id]);
-        legacy_role.name = "legacy-realm-member".to_string();
-        legacy_role.permissions = HashMap::from([("/realm-legacy".to_string(), Permission::WRITE)]);
-        let late_legacy = RealmAuthorizationDocument {
-            realm_id,
-            roles: HashMap::from([(role_id, legacy_role.clone())]),
-            operation_restrictions: Default::default(),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy realm auth serializes"),
-        )
-        .await
-        .expect("late legacy realm auth upsert skips with reducer state");
-
-        assert_eq!(read_realm_auth_doc(&storage, realm_id).await, reduced);
-
-        let bootstrap_realm_id = RealmId::from_bytes([24; 32]);
-        let bootstrap_role_id = Ulid::from_parts(123, 1);
-        let bootstrap_user_id = UserId::local(Ulid::from_parts(124, 1), bootstrap_realm_id);
-        let bootstrap = RealmAuthorizationDocument {
-            realm_id: bootstrap_realm_id,
-            roles: HashMap::from([(
-                bootstrap_role_id,
-                test_role(bootstrap_role_id, [bootstrap_user_id]),
-            )]),
-            operation_restrictions: Default::default(),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            DocumentSyncTarget::RealmAuthorization {
-                realm_id: bootstrap_realm_id,
-            },
-            bootstrap
-                .to_bytes(&actor)
-                .expect("bootstrap realm auth serializes"),
-        )
-        .await
-        .expect("bootstrap legacy realm auth applies");
-
-        assert_eq!(
-            read_realm_auth_doc(&storage, bootstrap_realm_id).await,
-            bootstrap
-        );
-    }
-
-    #[tokio::test]
-    async fn late_legacy_group_auth_upsert_skips_with_reducer_role_state_and_conflicts() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([25; 32]);
-        let group_id = Ulid::from_parts(130, 1);
-        let role_id = Ulid::from_parts(131, 1);
-        let conflicted_role_id = Ulid::from_parts(132, 1);
-        let assigned_user_id = UserId::local(Ulid::from_parts(133, 1), realm_id);
-        let legacy_user_id = UserId::local(Ulid::from_parts(134, 1), realm_id);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(135, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::Group { group_id };
-        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
-
-        let reducer_role = test_admin_role_definition(
-            role_id,
-            "Reduced group role",
-            "/group/reduced/**",
-            Permission::WRITE,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(136, 1),
-                target.clone(),
-                &actor,
-                1,
-                AdminDocumentOperation::GroupRoleCreated { role: reducer_role },
-            ),
-        )
-        .await
-        .expect("group role create applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(137, 1),
-                target.clone(),
-                &actor,
-                2,
-                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
-                    role_id,
-                    user_id: assigned_user_id,
-                },
-            ),
-        )
-        .await
-        .expect("group assignment applies");
-
-        let conflict_actor_a = test_actor(
-            9,
-            UserId::local(Ulid::from_parts(138, 1), realm_id),
-            realm_id,
-        );
-        let conflict_actor_b = test_actor(
-            10,
-            UserId::local(Ulid::from_parts(139, 1), realm_id),
-            realm_id,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(140, 1),
-                target.clone(),
-                &conflict_actor_a,
-                1,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "First conflicted group role",
-                        "/group/conflict-a/**",
-                        Permission::READ,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("first group conflict role applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(141, 1),
-                target.clone(),
-                &conflict_actor_b,
-                1,
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "Second conflicted group role",
-                        "/group/conflict-b/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("second group conflict role applies");
-        let reduced = read_group_auth_doc(&storage, group_id).await;
-
-        let mut legacy_role = test_role(role_id, [legacy_user_id]);
-        legacy_role.name = "legacy group role".to_string();
-        legacy_role.permissions =
-            HashMap::from([("/group/legacy/**".to_string(), Permission::READ)]);
-        let mut legacy_conflicted_role = test_role(conflicted_role_id, [legacy_user_id]);
-        legacy_conflicted_role.name = "legacy conflicted group role".to_string();
-        let late_legacy = GroupAuthorizationDocument {
-            group_id,
-            roles: HashMap::from([
-                (role_id, legacy_role),
-                (conflicted_role_id, legacy_conflicted_role),
-            ]),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            document_target,
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy group auth serializes"),
-        )
-        .await
-        .expect("late legacy group auth upsert skips with reducer state");
-
-        assert_eq!(read_group_auth_doc(&storage, group_id).await, reduced);
-    }
-
-    #[tokio::test]
-    async fn late_legacy_realm_auth_upsert_skips_with_reducer_role_state_and_conflicts() {
-        let (_dir, storage) = test_storage();
-        let realm_id = RealmId::from_bytes([26; 32]);
-        let role_id = Ulid::from_parts(142, 1);
-        let conflicted_role_id = Ulid::from_parts(143, 1);
-        let assigned_user_id = UserId::local(Ulid::from_parts(144, 1), realm_id);
-        let legacy_user_id = UserId::local(Ulid::from_parts(145, 1), realm_id);
-        let actor = test_actor(
-            8,
-            UserId::local(Ulid::from_parts(146, 1), realm_id),
-            realm_id,
-        );
-        let target = AdminDocumentTarget::Realm { realm_id };
-        let document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-
-        let reducer_role = test_admin_role_definition(
-            role_id,
-            "Reduced realm role",
-            "/realm/reduced/**",
-            Permission::WRITE,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(147, 1),
-                target.clone(),
-                &actor,
-                1,
-                AdminDocumentOperation::RealmRoleCreated { role: reducer_role },
-            ),
-        )
-        .await
-        .expect("realm role create applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(148, 1),
-                target.clone(),
-                &actor,
-                2,
-                AdminDocumentOperation::RealmRoleUserAssignmentAdded {
-                    role_id,
-                    user_id: assigned_user_id,
-                },
-            ),
-        )
-        .await
-        .expect("realm assignment applies");
-
-        let conflict_actor_a = test_actor(
-            9,
-            UserId::local(Ulid::from_parts(149, 1), realm_id),
-            realm_id,
-        );
-        let conflict_actor_b = test_actor(
-            10,
-            UserId::local(Ulid::from_parts(150, 1), realm_id),
-            realm_id,
-        );
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(151, 1),
-                target.clone(),
-                &conflict_actor_a,
-                1,
-                AdminDocumentOperation::RealmRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "First conflicted realm role",
-                        "/realm/conflict-a/**",
-                        Permission::READ,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("first realm conflict role applies");
-        apply_admin_document_operation_to_storage(
-            &storage,
-            document_target.clone(),
-            test_admin_event(
-                Ulid::from_parts(152, 1),
-                target.clone(),
-                &conflict_actor_b,
-                1,
-                AdminDocumentOperation::RealmRoleCreated {
-                    role: test_admin_role_definition(
-                        conflicted_role_id,
-                        "Second conflicted realm role",
-                        "/realm/conflict-b/**",
-                        Permission::WRITE,
-                    ),
-                },
-            ),
-        )
-        .await
-        .expect("second realm conflict role applies");
-        let reduced = read_realm_auth_doc(&storage, realm_id).await;
-
-        let mut legacy_role = test_role(role_id, [legacy_user_id]);
-        legacy_role.name = "legacy realm role".to_string();
-        legacy_role.permissions =
-            HashMap::from([("/realm/legacy/**".to_string(), Permission::READ)]);
-        let mut legacy_conflicted_role = test_role(conflicted_role_id, [legacy_user_id]);
-        legacy_conflicted_role.name = "legacy conflicted realm role".to_string();
-        let late_legacy = RealmAuthorizationDocument {
-            realm_id,
-            roles: HashMap::from([
-                (role_id, legacy_role),
-                (conflicted_role_id, legacy_conflicted_role),
-            ]),
-            operation_restrictions: Default::default(),
-        };
-        apply_legacy_admin_document_upsert_to_storage(
-            &storage,
-            document_target,
-            late_legacy
-                .to_bytes(&actor)
-                .expect("legacy realm auth serializes"),
-        )
-        .await
-        .expect("late legacy realm auth upsert skips with reducer state");
-
-        assert_eq!(read_realm_auth_doc(&storage, realm_id).await, reduced);
     }
 
     #[tokio::test]
@@ -8891,15 +6213,23 @@ mod tests {
             let service = open_restart_service(&root, "child-storage").await;
             let target = restart_target();
             let event = service
-                .publish_document(
-                    restart_event_id(),
-                    target.clone(),
-                    restart_payload(),
+                .publish_documents(
+                    vec![DocumentSyncPublish::Upsert {
+                        event_id: restart_event_id(),
+                        target: target.clone(),
+                        bytes: restart_payload(),
+                        change: revision_change(),
+                    }],
                     Vec::new(),
                 )
                 .await;
 
-            assert_eq!(event, IrokleEvent::DocumentPublished { target });
+            assert_eq!(
+                event,
+                IrokleEvent::DocumentsPublished {
+                    targets: vec![target]
+                }
+            );
         });
 
         // Skip Rust destructors so the parent verifies the restart contract, not shutdown cleanup.
@@ -8907,8 +6237,8 @@ mod tests {
     }
 
     #[test]
-    fn upsert_with_revision_event_envelope_round_trips() {
-        let event = DocumentSyncEvent::UpsertWithRevision {
+    fn upsert_event_envelope_round_trips() {
+        let event = DocumentSyncEvent::Upsert {
             event_id: restart_event_id(),
             target: restart_target(),
             bytes: restart_payload(),
@@ -8946,6 +6276,7 @@ mod tests {
                 event_id: restart_event_id(),
                 target,
                 bytes: restart_payload(),
+                change: revision_change(),
             }
         );
 

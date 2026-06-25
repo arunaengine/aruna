@@ -287,20 +287,16 @@ mod tests {
 
     #[test]
     fn outbox_prefix_is_deterministic_and_kind_scoped() {
-        let upsert = DocumentSyncOutboxEvent::Upsert { bytes: vec![1, 2] };
-        let upsert_with_revision = DocumentSyncOutboxEvent::UpsertWithRevision {
+        let upsert = DocumentSyncOutboxEvent::Upsert {
             bytes: vec![1, 2],
             change: change(),
         };
-        let delete = DocumentSyncOutboxEvent::Delete;
-        let delete_with_revision = DocumentSyncOutboxEvent::DeleteWithRevision {
+        let delete = DocumentSyncOutboxEvent::Delete {
             change: delete_change(),
         };
 
         assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert));
-        assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert_with_revision));
         assert_ne!(outbox_prefix(&upsert), outbox_prefix(&delete));
-        assert_eq!(outbox_prefix(&delete), outbox_prefix(&delete_with_revision));
     }
 
     #[test]
@@ -310,7 +306,10 @@ mod tests {
             node(1),
             target(),
             vec![peer, peer],
-            DocumentSyncOutboxEvent::Upsert { bytes: vec![4, 5] },
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![4, 5],
+                change: change(),
+            },
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -321,12 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn outbox_record_with_revision_round_trips() {
+    fn outbox_record_upsert_round_trips_with_revision() {
         let record = new_outbox_record(
             node(1),
             target(),
             vec![node(3)],
-            DocumentSyncOutboxEvent::UpsertWithRevision {
+            DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![4, 5],
                 change: change(),
             },
@@ -339,12 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn outbox_record_with_revisioned_delete_round_trips() {
+    fn outbox_record_delete_round_trips_with_revision() {
         let record = new_outbox_record(
             node(1),
             target(),
             vec![node(3)],
-            DocumentSyncOutboxEvent::DeleteWithRevision {
+            DocumentSyncOutboxEvent::Delete {
                 change: delete_change(),
             },
         );
@@ -357,7 +356,10 @@ mod tests {
 
     #[test]
     fn outbox_key_is_unique_under_kind_prefix() {
-        let event = DocumentSyncOutboxEvent::Upsert { bytes: vec![1] };
+        let event = DocumentSyncOutboxEvent::Upsert {
+            bytes: vec![1],
+            change: change(),
+        };
         let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
         let right = new_outbox_record(node(1), target(), vec![node(2)], event);
         let prefix = outbox_prefix(&left.event);
@@ -369,7 +371,10 @@ mod tests {
 
     #[test]
     fn outbox_keys_order_by_outbox_id_across_targets() {
-        let event = DocumentSyncOutboxEvent::Upsert { bytes: vec![1] };
+        let event = DocumentSyncOutboxEvent::Upsert {
+            bytes: vec![1],
+            change: change(),
+        };
         let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(

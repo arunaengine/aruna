@@ -1,18 +1,23 @@
 use std::collections::VecDeque;
 
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+    DocumentSyncTarget,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+};
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::document_sync_revision_key;
+use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
+use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
-use aruna_core::{DOCUMENT_SYNC_REVISION_KEYSPACE, NodeId, TopicId, USER_KEYSPACE};
+use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -52,7 +57,6 @@ pub struct AnnounceTopicOperation {
 enum AnnounceTopicState {
     Init,
     ReadDocument,
-    ReadUserDocumentAndRevision,
     ListUsers,
     WriteOutbox,
     ScheduleSync,
@@ -165,42 +169,6 @@ impl AnnounceTopicOperation {
             });
             return;
         }
-
-        match &self.topic {
-            TopicId::Realm(realm_id) => {
-                self.pending.push_back(PendingDocumentSync::Document {
-                    document: DocumentSyncTarget::RealmAuthorization {
-                        realm_id: *realm_id,
-                    },
-                    bytes: None,
-                });
-                self.pending.push_back(PendingDocumentSync::Document {
-                    document: DocumentSyncTarget::RealmConfig {
-                        realm_id: *realm_id,
-                    },
-                    bytes: None,
-                });
-            }
-            TopicId::Group(group_id) => {
-                self.pending.push_back(PendingDocumentSync::Document {
-                    document: DocumentSyncTarget::Group {
-                        group_id: *group_id,
-                    },
-                    bytes: None,
-                });
-                self.pending.push_back(PendingDocumentSync::Document {
-                    document: DocumentSyncTarget::GroupAuthorization {
-                        group_id: *group_id,
-                    },
-                    bytes: None,
-                });
-            }
-            TopicId::Users(realm_id) => self.pending.push_back(PendingDocumentSync::UserPage {
-                realm_id: *realm_id,
-                start_after: None,
-            }),
-            TopicId::Metadata(_) | TopicId::Node(_) => {}
-        }
     }
 
     fn write_document_outbox_effect(
@@ -208,7 +176,14 @@ impl AnnounceTopicOperation {
         document: DocumentSyncTarget,
         bytes: Vec<u8>,
     ) -> Effects {
-        self.write_document_outbox_event_effect(document, DocumentSyncOutboxEvent::Upsert { bytes })
+        let change = match self.document_upsert_change(&document, &bytes) {
+            Ok(change) => change,
+            Err(error) => return self.fail(error),
+        };
+        self.write_document_outbox_event_effect(
+            document,
+            DocumentSyncOutboxEvent::Upsert { bytes, change },
+        )
     }
 
     fn write_document_outbox_event_effect(
@@ -225,32 +200,100 @@ impl AnnounceTopicOperation {
         }
     }
 
-    fn read_user_document_with_revision_effect(document: &DocumentSyncTarget) -> Effect {
-        Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document_repository::storage_keyspace(document).to_string(),
-                    document_repository::storage_key(document),
-                ),
-                (
-                    DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-                    document_sync_revision_key(document),
-                ),
-            ],
-            txn_id: None,
-        })
-    }
-
-    fn user_outbox_event(
-        bytes: Vec<u8>,
-        revision_value: Option<&aruna_core::types::Value>,
-    ) -> DocumentSyncOutboxEvent {
-        match revision_value
-            .and_then(|value| postcard::from_bytes::<DocumentSyncChange>(value.as_ref()).ok())
-            .filter(|change| change.kind == DocumentSyncChangeKind::Upsert)
-        {
-            Some(change) => DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change },
-            None => DocumentSyncOutboxEvent::Upsert { bytes },
+    fn document_upsert_change(
+        &self,
+        document: &DocumentSyncTarget,
+        bytes: &[u8],
+    ) -> Result<DocumentSyncChange, AnnounceTopicError> {
+        match document {
+            DocumentSyncTarget::Group { .. }
+            | DocumentSyncTarget::GroupAuthorization { .. }
+            | DocumentSyncTarget::RealmAuthorization { .. }
+            | DocumentSyncTarget::RealmConfig { .. }
+            | DocumentSyncTarget::User { .. } => Err(AnnounceTopicError::DocumentSync(
+                "whole-document admin sync is unsupported; admin documents must sync as operations"
+                    .to_string(),
+            )),
+            DocumentSyncTarget::MetadataRegistry {
+                group_id,
+                document_id,
+            } => {
+                let record: MetadataRegistryRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.group_id != *group_id || record.document_id != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata registry target {group_id}/{document_id} does not match payload {}/{}",
+                        record.group_id, record.document_id
+                    )));
+                }
+                Ok(DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.updated_at_ms,
+                        event_id: record.last_event_id,
+                        actor: self.local_node_id,
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                })
+            }
+            DocumentSyncTarget::MetadataCreateEvent {
+                document_id,
+                event_id,
+            } => {
+                let record: MetadataCreateEventRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.record.document_id != *document_id || record.event_id != *event_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata create-event target {document_id}/{event_id} does not match payload {}/{}",
+                        record.record.document_id, record.event_id
+                    )));
+                }
+                Ok(DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.record.updated_at_ms,
+                        event_id: record.event_id,
+                        actor: record.node_id,
+                        updated_at_ms: record.occurred_at_ms,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                })
+            }
+            DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+                let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.document_id() != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata document lifecycle target {document_id} does not match payload document {}",
+                        record.document_id()
+                    )));
+                }
+                Ok(metadata_document_lifecycle_revision_change(
+                    &record,
+                    self.local_node_id,
+                ))
+            }
+            DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
+                let record: MetadataGraphLifecycleRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.graph_iri != *graph_iri {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
+                        record.graph_iri
+                    )));
+                }
+                Ok(DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.updated_at_ms,
+                        event_id: Ulid::new(),
+                        actor: self.local_node_id,
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                })
+            }
         }
     }
 
@@ -259,10 +302,6 @@ impl AnnounceTopicOperation {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
                     self.write_document_outbox_effect(document, bytes)
-                } else if matches!(document, DocumentSyncTarget::User { .. }) {
-                    self.current = Some(document.clone());
-                    self.state = AnnounceTopicState::ReadUserDocumentAndRevision;
-                    smallvec![Self::read_user_document_with_revision_effect(&document)]
                 } else {
                     self.current = Some(document.clone());
                     self.state = AnnounceTopicState::ReadDocument;
@@ -313,29 +352,6 @@ impl Operation for AnnounceTopicOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
-            },
-            AnnounceTopicState::ReadUserDocumentAndRevision => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let Some(document) = self.current.clone() else {
-                        return self.unexpected_event(
-                            "tracked document sync target",
-                            "missing current document".to_string(),
-                        );
-                    };
-                    let [(_, user_value), (_, revision_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with user document and revision",
-                            format!("{values:?}"),
-                        );
-                    };
-                    let Some(bytes) = user_value else {
-                        return self.next_effect();
-                    };
-                    let event = Self::user_outbox_event(bytes.to_vec(), revision_value.as_ref());
-                    self.write_document_outbox_event_effect(document, event)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
             AnnounceTopicState::ListUsers => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -427,13 +443,10 @@ impl Operation for AnnounceTopicOperation {
 mod tests {
     use super::*;
 
-    use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncOutboxRecord, DocumentSyncRevision,
-    };
+    use aruna_core::document::DocumentSyncOutboxRecord;
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
-    };
+    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::metadata::MetadataGraphLifecycleRecord;
     use aruna_core::types::GroupId;
     use ulid::Ulid;
 
@@ -445,31 +458,6 @@ mod tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         (user_id, DocumentSyncTarget::User { user_id })
-    }
-
-    fn upsert_change(actor: NodeId) -> DocumentSyncChange {
-        DocumentSyncChange {
-            base: None,
-            current: DocumentSyncRevision {
-                generation: 7,
-                event_id: Ulid::from_bytes([4u8; 16]),
-                actor,
-                updated_at_ms: 123,
-            },
-            kind: DocumentSyncChangeKind::Upsert,
-        }
-    }
-
-    fn assert_user_batch_read(effects: &[Effect], user_id: UserId, document: &DocumentSyncTarget) {
-        let [Effect::Storage(StorageEffect::BatchRead { reads, txn_id })] = effects else {
-            panic!("expected user batch read, got {effects:?}");
-        };
-        assert_eq!(txn_id, &None);
-        assert_eq!(reads.len(), 2);
-        assert_eq!(reads[0].0, USER_KEYSPACE);
-        assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
-        assert_eq!(reads[1].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
-        assert_eq!(reads[1].1, document_sync_revision_key(document));
     }
 
     fn written_outbox_record(effects: &[Effect]) -> DocumentSyncOutboxRecord {
@@ -492,11 +480,17 @@ mod tests {
     #[test]
     fn provided_document_bytes_skip_readback_before_outbox_write() {
         let local_node_id = local_node_id();
-        let document = DocumentSyncTarget::MetadataRegistry {
-            group_id: GroupId::new(),
-            document_id: Ulid::new(),
+        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:announce".to_string(),
+            RealmId::from_bytes([2u8; 32]),
+            GroupId::new(),
+            Ulid::new(),
+            42,
+        );
+        let document = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: lifecycle.graph_iri.clone(),
         };
-        let bytes = vec![1, 2, 3, 4];
+        let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
         let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
             document.topic_id(),
             local_node_id,
@@ -509,67 +503,59 @@ mod tests {
 
         let record = written_outbox_record(effects.as_slice());
         assert_eq!(record.target, document);
-        assert_eq!(record.event, DocumentSyncOutboxEvent::Upsert { bytes });
+        let DocumentSyncOutboxEvent::Upsert {
+            bytes: actual,
+            change,
+        } = record.event
+        else {
+            panic!("expected revisioned upsert");
+        };
+        assert_eq!(actual, bytes);
+        assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
     }
 
     #[test]
-    fn user_with_upsert_sidecar_writes_upsert_with_revision() {
+    fn user_document_announcement_fails_without_revision() {
         let local_node_id = local_node_id();
-        let (user_id, document) = user_document();
-        let bytes = vec![9, 8, 7];
-        let change = upsert_change(local_node_id);
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers(
+        let (_, document) = user_document();
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
             document.topic_id(),
             local_node_id,
-            Some(document.clone()),
+            document,
             Vec::new(),
+            b"user whole document".to_vec(),
         );
 
         let effects = operation.start();
-        assert_user_batch_read(effects.as_slice(), user_id, &document);
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (user_id.to_bytes().into(), Some(bytes.clone().into())),
-                (
-                    document_sync_revision_key(&document),
-                    Some(postcard::to_allocvec(&change).unwrap().into()),
-                ),
-            ],
-        }));
-
-        let record = written_outbox_record(effects.as_slice());
-        assert_eq!(record.target, document);
-        assert_eq!(
-            record.event,
-            DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change }
-        );
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AnnounceTopicError::DocumentSync(error))
+                if error.contains("admin documents must sync as operations")
+        ));
     }
 
     #[test]
-    fn user_without_sidecar_writes_legacy_upsert() {
+    fn admin_document_announcement_fails_without_revision() {
         let local_node_id = local_node_id();
-        let (user_id, document) = user_document();
-        let bytes = vec![5, 6, 7];
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers(
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let document = DocumentSyncTarget::RealmConfig { realm_id };
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
             document.topic_id(),
             local_node_id,
-            Some(document.clone()),
+            document,
             Vec::new(),
+            b"realm config whole document".to_vec(),
         );
 
         let effects = operation.start();
-        assert_user_batch_read(effects.as_slice(), user_id, &document);
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (user_id.to_bytes().into(), Some(bytes.clone().into())),
-                (document_sync_revision_key(&document), None),
-            ],
-        }));
-
-        let record = written_outbox_record(effects.as_slice());
-        assert_eq!(record.target, document);
-        assert_eq!(record.event, DocumentSyncOutboxEvent::Upsert { bytes });
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AnnounceTopicError::DocumentSync(error))
+                if error.contains("admin documents must sync as operations")
+        ));
     }
 }

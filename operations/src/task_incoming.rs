@@ -71,29 +71,19 @@ fn document_publish_from_outbox(
     event: DocumentSyncOutboxEvent,
 ) -> DocumentSyncPublish {
     match event {
-        DocumentSyncOutboxEvent::Upsert { bytes } => DocumentSyncPublish::Upsert {
+        DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
             event_id,
             target,
             bytes,
+            change,
         },
-        DocumentSyncOutboxEvent::Delete => DocumentSyncPublish::Delete { event_id, target },
-        DocumentSyncOutboxEvent::DeleteWithRevision { change } => {
-            DocumentSyncPublish::DeleteWithRevision {
-                event_id,
-                target,
-                change,
-            }
-        }
+        DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
+            event_id,
+            target,
+            change,
+        },
         DocumentSyncOutboxEvent::AdminOperation { event } => {
             DocumentSyncPublish::AdminOperation { target, event }
-        }
-        DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change } => {
-            DocumentSyncPublish::UpsertWithRevision {
-                event_id,
-                target,
-                bytes,
-                change,
-            }
         }
     }
 }
@@ -719,14 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn outbox_upsert_with_revision_maps_to_publish_with_revision() {
+    fn outbox_upsert_maps_to_publish_with_revision() {
         let event_id = Ulid::from_parts(10, 1);
         let target = target();
         let change = change();
         let publish = document_publish_from_outbox(
             event_id,
             target.clone(),
-            DocumentSyncOutboxEvent::UpsertWithRevision {
+            DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![1, 2, 3],
                 change,
             },
@@ -736,7 +726,7 @@ mod tests {
         assert_eq!(publish.event_id(), event_id);
         assert!(matches!(
             publish,
-            DocumentSyncPublish::UpsertWithRevision { bytes, change: actual, .. }
+            DocumentSyncPublish::Upsert { bytes, change: actual, .. }
                 if bytes == vec![1, 2, 3] && actual == change
         ));
     }
@@ -769,6 +759,7 @@ mod tests {
             vec![node(2)],
             DocumentSyncOutboxEvent::Upsert {
                 bytes: b"restore durable work".to_vec(),
+                change: change(),
             },
         );
         write_outbox_record(&storage, &record).await;
@@ -797,6 +788,7 @@ mod tests {
             vec![node(2)],
             DocumentSyncOutboxEvent::Upsert {
                 bytes: b"retained work".to_vec(),
+                change: change(),
             },
         );
         let key = outbox_key(&record).to_vec();
@@ -841,6 +833,7 @@ mod tests {
             vec![node(2)],
             DocumentSyncOutboxEvent::Upsert {
                 bytes: b"retry after restart".to_vec(),
+                change: change(),
             },
         );
         let key = outbox_key(&record).to_vec();
