@@ -16,6 +16,7 @@ use aruna_core::document::{
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
     IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -896,13 +897,17 @@ impl IrokleService {
             match result {
                 Ok((peer, Ok(()), elapsed)) => {
                     successes += 1;
-                    per_peer.push(format!("{}={}ms", short_peer(peer), duration_ms(elapsed)));
+                    per_peer.push(format!(
+                        "{}={}ms",
+                        short_display_id(peer),
+                        duration_ms(elapsed)
+                    ));
                     debug!(%peer, context = %context, "Synced Irokle document peer")
                 }
                 Ok((peer, Err(error), elapsed)) => {
                     per_peer.push(format!(
                         "{}={}ms(err)",
-                        short_peer(peer),
+                        short_display_id(peer),
                         duration_ms(elapsed)
                     ));
                     warn!(%peer, context = %context, error = %error, "Irokle peer sync failed; deferring to resync scheduler");
@@ -4130,12 +4135,6 @@ fn metadata_document_delete_write_entries(
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
-}
-
-fn short_peer(peer: PeerId) -> String {
-    let mut id = peer.to_string();
-    id.truncate(8);
-    id
 }
 
 fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {

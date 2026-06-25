@@ -10,7 +10,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::{Span, info};
 
 /// Default flush interval for latency summaries.
 pub const LATENCY_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
@@ -48,6 +48,16 @@ const BUCKET_COUNT: usize = BUCKET_BOUNDS_US.len() + 1;
 
 pub fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub fn record_duration_ms(span: &Span, field: &'static str, duration: Duration) {
+    span.record(field, duration_ms(duration));
+}
+
+pub fn record_elapsed_ms(span: &Span, field: &'static str, started: Instant) -> Duration {
+    let duration = started.elapsed();
+    record_duration_ms(span, field, duration);
+    duration
 }
 
 fn us_to_ms(us: u64) -> f64 {

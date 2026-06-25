@@ -2,11 +2,12 @@ use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_real
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::short_display_id;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
-use aruna_core::telemetry::duration_ms;
+use aruna_core::telemetry::record_elapsed_ms;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -1698,10 +1699,6 @@ fn map_query_results(
     })
 }
 
-fn record_api_elapsed(span: &Span, field: &'static str, started: Instant) {
-    span.record(field, duration_ms(started.elapsed()));
-}
-
 fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
     match results {
         MetadataQueryResults::Solutions(_) => "solutions",
@@ -1732,12 +1729,6 @@ fn deduplicate_node_ids(nodes: Vec<aruna_core::NodeId>) -> Vec<aruna_core::NodeI
         .into_iter()
         .filter(|node_id| seen.insert(*node_id))
         .collect()
-}
-
-fn short_node_id(node_id: aruna_core::NodeId) -> String {
-    let mut id = node_id.to_string();
-    id.truncate(8);
-    id
 }
 
 fn metadata_auth_token_from_carrier(
@@ -1800,7 +1791,7 @@ async fn run_query_distributed(
                 .query_authorized_local(auth, graph_iris, query)
                 .instrument(node_span.clone())
                 .await;
-            record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            record_elapsed_ms(&node_span, "elapsed_ms", node_started);
             fanout.nodes_queried = 1;
             match result {
                 Ok(result) => {
@@ -1824,7 +1815,7 @@ async fn run_query_distributed(
                     let nodes =
                         aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
                             .await?;
-                    record_api_elapsed(&span, "discovery_ms", discovery_started);
+                    record_elapsed_ms(&span, "discovery_ms", discovery_started);
                     nodes
                 }
             };
@@ -1882,10 +1873,10 @@ async fn run_query_distributed(
                                 ))),
                             }
                         };
-                        record_api_elapsed(&node_span, "elapsed_ms", node_started);
+                        record_elapsed_ms(&node_span, "elapsed_ms", node_started);
                         aruna_core::telemetry::record_stage_detail(
                             "fanout_node",
-                            || short_node_id(node_id),
+                            || short_display_id(node_id),
                             node_started.elapsed(),
                         );
                         match &result {
@@ -1923,7 +1914,7 @@ async fn run_query_distributed(
     }
 
     let result = aggregate_query_results(parts, query_form, select_limit);
-    record_api_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     match &result {
         Ok(results) => {
             span.record("result", metadata_query_result_kind(results));
@@ -1986,7 +1977,7 @@ async fn run_search_distributed(
                 .search_authorized_local(auth, graph_iris, query, limit)
                 .instrument(node_span.clone())
                 .await;
-            record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            record_elapsed_ms(&node_span, "elapsed_ms", node_started);
             fanout.nodes_queried = 1;
             match result {
                 Ok(result) => {
@@ -2007,7 +1998,7 @@ async fn run_search_distributed(
                     let nodes =
                         aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
                             .await?;
-                    record_api_elapsed(&span, "discovery_ms", discovery_started);
+                    record_elapsed_ms(&span, "discovery_ms", discovery_started);
                     nodes
                 }
             };
@@ -2065,10 +2056,10 @@ async fn run_search_distributed(
                                 ))),
                             }
                         };
-                        record_api_elapsed(&node_span, "elapsed_ms", node_started);
+                        record_elapsed_ms(&node_span, "elapsed_ms", node_started);
                         aruna_core::telemetry::record_stage_detail(
                             "fanout_node",
-                            || short_node_id(node_id),
+                            || short_display_id(node_id),
                             node_started.elapsed(),
                         );
                         match &result {
@@ -2105,7 +2096,7 @@ async fn run_search_distributed(
 
     let hits = deduplicate_search_hits(hits, limit);
     span.record("hit_count", hits.len() as u64);
-    record_api_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok((hits, fanout))
 }
 

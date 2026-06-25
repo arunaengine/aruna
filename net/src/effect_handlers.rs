@@ -1,7 +1,7 @@
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, NetEvent, StreamEvent};
-use aruna_core::id::DhtKeyId;
+use aruna_core::id::{DhtKeyId, hex_prefix};
 use tracing::{trace, warn};
 
 use crate::{DhtHandle, IrokleService};
@@ -65,7 +65,7 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
         } => {
             trace!(
                 event = "dht.put.started",
-                key = %hex::encode(&key[..8]),
+                key = %hex_prefix(&key),
                 realm_id = %realm_id,
                 value_len = value.len(),
                 ttl_secs = ttl.as_secs(),
@@ -75,7 +75,7 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
             match dht.put(&key_id, realm_id, value, ttl).await {
                 Ok(()) => NetEvent::Dht(DhtEvent::PutComplete { key }),
                 Err(error) => {
-                    warn!(key = %hex::encode(&key[..8]), error = %error, "DHT put failed");
+                    warn!(key = %hex_prefix(&key), error = %error, "DHT put failed");
                     NetEvent::Dht(DhtEvent::Error {
                         error: DhtError::StoreFailed(error.to_string()),
                     })
@@ -85,7 +85,7 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
         DhtEffect::Get { key, realm_filter } => {
             trace!(
                 event = "dht.get.started",
-                key = %hex::encode(&key[..8]),
+                key = %hex_prefix(&key),
                 realm_id = ?realm_filter,
                 "Starting DHT get"
             );
@@ -93,7 +93,7 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
             match dht.get(&key_id, realm_filter).await {
                 Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
                 Err(error) => {
-                    warn!(key = %hex::encode(&key[..8]), error = %error, "DHT get failed");
+                    warn!(key = %hex_prefix(&key), error = %error, "DHT get failed");
                     NetEvent::Dht(DhtEvent::Error {
                         error: DhtError::Other(error.to_string()),
                     })

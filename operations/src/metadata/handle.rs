@@ -24,7 +24,7 @@ use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
 };
-use aruna_core::telemetry::duration_ms;
+use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -705,7 +705,7 @@ impl MetadataHandle {
             match result {
                 Ok(read) if read.deleted => {
                     span.record("deleted", true);
-                    record_elapsed(&span, "elapsed_ms", started);
+                    record_elapsed_ms(&span, "elapsed_ms", started);
                     match &effect {
                         MetadataEffect::DeleteGraph { .. } => {}
                         MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
@@ -733,11 +733,11 @@ impl MetadataHandle {
                 }
                 Ok(_) => {
                     span.record("deleted", false);
-                    record_elapsed(&span, "elapsed_ms", started);
+                    record_elapsed_ms(&span, "elapsed_ms", started);
                 }
                 Err(error) => {
                     record_error(&span, &error.to_string());
-                    record_elapsed(&span, "elapsed_ms", started);
+                    record_elapsed_ms(&span, "elapsed_ms", started);
                     return Event::Metadata(MetadataEvent::Error {
                         graph_iri: Some(graph_iri.to_string()),
                         error,
@@ -824,7 +824,7 @@ impl MetadataHandle {
                         }
                     }
                 };
-                record_elapsed(&span, "elapsed_ms", started);
+                record_elapsed_ms(&span, "elapsed_ms", started);
                 span.record("result", metadata_event_kind(&metadata_event));
                 Event::Metadata(metadata_event)
             }
@@ -946,7 +946,7 @@ impl MetadataHandle {
         let read_started = Instant::now();
         let message = read_transport_message(&mut stream).await?;
         let span = Span::current();
-        record_elapsed(&span, "read_ms", read_started);
+        record_elapsed_ms(&span, "read_ms", read_started);
         span.record("request", metadata_transport_message_kind(&message));
 
         let process_started = Instant::now();
@@ -1008,17 +1008,17 @@ impl MetadataHandle {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
         };
-        record_elapsed(&span, "process_ms", process_started);
+        record_elapsed_ms(&span, "process_ms", process_started);
 
         let drain_started = Instant::now();
         drain_request_stream(&mut stream).await?;
-        record_elapsed(&span, "drain_ms", drain_started);
+        record_elapsed_ms(&span, "drain_ms", drain_started);
 
         let write_started = Instant::now();
         let _ = write_transport_message(&mut stream, &response).await;
-        record_elapsed(&span, "write_ms", write_started);
+        record_elapsed_ms(&span, "write_ms", write_started);
         close_stream(&mut stream).await;
-        record_elapsed(&span, "elapsed_ms", total_started);
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
         span.record("response", metadata_transport_message_kind(&response));
         Ok(())
     }
@@ -1173,7 +1173,7 @@ impl MetadataHandle {
                 "unexpected metadata query response: {other:?}"
             ))),
         };
-        record_elapsed(&span, "elapsed_ms", started);
+        record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
             Ok(results) => {
                 span.record("result", metadata_query_result_kind(results));
@@ -1230,7 +1230,7 @@ impl MetadataHandle {
                 "unexpected metadata search response: {other:?}"
             ))),
         };
-        record_elapsed(&span, "elapsed_ms", started);
+        record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
             Ok(hits) => {
                 span.record("result", "ok");
@@ -1545,8 +1545,8 @@ async fn sync_graph_once(
     })
     .await
     .map_err(|error| MetadataError::TaskJoin(error.to_string()))?;
-    record_elapsed(&setup_span, "elapsed_ms", setup_started);
-    record_elapsed(&span, "local_peer_setup_ms", setup_started);
+    record_elapsed_ms(&setup_span, "elapsed_ms", setup_started);
+    record_elapsed_ms(&span, "local_peer_setup_ms", setup_started);
     match &topic_id {
         Ok(_) => {
             setup_span.record("result", "ok");
@@ -1560,8 +1560,8 @@ async fn sync_graph_once(
         .sync_irokle_topic_with_peers(topic_id, peers)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    record_elapsed(&span, "network_sync_ms", sync_started);
-    record_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "network_sync_ms", sync_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok(())
 }
 
@@ -2073,7 +2073,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     if result.is_ok() && persist_error.is_none() && deferred_persist_after_success {
         schedule_deferred_metadata_persist(inner.clone(), effect_name, graph_iri.clone());
     }
-    record_elapsed(&effect_span, "elapsed_ms", effect_started);
+    record_elapsed_ms(&effect_span, "elapsed_ms", effect_started);
     let event = match (result, persist_error) {
         (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
         (Ok(event), None) => event,
@@ -2118,7 +2118,7 @@ fn flush_irokle_journal(
     );
     let started = Instant::now();
     let result = span.in_scope(|| db.persist(inner.irokle_persist_policy.as_fjall()));
-    record_elapsed(&span, "elapsed_ms", started);
+    record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
             span.record("result", "ok");
@@ -2282,7 +2282,7 @@ fn run_deferred_metadata_flush(
     );
     let started = Instant::now();
     let result = span.in_scope(|| flush_metadata_persistence(inner, effect_name, graph_iri));
-    record_elapsed(&span, "elapsed_ms", started);
+    record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
             span.record("result", "ok");
@@ -3007,14 +3007,6 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
     }
 }
 
-fn record_duration(span: &Span, field: &'static str, duration: Duration) {
-    span.record(field, duration_ms(duration));
-}
-
-fn record_elapsed(span: &Span, field: &'static str, started: Instant) {
-    record_duration(span, field, started.elapsed());
-}
-
 fn record_error(span: &Span, error: &str) {
     span.record("result", "error");
     span.record("error", field::display(error));
@@ -3048,7 +3040,7 @@ fn record_craqle_call_result<T>(
     result: &Result<T, CraqleError>,
 ) {
     let duration = started.elapsed();
-    record_duration(span, "elapsed_ms", duration);
+    record_duration_ms(span, "elapsed_ms", duration);
     match result {
         Ok(_) => {
             span.record("result", "ok");
@@ -3330,7 +3322,7 @@ async fn list_local_registry_records(
             span.record("cache_hit", true);
             span.record("stale", !fresh);
             span.record("record_count", records.len() as u64);
-            record_elapsed(&span, "elapsed_ms", started);
+            record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
         None => {
@@ -3345,13 +3337,13 @@ async fn list_local_registry_records(
                 span.record("cache_hit", true);
                 span.record("stale", false);
                 span.record("record_count", records.len() as u64);
-                record_elapsed(&span, "elapsed_ms", started);
+                record_elapsed_ms(&span, "elapsed_ms", started);
                 return Ok(records);
             }
             span.record("cache_hit", false);
             let records = fill_visibility_caches(&inner).await?;
             span.record("record_count", records.len() as u64);
-            record_elapsed(&span, "elapsed_ms", started);
+            record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
     }
@@ -3386,7 +3378,7 @@ async fn list_local_registry_records_for_group(
             span.record("cache_hit", true);
             span.record("stale", !fresh);
             span.record("record_count", records.len() as u64);
-            record_elapsed(&span, "elapsed_ms", started);
+            record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
         None => {
@@ -3403,7 +3395,7 @@ async fn list_local_registry_records_for_group(
                 span.record("cache_hit", true);
                 span.record("stale", false);
                 span.record("record_count", records.len() as u64);
-                record_elapsed(&span, "elapsed_ms", started);
+                record_elapsed_ms(&span, "elapsed_ms", started);
                 return Ok(records);
             }
             span.record("cache_hit", false);
@@ -3414,7 +3406,7 @@ async fn list_local_registry_records_for_group(
                 .map(|(records, _)| records)
                 .unwrap_or_else(|| Arc::new(Vec::new()));
             span.record("record_count", records.len() as u64);
-            record_elapsed(&span, "elapsed_ms", started);
+            record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
     }
@@ -3512,7 +3504,7 @@ async fn fill_visibility_caches(
         lifecycle_entries,
         fill_generation,
     );
-    record_elapsed(&span, "elapsed_ms", started);
+    record_elapsed_ms(&span, "elapsed_ms", started);
     Ok(records)
 }
 
@@ -3594,7 +3586,7 @@ async fn query_local_graphs(
 
     let registry_started = Instant::now();
     let records = list_local_registry_records(inner.clone()).await?;
-    record_elapsed(&span, "registry_ms", registry_started);
+    record_elapsed_ms(&span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
 
     let authorization_started = Instant::now();
@@ -3609,7 +3601,7 @@ async fn query_local_graphs(
             resolve_graph_visibility_scope(&inner, auth_context, records).await?,
         ),
     };
-    record_elapsed(&span, "authorization_ms", authorization_started);
+    record_elapsed_ms(&span, "authorization_ms", authorization_started);
     let lazy = match &scope {
         LocalReadScope::Eager(allowed) => {
             span.record("authorized_graphs", allowed.len() as u64);
@@ -3660,8 +3652,8 @@ async fn query_local_graphs(
         Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
     };
     let query_elapsed = query_started.elapsed();
-    record_duration(&query_span, "elapsed_ms", query_elapsed);
-    record_duration(&span, "craqle_query_ms", query_elapsed);
+    record_duration_ms(&query_span, "elapsed_ms", query_elapsed);
+    record_duration_ms(&span, "craqle_query_ms", query_elapsed);
     match &result {
         Ok(results) => {
             query_span.record("result", metadata_query_result_kind(results));
@@ -3675,7 +3667,7 @@ async fn query_local_graphs(
         }
     }
     warn_if_slow_metadata_backend("query_graphs", None, query_elapsed);
-    record_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
 }
 
@@ -3709,19 +3701,19 @@ async fn search_local_graphs(
 
     let registry_started = Instant::now();
     let records = list_local_registry_records(inner.clone()).await?;
-    record_elapsed(&span, "registry_ms", registry_started);
+    record_elapsed_ms(&span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
 
     let authorization_started = Instant::now();
     let allowed_records =
         select_authorized_records(inner.clone(), auth_context, records, graph_iris).await?;
-    record_elapsed(&span, "authorization_ms", authorization_started);
+    record_elapsed_ms(&span, "authorization_ms", authorization_started);
     span.record("authorized_graphs", allowed_records.len() as u64);
 
     if limit == 0 || allowed_records.is_empty() {
         span.record("result", "ok");
         span.record("hit_count", 0u64);
-        record_elapsed(&span, "elapsed_ms", total_started);
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok(Vec::new());
     }
 
@@ -3771,8 +3763,8 @@ async fn search_local_graphs(
         Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
     };
     let search_elapsed = search_started.elapsed();
-    record_duration(&search_span, "elapsed_ms", search_elapsed);
-    record_duration(&span, "craqle_search_ms", search_elapsed);
+    record_duration_ms(&search_span, "elapsed_ms", search_elapsed);
+    record_duration_ms(&span, "craqle_search_ms", search_elapsed);
     match &result {
         Ok(hits) => {
             search_span.record("result", "ok");
@@ -3786,7 +3778,7 @@ async fn search_local_graphs(
         }
     }
     warn_if_slow_metadata_backend("search", None, search_elapsed);
-    record_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
 }
 
@@ -3924,7 +3916,7 @@ async fn select_authorized_records(
     span.record("public_count", public_count as u64);
     span.record("private_checked_count", private_checked_count as u64);
     span.record("denied_count", denied_count as u64);
-    record_elapsed(&span, "elapsed_ms", started);
+    record_elapsed_ms(&span, "elapsed_ms", started);
     Ok(visible)
 }
 
@@ -4115,27 +4107,27 @@ async fn send_request(
         .open_stream(node_id, Alpn::Metadata)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    record_elapsed(&span, "open_stream_ms", open_started);
+    record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
     write_transport_message(&mut stream, &message).await?;
-    record_elapsed(&span, "write_ms", write_started);
+    record_elapsed_ms(&span, "write_ms", write_started);
 
     let finish_started = Instant::now();
     stream
         .0
         .finish()
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    record_elapsed(&span, "finish_ms", finish_started);
+    record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
     let response = read_transport_message(&mut stream).await?;
-    record_elapsed(&span, "read_ms", read_started);
+    record_elapsed_ms(&span, "read_ms", read_started);
 
     let close_started = Instant::now();
     close_stream(&mut stream).await;
-    record_elapsed(&span, "close_ms", close_started);
-    record_elapsed(&span, "elapsed_ms", total_started);
+    record_elapsed_ms(&span, "close_ms", close_started);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
     span.record("response", metadata_transport_message_kind(&response));
     Ok(response)
 }
