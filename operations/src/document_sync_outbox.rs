@@ -278,6 +278,13 @@ mod tests {
         }
     }
 
+    fn delete_change() -> DocumentSyncChange {
+        DocumentSyncChange {
+            kind: DocumentSyncChangeKind::Delete,
+            ..change()
+        }
+    }
+
     #[test]
     fn outbox_prefix_is_deterministic_and_kind_scoped() {
         let upsert = DocumentSyncOutboxEvent::Upsert { bytes: vec![1, 2] };
@@ -286,10 +293,14 @@ mod tests {
             change: change(),
         };
         let delete = DocumentSyncOutboxEvent::Delete;
+        let delete_with_revision = DocumentSyncOutboxEvent::DeleteWithRevision {
+            change: delete_change(),
+        };
 
         assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert));
         assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert_with_revision));
         assert_ne!(outbox_prefix(&upsert), outbox_prefix(&delete));
+        assert_eq!(outbox_prefix(&delete), outbox_prefix(&delete_with_revision));
     }
 
     #[test]
@@ -318,6 +329,23 @@ mod tests {
             DocumentSyncOutboxEvent::UpsertWithRevision {
                 bytes: vec![4, 5],
                 change: change(),
+            },
+        );
+        let bytes = postcard::to_allocvec(&record).expect("record serializes");
+        let decoded: DocumentSyncOutboxRecord =
+            postcard::from_bytes(&bytes).expect("record decodes");
+
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn outbox_record_with_revisioned_delete_round_trips() {
+        let record = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(3)],
+            DocumentSyncOutboxEvent::DeleteWithRevision {
+                change: delete_change(),
             },
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");

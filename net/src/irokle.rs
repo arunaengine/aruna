@@ -10,9 +10,9 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncConflict, DocumentSyncEvent,
-    DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget, IrokleEvent,
-    document_sync_apply_decision,
+    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict,
+    DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
+    IrokleEvent, document_sync_apply_decision,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -553,6 +553,15 @@ impl IrokleService {
             DocumentSyncEvent::Delete { event_id, target } => {
                 DocumentSyncPublish::Delete { event_id, target }
             }
+            DocumentSyncEvent::DeleteWithRevision {
+                event_id,
+                target,
+                change,
+            } => DocumentSyncPublish::DeleteWithRevision {
+                event_id,
+                target,
+                change,
+            },
             DocumentSyncEvent::AdminOperation { target, event } => {
                 DocumentSyncPublish::AdminOperation { target, event }
             }
@@ -628,6 +637,15 @@ impl IrokleService {
                 DocumentSyncPublish::Delete { event_id, target } => {
                     DocumentSyncEvent::Delete { event_id, target }
                 }
+                DocumentSyncPublish::DeleteWithRevision {
+                    event_id,
+                    target,
+                    change,
+                } => DocumentSyncEvent::DeleteWithRevision {
+                    event_id,
+                    target,
+                    change,
+                },
                 DocumentSyncPublish::AdminOperation { target, event } => {
                     DocumentSyncEvent::AdminOperation { target, event }
                 }
@@ -1592,6 +1610,9 @@ impl IrokleService {
                 ..
             } => self.apply_upsert_with_revision(target, bytes, change).await,
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
+            DocumentSyncEvent::DeleteWithRevision { target, change, .. } => {
+                self.apply_delete_with_revision(target, change).await
+            }
             DocumentSyncEvent::AdminOperation { target, event } => {
                 apply_admin_document_operation_to_storage(&self.storage, target, *event).await
             }
@@ -1604,11 +1625,25 @@ impl IrokleService {
         bytes: Vec<u8>,
         change: DocumentSyncChange,
     ) -> Result<()> {
-        if let DocumentSyncTarget::User { user_id } = target {
-            return apply_revisioned_user_upsert_to_storage(&self.storage, user_id, bytes, change)
-                .await;
+        if matches!(
+            target,
+            DocumentSyncTarget::User { .. }
+                | DocumentSyncTarget::Group { .. }
+                | DocumentSyncTarget::GroupAuthorization { .. }
+                | DocumentSyncTarget::RealmAuthorization { .. }
+                | DocumentSyncTarget::RealmConfig { .. }
+        ) {
+            return apply_revisioned_upsert_to_storage(&self.storage, target, bytes, change).await;
         }
         self.apply_upsert(target, bytes).await
+    }
+
+    async fn apply_delete_with_revision(
+        &self,
+        target: DocumentSyncTarget,
+        change: DocumentSyncChange,
+    ) -> Result<()> {
+        apply_revisioned_delete_to_storage(&self.storage, target, change).await
     }
 
     async fn apply_upsert(&self, target: DocumentSyncTarget, bytes: Vec<u8>) -> Result<()> {
@@ -1753,6 +1788,9 @@ impl IrokleService {
         if apply_legacy_admin_document_delete_to_storage(&self.storage, target.clone()).await? {
             return Ok(());
         }
+        if document_sync_revision_exists(&self.storage, &target).await? {
+            return Ok(());
+        }
         self.storage_delete(target.storage_keyspace().to_string(), target.storage_key())
             .await
     }
@@ -1803,6 +1841,268 @@ impl IrokleService {
     }
 }
 
+async fn apply_revisioned_upsert_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+    change: DocumentSyncChange,
+) -> Result<()> {
+    if change.kind != DocumentSyncChangeKind::Upsert {
+        return Err(NetError::Bootstrap(
+            "revisioned upsert must carry an upsert change".to_string(),
+        ));
+    }
+
+    if let DocumentSyncTarget::User { user_id } = target {
+        return apply_revisioned_user_upsert_to_storage(storage, user_id, bytes, change).await;
+    }
+    apply_revisioned_admin_document_upsert_to_storage(storage, target, bytes, change).await
+}
+
+async fn apply_revisioned_admin_document_upsert_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+    change: DocumentSyncChange,
+) -> Result<()> {
+    validate_admin_document_upsert(&target, &bytes)?;
+    if admin_document_reducer_state_exists(storage, &target).await? {
+        return Ok(());
+    }
+
+    let local_change = read_document_sync_change(storage, &target).await?;
+    let local_bytes = read_document_primary_bytes(storage, &target).await?;
+    match document_sync_apply_decision(local_change.as_ref(), &change) {
+        DocumentSyncApplyDecision::Apply => {
+            let writes = vec![
+                target_write_entry(target.clone(), bytes.into()),
+                document_sync_revision_write_entry(&target, &change)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ];
+            storage_batch_write_to(storage, writes).await
+        }
+        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => Ok(()),
+        DocumentSyncApplyDecision::Conflict => {
+            write_document_sync_conflict(storage, target, local_change, local_bytes, change, bytes)
+                .await
+        }
+    }
+}
+
+async fn apply_revisioned_delete_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    change: DocumentSyncChange,
+) -> Result<()> {
+    if change.kind != DocumentSyncChangeKind::Delete {
+        return Err(NetError::Bootstrap(
+            "revisioned delete must carry a delete change".to_string(),
+        ));
+    }
+
+    if matches!(
+        target,
+        DocumentSyncTarget::MetadataGraphLifecycle { .. }
+            | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+    ) {
+        return Ok(());
+    }
+    if let DocumentSyncTarget::MetadataRegistry {
+        group_id,
+        document_id,
+    } = target
+    {
+        return apply_metadata_registry_delete_to_storage(storage, group_id, document_id).await;
+    }
+
+    apply_revisioned_admin_document_delete_to_storage(storage, target, change).await
+}
+
+async fn apply_revisioned_admin_document_delete_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    change: DocumentSyncChange,
+) -> Result<()> {
+    if admin_document_target_for_legacy_upsert(&target).is_none() {
+        return Err(NetError::Bootstrap(
+            "revisioned delete target is not admin-reduced".to_string(),
+        ));
+    }
+    if admin_document_reducer_state_exists(storage, &target).await? {
+        return Ok(());
+    }
+
+    let local_change = read_document_sync_change(storage, &target).await?;
+    let local_bytes = read_document_primary_bytes(storage, &target).await?;
+    match document_sync_apply_decision(local_change.as_ref(), &change) {
+        DocumentSyncApplyDecision::Apply => {
+            let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
+            if matches!(target, DocumentSyncTarget::User { .. })
+                && let Some(previous) = local_bytes
+                    .as_ref()
+                    .map(|bytes| User::from_bytes(bytes.as_ref()))
+                    .transpose()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            {
+                deletes.extend(stale_subject_index_deletes(Some(&previous), None));
+            }
+            let writes = vec![
+                document_sync_revision_write_entry(&target, &change)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ];
+            storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
+        }
+        DocumentSyncApplyDecision::SkipStale | DocumentSyncApplyDecision::SkipTombstoned => Ok(()),
+        DocumentSyncApplyDecision::Conflict => {
+            write_document_sync_conflict(
+                storage,
+                target,
+                local_change,
+                local_bytes,
+                change,
+                Vec::new(),
+            )
+            .await
+        }
+    }
+}
+
+async fn admin_document_reducer_state_exists(
+    storage: &StorageHandle,
+    target: &DocumentSyncTarget,
+) -> Result<bool> {
+    let Some(admin_target) = admin_document_target_for_legacy_upsert(target) else {
+        return Ok(false);
+    };
+    let reducer_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&admin_target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if let Some(reducer_state) = reducer_state.as_ref()
+        && reducer_state.target != admin_target
+    {
+        return Err(NetError::Bootstrap(
+            "admin document reducer state target mismatch".to_string(),
+        ));
+    }
+    Ok(reducer_state.is_some())
+}
+
+async fn document_sync_revision_exists(
+    storage: &StorageHandle,
+    target: &DocumentSyncTarget,
+) -> Result<bool> {
+    Ok(read_document_sync_change(storage, target).await?.is_some())
+}
+
+async fn read_document_sync_change(
+    storage: &StorageHandle,
+    target: &DocumentSyncTarget,
+) -> Result<Option<DocumentSyncChange>> {
+    storage_read_from(
+        storage,
+        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        document_sync_revision_key(target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<DocumentSyncChange>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+async fn read_document_primary_bytes(
+    storage: &StorageHandle,
+    target: &DocumentSyncTarget,
+) -> Result<Option<Value>> {
+    storage_read_from(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+    )
+    .await
+}
+
+async fn write_document_sync_conflict(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    local_change: Option<DocumentSyncChange>,
+    local_bytes: Option<Value>,
+    incoming_change: DocumentSyncChange,
+    incoming_bytes: Vec<u8>,
+) -> Result<()> {
+    let conflict = DocumentSyncConflict {
+        target: target.clone(),
+        local_change,
+        local_bytes: local_bytes.map(|bytes| bytes.as_ref().to_vec()),
+        incoming_change,
+        incoming_bytes,
+    };
+    storage_batch_write_to(
+        storage,
+        vec![
+            document_sync_conflict_write_entry(&target, &conflict)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        ],
+    )
+    .await
+}
+
+fn validate_admin_document_upsert(target: &DocumentSyncTarget, bytes: &[u8]) -> Result<()> {
+    match target {
+        DocumentSyncTarget::Group { group_id } => {
+            let group =
+                Group::from_bytes(bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if group.group_id != *group_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated group document id {group_id} does not match payload group id {}",
+                    group.group_id
+                )));
+            }
+        }
+        DocumentSyncTarget::GroupAuthorization { group_id } => {
+            let auth_doc = GroupAuthorizationDocument::from_bytes(bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if auth_doc.group_id != *group_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated group authorization document id {group_id} does not match payload group id {}",
+                    auth_doc.group_id
+                )));
+            }
+        }
+        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            let auth_doc = RealmAuthorizationDocument::from_bytes(bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if auth_doc.realm_id != *realm_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated realm authorization document id {realm_id} does not match payload realm id {}",
+                    auth_doc.realm_id
+                )));
+            }
+        }
+        DocumentSyncTarget::RealmConfig { realm_id } => {
+            let config = RealmConfigDocument::from_bytes(bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if config.realm_id != *realm_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated realm config document id {realm_id} does not match payload realm id {}",
+                    config.realm_id
+                )));
+            }
+        }
+        _ => {
+            return Err(NetError::Bootstrap(
+                "revisioned admin upsert target is not admin-reduced".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn apply_legacy_admin_document_delete_to_storage(
     storage: &StorageHandle,
     target: DocumentSyncTarget,
@@ -1827,6 +2127,9 @@ async fn apply_legacy_admin_document_delete_to_storage(
         ));
     }
     if reducer_state.is_some() {
+        return Ok(true);
+    }
+    if document_sync_revision_exists(storage, &target).await? {
         return Ok(true);
     }
 
@@ -4176,10 +4479,11 @@ mod tests {
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-        METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+        IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+        METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
+        USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
@@ -4262,9 +4566,9 @@ mod tests {
         revision_change_at(None, 1, 43)
     }
 
-    async fn restart_endpoint() -> iroh::Endpoint {
+    async fn test_endpoint(seed: u8) -> iroh::Endpoint {
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(iroh::SecretKey::from_bytes(&[91; 32]))
+            .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
             .relay_mode(iroh::RelayMode::Disabled)
             .alpns(vec![Alpn::Irokle.as_bytes().to_vec()])
             .bind_addr(
@@ -4278,11 +4582,28 @@ mod tests {
             .expect("endpoint binds")
     }
 
+    async fn restart_endpoint() -> iroh::Endpoint {
+        test_endpoint(91).await
+    }
+
     async fn open_restart_service(root: &Path, storage_name: &str) -> IrokleService {
         IrokleService::open_with_persist_policy(
             restart_endpoint().await,
             storage_at(&root.join(storage_name)),
             root.join("irokle"),
+            &[],
+            vec![Alpn::Irokle.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("Irokle service opens")
+    }
+
+    async fn open_test_service(root: &Path, storage_name: &str, seed: u8) -> IrokleService {
+        IrokleService::open_with_persist_policy(
+            test_endpoint(seed).await,
+            storage_at(&root.join(storage_name)),
+            root.join(format!("irokle-{seed}")),
             &[],
             vec![Alpn::Irokle.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
@@ -4496,13 +4817,20 @@ mod tests {
         user_id: UserId,
     ) -> Option<DocumentSyncConflict> {
         let target = DocumentSyncTarget::User { user_id };
+        read_document_conflict(storage, &target).await
+    }
+
+    async fn read_document_conflict(
+        storage: &StorageHandle,
+        target: &DocumentSyncTarget,
+    ) -> Option<DocumentSyncConflict> {
         read_storage_value(
             storage,
             DOCUMENT_SYNC_CONFLICT_KEYSPACE,
-            document_sync_conflict_key(&target),
+            document_sync_conflict_key(target),
         )
         .await
-        .map(|value| postcard::from_bytes(&value).expect("user conflict decodes"))
+        .map(|value| postcard::from_bytes(&value).expect("document conflict decodes"))
     }
 
     fn test_user_doc(user_id: UserId, name: &str, subjects: &[&str]) -> User {
@@ -5991,6 +6319,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_sync_fencing_legacy_admin_delete_skips_revisioned_user_and_indexes() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([55; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_520, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let local_change = revision_change_at(None, 2, 1_521);
+        let local = test_user_doc(user_id, "Revisioned", &["revisioned-subject"]);
+        write_user_with_revision(&storage, &local, &actor, &local_change).await;
+
+        assert!(
+            apply_legacy_admin_document_delete_to_storage(
+                &storage,
+                DocumentSyncTarget::User { user_id },
+            )
+            .await
+            .expect("legacy delete skips revisioned user")
+        );
+
+        assert_eq!(read_user_doc(&storage, user_id).await, local);
+        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("revisioned-subject"),
+            )
+            .await,
+            Some(subject_index_value(user_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn document_sync_fencing_skipped_stale_event_advances_applied_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let service = open_test_service(dir.path(), "cursor-storage", 92).await;
+        let storage = service.storage.clone();
+        let realm_id = RealmId::from_bytes([56; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_530, 1), realm_id);
+        let actor = test_actor(8, user_id, realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let local_change = revision_change_at(None, 2, 1_531);
+        let stale_change = revision_change_at(None, 1, 1_532);
+        let local = test_user_doc(user_id, "Fresh", &["fresh-subject"]);
+        write_user_with_revision(&storage, &local, &actor, &local_change).await;
+
+        service
+            .publish_events_blocking(
+                vec![DocumentSyncPublish::UpsertWithRevision {
+                    event_id: stale_change.current.event_id,
+                    target: target.clone(),
+                    bytes: test_user_doc(user_id, "Stale", &["stale-subject"])
+                        .to_bytes(&actor)
+                        .expect("stale user serializes"),
+                    change: stale_change,
+                }],
+                &BTreeSet::new(),
+            )
+            .expect("stale event publishes without advancing cursor");
+        service.flush_database().expect("irokle database flushes");
+
+        let topic_id = target.irokle_topic_id();
+        let first = service
+            .reconcile_irokle_topics(vec![topic_id])
+            .await
+            .expect("stale event reconciles");
+        assert_eq!(first.targets, vec![target.clone()]);
+        assert_eq!(read_user_doc(&storage, user_id).await, local);
+        assert_eq!(read_user_revision(&storage, user_id).await, local_change);
+        assert_eq!(
+            read_storage_value(
+                &storage,
+                USER_SUBJECT_INDEX_KEYSPACE,
+                subject_index_key("stale-subject"),
+            )
+            .await,
+            None
+        );
+
+        let cursor_value = read_storage_value(
+            &storage,
+            IROKLE_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("applied cursor exists");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_value).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock reads");
+        assert!(cursor.dominates(&topic_clock));
+
+        let second = service
+            .reconcile_irokle_topics(vec![topic_id])
+            .await
+            .expect("advanced cursor prevents replay");
+        assert!(second.targets.is_empty());
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn revisioned_user_unbased_concurrent_upsert_records_conflict_without_overwrite() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([33; 32]);
@@ -6316,6 +6747,154 @@ mod tests {
             )
             .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn document_sync_fencing_revisioned_admin_upsert_delete_skip_operation_authoritative_state()
+     {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([57; 32]);
+        let group_id = Ulid::from_parts(1_540, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_541, 1), realm_id),
+            realm_id,
+        );
+        let reducer_target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::Group { group_id };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            test_admin_event(
+                Ulid::from_parts(1_542, 1),
+                reducer_target,
+                &actor,
+                1,
+                AdminDocumentOperation::GroupCreated {
+                    realm_id,
+                    display_name: "Reducer group".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("group create reducer event applies");
+        let reduced = read_group_doc(&storage, group_id).await;
+
+        let stale_group = Group {
+            group_id,
+            realm_id,
+            display_name: "Stale document".to_string(),
+            roles: HashSet::from([Ulid::from_parts(1_543, 1)]),
+        };
+        apply_revisioned_upsert_to_storage(
+            &storage,
+            document_target.clone(),
+            stale_group
+                .to_bytes(&actor)
+                .expect("stale group serializes"),
+            revision_change_at(None, 1, 1_544),
+        )
+        .await
+        .expect("revisioned admin upsert skips reducer state");
+
+        let delete_change = DocumentSyncChange {
+            kind: DocumentSyncChangeKind::Delete,
+            ..revision_change_at(None, 2, 1_545)
+        };
+        apply_revisioned_delete_to_storage(&storage, document_target, delete_change)
+            .await
+            .expect("revisioned admin delete skips reducer state");
+
+        assert_eq!(read_group_doc(&storage, group_id).await, reduced);
+        assert!(
+            read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_CONFLICT_KEYSPACE,
+                document_sync_conflict_key(&DocumentSyncTarget::Group { group_id }),
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn document_sync_fencing_revisioned_group_auth_conflict_sidecar_without_overwrite() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([58; 32]);
+        let group_id = Ulid::from_parts(1_550, 1);
+        let local_role_id = Ulid::from_parts(1_551, 1);
+        let incoming_role_id = Ulid::from_parts(1_552, 1);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_553, 1), realm_id),
+            realm_id,
+        );
+        let target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let local_change = revision_change_at(None, 1, 1_554);
+        let concurrent_change = revision_change_at(None, 2, 1_555);
+        let local = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(local_role_id, test_role(local_role_id, std::iter::empty()))]),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    target.clone(),
+                    local
+                        .to_bytes(&actor)
+                        .expect("local auth serializes")
+                        .into(),
+                ),
+                document_sync_revision_write_entry(&target, &local_change)
+                    .expect("local revision writes"),
+            ],
+        )
+        .await
+        .expect("local auth doc and revision write");
+
+        let incoming = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                incoming_role_id,
+                test_role(incoming_role_id, std::iter::empty()),
+            )]),
+        };
+        apply_revisioned_upsert_to_storage(
+            &storage,
+            target.clone(),
+            incoming.to_bytes(&actor).expect("incoming auth serializes"),
+            concurrent_change,
+        )
+        .await
+        .expect("concurrent group auth update records conflict");
+
+        assert_eq!(read_group_auth_doc(&storage, group_id).await, local);
+        let revision_value = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
+            document_sync_revision_key(&target),
+        )
+        .await
+        .expect("local revision remains");
+        assert_eq!(
+            postcard::from_bytes::<DocumentSyncChange>(&revision_value).expect("revision decodes"),
+            local_change
+        );
+        let conflict = read_document_conflict(&storage, &target)
+            .await
+            .expect("document conflict sidecar exists");
+        assert_eq!(conflict.target, target);
+        assert_eq!(conflict.local_change, Some(local_change));
+        assert_eq!(
+            conflict.local_bytes,
+            Some(local.to_bytes(&actor).expect("local auth serializes"))
+        );
+        assert_eq!(conflict.incoming_change, concurrent_change);
+        assert_eq!(
+            conflict.incoming_bytes,
+            incoming.to_bytes(&actor).expect("incoming auth serializes")
         );
     }
 
@@ -8491,6 +9070,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_sync_fencing_metadata_registry_stale_delete_preserves_newer_live_indexes() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(1_560, 1);
+        let document_id = Ulid::from_parts(1_561, 1);
+        let live_event_id = Ulid::from_parts(1_564, 1);
+        let live = registry_record(
+            group_id,
+            document_id,
+            "datasets/live-after-delete",
+            300,
+            live_event_id,
+        );
+        write_registry_record(&storage, &live).await;
+        let stale_delete = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(1_562, 1),
+            Ulid::from_parts(1_563, 1),
+        );
+        write_document_lifecycle_record(&storage, &stale_delete).await;
+
+        apply_metadata_registry_delete_to_storage(&storage, group_id, document_id)
+            .await
+            .expect("stale registry delete is fenced");
+
+        assert_registry_record_present(&storage, &live).await;
+    }
+
+    #[tokio::test]
+    async fn document_sync_fencing_tombstone_wins_over_late_metadata_registry_upsert() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(1_570, 1);
+        let document_id = Ulid::from_parts(1_571, 1);
+        let stale_event_id = Ulid::from_parts(1_572, 1);
+        let delete_lifecycle = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(1_573, 1),
+            stale_event_id,
+        );
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(&storage, &delete_lifecycle, node(8))
+                .await
+                .expect("document tombstone applies")
+        );
+        let stale = registry_record(
+            group_id,
+            document_id,
+            "datasets/stale-after-tombstone",
+            100,
+            stale_event_id,
+        );
+
+        apply_metadata_registry_upsert_to_storage(
+            &storage,
+            stale.clone(),
+            postcard::to_allocvec(&stale).expect("stale registry serializes"),
+        )
+        .await
+        .expect("late registry upsert is fenced by tombstone");
+
+        assert_registry_record_deleted(&storage, group_id, document_id).await;
+        assert_eq!(
+            read_document_lifecycle_record(&storage, document_id).await,
+            delete_lifecycle
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_graph_lifecycle_delete_skips_without_document_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(50, 1);
@@ -8775,7 +9425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_document_lifecycle_upsert_stamps_revision_and_replays_idempotently() {
+    async fn metadata_lifecycle_upsert_stamps_revision_and_replays_idempotently() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1, 1);
         let document_id = Ulid::from_parts(2, 2);
@@ -8816,7 +9466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_document_lifecycle_upsert_skips_newer_delete_sidecar() {
+    async fn metadata_lifecycle_upsert_skips_newer_delete_sidecar() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(10, 1);
         let document_id = Ulid::from_parts(11, 1);
@@ -8859,7 +9509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_document_lifecycle_delete_skips_stale_and_equal_sidecars() {
+    async fn metadata_lifecycle_delete_skips_stale_and_equal_sidecars() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(20, 1);
         let document_id = Ulid::from_parts(21, 1);

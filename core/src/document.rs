@@ -84,6 +84,9 @@ pub enum DocumentSyncOutboxEvent {
         bytes: Vec<u8>,
         change: DocumentSyncChange,
     },
+    DeleteWithRevision {
+        change: DocumentSyncChange,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -145,6 +148,11 @@ pub enum DocumentSyncPublish {
         bytes: Vec<u8>,
         change: DocumentSyncChange,
     },
+    DeleteWithRevision {
+        event_id: Ulid,
+        target: DocumentSyncTarget,
+        change: DocumentSyncChange,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,6 +174,7 @@ impl DocumentSyncPublish {
             Self::Upsert { target, .. }
             | Self::UpsertWithRevision { target, .. }
             | Self::Delete { target, .. }
+            | Self::DeleteWithRevision { target, .. }
             | Self::AdminOperation { target, .. } => target,
         }
     }
@@ -174,7 +183,8 @@ impl DocumentSyncPublish {
         match self {
             Self::Upsert { event_id, .. }
             | Self::UpsertWithRevision { event_id, .. }
-            | Self::Delete { event_id, .. } => *event_id,
+            | Self::Delete { event_id, .. }
+            | Self::DeleteWithRevision { event_id, .. } => *event_id,
             Self::AdminOperation { event, .. } => event.event_id,
         }
     }
@@ -184,7 +194,7 @@ impl DocumentSyncOutboxEvent {
     pub fn kind(&self) -> &'static [u8] {
         match self {
             Self::Upsert { .. } | Self::UpsertWithRevision { .. } => b"upsert",
-            Self::Delete => b"delete",
+            Self::Delete | Self::DeleteWithRevision { .. } => b"delete",
             Self::AdminOperation { .. } => b"admin-operation",
         }
     }
@@ -353,6 +363,11 @@ pub enum DocumentSyncEvent {
         bytes: Vec<u8>,
         change: DocumentSyncChange,
     },
+    DeleteWithRevision {
+        event_id: Ulid,
+        target: DocumentSyncTarget,
+        change: DocumentSyncChange,
+    },
 }
 
 impl DocumentSyncEvent {
@@ -361,6 +376,7 @@ impl DocumentSyncEvent {
             Self::Upsert { target, .. }
             | Self::UpsertWithRevision { target, .. }
             | Self::Delete { target, .. }
+            | Self::DeleteWithRevision { target, .. }
             | Self::AdminOperation { target, .. } => target,
         }
     }
@@ -369,7 +385,8 @@ impl DocumentSyncEvent {
         match self {
             Self::Upsert { event_id, .. }
             | Self::UpsertWithRevision { event_id, .. }
-            | Self::Delete { event_id, .. } => *event_id,
+            | Self::Delete { event_id, .. }
+            | Self::DeleteWithRevision { event_id, .. } => *event_id,
             Self::AdminOperation { event, .. } => event.event_id,
         }
     }
@@ -715,6 +732,32 @@ mod tests {
             outbox.kind(),
             DocumentSyncOutboxEvent::Upsert { bytes: vec![] }.kind()
         );
+        assert_eq!(publish.target(), &target);
+        assert_eq!(publish.event_id(), event_id);
+        assert_eq!(event.target(), &target);
+        assert_eq!(event.event_id(), event_id);
+    }
+
+    #[test]
+    fn delete_with_revision_uses_delete_kind_and_helpers() {
+        let event_id = test_ulid(13);
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: test_realm(14),
+        };
+        let change = change(DocumentSyncChangeKind::Delete, None, 2, 15, 1);
+        let outbox = DocumentSyncOutboxEvent::DeleteWithRevision { change };
+        let publish = DocumentSyncPublish::DeleteWithRevision {
+            event_id,
+            target: target.clone(),
+            change,
+        };
+        let event = DocumentSyncEvent::DeleteWithRevision {
+            event_id,
+            target: target.clone(),
+            change,
+        };
+
+        assert_eq!(outbox.kind(), DocumentSyncOutboxEvent::Delete.kind());
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
         assert_eq!(event.target(), &target);

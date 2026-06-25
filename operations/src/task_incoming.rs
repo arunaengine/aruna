@@ -77,6 +77,13 @@ fn document_publish_from_outbox(
             bytes,
         },
         DocumentSyncOutboxEvent::Delete => DocumentSyncPublish::Delete { event_id, target },
+        DocumentSyncOutboxEvent::DeleteWithRevision { change } => {
+            DocumentSyncPublish::DeleteWithRevision {
+                event_id,
+                target,
+                change,
+            }
+        }
         DocumentSyncOutboxEvent::AdminOperation { event } => {
             DocumentSyncPublish::AdminOperation { target, event }
         }
