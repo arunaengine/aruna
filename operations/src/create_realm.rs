@@ -162,6 +162,16 @@ impl CreateRealmOperation {
                 kind: RealmNodeKind::Management,
             },
         )?;
+        let mut config_events = vec![config_node_event];
+        let mut oidc_providers = self.config.oidc_providers.clone();
+        oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
+        for provider in oidc_providers {
+            config_events.push(apply_admin_reducer_operation(
+                &mut config_state,
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+            )?);
+        }
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -174,22 +184,25 @@ impl CreateRealmOperation {
                 event: Box::new(realm_role_event),
             },
         );
-        let realm_config_record = new_outbox_record_with_id(
-            config_node_event.event_id,
-            self.config.actor.node_id,
-            realm_config_target,
-            Vec::new(),
-            DocumentSyncOutboxEvent::AdminOperation {
-                event: Box::new(config_node_event),
-            },
-        );
-
-        Ok(vec![
+        let mut writes = vec![
             admin_document_reducer_state_write_entry(&realm_state)?,
             admin_document_reducer_state_write_entry(&config_state)?,
             outbox_write_entry(&realm_auth_record).map_err(ConversionError::from)?,
-            outbox_write_entry(&realm_config_record).map_err(ConversionError::from)?,
-        ])
+        ];
+        for event in config_events {
+            let record = new_outbox_record_with_id(
+                event.event_id,
+                self.config.actor.node_id,
+                realm_config_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(event),
+                },
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
+
+        Ok(writes)
     }
 
     fn emit_legacy_document_replication(&mut self) -> Effects {
@@ -517,7 +530,8 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -544,6 +558,15 @@ mod test {
             actor,
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+        }
+    }
+
+    fn oidc_provider(id: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: format!("https://issuer.example/{id}"),
+            audience: format!("audience-{id}"),
+            discovery_url: format!("https://issuer.example/{id}/.well-known/openid-configuration"),
         }
     }
 
@@ -597,7 +620,11 @@ mod test {
             .find(|role| role.name == "realm_admin")
             .unwrap()
             .clone();
-        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        let alpha_provider = oidc_provider("alpha");
+        let beta_provider = oidc_provider("beta");
+        let mut realm_config = config(actor.clone());
+        realm_config.oidc_providers = vec![beta_provider.clone(), alpha_provider.clone()];
+        let mut operation = CreateRealmOperation::new(realm_config);
         operation.txn_id = Some(txn_id);
         operation.auth_doc = Some(auth_doc);
 
@@ -641,12 +668,16 @@ mod test {
             config_state.materialized_realm_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
         );
+        let materialized_providers = config_state.materialized_realm_config_oidc_providers();
+        assert_eq!(materialized_providers.len(), 2);
+        assert_eq!(materialized_providers.get("alpha"), Some(&alpha_provider));
+        assert_eq!(materialized_providers.get("beta"), Some(&beta_provider));
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 2);
+        assert_eq!(outbox_records.len(), 4);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -673,6 +704,33 @@ mod test {
                             )
                 )
         }));
+        let provider_events = outbox_records
+            .iter()
+            .filter_map(|record| {
+                if record.target != (DocumentSyncTarget::RealmConfig { realm_id }) {
+                    return None;
+                }
+
+                let DocumentSyncOutboxEvent::AdminOperation { event } = &record.event else {
+                    return None;
+                };
+
+                if event.target != config_target {
+                    return None;
+                }
+
+                match &event.op {
+                    AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
+                        Some((provider.id.clone(), event.origin_seq))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_events,
+            vec![("alpha".to_string(), 2), ("beta".to_string(), 3)]
+        );
     }
 
     #[test]
