@@ -1,19 +1,29 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::admin_documents::{
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
     Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument,
     RealmNodeKind,
 };
+use aruna_core::task::TaskEvent;
+use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 use crate::replicate_documents::replicate_documents_effect;
-use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -111,12 +121,98 @@ impl CreateRealmOperation {
 
         let key = (*realm_id.as_bytes()).into();
         let value = config_doc.to_bytes(&self.config.actor)?.into();
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key,
-            value,
+        let mut writes = vec![(REALM_CONFIG_KEYSPACE.to_string(), key, value)];
+        writes.extend(self.admin_reducer_seed_writes()?);
+
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
             txn_id: self.txn_id,
         })])
+    }
+
+    fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
+        let realm_id = self.config.actor.realm_id;
+        let auth_doc = self
+            .auth_doc
+            .as_ref()
+            .ok_or(CreateRealmError::AuthDocNotFound)?;
+        let realm_admin_role = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .ok_or(CreateRealmError::RealmAdminRoleNotFound)?;
+
+        let realm_target = AdminDocumentTarget::Realm { realm_id };
+        let mut realm_state = AdminDocumentReducerState::new(realm_target);
+        let realm_role_event = apply_admin_reducer_operation(
+            &mut realm_state,
+            &self.config.actor,
+            AdminDocumentOperation::RealmRoleCreated {
+                role: AdminDocumentRoleDefinition::from(realm_admin_role),
+            },
+        )?;
+
+        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config_state = AdminDocumentReducerState::new(config_target);
+        let config_node_event = apply_admin_reducer_operation(
+            &mut config_state,
+            &self.config.actor,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: self.config.actor.node_id,
+                kind: RealmNodeKind::Management,
+            },
+        )?;
+
+        let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let realm_auth_record = new_outbox_record_with_id(
+            realm_role_event.event_id,
+            self.config.actor.node_id,
+            realm_auth_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::AdminOperation {
+                event: Box::new(realm_role_event),
+            },
+        );
+        let realm_config_record = new_outbox_record_with_id(
+            config_node_event.event_id,
+            self.config.actor.node_id,
+            realm_config_target,
+            Vec::new(),
+            DocumentSyncOutboxEvent::AdminOperation {
+                event: Box::new(config_node_event),
+            },
+        );
+
+        Ok(vec![
+            admin_document_reducer_state_write_entry(&realm_state)?,
+            admin_document_reducer_state_write_entry(&config_state)?,
+            outbox_write_entry(&realm_auth_record).map_err(ConversionError::from)?,
+            outbox_write_entry(&realm_config_record).map_err(ConversionError::from)?,
+        ])
+    }
+
+    fn emit_legacy_document_replication(&mut self) -> Effects {
+        if let Some(realm) = &self.realm
+            && self.auth_doc.is_some()
+            && self.config_doc.is_some()
+        {
+            self.state = CreateRealmState::ReplicateDocuments;
+            smallvec![replicate_documents_effect(
+                self.config.actor.realm_id,
+                self.config.actor.node_id,
+                vec![
+                    DocumentSyncTarget::RealmAuthorization {
+                        realm_id: realm.realm_id,
+                    },
+                    DocumentSyncTarget::RealmConfig {
+                        realm_id: realm.realm_id,
+                    },
+                ],
+            )]
+        } else {
+            self.fail(CreateRealmError::RealmNotFound)
+        }
     }
 
     fn fail(&mut self, err: CreateRealmError) -> Effects {
@@ -210,10 +306,10 @@ impl CreateRealmOperation {
 
     fn handle_create_config_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateRealmState::CreateConfigDoc,
-                "Event::Storage(StorageEvent::WriteResult)",
+                "Event::Storage(StorageEvent::BatchWriteResult)",
                 got,
             );
         };
@@ -236,25 +332,28 @@ impl CreateRealmOperation {
             );
         };
 
-        if let Some(realm) = &self.realm
-            && self.auth_doc.is_some()
-            && self.config_doc.is_some()
-        {
-            self.state = CreateRealmState::ReplicateDocuments;
-            smallvec![replicate_documents_effect(
-                self.config.actor.realm_id,
-                self.config.actor.node_id,
-                vec![
-                    DocumentSyncTarget::RealmAuthorization {
-                        realm_id: realm.realm_id,
-                    },
-                    DocumentSyncTarget::RealmConfig {
-                        realm_id: realm.realm_id,
-                    },
-                ],
-            )]
+        if self.realm.is_some() && self.auth_doc.is_some() && self.config_doc.is_some() {
+            self.state = CreateRealmState::ScheduleDocumentSyncOutboxDrain;
+            smallvec![schedule_outbox_drain_effect()]
         } else {
             self.fail(CreateRealmError::RealmNotFound)
+        }
+    }
+
+    fn handle_schedule_document_sync_outbox_drain(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                self.emit_legacy_document_replication()
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(error = %message, "Failed to schedule document sync outbox drain; continuing with legacy realm creation replication");
+                self.emit_legacy_document_replication()
+            }
+            other => self.unexpected_event(
+                CreateRealmState::ScheduleDocumentSyncOutboxDrain,
+                "Event::Task(TaskEvent::TimerScheduled)",
+                format!("{other:?}"),
+            ),
         }
     }
 
@@ -292,6 +391,7 @@ pub enum CreateRealmState {
     CreateAuthDoc,
     CreateConfigDoc,
     CommitTransaction,
+    ScheduleDocumentSyncOutboxDrain,
     ReplicateDocuments,
     Finish,
     Error,
@@ -303,8 +403,14 @@ pub enum CreateRealmError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("document sync failed: {0}")]
     DocumentSync(String),
+    #[error("authorization document not found")]
+    AuthDocNotFound,
+    #[error("realm_admin role not found")]
+    RealmAdminRoleNotFound,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -344,6 +450,9 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::CreateAuthDoc => self.handle_create_auth_doc(event),
             CreateRealmState::CreateConfigDoc => self.handle_create_config_doc(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
+            CreateRealmState::ScheduleDocumentSyncOutboxDrain => {
+                self.handle_schedule_document_sync_outbox_drain(event)
+            }
             CreateRealmState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
@@ -370,10 +479,48 @@ impl Operation for CreateRealmOperation {
     }
 }
 
+fn apply_admin_reducer_operation(
+    state: &mut AdminDocumentReducerState,
+    actor: &Actor,
+    op: AdminDocumentOperation,
+) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+    let observed = state.clock.clone();
+    let event = AdminDocumentEvent {
+        event_id: Ulid::new(),
+        target: state.target.clone(),
+        origin_node_id: actor.node_id,
+        origin_seq: observed.sequence_for(&actor.node_id) + 1,
+        observed,
+        actor: actor.clone(),
+        op,
+    };
+    state.apply(&event)?;
+    Ok(event)
+}
+
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use aruna_core::UserId;
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+    use aruna_core::admin_documents::{
+        AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    };
+    use aruna_core::document::{
+        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
+    };
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    };
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{
+        Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
+    use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+    use aruna_core::types::{Key, KeySpace, TxnId, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -383,6 +530,180 @@ mod test {
 
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
+
+    fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[node_seed; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([user_seed; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn config(actor: Actor) -> CreateRealmConfig {
+        CreateRealmConfig {
+            actor,
+            realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
+        }
+    }
+
+    fn batch_writes(effects: &[Effect], txn_id: TxnId) -> &Vec<(KeySpace, Key, Value)> {
+        match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(*effect_txn_id, Some(txn_id));
+                writes
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+
+    fn write_values<'a>(writes: &'a [(KeySpace, Key, Value)], keyspace: &str) -> Vec<&'a Value> {
+        writes
+            .iter()
+            .filter(|(candidate, _, _)| candidate == keyspace)
+            .map(|(_, _, value)| value)
+            .collect()
+    }
+
+    fn operation_ready_to_schedule(actor: Actor, txn_id: TxnId) -> CreateRealmOperation {
+        let mut config_doc = RealmConfigDocument::default_for_realm(actor.realm_id, Vec::new());
+        config_doc.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+        operation.realm = Some(Realm {
+            realm_id: actor.realm_id,
+            description: "A realm description".to_string(),
+        });
+        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(
+            actor.realm_id,
+        ));
+        operation.config_doc = Some(config_doc);
+        operation.state = super::CreateRealmState::CommitTransaction;
+        operation
+    }
+
+    #[test]
+    fn seeds_reducer_state_and_admin_outbox() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::new();
+        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_admin_role = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .unwrap()
+            .clone();
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+        operation.auth_doc = Some(auth_doc);
+
+        let effects = operation.emit_create_config_doc().unwrap();
+        let writes = batch_writes(&effects, txn_id);
+
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(config_doc.has_node(actor.node_id));
+
+        let states = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        let realm_target = AdminDocumentTarget::Realm { realm_id };
+        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let realm_state = states
+            .iter()
+            .find(|state| state.target == realm_target)
+            .unwrap();
+        let config_state = states
+            .iter()
+            .find(|state| state.target == config_target)
+            .unwrap();
+        assert!(
+            realm_state
+                .materialized_realm_roles()
+                .contains(&realm_admin_role.role_id)
+        );
+        assert!(
+            realm_state
+                .materialized_realm_role_user_assignments()
+                .is_empty()
+        );
+        assert_eq!(
+            config_state.materialized_realm_config_nodes()[&actor.node_id],
+            RealmNodeKind::Management
+        );
+
+        let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outbox_records.len(), 2);
+        assert!(outbox_records.iter().any(|record| {
+            record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
+                && matches!(
+                    &record.event,
+                    DocumentSyncOutboxEvent::AdminOperation { event }
+                        if event.target == realm_target
+                            && matches!(
+                                &event.op,
+                                AdminDocumentOperation::RealmRoleCreated { role }
+                                    if role == &AdminDocumentRoleDefinition::from(&realm_admin_role)
+                            )
+                )
+        }));
+        assert!(outbox_records.iter().any(|record| {
+            record.target == DocumentSyncTarget::RealmConfig { realm_id }
+                && matches!(
+                    &record.event,
+                    DocumentSyncOutboxEvent::AdminOperation { event }
+                        if event.target == config_target
+                            && matches!(
+                                &event.op,
+                                AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind }
+                                    if *node_id == actor.node_id && *kind == RealmNodeKind::Management
+                            )
+                )
+        }));
+    }
+
+    #[test]
+    fn schedules_outbox_drain_before_legacy_replication_and_continues_on_error() {
+        let realm_id = RealmId::from_bytes([5; 32]);
+        let actor = actor(realm_id, 6, 7);
+        let txn_id = TxnId::new();
+        let mut operation = operation_ready_to_schedule(actor, txn_id);
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(
+            operation.state,
+            super::CreateRealmState::ScheduleDocumentSyncOutboxDrain
+        );
+        assert_eq!(
+            effects.first(),
+            Some(&Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::ZERO,
+            }))
+        );
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            message: "schedule failed".to_string(),
+        }));
+        assert_eq!(operation.state, super::CreateRealmState::ReplicateDocuments);
+        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+    }
 
     #[tokio::test]
     pub async fn test_realm_creation() {
