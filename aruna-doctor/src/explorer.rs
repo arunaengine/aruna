@@ -880,15 +880,14 @@ fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
         if !(value.len() - 1).is_multiple_of(40) {
             return Err(format!("invalid craqle dot payload length {}", value.len()));
         }
-        value[1..]
-            .chunks_exact(40)
-            .map(|chunk| {
-                Ok(CraqleDot {
-                    actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
-                    counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
-                })
+        let (chunks, _) = value[1..].as_chunks::<40>();
+        chunks
+            .iter()
+            .map(|chunk| CraqleDot {
+                actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
+                counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect()
     } else {
         postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
     };
