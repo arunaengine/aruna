@@ -10,7 +10,8 @@ use aruna_core::metadata::{
     MetadataError, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_graph_lifecycle_key, metadata_graph_prune_job_write_entry,
+    metadata_graph_lifecycle_key, metadata_graph_prune_job_key,
+    metadata_graph_prune_job_write_entry,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -24,10 +25,15 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
+use crate::queue_backoff::queue_retry_after_ms;
+
+use super::queue_storage::{
+    MetadataQueueStorageError, abort_storage_transaction_best_effort, commit_storage_transaction,
+    start_write_transaction,
+};
+
 const PRUNE_SCAN_PAGE_SIZE: usize = 512;
 const PRUNE_BATCH_SIZE: usize = 128;
-const PRUNE_RETRY_BASE_MS: u64 = 250;
-const PRUNE_RETRY_MAX_MS: u64 = 30_000;
 
 pub const METADATA_GRAPH_PRUNE_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const METADATA_GRAPH_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -36,6 +42,7 @@ pub const METADATA_GRAPH_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(1);
 pub struct MetadataGraphPruneDrainResult {
     pub processed: usize,
     pub has_more_due: bool,
+    pub next_due_after: Option<Duration>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -60,6 +67,15 @@ pub enum MetadataGraphPruneQueueError {
     Metadata(#[from] MetadataError),
     #[error("unexpected event while processing metadata graph prune queue: {0}")]
     UnexpectedEvent(String),
+}
+
+impl From<MetadataQueueStorageError> for MetadataGraphPruneQueueError {
+    fn from(error: MetadataQueueStorageError) -> Self {
+        match error {
+            MetadataQueueStorageError::Storage(error) => Self::Storage(error),
+            MetadataQueueStorageError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+        }
+    }
 }
 
 pub fn new_graph_prune_job(graph_iri: String, due_at_ms: u64) -> MetadataGraphPruneJobRecord {
@@ -87,11 +103,14 @@ pub fn schedule_metadata_graph_prune_drain_effect() -> Effect {
 }
 
 pub async fn restore_metadata_graph_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    match metadata_graph_prune_jobs_exist(storage).await {
-        Ok(false) => {}
-        Ok(true) => {
+    match next_metadata_graph_prune_timer_after(storage).await {
+        Ok(None) => {}
+        Ok(Some(after)) => {
             let event = task_handle
-                .send_effect(schedule_metadata_graph_prune_drain_effect())
+                .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                    key: TaskKey::DrainMetadataGraphPruneQueue,
+                    after,
+                }))
                 .await;
             if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
                 warn!(message = %message, "Failed to restore metadata graph prune timer");
@@ -101,24 +120,79 @@ pub async fn restore_metadata_graph_prune_timer(storage: &StorageHandle, task_ha
     }
 }
 
+pub async fn next_metadata_graph_prune_timer_after(
+    storage: &StorageHandle,
+) -> Result<Option<Duration>, MetadataGraphPruneQueueError> {
+    let now_ms = unix_timestamp_millis();
+    let (jobs, has_more_due, next_due_at_ms) =
+        scan_due_graph_prune_jobs(storage, now_ms, 1).await?;
+    if !jobs.is_empty() || has_more_due {
+        return Ok(Some(Duration::ZERO));
+    }
+    Ok(next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms)))
+}
+
 pub async fn metadata_graph_prune_jobs_exist(
     storage: &StorageHandle,
 ) -> Result<bool, MetadataGraphPruneQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+    let mut start_after = None;
+    loop {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.take().map(IterStart::After),
+                limit: 1,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                let Some((key, value)) = values.into_iter().next() else {
+                    return Ok(false);
+                };
+                match postcard::from_bytes::<MetadataGraphPruneJobRecord>(&value) {
+                    Ok(job) if graph_prune_job_key_matches(key.as_ref(), &job) => {
+                        return Ok(true);
+                    }
+                    Ok(job) => {
+                        let key = key.to_vec();
+                        warn!(key = ?key, "Repairing metadata graph prune job stored under non-canonical key while probing queue");
+                        if find_decoded_graph_prune_job(
+                            storage,
+                            &job.graph_iri,
+                            Some(key.as_slice()),
+                        )
+                        .await?
+                        .is_some()
+                        {
+                            delete_graph_prune_jobs(storage, vec![key]).await?;
+                            return Ok(true);
+                        }
+                        repair_graph_prune_job_key(storage, key, &job).await?;
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        let key = key.to_vec();
+                        warn!(error = %error, key = ?key, "Deleting malformed metadata graph prune job while probing queue");
+                        delete_graph_prune_jobs(storage, vec![key]).await?;
+                    }
+                }
+                match next_start_after {
+                    Some(next) => start_after = Some(next),
+                    None => return Ok(false),
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        }
     }
 }
 
@@ -127,8 +201,8 @@ pub async fn process_metadata_graph_prune_batch(
 ) -> Result<MetadataGraphPruneDrainResult, MetadataGraphPruneQueueError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
-    let (jobs, has_more_due) =
-        read_due_graph_prune_jobs(&context.storage_handle, now_ms, PRUNE_BATCH_SIZE).await?;
+    let (jobs, has_more_due, next_due_at_ms) =
+        scan_due_graph_prune_jobs(&context.storage_handle, now_ms, PRUNE_BATCH_SIZE).await?;
     let scan_elapsed = batch_started.elapsed();
     let job_count = jobs.len();
     let oldest_lag_ms = jobs
@@ -167,6 +241,11 @@ pub async fn process_metadata_graph_prune_batch(
     Ok(MetadataGraphPruneDrainResult {
         processed,
         has_more_due,
+        next_due_after: if has_more_due {
+            Some(Duration::ZERO)
+        } else {
+            next_due_at_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+        },
     })
 }
 
@@ -307,13 +386,21 @@ fn representative_job(
         .unwrap_or_else(|| new_graph_prune_job(graph_iri.to_string(), unix_timestamp_millis()))
 }
 
-async fn read_due_graph_prune_jobs(
+async fn scan_due_graph_prune_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
-) -> Result<(Vec<(Vec<u8>, MetadataGraphPruneJobRecord)>, bool), MetadataGraphPruneQueueError> {
+) -> Result<
+    (
+        Vec<(Vec<u8>, MetadataGraphPruneJobRecord)>,
+        bool,
+        Option<u64>,
+    ),
+    MetadataGraphPruneQueueError,
+> {
     let mut start_after = None;
     let mut jobs = Vec::new();
+    let mut next_due_at_ms = None;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
@@ -338,27 +425,87 @@ async fn read_due_graph_prune_jobs(
         };
 
         for (key, value) in values {
+            let key = key.to_vec();
             let job = match postcard::from_bytes::<MetadataGraphPruneJobRecord>(&value) {
                 Ok(job) => job,
                 Err(error) => {
-                    warn!(error = %error, key = ?key, "Failed to decode metadata graph prune job");
+                    warn!(error = %error, key = ?key, "Deleting malformed metadata graph prune job");
+                    delete_graph_prune_jobs(storage, vec![key]).await?;
                     continue;
                 }
             };
-            if job.due_at_ms > now_ms {
-                return Ok((jobs, false));
+            if !graph_prune_job_key_matches(&key, &job) {
+                warn!(key = ?key, "Repairing metadata graph prune job stored under non-canonical key");
+                if let Some(existing_job) =
+                    find_decoded_graph_prune_job(storage, &job.graph_iri, Some(key.as_slice()))
+                        .await?
+                {
+                    delete_graph_prune_jobs(storage, vec![key]).await?;
+                    if existing_job.due_at_ms > now_ms {
+                        next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
+                        continue;
+                    }
+                    jobs.push((
+                        metadata_graph_prune_job_key(&existing_job).to_vec(),
+                        existing_job,
+                    ));
+                    if jobs.len() >= limit {
+                        return Ok((jobs, true, next_due_at_ms));
+                    }
+                    continue;
+                }
+                repair_graph_prune_job_key(storage, key, &job).await?;
+                if job.due_at_ms > now_ms {
+                    next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+                    continue;
+                }
+                jobs.push((metadata_graph_prune_job_key(&job).to_vec(), job));
+                if jobs.len() >= limit {
+                    return Ok((jobs, true, next_due_at_ms));
+                }
+                continue;
             }
-            jobs.push((key.to_vec(), job));
+            if let Some(existing_job) =
+                find_decoded_graph_prune_job(storage, &job.graph_iri, Some(key.as_slice())).await?
+                && graph_prune_job_preferred(&existing_job, &job)
+            {
+                delete_graph_prune_jobs(storage, vec![key]).await?;
+                if existing_job.due_at_ms > now_ms {
+                    next_due_at_ms = min_due_at(next_due_at_ms, existing_job.due_at_ms);
+                    continue;
+                }
+                jobs.push((
+                    metadata_graph_prune_job_key(&existing_job).to_vec(),
+                    existing_job,
+                ));
+                if jobs.len() >= limit {
+                    return Ok((jobs, true, next_due_at_ms));
+                }
+                continue;
+            }
+            if job.due_at_ms > now_ms {
+                next_due_at_ms = min_due_at(next_due_at_ms, job.due_at_ms);
+                continue;
+            }
+            jobs.push((key, job));
             if jobs.len() >= limit {
-                return Ok((jobs, true));
+                return Ok((jobs, true, next_due_at_ms));
             }
         }
 
         match next_start_after {
             Some(next) => start_after = Some(next),
-            None => return Ok((jobs, false)),
+            None => return Ok((jobs, false, next_due_at_ms)),
         }
     }
+}
+
+fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
+    Some(current.map_or(due_at_ms, |current| current.min(due_at_ms)))
+}
+
+fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
+    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
 async fn metadata_graph_deleted(
@@ -410,6 +557,140 @@ async fn write_graph_prune_job(
     }
 }
 
+async fn repair_graph_prune_job_key(
+    storage: &StorageHandle,
+    old_key: Vec<u8>,
+    job: &MetadataGraphPruneJobRecord,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    let canonical_key = metadata_graph_prune_job_key(job);
+    let txn_id = start_write_transaction(storage).await?;
+    let result = async {
+        transactional_batch_write(
+            storage,
+            txn_id,
+            vec![metadata_graph_prune_job_write_entry(job)?],
+        )
+        .await?;
+        if old_key.as_slice() != canonical_key.as_ref() {
+            transactional_batch_delete(
+                storage,
+                txn_id,
+                vec![(
+                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    ByteView::from(old_key),
+                )],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            commit_storage_transaction(storage, txn_id).await?;
+            Ok(())
+        }
+        Err(error) => {
+            abort_storage_transaction_best_effort(
+                storage,
+                txn_id,
+                "Failed to abort metadata graph prune repair transaction",
+                "Unexpected metadata graph prune repair transaction abort result",
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+fn graph_prune_job_key_matches(key: &[u8], job: &MetadataGraphPruneJobRecord) -> bool {
+    metadata_graph_prune_job_key(job).as_ref() == key
+}
+
+fn graph_prune_job_preferred(
+    candidate: &MetadataGraphPruneJobRecord,
+    current: &MetadataGraphPruneJobRecord,
+) -> bool {
+    (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
+}
+
+async fn find_decoded_graph_prune_job(
+    storage: &StorageHandle,
+    graph_iri: &str,
+    skip_key: Option<&[u8]>,
+) -> Result<Option<MetadataGraphPruneJobRecord>, MetadataGraphPruneQueueError> {
+    let mut selected: Option<(Vec<u8>, MetadataGraphPruneJobRecord)> = None;
+    let mut stale_keys = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.take().map(IterStart::After),
+                limit: PRUNE_SCAN_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        };
+
+        for (key, value) in values {
+            if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
+                continue;
+            }
+            let Ok(job) = postcard::from_bytes::<MetadataGraphPruneJobRecord>(&value) else {
+                continue;
+            };
+            if job.graph_iri != graph_iri {
+                continue;
+            }
+            let key = key.to_vec();
+            match selected.as_mut() {
+                Some((selected_key, selected_job))
+                    if graph_prune_job_preferred(&job, selected_job) =>
+                {
+                    stale_keys.push(std::mem::replace(selected_key, key));
+                    *selected_job = job;
+                }
+                Some(_) => stale_keys.push(key),
+                None => selected = Some((key, job)),
+            }
+        }
+
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+
+    let Some((key, job)) = selected else {
+        return Ok(None);
+    };
+    if !graph_prune_job_key_matches(&key, &job) {
+        repair_graph_prune_job_key(storage, key.clone(), &job).await?;
+    }
+    let canonical_key = metadata_graph_prune_job_key(&job);
+    let stale_keys = stale_keys
+        .into_iter()
+        .filter(|stale_key| {
+            stale_key.as_slice() != key.as_slice() && stale_key.as_slice() != canonical_key.as_ref()
+        })
+        .collect::<Vec<_>>();
+    delete_graph_prune_jobs(storage, stale_keys).await?;
+    Ok(Some(job))
+}
+
 async fn reschedule_graph_prune_job(
     storage: &StorageHandle,
     old_keys: &[Vec<u8>],
@@ -419,7 +700,7 @@ async fn reschedule_graph_prune_job(
     let attempts = job.attempts.saturating_add(1);
     let next_job = MetadataGraphPruneJobRecord {
         graph_iri: job.graph_iri.clone(),
-        due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
+        due_at_ms: unix_timestamp_millis().saturating_add(queue_retry_after_ms(attempts)),
         attempts,
         last_error: Some(error),
     };
@@ -443,9 +724,18 @@ async fn reschedule_graph_prune_job(
     }
     .await;
     match result {
-        Ok(()) => commit_storage_transaction(storage, txn_id).await,
+        Ok(()) => {
+            commit_storage_transaction(storage, txn_id).await?;
+            Ok(())
+        }
         Err(error) => {
-            abort_storage_transaction_best_effort(storage, txn_id).await;
+            abort_storage_transaction_best_effort(
+                storage,
+                txn_id,
+                "Failed to abort metadata graph prune transaction",
+                "Unexpected metadata graph prune transaction abort result",
+            )
+            .await;
             Err(error)
         }
     }
@@ -465,60 +755,6 @@ async fn delete_graph_prune_jobs(
         })
         .collect::<Vec<_>>();
     transactional_batch_delete_no_txn(storage, deletes).await
-}
-
-fn retry_after_ms(attempts: u32) -> u64 {
-    let shift = attempts.min(7);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    PRUNE_RETRY_BASE_MS
-        .saturating_mul(multiplier)
-        .min(PRUNE_RETRY_MAX_MS)
-}
-
-async fn start_write_transaction(
-    storage: &StorageHandle,
-) -> Result<Ulid, MetadataGraphPruneQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-async fn commit_storage_transaction(
-    storage: &StorageHandle,
-    txn_id: Ulid,
-) -> Result<(), MetadataGraphPruneQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-async fn abort_storage_transaction_best_effort(storage: &StorageHandle, txn_id: Ulid) {
-    match storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, txn_id = %txn_id, "Failed to abort metadata graph prune transaction");
-        }
-        other => {
-            warn!(event = ?other, txn_id = %txn_id, "Unexpected metadata graph prune transaction abort result");
-        }
-    }
 }
 
 async fn transactional_batch_write(
@@ -649,6 +885,20 @@ mod tests {
         }
     }
 
+    async fn storage_key_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     async fn read_jobs(storage: &StorageHandle) -> Vec<MetadataGraphPruneJobRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -664,6 +914,25 @@ mod tests {
                 .into_iter()
                 .map(|(_, value)| postcard::from_bytes(&value).expect("job decodes"))
                 .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn read_job_at_key(
+        storage: &StorageHandle,
+        key: Vec<u8>,
+    ) -> Option<MetadataGraphPruneJobRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.map(|value| postcard::from_bytes(&value).expect("prune job decodes"))
+            }
             other => panic!("unexpected storage event: {other:?}"),
         }
     }
@@ -755,6 +1024,243 @@ mod tests {
 
         assert_eq!(result.processed, 0);
         assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_graph_prune_job_only_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let corrupt_key = vec![0];
+        write_entries(
+            &storage,
+            vec![(
+                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                ByteView::from(corrupt_key.clone()),
+                ByteView::from(vec![1, 2, 3]),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = process_metadata_graph_prune_batch(&context)
+            .await
+            .expect("corrupt-only drain succeeds");
+
+        assert_eq!(result.processed, 0);
+        assert!(!result.has_more_due);
+        assert!(!storage_key_exists(&storage, corrupt_key).await);
+    }
+
+    #[tokio::test]
+    async fn graph_prune_jobs_exist_deletes_corrupt_before_valid() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let corrupt_key = vec![0];
+        let valid_job = new_graph_prune_job("urn:graph:valid".to_string(), 1);
+        write_entries(
+            &storage,
+            vec![
+                (
+                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    ByteView::from(corrupt_key.clone()),
+                    ByteView::from(vec![1, 2, 3]),
+                ),
+                metadata_graph_prune_job_write_entry(&valid_job).expect("job entry"),
+            ],
+        )
+        .await;
+
+        assert!(metadata_graph_prune_jobs_exist(&storage).await.unwrap());
+        assert!(!storage_key_exists(&storage, corrupt_key).await);
+    }
+
+    #[tokio::test]
+    async fn noncanonical_future_graph_prune_job_does_not_hide_due_job() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let now_ms = unix_timestamp_millis();
+        let future_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:future".to_string(),
+            due_at_ms: now_ms.saturating_add(60_000),
+            attempts: 0,
+            last_error: None,
+        };
+        let due_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:due".to_string(),
+            due_at_ms: 1,
+            attempts: 0,
+            last_error: None,
+        };
+        let misplaced_key = vec![0];
+        write_entries(
+            &storage,
+            vec![
+                (
+                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    ByteView::from(misplaced_key.clone()),
+                    ByteView::from(postcard::to_allocvec(&future_job).unwrap()),
+                ),
+                metadata_graph_prune_job_write_entry(&due_job).expect("job entry"),
+            ],
+        )
+        .await;
+
+        let (jobs, has_more_due, _next_due_at_ms) = scan_due_graph_prune_jobs(&storage, now_ms, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            jobs,
+            vec![(metadata_graph_prune_job_key(&due_job).to_vec(), due_job)]
+        );
+        assert!(!has_more_due);
+        assert!(!storage_key_exists(&storage, misplaced_key).await);
+        assert!(
+            storage_key_exists(&storage, metadata_graph_prune_job_key(&future_job).to_vec()).await
+        );
+    }
+
+    #[tokio::test]
+    async fn due_noncanonical_graph_prune_job_after_future_job_is_repaired() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let now_ms = unix_timestamp_millis();
+        let future_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:future-canonical".to_string(),
+            due_at_ms: now_ms.saturating_add(60_000),
+            attempts: 0,
+            last_error: None,
+        };
+        let due_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:due-misplaced".to_string(),
+            due_at_ms: 1,
+            attempts: 0,
+            last_error: None,
+        };
+        let misplaced_key = vec![255];
+        write_entries(
+            &storage,
+            vec![
+                metadata_graph_prune_job_write_entry(&future_job).expect("future job entry"),
+                (
+                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    ByteView::from(misplaced_key.clone()),
+                    ByteView::from(postcard::to_allocvec(&due_job).unwrap()),
+                ),
+            ],
+        )
+        .await;
+
+        let (jobs, has_more_due, _next_due_at_ms) = scan_due_graph_prune_jobs(&storage, now_ms, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            jobs,
+            vec![(metadata_graph_prune_job_key(&due_job).to_vec(), due_job)]
+        );
+        assert!(!has_more_due);
+        assert!(!storage_key_exists(&storage, misplaced_key).await);
+    }
+
+    #[tokio::test]
+    async fn noncanonical_graph_prune_duplicate_preserves_future_retry() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let now_ms = unix_timestamp_millis();
+        let future_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:future-retry".to_string(),
+            due_at_ms: now_ms.saturating_add(60_000),
+            attempts: 1,
+            last_error: Some("transient".to_string()),
+        };
+        let stale_job = MetadataGraphPruneJobRecord {
+            due_at_ms: 1,
+            attempts: 0,
+            last_error: None,
+            ..future_job.clone()
+        };
+        let misplaced_key = vec![0];
+        let future_key = metadata_graph_prune_job_key(&future_job);
+        write_entries(
+            &storage,
+            vec![
+                metadata_graph_prune_job_write_entry(&future_job).expect("future job entry"),
+                (
+                    METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                    ByteView::from(misplaced_key.clone()),
+                    ByteView::from(postcard::to_allocvec(&stale_job).unwrap()),
+                ),
+            ],
+        )
+        .await;
+
+        let (jobs, has_more_due, next_due_at_ms) = scan_due_graph_prune_jobs(&storage, now_ms, 8)
+            .await
+            .unwrap();
+
+        assert!(jobs.is_empty());
+        assert!(!has_more_due);
+        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
+        assert!(!storage_key_exists(&storage, misplaced_key).await);
+        assert_eq!(
+            read_job_at_key(&storage, future_key.to_vec()).await,
+            Some(future_job)
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_graph_prune_duplicate_preserves_future_retry() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let now_ms = unix_timestamp_millis();
+        let future_job = MetadataGraphPruneJobRecord {
+            graph_iri: "urn:graph:canonical-future-retry".to_string(),
+            due_at_ms: now_ms.saturating_add(60_000),
+            attempts: 1,
+            last_error: Some("transient".to_string()),
+        };
+        let stale_job = MetadataGraphPruneJobRecord {
+            due_at_ms: 1,
+            attempts: 0,
+            last_error: None,
+            ..future_job.clone()
+        };
+        let stale_key = metadata_graph_prune_job_key(&stale_job);
+        let future_key = metadata_graph_prune_job_key(&future_job);
+        write_entries(
+            &storage,
+            vec![
+                metadata_graph_prune_job_write_entry(&stale_job).expect("stale job entry"),
+                metadata_graph_prune_job_write_entry(&future_job).expect("future job entry"),
+            ],
+        )
+        .await;
+
+        let (jobs, has_more_due, next_due_at_ms) = scan_due_graph_prune_jobs(&storage, now_ms, 8)
+            .await
+            .unwrap();
+
+        assert!(jobs.is_empty());
+        assert!(!has_more_due);
+        assert_eq!(next_due_at_ms, Some(future_job.due_at_ms));
+        assert!(!storage_key_exists(&storage, stale_key.to_vec()).await);
+        assert_eq!(
+            read_job_at_key(&storage, future_key.to_vec()).await,
+            Some(future_job)
+        );
     }
 
     #[tokio::test]

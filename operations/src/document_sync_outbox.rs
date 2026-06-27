@@ -149,8 +149,14 @@ pub async fn read_outbox_records(
             let has_more = values.len() > limit;
             let mut records = Vec::with_capacity(values.len().min(limit));
             for (key, value) in values.into_iter().take(limit) {
-                let record = postcard::from_bytes(&value).map_err(|error| error.to_string())?;
-                records.push((key.to_vec(), record));
+                match postcard::from_bytes(&value) {
+                    Ok(record) => records.push((key.to_vec(), record)),
+                    Err(error) => {
+                        let key = key.to_vec();
+                        warn!(error = %error, key = ?key, "Deleting malformed document sync outbox record");
+                        delete_outbox_records(storage, vec![key]).await?;
+                    }
+                }
             }
             Ok(OutboxReadBatch { records, has_more })
         }
@@ -233,6 +239,8 @@ mod tests {
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::UserId;
+    use aruna_storage::{FjallStorage, StorageHandle};
+    use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -284,6 +292,80 @@ mod tests {
             kind: DocumentSyncChangeKind::Delete,
             ..change()
         }
+    }
+
+    async fn write_raw_outbox_record(storage: &StorageHandle, key: Vec<u8>, value: Vec<u8>) {
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                value: ByteView::from(value),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected outbox write event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_outbox_record_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let corrupt_key = b"000-corrupt-outbox".to_vec();
+        write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
+
+        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+            .await
+            .expect("outbox read succeeds");
+
+        assert!(batch.records.is_empty());
+        assert!(!batch.has_more);
+        assert_eq!(
+            read_outbox_record(&storage, &corrupt_key)
+                .await
+                .expect("corrupt record was deleted"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_outbox_record_before_valid_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let corrupt_key = b"000-corrupt-outbox".to_vec();
+        let valid = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![4, 5],
+                change: change(),
+            },
+        );
+        write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
+        match storage
+            .send_effect(write_outbox_effect(&valid).expect("valid outbox effect"))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected valid outbox write event: {other:?}"),
+        }
+
+        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+            .await
+            .expect("outbox read succeeds");
+
+        assert_eq!(batch.records, vec![(outbox_key(&valid).to_vec(), valid)]);
+        assert_eq!(
+            read_outbox_record(&storage, &corrupt_key)
+                .await
+                .expect("corrupt record was deleted"),
+            None
+        );
     }
 
     #[test]

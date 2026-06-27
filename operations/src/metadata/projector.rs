@@ -26,7 +26,11 @@ use aruna_core::structs::{
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
+use aruna_storage::StorageHandle;
+use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync_outbox::schedule_outbox_drain_effect;
@@ -96,6 +100,40 @@ pub async fn schedule_pending_metadata_projection_drain(
         other => Err(MetadataProjectionError::UnexpectedEvent(format!(
             "{other:?}"
         ))),
+    }
+}
+
+pub async fn restore_pending_metadata_projection_timer(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+) {
+    let event = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {}
+        Event::Storage(StorageEvent::IterResult { .. }) => {
+            let event = task_handle
+                .send_effect(Effect::Task(pending_metadata_projection_drain_task_effect(
+                    Duration::ZERO,
+                )))
+                .await;
+            if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
+                warn!(message = %message, "Failed to restore metadata projection timer");
+            }
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan metadata pending projection markers");
+        }
+        other => {
+            warn!(event = ?other, "Unexpected event while scanning metadata pending projection markers");
+        }
     }
 }
 
@@ -173,17 +211,18 @@ pub async fn drain_pending_metadata_projection_queue(
     let mut targets = Vec::with_capacity(values.len());
     for (key, _) in &values {
         let Some(target) = metadata_pending_projection_target(key.as_ref()) else {
-            return Err(MetadataProjectionError::UnexpectedEvent(
-                "invalid metadata pending projection marker key".to_string(),
-            ));
+            let key = key.to_vec();
+            warn!(key = ?key, "Deleting malformed metadata pending projection marker");
+            delete_pending_projection_marker_keys(context, vec![key]).await?;
+            continue;
         };
         targets.push(target);
     }
-    let markers_examined = targets.len();
-    let projected = project_metadata_create_events_from_log(context, targets).await?;
+    let projected_from_log =
+        project_metadata_create_events_from_log_inner(context, targets, true).await?;
     Ok(PendingMetadataProjectionDrainResult {
-        markers_examined,
-        projected,
+        markers_examined: projected_from_log.existing_events,
+        projected: projected_from_log.projected,
         has_more: next_start_after.is_some(),
     })
 }
@@ -202,16 +241,59 @@ pub async fn project_metadata_create_events_from_log(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (Ulid, Ulid)>,
 ) -> Result<usize, MetadataProjectionError> {
+    Ok(
+        project_metadata_create_events_from_log_inner(context, targets, false)
+            .await?
+            .projected,
+    )
+}
+
+struct MetadataProjectionFromLogResult {
+    projected: usize,
+    existing_events: usize,
+}
+
+async fn project_metadata_create_events_from_log_inner(
+    context: &DriverContext,
+    targets: impl IntoIterator<Item = (Ulid, Ulid)>,
+    delete_orphan_markers: bool,
+) -> Result<MetadataProjectionFromLogResult, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
     let mut seen = BTreeSet::new();
     let mut events = Vec::new();
+    let mut missing_event_markers = BTreeSet::new();
     for (document_id, event_id) in targets {
         if !seen.insert((document_id, event_id)) {
             continue;
         }
-        events.push(read_create_event_from_log(context, document_id, event_id).await?);
+        match read_create_event_from_log(context, document_id, event_id).await {
+            Ok(event) => events.push(event),
+            Err(MetadataProjectionError::MetadataCreateEventMissing {
+                document_id,
+                event_id,
+            }) if delete_orphan_markers => {
+                warn!(%document_id, %event_id, "Deleting orphan metadata pending projection marker");
+                missing_event_markers.insert((document_id, event_id));
+            }
+            Err(MetadataProjectionError::MetadataCreateEventMissing {
+                document_id,
+                event_id,
+            }) => {
+                return Err(MetadataProjectionError::MetadataCreateEventMissing {
+                    document_id,
+                    event_id,
+                });
+            }
+            Err(error) => return Err(error),
+        }
     }
-    project_metadata_create_events(context, events, local_node_id).await
+    delete_pending_projection_markers(context, missing_event_markers).await?;
+    let existing_events = events.len();
+    let projected = project_metadata_create_events(context, events, local_node_id).await?;
+    Ok(MetadataProjectionFromLogResult {
+        projected,
+        existing_events,
+    })
 }
 
 async fn read_create_event_from_log(
@@ -482,6 +564,38 @@ async fn delete_pending_projection_markers(
     }
 }
 
+async fn delete_pending_projection_marker_keys(
+    context: &DriverContext,
+    keys: Vec<Vec<u8>>,
+) -> Result<(), MetadataProjectionError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let deletes = keys
+        .into_iter()
+        .map(|key| {
+            (
+                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                ByteView::from(key),
+            )
+        })
+        .collect();
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
 async fn expand_create_event_holders_cached(
     context: &DriverContext,
     event: MetadataCreateEventRecord,
@@ -727,7 +841,27 @@ async fn schedule_materialization_drain(
 mod tests {
     use super::*;
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
+    use aruna_core::storage_entries::{
+        metadata_create_event_write_entry, metadata_pending_projection_key,
+    };
     use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_tasks::{InboundTaskHandler, TaskHandle};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+
+    struct RecordingTaskHandler {
+        seen: mpsc::Sender<TaskKey>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for RecordingTaskHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            let _ = self.seen.send(key).await;
+        }
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -780,6 +914,176 @@ mod tests {
         config
     }
 
+    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn pending_projection_marker_exists(storage: &StorageHandle, key: Vec<u8>) -> bool {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pending_projection_marker_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let corrupt_key = b"short".to_vec();
+        write_entries(
+            &storage,
+            vec![(
+                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                ByteView::from(corrupt_key.clone()),
+                ByteView::from(Vec::new()),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = drain_pending_metadata_projection_queue(&context)
+            .await
+            .expect("projection drain succeeds");
+
+        assert_eq!(result.markers_examined, 0);
+        assert_eq!(result.projected, 0);
+        assert!(!result.has_more);
+        assert!(!pending_projection_marker_exists(&storage, corrupt_key).await);
+    }
+
+    #[tokio::test]
+    async fn malformed_pending_projection_marker_before_valid_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let corrupt_key = b"short".to_vec();
+        let event = create_event();
+        let valid_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        write_entries(
+            &storage,
+            vec![
+                (
+                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    ByteView::from(corrupt_key.clone()),
+                    ByteView::from(Vec::new()),
+                ),
+                metadata_create_event_write_entry(&event).expect("event log entry"),
+                (
+                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    valid_key.clone(),
+                    ByteView::from(Vec::new()),
+                ),
+            ],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = drain_pending_metadata_projection_queue(&context)
+            .await
+            .expect("projection drain succeeds");
+
+        assert_eq!(result.markers_examined, 1);
+        assert_eq!(result.projected, 1);
+        assert!(!pending_projection_marker_exists(&storage, corrupt_key).await);
+        assert!(!pending_projection_marker_exists(&storage, valid_key.to_vec()).await);
+    }
+
+    #[tokio::test]
+    async fn orphan_pending_projection_marker_is_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let document_id = Ulid::from_bytes([21u8; 16]);
+        let event_id = Ulid::from_parts(21, 1);
+        let marker_key = metadata_pending_projection_key(document_id, event_id);
+        write_entries(
+            &storage,
+            vec![(
+                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                marker_key.clone(),
+                ByteView::from(Vec::new()),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = drain_pending_metadata_projection_queue(&context)
+            .await
+            .expect("projection drain succeeds");
+
+        assert_eq!(result.markers_examined, 0);
+        assert_eq!(result.projected, 0);
+        assert!(!pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+    }
+
+    #[tokio::test]
+    async fn restore_pending_projection_timer_schedules_when_marker_exists() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let event = create_event();
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&event).expect("event log entry"),
+                (
+                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    metadata_pending_projection_key(event.record.document_id, event.event_id),
+                    ByteView::from(Vec::new()),
+                ),
+            ],
+        )
+        .await;
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+
+        restore_pending_metadata_projection_timer(&storage, &task_handle).await;
+
+        let restored_key = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("restored projection timer should fire")
+            .expect("recording handler should receive timer key");
+        assert_eq!(restored_key, TaskKey::DrainMetadataProjectionQueue);
+    }
+
     #[test]
     fn metadata_origin_expands_holders_with_rendezvous() {
         let mut event = create_event();
@@ -810,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_recipient_does_not_expand_single_holder_legacy_event() {
+    fn metadata_recipient_preserves_single_authoritative_holder() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids.clear();
