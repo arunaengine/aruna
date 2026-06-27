@@ -382,6 +382,16 @@ pub enum MetadataQueryResults {
     Graph(Vec<(String, String, String)>),
 }
 
+impl MetadataQueryResults {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Solutions(_) => "solutions",
+            Self::Boolean(_) => "boolean",
+            Self::Graph(_) => "graph",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEffect {
     ValidateCreateCrate {
@@ -538,7 +548,7 @@ mod tests {
     use super::{
         MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-        MetadataGraphLifecycleRecord, compare_metadata_clocks,
+        MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
     };
     use crate::structs::{MetadataRegistryRecord, RealmId};
     use crate::{NodeId, UserId};
@@ -569,6 +579,16 @@ mod tests {
             compare_metadata_clocks(&local, &concurrent),
             MetadataClockRelation::Concurrent
         );
+    }
+
+    #[test]
+    fn metadata_query_results_kind_labels_variants() {
+        assert_eq!(
+            MetadataQueryResults::Solutions(Vec::new()).kind(),
+            "solutions"
+        );
+        assert_eq!(MetadataQueryResults::Boolean(true).kind(), "boolean");
+        assert_eq!(MetadataQueryResults::Graph(Vec::new()).kind(), "graph");
     }
 
     fn node(seed: u8) -> NodeId {

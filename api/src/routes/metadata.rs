@@ -2,12 +2,10 @@ use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_real
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::id::short_display_id;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
-use aruna_core::telemetry::record_elapsed_ms;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -17,13 +15,18 @@ use aruna_operations::delete_metadata_document::{
     DeleteMetadataDocumentOperation, delete_metadata_document as run_delete_metadata_document,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::get_metadata_document::{
-    is_metadata_record_materialized_for_graph_read,
-    load_metadata_record_by_document as load_metadata_record_by_document_from_operations,
+use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
+    ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
+    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
+    MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
+    export_metadata_rocrate as run_export_metadata_rocrate,
+    get_visible_metadata_document as run_get_visible_metadata_document,
+    list_visible_metadata_documents as run_list_visible_metadata_documents,
+    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
+    search_metadata as run_search_metadata,
 };
-use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
@@ -33,19 +36,25 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
-use futures_util::StreamExt;
-use futures_util::future::{BoxFuture, FutureExt};
-use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{Instrument, Span, debug_span, field, warn};
+use std::time::Instant;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
+
+#[cfg(test)]
+use aruna_operations::metadata::MetadataAuthToken;
+#[cfg(test)]
+use aruna_operations::metadata::api::{
+    MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
+    deduplicate_search_hits, document_replica_query_nodes, load_metadata_realm_nodes,
+    metadata_auth_token_from_bearer, query_select_limit,
+};
+#[cfg(test)]
+use std::time::Duration;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -270,11 +279,6 @@ struct MetadataIncludeFlags {
     summary: bool,
 }
 
-const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
-const MAX_LIST_METADATA_LIMIT: usize = 1_000;
-const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
-const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SparqlQueryRequest {
     /// SPARQL query string. Only `SELECT` and `ASK` queries are supported.
@@ -300,18 +304,6 @@ pub enum MetadataQueryMode {
     /// This is best-effort and may return partial results if discovery or
     /// remote requests fail.
     Distributed,
-}
-
-#[derive(Debug)]
-struct MetadataFanoutScope {
-    mode: Option<MetadataQueryMode>,
-    target_nodes: Option<Vec<aruna_core::NodeId>>,
-}
-
-impl MetadataFanoutScope {
-    fn new(mode: Option<MetadataQueryMode>, target_nodes: Option<Vec<aruna_core::NodeId>>) -> Self {
-        Self { mode, target_nodes }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -426,16 +418,14 @@ impl MetadataDocumentListItem {
                     "Created" = (
                         summary = "Created metadata summary",
                         value = json!({
-                            "summary": {
-                                "document_id": "01JMETADATA0123456789ABCDE",
-                                "group_id": "01JABCDEF0123456789ABCDEFG",
-                                "document_path": "datasets/proteomics/run-42",
-                                "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-                                "public": true,
-                                "replicas": 3,
-                                "created_at": "2026-04-09T14:23:11.123Z",
-                                "updated_at": "2026-04-09T14:23:11.123Z"
-                            }
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:23:11.123Z"
                         })
                     )
                 )
@@ -530,26 +520,10 @@ pub async fn list_all_metadata_documents(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListMetadataQuery>,
 ) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
-    if let Some(group_id) = query.group_id.as_deref() {
-        let group_id = parse_group_id(group_id)?;
-        let records = load_group_metadata_records(&state, group_id).await?;
-        return Ok((
-            StatusCode::OK,
-            Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
-        ));
-    }
-
-    let groups = drive(ListGroupOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let mut records = Vec::new();
-    for group in groups {
-        records.extend(load_group_metadata_records(&state, group.group_id).await?);
-    }
-
+    let group_id = query.group_id.as_deref().map(parse_group_id).transpose()?;
     Ok((
         StatusCode::OK,
-        Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
+        Json(run_list_metadata_documents(&state, auth, query, group_id).await?),
     ))
 }
 
@@ -576,11 +550,9 @@ pub async fn list_metadata_documents(
     Query(query): Query<ListMetadataQuery>,
 ) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let records = load_group_metadata_records(&state, group_id).await?;
-
     Ok((
         StatusCode::OK,
-        Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
+        Json(run_list_metadata_documents(&state, auth, query, Some(group_id)).await?),
     ))
 }
 
@@ -603,9 +575,14 @@ pub async fn get_metadata_document(
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(&state, &record).await?;
+    let ctx = state.get_ctx();
+    let record = run_get_visible_metadata_document(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest { document_id, auth },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -721,34 +698,23 @@ pub async fn export_metadata_rocrate(
     Query(params): Query<MetadataRoCrateExportParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataRoCrateResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(&state, &record).await?;
-    let response = match params.view.clone().unwrap_or(MetadataRoCrateView::Full) {
-        MetadataRoCrateView::Full => MetadataRoCrateResponse {
-            rocrate: export_rocrate_jsonld(&state, &record.graph_iri).await?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
+    let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
+    let ctx = state.get_ctx();
+    let export = run_export_metadata_rocrate(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        ExportMetadataRoCrateRequest {
+            document_id,
+            auth,
+            view: map_rocrate_export_view(&view),
+            limit: params.limit,
+            offset: params.offset,
+            after: params.after.clone(),
         },
-        MetadataRoCrateView::Summary => MetadataRoCrateResponse {
-            rocrate: rewrite_view_jsonld(
-                export_rocrate_summary_jsonld(&state, &record.graph_iri).await?,
-                &record.graph_iri,
-                &build_view_id(&record.graph_iri, &params, MetadataRoCrateView::Summary),
-            )?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
-        },
-        MetadataRoCrateView::Page => map_page_response(
-            export_rocrate_page(&state, &record.graph_iri, &params).await?,
-            &record.graph_iri,
-            &build_view_id(&record.graph_iri, &params, MetadataRoCrateView::Page),
-        )?,
-    };
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    let response = map_rocrate_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))
 }
 
@@ -1083,24 +1049,23 @@ pub async fn query_metadata_document(
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    ensure_supported_query_form(&request.query)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    ensure_record_materialized_for_graph_read(&state, &record).await?;
-    let (results, fanout_stats) = run_query_distributed(
-        &state,
-        auth,
-        bearer_token,
-        Some(vec![record.graph_iri.clone()]),
-        request.query,
-        MetadataFanoutScope::new(
-            request.mode,
-            Some(document_replica_query_nodes(&record, state.get_node_id())),
-        ),
+    let ctx = state.get_ctx();
+    let result = run_query_metadata_document(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataDocumentQueryRequest {
+            document_id,
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            query: request.query,
+            mode: map_query_mode(request.mode),
+        },
     )
-    .await?;
+    .await
+    .map_err(map_metadata_api_error)?;
     let serialize_started = Instant::now();
-    let response = map_query_results(results, fanout_stats)?;
+    let response = map_query_results(result.results, result.fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
     Ok((StatusCode::OK, Json(response)))
 }
@@ -1144,18 +1109,24 @@ pub async fn query_all_metadata(
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
-    ensure_supported_query_form(&request.query)?;
-    let (results, fanout_stats) = run_query_distributed(
-        &state,
-        auth,
-        bearer_token,
-        None,
-        request.query,
-        MetadataFanoutScope::new(request.mode, None),
+    let ctx = state.get_ctx();
+    let result = run_query_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataQueryRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            graph_iris: None,
+            query: request.query,
+            mode: map_query_mode(request.mode),
+            target_nodes: None,
+        },
     )
-    .await?;
+    .await
+    .map_err(map_metadata_api_error)?;
     let serialize_started = Instant::now();
-    let response = map_query_results(results, fanout_stats)?;
+    let response = map_query_results(result.results, result.fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
     Ok((StatusCode::OK, Json(response)))
 }
@@ -1181,26 +1152,29 @@ pub async fn search_metadata(
     Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(params): Query<MetadataSearchParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
-    if params.q.trim().is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let (hits, fanout_stats) = run_search_distributed(
-        &state,
-        auth,
-        bearer_token,
-        None,
-        params.q,
-        limit,
-        MetadataFanoutScope::new(params.mode, None),
+    let ctx = state.get_ctx();
+    let result = run_search_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataSearchRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            graph_iris: None,
+            query: params.q,
+            limit: params.limit,
+            mode: map_query_mode(params.mode),
+            target_nodes: None,
+        },
     )
-    .await?;
+    .await
+    .map_err(map_metadata_api_error)?;
     Ok((
         StatusCode::OK,
         Json(MetadataSearchResponse {
-            hits: hits.into_iter().map(map_search_hit).collect(),
-            nodes_queried: fanout_stats.nodes_queried,
-            nodes_failed: fanout_stats.nodes_failed,
+            hits: result.hits.into_iter().map(map_search_hit).collect(),
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
         }),
     ))
 }
@@ -1209,115 +1183,46 @@ fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
 }
 
-async fn load_group_metadata_records(
+async fn run_list_metadata_documents(
     state: &ServerState,
-    group_id: Ulid,
-) -> ServerResult<Vec<MetadataRegistryRecord>> {
-    let ctx = state.get_ctx();
-    // Listing is eventually consistent by design: the handle-owned visibility
-    // cache is incrementally updated on local writes, serves stale snapshots
-    // while a background refill runs, and is keyed per group so a small
-    // group's listing stays independent of the realm-wide corpus size.
-    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
-        match metadata_handle
-            .list_cached_registry_records_for_group(group_id)
-            .await
-        {
-            Ok(group_records) => return Ok(group_records.as_ref().clone()),
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "metadata registry cache fill failed, falling back to registry scan"
-                );
-            }
-        }
-    }
-
-    drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))
-}
-
-async fn build_metadata_list_response(
-    state: &ServerState,
-    auth: Option<&AuthContext>,
-    records: Vec<MetadataRegistryRecord>,
-    query: &ListMetadataQuery,
+    auth: Option<AuthContext>,
+    query: ListMetadataQuery,
+    group_id: Option<Ulid>,
 ) -> ServerResult<ListMetadataResponse> {
     let include = parse_metadata_include_flags(query.include.as_deref())?;
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
-        .clamp(1, MAX_LIST_METADATA_LIMIT);
-    let offset = query.offset.unwrap_or(0);
+    let ctx = state.get_ctx();
+    let result = run_list_visible_metadata_documents(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        ListVisibleMetadataDocumentsRequest {
+            group_id,
+            path_prefix: query.path_prefix,
+            include_summary: include.summary,
+            limit: query.limit,
+            offset: query.offset,
+            auth,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
 
-    let needed = offset.saturating_add(limit);
-    let mut selected = Vec::with_capacity(limit.min(records.len()));
-    let mut visible_count = 0usize;
-    for record in records {
-        if !metadata_record_matches_filters(&record, query) {
-            continue;
-        }
-        if !can_read_record(state, auth, &record).await? {
-            continue;
-        }
-        visible_count += 1;
-        if visible_count > offset {
-            selected.push(record);
-            if visible_count >= needed {
-                break;
-            }
-        }
+    let mut documents = Vec::with_capacity(result.documents.len());
+    for document in result.documents {
+        let rocrate_summary = document
+            .rocrate_summary_jsonld
+            .map(parse_jsonld)
+            .transpose()?;
+        documents.push(MetadataDocumentListItem::from_record(
+            &document.record,
+            rocrate_summary,
+        ));
     }
-
-    let mut documents = Vec::with_capacity(selected.len());
-    if include.summary {
-        let summaries = futures_util::future::join_all(
-            selected
-                .iter()
-                .map(|record| export_rocrate_summary_jsonld(state, &record.graph_iri)),
-        )
-        .await;
-        for (record, summary) in selected.iter().zip(summaries) {
-            documents.push(MetadataDocumentListItem::from_record(
-                record,
-                Some(summary?),
-            ));
-        }
-    } else {
-        for record in &selected {
-            documents.push(MetadataDocumentListItem::from_record(record, None));
-        }
-    }
-    let total_returned = documents.len();
-
     Ok(ListMetadataResponse {
         documents,
-        limit,
-        offset,
-        total_returned,
+        limit: result.limit,
+        offset: result.offset,
+        total_returned: result.total_returned,
     })
-}
-
-fn metadata_record_matches_filters(
-    record: &MetadataRegistryRecord,
-    query: &ListMetadataQuery,
-) -> bool {
-    query
-        .path_prefix
-        .as_deref()
-        .map(|path_prefix| metadata_path_matches_prefix(&record.document_path, path_prefix))
-        .unwrap_or(true)
-}
-
-fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
-    let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
-    let normalized_prefix = MetadataRegistryRecord::normalize_document_path(path_prefix);
-    normalized_prefix.is_empty()
-        || normalized_path == normalized_prefix
-        || normalized_path
-            .strip_prefix(&normalized_prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn parse_metadata_include_flags(include: Option<&str>) -> ServerResult<MetadataIncludeFlags> {
@@ -1389,13 +1294,28 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
     }
 }
 
-// Pending graph materialization surfaces as GraphNotFound on read paths; the
-// document is known to exist, so signal retry instead of failure.
-fn map_metadata_event_error(error: MetadataError) -> ServerError {
+fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
     match error {
-        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        MetadataApiError::BadRequest => ServerError::BadRequest,
+        MetadataApiError::Unauthorized => ServerError::Unauthorized,
+        MetadataApiError::Forbidden => ServerError::Forbidden,
+        MetadataApiError::NotFound => ServerError::NotFound,
+        MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::Internal(message) => ServerError::InternalError(message),
     }
+}
+
+fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
+    mode.map(|mode| match mode {
+        MetadataQueryMode::Local => MetadataApiQueryMode::Local,
+        MetadataQueryMode::Distributed => MetadataApiQueryMode::Distributed,
+    })
+}
+
+fn bearer_token_to_string(
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+) -> Option<String> {
+    bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
 async fn ensure_metadata_write_scope(
@@ -1405,26 +1325,6 @@ async fn ensure_metadata_write_scope(
 ) -> ServerResult<()> {
     let path = format!("/{}/g/{group_id}/meta/**", state.get_realm_id());
     ensure_permission(state, auth.clone(), path, Permission::WRITE).await
-}
-
-async fn ensure_record_readable(
-    state: &ServerState,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<()> {
-    if record.public {
-        return Ok(());
-    }
-    let Some(auth) = auth.cloned() else {
-        return Err(ServerError::Unauthorized);
-    };
-    ensure_permission(
-        state,
-        auth,
-        record.permission_path.clone(),
-        Permission::READ,
-    )
-    .await
 }
 
 async fn ensure_record_writable(
@@ -1439,39 +1339,6 @@ async fn ensure_record_writable(
         Permission::WRITE,
     )
     .await
-}
-
-async fn can_read_record(
-    state: &ServerState,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<bool> {
-    if record.public {
-        return Ok(true);
-    }
-    let Some(auth) = auth.cloned() else {
-        return Ok(false);
-    };
-    if auth.realm_id != state.get_realm_id() {
-        return Ok(false);
-    }
-
-    match aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth,
-                path: record.permission_path.clone(),
-                required_permission: Permission::READ,
-            }),
-            &state.get_ctx(),
-        ),
-    )
-    .await
-    {
-        Ok(allowed) => Ok(allowed),
-        Err(_) => Ok(false),
-    }
 }
 
 async fn ensure_permission(
@@ -1528,71 +1395,44 @@ async fn load_metadata_record_by_document(
 
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
 
-async fn ensure_record_materialized_for_graph_read(
-    state: &ServerState,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<()> {
-    let ctx = state.get_ctx();
-    match is_metadata_record_materialized_for_graph_read(ctx.as_ref(), record).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::ServiceUnavailable),
-        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.to_string())),
-        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.to_string())),
+fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCrateExportView {
+    match view {
+        MetadataRoCrateView::Full => OperationMetadataRoCrateExportView::Full,
+        MetadataRoCrateView::Summary => OperationMetadataRoCrateExportView::Summary,
+        MetadataRoCrateView::Page => OperationMetadataRoCrateExportView::Page,
     }
 }
 
-async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<Value> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)
-        .and_then(parse_jsonld)
-}
-
-async fn export_rocrate_summary_jsonld(
-    state: &ServerState,
-    graph_iri: &str,
-) -> ServerResult<Value> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_summary_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)
-        .and_then(parse_jsonld)
-}
-
-async fn export_rocrate_page(
-    state: &ServerState,
-    graph_iri: &str,
+fn map_rocrate_export_response(
+    export: ExportMetadataRoCrateResult,
     params: &MetadataRoCrateExportParams,
-) -> ServerResult<MetadataRoCratePage> {
-    if params.offset.is_some() && params.after.is_some() {
-        return Err(ServerError::BadRequest);
+    view: MetadataRoCrateView,
+) -> ServerResult<MetadataRoCrateResponse> {
+    match export {
+        ExportMetadataRoCrateResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse {
+            rocrate: parse_jsonld(jsonld)?,
+            total_data_entities: None,
+            returned_data_entities: None,
+            next_offset: None,
+            next_cursor: None,
+        }),
+        ExportMetadataRoCrateResult::Summary { record, jsonld } => Ok(MetadataRoCrateResponse {
+            rocrate: rewrite_view_jsonld(
+                parse_jsonld(jsonld)?,
+                &record.graph_iri,
+                &build_view_id(&record.graph_iri, params, view),
+            )?,
+            total_data_entities: None,
+            returned_data_entities: None,
+            next_offset: None,
+            next_cursor: None,
+        }),
+        ExportMetadataRoCrateResult::Page { record, page } => map_page_response(
+            page,
+            &record.graph_iri,
+            &build_view_id(&record.graph_iri, params, view),
+        ),
     }
-    let limit = params.limit.unwrap_or(100).clamp(1, 1_000);
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_page(
-            graph_iri.to_string(),
-            limit,
-            params.offset,
-            params.after.clone(),
-        )
-        .await
-        .map_err(map_metadata_event_error)
 }
 
 fn map_page_response(
@@ -1680,19 +1520,6 @@ fn rewrite_identifier_value(
     }
 }
 
-fn ensure_supported_query_mode(mode: &Option<MetadataQueryMode>) -> ServerResult<()> {
-    match mode {
-        None | Some(MetadataQueryMode::Local) | Some(MetadataQueryMode::Distributed) => Ok(()),
-    }
-}
-
-fn ensure_supported_query_form(query: &str) -> ServerResult<()> {
-    match query_form(query) {
-        Some(QueryForm::Select | QueryForm::Ask) => Ok(()),
-        _ => Err(ServerError::BadRequest),
-    }
-}
-
 fn map_query_results(
     results: MetadataQueryResults,
     fanout_stats: MetadataFanoutStats,
@@ -1713,522 +1540,10 @@ fn map_query_results(
     })
 }
 
-fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
-    match results {
-        MetadataQueryResults::Solutions(_) => "solutions",
-        MetadataQueryResults::Boolean(_) => "boolean",
-        MetadataQueryResults::Graph(_) => "graph",
-    }
-}
-
+#[cfg(test)]
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    Ok(state.load_metadata_realm_nodes().await)
-}
-
-fn document_replica_query_nodes(
-    record: &MetadataRegistryRecord,
-    local_node_id: aruna_core::NodeId,
-) -> Vec<aruna_core::NodeId> {
-    let nodes = deduplicate_fanout_nodes(record.holder_node_ids.clone());
-    if nodes.is_empty() {
-        vec![local_node_id]
-    } else {
-        nodes
-    }
-}
-
-fn deduplicate_fanout_nodes(nodes: Vec<aruna_core::NodeId>) -> Vec<aruna_core::NodeId> {
-    let mut seen = HashSet::with_capacity(nodes.len());
-    nodes
-        .into_iter()
-        .filter(|node_id| seen.insert(*node_id))
-        .collect()
-}
-
-fn metadata_auth_token_from_carrier(
-    carrier: Option<&ValidatedArunaBearerTokenCarrier>,
-) -> Option<MetadataAuthToken> {
-    carrier.and_then(|carrier| MetadataAuthToken::bearer(carrier.as_str()).ok())
-}
-
-type MetadataNodeCall<T> =
-    Arc<dyn Fn(aruna_core::NodeId) -> BoxFuture<'static, Result<T, MetadataError>> + Send + Sync>;
-
-fn metadata_node_call<C, T, F, Fut>(context: C, call: F) -> MetadataNodeCall<T>
-where
-    C: Clone + Send + Sync + 'static,
-    T: Send + 'static,
-    F: Fn(C, aruna_core::NodeId) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<T, MetadataError>> + Send + 'static,
-{
-    Arc::new(move |node_id| {
-        let context = context.clone();
-        call(context, node_id).boxed()
-    })
-}
-
-#[derive(Clone, Copy)]
-enum MetadataFanoutOperation {
-    Query,
-    Search,
-}
-
-impl MetadataFanoutOperation {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Query => "query",
-            Self::Search => "search",
-        }
-    }
-
-    fn timeout_error(self) -> MetadataError {
-        MetadataError::Backend(format!(
-            "distributed metadata {} node timed out after {}ms",
-            self.label(),
-            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
-        ))
-    }
-}
-
-fn metadata_fanout_node_span(
-    operation: MetadataFanoutOperation,
-    node_id: aruna_core::NodeId,
-    local: bool,
-) -> Span {
-    match operation {
-        MetadataFanoutOperation::Query => debug_span!(
-            "metadata.api.query_node",
-            peer = ?node_id,
-            local,
-            elapsed_ms = field::Empty,
-            result = field::Empty,
-        ),
-        MetadataFanoutOperation::Search => debug_span!(
-            "metadata.api.search_node",
-            peer = ?node_id,
-            local,
-            elapsed_ms = field::Empty,
-            hit_count = field::Empty,
-            result = field::Empty,
-        ),
-    }
-}
-
-async fn run_metadata_fanout_node<T>(
-    operation: MetadataFanoutOperation,
-    node_id: aruna_core::NodeId,
-    local: bool,
-    local_call: MetadataNodeCall<T>,
-    remote_call: MetadataNodeCall<T>,
-    record_result: fn(&Span, &Result<T, MetadataError>),
-    record_stage_detail: bool,
-) -> Result<T, MetadataError> {
-    let node_span = metadata_fanout_node_span(operation, node_id, local);
-    let node_started = Instant::now();
-    // The coordinator's own partition runs in-process like mode=local; only
-    // remote partitions go over the wire and carry the per-node timeout.
-    let result = if local {
-        local_call(node_id).instrument(node_span.clone()).await
-    } else {
-        match tokio::time::timeout(
-            METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
-            remote_call(node_id).instrument(node_span.clone()),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(operation.timeout_error()),
-        }
-    };
-    let elapsed = record_elapsed_ms(&node_span, "elapsed_ms", node_started);
-    if record_stage_detail {
-        aruna_core::telemetry::record_stage_detail(
-            "fanout_node",
-            || short_display_id(node_id),
-            elapsed,
-        );
-    }
-    record_result(&node_span, &result);
-    result
-}
-
-async fn metadata_fanout_nodes(
-    state: &ServerState,
-    span: &Span,
-    target_nodes: Option<Vec<aruna_core::NodeId>>,
-) -> ServerResult<Vec<aruna_core::NodeId>> {
-    match target_nodes {
-        Some(nodes) => {
-            span.record("discovery_ms", 0u64);
-            Ok(deduplicate_fanout_nodes(nodes))
-        }
-        None => {
-            let discovery_started = Instant::now();
-            let nodes =
-                aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state)).await?;
-            record_elapsed_ms(span, "discovery_ms", discovery_started);
-            Ok(nodes)
-        }
-    }
-}
-
-async fn run_metadata_fanout<T>(
-    state: &ServerState,
-    scope: MetadataFanoutScope,
-    operation: MetadataFanoutOperation,
-    local_call: MetadataNodeCall<T>,
-    remote_call: MetadataNodeCall<T>,
-    record_result: fn(&Span, &Result<T, MetadataError>),
-    map_local_error: fn(MetadataError) -> ServerError,
-) -> ServerResult<(Vec<T>, MetadataFanoutStats)>
-where
-    T: Send + 'static,
-{
-    let span = Span::current();
-    let MetadataFanoutScope { mode, target_nodes } = scope;
-    ensure_supported_query_mode(&mode)?;
-    match mode.unwrap_or(MetadataQueryMode::Distributed) {
-        MetadataQueryMode::Local => {
-            let local_node_id = state.get_node_id();
-            let result = run_metadata_fanout_node(
-                operation,
-                local_node_id,
-                true,
-                local_call,
-                remote_call,
-                record_result,
-                false,
-            )
-            .await;
-            let fanout_stats = MetadataFanoutStats {
-                nodes_queried: 1,
-                nodes_failed: 0,
-            };
-            match result {
-                Ok(result) => Ok((vec![result], fanout_stats)),
-                Err(error) => Err(map_local_error(error)),
-            }
-        }
-        MetadataQueryMode::Distributed => {
-            let nodes = metadata_fanout_nodes(state, &span, target_nodes).await?;
-            span.record("node_count", nodes.len() as u64);
-            let mut fanout_stats = MetadataFanoutStats {
-                nodes_queried: nodes.len(),
-                nodes_failed: 0,
-            };
-            let fanout_started = Instant::now();
-            let local_node_id = state.get_node_id();
-            let mut node_parts = Vec::new();
-
-            let pending =
-                stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
-                    let local_call = local_call.clone();
-                    let remote_call = remote_call.clone();
-                    async move {
-                        let result = run_metadata_fanout_node(
-                            operation,
-                            node_id,
-                            node_id == local_node_id,
-                            local_call,
-                            remote_call,
-                            record_result,
-                            true,
-                        )
-                        .await;
-                        (node_index, node_id, result)
-                    }
-                }))
-                .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
-            futures_util::pin_mut!(pending);
-
-            while let Some((node_index, node_id, result)) = pending.next().await {
-                match result {
-                    Ok(result) => node_parts.push((node_index, result)),
-                    Err(error) => {
-                        fanout_stats.nodes_failed += 1;
-                        warn!(
-                            node_id = ?node_id,
-                            operation = operation.label(),
-                            error = %error,
-                            "distributed metadata skipped failed node result"
-                        );
-                    }
-                }
-            }
-
-            node_parts.sort_by_key(|(node_index, _)| *node_index);
-            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
-            Ok((
-                node_parts.into_iter().map(|(_, result)| result).collect(),
-                fanout_stats,
-            ))
-        }
-    }
-}
-
-fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, MetadataError>) {
-    match result {
-        Ok(result) => {
-            span.record("result", metadata_query_result_kind(result));
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn record_search_node_result(span: &Span, result: &Result<Vec<MetadataSearchHit>, MetadataError>) {
-    match result {
-        Ok(hits) => {
-            span.record("result", "ok");
-            span.record("hit_count", hits.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-}
-
-fn map_metadata_internal_error(error: MetadataError) -> ServerError {
-    ServerError::InternalError(error.to_string())
-}
-
-#[tracing::instrument(
-    name = "metadata.api.query_distributed",
-    level = "debug",
-    skip(state, auth, query, scope),
-    fields(
-        mode = ?scope.mode,
-        query_len = query.len() as u64,
-        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-        node_count = field::Empty,
-        discovery_ms = field::Empty,
-        elapsed_ms = field::Empty,
-        result = field::Empty,
-    )
-)]
-async fn run_query_distributed(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
-    graph_iris: Option<Vec<String>>,
-    query: String,
-    scope: MetadataFanoutScope,
-) -> ServerResult<(MetadataQueryResults, MetadataFanoutStats)> {
-    let span = Span::current();
-    let total_started = Instant::now();
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    let query_form = query_form(&query).ok_or(ServerError::BadRequest)?;
-    let select_limit = match query_form {
-        QueryForm::Select => query_select_limit(&query),
-        QueryForm::Ask => None,
-    };
-    let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
-
-    let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
-        (
-            handle.clone(),
-            auth.clone(),
-            graph_iris.clone(),
-            query.clone(),
-        ),
-        |(handle, auth, graph_iris, query), _| async move {
-            handle.query_authorized_local(auth, graph_iris, query).await
-        },
-    );
-    let remote_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
-        (
-            handle.clone(),
-            remote_auth_token.clone(),
-            graph_iris.clone(),
-            query.clone(),
-        ),
-        |(handle, auth_token, graph_iris, query), node_id| async move {
-            handle
-                .request_remote_query_graphs(node_id, auth_token, graph_iris, query)
-                .await
-        },
-    );
-    let (parts, fanout_stats) = run_metadata_fanout(
-        state,
-        scope,
-        MetadataFanoutOperation::Query,
-        local_call,
-        remote_call,
-        record_query_node_result,
-        map_metadata_event_error,
-    )
-    .await?;
-
-    let result = aggregate_query_results(parts, query_form, select_limit);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
-    match &result {
-        Ok(results) => {
-            span.record("result", metadata_query_result_kind(results));
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
-    result.map(|results| (results, fanout_stats))
-}
-
-#[tracing::instrument(
-    name = "metadata.api.search_distributed",
-    level = "debug",
-    skip(state, auth, query, scope),
-    fields(
-        mode = ?scope.mode,
-        query_len = query.len() as u64,
-        limit = limit as u64,
-        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-        node_count = field::Empty,
-        discovery_ms = field::Empty,
-        elapsed_ms = field::Empty,
-        hit_count = field::Empty,
-    )
-)]
-async fn run_search_distributed(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
-    graph_iris: Option<Vec<String>>,
-    query: String,
-    limit: usize,
-    scope: MetadataFanoutScope,
-) -> ServerResult<(Vec<MetadataSearchHit>, MetadataFanoutStats)> {
-    let span = Span::current();
-    let total_started = Instant::now();
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
-
-    let local_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
-        (
-            handle.clone(),
-            auth.clone(),
-            graph_iris.clone(),
-            query.clone(),
-            limit,
-        ),
-        |(handle, auth, graph_iris, query, limit), _| async move {
-            handle
-                .search_authorized_local(auth, graph_iris, query, limit)
-                .await
-        },
-    );
-    let remote_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
-        (
-            handle.clone(),
-            remote_auth_token.clone(),
-            graph_iris.clone(),
-            query.clone(),
-            limit,
-        ),
-        |(handle, auth_token, graph_iris, query, limit), node_id| async move {
-            handle
-                .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
-                .await
-        },
-    );
-    let (node_hits, fanout_stats) = run_metadata_fanout(
-        state,
-        scope,
-        MetadataFanoutOperation::Search,
-        local_call,
-        remote_call,
-        record_search_node_result,
-        map_metadata_internal_error,
-    )
-    .await?;
-
-    let hits = deduplicate_search_hits(node_hits.into_iter().flatten().collect(), limit);
-    span.record("hit_count", hits.len() as u64);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok((hits, fanout_stats))
-}
-
-fn aggregate_query_results(
-    results: Vec<MetadataQueryResults>,
-    query_form: QueryForm,
-    select_limit: Option<usize>,
-) -> ServerResult<MetadataQueryResults> {
-    match query_form {
-        QueryForm::Ask => {
-            Ok(MetadataQueryResults::Boolean(results.into_iter().any(
-                |result| matches!(result, MetadataQueryResults::Boolean(true)),
-            )))
-        }
-        QueryForm::Select => {
-            let mut seen = HashSet::new();
-            let mut merged = Vec::new();
-            for result in results {
-                let MetadataQueryResults::Solutions(rows) = result else {
-                    continue;
-                };
-                for row in rows {
-                    let key = serde_json::to_string(&row)
-                        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-                    if seen.insert(key) {
-                        merged.push(row);
-                    }
-                }
-            }
-            // Each node applies the query LIMIT independently, so the merged
-            // set can hold up to nodes x LIMIT rows; re-apply it after dedup.
-            if let Some(limit) = select_limit {
-                merged.truncate(limit);
-            }
-            Ok(MetadataQueryResults::Solutions(merged))
-        }
-    }
-}
-
-// Reads the outermost LIMIT of a SELECT query so distributed aggregation can
-// re-apply it; sub-select slices sit deeper in the algebra and are not picked
-// up here.
-fn query_select_limit(query: &str) -> Option<usize> {
-    let parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
-    let spargebra::Query::Select { pattern, .. } = parsed else {
-        return None;
-    };
-    let spargebra::algebra::GraphPattern::Slice { length, .. } = pattern else {
-        return None;
-    };
-    length
-}
-
-fn deduplicate_search_hits(hits: Vec<MetadataSearchHit>, limit: usize) -> Vec<MetadataSearchHit> {
-    let mut deduped = HashMap::new();
-    for hit in hits {
-        let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
-        deduped
-            .entry(key)
-            .and_modify(|existing: &mut MetadataSearchHit| {
-                if hit.score > existing.score {
-                    *existing = hit.clone();
-                }
-            })
-            .or_insert(hit);
-    }
-    let mut hits = deduped.into_values().collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.graph_iri.cmp(&right.graph_iri))
-            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
-    });
-    hits.truncate(limit);
-    hits
+    let ctx = state.get_ctx();
+    Ok(load_metadata_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
 fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
@@ -2239,44 +1554,6 @@ fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
         graph_iri: hit.graph_iri,
         subject_iri: hit.subject_iri,
         score: hit.score,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryForm {
-    Select,
-    Ask,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MetadataFanoutStats {
-    nodes_queried: usize,
-    nodes_failed: usize,
-}
-
-fn query_form(query: &str) -> Option<QueryForm> {
-    let mut remaining = query.trim_start();
-    loop {
-        let trimmed = remaining.trim_start();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            remaining = rest.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
-            continue;
-        }
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.starts_with("PREFIX ") || upper.starts_with("BASE ") {
-            remaining = trimmed.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
-            continue;
-        }
-        if upper.starts_with("SELECT") {
-            return Some(QueryForm::Select);
-        }
-        if upper.starts_with("ASK") {
-            return Some(QueryForm::Ask);
-        }
-        return None;
     }
 }
 
@@ -2333,6 +1610,13 @@ mod tests {
         auth: AuthContext,
         group_id: Ulid,
         state: Arc<ServerState>,
+    }
+
+    fn installed_metadata_handle(context: &DriverContext) -> &MetadataHandle {
+        let DriverContext {
+            metadata_handle, ..
+        } = context;
+        metadata_handle.as_ref().expect("metadata handle installed")
     }
 
     #[tokio::test]
@@ -2518,11 +1802,8 @@ mod tests {
         assert_eq!(result.nodes_queried, 1);
         assert_eq!(result.nodes_failed, 0);
 
-        test.state
-            .get_ctx()
-            .metadata_handle
-            .as_ref()
-            .unwrap()
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
             .flush_search_updates()
             .await
             .unwrap();
@@ -2635,10 +1916,7 @@ mod tests {
     async fn list_metadata_documents_serves_records_from_handle_registry_cache() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        ctx.metadata_handle
-            .as_ref()
-            .expect("metadata handle installed")
-            .expire_visibility_caches();
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -2659,10 +1937,7 @@ mod tests {
         .unwrap();
         drain_metadata_background(test.state.as_ref()).await;
 
-        ctx.metadata_handle
-            .as_ref()
-            .expect("metadata handle installed")
-            .expire_visibility_caches();
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
 
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
@@ -2699,10 +1974,7 @@ mod tests {
     async fn inbound_document_lifecycle_tombstone_hides_stale_registry_listing() {
         let test = setup_state().await;
         let ctx = test.state.get_ctx();
-        ctx.metadata_handle
-            .as_ref()
-            .expect("metadata handle installed")
-            .expire_visibility_caches();
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -3000,10 +2272,10 @@ mod tests {
         let carrier = ValidatedArunaBearerTokenCarrier::new_for_test("raw-aruna-token");
 
         assert_eq!(
-            metadata_auth_token_from_carrier(Some(&carrier)),
+            metadata_auth_token_from_bearer(Some(carrier.as_str())),
             Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
         );
-        assert_eq!(metadata_auth_token_from_carrier(None), None);
+        assert_eq!(metadata_auth_token_from_bearer(None), None);
     }
 
     #[tokio::test]
@@ -3483,12 +2755,8 @@ mod tests {
     #[tokio::test]
     async fn distributed_search_without_forwarded_token_reads_remote_public_metadata_only() {
         let test = setup_distributed_metadata_access_state().await;
-        test.remote
-            .state
-            .get_ctx()
-            .metadata_handle
-            .as_ref()
-            .unwrap()
+        let ctx = test.remote.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
             .flush_search_updates()
             .await
             .unwrap();
@@ -3822,26 +3090,29 @@ mod tests {
         auth: Option<AuthContext>,
         bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     ) -> QueryNamesResult {
-        let (results, fanout_stats) = run_query_distributed(
-            test.coordinator.state.as_ref(),
-            auth,
-            bearer_token,
-            None,
-            "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            MetadataFanoutScope::new(
-                Some(MetadataQueryMode::Distributed),
-                Some(vec![test.remote.net.node_id()]),
-            ),
+        let ctx = test.coordinator.state.get_ctx();
+        let result = run_query_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth,
+                bearer_token: bearer_token_to_string(bearer_token),
+                graph_iris: None,
+                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+            },
         )
         .await
         .unwrap();
-        let MetadataQueryResults::Solutions(rows) = results else {
+        let MetadataQueryResults::Solutions(rows) = result.results else {
             panic!("expected SELECT solutions");
         };
         QueryNamesResult {
             names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
-            nodes_queried: fanout_stats.nodes_queried,
-            nodes_failed: fanout_stats.nodes_failed,
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
         }
     }
 
@@ -3850,24 +3121,31 @@ mod tests {
         auth: Option<AuthContext>,
         bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     ) -> SearchPathsResult {
-        let (hits, fanout) = run_search_distributed(
-            test.coordinator.state.as_ref(),
-            auth,
-            bearer_token,
-            None,
-            "Remote".to_string(),
-            10,
-            MetadataFanoutScope::new(
-                Some(MetadataQueryMode::Distributed),
-                Some(vec![test.remote.net.node_id()]),
-            ),
+        let ctx = test.coordinator.state.get_ctx();
+        let result = run_search_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth,
+                bearer_token: bearer_token_to_string(bearer_token),
+                graph_iris: None,
+                query: "Remote".to_string(),
+                limit: Some(10),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+            },
         )
         .await
         .unwrap();
         SearchPathsResult {
-            paths: hits.into_iter().map(|hit| hit.document_path).collect(),
-            nodes_queried: fanout.nodes_queried,
-            nodes_failed: fanout.nodes_failed,
+            paths: result
+                .hits
+                .into_iter()
+                .map(|hit| hit.document_path)
+                .collect(),
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
         }
     }
 

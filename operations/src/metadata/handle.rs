@@ -242,6 +242,16 @@ struct MetadataGraphDeletedRead {
     cache_hit: bool,
 }
 
+struct VisibilityFillResult {
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    store_accepted: bool,
+}
+
+struct LifecycleVisibilityRefresh {
+    deleted_graphs: HashSet<String>,
+    store_accepted: bool,
+}
+
 impl MetadataVisibilityCache {
     fn new() -> Self {
         Self {
@@ -1178,7 +1188,7 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
             Ok(results) => {
-                span.record("result", metadata_query_result_kind(results));
+                span.record("result", results.kind());
                 record_metadata_query_result_counts(&span, results);
             }
             Err(error) => record_error(&span, &error.to_string()),
@@ -3101,14 +3111,6 @@ fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
     }
 }
 
-fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
-    match results {
-        MetadataQueryResults::Solutions(_) => "solutions",
-        MetadataQueryResults::Boolean(_) => "boolean",
-        MetadataQueryResults::Graph(_) => "graph",
-    }
-}
-
 fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResults) {
     match results {
         MetadataQueryResults::Solutions(rows) => {
@@ -3343,7 +3345,8 @@ async fn list_local_registry_records(
                 return Ok(records);
             }
             span.record("cache_hit", false);
-            let records = fill_visibility_caches(&inner).await?;
+            let fill = fill_visibility_caches(&inner).await?;
+            let records = fill.records;
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
@@ -3401,17 +3404,34 @@ async fn list_local_registry_records_for_group(
                 return Ok(records);
             }
             span.record("cache_hit", false);
-            fill_visibility_caches(&inner).await?;
-            let records = inner
-                .visibility_cache
-                .registry_records_for_group_any(group_id)
-                .map(|(records, _)| records)
-                .unwrap_or_else(|| Arc::new(Vec::new()));
+            let fill = fill_visibility_caches(&inner).await?;
+            let records = if fill.store_accepted {
+                inner
+                    .visibility_cache
+                    .registry_records_for_group_any(group_id)
+                    .map(|(records, _)| records)
+                    .unwrap_or_else(|| registry_records_for_group(&fill.records, group_id))
+            } else {
+                registry_records_for_group(&fill.records, group_id)
+            };
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
             Ok(records)
         }
     }
+}
+
+fn registry_records_for_group(
+    records: &Arc<Vec<MetadataRegistryRecord>>,
+    group_id: GroupId,
+) -> Arc<Vec<MetadataRegistryRecord>> {
+    Arc::new(
+        records
+            .iter()
+            .filter(|record| record.group_id == group_id)
+            .cloned()
+            .collect(),
+    )
 }
 
 // Single-flight background refill; readers keep being served the stale entry
@@ -3449,12 +3469,13 @@ fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
         lifecycle_pages = field::Empty,
         record_count = field::Empty,
         deleted_count = field::Empty,
+        store_accepted = field::Empty,
         elapsed_ms = field::Empty,
     )
 )]
 async fn fill_visibility_caches(
     inner: &Arc<MetadataInner>,
-) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+) -> Result<VisibilityFillResult, MetadataError> {
     let started = Instant::now();
     let span = Span::current();
     let fill_generation = inner.visibility_cache.current_generation();
@@ -3501,13 +3522,17 @@ async fn fill_visibility_caches(
         .collect::<Vec<_>>();
     records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
-    inner.visibility_cache.store_visibility_fill(
+    let store_accepted = inner.visibility_cache.store_visibility_fill(
         records.clone(),
         lifecycle_entries,
         fill_generation,
     );
+    span.record("store_accepted", store_accepted);
     record_elapsed_ms(&span, "elapsed_ms", started);
-    Ok(records)
+    Ok(VisibilityFillResult {
+        records,
+        store_accepted,
+    })
 }
 
 async fn list_deleted_graph_iris(
@@ -3666,8 +3691,8 @@ async fn query_local_graphs(
     record_duration_ms(&span, "craqle_query_ms", query_elapsed);
     match &result {
         Ok(results) => {
-            query_span.record("result", metadata_query_result_kind(results));
-            span.record("result", metadata_query_result_kind(results));
+            query_span.record("result", results.kind());
+            span.record("result", results.kind());
             record_metadata_query_result_counts(&query_span, results);
             record_metadata_query_result_counts(&span, results);
         }
@@ -3973,6 +3998,12 @@ struct GraphVisibilityScope {
     records: Arc<Vec<MetadataRegistryRecord>>,
     auth_realm: Option<RealmId>,
     readable_groups: HashSet<GroupId>,
+    lifecycle_visibility: LifecycleVisibility,
+}
+
+enum LifecycleVisibility {
+    Cache,
+    FreshDeletedGraphs(HashSet<String>),
 }
 
 impl GraphVisibilityScope {
@@ -3985,11 +4016,25 @@ impl GraphVisibilityScope {
         visibility_cache: &MetadataVisibilityCache,
         record: &MetadataRegistryRecord,
     ) -> bool {
-        if matches!(
-            visibility_cache.lifecycle_deleted_any(&record.graph_iri),
-            Some((true, _))
-        ) {
-            return false;
+        match &self.lifecycle_visibility {
+            LifecycleVisibility::Cache => {
+                if matches!(
+                    visibility_cache.lifecycle_deleted_any(&record.graph_iri),
+                    Some((true, _))
+                ) {
+                    return false;
+                }
+            }
+            LifecycleVisibility::FreshDeletedGraphs(deleted_graphs) => {
+                if deleted_graphs.contains(&record.graph_iri)
+                    || matches!(
+                        visibility_cache.lifecycle_deleted_any(&record.graph_iri),
+                        Some((true, _))
+                    )
+                {
+                    return false;
+                }
+            }
         }
         record.public
             || (self.auth_realm == Some(record.realm_id)
@@ -4027,7 +4072,12 @@ async fn resolve_graph_visibility_scope(
     auth_context: Option<AuthContext>,
     records: Arc<Vec<MetadataRegistryRecord>>,
 ) -> Result<GraphVisibilityScope, MetadataError> {
-    refresh_lifecycle_visibility_for_records(inner, &records).await?;
+    let lifecycle_refresh = refresh_lifecycle_visibility_for_records(inner, &records).await?;
+    let lifecycle_visibility = if lifecycle_refresh.store_accepted {
+        LifecycleVisibility::Cache
+    } else {
+        LifecycleVisibility::FreshDeletedGraphs(lifecycle_refresh.deleted_graphs)
+    };
     let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
     let mut readable_groups = HashSet::new();
     if let Some(auth_context) = auth_context {
@@ -4064,16 +4114,17 @@ async fn resolve_graph_visibility_scope(
         records,
         auth_realm,
         readable_groups,
+        lifecycle_visibility,
     })
 }
 
 async fn refresh_lifecycle_visibility_for_records(
     inner: &Arc<MetadataInner>,
     records: &[MetadataRegistryRecord],
-) -> Result<(), MetadataError> {
+) -> Result<LifecycleVisibilityRefresh, MetadataError> {
     let fill_generation = inner.visibility_cache.current_generation();
     let (deleted_graphs, _) = list_deleted_graph_iris(inner).await?;
-    inner.visibility_cache.refresh_lifecycle_deleted_if_current(
+    let store_accepted = inner.visibility_cache.refresh_lifecycle_deleted_if_current(
         records.iter().map(|record| {
             (
                 record.graph_iri.clone(),
@@ -4082,7 +4133,10 @@ async fn refresh_lifecycle_visibility_for_records(
         }),
         fill_generation,
     );
-    Ok(())
+    Ok(LifecycleVisibilityRefresh {
+        deleted_graphs,
+        store_accepted,
+    })
 }
 
 #[tracing::instrument(
@@ -4805,6 +4859,26 @@ mod tests {
     }
 
     #[test]
+    fn rejected_cold_group_fill_filters_fresh_records_for_requested_group() {
+        let group_a = Ulid::new();
+        let group_b = Ulid::new();
+        let mut record_a = registry_record("datasets/a");
+        record_a.group_id = group_a;
+        let mut record_b = registry_record("datasets/b");
+        record_b.group_id = group_b;
+        let cache = MetadataVisibilityCache::new();
+        let fill_generation = cache.current_generation();
+        let fresh_records = Arc::new(vec![record_a.clone(), record_b]);
+
+        cache.advance_generation();
+        assert!(!cache.store_visibility_fill(fresh_records.clone(), Vec::new(), fill_generation));
+        assert!(cache.registry_records_for_group_any(group_a).is_none());
+
+        let listed = registry_records_for_group(&fresh_records, group_a);
+        assert_eq!(listed.as_ref(), &vec![record_a]);
+    }
+
+    #[test]
     fn expired_lifecycle_entry_is_served_stale_not_dropped() {
         let cache = MetadataVisibilityCache::new();
         cache.store_lifecycle_deleted("urn:graph:a".to_string(), true);
@@ -4865,6 +4939,7 @@ mod tests {
             records: Arc::new(records.clone()),
             auth_realm: None,
             readable_groups: HashSet::new(),
+            lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
         assert!(!anonymous.graph_visible(&cache, &private_record.graph_iri));
@@ -4877,6 +4952,7 @@ mod tests {
             records: Arc::new(records.clone()),
             auth_realm: Some(realm),
             readable_groups: HashSet::from([private_record.group_id]),
+            lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(member.graph_visible(&cache, &public_record.graph_iri));
         assert!(member.graph_visible(&cache, &private_record.graph_iri));
@@ -4886,9 +4962,27 @@ mod tests {
             records: Arc::new(records),
             auth_realm: Some(RealmId([8u8; 32])),
             readable_groups: HashSet::from([private_record.group_id]),
+            lifecycle_visibility: LifecycleVisibility::Cache,
         };
         assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
         assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
+    }
+
+    #[test]
+    fn rejected_lifecycle_refresh_uses_fresh_tombstone_snapshot() {
+        let deleted_record = registry_record("datasets/deleted-race");
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), false);
+        let scope = GraphVisibilityScope {
+            records: Arc::new(vec![deleted_record.clone()]),
+            auth_realm: None,
+            readable_groups: HashSet::new(),
+            lifecycle_visibility: LifecycleVisibility::FreshDeletedGraphs(HashSet::from([
+                deleted_record.graph_iri.clone(),
+            ])),
+        };
+
+        assert!(!scope.graph_visible(&cache, &deleted_record.graph_iri));
     }
 
     #[test]

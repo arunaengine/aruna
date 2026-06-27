@@ -22,6 +22,7 @@ byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
 fjall = { workspace = true }
+futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
@@ -31,6 +32,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
+spargebra = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

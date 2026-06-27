@@ -1,8 +1,10 @@
+pub mod api;
 mod handle;
 pub mod materialization_queue;
 pub mod projector;
 mod protocol;
 pub mod prune_queue;
+mod queue_storage;
 pub mod repository;
 
 use std::sync::Arc;
