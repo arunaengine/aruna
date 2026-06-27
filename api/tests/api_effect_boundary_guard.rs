@@ -6,10 +6,41 @@ const SCAN_DIRS: &[&str] = &["src/routes", "src/s3"];
 const PATTERNS: &[&str] = &[
     "send_effect",
     "send_storage_effect",
+    "send_metadata_effect",
+    "Effect::Storage",
+    "Effect::Metadata",
+    "Effect::Net",
+    "Effect::Task",
     "StorageEffect::",
     "MetadataEffect::",
     "TaskEffect::",
     "NetEffect::",
+    "StorageEvent::",
+    "MetadataEvent::",
+    "use aruna_core::effects",
+    "use aruna_core::events",
+    "use aruna_core::handle::Handle",
+    ".storage_handle",
+    ".metadata_handle",
+    ".task_handle",
+    ".net_handle",
+    "visible_registry::",
+    "project_metadata_create_events_from_log",
+    "materialize_snapshot",
+    "materialize_reference",
+    "list_cached_registry_records_for_group",
+    "is_metadata_record_materialized_for_graph_read",
+    "export_rocrate_jsonld",
+    "export_rocrate_summary_jsonld",
+    "export_rocrate_page",
+    "run_metadata_fanout",
+    "run_query_distributed",
+    "run_search_distributed",
+    "query_authorized_local",
+    "search_authorized_local",
+    "request_remote_query_graphs",
+    "request_remote_search_graphs",
+    "tokio::spawn",
 ];
 
 const ALLOWLIST: &[(&str, usize, &str, &str)] = &[];
@@ -107,7 +138,9 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
             let patterns = PATTERNS
                 .iter()
                 .copied()
-                .filter(|pattern| line.contains(pattern))
+                .filter(|pattern| {
+                    pattern_applies(pattern, &relative_path) && line.contains(pattern)
+                })
                 .collect::<Vec<_>>();
 
             if !patterns.is_empty() {
@@ -144,6 +177,13 @@ fn scan_file(manifest_dir: &Path, path: &Path) -> Vec<GuardMatch> {
     }
 
     matches
+}
+
+fn pattern_applies(pattern: &str, relative_path: &str) -> bool {
+    // The D1 spawn rule targets domain background obligations owned by routes or
+    // S3 handlers. The S3 listener's connection tasks are infrastructure glue,
+    // so direct-effect tokens still scan there but tokio::spawn does not.
+    !(pattern == "tokio::spawn" && relative_path == "src/s3/s3_server.rs")
 }
 
 fn is_module_declaration(line: &str) -> bool {

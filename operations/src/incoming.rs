@@ -250,7 +250,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         error!(
                                             peer = %node_id,
                                             stream_id = %stream_id,
-                                            "Unsupported inbound bao payload; legacy raw bao replication is no longer supported"
+                                            "Unsupported inbound bao payload"
                                         );
                                         let close_event = blob_handle
                                             .send_blob_effect(BlobEffect::CloseConnection { stream_id })
