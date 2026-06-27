@@ -9,6 +9,7 @@ use aruna_operations::get_realm_description::{
     GetRealmDescriptionError, GetRealmDescriptionOperation,
 };
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::status::load_node_observability_status;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -414,54 +415,54 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
     )
 )]
 pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<InfoResponse>) {
-    let (network, my_addresses, connections, warnings) = match &state.get_ctx().net_handle {
-        Some(net) => {
-            let info = net.get_status().await;
-            (
-                NetworkServiceStatus {
-                    status: ServiceStatus::Available,
-                    discovery: info.discovery_methods,
-                    relay: Some(info.relay_method),
-                    relay_urls: info.relay_urls,
-                    routing_table_size: info.routing_table_size,
-                    requests: RequestSummary::from_state(&info.requests),
-                },
-                info.endpoint_addr
-                    .addrs
-                    .iter()
-                    .map(transport_addr_to_string)
-                    .collect(),
-                info.connections
-                    .iter()
-                    .map(|peer| PeerConnectionInfo {
-                        peer_id: peer.node_id.to_string(),
-                        status: PeerStatus::from(peer.status),
-                        active_addresses: peer
-                            .active_addresses
-                            .iter()
-                            .map(|address| ConnectionAddressInfo {
-                                status: AddressStatus::from(address.status),
-                                address: address.address.clone(),
-                                rtt_ms: address.rtt_ms,
-                                protocol_connections: address
-                                    .protocol_connections
-                                    .iter()
-                                    .map(|connection| ProtocolConnectionInfo {
-                                        connection_id: connection.connection_id,
-                                        protocol: protocol_name(connection.alpn),
-                                        side: side_name(connection.side),
-                                        status: ProtocolConnectionStatus::Open,
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                        last_error: peer.last_error.clone(),
-                        next_retry_secs: peer.next_retry_in_secs,
-                    })
-                    .collect(),
-                info.warnings,
-            )
-        }
+    let ctx = state.get_ctx();
+    let observability = load_node_observability_status(ctx.as_ref()).await;
+
+    let (network, my_addresses, connections, warnings) = match observability.network {
+        Some(info) => (
+            NetworkServiceStatus {
+                status: ServiceStatus::Available,
+                discovery: info.discovery_methods,
+                relay: Some(info.relay_method),
+                relay_urls: info.relay_urls,
+                routing_table_size: info.routing_table_size,
+                requests: RequestSummary::from_state(&info.requests),
+            },
+            info.endpoint_addr
+                .addrs
+                .iter()
+                .map(transport_addr_to_string)
+                .collect(),
+            info.connections
+                .iter()
+                .map(|peer| PeerConnectionInfo {
+                    peer_id: peer.node_id.to_string(),
+                    status: PeerStatus::from(peer.status),
+                    active_addresses: peer
+                        .active_addresses
+                        .iter()
+                        .map(|address| ConnectionAddressInfo {
+                            status: AddressStatus::from(address.status),
+                            address: address.address.clone(),
+                            rtt_ms: address.rtt_ms,
+                            protocol_connections: address
+                                .protocol_connections
+                                .iter()
+                                .map(|connection| ProtocolConnectionInfo {
+                                    connection_id: connection.connection_id,
+                                    protocol: protocol_name(connection.alpn),
+                                    side: side_name(connection.side),
+                                    status: ProtocolConnectionStatus::Open,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    last_error: peer.last_error.clone(),
+                    next_retry_secs: peer.next_retry_in_secs,
+                })
+                .collect(),
+            info.warnings,
+        ),
         None => (
             NetworkServiceStatus {
                 status: ServiceStatus::Unavailable,
@@ -477,21 +478,18 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
         ),
     };
 
-    let blob = match &state.get_ctx().blob_handle {
-        Some(blob) => {
-            let info = blob.get_status().await;
-            BlobServiceStatus {
-                status: ServiceStatus::from(info.status),
-                backend: Some(info.backend_type.to_string()),
-                max_bucket_size: info.max_bucket_size,
-                multipart_bucket: info.multipart_bucket,
-                timeouts_secs: Some(TimeoutConfigSecs {
-                    connect: info.timeouts.control_plane_connect_timeout.as_secs(),
-                    io: info.timeouts.control_plane_io_timeout.as_secs(),
-                    transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
-                }),
-            }
-        }
+    let blob = match observability.blob {
+        Some(info) => BlobServiceStatus {
+            status: ServiceStatus::from(info.status),
+            backend: Some(info.backend_type.to_string()),
+            max_bucket_size: info.max_bucket_size,
+            multipart_bucket: info.multipart_bucket,
+            timeouts_secs: Some(TimeoutConfigSecs {
+                connect: info.timeouts.control_plane_connect_timeout.as_secs(),
+                io: info.timeouts.control_plane_io_timeout.as_secs(),
+                transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
+            }),
+        },
         None => BlobServiceStatus {
             status: ServiceStatus::NotConfigured,
             backend: None,
@@ -503,18 +501,9 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
 
     let interfaces = interface_services_status(&state).await;
 
-    let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
     let database = DatabaseServiceStatus {
-        status: if storage_metrics.channel_closed {
-            ServiceStatus::Unavailable
-        } else {
-            ServiceStatus::Available
-        },
-        requests: RequestSummary::from_counts(
-            storage_metrics.requests_total,
-            storage_metrics.failed_total,
-            storage_metrics.last_error,
-        ),
+        status: ServiceStatus::from(observability.database.status),
+        requests: RequestSummary::from_state(&observability.database.requests),
     };
 
     (

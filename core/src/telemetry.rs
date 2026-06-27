@@ -14,6 +14,12 @@ use tracing::{Span, info};
 
 /// Default flush interval for latency summaries.
 pub const LATENCY_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+/// Default maximum distinct non-overflow latency keys per flush window.
+pub const DEFAULT_LATENCY_MAX_KEYS: usize = 1_024;
+/// Default maximum latency key length in bytes.
+pub const DEFAULT_LATENCY_MAX_KEY_LEN: usize = 256;
+/// Default bucket for latency observations whose original key is not retained.
+pub const DEFAULT_LATENCY_OVERFLOW_KEY: &str = "__overflow__";
 /// Default tick interval for queue lag gauges.
 pub const QUEUE_LAG_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -155,6 +161,30 @@ pub struct LatencySummary {
     pub window_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct LatencyAggregatorOptions {
+    pub interval: Duration,
+    /// Maximum distinct non-overflow keys retained in one flush window. Extra
+    /// new keys are aggregated under `overflow_key`, so total buckets are
+    /// bounded by `max_keys + 1`.
+    pub max_keys: usize,
+    /// Maximum key length in bytes before the observation is redirected to the
+    /// overflow bucket.
+    pub max_key_len: usize,
+    pub overflow_key: String,
+}
+
+impl Default for LatencyAggregatorOptions {
+    fn default() -> Self {
+        Self {
+            interval: LATENCY_SUMMARY_INTERVAL,
+            max_keys: DEFAULT_LATENCY_MAX_KEYS,
+            max_key_len: DEFAULT_LATENCY_MAX_KEY_LEN,
+            overflow_key: DEFAULT_LATENCY_OVERFLOW_KEY.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct LatencyEntry {
     total: LatencyHistogram,
@@ -174,7 +204,7 @@ struct AggregatorInner {
 #[derive(Debug)]
 pub struct LatencyAggregator {
     scope: &'static str,
-    interval: Duration,
+    options: LatencyAggregatorOptions,
     inner: Mutex<AggregatorInner>,
 }
 
@@ -184,9 +214,19 @@ impl LatencyAggregator {
     }
 
     pub fn with_interval(scope: &'static str, interval: Duration) -> Self {
+        Self::with_options(
+            scope,
+            LatencyAggregatorOptions {
+                interval,
+                ..LatencyAggregatorOptions::default()
+            },
+        )
+    }
+
+    pub fn with_options(scope: &'static str, options: LatencyAggregatorOptions) -> Self {
         Self {
             scope,
-            interval,
+            options,
             inner: Mutex::new(AggregatorInner::default()),
         }
     }
@@ -208,16 +248,17 @@ impl LatencyAggregator {
             let mut inner = self.inner.lock().unwrap_or_else(|lock| lock.into_inner());
             let now = Instant::now();
             let window_started = *inner.window_started.get_or_insert(now);
-            let entry = match inner.entries.get_mut(key) {
+            let key = self.bucket_key(&inner, key);
+            let entry = match inner.entries.get_mut(key.as_ref()) {
                 Some(entry) => entry,
-                None => inner.entries.entry(key.to_string()).or_default(),
+                None => inner.entries.entry(key.into_owned()).or_default(),
             };
             entry.total.record(total);
             if let Some((wait, service)) = split {
                 entry.wait.record(wait);
                 entry.service.record(service);
             }
-            if now.duration_since(window_started) >= self.interval {
+            if now.duration_since(window_started) >= self.options.interval {
                 Some(Self::drain_locked(&mut inner, now))
             } else {
                 None
@@ -225,6 +266,29 @@ impl LatencyAggregator {
         };
         if let Some(summaries) = due {
             self.emit(&summaries);
+        }
+    }
+
+    fn bucket_key<'a>(
+        &'a self,
+        inner: &AggregatorInner,
+        key: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        if key.len() > self.options.max_key_len {
+            return std::borrow::Cow::Borrowed(self.options.overflow_key.as_str());
+        }
+        if inner.entries.contains_key(key) || key == self.options.overflow_key {
+            return std::borrow::Cow::Borrowed(key);
+        }
+        let retained_keys = inner
+            .entries
+            .keys()
+            .filter(|existing| existing.as_str() != self.options.overflow_key)
+            .count();
+        if retained_keys >= self.options.max_keys {
+            std::borrow::Cow::Borrowed(self.options.overflow_key.as_str())
+        } else {
+            std::borrow::Cow::Borrowed(key)
         }
     }
 
@@ -428,6 +492,22 @@ pub async fn time_stage<F: Future>(name: &'static str, future: F) -> F::Output {
 mod tests {
     use super::*;
 
+    fn bounded_options(max_keys: usize, max_key_len: usize) -> LatencyAggregatorOptions {
+        LatencyAggregatorOptions {
+            interval: LATENCY_SUMMARY_INTERVAL,
+            max_keys,
+            max_key_len,
+            overflow_key: "overflow".to_string(),
+        }
+    }
+
+    fn summary<'a>(summaries: &'a [LatencySummary], key: &str) -> &'a LatencySummary {
+        summaries
+            .iter()
+            .find(|summary| summary.key == key)
+            .unwrap_or_else(|| panic!("missing {key} summary: {summaries:?}"))
+    }
+
     #[test]
     fn duration_ms_saturates_at_u64_max() {
         assert_eq!(duration_ms(Duration::from_millis(42)), 42);
@@ -504,6 +584,65 @@ mod tests {
         assert_eq!(split.wait_max_ms, 40.0);
         assert_eq!(split.service_max_ms, 2.0);
         assert_eq!(summaries[0].max_ms, 42.0);
+    }
+
+    #[test]
+    fn aggregator_limits_key_cardinality() {
+        let aggregator = LatencyAggregator::with_options("test", bounded_options(2, 64));
+        aggregator.record("route_a", Duration::from_millis(5));
+        aggregator.record("route_b", Duration::from_millis(10));
+        aggregator.record("route_c", Duration::from_millis(15));
+        aggregator.record("route_a", Duration::from_millis(20));
+
+        let summaries = aggregator.flush();
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summary(&summaries, "route_a").count, 2);
+        assert_eq!(summary(&summaries, "route_b").count, 1);
+        assert_eq!(summary(&summaries, "overflow").count, 1);
+        assert!(summaries.iter().all(|summary| summary.key != "route_c"));
+    }
+
+    #[test]
+    fn aggregator_limits_key_length() {
+        let aggregator = LatencyAggregator::with_options("test", bounded_options(10, 4));
+        aggregator.record("ok", Duration::from_millis(5));
+        aggregator.record("too-long", Duration::from_millis(10));
+
+        let summaries = aggregator.flush();
+        assert_eq!(summary(&summaries, "ok").count, 1);
+        assert_eq!(summary(&summaries, "overflow").count, 1);
+        assert!(summaries.iter().all(|summary| summary.key != "too-long"));
+    }
+
+    #[test]
+    fn aggregator_overflow_preserves_split_latency() {
+        let aggregator = LatencyAggregator::with_options("test", bounded_options(0, 64));
+        aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
+
+        let summaries = aggregator.flush();
+        let overflow = summary(&summaries, "overflow");
+        let split = overflow.split.as_ref().expect("split summary");
+        assert_eq!(overflow.count, 1);
+        assert_eq!(overflow.max_ms, 42.0);
+        assert_eq!(split.wait_max_ms, 40.0);
+        assert_eq!(split.service_max_ms, 2.0);
+    }
+
+    #[test]
+    fn aggregator_flush_resets_cardinality_window() {
+        let aggregator = LatencyAggregator::with_options("test", bounded_options(1, 64));
+        aggregator.record("route_a", Duration::from_millis(5));
+        aggregator.record("route_b", Duration::from_millis(10));
+
+        let first_window = aggregator.flush();
+        assert_eq!(summary(&first_window, "route_a").count, 1);
+        assert_eq!(summary(&first_window, "overflow").count, 1);
+        assert!(first_window.iter().all(|summary| summary.key != "route_b"));
+
+        aggregator.record("route_b", Duration::from_millis(15));
+        let second_window = aggregator.flush();
+        assert_eq!(second_window.len(), 1);
+        assert_eq!(summary(&second_window, "route_b").count, 1);
     }
 
     #[test]
