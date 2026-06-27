@@ -742,6 +742,16 @@ impl NetHandle {
             .allow_document_sync_peers(targets, peers)
     }
 
+    pub fn ensure_document_sync_topics(
+        &self,
+        targets: &[DocumentSyncTarget],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .ensure_document_sync_topics(targets, peers)
+    }
+
     pub async fn handle_document_sync_stream(
         &self,
         stream: streams::BiStream,

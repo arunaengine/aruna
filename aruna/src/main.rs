@@ -209,7 +209,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         target_node_id: config.node_id,
                         target_node_kind: RealmNodeKind::Management,
-                        bootstrap_peers: config.peer_nodes.clone(),
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
                         create_if_missing: true,

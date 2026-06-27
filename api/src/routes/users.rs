@@ -422,6 +422,7 @@ async fn register_admin(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: secret_hash.clone(),
+            node_id: user_id.to_string(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),

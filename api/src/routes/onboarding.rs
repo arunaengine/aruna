@@ -1,21 +1,18 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingSecret, OnboardingSecretRecord,
-    bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    OnboardingSecretState, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, DEFAULT_METADATA_REPLICATION_FACTOR, Permission, RealmNodeKind,
+use aruna_core::structs::{AuthContext, NodeCapabilities, Permission};
+use aruna_operations::bootstrap_onboarding_finalize::{
+    BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
+    bootstrap_onboarding_finalize,
 };
-use aruna_core::types::UserId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::consume_onboarding_secret::{
-    ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-};
+use aruna_operations::consume_onboarding_secret::ConsumeOnboardingSecretError;
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
@@ -23,17 +20,12 @@ use aruna_operations::delete_onboarding_secret::{
     DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::ensure_realm_config::{
-    EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
-};
+use aruna_operations::ensure_realm_config::EnsureRealmConfigError;
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
-use aruna_operations::replicate_documents::{
-    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
-};
+use aruna_operations::reserve_onboarding_secret::ReserveOnboardingSecretError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -47,12 +39,10 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::Rng;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
-const REALM_NODE_UPDATE_RETRIES: usize = 5;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -177,10 +167,12 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     for secret in secrets {
-        if secret.expires_at < now {
+        if secret.record.expires_at < now
+            && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
+        {
             drive(
                 DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput {
-                    enrollment_id: secret.enrollment_id,
+                    enrollment_id: secret.record.enrollment_id,
                 }),
                 &state.get_ctx(),
             )
@@ -275,14 +267,14 @@ pub async fn list_onboarding_secrets(
     let mut secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    secrets.sort_by_key(|record| record.expires_at);
+    secrets.sort_by_key(|entry| entry.record.expires_at);
 
     Ok((
         StatusCode::OK,
         Json(ListOnboardingSecretsResponse {
             secrets: secrets
                 .into_iter()
-                .map(OnboardingSecretSummary::from)
+                .map(|entry| OnboardingSecretSummary::from(entry.record))
                 .collect(),
         }),
     ))
@@ -348,6 +340,7 @@ pub async fn bootstrap_onboarding(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
+            node_id: request.node_id.clone(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),
@@ -366,77 +359,9 @@ pub async fn bootstrap_onboarding(
         OnboardingMode::Management | OnboardingMode::Local => {}
     }
 
-    let record = drive(
-        ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
-            enrollment_id: onboarding_secret.enrollment_id,
-            secret_hash: onboarding_secret.secret_hash(),
-            node_id: node_id.to_string(),
-            now: now_timestamp(),
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_consume_error)?;
-
     let bootstrap_endpoint = state
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
-    ensure_realm_node(&state, node_id, record.mode).await?;
-    let ctx = state.get_ctx();
-    let net_handle = ctx
-        .net_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
-    net_handle
-        .reload_realm_peers()
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let replication_ctx = ctx.clone();
-    let realm_id = state.get_realm_id();
-    let local_node_id = state.get_node_id();
-    tokio::spawn(async move {
-        if let Err(error) = drive(
-            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-                realm_id,
-                local_node_id,
-                excluded_peers: vec![node_id],
-                documents: vec![DocumentSyncTarget::RealmConfig { realm_id }],
-            }),
-            replication_ctx.as_ref(),
-        )
-        .await
-        {
-            warn!(error = ?error, "Failed to queue realm config replication during onboarding");
-        }
-    });
-
-    let placement_ctx = ctx.clone();
-    let realm_id = state.get_realm_id();
-    let local_node_id = state.get_node_id();
-    tokio::spawn(async move {
-        if let Err(error) = drive(
-            ProcessPlacementsOperation::new(PlacementConfig {
-                realm_id,
-                local_node_id,
-            }),
-            placement_ctx.as_ref(),
-        )
-        .await
-        {
-            warn!(error = ?error, "Failed to process pending topic placements during onboarding");
-        }
-    });
-
-    let onboarding_sync_ticket = state
-        .issue_onboarding_sync_ticket(node_id)
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    net_handle
-        .allow_document_sync_peers(&onboarding_sync_ticket.payload.documents, vec![node_id])
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    let onboarding_sync_ticket = onboarding_sync_ticket
-        .encode()
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
         Some(wrap_realm_private_key(
             &state,
@@ -448,7 +373,42 @@ pub async fn bootstrap_onboarding(
     } else {
         None
     };
-    let response = match record.mode {
+    let delegation_signature = if matches!(record.mode, OnboardingMode::Server) {
+        let issuer_public_key = request
+            .issuer_public_key
+            .as_deref()
+            .ok_or(ServerError::BadRequest)?;
+        Some(
+            state
+                .sign_server_delegation(issuer_public_key)
+                .ok_or(ServerError::Forbidden)?,
+        )
+    } else {
+        None
+    };
+    let realm_signing_key = match state.node_capabilities() {
+        NodeCapabilities::Management {
+            realm_signing_key, ..
+        } => realm_signing_key.clone(),
+        _ => return Err(ServerError::Forbidden),
+    };
+
+    let finalized = bootstrap_onboarding_finalize(
+        BootstrapOnboardingFinalizeInput {
+            enrollment_id: onboarding_secret.enrollment_id,
+            secret_hash: onboarding_secret.secret_hash(),
+            node_id,
+            realm_id: state.get_realm_id(),
+            local_node_id: state.get_node_id(),
+            realm_signing_key,
+            now: now_timestamp(),
+        },
+        state.get_ctx(),
+    )
+    .await
+    .map_err(map_finalize_error)?;
+
+    let response = match finalized.mode {
         OnboardingMode::Management => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Management,
@@ -459,27 +419,18 @@ pub async fn bootstrap_onboarding(
                 .map(|value| value.1.clone()),
             wrapping_public_key: wrapped_management_key.as_ref().map(|value| value.2.clone()),
             delegation_signature: None,
-            onboarding_sync_ticket,
+            onboarding_sync_ticket: finalized.onboarding_sync_ticket,
         },
-        OnboardingMode::Server => {
-            let issuer_public_key = request
-                .issuer_public_key
-                .as_deref()
-                .ok_or(ServerError::BadRequest)?;
-            let delegation_signature = state
-                .sign_server_delegation(issuer_public_key)
-                .ok_or(ServerError::Forbidden)?;
-            BootstrapOnboardingResponse {
-                realm_id: state.get_realm_id().to_string(),
-                mode: OnboardingMode::Server,
-                temporary_bootstrap_endpoint: bootstrap_endpoint,
-                wrapped_realm_private_key: None,
-                wrapped_realm_private_key_nonce: None,
-                wrapping_public_key: None,
-                delegation_signature: Some(delegation_signature),
-                onboarding_sync_ticket,
-            }
-        }
+        OnboardingMode::Server => BootstrapOnboardingResponse {
+            realm_id: state.get_realm_id().to_string(),
+            mode: OnboardingMode::Server,
+            temporary_bootstrap_endpoint: bootstrap_endpoint,
+            wrapped_realm_private_key: None,
+            wrapped_realm_private_key_nonce: None,
+            wrapping_public_key: None,
+            delegation_signature,
+            onboarding_sync_ticket: finalized.onboarding_sync_ticket,
+        },
         OnboardingMode::Local => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Local,
@@ -488,69 +439,11 @@ pub async fn bootstrap_onboarding(
             wrapped_realm_private_key_nonce: None,
             wrapping_public_key: None,
             delegation_signature: None,
-            onboarding_sync_ticket,
+            onboarding_sync_ticket: finalized.onboarding_sync_ticket,
         },
     };
 
     Ok((StatusCode::OK, Json(response)))
-}
-
-async fn ensure_realm_node(
-    state: &Arc<ServerState>,
-    node_id: NodeId,
-    mode: OnboardingMode,
-) -> ServerResult<()> {
-    let mut last_conflict = None;
-    for _ in 0..REALM_NODE_UPDATE_RETRIES {
-        match ensure_realm_node_once(state, node_id, mode).await {
-            Ok(()) => return Ok(()),
-            Err(EnsureRealmConfigError::StorageError(StorageError::TransactionConflict)) => {
-                last_conflict = Some(StorageError::TransactionConflict.to_string());
-                continue;
-            }
-            Err(EnsureRealmConfigError::NodeKindMismatch { .. }) => {
-                return Err(ServerError::BadRequest);
-            }
-            Err(error) => return Err(ServerError::InternalError(error.to_string())),
-        }
-    }
-
-    Err(ServerError::InternalError(last_conflict.unwrap_or_else(
-        || "realm config update conflicted".to_string(),
-    )))
-}
-
-async fn ensure_realm_node_once(
-    state: &Arc<ServerState>,
-    node_id: NodeId,
-    mode: OnboardingMode,
-) -> Result<(), EnsureRealmConfigError> {
-    let realm_id = state.get_realm_id();
-    let kind = match mode {
-        OnboardingMode::Management => RealmNodeKind::Management,
-        OnboardingMode::Server => RealmNodeKind::Server,
-        OnboardingMode::Local => RealmNodeKind::Local,
-    };
-
-    drive(
-        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: UserId::nil(realm_id),
-                realm_id,
-            },
-            target_node_id: node_id,
-            target_node_kind: kind,
-            bootstrap_peers: Vec::new(),
-            default_metadata_replication_factor: DEFAULT_METADATA_REPLICATION_FACTOR,
-            create_if_missing: false,
-            reject_kind_mismatch: true,
-        }),
-        &state.get_ctx(),
-    )
-    .await?;
-
-    Ok(())
 }
 
 fn now_timestamp() -> u64 {
@@ -563,6 +456,22 @@ fn map_consume_error(error: ConsumeOnboardingSecretError) -> ServerError {
         | ConsumeOnboardingSecretError::Expired
         | ConsumeOnboardingSecretError::AlreadyClaimed
         | ConsumeOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
+    match error {
+        BootstrapOnboardingFinalizeError::Reserve(
+            ReserveOnboardingSecretError::NotFound
+            | ReserveOnboardingSecretError::Expired
+            | ReserveOnboardingSecretError::AlreadyClaimed
+            | ReserveOnboardingSecretError::InvalidSecret,
+        ) => ServerError::Unauthorized,
+        BootstrapOnboardingFinalizeError::Consume(error) => map_consume_error(error),
+        BootstrapOnboardingFinalizeError::EnsureRealmConfig(
+            EnsureRealmConfigError::NodeKindMismatch { .. },
+        ) => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -675,17 +584,13 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::AdminDocumentTarget;
-    use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect, DocumentSyncNetEvent,
-        DocumentSyncPublish, DocumentSyncRevision,
-    };
-    use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-    use aruna_core::events::{Event, NetEvent, StorageEvent};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
-        bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+        OnboardingSecretRecord, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
     use aruna_core::storage_entries::admin_document_reducer_state_key;
     use aruna_core::structs::{
@@ -695,8 +600,15 @@ mod tests {
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
+    use aruna_operations::create_onboarding_secret::{
+        CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+    };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
+    use aruna_operations::reserve_onboarding_secret::{
+        ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
+    };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Extension;
@@ -787,68 +699,7 @@ mod tests {
             .await,
         );
 
-        seed_onboarding_document_topics(&state, node_id).await;
-
         (state, realm_id, node_id, user_id, net_handle, tempdir)
-    }
-
-    async fn seed_onboarding_document_topics(state: &Arc<ServerState>, node_id: iroh::PublicKey) {
-        let ctx = state.get_ctx();
-        let ticket = state.issue_onboarding_sync_ticket(node_id).await.unwrap();
-        let mut documents = Vec::with_capacity(ticket.payload.documents.len());
-
-        for (index, target) in ticket.payload.documents.into_iter().enumerate() {
-            let bytes = match ctx
-                .storage_handle
-                .send_effect(Effect::Storage(StorageEffect::Read {
-                    key_space: target.storage_keyspace().to_string(),
-                    key: target.storage_key(),
-                    txn_id: None,
-                }))
-                .await
-            {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(bytes), ..
-                }) => bytes.to_vec(),
-                other => {
-                    panic!("unexpected document read result while seeding sync topic: {other:?}")
-                }
-            };
-            let event_id = Ulid::from_parts(1_727_000_000_000, index as u128 + 1);
-            documents.push(DocumentSyncPublish::Upsert {
-                event_id,
-                target,
-                bytes,
-                change: DocumentSyncChange {
-                    base: None,
-                    current: DocumentSyncRevision {
-                        generation: 1,
-                        event_id,
-                        actor: state.get_node_id(),
-                        updated_at_ms: 1_727_000_000_000 + index as u64,
-                    },
-                    kind: DocumentSyncChangeKind::Upsert,
-                },
-            });
-        }
-
-        let event = ctx
-            .net_handle
-            .as_ref()
-            .unwrap()
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::PublishDocuments {
-                    documents,
-                    peers: Vec::new(),
-                },
-            )))
-            .await;
-        match event {
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
-                ..
-            })) => {}
-            other => panic!("unexpected document sync publish result: {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -1008,6 +859,78 @@ mod tests {
         .await
         .unwrap();
         assert!(listed.secrets.is_empty());
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_prunes_expired_available_but_keeps_expired_finalizing_secret() {
+        let (state, realm_id, _node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let finalizing_id = Ulid::new();
+        drive(
+            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id: finalizing_id,
+                    secret_hash: "finalizing".to_string(),
+                    mode: OnboardingMode::Server,
+                    expires_at: 1,
+                    claimed_node_id: None,
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        drive(
+            ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
+                enrollment_id: finalizing_id,
+                secret_hash: "finalizing".to_string(),
+                node_id: "node-a".to_string(),
+                now: 1,
+                reservation_expires_at: 2,
+                finalizing: true,
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let stale_id = Ulid::new();
+        drive(
+            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id: stale_id,
+                    secret_hash: "stale".to_string(),
+                    mode: OnboardingMode::Local,
+                    expires_at: 1,
+                    claimed_node_id: None,
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(listed)) =
+            list_onboarding_secrets(State(state.clone()), Extension(Some(auth)))
+                .await
+                .unwrap();
+        assert_eq!(listed.secrets.len(), 1);
+        assert_eq!(listed.secrets[0].enrollment_id, finalizing_id.to_string());
+        assert_eq!(listed.secrets[0].claimed_node_id.as_deref(), Some("node-a"));
+
+        let entries = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record.enrollment_id, finalizing_id);
 
         net_handle.shutdown().await;
     }

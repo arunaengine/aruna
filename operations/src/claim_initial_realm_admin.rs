@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_error_finishes_without_legacy_announcement() {
+    fn scheduling_error_finishes_without_direct_announcement() {
         let realm_id = RealmId::from_bytes([15u8; 32]);
         let actor = actor(realm_id, 16, 17);
         let (auth_doc, _) = auth_doc_and_admin_role(realm_id);

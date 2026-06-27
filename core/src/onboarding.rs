@@ -35,6 +35,31 @@ pub struct OnboardingSecretRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingSecretStateRecord {
+    pub enrollment_id: Ulid,
+    pub state: OnboardingSecretState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnboardingSecretState {
+    Available,
+    Reserved { node_id: String, expires_at: u64 },
+    Finalizing { node_id: String },
+    Consumed { node_id: String },
+}
+
+impl OnboardingSecretState {
+    pub fn claimed_node_id(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Reserved { node_id, .. }
+            | Self::Finalizing { node_id }
+            | Self::Consumed { node_id } => Some(node_id),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapOnboardingRequest {
     pub onboarding_secret: String,
     pub node_id: String,
