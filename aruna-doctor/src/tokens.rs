@@ -1,12 +1,12 @@
 use crate::error::CliError;
 use aruna::config::load;
-use aruna_api::error::TokenError;
 use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use aruna_api::server_state::load_persisted_state;
 use aruna_core::UserId;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
+use aruna_operations::auth::{ArunaBearerTokenValidationState, decode_aruna_bearer_token};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
@@ -23,13 +23,8 @@ use aruna_operations::register_or_get_oidc_user::{
 };
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
-use base64::Engine;
-use ed25519_dalek::VerifyingKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::{Signature, Verifier};
+use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
-use jsonwebtoken::{DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -37,12 +32,6 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
-
-#[derive(Debug, Clone)]
-struct OidcCliConfig {
-    http_socket_addr: SocketAddr,
-    oidc_providers: Vec<OidcProviderConfig>,
-}
 
 fn url_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
@@ -89,13 +78,12 @@ pub async fn create_local_bootstrap_token(
     oidc_scope: String,
     bootstrap_secret: String,
 ) -> Result<String, CliError> {
-    let config = load_oidc_cli_config()?;
-    let aruna_base_url = format!("http://{}", config.http_socket_addr);
-    if config.oidc_providers.is_empty() {
+    if load_oidc_providers_from_env()?.is_empty() {
         return create_direct_local_bootstrap_token(bootstrap_secret).await;
     }
 
     let oidc_token = create_oidc_token(oidc_username, oidc_password, oidc_scope, true).await?;
+    let aruna_base_url = format!("http://{}", load_http_socket_addr()?);
 
     exchange_bootstrap_token(
         &Client::new(),
@@ -118,10 +106,12 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let user_id = UserId::local(Ulid::new(), config.realm_id);
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
+            node_id: user_id.to_string(),
             now,
         }),
         &driver_ctx,
@@ -134,7 +124,6 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
         );
     }
 
-    let user_id = UserId::local(Ulid::new(), config.realm_id);
     drive(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
@@ -199,34 +188,28 @@ pub async fn create_oidc_token(
     scope: String,
     oidc_only: bool,
 ) -> Result<String, CliError> {
-    let config = load_oidc_cli_config()?;
-    let provider = config
-        .oidc_providers
+    let provider = load_oidc_providers_from_env()?
         .into_iter()
         .next()
         .ok_or_else(|| CliError::OidcProviderNotFound("No OIDC configured".to_string()))?;
-    let aruna_base_url = format!("http://{}", config.http_socket_addr);
 
     let client = Client::builder().build()?;
     let oidc_token = request_oidc_token(&client, &provider, &username, &password, &scope).await?;
     if !oidc_only {
+        let aruna_base_url = format!("http://{}", load_http_socket_addr()?);
         exchange_oidc_token(&client, &aruna_base_url, &oidc_token).await
     } else {
         Ok(oidc_token)
     }
 }
 
-fn load_oidc_cli_config() -> Result<OidcCliConfig, CliError> {
+fn load_http_socket_addr() -> Result<SocketAddr, CliError> {
     let _ = dotenvy::dotenv();
-    let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
-
-    Ok(OidcCliConfig {
-        http_socket_addr,
-        oidc_providers: load_oidc_providers_from_env()?,
-    })
+    Ok(SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?)
 }
 
 fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, CliError> {
+    let _ = dotenvy::dotenv();
     let Some(provider_ids) = dotenvy::var("OIDC_PROVIDER_IDS").ok() else {
         return Ok(Vec::new());
     };
@@ -367,10 +350,51 @@ pub enum Valid {
     False { reason: String },
 }
 
-pub async fn view_token(token: String) -> Result<String, CliError> {
-    let hash = bearer_token_hash(&token);
-    let unvalidated_claims = insecure_decode::<TokenClaims>(&token)?;
+#[derive(Debug, Default)]
+struct DoctorTokenValidationState {
+    revoked_token_hashes: HashSet<String, ahash::RandomState>,
+    trusted_realms: HashSet<RealmId, ahash::RandomState>,
+}
 
+impl DoctorTokenValidationState {
+    async fn load(driver_ctx: &DriverContext) -> Self {
+        let revoked_token_hashes = load_persisted_state::<HashSet<String, ahash::RandomState>>(
+            driver_ctx,
+            TOKEN_REVOCATION_LIST_KEY,
+        )
+        .await
+        .unwrap_or_default();
+        let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
+            driver_ctx,
+            TRUSTED_REALMS_LIST_KEY,
+        )
+        .await
+        .unwrap_or_default();
+
+        Self {
+            revoked_token_hashes,
+            trusted_realms,
+        }
+    }
+
+    fn is_token_blacklisted(&self, token: &str) -> bool {
+        self.revoked_token_hashes
+            .contains(&bearer_token_hash(token))
+    }
+}
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for DoctorTokenValidationState {
+    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        self.revoked_token_hashes.contains(token_hash)
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.trusted_realms.contains(realm_id)
+    }
+}
+
+pub async fn view_token(token: String) -> Result<String, CliError> {
     let (config, _) = load().await.unwrap();
     let storage_handle = storage::FjallStorage::open(&config.storage_path).unwrap();
 
@@ -381,111 +405,37 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         metadata_handle: None,
         task_handle: None,
     });
-    let persisted_blacklist = load_persisted_state::<HashSet<String, ahash::RandomState>>(
-        &driver_ctx,
-        TOKEN_REVOCATION_LIST_KEY,
-    )
-    .await
-    .unwrap_or_default();
+    let validation_state = DoctorTokenValidationState::load(driver_ctx.as_ref()).await;
+    let token_view = token_view_from_token(&token, &validation_state).await?;
 
-    let blacklisted = persisted_blacklist.contains(&hash);
+    Ok(serde_json::to_string_pretty(&token_view)?)
+}
 
-    let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
-        &driver_ctx,
-        TRUSTED_REALMS_LIST_KEY,
-    )
-    .await
-    .unwrap_or_default();
-
-    let valid = match validate(unvalidated_claims.claims.clone(), token, trusted_realms).await {
+async fn token_view_from_token(
+    token: &str,
+    validation_state: &DoctorTokenValidationState,
+) -> Result<TokenView, CliError> {
+    let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
+    let valid = match decode_aruna_bearer_token(validation_state, token).await {
         Ok(_) => Valid::True,
         Err(err) => Valid::False {
             reason: err.to_string(),
         },
     };
 
-    let token_view = TokenView {
+    Ok(TokenView {
         claims: unvalidated_claims.claims,
-        is_blacklisted: blacklisted,
+        is_blacklisted: validation_state.is_token_blacklisted(token),
         valid,
-    };
-
-    Ok(serde_json::to_string_pretty(&token_view)?)
-}
-
-async fn validate(
-    claims: TokenClaims,
-    token: String,
-    trusted_realms: HashSet<RealmId, ahash::RandomState>,
-) -> Result<(), TokenError> {
-    let claims = match (claims.issuer_pubkey, claims.delegation_signature.is_some()) {
-        (Some(issuer), true) => {
-            let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(issuer.clone())?
-                .try_into()
-                .map_err(|_| TokenError::InvalidIssuerKey)?;
-            let pub_pem_key = VerifyingKey::from_bytes(&issuer_pubkey)?
-                .to_public_key_pem(LineEnding::default())?;
-            let decoding_key = DecodingKey::from_ed_pem(pub_pem_key.as_bytes())?;
-
-            decode::<TokenClaims>(
-                token,
-                &decoding_key,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-        (_, _) => {
-            let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(claims.iss.clone())?
-                .try_into()
-                .map_err(|_| TokenError::InvalidIssuerKey)?;
-            let pub_pem_key = VerifyingKey::from_bytes(&issuer_pubkey)?
-                .to_public_key_pem(LineEnding::default())?;
-            let decoding_key = DecodingKey::from_ed_pem(pub_pem_key.as_bytes())?;
-
-            decode::<TokenClaims>(
-                token,
-                &decoding_key,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-    };
-
-    let now = chrono::Utc::now().timestamp() as u64;
-    if now > claims.claims.exp {
-        return Err(TokenError::Expired);
-    }
-
-    if !trusted_realms.contains(
-        &RealmId::from_base64(&claims.claims.iss).map_err(|_| TokenError::InvalidIssuerKey)?,
-    ) {
-        return Err(TokenError::RealmNotTrusted);
-    }
-
-    // Check server token claims
-    match (
-        &claims.claims.delegation_signature,
-        &claims.claims.issuer_pubkey,
-    ) {
-        (Some(delegation_token), Some(issuer_pubkey)) => {
-            // Check delegation signature
-            let realm_key =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&claims.claims.iss)?;
-            let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
-            let signature = Signature::from_str(delegation_token)?;
-            realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (_, _) => Err(TokenError::InvalidServerToken),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        create_local_bootstrap_token, create_oidc_token, load_oidc_providers_from_env,
-        oidc_password_grant_body, request_oidc_token,
+        DoctorTokenValidationState, Valid, create_local_bootstrap_token, create_oidc_token,
+        load_oidc_providers_from_env, oidc_password_grant_body, request_oidc_token,
+        token_view_from_token,
     };
     use crate::test_support::env_lock;
     use aruna::bootstrap::ensure_initial_local_onboarding_secret;
@@ -494,12 +444,14 @@ mod tests {
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;
     use aruna_core::UserId;
+    use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
     use aruna_core::structs::{
-        Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, TokenClaims, User,
+        Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId, TokenClaims,
+        User,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -519,8 +471,8 @@ mod tests {
     use axum::{Form, Json, Router};
     use base64::Engine;
     use byteview::ByteView;
-    use ed25519_dalek::SigningKey;
     use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, dangerous::insecure_decode};
     use reqwest::Client;
     use serde::{Deserialize, Serialize};
@@ -906,6 +858,44 @@ mod tests {
         insecure_decode::<TokenClaims>(token).unwrap().claims
     }
 
+    fn aruna_token_fixture() -> (SigningKey, RealmId, UserId) {
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        (signing_key, realm_id, user_id)
+    }
+
+    fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_string(),
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        }
+    }
+
+    fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
+        let key_pem = signing_key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .unwrap();
+        jsonwebtoken::encode(
+            &Header::new(Algorithm::EdDSA),
+            claims,
+            &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn public_key_base64(signing_key: &SigningKey) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signing_key.verifying_key().to_bytes())
+    }
+
     async fn assert_regular_token_cannot_manage_onboarding(
         node: &TestNode,
         token: &str,
@@ -934,6 +924,45 @@ mod tests {
             assert!(!body.secrets.is_empty());
         }
         Ok(status)
+    }
+
+    #[tokio::test]
+    async fn revoked_token_view_is_invalid_but_marks_blacklisted() {
+        let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
+        let claims = aruna_token_claims(realm_id, user_id);
+        let token = sign_aruna_token(&realm_signing_key, &claims);
+        let mut state = DoctorTokenValidationState::default();
+        state.trusted_realms.insert(realm_id);
+        state.revoked_token_hashes.insert(bearer_token_hash(&token));
+
+        let view = token_view_from_token(&token, &state).await.unwrap();
+
+        assert_eq!(view.claims.sub, user_id.to_string());
+        assert!(view.is_blacklisted);
+        match view.valid {
+            Valid::False { reason } => assert!(reason.contains("revoked")),
+            Valid::True => panic!("revoked token should be invalid"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_server_token_view_is_valid_for_trusted_realm() {
+        let (realm_signing_key, realm_id, user_id) = aruna_token_fixture();
+        let issuer_signing_key =
+            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let issuer_pubkey = public_key_base64(&issuer_signing_key);
+        let mut claims = aruna_token_claims(realm_id, user_id);
+        claims.issuer_pubkey = Some(issuer_pubkey.clone());
+        claims.delegation_signature =
+            Some(realm_signing_key.sign(issuer_pubkey.as_bytes()).to_string());
+        let token = sign_aruna_token(&issuer_signing_key, &claims);
+        let mut state = DoctorTokenValidationState::default();
+        state.trusted_realms.insert(realm_id);
+
+        let view = token_view_from_token(&token, &state).await.unwrap();
+
+        assert!(!view.is_blacklisted);
+        assert!(matches!(view.valid, Valid::True));
     }
 
     #[tokio::test]

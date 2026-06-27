@@ -16,6 +16,7 @@ aruna-operations = { workspace = true }
 aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }
 aruna-api = { workspace = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }

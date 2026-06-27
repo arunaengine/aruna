@@ -17,15 +17,15 @@ mod tests {
 
     #[test]
     fn bearer_token_hash_matches_existing_blake3_hex() {
-        let token = "bearer-token-for-compatibility";
-        let expected = blake3::hash(b"bearer-token-for-compatibility").to_string();
+        let token = "bearer-token";
+        let expected = blake3::hash(b"bearer-token").to_string();
 
         assert_eq!(bearer_token_hash(token), expected);
     }
 
     #[test]
     fn credential_hash_matches_existing_blake3_hex() {
-        let secret = b"credential-secret-for-compatibility";
+        let secret = b"credential-secret";
 
         assert_eq!(credential_hash(secret), blake3::hash(secret).to_string());
     }
