@@ -72,7 +72,7 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
         let hash = *blake3::hash(&body).as_bytes();
         let hash_hex = hex::encode(hash);
         let object_id = format!(
-            "arn:aruna:{}:{}/ch/{}",
+            "arn:aruna:{}:{}:ch/{}",
             seed.realm_id, joiner.config.node_id, hash_hex
         );
         dbg!(&object_id);

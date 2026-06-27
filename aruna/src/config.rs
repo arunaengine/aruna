@@ -1148,11 +1148,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fjall_persist_policy_env_accepts_sync_all_alias() {
+    async fn fjall_persist_policy_env_accepts_sync_all() {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_FJALL_PERSIST_MODE";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "sync-all") };
+        unsafe { std::env::set_var(key, "sync_all") };
 
         assert_eq!(
             fjall_persist_policy_env().unwrap(),

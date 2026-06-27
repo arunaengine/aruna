@@ -2,14 +2,14 @@ use std::time::Duration;
 
 use crate::alpn::Alpn;
 use crate::document::DocumentSyncEffect;
-use crate::id::NodeId;
+use crate::id::{DhtKeyId, NodeId};
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{BackendLocation, RealmId, ResolvedSourceAccess};
 use crate::task::TaskEffect;
 use crate::types::UserId;
-use crate::types::{DhtKey, Key, KeySpace, TxnId, Value};
+use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
 use ulid::Ulid;
@@ -182,13 +182,13 @@ pub enum NetEffect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DhtEffect {
     Put {
-        key: DhtKey,
+        key: DhtKeyId,
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
     },
     Get {
-        key: DhtKey,
+        key: DhtKeyId,
         realm_filter: Option<RealmId>,
     },
 }

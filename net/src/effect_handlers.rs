@@ -1,7 +1,7 @@
 use aruna_core::effects::{DhtEffect, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{DhtEvent, NetEvent, StreamEvent};
-use aruna_core::id::{DhtKeyId, hex_prefix};
+use aruna_core::id::hex_prefix;
 use tracing::{trace, warn};
 
 use crate::{DhtHandle, DocumentSyncService};
@@ -50,17 +50,16 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
         } => {
             trace!(
                 event = "dht.put.started",
-                key = %hex_prefix(&key),
+                key = %hex_prefix(key.as_bytes()),
                 realm_id = %realm_id,
                 value_len = value.len(),
                 ttl_secs = ttl.as_secs(),
                 "Starting DHT put"
             );
-            let key_id = DhtKeyId::from_bytes(key);
-            match dht.put(&key_id, realm_id, value, ttl).await {
+            match dht.put(&key, realm_id, value, ttl).await {
                 Ok(()) => NetEvent::Dht(DhtEvent::PutComplete { key }),
                 Err(error) => {
-                    warn!(key = %hex_prefix(&key), error = %error, "DHT put failed");
+                    warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT put failed");
                     NetEvent::Dht(DhtEvent::Error {
                         error: DhtError::StoreFailed(error.to_string()),
                     })
@@ -70,15 +69,14 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
         DhtEffect::Get { key, realm_filter } => {
             trace!(
                 event = "dht.get.started",
-                key = %hex_prefix(&key),
+                key = %hex_prefix(key.as_bytes()),
                 realm_id = ?realm_filter,
                 "Starting DHT get"
             );
-            let key_id = DhtKeyId::from_bytes(key);
-            match dht.get(&key_id, realm_filter).await {
+            match dht.get(&key, realm_filter).await {
                 Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
                 Err(error) => {
-                    warn!(key = %hex_prefix(&key), error = %error, "DHT get failed");
+                    warn!(key = %hex_prefix(key.as_bytes()), error = %error, "DHT get failed");
                     NetEvent::Dht(DhtEvent::Error {
                         error: DhtError::Other(error.to_string()),
                     })

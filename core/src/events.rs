@@ -8,9 +8,9 @@ use crate::structs::{
 use crate::{
     document::DocumentSyncNetEvent,
     errors::{AuthorizationError, DhtError, StorageError, StreamError},
-    id::NodeId,
+    id::{DhtKeyId, NodeId},
     task::TaskEvent,
-    types::{DhtKey, Key, KeySpace, TxnId, Value},
+    types::{Key, KeySpace, TxnId, Value},
 };
 use bytes::Bytes;
 use ulid::Ulid;
@@ -154,9 +154,16 @@ pub enum NetEvent {
 
 #[derive(Debug, PartialEq)]
 pub enum DhtEvent {
-    PutComplete { key: DhtKey },
-    GetResult { key: DhtKey, values: Vec<DhtEntry> },
-    Error { error: DhtError },
+    PutComplete {
+        key: DhtKeyId,
+    },
+    GetResult {
+        key: DhtKeyId,
+        values: Vec<DhtEntry>,
+    },
+    Error {
+        error: DhtError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

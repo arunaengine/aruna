@@ -4,11 +4,11 @@ use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
+use aruna_core::id::DhtKeyId;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::DhtKey;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -62,8 +62,8 @@ impl AnnounceRealmPresenceOperation {
         }
     }
 
-    fn presence_key(&self) -> DhtKey {
-        *realm_presence_key(&self.config.realm_id).as_bytes()
+    fn presence_key(&self) -> DhtKeyId {
+        realm_presence_key(&self.config.realm_id)
     }
 
     fn task_key(&self) -> TaskKey {

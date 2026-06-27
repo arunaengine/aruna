@@ -112,8 +112,8 @@ impl std::str::FromStr for FjallPersistPolicy {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "buffer" | "buffered" => Ok(Self::Buffer),
-            "sync_all" | "sync-all" | "syncall" | "sync" => Ok(Self::SyncAll),
+            "buffer" => Ok(Self::Buffer),
+            "sync_all" => Ok(Self::SyncAll),
             other => Err(format!("unsupported fjall persist policy `{other}`")),
         }
     }
@@ -1916,24 +1916,24 @@ mod tests {
     }
 
     #[test]
-    fn persist_policy_accepts_sync_all_aliases() {
-        for value in ["sync_all", "sync-all", "syncall", "sync", "SYNC_ALL"] {
-            assert_eq!(
-                value.parse::<FjallPersistPolicy>().unwrap(),
-                FjallPersistPolicy::SyncAll
-            );
-        }
-        for value in ["buffer", "buffered", "BUFFER"] {
-            assert_eq!(
-                value.parse::<FjallPersistPolicy>().unwrap(),
-                FjallPersistPolicy::Buffer
-            );
-        }
+    fn persist_policy_accepts_canonical_values() {
+        assert_eq!(
+            "sync_all".parse::<FjallPersistPolicy>().unwrap(),
+            FjallPersistPolicy::SyncAll
+        );
+        assert_eq!(
+            "buffer".parse::<FjallPersistPolicy>().unwrap(),
+            FjallPersistPolicy::Buffer
+        );
     }
 
     #[test]
     fn persist_policy_rejects_invalid_values() {
         assert!("always".parse::<FjallPersistPolicy>().is_err());
+        assert!("sync".parse::<FjallPersistPolicy>().is_err());
+        assert!("sync-all".parse::<FjallPersistPolicy>().is_err());
+        assert!("syncall".parse::<FjallPersistPolicy>().is_err());
+        assert!("buffered".parse::<FjallPersistPolicy>().is_err());
     }
 
     #[tokio::test]

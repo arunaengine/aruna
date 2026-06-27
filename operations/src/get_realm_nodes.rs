@@ -70,7 +70,7 @@ impl Operation for GetRealmNodesOperation {
     fn start(&mut self) -> Effects {
         self.state = GetRealmNodesState::ReadDocument;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
-            key: *realm_presence_key(&self.realm_id).as_bytes(),
+            key: realm_presence_key(&self.realm_id),
             realm_filter: Some(self.realm_id),
         }))]
     }

@@ -124,7 +124,7 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let key = [42u8; 32];
+    let key = aruna_core::id::DhtKeyId::from_bytes([42u8; 32]);
     let value = b"replicated-value".to_vec();
 
     let mut put_succeeded = false;
