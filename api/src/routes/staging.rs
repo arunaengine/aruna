@@ -3,19 +3,21 @@ use crate::auth::{
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::s3::replication::spawn_version_replication;
 use crate::server_state::ServerState;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{AuthContext, BucketInfo, Permission};
 use aruna_operations::driver::drive;
+use aruna_operations::replication::queue::{
+    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
+};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::staging::head_source::HeadStagingSourceError;
 use aruna_operations::staging::read_source::ReadStagingSourceError;
 use aruna_operations::staging::reference::{
-    MaterializeReferenceError, MaterializeReferenceInput, materialize_reference,
+    MaterializeReferenceError, MaterializeReferenceInput, stage_reference_blob,
 };
 use aruna_operations::staging::snapshot::{
-    MaterializeSnapshotError, MaterializeSnapshotInput, materialize_snapshot,
+    MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -24,6 +26,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 use std::sync::Arc;
+use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -128,7 +131,7 @@ async fn snapshot_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let result = materialize_snapshot(
+    let result = stage_snapshot_blob(
         &state.get_ctx(),
         MaterializeSnapshotInput {
             group_id,
@@ -144,16 +147,15 @@ async fn snapshot_blob(
     .await
     .map_err(map_snapshot_error)?;
 
-    spawn_version_replication(
-        state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
+    queue_live_version_replication(
+        &state,
         auth,
         request.bucket.clone(),
         request.key.clone(),
         result.version_id,
         false,
-    );
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -191,7 +193,7 @@ async fn reference_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let result = materialize_reference(
+    let result = stage_reference_blob(
         &state.get_ctx(),
         MaterializeReferenceInput {
             group_id,
@@ -340,6 +342,46 @@ fn map_staging_source_error(error: StagingSourceError) -> ServerError {
     }
 }
 
+async fn queue_live_version_replication(
+    state: &ServerState,
+    auth_context: AuthContext,
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    delete_marker: bool,
+) {
+    let result = match drive(
+        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+            local_node_id: state.get_node_id(),
+            auth_context,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            delete_marker,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker,
+                "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
+            );
+            return;
+        }
+    };
+
+    if result.queued > 0 && !result.scheduled {
+        warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+    }
+}
+
 fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
@@ -351,12 +393,18 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, GROUP_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
         RealmAuthorizationDocument,
     };
     use aruna_operations::driver::DriverContext;
+    use aruna_operations::replication::queue::{
+        LiveReplicationObligationRecord, live_replication_obligation_key,
+    };
     use aruna_storage::storage;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -412,6 +460,57 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn staging_queue_failure_after_snapshot_commit_leaves_obligation_repairable() {
+        let test = setup_state().await;
+        let version_id = Ulid::new();
+        write_doc(
+            &test.state.get_ctx(),
+            S3_BUCKET_REPLICATION_KEYSPACE,
+            test.bucket.as_bytes().to_vec().into(),
+            b"not a bucket replication config".to_vec().into(),
+        )
+        .await;
+
+        let obligation = LiveReplicationObligationRecord::new(
+            test.state.get_node_id(),
+            test.auth_with_source_read.clone(),
+            test.bucket.clone(),
+            test.key.clone(),
+            version_id,
+            false,
+        );
+        let obligation_key = live_replication_obligation_key(&obligation).unwrap();
+        write_doc(
+            &test.state.get_ctx(),
+            BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+            obligation_key.as_ref().to_vec().into(),
+            postcard::to_allocvec(&obligation).unwrap().into(),
+        )
+        .await;
+
+        queue_live_version_replication(
+            &test.state,
+            test.auth_with_source_read,
+            test.bucket,
+            test.key,
+            version_id,
+            false,
+        )
+        .await;
+
+        assert!(
+            read_doc(
+                &test.state.get_ctx(),
+                BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                obligation_key.as_ref().to_vec().into(),
+            )
+            .await
+            .is_some(),
+            "durable obligation should remain repairable when staging queue kick fails"
+        );
     }
 
     #[test]
@@ -604,5 +703,25 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    async fn read_doc(
+        driver_ctx: &Arc<DriverContext>,
+        key_space: &str,
+        key: byteview::ByteView,
+    ) -> Option<byteview::ByteView> {
+        let event = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("unexpected storage event")
+        };
+
+        value
     }
 }

@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
+use crate::replication::queue::write_live_replication_obligation_effect;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -10,8 +11,8 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId, VersionKey,
-    VersionSourceBinding,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId,
+    VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -31,6 +32,7 @@ pub enum PutObjectState {
     WriteBlobHead,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
+    WriteLiveReplicationObligation,
     CommitTransaction,
     RegisterBlobInDht,
     CleanupDuplicate,
@@ -390,6 +392,38 @@ impl PutObjectOperation {
 
     fn handle_blob_version_record_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+            self.write_live_replication_obligation()
+        } else {
+            self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn write_live_replication_obligation(&mut self) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        let effect = match write_live_replication_obligation_effect(
+            self.config.node_id,
+            AuthContext {
+                user_id: self.config.user_id,
+                realm_id: self.config.realm_id,
+                path_restrictions: None,
+            },
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+            version_id,
+            false,
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = PutObjectState::WriteLiveReplicationObligation;
+        smallvec![effect]
+    }
+
+    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             if let Some(txn_id) = self.txn_id {
                 self.state = PutObjectState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -417,8 +451,8 @@ impl PutObjectOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.continue_after_dht_registration();
         };
-        let key: [u8; 32] = match blake3_hash.try_into() {
-            Ok(key) => key,
+        let key = match blake3_hash.try_into() {
+            Ok(key) => aruna_core::id::DhtKeyId::from_bytes(key),
             Err(_) => return self.continue_after_dht_registration(),
         };
 
@@ -531,6 +565,9 @@ impl Operation for PutObjectOperation {
             PutObjectState::WriteHashPathIndex => self.handle_hash_path_index_created(event),
             PutObjectState::CreateBlobVersionRecord => {
                 self.handle_blob_version_record_created(event)
+            }
+            PutObjectState::WriteLiveReplicationObligation => {
+                self.handle_live_replication_obligation_written(event)
             }
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::RegisterBlobInDht => self.handle_blob_registered_in_dht(event),

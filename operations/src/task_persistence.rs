@@ -40,6 +40,8 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
         TaskKey::DrainDocumentSyncOutbox
             | TaskKey::DrainMetadataMaterializationQueue
             | TaskKey::DrainMetadataGraphPruneQueue
+            | TaskKey::DrainBlobReplicationQueue
+            | TaskKey::DrainReferenceMetadataRefreshQueue
     )
 }
 

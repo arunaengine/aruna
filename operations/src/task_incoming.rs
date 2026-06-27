@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncTarget};
@@ -30,7 +30,7 @@ use crate::metadata::materialization_queue::{
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_pending_metadata_projection_queue,
     project_metadata_create_events, project_metadata_create_events_from_log,
-    replay_metadata_event_log,
+    replay_metadata_event_log, restore_pending_metadata_projection_timer,
 };
 use crate::metadata::prune_queue::{
     METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER,
@@ -38,12 +38,20 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
+use crate::replication::queue::{
+    BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
+};
+use crate::s3::refresh_reference_metadata::{
+    REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
+    restore_reference_metadata_refresh_timer,
+};
 use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
+const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OperationsTaskHandler {
@@ -135,7 +143,12 @@ impl OperationsTaskHandler {
             match read_outbox_records(&self.context.storage_handle, &[], OUTBOX_DRAIN_BATCH_SIZE)
                 .await
             {
-                Ok(batch) if batch.records.is_empty() => return,
+                Ok(batch) if batch.records.is_empty() => {
+                    if batch.has_more {
+                        self.reschedule_timer(retry_key, Duration::ZERO).await;
+                    }
+                    return;
+                }
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(error = %error, "Failed to read document sync outbox record");
@@ -392,6 +405,15 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
+            Ok(result) if result.next_due_after.is_some() => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    result
+                        .next_due_after
+                        .unwrap_or(METADATA_MATERIALIZATION_POLL_AFTER),
+                )
+                .await;
+            }
             Ok(_) => {
                 match metadata_materialization_jobs_exist(&self.context.storage_handle).await {
                     Ok(false) => {}
@@ -429,6 +451,15 @@ impl OperationsTaskHandler {
                 self.reschedule_timer(
                     TaskKey::DrainMetadataGraphPruneQueue,
                     std::time::Duration::ZERO,
+                )
+                .await;
+            }
+            Ok(result) if result.next_due_after.is_some() => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    result
+                        .next_due_after
+                        .unwrap_or(METADATA_GRAPH_PRUNE_POLL_AFTER),
                 )
                 .await;
             }
@@ -491,6 +522,77 @@ impl OperationsTaskHandler {
             }
         }
     }
+
+    async fn drain_blob_replication_queue(&self) {
+        match process_blob_replication_batch(&self.context).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, Duration::ZERO)
+                    .await;
+            }
+            Ok(result) => {
+                if let Some(after) = result.next_due_after {
+                    self.reschedule_timer(TaskKey::DrainBlobReplicationQueue, after)
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!(error = ?error, "Failed to drain blob replication queue");
+                self.reschedule_timer(
+                    TaskKey::DrainBlobReplicationQueue,
+                    BLOB_REPLICATION_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn drain_reference_metadata_refresh_queue(&self) {
+        match process_reference_metadata_refresh_batch(&self.context).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, Duration::ZERO)
+                    .await;
+            }
+            Ok(result) => {
+                if let Some(after) = result.next_due_after {
+                    self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, after)
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!(error = ?error, "Failed to drain reference metadata refresh queue");
+                self.reschedule_timer(
+                    TaskKey::DrainReferenceMetadataRefreshQueue,
+                    REFERENCE_METADATA_REFRESH_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(durable_queue_rearm_loop(
+        Arc::downgrade(context),
+        task_handle.clone(),
+    ));
+}
+
+async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: TaskHandle) {
+    loop {
+        tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER).await;
+        let Some(context) = context.upgrade() else {
+            return;
+        };
+        restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
+        restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
+        restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
+        restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+        restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+    }
 }
 
 pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: TaskHandle) {
@@ -499,10 +601,14 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
     crate::queue_lag::spawn_queue_lag_monitor(&context);
+    spawn_durable_queue_rearm(&context, &task_handle);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+    restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+    restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
+    restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
 }
 
 #[async_trait]
@@ -619,6 +725,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainMetadataGraphPruneQueue => {
                 self.drain_metadata_graph_prune_queue().await;
+            }
+            TaskKey::DrainBlobReplicationQueue => {
+                self.drain_blob_replication_queue().await;
+            }
+            TaskKey::DrainReferenceMetadataRefreshQueue => {
+                self.drain_reference_metadata_refresh_queue().await;
             }
         }
     }

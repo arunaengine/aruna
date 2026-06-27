@@ -1,5 +1,6 @@
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::ConversionError;
+use aruna_core::id::DhtKeyId;
 use aruna_core::structs::RealmId;
 use aruna_core::types::NodeId;
 
@@ -8,7 +9,7 @@ pub(super) fn dht_registration_effect(
     local_realm_id: RealmId,
     local_node_id: NodeId,
 ) -> Result<Effect, ConversionError> {
-    let key: [u8; 32] = blake3.try_into()?;
+    let key = DhtKeyId::from_bytes(blake3.try_into()?);
 
     Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
         key,

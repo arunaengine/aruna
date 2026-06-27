@@ -5,20 +5,22 @@ use crate::s3::checksum::{
     encode_checksums, parse_upload_checksum_request,
 };
 use crate::s3::error::IntoS3Error;
-use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_type_from_multipart,
 };
 use aruna_core::NodeId;
-use aruna_core::stream::BackendStream;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::replication::queue::{
+    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
+};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
@@ -47,7 +49,7 @@ use aruna_operations::s3::put_bucket_replication::{
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::refresh_reference_metadata::{
-    ReferenceMetadataRefresh, refresh_reference_metadata,
+    QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
 };
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
 use base64::Engine;
@@ -253,7 +255,47 @@ impl ArunaS3Service {
         }
     }
 
-    fn complete_multipart_upload_response(
+    async fn queue_live_version_replication(
+        &self,
+        auth_context: AuthContext,
+        bucket: String,
+        key: String,
+        version_id: ulid::Ulid,
+        delete_marker: bool,
+    ) {
+        let result = match drive(
+            QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+                local_node_id: self.node_id,
+                auth_context,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                delete_marker,
+            }),
+            &self.state,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    bucket,
+                    key,
+                    version_id = %version_id,
+                    delete_marker,
+                    "Failed to queue live replication after committed write; durable obligation remains for repair"
+                );
+                return;
+            }
+        };
+
+        if result.queued > 0 && !result.scheduled {
+            warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+        }
+    }
+
+    async fn complete_multipart_upload_response(
         &self,
         bucket: String,
         key: String,
@@ -281,21 +323,19 @@ impl ArunaS3Service {
             s3_checksum_type_from_multipart(result.checksum_type),
         ));
 
-        spawn_version_replication(
-            self.state.clone(),
-            self.realm_id,
-            self.node_id,
+        self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
             replication_key,
             result.version_id,
             false,
-        );
+        )
+        .await;
 
         Ok(S3Response::new(output))
     }
 
-    fn put_object_response(
+    async fn put_object_response(
         &self,
         checksum_request: &UploadChecksumRequest,
         replication_auth: AuthContext,
@@ -319,21 +359,19 @@ impl ArunaS3Service {
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
         ));
-        spawn_version_replication(
-            self.state.clone(),
-            self.realm_id,
-            self.node_id,
+        self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
             replication_key,
             result.version_id,
             false,
-        );
+        )
+        .await;
 
         Ok(S3Response::new(output))
     }
 
-    fn delete_object_response(
+    async fn delete_object_response(
         &self,
         replication_auth: AuthContext,
         replication_bucket: String,
@@ -342,16 +380,14 @@ impl ArunaS3Service {
         result: DeleteObjectResult,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         if replicate_latest_delete {
-            spawn_version_replication(
-                self.state.clone(),
-                self.realm_id,
-                self.node_id,
+            self.queue_live_version_replication(
                 replication_auth,
                 replication_bucket,
                 replication_key,
                 result.version_id,
                 result.delete_marker,
-            );
+            )
+            .await;
         }
 
         Ok(S3Response::new(DeleteObjectOutput {
@@ -472,6 +508,46 @@ fn reference_metadata_refresh(
         version_id: result.resolved_version_id.or(result.version_id)?,
         metadata: result.source_metadata.clone()?,
         refreshed_at: result.last_refresh?,
+    })
+}
+
+fn attach_reference_metadata_refresh<T: 'static>(
+    blob: BackendStream<Result<T, StreamError>>,
+    context: Arc<DriverContext>,
+    refresh: ReferenceMetadataRefresh,
+) -> BackendStream<Result<T, StreamError>> {
+    let refresh_bucket = refresh.bucket.clone();
+    let refresh_key = refresh.key.clone();
+    let refresh_version_id = refresh.version_id;
+
+    blob.on_success_async(move || async move {
+        match drive(
+            QueueReferenceMetadataRefreshOperation::new(refresh),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(queue_result) => {
+                if queue_result.queued && !queue_result.scheduled {
+                    warn!(
+                        bucket = %refresh_bucket,
+                        key = %refresh_key,
+                        version_id = %refresh_version_id,
+                        "Reference metadata refresh job persisted but drain scheduling was not acknowledged"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    bucket = %refresh_bucket,
+                    key = %refresh_key,
+                    version_id = %refresh_version_id,
+                    "Failed to queue reference metadata refresh after successful stream; refresh is best effort"
+                );
+            }
+        }
+        Ok(())
     })
 }
 
@@ -725,6 +801,7 @@ impl S3 for ArunaS3Service {
             replication_key,
             result,
         )
+        .await
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -890,6 +967,7 @@ impl S3 for ArunaS3Service {
             replication_auth,
             result,
         )
+        .await
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -970,14 +1048,7 @@ impl S3 for ArunaS3Service {
             result.last_refresh,
         );
         let blob = if let Some(refresh) = reference_refresh {
-            let context = self.state.clone();
-            result.blob.on_success(move || {
-                tokio::spawn(async move {
-                    if let Err(err) = refresh_reference_metadata(context, refresh).await {
-                        warn!(error = %err, "Failed to refresh reference metadata after read");
-                    }
-                });
-            })
+            attach_reference_metadata_refresh(result.blob, self.state.clone(), refresh)
         } else {
             result.blob
         };
@@ -1121,6 +1192,7 @@ impl S3 for ArunaS3Service {
             replicate_latest_delete,
             result,
         )
+        .await
     }
 
     #[tracing::instrument(err)]
@@ -1217,17 +1289,24 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
         BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
         PortableSourceDescriptor, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
         VersionSourceBinding,
     };
-    use aruna_operations::driver::DriverContext;
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::replication::queue::{
+        LiveReplicationObligationRecord, live_replication_obligation_key,
+    };
+    use aruna_operations::s3::refresh_reference_metadata::refresh_reference_metadata;
     use aruna_storage::storage;
+    use futures_util::{StreamExt, stream};
     use http::Extensions;
-    use hyper::{HeaderMap, Method, Uri};
+    use hyper::{HeaderMap, Method, Uri, body::Bytes};
+    use s3s::dto::ChecksumType;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1241,6 +1320,138 @@ mod tests {
         key: String,
         version_id: Ulid,
         created_by: UserId,
+    }
+
+    #[tokio::test]
+    async fn put_response_ignores_post_commit_live_replication_queue_failure() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([40u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let service = ArunaS3Service::new(context, realm_id, node_id).await;
+        let bucket = "bucket".to_string();
+        let key = "object".to_string();
+        let version_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+
+        write_storage_value(
+            &storage_handle,
+            S3_BUCKET_REPLICATION_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            b"not a bucket replication config".to_vec(),
+        )
+        .await;
+        let obligation = LiveReplicationObligationRecord::new(
+            node_id,
+            auth.clone(),
+            bucket.clone(),
+            key.clone(),
+            version_id,
+            false,
+        );
+        let obligation_key = live_replication_obligation_key(&obligation).unwrap();
+        write_storage_value(
+            &storage_handle,
+            BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+            obligation_key.as_ref().to_vec(),
+            postcard::to_allocvec(&obligation).unwrap(),
+        )
+        .await;
+
+        let checksum_request = UploadChecksumRequest {
+            expected: Vec::new(),
+            response_algorithm: None,
+            checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        };
+        let response = service
+            .put_object_response(
+                &checksum_request,
+                auth,
+                bucket.clone(),
+                key,
+                PutObjectResult {
+                    location: response_location(user_id),
+                    version_id,
+                },
+            )
+            .await
+            .expect("committed PUT response should not fail on queue kick error");
+
+        assert_eq!(response.output.version_id, Some(version_id.to_string()));
+        assert!(
+            read_storage_value(
+                &storage_handle,
+                BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                obligation_key.as_ref().to_vec(),
+            )
+            .await
+            .is_some(),
+            "durable obligation should remain repairable when queue kick fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_refresh_queue_failure_does_not_surface_as_stream_error() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let refresh = ReferenceMetadataRefresh {
+            bucket: "bucket".to_string(),
+            key: "reference".to_string(),
+            version_id: Ulid::new(),
+            metadata: source_metadata(2, "etag"),
+            refreshed_at: UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap(),
+        };
+
+        let queue_result = drive(
+            QueueReferenceMetadataRefreshOperation::new(refresh.clone()),
+            context.as_ref(),
+        )
+        .await;
+        assert!(
+            queue_result.is_err(),
+            "test refresh must fail queueing to exercise the callback error path"
+        );
+
+        let mut blob = attach_reference_metadata_refresh(
+            BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
+                Bytes::from_static(b"ok"),
+            )])),
+            context,
+            refresh,
+        );
+
+        let mut body = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(result) = blob.next().await {
+            match result {
+                Ok(bytes) => body.extend_from_slice(&bytes),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        assert_eq!(body, b"ok");
+        assert!(errors.is_empty(), "unexpected stream errors: {errors:?}");
     }
 
     #[tokio::test]
@@ -1311,6 +1522,65 @@ mod tests {
             version_id: Ulid::new(),
             created_by: UserId::local(Ulid::new(), realm_id),
         }
+    }
+
+    fn response_location(created_by: UserId) -> BackendLocation {
+        let mut hashes = HashMap::new();
+        hashes.insert(HASH_MD5.to_string(), vec![1u8; 16]);
+
+        BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "objects".to_string(),
+            backend_path: "bucket/object".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 2,
+            hashes,
+        }
+    }
+
+    async fn write_storage_value(
+        storage: &storage::StorageHandle,
+        keyspace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        let event = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: keyspace.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn read_storage_value(
+        storage: &storage::StorageHandle,
+        keyspace: &str,
+        key: Vec<u8>,
+    ) -> Option<byteview::ByteView> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: keyspace.to_string(),
+                key: key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read event")
+        };
+
+        value
     }
 
     async fn write_reference_version(

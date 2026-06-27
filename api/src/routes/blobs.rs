@@ -7,8 +7,9 @@ use aruna_core::structs::{
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::protocol::ReplicationMode;
+use aruna_operations::replication::queue::QueueBlobReplicationOperation;
 use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
+    ReplicateScopeInput, ReplicateScopeTarget,
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
 use axum::extract::State;
@@ -18,7 +19,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{Instrument, debug, info, warn};
+use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -157,72 +158,21 @@ pub async fn replicate_blob(
         version_id: version_id.clone(),
         target_node_id: input.target_node_id.to_string(),
     };
-    let bucket = input.bucket.clone();
-    let path_for_span = path.clone();
-    let version_id_for_span = version_id.clone();
-    let target_node_id = input.target_node_id;
-    let ctx = state.get_ctx();
-    let span = tracing::info_span!(
-        "api.on_demand_replication",
-        bucket = %bucket,
-        path = ?path_for_span,
-        version_id = ?version_id_for_span,
-        target_node = %target_node_id,
-    );
-
-    tokio::spawn(
-        async move {
-            debug!(
-                bucket = %bucket,
-                path = ?path,
-                version_id = ?version_id,
-                target_node = %target_node_id,
-                "Starting on-demand replication task"
-            );
-            match drive(ReplicateScopeOperation::new(input), &ctx).await {
-                Ok(Some(Ok(result))) if result.failed == 0 => {
-                    info!(bucket,
-                        path = ?path,
-                        version_id = ?version_id,
-                        target_node = %target_node_id,
-                        "On-demand replication succeeded"
-                    );
-                }
-                Ok(Some(Ok(result))) => {
-                    warn!(
-                        bucket,
-                        path = ?path,
-                        version_id = ?version_id,
-                        target_node = %target_node_id,
-                        replicated = result.replicated,
-                        skipped = result.skipped,
-                        failed = result.failed,
-                        "On-demand replication completed with failures"
-                    );
-                }
-                Ok(Some(Err(err))) | Err(err) => {
-                    warn!(
-                        bucket,
-                        path = ?path,
-                        version_id = ?version_id,
-                        target_node = %target_node_id,
-                        error = %err,
-                        "On-demand replication failed"
-                    );
-                }
-                Ok(None) => {
-                    warn!(
-                        bucket,
-                        path = ?path,
-                        version_id = ?version_id,
-                        target_node = %target_node_id,
-                        "On-demand replication produced no result"
-                    );
-                }
-            }
-        }
-        .instrument(span),
-    );
+    let queue_result = drive(
+        QueueBlobReplicationOperation::new(input, None),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    if !queue_result.scheduled {
+        warn!(
+            bucket = %response.bucket,
+            path = ?response.path,
+            version_id = ?response.version_id,
+            target_node = %response.target_node_id,
+            "On-demand replication job persisted but drain scheduling was not acknowledged"
+        );
+    }
 
     Ok((StatusCode::ACCEPTED, Json(response)))
 }

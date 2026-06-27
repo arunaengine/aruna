@@ -96,3 +96,10 @@ pub async fn materialize_snapshot(
         version_id: put_result.version_id,
     })
 }
+
+pub async fn stage_snapshot_blob(
+    context: &DriverContext,
+    input: MaterializeSnapshotInput,
+) -> Result<MaterializeSnapshotResult, MaterializeSnapshotError> {
+    materialize_snapshot(context, input).await
+}

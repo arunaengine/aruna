@@ -21,6 +21,7 @@ use aruna_core::structs::{
     SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, Key, NodeId};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -58,7 +59,7 @@ struct PendingMaterializedReplicationVersion {
     source: Option<VersionSourceBinding>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReplicateScopeTarget {
     Bucket,
     Prefix(String),
@@ -66,7 +67,7 @@ pub enum ReplicateScopeTarget {
     Version { key: String, version_id: Ulid },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicateScopeInput {
     pub bucket: String,
     pub target: ReplicateScopeTarget,

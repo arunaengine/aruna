@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, build_head_transition_effects, delete_blob_version_effect,
     delete_hash_path_index_effect, write_blob_version_effect,
 };
+use crate::replication::queue::write_live_replication_obligation_effect;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -10,8 +11,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, CurrentVersionPointer, MultipartObjectMetadataKey, RealmId,
-    VersionKey,
+    AuthContext, BlobHeadKey, BlobVersion, CurrentVersionPointer, MultipartObjectMetadataKey,
+    RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -34,6 +35,7 @@ pub enum DeleteObjectState {
     ReadMultipartParts,
     DeleteMultipartPart,
     WriteBlobVersion,
+    WriteLiveReplicationObligation,
     CommitTransaction,
     Finish,
     Error,
@@ -550,6 +552,37 @@ impl DeleteObjectOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
+        self.write_live_replication_obligation()
+    }
+
+    fn write_live_replication_obligation(&mut self) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let effect = match write_live_replication_obligation_effect(
+            self.input.node_id,
+            AuthContext {
+                user_id: self.input.deleted_by,
+                realm_id: self.input.realm_id,
+                path_restrictions: None,
+            },
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            version_id,
+            true,
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        self.state = DeleteObjectState::WriteLiveReplicationObligation;
+        smallvec![effect]
+    }
+
+    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
 
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
@@ -618,6 +651,9 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::ReadMultipartParts => self.handle_multipart_parts_read(event),
             DeleteObjectState::DeleteMultipartPart => self.handle_multipart_part_deleted(event),
             DeleteObjectState::WriteBlobVersion => self.handle_blob_version_written(event),
+            DeleteObjectState::WriteLiveReplicationObligation => {
+                self.handle_live_replication_obligation_written(event)
+            }
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],
             DeleteObjectState::Error => self.abort(),
