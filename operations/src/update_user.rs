@@ -610,18 +610,7 @@ fn apply_admin_reducer_updates(
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
     let mut events = Vec::new();
     for operation in admin_document_operations(input) {
-        let observed = state.clock.clone();
-        let event = AdminDocumentEvent {
-            event_id: Ulid::new(),
-            target: state.target.clone(),
-            origin_node_id: input.actor.node_id,
-            origin_seq: observed.sequence_for(&input.actor.node_id) + 1,
-            observed,
-            actor: input.actor.clone(),
-            op: operation,
-        };
-        state.apply(&event)?;
-        events.push(event);
+        events.push(state.apply_operation(&input.actor, operation)?);
     }
 
     Ok(events)

@@ -3,7 +3,7 @@ use crate::document_sync_outbox::{
 };
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -141,8 +141,7 @@ impl CreateGroupOperation {
         let mut admin_events = Vec::new();
         let roles = sorted_roles(auth_doc);
 
-        admin_events.push(apply_admin_reducer_operation(
-            &mut reducer_state,
+        admin_events.push(reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::GroupCreated {
                 realm_id: self.config.actor.realm_id,
@@ -151,8 +150,7 @@ impl CreateGroupOperation {
         )?);
 
         for role in &roles {
-            admin_events.push(apply_admin_reducer_operation(
-                &mut reducer_state,
+            admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::GroupRoleCreated {
                     role: AdminDocumentRoleDefinition::from(*role),
@@ -165,8 +163,7 @@ impl CreateGroupOperation {
             .find(|role| role.name == "admin")
             .ok_or(CreateGroupError::AdminRoleNotFound)?;
         for user_id in sorted_user_ids(&admin_role.assigned_users) {
-            admin_events.push(apply_admin_reducer_operation(
-                &mut reducer_state,
+            admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::GroupRoleUserAssignmentAdded {
                     role_id: admin_role.role_id,
@@ -339,25 +336,6 @@ impl CreateGroupOperation {
             ),
         }
     }
-}
-
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::new(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
 }
 
 fn sorted_roles(auth_doc: &GroupAuthorizationDocument) -> Vec<&Role> {
@@ -681,7 +659,7 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_and_finishes_without_legacy_replication() {
+    fn schedules_outbox_drain_and_finishes_without_direct_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::new();

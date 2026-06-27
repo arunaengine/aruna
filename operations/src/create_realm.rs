@@ -1,6 +1,6 @@
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -146,8 +146,7 @@ impl CreateRealmOperation {
 
         let realm_target = AdminDocumentTarget::Realm { realm_id };
         let mut realm_state = AdminDocumentReducerState::new(realm_target);
-        let realm_role_event = apply_admin_reducer_operation(
-            &mut realm_state,
+        let realm_role_event = realm_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmRoleCreated {
                 role: AdminDocumentRoleDefinition::from(realm_admin_role),
@@ -156,8 +155,7 @@ impl CreateRealmOperation {
 
         let config_target = AdminDocumentTarget::RealmConfig { realm_id };
         let mut config_state = AdminDocumentReducerState::new(config_target);
-        let config_node_event = apply_admin_reducer_operation(
-            &mut config_state,
+        let config_node_event = config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodeEnsured {
                 node_id: self.config.actor.node_id,
@@ -168,14 +166,12 @@ impl CreateRealmOperation {
         let mut oidc_providers = self.config.oidc_providers.clone();
         oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
         for provider in oidc_providers {
-            config_events.push(apply_admin_reducer_operation(
-                &mut config_state,
+            config_events.push(config_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
             )?);
         }
-        config_events.push(apply_admin_reducer_operation(
-            &mut config_state,
+        config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigSettingsSet {
                 metadata_replication: config_doc.metadata_replication.clone(),
@@ -460,25 +456,6 @@ impl Operation for CreateRealmOperation {
     }
 }
 
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::new(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
-}
-
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -719,7 +696,7 @@ mod test {
     }
 
     #[test]
-    fn schedules_outbox_drain_and_finishes_without_legacy_replication() {
+    fn schedules_outbox_drain_and_finishes_without_direct_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
         let txn_id = TxnId::new();

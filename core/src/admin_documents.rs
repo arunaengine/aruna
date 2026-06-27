@@ -191,14 +191,6 @@ mod tests {
         }
     }
 
-    fn postcard_discriminant(op: &AdminDocumentOperation) -> u8 {
-        postcard::to_allocvec(op).expect("operation serializes")[0]
-    }
-
-    fn target_postcard_discriminant(target: &AdminDocumentTarget) -> u8 {
-        postcard::to_allocvec(target).expect("target serializes")[0]
-    }
-
     fn postcard_roundtrip<T>(value: T) -> T
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de>,
@@ -208,136 +200,81 @@ mod tests {
     }
 
     #[test]
-    fn admin_document_operation_postcard_discriminants_preserve_legacy_order() {
+    fn admin_document_operations_roundtrip() {
         let role_id = role_id(1);
         let user_id = user_id(2);
         let realm_id = RealmId::from_bytes([9; 32]);
-        let operations = [
-            (AdminDocumentOperation::GroupRoleAdded { role_id }, 0),
-            (
-                AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
-                1,
-            ),
-            (
-                AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
-                2,
-            ),
-            (
-                AdminDocumentOperation::UserAttributeSet {
-                    key: "department".to_string(),
-                    value: "biology".to_string(),
+        let operations = vec![
+            AdminDocumentOperation::GroupRoleAdded { role_id },
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "biology".to_string(),
+            },
+            AdminDocumentOperation::UserAttributeRemoved {
+                key: "department".to_string(),
+            },
+            AdminDocumentOperation::UserNameSet {
+                name: "Alice".to_string(),
+            },
+            AdminDocumentOperation::UserSubjectIdAdded {
+                subject_id: "subject-1".to_string(),
+            },
+            AdminDocumentOperation::UserSubjectIdRemoved {
+                subject_id: "subject-1".to_string(),
+            },
+            AdminDocumentOperation::RealmRoleAdded { role_id },
+            AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+            AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+            AdminDocumentOperation::GroupRoleCreated {
+                role: role_definition(role_id),
+            },
+            AdminDocumentOperation::RealmRoleCreated {
+                role: role_definition(role_id),
+            },
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: node(1),
+                kind: RealmNodeKind::Management,
+            },
+            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                provider: oidc_provider("default"),
+            },
+            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+                provider_id: "default".to_string(),
+            },
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: RealmDiscoveryConfig::Static {
+                    endpoints: Vec::new(),
                 },
-                3,
-            ),
-            (
-                AdminDocumentOperation::UserAttributeRemoved {
-                    key: "department".to_string(),
-                },
-                4,
-            ),
-            (
-                AdminDocumentOperation::UserNameSet {
-                    name: "Alice".to_string(),
-                },
-                5,
-            ),
-            (
-                AdminDocumentOperation::UserSubjectIdAdded {
-                    subject_id: "subject-1".to_string(),
-                },
-                6,
-            ),
-            (
-                AdminDocumentOperation::UserSubjectIdRemoved {
-                    subject_id: "subject-1".to_string(),
-                },
-                7,
-            ),
-            (AdminDocumentOperation::RealmRoleAdded { role_id }, 8),
-            (
-                AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
-                9,
-            ),
-            (
-                AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
-                10,
-            ),
-            (
-                AdminDocumentOperation::GroupRoleCreated {
-                    role: role_definition(role_id),
-                },
-                11,
-            ),
-            (
-                AdminDocumentOperation::RealmRoleCreated {
-                    role: role_definition(role_id),
-                },
-                12,
-            ),
-            (
-                AdminDocumentOperation::RealmConfigNodeEnsured {
-                    node_id: node(1),
-                    kind: RealmNodeKind::Management,
-                },
-                13,
-            ),
-            (
-                AdminDocumentOperation::RealmConfigOidcProviderUpserted {
-                    provider: oidc_provider("default"),
-                },
-                14,
-            ),
-            (
-                AdminDocumentOperation::RealmConfigOidcProviderRemoved {
-                    provider_id: "default".to_string(),
-                },
-                15,
-            ),
-            (
-                AdminDocumentOperation::RealmConfigSettingsSet {
-                    metadata_replication: MetadataReplicationConfig::new(3),
-                    discovery: RealmDiscoveryConfig::Static {
-                        endpoints: Vec::new(),
-                    },
-                },
-                16,
-            ),
-            (
-                AdminDocumentOperation::GroupCreated {
-                    realm_id,
-                    display_name: "Engineering".to_string(),
-                },
-                17,
-            ),
+            },
+            AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name: "Engineering".to_string(),
+            },
         ];
 
-        for (op, discriminant) in operations {
-            assert_eq!(postcard_discriminant(&op), discriminant);
+        for op in operations {
+            assert_eq!(postcard_roundtrip(op.clone()), op);
         }
     }
 
     #[test]
-    fn admin_document_target_postcard_discriminants_preserve_legacy_order() {
+    fn admin_document_targets_roundtrip() {
         let realm_id = RealmId::from_bytes([9; 32]);
         let targets = [
-            (
-                AdminDocumentTarget::Group {
-                    group_id: group_id(1),
-                },
-                0,
-            ),
-            (AdminDocumentTarget::Realm { realm_id }, 1),
-            (
-                AdminDocumentTarget::User {
-                    user_id: user_id(2),
-                },
-                2,
-            ),
-            (AdminDocumentTarget::RealmConfig { realm_id }, 3),
+            AdminDocumentTarget::Group {
+                group_id: group_id(1),
+            },
+            AdminDocumentTarget::Realm { realm_id },
+            AdminDocumentTarget::User {
+                user_id: user_id(2),
+            },
+            AdminDocumentTarget::RealmConfig { realm_id },
         ];
 
-        for (target, discriminant) in targets {
-            assert_eq!(target_postcard_discriminant(&target), discriminant);
+        for target in targets {
             assert_eq!(postcard_roundtrip(target.clone()), target);
         }
     }

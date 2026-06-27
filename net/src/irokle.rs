@@ -1,11 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
-use aruna_core::admin_document_reducer::{AdminDocumentApplyStatus, AdminDocumentReducerState};
+use aruna_core::admin_document_reducer::{
+    AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
+    GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
+    USER_NAME_PATH, group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
+    group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
+    realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
+    realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
+};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
@@ -70,11 +76,6 @@ pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
-const USER_NAME_PATH: &str = "user.name";
-const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
-const GROUP_REALM_ID_PATH: &str = "group.realm_id";
-const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
-const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
@@ -225,6 +226,9 @@ impl DocumentSyncService {
         self.node
             .add_peers_to_whitelist(peers.iter().copied())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        // The underlying sync node exposes additive whitelist updates only; this
+        // refresh replaces the default fan-out set while retaining previously
+        // allowed peers until process restart.
         *self.default_peers.write() = peers;
         self.flush_database()?;
         Ok(())
@@ -311,6 +315,28 @@ impl DocumentSyncService {
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             }
             self.net.schedule_topic_recheck(topic_id)?;
+        }
+
+        self.flush_database()
+    }
+
+    pub fn ensure_document_sync_topics(
+        &self,
+        targets: &[DocumentSyncTarget],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let sync_peers = self.sync_peers(peers);
+        self.allow_sync_peers(&sync_peers)?;
+
+        let mut seen_topics = BTreeSet::new();
+        for target in targets {
+            if seen_topics.insert(target.sync_topic_id()) {
+                self.ensure_topic(target, &sync_peers)?;
+            }
         }
 
         self.flush_database()
@@ -1807,7 +1833,7 @@ fn overlay_group_role_set_reducer_materialization(
     }
 
     for path in reducer_state.conflicts.keys() {
-        if let Some(role_id) = group_role_from_path(path) {
+        if let Some(role_id) = group_role_id_from_path(path) {
             group.roles.remove(&role_id);
         }
     }
@@ -1963,7 +1989,7 @@ fn overlay_realm_config_reducer_materialization(
     }
 
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_node_from_path(path) {
+        if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
         }
     }
@@ -1979,13 +2005,13 @@ fn overlay_realm_config_reducer_materialization(
 
     let materialized_providers = reducer_state.materialized_realm_config_oidc_providers();
     for path in reducer_state.conflicts.keys() {
-        if let Some(provider_id) = realm_config_oidc_provider_from_path(path) {
+        if let Some(provider_id) = realm_config_oidc_provider_id_from_path(path) {
             remove_realm_config_oidc_provider(config, provider_id);
         }
     }
 
     for path in reducer_state.user_subject_ids.keys() {
-        let Some(provider_id) = realm_config_oidc_provider_from_path(path) else {
+        let Some(provider_id) = realm_config_oidc_provider_id_from_path(path) else {
             continue;
         };
         remove_realm_config_oidc_provider(config, provider_id);
@@ -2024,41 +2050,6 @@ fn remove_realm_config_oidc_provider(config: &mut RealmConfigDocument, provider_
     config
         .oidc_providers
         .retain(|provider| provider.id != provider_id);
-}
-
-fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
-    let path = path.strip_prefix("group.roles.")?;
-    let (role_id, user_id) = path.split_once(".assigned_users.")?;
-    Some((
-        Ulid::from_string(role_id).ok()?,
-        UserId::from_string(user_id).ok()?,
-    ))
-}
-
-fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
-    let path = path.strip_prefix("realm.roles.")?;
-    let (role_id, user_id) = path.split_once(".assigned_users.")?;
-    Some((
-        Ulid::from_string(role_id).ok()?,
-        UserId::from_string(user_id).ok()?,
-    ))
-}
-
-fn group_role_from_path(path: &str) -> Option<RoleId> {
-    let role_id = path.strip_prefix("group.roles.")?;
-    if role_id.contains(".assigned_users.") {
-        return None;
-    }
-    Ulid::from_string(role_id).ok()
-}
-
-fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
-    let node_id = path.strip_prefix("realm_config.nodes.")?;
-    NodeId::from_str(node_id).ok()
-}
-
-fn realm_config_oidc_provider_from_path(path: &str) -> Option<&str> {
-    path.strip_prefix("realm_config.oidc_providers.")
 }
 
 fn admin_document_target_for_reduced_document(
@@ -2870,26 +2861,6 @@ fn materialize_realm_authorization_role(
     );
 }
 
-fn group_role_path(role_id: &RoleId) -> String {
-    format!("group.roles.{role_id}")
-}
-
-fn realm_role_path(role_id: &RoleId) -> String {
-    format!("realm.roles.{role_id}")
-}
-
-fn realm_config_node_path(node_id: &NodeId) -> String {
-    format!("realm_config.nodes.{node_id}")
-}
-
-fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
-    format!("group.roles.{role_id}.assigned_users.{user_id}")
-}
-
-fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
-    format!("realm.roles.{role_id}.assigned_users.{user_id}")
-}
-
 fn materialize_user_admin_document_operation(
     user_id: UserId,
     previous_user: Option<&User>,
@@ -2914,7 +2885,7 @@ fn materialize_user_admin_document_operation(
         }
         AdminDocumentOperation::UserSubjectIdAdded { subject_id }
         | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
-            let path = format!("user.subject_ids.{subject_id}");
+            let path = user_subject_id_path(subject_id);
             let materialized_subject_id = if reducer_state.conflicts.contains_key(&path) {
                 None
             } else {
@@ -2933,7 +2904,7 @@ fn materialize_user_admin_document_operation(
         }
         AdminDocumentOperation::UserAttributeSet { key, .. }
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
-            let path = format!("user.attributes.{key}");
+            let path = user_attribute_path(key);
             if reducer_state.conflicts.contains_key(&path) {
                 user.attributes.remove(key);
             } else {
@@ -4197,10 +4168,11 @@ mod tests {
         );
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let legacy_provider = test_oidc_provider("legacy", "legacy-settings");
+        let existing_provider = test_oidc_provider("existing", "existing-settings");
         let seed_node = node(20);
-        let mut seed_config = RealmConfigDocument::new(realm_id, vec![legacy_provider.clone()], 3);
-        seed_config.discovery = test_discovery(21, "https://legacy-settings.example:443");
+        let mut seed_config =
+            RealmConfigDocument::new(realm_id, vec![existing_provider.clone()], 3);
+        seed_config.discovery = test_discovery(21, "https://existing-settings.example:443");
         seed_config.ensure_node(seed_node, RealmNodeKind::Server);
         storage_batch_write_to(
             &storage,
@@ -4237,7 +4209,7 @@ mod tests {
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert_eq!(config.metadata_replication, metadata_replication);
         assert_eq!(config.discovery, discovery);
-        assert_eq!(config.oidc_providers, vec![legacy_provider]);
+        assert_eq!(config.oidc_providers, vec![existing_provider]);
         assert_eq!(
             realm_config_nodes(&config),
             realm_config_nodes(&seed_config)
@@ -4566,13 +4538,13 @@ mod tests {
         );
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let document_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let legacy = test_oidc_provider("legacy", "legacy");
+        let existing = test_oidc_provider("existing", "existing");
         let removed = test_oidc_provider("removed", "removed");
         let first = test_oidc_provider("default", "one");
         let second = test_oidc_provider("partner", "two");
         let seed_node = node(16);
         let mut seed_config =
-            RealmConfigDocument::new(realm_id, vec![legacy.clone(), removed.clone()], 5);
+            RealmConfigDocument::new(realm_id, vec![existing.clone(), removed.clone()], 5);
         seed_config.discovery = RealmDiscoveryConfig::Static {
             endpoints: vec![StaticRealmEndpoint {
                 node_id: seed_node.to_string(),
@@ -4642,7 +4614,7 @@ mod tests {
             realm_config_oidc_providers(&config),
             BTreeMap::from([
                 ("default".to_string(), first),
-                ("legacy".to_string(), legacy),
+                ("existing".to_string(), existing),
                 ("partner".to_string(), second),
             ])
         );
@@ -4716,7 +4688,7 @@ mod tests {
         let providers = realm_config_oidc_providers(&config);
         assert!(!providers.contains_key("default"));
         assert_eq!(providers.get("untouched"), Some(&untouched));
-        let path = "realm_config.oidc_providers.default".to_string();
+        let path = aruna_core::admin_document_reducer::realm_config_oidc_provider_path("default");
         assert!(
             read_storage_value(
                 &storage,
@@ -4885,7 +4857,7 @@ mod tests {
             read_storage_value(
                 &storage,
                 ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
-                admin_document_reducer_conflict_key(&target, "user.attributes.department"),
+                admin_document_reducer_conflict_key(&target, &user_attribute_path("department")),
             )
             .await
             .is_some()

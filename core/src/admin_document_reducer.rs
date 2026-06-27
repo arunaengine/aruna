@@ -11,7 +11,8 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+    Actor, MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -77,6 +78,25 @@ impl AdminDocumentReducerState {
             user_name: None,
             user_subject_ids: BTreeMap::new(),
         }
+    }
+
+    pub fn apply_operation(
+        &mut self,
+        actor: &Actor,
+        op: AdminDocumentOperation,
+    ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+        let observed = self.clock.clone();
+        let event = AdminDocumentEvent {
+            event_id: Ulid::new(),
+            target: self.target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: observed.sequence_for(&actor.node_id) + 1,
+            observed,
+            actor: actor.clone(),
+            op,
+        };
+        self.apply(&event)?;
+        Ok(event)
     }
 
     pub fn apply(
@@ -510,7 +530,7 @@ impl AdminDocumentReducerState {
         let path = group_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_role_value(event, &path, role_id, current, value) {
+        match self.reduce_role_value(event, &path, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -544,7 +564,7 @@ impl AdminDocumentReducerState {
         let path = realm_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_role_value(event, &path, role_id, current, value) {
+        match self.reduce_role_value(event, &path, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -688,7 +708,6 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         path: &str,
-        role_id: &RoleId,
         current: Option<AdminDocumentAttributeVersion>,
         value: String,
     ) -> Option<AdminDocumentAttributeVersion> {
@@ -722,20 +741,6 @@ impl AdminDocumentReducerState {
                 });
             }
             return Some(current);
-        }
-
-        if role_values_are_compatible(role_id, current.value.as_deref(), &value) {
-            if current
-                .value
-                .as_deref()
-                .is_some_and(|value| role_value_is_definition_for(value, role_id))
-            {
-                return Some(current);
-            }
-            return Some(AdminDocumentAttributeVersion {
-                value: Some(value),
-                dot,
-            });
         }
 
         if event_observes_dot(event, &current.dot) {
@@ -777,11 +782,12 @@ impl AdminDocumentReducerState {
     }
 }
 
-const USER_NAME_PATH: &str = "user.name";
-const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
-const GROUP_REALM_ID_PATH: &str = "group.realm_id";
-const REALM_CONFIG_METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
-const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
+pub const USER_NAME_PATH: &str = "user.name";
+pub const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
+pub const GROUP_REALM_ID_PATH: &str = "group.realm_id";
+pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
+    "realm_config.settings.metadata_replication";
+pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -792,51 +798,35 @@ fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
     serde_json::to_string(role).expect("admin document role definition serializes")
 }
 
-fn role_values_are_compatible(role_id: &RoleId, current_value: Option<&str>, value: &str) -> bool {
-    let Some(current_value) = current_value else {
-        return false;
-    };
-    let legacy_value = role_id.to_string();
-
-    (current_value == legacy_value && role_value_is_definition_for(value, role_id))
-        || (value == legacy_value && role_value_is_definition_for(current_value, role_id))
-}
-
-fn role_value_is_definition_for(value: &str, role_id: &RoleId) -> bool {
-    serde_json::from_str::<AdminDocumentRoleDefinition>(value)
-        .map(|role| role.role_id == *role_id)
-        .unwrap_or(false)
-}
-
-fn user_attribute_path(key: &str) -> String {
+pub fn user_attribute_path(key: &str) -> String {
     format!("user.attributes.{key}")
 }
 
-fn user_subject_id_path(subject_id: &str) -> String {
+pub fn user_subject_id_path(subject_id: &str) -> String {
     format!("user.subject_ids.{subject_id}")
 }
 
-fn group_role_path(role_id: &RoleId) -> String {
+pub fn group_role_path(role_id: &RoleId) -> String {
     format!("group.roles.{role_id}")
 }
 
-fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+pub fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("group.roles.{role_id}.assigned_users.{user_id}")
 }
 
-fn realm_role_path(role_id: &RoleId) -> String {
+pub fn realm_role_path(role_id: &RoleId) -> String {
     format!("realm.roles.{role_id}")
 }
 
-fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+pub fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
     format!("realm.roles.{role_id}.assigned_users.{user_id}")
 }
 
-fn realm_config_node_path(node_id: &NodeId) -> String {
+pub fn realm_config_node_path(node_id: &NodeId) -> String {
     format!("realm_config.nodes.{node_id}")
 }
 
-fn realm_config_oidc_provider_path(provider_id: &str) -> String {
+pub fn realm_config_oidc_provider_path(provider_id: &str) -> String {
     format!("realm_config.oidc_providers.{provider_id}")
 }
 
@@ -862,7 +852,7 @@ fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
     .to_string()
 }
 
-fn group_role_id_from_path(path: &str) -> Option<RoleId> {
+pub fn group_role_id_from_path(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("group.roles.")?;
 
     if role_id.contains(".assigned_users.") {
@@ -872,14 +862,21 @@ fn group_role_id_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
-fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+pub fn group_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("group.roles.")?;
-    let (role_id, _) = path.split_once(".assigned_users.")?;
+    let (role_id, user_id) = path.split_once(".assigned_users.")?;
 
-    Ulid::from_string(role_id).ok()
+    Some((
+        Ulid::from_string(role_id).ok()?,
+        UserId::from_string(user_id).ok()?,
+    ))
 }
 
-fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
+fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    group_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+}
+
+pub fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("realm.roles.")?;
 
     if role_id.contains(".assigned_users.") {
@@ -889,19 +886,26 @@ fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
     Ulid::from_string(role_id).ok()
 }
 
-fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+pub fn realm_role_user_assignment_from_path(path: &str) -> Option<(RoleId, UserId)> {
     let path = path.strip_prefix("realm.roles.")?;
-    let (role_id, _) = path.split_once(".assigned_users.")?;
+    let (role_id, user_id) = path.split_once(".assigned_users.")?;
 
-    Ulid::from_string(role_id).ok()
+    Some((
+        Ulid::from_string(role_id).ok()?,
+        UserId::from_string(user_id).ok()?,
+    ))
 }
 
-fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
+fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    realm_role_user_assignment_from_path(path).map(|(role_id, _)| role_id)
+}
+
+pub fn realm_config_node_id_from_path(path: &str) -> Option<NodeId> {
     let node_id = path.strip_prefix("realm_config.nodes.")?;
     NodeId::from_str(node_id).ok()
 }
 
-fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
+pub fn realm_config_oidc_provider_id_from_path(path: &str) -> Option<&str> {
     path.strip_prefix("realm_config.oidc_providers.")
 }
 
@@ -931,8 +935,13 @@ mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
         GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH,
-        REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, metadata_replication_value,
-        oidc_provider_value, realm_discovery_value, role_definition_value,
+        REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, group_role_id_from_path,
+        group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
+        metadata_replication_value, oidc_provider_value, realm_config_node_id_from_path,
+        realm_config_node_path, realm_config_oidc_provider_id_from_path,
+        realm_config_oidc_provider_path, realm_discovery_value, realm_role_id_from_path,
+        realm_role_path, realm_role_user_assignment_from_path, realm_role_user_assignment_path,
+        role_definition_value, user_attribute_path, user_subject_id_path,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -1326,6 +1335,126 @@ mod tests {
                 discovery,
             },
         )
+    }
+
+    #[test]
+    fn apply_operation_uses_next_origin_sequence_and_applies_event() {
+        let mut state = user_state();
+        let actor = actor(node(1));
+
+        let first = state
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::UserNameSet {
+                    name: "Alice".to_string(),
+                },
+            )
+            .unwrap();
+        let second = state
+            .apply_operation(
+                &actor,
+                AdminDocumentOperation::UserAttributeSet {
+                    key: "department".to_string(),
+                    value: "biology".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(first.origin_seq, 1);
+        assert_eq!(first.observed.sequence_for(&actor.node_id), 0);
+        assert_eq!(second.origin_seq, 2);
+        assert_eq!(second.observed.sequence_for(&actor.node_id), 1);
+        assert!(second.observed.observes(&first.dot()));
+        assert_eq!(state.clock.sequence_for(&actor.node_id), 2);
+        assert_eq!(state.materialized_user_name().as_deref(), Some("Alice"));
+        assert_eq!(
+            state.materialized_user_attributes().get("department"),
+            Some(&"biology".to_string())
+        );
+    }
+
+    #[test]
+    fn admin_document_paths_preserve_strings_and_round_trip() {
+        let role_id = role_id(4);
+        let user_id = user_id_with_seed(5);
+        let node_id = node(6);
+
+        assert_eq!(USER_NAME_PATH, "user.name");
+        assert_eq!(GROUP_DISPLAY_NAME_PATH, "group.display_name");
+        assert_eq!(GROUP_REALM_ID_PATH, "group.realm_id");
+        assert_eq!(
+            REALM_CONFIG_METADATA_REPLICATION_PATH,
+            "realm_config.settings.metadata_replication"
+        );
+        assert_eq!(
+            REALM_CONFIG_DISCOVERY_PATH,
+            "realm_config.settings.discovery"
+        );
+        assert_eq!(
+            user_attribute_path("department"),
+            "user.attributes.department"
+        );
+        assert_eq!(
+            user_subject_id_path("subject-1"),
+            "user.subject_ids.subject-1"
+        );
+
+        let group_role = group_role_path(&role_id);
+        let group_assignment = group_role_user_assignment_path(&role_id, &user_id);
+        assert_eq!(group_role, format!("group.roles.{role_id}"));
+        assert_eq!(
+            group_assignment,
+            format!("group.roles.{role_id}.assigned_users.{user_id}")
+        );
+        assert_eq!(group_role_id_from_path(&group_role), Some(role_id));
+        assert_eq!(group_role_id_from_path(&group_assignment), None);
+        assert_eq!(
+            group_role_user_assignment_from_path(&group_assignment),
+            Some((role_id, user_id))
+        );
+
+        let realm_role = realm_role_path(&role_id);
+        let realm_assignment = realm_role_user_assignment_path(&role_id, &user_id);
+        assert_eq!(realm_role, format!("realm.roles.{role_id}"));
+        assert_eq!(
+            realm_assignment,
+            format!("realm.roles.{role_id}.assigned_users.{user_id}")
+        );
+        assert_eq!(realm_role_id_from_path(&realm_role), Some(role_id));
+        assert_eq!(realm_role_id_from_path(&realm_assignment), None);
+        assert_eq!(
+            realm_role_user_assignment_from_path(&realm_assignment),
+            Some((role_id, user_id))
+        );
+
+        let node_path = realm_config_node_path(&node_id);
+        assert_eq!(node_path, format!("realm_config.nodes.{node_id}"));
+        assert_eq!(realm_config_node_id_from_path(&node_path), Some(node_id));
+        assert_eq!(
+            realm_config_oidc_provider_path("default"),
+            "realm_config.oidc_providers.default"
+        );
+        assert_eq!(
+            realm_config_oidc_provider_id_from_path("realm_config.oidc_providers.default"),
+            Some("default")
+        );
+
+        assert_eq!(
+            group_role_user_assignment_from_path("group.roles.invalid"),
+            None
+        );
+        assert_eq!(
+            realm_role_user_assignment_from_path("realm.roles.invalid"),
+            None
+        );
+        assert_eq!(
+            realm_config_node_id_from_path("realm_config.nodes.invalid"),
+            None
+        );
+        assert_eq!(
+            realm_config_oidc_provider_id_from_path("unknown.path"),
+            None
+        );
     }
 
     #[test]
@@ -1818,48 +1947,6 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some(second_value.as_str()))
         );
-    }
-
-    #[test]
-    fn group_role_created_and_legacy_added_do_not_conflict() {
-        let mut state = group_state();
-        let role_id = role_id(3);
-        let role = role_definition(role_id, "Group admin");
-        let expected_value = role_definition_value(&role);
-
-        state.apply(&create_group_role(1, 1, role)).unwrap();
-        state.apply(&add_group_role(2, 2, role_id)).unwrap();
-
-        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
-        assert_eq!(
-            state
-                .user_subject_ids
-                .get(&format!("group.roles.{role_id}"))
-                .and_then(|version| version.value.as_deref()),
-            Some(expected_value.as_str())
-        );
-        assert!(state.conflicts.is_empty());
-    }
-
-    #[test]
-    fn realm_legacy_added_and_role_created_do_not_conflict() {
-        let mut state = realm_state();
-        let role_id = role_id(3);
-        let role = role_definition(role_id, "Realm admin");
-        let expected_value = role_definition_value(&role);
-
-        state.apply(&add_realm_role(1, 1, role_id)).unwrap();
-        state.apply(&create_realm_role(2, 2, role)).unwrap();
-
-        assert_eq!(state.materialized_realm_roles(), BTreeSet::from([role_id]));
-        assert_eq!(
-            state
-                .user_subject_ids
-                .get(&format!("realm.roles.{role_id}"))
-                .and_then(|version| version.value.as_deref()),
-            Some(expected_value.as_str())
-        );
-        assert!(state.conflicts.is_empty());
     }
 
     #[test]

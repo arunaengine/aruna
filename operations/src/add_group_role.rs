@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_sync_outbox::{
@@ -696,8 +695,7 @@ fn apply_admin_reducer_updates(
     input: &AddGroupRoleConfig,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
     let mut admin_events = Vec::new();
-    let event = apply_admin_reducer_operation(
-        state,
+    let event = state.apply_operation(
         &input.actor,
         AdminDocumentOperation::GroupRoleCreated {
             role: AdminDocumentRoleDefinition::from(&input.role),
@@ -706,8 +704,7 @@ fn apply_admin_reducer_updates(
     admin_events.push(event);
 
     for user_id in sorted_user_ids(&input.role.assigned_users) {
-        let event = apply_admin_reducer_operation(
-            state,
+        let event = state.apply_operation(
             &input.actor,
             AdminDocumentOperation::GroupRoleUserAssignmentAdded {
                 role_id: input.role.role_id,
@@ -718,25 +715,6 @@ fn apply_admin_reducer_updates(
     }
 
     Ok(admin_events)
-}
-
-fn apply_admin_reducer_operation(
-    state: &mut AdminDocumentReducerState,
-    actor: &Actor,
-    op: AdminDocumentOperation,
-) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
-    let observed = state.clock.clone();
-    let event = AdminDocumentEvent {
-        event_id: Ulid::new(),
-        target: state.target.clone(),
-        origin_node_id: actor.node_id,
-        origin_seq: observed.sequence_for(&actor.node_id) + 1,
-        observed,
-        actor: actor.clone(),
-        op,
-    };
-    state.apply(&event)?;
-    Ok(event)
 }
 
 fn materialize_group_role(
