@@ -1,4 +1,5 @@
 pub mod abort_multipart_upload;
+pub mod bucket_cors;
 pub mod complete_multipart_upload;
 pub mod create_bucket;
 pub mod create_multipart_upload;
