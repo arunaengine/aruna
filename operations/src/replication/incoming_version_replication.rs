@@ -1235,6 +1235,7 @@ mod tests {
             group_id,
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            cors_configuration: None,
         }
     }
 

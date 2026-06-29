@@ -234,6 +234,7 @@ mod test {
             group_id: Ulid::new(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
+            cors_configuration: None,
         };
 
         let result = drive(

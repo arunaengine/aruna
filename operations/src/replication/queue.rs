@@ -1432,6 +1432,7 @@ mod tests {
             group_id: Ulid::from_parts(2, 2),
             created_at: SystemTime::UNIX_EPOCH,
             created_by: user(),
+            cors_configuration: None,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {

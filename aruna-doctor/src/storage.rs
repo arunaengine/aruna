@@ -715,6 +715,7 @@ mod tests {
                         group_id: group.0.group_id,
                         created_at: SystemTime::now(),
                         created_by: realm_admin,
+                        cors_configuration: None,
                     },
                 ),
                 context.as_ref(),

@@ -621,6 +621,7 @@ mod tests {
             group_id: bucket_group_id,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             created_by: user_with_source_read,
+            cors_configuration: None,
         };
         write_doc(
             &driver_ctx,

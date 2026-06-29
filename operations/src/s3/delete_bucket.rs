@@ -351,6 +351,7 @@ mod test {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
+                    cors_configuration: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -412,6 +413,7 @@ mod test {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
+                    cors_configuration: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -486,6 +488,7 @@ mod test {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
+                    cors_configuration: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -547,6 +550,7 @@ mod test {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
+                    cors_configuration: None,
                 }
                 .to_bytes()
                 .unwrap()

@@ -577,6 +577,7 @@ impl S3 for ArunaS3Service {
         drive(operation, &self.state)
             .await
             .and_then(|result| result.transpose())
+                cors_configuration: None,
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to create bucket"))?;
 
@@ -1902,6 +1903,7 @@ mod tests {
         )
         .await;
 
+            cors_configuration: None,
         let mut extensions = Extensions::new();
         extensions.insert(test_user_access(group_id, realm_id));
         extensions.insert(test_bucket_info(group_id, created_by));
