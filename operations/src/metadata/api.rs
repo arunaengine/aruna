@@ -4,10 +4,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
+use aruna_core::keyspaces::{
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
+};
 use aruna_core::metadata::{
-    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataCreateEventRecord, MetadataError, MetadataGraphLifecycleRecord, MetadataQueryResults,
+    MetadataRoCratePage, MetadataSearchHit,
+};
+use aruna_core::storage_entries::{
+    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_target,
 };
 use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission, RealmId};
 use aruna_core::telemetry::record_elapsed_ms;
@@ -28,7 +38,7 @@ use crate::get_metadata_document::{
 use crate::get_realm_nodes::GetRealmNodesOperation;
 use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
-use crate::metadata::repository::StorageReadError;
+use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
@@ -198,14 +208,20 @@ pub async fn list_visible_metadata_documents(
     let offset = request.offset.unwrap_or(0);
 
     let mut records = Vec::new();
+    let include_pending_projection = request.include_summary;
     if let Some(group_id) = request.group_id {
-        records.extend(load_group_metadata_records(context, group_id).await?);
+        records.extend(
+            load_group_metadata_records(context, group_id, include_pending_projection).await?,
+        );
     } else {
         let groups = drive(ListGroupOperation::new(), context)
             .await
             .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
         for group in groups {
-            records.extend(load_group_metadata_records(context, group.group_id).await?);
+            records.extend(
+                load_group_metadata_records(context, group.group_id, include_pending_projection)
+                    .await?,
+            );
         }
     }
 
@@ -237,9 +253,14 @@ pub async fn list_visible_metadata_documents(
         )
         .await;
         for (record, summary) in selected.into_iter().zip(summaries) {
+            let rocrate_summary_jsonld = match summary {
+                Ok(summary) => Some(summary),
+                Err(MetadataApiError::ServiceUnavailable) => None,
+                Err(error) => return Err(error),
+            };
             documents.push(ListedMetadataDocument {
                 record,
-                rocrate_summary_jsonld: Some(summary?),
+                rocrate_summary_jsonld,
             });
         }
     } else {
@@ -403,10 +424,11 @@ pub async fn load_metadata_realm_nodes(
 async fn load_group_metadata_records(
     context: &DriverContext,
     group_id: GroupId,
+    include_pending_projection: bool,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
     // Listing remains eventually consistent: the handle-owned visibility cache
     // serves stale snapshots while one refill updates the operation-owned read path.
-    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+    if !include_pending_projection && let Some(metadata_handle) = context.metadata_handle.as_ref() {
         match metadata_handle
             .list_cached_registry_records_for_group(group_id)
             .await
@@ -421,9 +443,164 @@ async fn load_group_metadata_records(
         }
     }
 
-    drive(ListMetadataDocumentsOperation::new(group_id), context)
+    let mut records = drive(ListMetadataDocumentsOperation::new(group_id), context)
         .await
-        .map_err(|err| MetadataApiError::Internal(err.to_string()))
+        .map_err(|err| MetadataApiError::Internal(err.to_string()))?;
+
+    if include_pending_projection {
+        merge_pending_metadata_records(
+            &mut records,
+            load_pending_group_metadata_records(context, group_id).await?,
+        );
+        records.sort_by_key(|record| record.document_id);
+    }
+
+    Ok(records)
+}
+
+async fn load_pending_group_metadata_records(
+    context: &DriverContext,
+    group_id: GroupId,
+) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
+    let mut records = Vec::new();
+    let mut start_after = None;
+
+    loop {
+        let page = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.take().map(IterStart::After),
+                limit: LIST_METADATA_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+        let (values, next_start_after) = match page {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataApiError::Internal(error.to_string()));
+            }
+            other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        };
+
+        for (key, _) in values {
+            let Some((document_id, event_id)) = metadata_pending_projection_target(key.as_ref())
+            else {
+                continue;
+            };
+            let Some(event) = read_metadata_create_event(context, document_id, event_id).await?
+            else {
+                continue;
+            };
+            let record = event.record;
+            if record.group_id != group_id {
+                continue;
+            }
+            if metadata_graph_is_deleted(context, &record.graph_iri).await? {
+                continue;
+            }
+            records.push(record);
+        }
+
+        if next_start_after.is_none() {
+            break;
+        }
+        start_after = next_start_after;
+    }
+
+    Ok(records)
+}
+
+async fn read_metadata_create_event(
+    context: &DriverContext,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<Option<MetadataCreateEventRecord>, MetadataApiError> {
+    let value = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key: metadata_event_log_key(document_id, event_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(MetadataApiError::Internal(error.to_string()));
+        }
+        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let event: MetadataCreateEventRecord = postcard::from_bytes(&value)
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+    if event.record.document_id != document_id || event.event_id != event_id {
+        return Err(MetadataApiError::Internal(format!(
+            "metadata create event log target {document_id}/{event_id} did not match payload {}/{}",
+            event.record.document_id, event.event_id
+        )));
+    }
+    Ok(Some(event))
+}
+
+async fn metadata_graph_is_deleted(
+    context: &DriverContext,
+    graph_iri: &str,
+) -> Result<bool, MetadataApiError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_graph_lifecycle_key(graph_iri),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+            Ok(record.is_deleted())
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataApiError::Internal(error.to_string()))
+        }
+        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+    }
+}
+
+fn merge_pending_metadata_records(
+    records: &mut Vec<MetadataRegistryRecord>,
+    pending_records: Vec<MetadataRegistryRecord>,
+) {
+    let mut positions = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.document_id, index))
+        .collect::<HashMap<_, _>>();
+
+    for pending_record in pending_records {
+        if let Some(&index) = positions.get(&pending_record.document_id) {
+            let existing_record = &records[index];
+            if (pending_record.updated_at_ms, pending_record.last_event_id)
+                > (existing_record.updated_at_ms, existing_record.last_event_id)
+            {
+                records[index] = pending_record;
+            }
+        } else {
+            positions.insert(pending_record.document_id, records.len());
+            records.push(pending_record);
+        }
+    }
 }
 
 async fn load_record_by_document(
