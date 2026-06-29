@@ -1,43 +1,32 @@
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::structs::realm::{RealmId, autosurgeon_realm_id};
+use crate::structs::realm::RealmId;
 use crate::structs::structs::{Permission, Role};
-use crate::types::autosurgeon_ulid;
 use crate::types::{GroupId, RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Group {
     pub display_name: String,
-    #[autosurgeon(with = "autosurgeon_ulid")]
     pub group_id: GroupId,
-    #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
-    #[autosurgeon(with = "autosurgeon_role_set")]
     pub roles: HashSet<RoleId>,
 }
 
 impl Group {
-    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct GroupAuthorizationDocument {
-    #[autosurgeon(with = "autosurgeon_ulid")]
     pub group_id: GroupId,
-    #[autosurgeon(with = "autosurgeon_role_map")]
     pub roles: HashMap<RoleId, Role>,
 }
 
@@ -104,102 +93,11 @@ impl GroupAuthorizationDocument {
         GroupAuthorizationDocument { group_id, roles }
     }
 
-    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
-    }
-}
-
-pub mod autosurgeon_role_map {
-    use crate::errors::ConversionError;
-    use crate::structs::Role;
-    use crate::types::RoleId;
-    use autosurgeon::reconcile::MapReconciler;
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-    use std::collections::HashMap;
-    use ulid::Ulid;
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<HashMap<RoleId, Role>, HydrateError> {
-        let inner: HashMap<String, Role> = HashMap::hydrate(doc, obj, prop)?;
-        let role_set = inner
-            .into_iter()
-            .map(|(id, role)| -> Result<(RoleId, Role), ConversionError> {
-                let id = Ulid::from_string(&id).map_err(|_e| ConversionError::InvalidUserId)?;
-                Ok((id, role))
-            })
-            .collect::<Result<HashMap<RoleId, Role>, ConversionError>>()
-            .map_err(|e| {
-                HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
-            })?;
-        Ok(role_set)
-    }
-    pub fn reconcile<R: Reconciler>(
-        role_map: &HashMap<RoleId, Role>,
-        mut reconciler: R,
-    ) -> Result<(), R::Error> {
-        let mut map = reconciler.map()?;
-        map.retain(|role_id, _| {
-            Ulid::from_string(role_id)
-                .ok()
-                .is_some_and(|role_id| role_map.contains_key(&role_id))
-        })?;
-        for (role_id, role) in role_map.iter() {
-            map.put(role_id.to_string(), role)?;
-        }
-        Ok(())
-    }
-}
-
-pub mod autosurgeon_role_set {
-    use std::collections::{HashMap, HashSet};
-
-    use autosurgeon::reconcile::MapReconciler;
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-    use ulid::Ulid;
-
-    use crate::errors::ConversionError;
-    use crate::types::RoleId;
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<HashSet<RoleId>, HydrateError> {
-        let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
-        let role_set = inner
-            .into_keys()
-            .map(|id| {
-                let id = Ulid::from_string(&id).map_err(|_e| ConversionError::InvalidUserId)?;
-                Ok(id)
-            })
-            .collect::<Result<HashSet<RoleId>, ConversionError>>()
-            .map_err(|e| {
-                HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
-            })?;
-        Ok(role_set)
-    }
-    pub fn reconcile<R: Reconciler>(
-        role_set: &HashSet<RoleId>,
-        mut reconciler: R,
-    ) -> Result<(), R::Error> {
-        let mut map = reconciler.map()?;
-        map.retain(|role_id, _| {
-            Ulid::from_string(role_id)
-                .ok()
-                .is_some_and(|role_id| role_set.contains(&role_id))
-        })?;
-        for role_id in role_set.iter() {
-            map.put(role_id.to_string(), String::new())?;
-        }
-        Ok(())
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -208,8 +106,7 @@ mod test {
     use std::collections::HashSet;
 
     use crate::UserId;
-    use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
-    use autosurgeon::{hydrate, reconcile};
+    use crate::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
     use ulid::Ulid;
 
     #[test]
@@ -220,13 +117,13 @@ mod test {
             realm_id: RealmId([0u8; 32]),
             roles: HashSet::from([Ulid::new(), Ulid::new()]),
         };
-        let mut automerge_doc = automerge::AutoCommit::new();
-        reconcile(&mut automerge_doc, &group).unwrap();
-
-        let bytes = automerge_doc.save();
-
-        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
-        let hydrated_group: Group = hydrate(&stored_automerge_doc).unwrap();
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
+        };
+        let bytes = group.to_bytes(&actor).unwrap();
+        let hydrated_group = Group::from_bytes(&bytes).unwrap();
 
         assert_eq!(group, hydrated_group);
     }
@@ -238,13 +135,13 @@ mod test {
             RealmId([0u8; 32]),
             Ulid::new(),
         );
-        let mut automerge_doc = automerge::AutoCommit::new();
-        reconcile(&mut automerge_doc, &auth_doc).unwrap();
-
-        let bytes = automerge_doc.save();
-
-        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
-        let hydrated_auth_doc: GroupAuthorizationDocument = hydrate(&stored_automerge_doc).unwrap();
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
+        };
+        let bytes = auth_doc.to_bytes(&actor).unwrap();
+        let hydrated_auth_doc = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
 
         assert_eq!(auth_doc, hydrated_auth_doc);
     }

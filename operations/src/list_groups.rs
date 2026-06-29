@@ -47,7 +47,7 @@ impl ListGroupOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: GROUP_KEYSPACE.to_string(),
             prefix: None,
-            start_after: None,
+            start: None,
             limit: scan_limit,
             txn_id: self.txn_id,
         })]
@@ -270,7 +270,6 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
         };

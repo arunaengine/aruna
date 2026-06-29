@@ -1,29 +1,35 @@
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
-use aruna_core::handle::Handle;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit,
+    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, create_metadata_document as run_create_metadata_document,
 };
-use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
+use aruna_operations::delete_metadata_document::{
+    DeleteMetadataDocumentOperation, delete_metadata_document as run_delete_metadata_document,
+};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::repository::{
-    parse_registry_read, read_registry_by_document_effect,
+use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::api::{
+    ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
+    ListVisibleMetadataDocumentsRequest, MetadataApiError, MetadataApiQueryMode,
+    MetadataDocumentQueryRequest, MetadataFanoutStats, MetadataQueryRequest,
+    MetadataRoCrateExportView as OperationMetadataRoCrateExportView, MetadataSearchRequest,
+    export_metadata_rocrate as run_export_metadata_rocrate,
+    get_visible_metadata_document as run_get_visible_metadata_document,
+    list_visible_metadata_documents as run_list_visible_metadata_documents,
+    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
+    search_metadata as run_search_metadata,
 };
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -32,12 +38,23 @@ use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Instant;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
+
+#[cfg(test)]
+use aruna_operations::metadata::MetadataAuthToken;
+#[cfg(test)]
+use aruna_operations::metadata::api::{
+    MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
+    deduplicate_search_hits, document_replica_query_nodes, load_metadata_realm_nodes,
+    metadata_auth_token_from_bearer, query_select_limit,
+};
+#[cfg(test)]
+use std::time::Duration;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -45,6 +62,7 @@ use utoipa::{OpenApi, ToSchema};
     components(schemas(MetadataRoCrateView)),
     paths(
         create_metadata_document,
+        list_all_metadata_documents,
         list_metadata_documents,
         get_metadata_document,
         delete_metadata_document,
@@ -61,7 +79,10 @@ pub struct MetadataApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/metadata", post(create_metadata_document))
+        .route(
+            "/metadata",
+            get(list_all_metadata_documents).post(create_metadata_document),
+        )
         .route("/metadata/search", get(search_metadata))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
@@ -87,6 +108,11 @@ pub fn router() -> Router<Arc<ServerState>> {
         )
 }
 
+/// Public metadata registry summary.
+///
+/// When returned by create or update endpoints, this summary reflects a write
+/// accepted into the durable event/projection pipeline. The graph, query/search
+/// visibility, and remote replicas may still be catching up.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataDocumentSummary {
     pub document_id: String,
@@ -130,15 +156,51 @@ pub enum CreateMetadataRequest {
     RoCrate(CreateMetadataRoCrateRequest),
 }
 
+/// Response for a metadata create request accepted into the durable
+/// event/projection pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateMetadataResponse {
+    /// Accepted registry summary. It does not guarantee the graph is fully
+    /// materialized, queryable, searchable, or replicated yet.
     #[serde(flatten)]
     pub summary: MetadataDocumentSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListMetadataResponse {
-    pub documents: Vec<MetadataDocumentSummary>,
+    pub documents: Vec<MetadataDocumentListItem>,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_returned: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataDocumentListItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub public: bool,
+    pub replicas: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub rocrate_summary: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListMetadataQuery {
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub include: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -205,6 +267,16 @@ pub struct MetadataSearchHitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchResponse {
     pub hits: Vec<MetadataSearchHitResponse>,
+    /// Number of node partitions this search was executed against.
+    pub nodes_queried: usize,
+    /// Number of node partitions that failed or timed out; a non-zero value
+    /// means the result is partial.
+    pub nodes_failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataIncludeFlags {
+    summary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -214,7 +286,9 @@ pub struct SparqlQueryRequest {
     /// Query execution scope. Omit to use `distributed`.
     ///
     /// `local` runs only against metadata indexed on the current node.
-    /// `distributed` fans out to all known realm nodes and merges the results.
+    /// `distributed` fans out to all known realm nodes for all-metadata queries,
+    /// or to the document's registry replica nodes for document-scoped queries,
+    /// and merges the results.
     /// Distributed mode is best-effort and may return partial results if realm
     /// node discovery or remote requests fail.
     #[serde(default)]
@@ -233,8 +307,19 @@ pub enum MetadataQueryMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataQueryResponse {
+    #[serde(flatten)]
+    pub result: MetadataQueryResult,
+    /// Number of node partitions this query was executed against.
+    pub nodes_queried: usize,
+    /// Number of node partitions that failed or timed out; a non-zero value
+    /// means the result is partial.
+    pub nodes_failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", content = "value")]
-pub enum MetadataQueryResponse {
+pub enum MetadataQueryResult {
     Solutions(Vec<HashMap<String, String>>),
     Boolean(bool),
 }
@@ -250,6 +335,22 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
             replicas: record.holder_node_ids.len(),
             created_at: format_timestamp_ms(record.created_at_ms),
             updated_at: format_timestamp_ms(record.updated_at_ms),
+        }
+    }
+}
+
+impl MetadataDocumentListItem {
+    fn from_record(record: &MetadataRegistryRecord, rocrate_summary: Option<Value>) -> Self {
+        Self {
+            document_id: record.document_id.to_string(),
+            group_id: record.group_id.to_string(),
+            document_path: record.document_path.clone(),
+            graph_iri: record.graph_iri.clone(),
+            public: record.public,
+            replicas: record.holder_node_ids.len(),
+            created_at: format_timestamp_ms(record.created_at_ms),
+            updated_at: format_timestamp_ms(record.updated_at_ms),
+            rocrate_summary,
         }
     }
 }
@@ -310,23 +411,21 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
     responses(
         (
             status = 201,
-            description = "Metadata document created",
+            description = "Metadata create accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = CreateMetadataResponse,
             examples(
                 (
                     "Created" = (
                         summary = "Created metadata summary",
                         value = json!({
-                            "summary": {
-                                "document_id": "01JMETADATA0123456789ABCDE",
-                                "group_id": "01JABCDEF0123456789ABCDEFG",
-                                "document_path": "datasets/proteomics/run-42",
-                                "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-                                "public": true,
-                                "replicas": 3,
-                                "created_at": "2026-04-09T14:23:11.123Z",
-                                "updated_at": "2026-04-09T14:23:11.123Z"
-                            }
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:23:11.123Z"
                         })
                     )
                 )
@@ -370,23 +469,27 @@ pub async fn create_metadata_document(
     }
     ensure_metadata_write_scope(&state, &auth, group_id).await?;
 
-    let result = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
+    let ctx = state.get_ctx();
+    let created = run_create_metadata_document(
+        CreateMetadataDocumentOperation::new_for_generated_document_id(
+            CreateMetadataDocumentConfig {
+                actor: Actor {
+                    node_id: state.get_node_id(),
+                    user_id: auth.user_id,
+                    realm_id: state.get_realm_id(),
+                },
+                group_id,
+                document_id: Ulid::new(),
+                document_path: path,
+                public,
+                payload,
             },
-            group_id,
-            document_id: Ulid::new(),
-            document_path: path,
-            public,
-            payload,
-        }),
-        &state.get_ctx(),
+        ),
+        ctx,
     )
     .await
     .map_err(map_create_metadata_error)?;
+    let result = created.record;
 
     Ok((
         StatusCode::CREATED,
@@ -398,9 +501,43 @@ pub async fn create_metadata_document(
 
 #[utoipa::path(
     get,
+    path = "/metadata",
+    tag = "metadata",
+    params(
+        ("group_id" = Option<String>, Query, description = "Optional group id filter"),
+        ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
+        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
+        ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+    ),
+    responses(
+        (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
+        (status = 400, description = "Invalid query", body = ErrorResponse)
+    )
+)]
+pub async fn list_all_metadata_documents(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ListMetadataQuery>,
+) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
+    let group_id = query.group_id.as_deref().map(parse_group_id).transpose()?;
+    Ok((
+        StatusCode::OK,
+        Json(run_list_metadata_documents(&state, auth, query, group_id).await?),
+    ))
+}
+
+#[utoipa::path(
+    get,
     path = "/groups/{group_id}/metadata",
     tag = "metadata",
-    params(("group_id" = String, Path, description = "Group id")),
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
+        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
+        ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+    ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid group id", body = ErrorResponse)
@@ -410,25 +547,12 @@ pub async fn list_metadata_documents(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
+    Query(query): Query<ListMetadataQuery>,
 ) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let records = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-
-    let mut visible = Vec::new();
-    for record in records {
-        if can_read_record(&state, auth.as_ref(), &record).await? {
-            visible.push(MetadataDocumentSummary::from(&record));
-        }
-    }
-
     Ok((
         StatusCode::OK,
-        Json(ListMetadataResponse { documents: visible }),
+        Json(run_list_metadata_documents(&state, auth, query, Some(group_id)).await?),
     ))
 }
 
@@ -451,8 +575,14 @@ pub async fn get_metadata_document(
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
+    let ctx = state.get_ctx();
+    let record = run_get_visible_metadata_document(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        GetVisibleMetadataDocumentRequest { document_id, auth },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -480,7 +610,8 @@ pub async fn delete_metadata_document(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    drive(
+    let ctx = state.get_ctx();
+    run_delete_metadata_document(
         DeleteMetadataDocumentOperation::new(
             Actor {
                 node_id: state.get_node_id(),
@@ -490,7 +621,8 @@ pub async fn delete_metadata_document(
             record.group_id,
             document_id,
         ),
-        &state.get_ctx(),
+        ctx.as_ref(),
+        document_id,
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
@@ -566,33 +698,23 @@ pub async fn export_metadata_rocrate(
     Query(params): Query<MetadataRoCrateExportParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataRoCrateResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    let response = match params.view.clone().unwrap_or(MetadataRoCrateView::Full) {
-        MetadataRoCrateView::Full => MetadataRoCrateResponse {
-            rocrate: export_rocrate_jsonld(&state, &record.graph_iri).await?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
+    let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
+    let ctx = state.get_ctx();
+    let export = run_export_metadata_rocrate(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        ExportMetadataRoCrateRequest {
+            document_id,
+            auth,
+            view: map_rocrate_export_view(&view),
+            limit: params.limit,
+            offset: params.offset,
+            after: params.after.clone(),
         },
-        MetadataRoCrateView::Summary => MetadataRoCrateResponse {
-            rocrate: rewrite_view_jsonld(
-                export_rocrate_summary_jsonld(&state, &record.graph_iri).await?,
-                &record.graph_iri,
-                &build_view_id(&record.graph_iri, &params, MetadataRoCrateView::Summary),
-            )?,
-            total_data_entities: None,
-            returned_data_entities: None,
-            next_offset: None,
-            next_cursor: None,
-        },
-        MetadataRoCrateView::Page => map_page_response(
-            export_rocrate_page(&state, &record.graph_iri, &params).await?,
-            &record.graph_iri,
-            &build_view_id(&record.graph_iri, &params, MetadataRoCrateView::Page),
-        )?,
-    };
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    let response = map_rocrate_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))
 }
 
@@ -637,7 +759,7 @@ pub async fn export_metadata_rocrate(
     responses(
         (
             status = 200,
-            description = "Metadata document updated",
+            description = "Metadata update accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -675,7 +797,8 @@ pub async fn replace_metadata_rocrate(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -689,7 +812,7 @@ pub async fn replace_metadata_rocrate(
                 jsonld: serialize_jsonld_object(&request.rocrate)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
@@ -729,7 +852,7 @@ pub async fn replace_metadata_rocrate(
     responses(
         (
             status = 200,
-            description = "Data entity upserted",
+            description = "Data entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -767,7 +890,8 @@ pub async fn add_metadata_data_entity(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -781,7 +905,7 @@ pub async fn add_metadata_data_entity(
                 jsonld: serialize_jsonld_entity(&entity)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
@@ -817,7 +941,7 @@ pub async fn add_metadata_data_entity(
     responses(
         (
             status = 200,
-            description = "Contextual entity upserted",
+            description = "Contextual entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -855,7 +979,8 @@ pub async fn add_metadata_contextual_entity(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
-    let updated = drive(
+    let ctx = state.get_ctx();
+    let updated = run_update_metadata_document(
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
@@ -869,7 +994,7 @@ pub async fn add_metadata_contextual_entity(
                 jsonld: serialize_jsonld_entity(&entity)?,
             },
         }),
-        &state.get_ctx(),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_update_metadata_error)?;
@@ -887,7 +1012,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replica nodes and merges the results. Distributed mode is best-effort and may return partial results if replica requests fail. Omitting `mode` defaults to `distributed`.",
         examples(
             (
                 "DocumentAsk" = (
@@ -919,22 +1044,30 @@ pub async fn add_metadata_contextual_entity(
 pub async fn query_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    ensure_supported_query_form(&request.query)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    let results = run_query_distributed(
-        &state,
-        auth,
-        Some(vec![record.graph_iri.clone()]),
-        request.query,
-        request.mode,
+    let ctx = state.get_ctx();
+    let result = run_query_metadata_document(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataDocumentQueryRequest {
+            document_id,
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            query: request.query,
+            mode: map_query_mode(request.mode),
+        },
     )
-    .await?;
-    Ok((StatusCode::OK, Json(map_query_results(results)?)))
+    .await
+    .map_err(map_metadata_api_error)?;
+    let serialize_started = Instant::now();
+    let response = map_query_results(result.results, result.fanout_stats)?;
+    aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -973,11 +1106,29 @@ pub async fn query_metadata_document(
 pub async fn query_all_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
-    ensure_supported_query_form(&request.query)?;
-    let results = run_query_distributed(&state, auth, None, request.query, request.mode).await?;
-    Ok((StatusCode::OK, Json(map_query_results(results)?)))
+    let ctx = state.get_ctx();
+    let result = run_query_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataQueryRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            graph_iris: None,
+            query: request.query,
+            mode: map_query_mode(request.mode),
+            target_nodes: None,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+    let serialize_started = Instant::now();
+    let response = map_query_results(result.results, result.fanout_stats)?;
+    aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -998,23 +1149,97 @@ pub async fn query_all_metadata(
 pub async fn search_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(params): Query<MetadataSearchParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
-    if params.q.trim().is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let hits = run_search_distributed(&state, auth, None, params.q, limit, params.mode).await?;
+    let ctx = state.get_ctx();
+    let result = run_search_metadata(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        MetadataSearchRequest {
+            auth,
+            bearer_token: bearer_token_to_string(bearer_token),
+            graph_iris: None,
+            query: params.q,
+            limit: params.limit,
+            mode: map_query_mode(params.mode),
+            target_nodes: None,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
     Ok((
         StatusCode::OK,
         Json(MetadataSearchResponse {
-            hits: hits.into_iter().map(map_search_hit).collect(),
+            hits: result.hits.into_iter().map(map_search_hit).collect(),
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
         }),
     ))
 }
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+}
+
+async fn run_list_metadata_documents(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    query: ListMetadataQuery,
+    group_id: Option<Ulid>,
+) -> ServerResult<ListMetadataResponse> {
+    let include = parse_metadata_include_flags(query.include.as_deref())?;
+    let ctx = state.get_ctx();
+    let result = run_list_visible_metadata_documents(
+        ctx.as_ref(),
+        state.get_realm_id(),
+        ListVisibleMetadataDocumentsRequest {
+            group_id,
+            path_prefix: query.path_prefix,
+            include_summary: include.summary,
+            limit: query.limit,
+            offset: query.offset,
+            auth,
+        },
+    )
+    .await
+    .map_err(map_metadata_api_error)?;
+
+    let mut documents = Vec::with_capacity(result.documents.len());
+    for document in result.documents {
+        let rocrate_summary = document
+            .rocrate_summary_jsonld
+            .map(parse_jsonld)
+            .transpose()?;
+        documents.push(MetadataDocumentListItem::from_record(
+            &document.record,
+            rocrate_summary,
+        ));
+    }
+    Ok(ListMetadataResponse {
+        documents,
+        limit: result.limit,
+        offset: result.offset,
+        total_returned: result.total_returned,
+    })
+}
+
+fn parse_metadata_include_flags(include: Option<&str>) -> ServerResult<MetadataIncludeFlags> {
+    let mut flags = MetadataIncludeFlags::default();
+    let Some(include) = include else {
+        return Ok(flags);
+    };
+    for value in include.split(',').map(str::trim) {
+        if value.is_empty() {
+            continue;
+        }
+        match value {
+            "summary" => flags.summary = true,
+            _ => return Err(ServerError::BadRequest),
+        }
+    }
+    Ok(flags)
 }
 
 fn format_timestamp_ms(timestamp_ms: u64) -> String {
@@ -1064,8 +1289,33 @@ fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError 
 fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
+}
+
+fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
+    match error {
+        MetadataApiError::BadRequest => ServerError::BadRequest,
+        MetadataApiError::Unauthorized => ServerError::Unauthorized,
+        MetadataApiError::Forbidden => ServerError::Forbidden,
+        MetadataApiError::NotFound => ServerError::NotFound,
+        MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::Internal(message) => ServerError::InternalError(message),
+    }
+}
+
+fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
+    mode.map(|mode| match mode {
+        MetadataQueryMode::Local => MetadataApiQueryMode::Local,
+        MetadataQueryMode::Distributed => MetadataApiQueryMode::Distributed,
+    })
+}
+
+fn bearer_token_to_string(
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+) -> Option<String> {
+    bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
 async fn ensure_metadata_write_scope(
@@ -1075,26 +1325,6 @@ async fn ensure_metadata_write_scope(
 ) -> ServerResult<()> {
     let path = format!("/{}/g/{group_id}/meta/**", state.get_realm_id());
     ensure_permission(state, auth.clone(), path, Permission::WRITE).await
-}
-
-async fn ensure_record_readable(
-    state: &ServerState,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<()> {
-    if record.public {
-        return Ok(());
-    }
-    let Some(auth) = auth.cloned() else {
-        return Err(ServerError::Unauthorized);
-    };
-    ensure_permission(
-        state,
-        auth,
-        record.permission_path.clone(),
-        Permission::READ,
-    )
-    .await
 }
 
 async fn ensure_record_writable(
@@ -1111,36 +1341,6 @@ async fn ensure_record_writable(
     .await
 }
 
-async fn can_read_record(
-    state: &ServerState,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<bool> {
-    if record.public {
-        return Ok(true);
-    }
-    let Some(auth) = auth.cloned() else {
-        return Ok(false);
-    };
-    if auth.realm_id != state.get_realm_id() {
-        return Ok(false);
-    }
-
-    match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path: record.permission_path.clone(),
-            required_permission: Permission::READ,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(allowed) => Ok(allowed),
-        Err(_) => Ok(false),
-    }
-}
-
 async fn ensure_permission(
     state: &ServerState,
     auth: AuthContext,
@@ -1150,16 +1350,25 @@ async fn ensure_permission(
     if auth.realm_id != state.get_realm_id() {
         return Err(ServerError::Forbidden);
     }
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
+    let allowed = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth,
+                path,
+                required_permission,
+            }),
+            &state.get_ctx(),
+        ),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| match err {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(err.to_string()),
+    })?;
     if allowed {
         Ok(())
     } else {
@@ -1171,12 +1380,8 @@ async fn load_metadata_record_by_document(
     state: &ServerState,
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_effect(read_registry_by_document_effect(document_id, None))
-        .await;
-    match parse_registry_read(event) {
+    let ctx = state.get_ctx();
+    match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
         Err(crate::routes::metadata::ReadError::Storage(error)) => {
@@ -1190,83 +1395,43 @@ async fn load_metadata_record_by_document(
 
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
 
-async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<Value> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
-            graph_iri: graph_iri.to_string(),
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata export event: {other:?}"
-        ))),
+fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCrateExportView {
+    match view {
+        MetadataRoCrateView::Full => OperationMetadataRoCrateExportView::Full,
+        MetadataRoCrateView::Summary => OperationMetadataRoCrateExportView::Summary,
+        MetadataRoCrateView::Page => OperationMetadataRoCrateExportView::Page,
     }
 }
 
-async fn export_rocrate_summary_jsonld(
-    state: &ServerState,
-    graph_iri: &str,
-) -> ServerResult<Value> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrateSummary {
-            graph_iri: graph_iri.to_string(),
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata summary event: {other:?}"
-        ))),
-    }
-}
-
-async fn export_rocrate_page(
-    state: &ServerState,
-    graph_iri: &str,
+fn map_rocrate_export_response(
+    export: ExportMetadataRoCrateResult,
     params: &MetadataRoCrateExportParams,
-) -> ServerResult<MetadataRoCratePage> {
-    if params.offset.is_some() && params.after.is_some() {
-        return Err(ServerError::BadRequest);
-    }
-    let limit = params.limit.unwrap_or(100).clamp(1, 1_000);
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCratePage {
-            graph_iri: graph_iri.to_string(),
-            offset: params.offset,
-            after: params.after.clone(),
-            limit,
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::RoCratePageResult { page, .. }) => Ok(page),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata page event: {other:?}"
-        ))),
+    view: MetadataRoCrateView,
+) -> ServerResult<MetadataRoCrateResponse> {
+    match export {
+        ExportMetadataRoCrateResult::Full { jsonld, .. } => Ok(MetadataRoCrateResponse {
+            rocrate: parse_jsonld(jsonld)?,
+            total_data_entities: None,
+            returned_data_entities: None,
+            next_offset: None,
+            next_cursor: None,
+        }),
+        ExportMetadataRoCrateResult::Summary { record, jsonld } => Ok(MetadataRoCrateResponse {
+            rocrate: rewrite_view_jsonld(
+                parse_jsonld(jsonld)?,
+                &record.graph_iri,
+                &build_view_id(&record.graph_iri, params, view),
+            )?,
+            total_data_entities: None,
+            returned_data_entities: None,
+            next_offset: None,
+            next_cursor: None,
+        }),
+        ExportMetadataRoCrateResult::Page { record, page } => map_page_response(
+            page,
+            &record.graph_iri,
+            &build_view_id(&record.graph_iri, params, view),
+        ),
     }
 }
 
@@ -1355,226 +1520,30 @@ fn rewrite_identifier_value(
     }
 }
 
-fn ensure_supported_query_mode(mode: &Option<MetadataQueryMode>) -> ServerResult<()> {
-    match mode {
-        None | Some(MetadataQueryMode::Local) | Some(MetadataQueryMode::Distributed) => Ok(()),
-    }
-}
-
-fn ensure_supported_query_form(query: &str) -> ServerResult<()> {
-    match query_form(query) {
-        Some(QueryForm::Select | QueryForm::Ask) => Ok(()),
-        _ => Err(ServerError::BadRequest),
-    }
-}
-
-fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQueryResponse> {
-    match results {
-        MetadataQueryResults::Solutions(rows) => Ok(MetadataQueryResponse::Solutions(
+fn map_query_results(
+    results: MetadataQueryResults,
+    fanout_stats: MetadataFanoutStats,
+) -> ServerResult<MetadataQueryResponse> {
+    let result = match results {
+        MetadataQueryResults::Solutions(rows) => MetadataQueryResult::Solutions(
             rows.into_iter()
                 .map(|row| row.into_iter().collect::<HashMap<_, _>>())
                 .collect(),
-        )),
-        MetadataQueryResults::Boolean(value) => Ok(MetadataQueryResponse::Boolean(value)),
-        MetadataQueryResults::Graph(_) => Err(ServerError::BadRequest),
-    }
-}
-
-async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let nodes = match drive(
-        GetRealmNodesOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(nodes) => nodes,
-        Err(error) => {
-            warn!(
-                error = %error,
-                "realm node discovery failed, using best-effort local-only metadata results"
-            );
-            HashSet::new()
-        }
+        ),
+        MetadataQueryResults::Boolean(value) => MetadataQueryResult::Boolean(value),
+        MetadataQueryResults::Graph(_) => return Err(ServerError::BadRequest),
     };
-    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-    if !nodes.contains(&state.get_node_id()) {
-        nodes.push(state.get_node_id());
-    }
-    Ok(nodes)
+    Ok(MetadataQueryResponse {
+        result,
+        nodes_queried: fanout_stats.nodes_queried,
+        nodes_failed: fanout_stats.nodes_failed,
+    })
 }
 
-async fn run_query_distributed(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-    graph_iris: Option<Vec<String>>,
-    query: String,
-    mode: Option<MetadataQueryMode>,
-) -> ServerResult<MetadataQueryResults> {
-    ensure_supported_query_mode(&mode)?;
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    let query_form = query_form(&query).ok_or(ServerError::BadRequest)?;
-
-    let mut parts = Vec::new();
-    match mode.unwrap_or(MetadataQueryMode::Distributed) {
-        MetadataQueryMode::Local => {
-            parts.push(
-                handle
-                    .query_authorized_local(auth, graph_iris, query)
-                    .await
-                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
-            );
-        }
-        MetadataQueryMode::Distributed => {
-            let nodes = load_realm_nodes(state).await?;
-            for node_id in nodes {
-                let result = if node_id == state.get_node_id() {
-                    handle
-                        .query_authorized_local(auth.clone(), graph_iris.clone(), query.clone())
-                        .await
-                } else {
-                    handle
-                        .request_remote_query_graphs(
-                            node_id,
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                        )
-                        .await
-                };
-                match result {
-                    Ok(result) => parts.push(result),
-                    Err(error) => warn!(
-                        node_id = ?node_id,
-                        error = %error,
-                        "distributed metadata query skipped failed node result"
-                    ),
-                }
-            }
-        }
-    }
-
-    aggregate_query_results(parts, query_form)
-}
-
-async fn run_search_distributed(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-    graph_iris: Option<Vec<String>>,
-    query: String,
-    limit: usize,
-    mode: Option<MetadataQueryMode>,
-) -> ServerResult<Vec<MetadataSearchHit>> {
-    ensure_supported_query_mode(&mode)?;
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-
-    let mut hits = Vec::new();
-    match mode.unwrap_or(MetadataQueryMode::Distributed) {
-        MetadataQueryMode::Local => {
-            hits.extend(
-                handle
-                    .search_authorized_local(auth, graph_iris, query, limit)
-                    .await
-                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
-            );
-        }
-        MetadataQueryMode::Distributed => {
-            let nodes = load_realm_nodes(state).await?;
-            for node_id in nodes {
-                let result = if node_id == state.get_node_id() {
-                    handle
-                        .search_authorized_local(
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                            limit,
-                        )
-                        .await
-                } else {
-                    handle
-                        .request_remote_search_graphs(
-                            node_id,
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                            limit,
-                        )
-                        .await
-                };
-                match result {
-                    Ok(result) => hits.extend(result),
-                    Err(error) => warn!(
-                        node_id = ?node_id,
-                        error = %error,
-                        "distributed metadata search skipped failed node result"
-                    ),
-                }
-            }
-        }
-    }
-
-    Ok(deduplicate_search_hits(hits, limit))
-}
-
-fn aggregate_query_results(
-    results: Vec<MetadataQueryResults>,
-    query_form: QueryForm,
-) -> ServerResult<MetadataQueryResults> {
-    match query_form {
-        QueryForm::Ask => {
-            Ok(MetadataQueryResults::Boolean(results.into_iter().any(
-                |result| matches!(result, MetadataQueryResults::Boolean(true)),
-            )))
-        }
-        QueryForm::Select => {
-            let mut seen = HashSet::new();
-            let mut merged = Vec::new();
-            for result in results {
-                let MetadataQueryResults::Solutions(rows) = result else {
-                    continue;
-                };
-                for row in rows {
-                    let key = serde_json::to_string(&row)
-                        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-                    if seen.insert(key) {
-                        merged.push(row);
-                    }
-                }
-            }
-            Ok(MetadataQueryResults::Solutions(merged))
-        }
-    }
-}
-
-fn deduplicate_search_hits(hits: Vec<MetadataSearchHit>, limit: usize) -> Vec<MetadataSearchHit> {
-    let mut deduped = HashMap::new();
-    for hit in hits {
-        let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
-        deduped
-            .entry(key)
-            .and_modify(|existing: &mut MetadataSearchHit| {
-                if hit.score > existing.score {
-                    *existing = hit.clone();
-                }
-            })
-            .or_insert(hit);
-    }
-    let mut hits = deduped.into_values().collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    hits.truncate(limit);
-    hits
+#[cfg(test)]
+async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
+    let ctx = state.get_ctx();
+    Ok(load_metadata_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
 fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
@@ -1588,51 +1557,49 @@ fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryForm {
-    Select,
-    Ask,
-}
-
-fn query_form(query: &str) -> Option<QueryForm> {
-    let mut remaining = query.trim_start();
-    loop {
-        let trimmed = remaining.trim_start();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            remaining = rest.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
-            continue;
-        }
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.starts_with("PREFIX ") || upper.starts_with("BASE ") {
-            remaining = trimmed.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
-            continue;
-        }
-        if upper.starts_with("SELECT") {
-            return Some(QueryForm::Select);
-        }
-        if upper.starts_with("ASK") {
-            return Some(QueryForm::Ask);
-        }
-        return None;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, TASK_TIMER_KEYSPACE,
+    };
+    use aruna_core::metadata::{
+        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+    };
+    use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+    };
+    use aruna_core::task::{PersistedTaskTimer, TaskKey};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::announce_realm_presence::{
+        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
     use aruna_operations::driver::DriverContext;
+    use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::metadata::MetadataHandle;
+    use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
+    use aruna_operations::metadata::projector::{
+        drain_pending_metadata_projection_queue, replay_metadata_event_log,
+        schedule_pending_metadata_projection_drain,
+    };
+    use aruna_operations::metadata::prune_queue::{
+        metadata_graph_prune_jobs_exist, process_metadata_graph_tombstones,
+    };
+    use aruna_operations::metadata::repository::{
+        write_document_lifecycle_effect, write_graph_lifecycle_effect,
+    };
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -1643,6 +1610,13 @@ mod tests {
         auth: AuthContext,
         group_id: Ulid,
         state: Arc<ServerState>,
+    }
+
+    fn installed_metadata_handle(context: &DriverContext) -> &MetadataHandle {
+        let DriverContext {
+            metadata_handle, ..
+        } = context;
+        metadata_handle.as_ref().expect("metadata handle installed")
     }
 
     #[tokio::test]
@@ -1667,17 +1641,38 @@ mod tests {
         .await
         .unwrap();
 
+        let document_id = created.summary.document_id.clone();
+
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
             Extension(None),
             Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
+
+        let fetched = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(document_id.clone()),
+        )
+        .await;
+        assert!(matches!(fetched, Err(ServerError::NotFound)));
+
+        drain_metadata_background(test.state.as_ref()).await;
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
         )
         .await
         .unwrap();
         assert_eq!(listed.documents.len(), 1);
         assert_eq!(listed.documents[0].document_id, created.summary.document_id);
 
-        let document_id = created.summary.document_id.clone();
         let paged_jsonld = format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -1731,6 +1726,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(response)) = export_metadata_rocrate(
             State(test.state.clone()),
@@ -1793,6 +1789,7 @@ mod tests {
         let (_, Json(result)) = query_metadata_document(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(document_id.clone()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s <http://schema.org/name> \"Public Dataset\" }".to_string(),
@@ -1801,10 +1798,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, MetadataQueryResponse::Boolean(true)));
+        assert!(matches!(result.result, MetadataQueryResult::Boolean(true)));
+        assert_eq!(result.nodes_queried, 1);
+        assert_eq!(result.nodes_failed, 0);
+
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
 
         let (_, Json(search)) = search_metadata(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
@@ -1815,6 +1821,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!search.hits.is_empty());
+        assert_eq!(search.nodes_queried, 1);
+        assert_eq!(search.nodes_failed, 0);
     }
 
     #[tokio::test]
@@ -1858,6 +1866,7 @@ mod tests {
         assert_eq!(created.summary.document_path, "datasets/rocrate-dataset");
         assert!(created.summary.created_at.ends_with('Z'));
         assert!(created.summary.updated_at.ends_with('Z'));
+        drain_metadata_background(test.state.as_ref()).await;
 
         let _ = add_metadata_contextual_entity(
             State(test.state.clone()),
@@ -1885,6 +1894,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(exported)) = export_metadata_rocrate(
             State(test.state),
@@ -1900,6 +1910,179 @@ mod tests {
         assert!(json.contains("Created From RO-Crate"));
         assert!(json.contains("Ada Lovelace"));
         assert!(json.contains("run-42.raw"));
+    }
+
+    #[tokio::test]
+    async fn list_metadata_documents_serves_records_from_handle_registry_cache() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/cache-served".to_string(),
+                    name: "Cache Served Dataset".to_string(),
+                    description: "Served from the handle registry cache".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert_eq!(listed.documents[0].document_id, created.summary.document_id);
+
+        let status = delete_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(created.summary.document_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_document_lifecycle_tombstone_hides_stale_registry_listing() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/inbound-tombstone".to_string(),
+                    name: "Inbound Tombstone Dataset".to_string(),
+                    description: "Deleted by document lifecycle only".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let document_id = parse_document_id(&created.summary.document_id).unwrap();
+        let record = load_metadata_record_by_document(test.state.as_ref(), document_id)
+            .await
+            .unwrap();
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+            event: MetadataDocumentDeleteRecord {
+                event_id: Ulid::new(),
+                tombstone: tombstone.clone(),
+                deleted_after_event_id: record.last_event_id,
+            },
+        };
+        for effect in [
+            write_graph_lifecycle_effect(&tombstone, None).unwrap(),
+            write_document_lifecycle_effect(&lifecycle, None).unwrap(),
+        ] {
+            match ctx.storage_handle.send_effect(effect).await {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected lifecycle write event: {other:?}"),
+            }
+        }
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes: metadata_registry_delete_entries(record.group_id, record.document_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            other => panic!("unexpected registry delete event: {other:?}"),
+        }
+
+        let processed = process_metadata_graph_tombstones(ctx.as_ref(), vec![tombstone]).await;
+
+        assert_eq!(processed.enqueued, 1);
+        assert!(
+            metadata_graph_prune_jobs_exist(&ctx.storage_handle)
+                .await
+                .unwrap()
+        );
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
+        let fetched = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id),
+        )
+        .await;
+        assert!(matches!(fetched, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn pending_projection_drain_timer_is_persisted() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+
+        schedule_pending_metadata_projection_drain(ctx.as_ref(), Duration::ZERO)
+            .await
+            .expect("projection drain scheduled");
+
+        let timer = read_persisted_task_timer(ctx.as_ref(), &TaskKey::DrainMetadataProjectionQueue)
+            .await
+            .expect("projection drain timer persisted");
+        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
     }
 
     #[tokio::test]
@@ -1923,11 +2106,13 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(listed)) = list_metadata_documents(
             State(test.state.clone()),
             Extension(None),
             Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
         )
         .await
         .unwrap();
@@ -1950,6 +2135,7 @@ mod tests {
         let result = query_metadata_document(
             State(test.state),
             Extension(None),
+            Extension(None),
             Path(Ulid::new().to_string()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
@@ -1971,6 +2157,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_realm_nodes_reflects_new_presence_without_stale_cache() {
+        let realm_id = test_realm_id(31);
+        let coordinator = spawn_distributed_metadata_node(realm_id).await;
+        let remote = spawn_distributed_metadata_node(realm_id).await;
+
+        coordinator
+            .net
+            .add_peer_addr(remote.net.endpoint_addr())
+            .await;
+        remote
+            .net
+            .add_peer_addr(coordinator.net.endpoint_addr())
+            .await;
+
+        let initial = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+        assert_eq!(initial, vec![coordinator.net.node_id()]);
+
+        let remote_ctx = remote.state.get_ctx();
+        let mut announced = false;
+        let mut last_announce_error = None;
+        for _ in 0..10 {
+            match drive(
+                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    realm_id,
+                    node_id: remote.net.node_id(),
+                    schedule_refresh: false,
+                }),
+                remote_ctx.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    announced = true;
+                    break;
+                }
+                Err(error) => {
+                    last_announce_error = Some(format!("{error:?}"));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if !announced {
+            coordinator.net.shutdown().await;
+            remote.net.shutdown().await;
+            panic!(
+                "remote realm presence was not announced: {}",
+                last_announce_error.unwrap_or_else(|| "no attempts".to_string())
+            );
+        }
+
+        let mut discovered = Vec::new();
+        for _ in 0..10 {
+            discovered = load_realm_nodes(coordinator.state.as_ref()).await.unwrap();
+            if discovered.contains(&remote.net.node_id()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(discovered.contains(&coordinator.net.node_id()));
+        assert!(discovered.contains(&remote.net.node_id()));
+
+        coordinator.net.shutdown().await;
+        remote.net.shutdown().await;
+    }
+
+    #[test]
+    fn document_replica_query_nodes_use_deduplicated_replicas() {
+        let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let document_id = Ulid::new();
+        let record = MetadataRegistryRecord {
+            realm_id: RealmId([3u8; 32]),
+            group_id: Ulid::new(),
+            document_id,
+            document_path: "datasets/query-targets".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: "/metadata/query-targets".to_string(),
+            holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event_id: Ulid::nil(),
+        };
+
+        assert_eq!(
+            document_replica_query_nodes(&record, local_node_id),
+            vec![remote_node_id, local_node_id]
+        );
+
+        let mut empty_replicas = record;
+        empty_replicas.holder_node_ids.clear();
+        assert_eq!(
+            document_replica_query_nodes(&empty_replicas, local_node_id),
+            vec![local_node_id]
+        );
+    }
+
+    #[test]
+    fn deduplicate_fanout_nodes_preserves_first_seen_order() {
+        let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
+        let third = iroh::SecretKey::from_bytes(&[33u8; 32]).public();
+
+        assert_eq!(
+            deduplicate_fanout_nodes(vec![first, second, first, third, second]),
+            vec![first, second, third]
+        );
+    }
+
+    #[test]
+    fn metadata_auth_token_helper_uses_validated_carrier_only() {
+        let carrier = ValidatedArunaBearerTokenCarrier::new_for_test("raw-aruna-token");
+
+        assert_eq!(
+            metadata_auth_token_from_bearer(Some(carrier.as_str())),
+            Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
+        );
+        assert_eq!(metadata_auth_token_from_bearer(None), None);
+    }
+
+    #[tokio::test]
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
 
@@ -1980,6 +2288,83 @@ mod tests {
             result,
             Err(ServerError::InternalError(message)) if message == "Channel closed"
         ));
+    }
+
+    #[tokio::test]
+    async fn ensure_permission_returns_forbidden_for_nonexistent_group() {
+        let test = setup_state().await;
+        let missing_group = Ulid::new();
+        let path = format!("/{}/g/{missing_group}/meta/**", test.state.get_realm_id());
+
+        let result = ensure_permission(
+            test.state.as_ref(),
+            test.auth.clone(),
+            path,
+            Permission::WRITE,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn export_returns_service_unavailable_while_materialization_pending() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/pending-dataset".to_string(),
+                    name: "Pending Dataset".to_string(),
+                    description: "Not yet materialized".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id.clone()),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::NotFound)));
+
+        let projected = drain_pending_metadata_projection_queue(ctx.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(projected.markers_examined, 1);
+        assert_eq!(projected.projected, 1);
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id.clone()),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
+
+        let materialized = process_metadata_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(materialized.processed, 1);
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2010,6 +2395,30 @@ mod tests {
             .unwrap();
         assert!(create_examples.contains_key("ScaffoldCreate"));
         assert!(create_examples.contains_key("RoCrateCreate"));
+
+        let create_response_description = openapi["paths"]["/metadata"]["post"]["responses"]["201"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert!(create_response_description.contains("durable event/projection pipeline"));
+        assert!(create_response_description.contains("fully materialized"));
+        assert!(create_response_description.contains("replicated yet"));
+
+        for (path, method) in [
+            ("/metadata/{document_id}/rocrate", "put"),
+            ("/metadata/{document_id}/rocrate/data-entities", "post"),
+            (
+                "/metadata/{document_id}/rocrate/contextual-entities",
+                "post",
+            ),
+        ] {
+            let description = openapi["paths"][path][method]["responses"]["200"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("durable event/projection pipeline"));
+            assert!(description.contains("fully materialized"));
+            assert!(description.contains("replicated yet"));
+        }
 
         let document_query_request =
             &openapi["paths"]["/metadata/{document_id}/sparql/query"]["post"]["requestBody"];
@@ -2081,6 +2490,7 @@ mod tests {
                 )])]),
             ],
             QueryForm::Select,
+            None,
         )
         .unwrap();
 
@@ -2088,6 +2498,276 @@ mod tests {
             panic!("expected solutions");
         };
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn reapplies_select_limit_after_distributed_merge() {
+        let results = aggregate_query_results(
+            vec![
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
+                    BTreeMap::from([(String::from("s"), String::from("<urn:b>"))]),
+                ]),
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:c>"))]),
+                    BTreeMap::from([(String::from("s"), String::from("<urn:d>"))]),
+                ]),
+            ],
+            QueryForm::Select,
+            Some(3),
+        )
+        .unwrap();
+
+        let MetadataQueryResults::Solutions(rows) = results else {
+            panic!("expected solutions");
+        };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn query_select_limit_reads_outermost_limit_only() {
+        assert_eq!(
+            query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 5"),
+            Some(5)
+        );
+        assert_eq!(
+            query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 7 OFFSET 3"),
+            Some(7)
+        );
+        assert_eq!(query_select_limit("SELECT ?s WHERE { ?s ?p ?o }"), None);
+        assert_eq!(
+            query_select_limit(
+                "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 5 } ?s ?p ?o }"
+            ),
+            None
+        );
+        assert_eq!(query_select_limit("ASK WHERE { ?s ?p ?o }"), None);
+        assert_eq!(query_select_limit("not sparql"), None);
+    }
+
+    #[test]
+    fn query_response_serializes_envelope_with_partiality_fields() {
+        let response = MetadataQueryResponse {
+            result: MetadataQueryResult::Boolean(true),
+            nodes_queried: 3,
+            nodes_failed: 1,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["kind"], json!("Boolean"));
+        assert_eq!(value["value"], json!(true));
+        assert_eq!(value["nodes_queried"], json!(3));
+        assert_eq!(value["nodes_failed"], json!(1));
+
+        let roundtrip: MetadataQueryResponse = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            roundtrip.result,
+            MetadataQueryResult::Boolean(true)
+        ));
+        assert_eq!(roundtrip.nodes_queried, 3);
+        assert_eq!(roundtrip.nodes_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn distributed_query_executes_local_partition_in_process() {
+        let test = setup_state().await;
+
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/local-partition".to_string(),
+                    name: "Local Partition Dataset".to_string(),
+                    description: "Coordinator partition".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        // The test state has no remote realm nodes and no net handle, so a
+        // distributed query only succeeds if the coordinator partition runs
+        // in-process instead of going over the wire.
+        let (_, Json(result)) = query_all_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Json(SparqlQueryRequest {
+                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
+                    .to_string(),
+                mode: Some(MetadataQueryMode::Distributed),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.nodes_queried, 1);
+        assert_eq!(result.nodes_failed, 0);
+        let MetadataQueryResult::Solutions(rows) = result.result else {
+            panic!("expected solutions");
+        };
+        assert!(rows.iter().any(|row| {
+            row.values()
+                .any(|value| value.contains("Local Partition Dataset"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn query_all_metadata_applies_lazy_per_caller_visibility() {
+        let test = setup_state().await;
+
+        for (path, name, public) in [
+            ("datasets/lazy-public", "Lazy Public Dataset", true),
+            ("datasets/lazy-private", "Lazy Private Dataset", false),
+        ] {
+            let _ = create_metadata_document(
+                State(test.state.clone()),
+                Extension(Some(test.auth.clone())),
+                Json(CreateMetadataRequest::Scaffold(
+                    CreateMetadataScaffoldRequest {
+                        group_id: test.group_id.to_string(),
+                        path: path.to_string(),
+                        name: name.to_string(),
+                        description: "Lazy visibility".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        public,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let query_names = async |auth: Option<AuthContext>| {
+            let (_, Json(result)) = query_all_metadata(
+                State(test.state.clone()),
+                Extension(auth),
+                Extension(None),
+                Json(SparqlQueryRequest {
+                    query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                    mode: Some(MetadataQueryMode::Local),
+                }),
+            )
+            .await
+            .unwrap();
+            let MetadataQueryResult::Solutions(rows) = result.result else {
+                panic!("expected solutions");
+            };
+            rows.into_iter()
+                .flat_map(|row| row.into_values())
+                .collect::<Vec<_>>()
+        };
+
+        let anonymous = query_names(None).await;
+        assert!(anonymous.iter().any(|name| name.contains("Lazy Public")));
+        assert!(!anonymous.iter().any(|name| name.contains("Lazy Private")));
+
+        let authorized = query_names(Some(test.auth.clone())).await;
+        assert!(authorized.iter().any(|name| name.contains("Lazy Public")));
+        assert!(authorized.iter().any(|name| name.contains("Lazy Private")));
+    }
+
+    #[tokio::test]
+    async fn distributed_query_forwards_validated_bearer_token_for_remote_private_metadata() {
+        let test = setup_distributed_metadata_access_state().await;
+        let token_auth: AuthContext =
+            crate::auth::handle_token(test.coordinator.state.as_ref(), &test.valid_bearer_token)
+                .await
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(token_auth, test.auth);
+
+        let authorized = query_remote_metadata_names(
+            &test,
+            Some(token_auth.clone()),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                test.valid_bearer_token.clone(),
+            )),
+        )
+        .await;
+        assert_eq!(authorized.nodes_queried, 1);
+        assert_eq!(authorized.nodes_failed, 0);
+        assert_contains_dataset_name(&authorized.names, "Remote Public Dataset");
+        assert_contains_dataset_name(&authorized.names, "Remote Private Dataset");
+
+        let anonymous = query_remote_metadata_names(&test, None, None).await;
+        assert_eq!(anonymous.nodes_failed, 0);
+        assert_contains_dataset_name(&anonymous.names, "Remote Public Dataset");
+        assert_excludes_dataset_name(&anonymous.names, "Remote Private Dataset");
+
+        let authenticated_without_forwardable_token =
+            query_remote_metadata_names(&test, Some(token_auth.clone()), None).await;
+        assert_eq!(authenticated_without_forwardable_token.nodes_failed, 0);
+        assert_contains_dataset_name(
+            &authenticated_without_forwardable_token.names,
+            "Remote Public Dataset",
+        );
+        assert_excludes_dataset_name(
+            &authenticated_without_forwardable_token.names,
+            "Remote Private Dataset",
+        );
+
+        let oversized_non_forwardable_token = query_remote_metadata_names(
+            &test,
+            Some(token_auth.clone()),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+                "x".repeat(4097),
+            )),
+        )
+        .await;
+        assert_eq!(oversized_non_forwardable_token.nodes_failed, 0);
+        assert_contains_dataset_name(
+            &oversized_non_forwardable_token.names,
+            "Remote Public Dataset",
+        );
+        assert_excludes_dataset_name(
+            &oversized_non_forwardable_token.names,
+            "Remote Private Dataset",
+        );
+
+        assert!(
+            crate::auth::handle_token(test.coordinator.state.as_ref(), "not-a-jwt")
+                .await
+                .is_err()
+        );
+        let invalid_forwarded_token = query_remote_metadata_names(
+            &test,
+            Some(token_auth),
+            Some(ValidatedArunaBearerTokenCarrier::new_for_test("not-a-jwt")),
+        )
+        .await;
+        assert_eq!(invalid_forwarded_token.nodes_queried, 1);
+        assert_eq!(invalid_forwarded_token.nodes_failed, 1);
+        assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Public Dataset");
+        assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Private Dataset");
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn distributed_search_without_forwarded_token_reads_remote_public_metadata_only() {
+        let test = setup_distributed_metadata_access_state().await;
+        let ctx = test.remote.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let anonymous = search_remote_metadata_paths(&test, None, None).await;
+        assert_eq!(anonymous.nodes_queried, 1);
+        assert_eq!(anonymous.nodes_failed, 0);
+        assert_contains_search_path(&anonymous.paths, "datasets/remote-public");
+        assert_excludes_search_path(&anonymous.paths, "datasets/remote-private");
+
+        test.shutdown().await;
     }
 
     #[test]
@@ -2119,12 +2799,419 @@ mod tests {
                     score: 0.7,
                 },
             ],
-            10,
+            2,
         );
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
         assert_eq!(hits[0].score, 0.8);
+        assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
+    }
+
+    #[test]
+    fn search_hit_dedup_orders_equal_scores_stably() {
+        let hit = |document_id: &str, subject_iri: &str| MetadataSearchHit {
+            document_id: document_id.to_string(),
+            group_id: "01G".to_string(),
+            document_path: format!("datasets/{document_id}"),
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            subject_iri: subject_iri.to_string(),
+            score: 0.7,
+        };
+
+        let hits = deduplicate_search_hits(
+            vec![
+                hit("01B", "./file-b.txt"),
+                hit("01A", "./file-b.txt"),
+                hit("01A", "./file-a.txt"),
+            ],
+            10,
+        );
+
+        let keys = hits
+            .iter()
+            .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                ("https://w3id.org/aruna/01A", "./file-a.txt"),
+                ("https://w3id.org/aruna/01A", "./file-b.txt"),
+                ("https://w3id.org/aruna/01B", "./file-b.txt"),
+            ]
+        );
+    }
+
+    struct DistributedMetadataAccessState {
+        auth: AuthContext,
+        valid_bearer_token: String,
+        coordinator: DistributedMetadataNode,
+        remote: DistributedMetadataNode,
+    }
+
+    impl DistributedMetadataAccessState {
+        async fn shutdown(self) {
+            self.coordinator.net.shutdown().await;
+            self.remote.net.shutdown().await;
+        }
+    }
+
+    struct DistributedMetadataNode {
+        _node_dir: TempDir,
+        net: NetHandle,
+        state: Arc<ServerState>,
+    }
+
+    struct QueryNamesResult {
+        names: Vec<String>,
+        nodes_queried: usize,
+        nodes_failed: usize,
+    }
+
+    struct SearchPathsResult {
+        paths: Vec<String>,
+        nodes_queried: usize,
+        nodes_failed: usize,
+    }
+
+    async fn setup_distributed_metadata_access_state() -> DistributedMetadataAccessState {
+        let realm_signing_key = test_realm_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+        let coordinator = spawn_distributed_metadata_node(realm_id).await;
+        let remote = spawn_distributed_metadata_node(realm_id).await;
+        let nodes = [&coordinator, &remote];
+
+        coordinator
+            .net
+            .add_peer_addr(remote.net.endpoint_addr())
+            .await;
+        remote
+            .net
+            .add_peer_addr(coordinator.net.endpoint_addr())
+            .await;
+        install_distributed_realm_config(&nodes, realm_id).await;
+        for node in nodes {
+            install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
+        }
+
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        create_test_metadata_document(
+            remote.state.clone(),
+            auth.clone(),
+            group_id,
+            "datasets/remote-public",
+            "Remote Public Dataset",
+            true,
+        )
+        .await;
+        create_test_metadata_document(
+            remote.state.clone(),
+            auth.clone(),
+            group_id,
+            "datasets/remote-private",
+            "Remote Private Dataset",
+            false,
+        )
+        .await;
+        drain_metadata_background(remote.state.as_ref()).await;
+
+        let valid_bearer_token =
+            sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+
+        DistributedMetadataAccessState {
+            auth,
+            valid_bearer_token,
+            coordinator,
+            remote,
+        }
+    }
+
+    async fn spawn_distributed_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
+        let node_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            node_dir.path().join("metadata"),
+            net.node_id(),
+            storage_handle.clone(),
+            Some(net.clone()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
+        )
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: Some(TaskHandle::new()),
+        });
+        initialize_net_incoming(context.clone());
+        let state = Arc::new(
+            ServerState::new(
+                context,
+                realm_id,
+                net.node_id(),
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        );
+
+        DistributedMetadataNode {
+            _node_dir: node_dir,
+            net,
+            state,
+        }
+    }
+
+    async fn install_distributed_realm_config(
+        nodes: &[&DistributedMetadataNode],
+        realm_id: RealmId,
+    ) {
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        for node in nodes {
+            config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
+        }
+
+        for node in nodes {
+            let actor = Actor {
+                node_id: node.net.node_id(),
+                user_id: aruna_core::UserId::nil(realm_id),
+                realm_id,
+            };
+            write_doc(
+                &node.state.get_ctx(),
+                REALM_CONFIG_KEYSPACE,
+                (*realm_id.as_bytes()).into(),
+                config.to_bytes(&actor).unwrap().into(),
+            )
+            .await;
+            node.net
+                .refresh_realm_peers_from_document(&config)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn install_metadata_auth_documents(
+        node: &DistributedMetadataNode,
+        realm_id: RealmId,
+        user_id: aruna_core::UserId,
+        group_id: Ulid,
+    ) {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id,
+            realm_id,
+        };
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "distributed-metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let context = node.state.get_ctx();
+
+        write_doc(
+            &context,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &context,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &context,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+    }
+
+    async fn create_test_metadata_document(
+        state: Arc<ServerState>,
+        auth: AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+        public: bool,
+    ) {
+        let _ = create_metadata_document(
+            State(state),
+            Extension(Some(auth)),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: group_id.to_string(),
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    description: "Remote metadata access fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn query_remote_metadata_names(
+        test: &DistributedMetadataAccessState,
+        auth: Option<AuthContext>,
+        bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    ) -> QueryNamesResult {
+        let ctx = test.coordinator.state.get_ctx();
+        let result = run_query_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth,
+                bearer_token: bearer_token_to_string(bearer_token),
+                graph_iris: None,
+                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+            },
+        )
+        .await
+        .unwrap();
+        let MetadataQueryResults::Solutions(rows) = result.results else {
+            panic!("expected SELECT solutions");
+        };
+        QueryNamesResult {
+            names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
+        }
+    }
+
+    async fn search_remote_metadata_paths(
+        test: &DistributedMetadataAccessState,
+        auth: Option<AuthContext>,
+        bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+    ) -> SearchPathsResult {
+        let ctx = test.coordinator.state.get_ctx();
+        let result = run_search_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth,
+                bearer_token: bearer_token_to_string(bearer_token),
+                graph_iris: None,
+                query: "Remote".to_string(),
+                limit: Some(10),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+            },
+        )
+        .await
+        .unwrap();
+        SearchPathsResult {
+            paths: result
+                .hits
+                .into_iter()
+                .map(|hit| hit.document_path)
+                .collect(),
+            nodes_queried: result.fanout_stats.nodes_queried,
+            nodes_failed: result.fanout_stats.nodes_failed,
+        }
+    }
+
+    fn assert_contains_dataset_name(names: &[String], expected: &str) {
+        assert!(
+            names.iter().any(|name| name.contains(expected)),
+            "expected {names:?} to contain {expected:?}"
+        );
+    }
+
+    fn assert_excludes_dataset_name(names: &[String], unexpected: &str) {
+        assert!(
+            !names.iter().any(|name| name.contains(unexpected)),
+            "expected {names:?} not to contain {unexpected:?}"
+        );
+    }
+
+    fn assert_contains_search_path(paths: &[String], expected: &str) {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "expected {paths:?} to contain {expected:?}"
+        );
+    }
+
+    fn assert_excludes_search_path(paths: &[String], unexpected: &str) {
+        assert!(
+            !paths.iter().any(|path| path == unexpected),
+            "expected {paths:?} not to contain {unexpected:?}"
+        );
+    }
+
+    fn test_realm_signing_key() -> SigningKey {
+        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
+        SigningKey::generate(&mut rng)
+    }
+
+    fn test_realm_id(seed: u8) -> RealmId {
+        RealmId::from_bytes(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_string(),
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        }
+    }
+
+    fn sign_test_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
+        let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        encode(
+            &Header::new(Algorithm::EdDSA),
+            claims,
+            &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn setup_state() -> TestState {
@@ -2133,23 +3220,29 @@ mod tests {
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let realm_id = aruna_core::structs::RealmId([3u8; 32]);
+        let realm_id = test_realm_id(3);
         let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
             realm_id,
         };
-        let metadata_handle =
-            MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)
-                .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let task_handle = TaskHandle::new();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: Some(metadata_handle),
-            task_handle: None,
+            task_handle: Some(task_handle),
         });
         let group_id = Ulid::new();
         let group_auth =
@@ -2209,11 +3302,24 @@ mod tests {
         }
     }
 
+    async fn drain_metadata_background(state: &ServerState) {
+        let ctx = state.get_ctx();
+        let drained = drain_pending_metadata_projection_queue(ctx.as_ref())
+            .await
+            .unwrap();
+        if drained.markers_examined == 0 {
+            replay_metadata_event_log(ctx.as_ref()).await.unwrap();
+        }
+        process_metadata_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
+    }
+
     async fn setup_state_with_closed_storage() -> Arc<ServerState> {
         let (storage_handle, receiver) = storage::StorageHandle::new();
         drop(receiver);
 
-        let realm_id = RealmId([3u8; 32]);
+        let realm_id = test_realm_id(3);
         let node_id = iroh::SecretKey::from_bytes(&[14u8; 32]).public();
         Arc::new(
             ServerState::new(
@@ -2221,7 +3327,6 @@ mod tests {
                     storage_handle,
                     net_handle: None,
                     blob_handle: None,
-                    automerge_handle: None,
                     metadata_handle: None,
                     task_handle: None,
                 }),
@@ -2254,5 +3359,25 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    async fn read_persisted_task_timer(
+        ctx: &DriverContext,
+        key: &TaskKey,
+    ) -> Option<PersistedTaskTimer> {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key: postcard::to_allocvec(key).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.map(|value| postcard::from_bytes(&value).expect("timer decodes"))
+            }
+            other => panic!("unexpected task timer read event: {other:?}"),
+        }
     }
 }

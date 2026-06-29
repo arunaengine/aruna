@@ -13,22 +13,24 @@ use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
+use aruna_core::structs::{Actor, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
+use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,17 +65,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             relay_method: config.relay_method.clone(),
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
+            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            document_sync_runtime: Some(config.document_sync_runtime),
+            fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),
     )
     .await?;
+    if let Err(error) = net_handle.reload_realm_peers().await {
+        warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
+    }
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
-    let metadata_handle = MetadataHandle::new(
+    let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
         config.node_id,
         storage_handle.clone(),
         Some(net_handle.clone()),
+        Some(net_handle.document_sync_node()),
+        Some(net_handle.document_sync_database()),
+        MetadataHandleOptions::default()
+            .with_search_storage(config.metadata_search_storage)
+            .with_document_sync_persist_policy(config.fjall_persist_policy),
     )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {
@@ -94,13 +106,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: Some(blob_handle),
-        automerge_handle: Some(automerge_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+
+    let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
+    if replayed_metadata_events > 0 {
+        info!(
+            replayed_metadata_events,
+            "Replayed metadata event log during startup"
+        );
+    }
+    spawn_metadata_warmup(driver_ctx.clone());
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -162,13 +182,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     OnboardingPhase::CoreDocumentsFetched,
                 )
                 .await?;
+                if let Err(error) = net_handle.reload_realm_peers().await {
+                    warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
+                }
             }
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::Provisioned => {
             drive(
-                RestoreTopicSubscriptionsOperation::new(config.node_id),
+                RestoreTopicSubscriptionsOperation::new(config.node_id, config.realm_id),
                 driver_ctx.as_ref(),
             )
             .await?;
@@ -184,9 +207,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             user_id: UserId::nil(config.realm_id),
                             realm_id: config.realm_id,
                         },
-                        bootstrap_peers: config.peer_nodes.clone(),
+                        target_node_id: config.node_id,
+                        target_node_kind: RealmNodeKind::Management,
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
+                        create_if_missing: true,
+                        reject_kind_mismatch: false,
                     }),
                     driver_ctx.as_ref(),
                 )
@@ -196,6 +222,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
         }
     }
+
+    drive(
+        ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id: config.realm_id,
+            local_node_id: config.node_id,
+        }),
+        driver_ctx.as_ref(),
+    )
+    .await?;
 
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
@@ -230,7 +265,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let s3_server = S3Server::new(
         &config.s3_address,
         &config.s3_host,
-        driver_ctx,
+        driver_ctx.clone(),
         config.realm_id,
         config.node_id,
     )
@@ -265,5 +300,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    shutdown_runtime(
+        driver_ctx.net_handle.as_ref(),
+        driver_ctx.metadata_handle.as_ref(),
+        &driver_ctx.storage_handle,
+    )
+    .await;
+
     Ok(())
+}
+
+async fn shutdown_runtime(
+    net_handle: Option<&NetHandle>,
+    metadata_handle: Option<&MetadataHandle>,
+    storage_handle: &StorageHandle,
+) {
+    if let Some(net_handle) = net_handle {
+        info!("Shutting down network services");
+        net_handle.shutdown().await;
+    }
+
+    if let Some(metadata_handle) = metadata_handle {
+        info!("Flushing metadata persistence");
+        if let Err(error) = metadata_handle.flush_persistence().await {
+            error!(error = %error, "Failed to flush metadata persistence during shutdown");
+        }
+    }
+
+    if let Err(error) = storage_handle.sync_all().await {
+        error!(error = %error, "Failed to sync storage during shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use std::thread;
+
+    #[tokio::test]
+    async fn shutdown_runtime_syncs_storage_without_net() {
+        let (storage_handle, receiver) = StorageHandle::new();
+        let worker = thread::spawn(move || {
+            let (effect, response_tx, _span, _queued_at) = receiver
+                .recv()
+                .expect("shutdown should request storage sync_all");
+            assert!(matches!(effect, StorageEffect::SyncAll));
+            response_tx.send(StorageEvent::SyncAllFinished);
+        });
+
+        shutdown_runtime(None, None, &storage_handle).await;
+
+        worker.join().expect("storage responder should finish");
+    }
 }

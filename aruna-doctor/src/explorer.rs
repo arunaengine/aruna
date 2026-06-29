@@ -1,17 +1,20 @@
 use crate::error::CliError;
 use aruna::config::PersistedNodeState;
-use aruna_api::server_state::{
-    INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
-};
-use aruna_core::id::{DhtKeyId, TopicId};
+use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
+use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
+    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
+    SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -49,6 +52,8 @@ pub enum ExplorerError {
     Fjall(#[from] fjall::Error),
     #[error("keyspace not found: {0}")]
     KeyspaceNotFound(String),
+    #[error("decode failed: {0}")]
+    Decode(String),
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -68,6 +73,39 @@ struct EntriesOutput {
     database_path: String,
     keyspace: String,
     entries: Vec<EntryOutput>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicsListOutput {
+    database_path: String,
+    topics: Vec<TopicListEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicListEntry {
+    topic_id: String,
+    target: JsonDocumentSyncTarget,
+    status: &'static str,
+    desired_peer_count: usize,
+    selected_peer_count: usize,
+    missing_peer_count: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicStatusOutput {
+    database_path: String,
+    topic_id: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_placement: Option<JsonPendingDocumentPlacement>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicPlacementsOutput {
+    database_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic_id: Option<String>,
+    placements: Vec<JsonPendingDocumentPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -167,11 +205,11 @@ enum DecodedValue {
     ApiInitialRealmAdminClaimed {
         data: bool,
     },
-    GossipSubscriptions {
-        data: Vec<String>,
-    },
     NodeState {
         data: JsonPersistedNodeState,
+    },
+    PendingDocumentPlacement {
+        data: JsonPendingDocumentPlacement,
     },
     OnboardingSecretRecord {
         data: OnboardingSecretRecord,
@@ -467,6 +505,134 @@ impl Serialize for JsonPersistedNodeState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct JsonPendingDocumentPlacement(PendingDocumentPlacement);
+
+impl Serialize for JsonPendingDocumentPlacement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PendingDocumentPlacement", 8)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
+        state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
+        state.serialize_field(
+            "authoritative_node_id",
+            &self.0.authoritative_node_id.to_string(),
+        )?;
+        state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
+        state.serialize_field(
+            "selected_peers",
+            &self
+                .0
+                .selected_peers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        state.serialize_field("missing_peer_count", &placement_missing_peer_count(&self.0))?;
+        state.serialize_field("updated_at", &self.0.updated_at)?;
+        state.end()
+    }
+}
+
+fn placement_topic_id(placement: &PendingDocumentPlacement) -> String {
+    placement.target.sync_topic_id().to_string()
+}
+
+fn placement_missing_peer_count(placement: &PendingDocumentPlacement) -> usize {
+    let mut selected_peers = placement.selected_peers.clone();
+    selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
+    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    selected_peers.dedup();
+    placement
+        .desired_peer_count
+        .saturating_sub(selected_peers.len().saturating_add(1))
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonDocumentSyncTarget {
+    Group {
+        group_id: String,
+    },
+    GroupAuthorization {
+        group_id: String,
+    },
+    RealmAuthorization {
+        realm_id: String,
+    },
+    RealmConfig {
+        realm_id: String,
+    },
+    User {
+        user_id: String,
+    },
+    MetadataRegistry {
+        group_id: String,
+        document_id: String,
+    },
+    MetadataCreateEvent {
+        document_id: String,
+        event_id: String,
+    },
+    MetadataDocumentLifecycle {
+        document_id: String,
+    },
+    MetadataGraphLifecycle {
+        graph_iri: String,
+    },
+}
+
+fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
+    match target {
+        DocumentSyncTarget::Group { group_id } => JsonDocumentSyncTarget::Group {
+            group_id: group_id.to_string(),
+        },
+        DocumentSyncTarget::GroupAuthorization { group_id } => {
+            JsonDocumentSyncTarget::GroupAuthorization {
+                group_id: group_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            JsonDocumentSyncTarget::RealmAuthorization {
+                realm_id: realm_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::RealmConfig { realm_id } => JsonDocumentSyncTarget::RealmConfig {
+            realm_id: realm_id.to_string(),
+        },
+        DocumentSyncTarget::User { user_id } => JsonDocumentSyncTarget::User {
+            user_id: user_id.to_string(),
+        },
+        DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        } => JsonDocumentSyncTarget::MetadataRegistry {
+            group_id: group_id.to_string(),
+            document_id: document_id.to_string(),
+        },
+        DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        } => JsonDocumentSyncTarget::MetadataCreateEvent {
+            document_id: document_id.to_string(),
+            event_id: event_id.to_string(),
+        },
+        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+            JsonDocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: document_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
+            JsonDocumentSyncTarget::MetadataGraphLifecycle {
+                graph_iri: graph_iri.clone(),
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct JsonStoredEntry(StoredEntry);
 
@@ -714,15 +880,14 @@ fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
         if !(value.len() - 1).is_multiple_of(40) {
             return Err(format!("invalid craqle dot payload length {}", value.len()));
         }
-        value[1..]
-            .chunks_exact(40)
-            .map(|chunk| {
-                Ok(CraqleDot {
-                    actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
-                    counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
-                })
+        let (chunks, _) = value[1..].as_chunks::<40>();
+        chunks
+            .iter()
+            .map(|chunk| CraqleDot {
+                actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
+                counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect()
     } else {
         postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
     };
@@ -805,6 +970,51 @@ pub async fn explore_entries(database_path: String, keyspace: String) -> Result<
     Ok(())
 }
 
+pub async fn print_node_state(database_path: String) -> Result<(), CliError> {
+    explore_entries(database_path, NODE_STATE_KEYSPACE.to_string()).await
+}
+
+pub async fn print_topics_list(database_path: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        move || topics_list_output(&database_path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn print_topic_status(database_path: String, topic_id: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        let topic_id = topic_id.clone();
+        move || topic_status_output(&database_path, &topic_id)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn print_topic_placements(
+    database_path: String,
+    topic_id: Option<String>,
+) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        let topic_id = topic_id.clone();
+        move || topic_placements_output(&database_path, topic_id.as_deref())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let mut keyspaces = db.list_keyspace_names();
@@ -834,21 +1044,28 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 23] {
+fn defined_keyspaces() -> [&'static str; 33] {
     [
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+        ADMIN_DOCUMENT_STATE_KEYSPACE,
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE,
+        BUCKET_STATS_DB,
         CRAQLE_GRAPHS_KEYSPACE,
         CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE,
         CRAQLE_TERMS_KEYSPACE,
         DHT_KEYSPACE,
-        GOSSIP_SUBSCRIPTIONS_KEYSPACE,
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE,
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
@@ -858,6 +1075,9 @@ fn defined_keyspaces() -> [&'static str; 23] {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
         S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        SOURCE_CONNECTOR_INDEX_KEYSPACE,
+        SOURCE_CONNECTOR_SECRET_KEYSPACE,
+        SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
     ]
 }
@@ -886,6 +1106,93 @@ fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutpu
         keyspace: keyspace_name.to_string(),
         entries,
     })
+}
+
+fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerError> {
+    let mut topics = load_pending_placements(database_path)?
+        .into_iter()
+        .map(|placement| TopicListEntry {
+            topic_id: placement_topic_id(&placement),
+            target: json_document_sync_target(&placement.target),
+            status: "under_replicated",
+            desired_peer_count: placement.desired_peer_count,
+            selected_peer_count: placement.selected_peers.len(),
+            missing_peer_count: placement_missing_peer_count(&placement),
+        })
+        .collect::<Vec<_>>();
+    topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+
+    Ok(TopicsListOutput {
+        database_path: database_path.to_string(),
+        topics,
+    })
+}
+
+fn topic_status_output(
+    database_path: &str,
+    topic_id: &str,
+) -> Result<TopicStatusOutput, ExplorerError> {
+    let pending_placement = load_pending_placements(database_path)?
+        .into_iter()
+        .find(|placement| placement_topic_id(placement) == topic_id)
+        .map(JsonPendingDocumentPlacement);
+    let status = if pending_placement.is_some() {
+        "under_replicated"
+    } else {
+        "not_pending"
+    };
+
+    Ok(TopicStatusOutput {
+        database_path: database_path.to_string(),
+        topic_id: topic_id.to_string(),
+        status,
+        pending_placement,
+    })
+}
+
+fn topic_placements_output(
+    database_path: &str,
+    topic_id: Option<&str>,
+) -> Result<TopicPlacementsOutput, ExplorerError> {
+    let mut placements = load_pending_placements(database_path)?;
+    if let Some(topic_id) = topic_id {
+        placements.retain(|placement| placement_topic_id(placement) == topic_id);
+    }
+    placements.sort_by_key(placement_topic_id);
+
+    Ok(TopicPlacementsOutput {
+        database_path: database_path.to_string(),
+        topic_id: topic_id.map(str::to_string),
+        placements: placements
+            .into_iter()
+            .map(JsonPendingDocumentPlacement)
+            .collect(),
+    })
+}
+
+fn load_pending_placements(
+    database_path: &str,
+) -> Result<Vec<PendingDocumentPlacement>, ExplorerError> {
+    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let keyspace_names = db.list_keyspace_names();
+    if !keyspace_names
+        .iter()
+        .any(|name| name.as_ref() == SYNC_PLACEMENT_KEYSPACE)
+    {
+        return Ok(Vec::new());
+    }
+
+    let keyspace = db.keyspace(SYNC_PLACEMENT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let snapshot = db.read_tx();
+    let mut placements = Vec::new();
+    for entry in snapshot.iter(&keyspace) {
+        let (_, value) = entry.into_inner()?;
+        placements.push(
+            aruna_operations::sync_placement::decode_placement(value.as_ref())
+                .map_err(|error| ExplorerError::Decode(error.to_string()))?,
+        );
+    }
+    Ok(placements)
 }
 
 fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
@@ -923,9 +1230,10 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | S3_BUCKET_KEYSPACE
         | S3_BUCKET_REPLICATION_KEYSPACE
         | API_STATE_KEYSPACE
-        | GOSSIP_SUBSCRIPTIONS_KEYSPACE
+        | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        SYNC_PLACEMENT_KEYSPACE => raw_field(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
             .map(|value| DecodedField::MultipartUploadPartKey { value })
@@ -999,12 +1307,21 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_multipart_object_metadata_value(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
-        GOSSIP_SUBSCRIPTIONS_KEYSPACE => decode_gossip_subscriptions_value(value),
+        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE => {
+            raw_value(value, Some("document sync applied op".to_string()))
+        }
         NODE_STATE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
             |data| DecodedValue::NodeState {
                 data: JsonPersistedNodeState(data),
+            },
+        ),
+        SYNC_PLACEMENT_KEYSPACE => decode_value_with(
+            value,
+            aruna_operations::sync_placement::decode_placement,
+            |data| DecodedValue::PendingDocumentPlacement {
+                data: JsonPendingDocumentPlacement(data),
             },
         ),
         ONBOARDING_KEYSPACE => decode_value_with(
@@ -1027,21 +1344,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         }),
         _ => raw_value(value, None),
     }
-}
-
-fn decode_gossip_subscriptions_value(value: &[u8]) -> DecodedValue {
-    decode_value_with(
-        value,
-        |bytes| postcard::from_bytes::<Vec<TopicId>>(bytes),
-        |data| {
-            let mut data = data
-                .into_iter()
-                .map(|topic| topic.to_string())
-                .collect::<Vec<_>>();
-            data.sort();
-            DecodedValue::GossipSubscriptions { data }
-        },
-    )
 }
 
 fn decode_auth_value(value: &[u8]) -> DecodedValue {
@@ -1182,19 +1484,24 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        raw_field,
+        placement_missing_peer_count, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
-    use aruna_core::id::{DhtKeyId, TopicId};
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
-        API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
+        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE,
+        S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
@@ -1249,18 +1556,25 @@ mod tests {
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
         let mut expected_missing = vec![
+            ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+            ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
             API_STATE_KEYSPACE.to_string(),
             AUTH_KEYSPACE.to_string(),
             BLOB_HEAD_KEYSPACE.to_string(),
             BLOB_LOCATIONS_KEYSPACE.to_string(),
             BLOB_VERSIONS_KEYSPACE.to_string(),
+            BUCKET_STATS_DB.to_string(),
             CRAQLE_GRAPHS_KEYSPACE.to_string(),
             CRAQLE_LOG_KEYSPACE.to_string(),
             CRAQLE_QUADS_KEYSPACE.to_string(),
             CRAQLE_TERMS_KEYSPACE.to_string(),
             DHT_KEYSPACE.to_string(),
-            GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            METADATA_AUDIT_KEYSPACE.to_string(),
+            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+            METADATA_HOLDERS_KEYSPACE.to_string(),
+            METADATA_INDEX_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
@@ -1270,6 +1584,9 @@ mod tests {
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+            SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+            SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+            SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
@@ -1415,29 +1732,6 @@ mod tests {
     }
 
     #[test]
-    fn decodes_gossip_subscriptions_value() {
-        let realm_id = RealmId::from_bytes([8_u8; 32]);
-        let group_id = Ulid::new();
-        let value =
-            postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id)])
-                .unwrap();
-
-        let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
-        assert_eq!(
-            decoded.key,
-            DecodedField::Utf8 {
-                value: "topics".to_string()
-            }
-        );
-        match decoded.value {
-            DecodedValue::GossipSubscriptions { data } => {
-                assert_eq!(data, vec![format!("g:{group_id}"), format!("r:{realm_id}")]);
-            }
-            other => panic!("expected gossip subscriptions, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn decodes_onboarding_secret_record_value() {
         let record = OnboardingSecretRecord {
             enrollment_id: Ulid::new(),
@@ -1485,6 +1779,44 @@ mod tests {
         match decoded.value {
             DecodedValue::NodeState { data } => assert_eq!(data.0, state),
             other => panic!("expected node state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_pending_topic_placement_value() {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([4_u8; 32]),
+        };
+        let realm_id = RealmId::from_bytes([4_u8; 32]);
+        let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
+        let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
+        let placement = aruna_operations::sync_placement::new_placement(
+            realm_id,
+            target.clone(),
+            authoritative_node_id,
+            3,
+            vec![selected_peer],
+        );
+        let value = postcard::to_allocvec(&placement).unwrap();
+        let key = aruna_operations::sync_placement::placement_key(realm_id, &target);
+
+        let decoded = decode_entry(SYNC_PLACEMENT_KEYSPACE, key.as_ref(), &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::Raw {
+                hex: hex::encode(key.as_ref())
+            }
+        );
+        match decoded.value {
+            DecodedValue::PendingDocumentPlacement { data } => {
+                assert_eq!(data.0.realm_id, realm_id);
+                assert_eq!(data.0.target, target);
+                assert_eq!(data.0.authoritative_node_id, authoritative_node_id);
+                assert_eq!(data.0.desired_peer_count, 3);
+                assert_eq!(data.0.selected_peers, vec![selected_peer]);
+                assert_eq!(placement_missing_peer_count(&data.0), 1);
+            }
+            other => panic!("expected pending topic placement, got {other:?}"),
         }
     }
 

@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -14,8 +14,11 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_from_config_string};
-use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
+use aruna_net::{
+    DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
+};
+use aruna_operations::metadata::MetadataSearchStorage;
+use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
 use crypto_box::{
@@ -31,14 +34,21 @@ use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use thiserror::Error;
 
 const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
+const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Config {
     pub storage_path: String,
     pub metadata_storage_path: String,
+    pub metadata_search_storage: MetadataSearchStorage,
+    pub fjall_persist_policy: FjallPersistPolicy,
+    pub document_sync_storage_path: PathBuf,
     pub blob_root: String,
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
@@ -56,6 +66,7 @@ pub struct Config {
     pub net_secret_key: iroh::SecretKey,
     pub peer_nodes: Vec<iroh::PublicKey>,
     pub peer_endpoints: Vec<EndpointAddr>,
+    pub document_sync_runtime: IrohRuntimeConfig,
     pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
@@ -185,6 +196,12 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
         dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
+    let metadata_search_storage = metadata_search_storage_env()?;
+    let fjall_persist_policy = fjall_persist_policy_env()?;
+    let document_sync_storage_path = dotenvy::var("DOCUMENT_SYNC_STORAGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/document-sync")));
+    let document_sync_runtime = load_document_sync_runtime_config()?;
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
@@ -247,7 +264,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .filter(|value| !value.trim().is_empty());
     let oidc_providers = load_oidc_providers_from_env()?;
 
-    let storage_handle = FjallStorage::open(&storage_path)?;
+    let storage_handle =
+        FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
     let mut temporary_bootstrap_endpoint = None;
     let node_state = match load_persisted_node_state(&storage_handle).await? {
         Some(state) => state,
@@ -316,6 +334,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         Config {
             storage_path,
             metadata_storage_path,
+            metadata_search_storage,
+            fjall_persist_policy,
+            document_sync_storage_path,
             blob_root,
             blob_bucket_prefix,
             blob_max_bucket_size,
@@ -333,6 +354,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             net_secret_key,
             peer_nodes,
             peer_endpoints,
+            document_sync_runtime,
             temporary_bootstrap_active,
             discovery_method,
             relay_method,
@@ -364,6 +386,34 @@ fn invalid_config_value(
     }
 }
 
+fn metadata_search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
+    const KEY: &str = "CRAQLE_SEARCH_STORAGE";
+    let Some(value) = dotenvy::var(KEY).ok() else {
+        return Ok(MetadataSearchStorage::Disk);
+    };
+
+    match normalize_env_value(&value).as_str() {
+        "disk" => Ok(MetadataSearchStorage::Disk),
+        "memory" | "in_memory" | "ram" => Ok(MetadataSearchStorage::Memory),
+        _ => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: disk, memory",
+        )),
+    }
+}
+
+fn fjall_persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
+    const KEY: &str = "ARUNA_FJALL_PERSIST_MODE";
+    let Some(value) = dotenvy::var(KEY).ok() else {
+        return Ok(FjallPersistPolicy::default());
+    };
+
+    value
+        .parse::<FjallPersistPolicy>()
+        .map_err(|message| invalid_config_value(KEY, value, message))
+}
+
 fn parse_list_env(key: &str) -> Vec<String> {
     dotenvy::var(key)
         .unwrap_or_default()
@@ -372,6 +422,50 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn load_document_sync_runtime_config() -> Result<IrohRuntimeConfig, SetupError> {
+    let default = IrohRuntimeConfig::default();
+    Ok(IrohRuntimeConfig {
+        connect_timeout: duration_secs_env(
+            "DOCUMENT_SYNC_CONNECT_TIMEOUT_SECS",
+            default.connect_timeout,
+        )?,
+        sync_io_timeout: duration_secs_env(
+            "DOCUMENT_SYNC_IO_TIMEOUT_SECS",
+            default.sync_io_timeout,
+        )?,
+        resync_interval: duration_secs_env(
+            "DOCUMENT_SYNC_RESYNC_INTERVAL_SECS",
+            default.resync_interval,
+        )?,
+        resync_initial_backoff: duration_secs_env(
+            "DOCUMENT_SYNC_RESYNC_INITIAL_BACKOFF_SECS",
+            default.resync_initial_backoff,
+        )?,
+        resync_max_backoff: duration_secs_env(
+            "DOCUMENT_SYNC_RESYNC_MAX_BACKOFF_SECS",
+            default.resync_max_backoff,
+        )?,
+        full_sweep_interval: duration_secs_env(
+            "DOCUMENT_SYNC_FULL_SWEEP_INTERVAL_SECS",
+            default.full_sweep_interval,
+        )?,
+        full_sweep_time_of_day: duration_secs_env(
+            "DOCUMENT_SYNC_FULL_SWEEP_TIME_OF_DAY_SECS",
+            default.full_sweep_time_of_day,
+        )?,
+    })
+}
+
+fn duration_secs_env(key: &'static str, default: Duration) -> Result<Duration, SetupError> {
+    let Some(value) = dotenvy::var(key).ok() else {
+        return Ok(default);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|error| invalid_config_value(key, value, error))?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
@@ -539,7 +633,7 @@ async fn bootstrap_onboarded_node_state(
                 .to_string()
         });
 
-    let response = reqwest::Client::new()
+    let response = onboarding_bootstrap_client()?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -701,7 +795,7 @@ async fn refresh_onboarding_bootstrap(
                 .to_string()
         });
 
-    let response = reqwest::Client::new()
+    let response = onboarding_bootstrap_client()?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -740,6 +834,13 @@ async fn refresh_onboarding_bootstrap(
     Ok(response)
 }
 
+fn onboarding_bootstrap_client() -> Result<reqwest::Client, SetupError> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
+        .timeout(ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT)
+        .build()?)
+}
+
 fn validate_bootstrap_response(
     response: &BootstrapOnboardingResponse,
     expected_mode: OnboardingMode,
@@ -768,7 +869,7 @@ fn validate_bootstrap_response(
     }
     ticket.verify(
         expected_node_id,
-        &AutomergeDocumentVariant::RealmConfig {
+        &DocumentSyncTarget::RealmConfig {
             realm_id: expected_realm_id,
         },
         unix_timestamp_secs(),
@@ -1003,15 +1104,15 @@ async fn persist_node_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, load,
-        load_oidc_providers_from_env, persist_node_state,
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+        fjall_persist_policy_env, load, load_oidc_providers_from_env, persist_node_state,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         StaticRealmEndpoint,
     };
     use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_to_config_string};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::{FjallPersistPolicy, FjallStorage};
     use ed25519_dalek::SigningKey;
     use std::sync::OnceLock;
     use tempfile::tempdir;
@@ -1029,6 +1130,55 @@ mod tests {
                 None => unsafe { std::env::remove_var(key) },
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fjall_persist_policy_env_defaults_to_buffer() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_FJALL_PERSIST_MODE";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::remove_var(key) };
+
+        assert_eq!(
+            fjall_persist_policy_env().unwrap(),
+            FjallPersistPolicy::Buffer
+        );
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fjall_persist_policy_env_accepts_sync_all() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_FJALL_PERSIST_MODE";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "sync_all") };
+
+        assert_eq!(
+            fjall_persist_policy_env().unwrap(),
+            FjallPersistPolicy::SyncAll
+        );
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fjall_persist_policy_env_rejects_invalid_value() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_FJALL_PERSIST_MODE";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "always") };
+
+        let error = fjall_persist_policy_env().expect_err("invalid policy should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_FJALL_PERSIST_MODE",
+                ..
+            }
+        ));
+
+        restore_env(previous);
     }
 
     #[tokio::test]
@@ -1110,6 +1260,7 @@ mod tests {
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE", "sync_all".to_string()),
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
             ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
@@ -1124,6 +1275,7 @@ mod tests {
             "P2P_SOCKET_ADDRESS",
             "S3_HOST",
             "S3_ADDRESS",
+            "ARUNA_FJALL_PERSIST_MODE",
             "OIDC_PROVIDER_IDS",
             "OIDC_MAIN_ISSUER",
             "OIDC_MAIN_AUDIENCE",
@@ -1143,6 +1295,7 @@ mod tests {
         assert_eq!(config.oidc_providers[0].audience, "aruna-api");
         assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
         assert_eq!(config.relay_method, RelayMethod::N0);
+        assert_eq!(config.fjall_persist_policy, FjallPersistPolicy::SyncAll);
 
         restore_env(previous);
     }
@@ -1214,6 +1367,7 @@ mod tests {
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
             (
                 "P2P_ADDITIONAL_RELAY_URLS",
                 "https://relay-a.example, https://relay-b.example".to_string(),
@@ -1225,6 +1379,7 @@ mod tests {
             "P2P_SOCKET_ADDRESS",
             "S3_HOST",
             "S3_ADDRESS",
+            "ARUNA_FJALL_PERSIST_MODE",
             "P2P_ADDITIONAL_RELAY_URLS",
         ];
         let previous: Vec<_> = cleanup_keys
@@ -1275,6 +1430,7 @@ mod tests {
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
             (
                 "ONBOARDING_SECRET",
                 "definitely-not-a-valid-secret".to_string(),
@@ -1326,6 +1482,7 @@ mod tests {
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
+            ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
@@ -1333,6 +1490,7 @@ mod tests {
             "P2P_SOCKET_ADDRESS",
             "S3_HOST",
             "S3_ADDRESS",
+            "ARUNA_FJALL_PERSIST_MODE",
             "ONBOARDING_SECRET",
         ];
         let previous: Vec<_> = cleanup_keys

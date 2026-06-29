@@ -1,6 +1,8 @@
 use crate::error::CliError;
 use blake3::Hasher;
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use fjall::{
+    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
+};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
@@ -167,7 +169,9 @@ pub fn import_snapshot_into_new_database(
     let mut reader = BufReader::new(file);
     let snapshot_created_at_unix_seconds = read_header(&mut reader)?;
 
-    let db = OptimisticTxDatabase::builder(target_db_path).open()?;
+    let db = OptimisticTxDatabase::builder(target_db_path)
+        .manual_journal_persist(true)
+        .open()?;
     let mut hasher = Hasher::new();
     let mut seen_keyspaces = HashSet::new();
     let mut keyspace_state: Option<ImportKeyspaceState> = None;
@@ -264,6 +268,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 ensure_reader_exhausted(&mut reader)?;
+                db.persist(PersistMode::Buffer)?;
                 return Ok(ImportStats {
                     snapshot_created_at_unix_seconds,
                     keyspace_count,
@@ -303,7 +308,7 @@ impl ImportKeyspaceState {
         value: Vec<u8>,
     ) -> Result<(), SnapshotError> {
         if self.pending_txn.is_none() {
-            self.pending_txn = Some(db.write_tx()?);
+            self.pending_txn = Some(db.write_tx()?.durability(Some(PersistMode::Buffer)));
         }
 
         if let Some(txn) = self.pending_txn.as_mut() {
@@ -508,7 +513,6 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -624,13 +628,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
-
             let context = Arc::new(DriverContext {
                 storage_handle: storage_handle.clone(),
                 net_handle: Some(net_handle.clone()),
                 blob_handle: Some(blob_handle.clone()),
-                automerge_handle: Some(automerge_handle.clone()),
                 metadata_handle: None,
                 task_handle: Some(task_handle.clone()),
             });
@@ -751,7 +752,6 @@ mod tests {
 
             drop(server_state);
             drop(context);
-            drop(automerge_handle);
             drop(task_handle);
             drop(blob_handle);
             net_handle.shutdown().await;

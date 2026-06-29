@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use aruna_core::effects::Effect;
@@ -62,6 +62,8 @@ struct SchedulerState {
     timers_by_deadline: BTreeMap<(Instant, u64), TaskKey>,
     running_by_id: HashMap<u64, RunningTaskEntry>,
     running_warn_deadlines: BTreeSet<(Instant, u64)>,
+    in_flight_keys: HashMap<TaskKey, usize>,
+    refire_requested: HashSet<TaskKey>,
     inbound_handler: Option<Arc<dyn InboundTaskHandler>>,
     next_timer_id: u64,
     next_run_id: u64,
@@ -94,6 +96,8 @@ impl SchedulerState {
             timers_by_deadline: BTreeMap::new(),
             running_by_id: HashMap::new(),
             running_warn_deadlines: BTreeSet::new(),
+            in_flight_keys: HashMap::new(),
+            refire_requested: HashSet::new(),
             inbound_handler: None,
             next_timer_id: 1,
             next_run_id: 1,
@@ -167,6 +171,31 @@ impl SchedulerState {
             },
         );
         self.running_warn_deadlines.insert((warn_at, id));
+        *self.in_flight_keys.entry(task.key.clone()).or_insert(0) += 1;
+    }
+
+    fn spawn_handler_for_key(
+        &mut self,
+        key: TaskKey,
+        started_at: Instant,
+        command_tx: &mpsc::WeakSender<TaskCommand>,
+    ) {
+        if let Some(handler) = self.inbound_handler.clone() {
+            let task = self.prepare_running_task(key, started_at);
+            let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
+            self.track_running_task(&task, handle);
+        }
+    }
+
+    fn release_in_flight_key(&mut self, key: &TaskKey) -> bool {
+        if let Some(count) = self.in_flight_keys.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count > 0 {
+                return false;
+            }
+            self.in_flight_keys.remove(key);
+        }
+        true
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -202,10 +231,10 @@ impl SchedulerState {
             {
                 self.timers_by_key.remove(&key);
 
-                if let Some(handler) = self.inbound_handler.clone() {
-                    let task = self.prepare_running_task(key, now);
-                    let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
-                    self.track_running_task(&task, handle);
+                if self.in_flight_keys.contains_key(&key) {
+                    self.refire_requested.insert(key);
+                } else {
+                    self.spawn_handler_for_key(key, now, command_tx);
                 }
             }
         }
@@ -299,7 +328,13 @@ impl SchedulerState {
         TaskEvent::TimerCancelled { key }
     }
 
-    fn complete_handler(&mut self, run_id: u64, key: TaskKey, elapsed: Duration) {
+    fn complete_handler(
+        &mut self,
+        run_id: u64,
+        key: TaskKey,
+        elapsed: Duration,
+        command_tx: &mpsc::WeakSender<TaskCommand>,
+    ) {
         let Some(entry) = self.running_by_id.remove(&run_id) else {
             return;
         };
@@ -315,6 +350,10 @@ impl SchedulerState {
                 "Timer handler task exceeded warning threshold before completing"
             );
         }
+
+        if self.release_in_flight_key(&entry.key) && self.refire_requested.remove(&entry.key) {
+            self.spawn_handler_for_key(entry.key, Instant::now(), command_tx);
+        }
     }
 
     fn abort_running_handlers(&mut self, key: TaskKey) -> TaskEvent {
@@ -329,8 +368,10 @@ impl SchedulerState {
                 self.running_warn_deadlines
                     .remove(&(entry.warn_at, *run_id));
                 entry.task.abort();
+                self.release_in_flight_key(&entry.key);
             }
         }
+        self.refire_requested.remove(&key);
 
         TaskEvent::RunningHandlersAborted {
             key,
@@ -338,7 +379,7 @@ impl SchedulerState {
         }
     }
 
-    fn handle_command(&mut self, command: TaskCommand) {
+    fn handle_command(&mut self, command: TaskCommand, command_tx: &mpsc::WeakSender<TaskCommand>) {
         match command {
             TaskCommand::SetInboundHandler { handler, response } => {
                 self.inbound_handler = Some(handler);
@@ -372,7 +413,7 @@ impl SchedulerState {
                 run_id,
                 key,
                 elapsed,
-            } => self.complete_handler(run_id, key, elapsed),
+            } => self.complete_handler(run_id, key, elapsed, command_tx),
         }
     }
 }
@@ -396,7 +437,7 @@ async fn run_scheduler(
                 tokio::select! {
                     maybe_command = command_rx.recv() => {
                         let Some(command) = maybe_command else { break };
-                        state.handle_command(command);
+                        state.handle_command(command, &command_tx);
                     }
                     _ = tokio::time::sleep_until(deadline) => {}
                 }
@@ -405,7 +446,7 @@ async fn run_scheduler(
                 let Some(command) = command_rx.recv().await else {
                     break;
                 };
-                state.handle_command(command);
+                state.handle_command(command, &command_tx);
             }
         }
     }
@@ -684,6 +725,46 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingGatedHandler {
+        runs: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for CountingGatedHandler {
+        async fn handle_timer(&self, _key: TaskKey) {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            let permit = self
+                .gate
+                .acquire()
+                .await
+                .expect("handler gate should stay open");
+            permit.forget();
+        }
+    }
+
+    async fn fire_timer(handle: &TaskHandle, key: TaskKey) {
+        let _ = handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key,
+                after: Duration::ZERO,
+            }))
+            .await;
+    }
+
+    async fn wait_for_runs(runs: &Arc<AtomicUsize>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runs.load(Ordering::SeqCst) < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {expected} handler runs"));
+    }
+
     fn test_key() -> TaskKey {
         TaskKey::RealmPresence {
             realm_id: aruna_core::structs::RealmId([7u8; 32]),
@@ -788,6 +869,96 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), dropped.notified())
             .await
             .expect("handler future should be dropped after abort");
+    }
+
+    #[tokio::test]
+    async fn overlapping_fires_coalesce_into_one_follow_up_run() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate: gate.clone(),
+            }))
+            .await;
+
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("first handler run should start");
+
+        for _ in 0..3 {
+            fire_timer(&handle, key.clone()).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(16);
+        wait_for_runs(&runs, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fire_during_running_handler_triggers_follow_up_run() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate: gate.clone(),
+            }))
+            .await;
+
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("first handler run should start");
+
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(16);
+        wait_for_runs(&runs, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sequential_fires_run_once_each() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(100));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate: gate.clone(),
+            }))
+            .await;
+
+        fire_timer(&handle, key.clone()).await;
+        wait_for_runs(&runs, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        fire_timer(&handle, key).await;
+        wait_for_runs(&runs, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

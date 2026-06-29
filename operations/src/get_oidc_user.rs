@@ -7,7 +7,6 @@ use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::str::Utf8Error;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,8 +39,6 @@ pub enum GetOidcUserError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    Utf8Error(#[from] Utf8Error),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -139,15 +136,12 @@ impl GetOidcUserOperation {
         txn_id: TxnId,
         value: Option<ByteView>,
     ) -> Result<Effects, GetOidcUserError> {
-        let user_id = UserId::from_string(std::str::from_utf8(
-            value
-                .ok_or_else(|| GetOidcUserError::UserNotFound)?
-                .as_ref(),
-        )?)?;
+        let key = value.ok_or_else(|| GetOidcUserError::UserNotFound)?;
+        let user_id = UserId::from_storage_key(&key)?;
         self.state = GetOidcUserState::ReadExistingUser { txn_id };
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
+            key: ByteView::from(user_id.to_storage_key()),
             txn_id: Some(txn_id),
         })])
     }

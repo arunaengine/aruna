@@ -2,13 +2,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
-use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::onboarding_secret_state::secret_state_write_entry;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateOnboardingSecretInput {
@@ -102,21 +104,31 @@ impl Operation for CreateOnboardingSecretOperation {
                         );
                     }
                 };
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    key,
-                    value: ByteView::from(value),
+                let state_entry = match secret_state_write_entry(
+                    self.input.record.enrollment_id,
+                    OnboardingSecretState::Available,
+                ) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return fail(self, CreateOnboardingSecretError::ConversionError(error));
+                    }
+                };
+                smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes: vec![
+                        (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(value)),
+                        state_entry
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }
             CreateOnboardingSecretState::WriteRecord { txn_id } => {
                 let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
                         CreateOnboardingSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
-                            expected: "write result",
+                            expected: "batch write result",
                             got,
                         },
                     );

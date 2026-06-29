@@ -1,5 +1,8 @@
 use crate::error::CliError;
-use crate::explorer::{explore_entries, explore_keyspaces};
+use crate::explorer::{
+    explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
+    print_topic_status, print_topics_list,
+};
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
 use crate::storage::{import, snapshot};
@@ -48,6 +51,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: ExploreCommands,
     },
+    Topics {
+        #[command(subcommand)]
+        command: TopicsCommands,
+    },
+    Topic {
+        #[command(subcommand)]
+        command: TopicCommands,
+    },
+    NodeState {
+        #[arg(long)]
+        database_path: String,
+    },
     Import {
         snapshot_path: String,
         target_path: String,
@@ -67,6 +82,30 @@ pub enum ExploreCommands {
     Entries {
         database_path: String,
         keyspace: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TopicsCommands {
+    List {
+        #[arg(long)]
+        database_path: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TopicCommands {
+    Status {
+        #[arg(long)]
+        database_path: String,
+        #[arg(long)]
+        id: String,
+    },
+    Placements {
+        #[arg(long)]
+        database_path: String,
+        #[arg(long)]
+        id: Option<String>,
     },
 }
 
@@ -117,6 +156,18 @@ pub async fn main() -> Result<(), CliError> {
                 keyspace,
             } => explore_entries(database_path, keyspace).await?,
         },
+        Commands::Topics { command } => match command {
+            TopicsCommands::List { database_path } => print_topics_list(database_path).await?,
+        },
+        Commands::Topic { command } => match command {
+            TopicCommands::Status { database_path, id } => {
+                print_topic_status(database_path, id).await?
+            }
+            TopicCommands::Placements { database_path, id } => {
+                print_topic_placements(database_path, id).await?
+            }
+        },
+        Commands::NodeState { database_path } => print_node_state(database_path).await?,
         Commands::Import {
             snapshot_path,
             target_path,

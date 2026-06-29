@@ -6,11 +6,11 @@ use crate::structs::{
     ResolvedSourceConnector, SourceMetadata,
 };
 use crate::{
-    automerge::AutomergeEvent,
-    errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
-    id::NodeId,
+    document::DocumentSyncNetEvent,
+    errors::{AuthorizationError, DhtError, StorageError, StreamError},
+    id::{DhtKeyId, NodeId},
     task::TaskEvent,
-    types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value},
+    types::{Key, KeySpace, TxnId, Value},
 };
 use bytes::Bytes;
 use ulid::Ulid;
@@ -21,7 +21,6 @@ pub enum Event {
     StagingSource(StagingSourceEvent),
     Storage(StorageEvent),
     Net(NetEvent),
-    Automerge(AutomergeEvent),
     Metadata(MetadataEvent),
     SubOperation(SubOperationEvent),
     Task(TaskEvent),
@@ -40,14 +39,11 @@ pub enum SubOperationEvent {
     RealmNodesResult {
         result: Result<Vec<NodeId>, String>,
     },
-    AutomergeSyncResult {
-        result: Result<(), String>,
-    },
-    TopicAnnouncementResult {
+    DocumentSyncResult {
         result: Result<(), String>,
     },
     SourceConnectorResolved {
-        result: Result<ResolvedSourceConnector, SourceConnectorResolutionError>,
+        result: Box<Result<ResolvedSourceConnector, SourceConnectorResolutionError>>,
     },
     VersionSourceAccessResolved {
         result: Result<ResolvedSourceAccess, SourceConnectorResolutionError>,
@@ -121,6 +117,10 @@ pub enum StorageEvent {
         key: Key,
         value: Option<Value>,
     },
+    /// Values in the same order as the requested reads.
+    BatchReadResult {
+        values: Vec<(Key, Option<Value>)>,
+    },
     WriteResult {
         key: Key,
     },
@@ -133,6 +133,7 @@ pub enum StorageEvent {
     BatchDeleteResult {
         entries: Vec<(KeySpace, Key)>,
     },
+    SyncAllFinished,
     /// Result of an iteration request with optional pagination cursor.
     IterResult {
         values: Vec<(Key, Value)>,
@@ -146,16 +147,23 @@ pub enum StorageEvent {
 #[derive(Debug, PartialEq)]
 pub enum NetEvent {
     Dht(DhtEvent),
-    Gossip(GossipEvent),
+    DocumentSync(DocumentSyncNetEvent),
     Stream(StreamEvent),
     Error(NetError),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum DhtEvent {
-    PutComplete { key: DhtKey },
-    GetResult { key: DhtKey, values: Vec<DhtEntry> },
-    Error { error: DhtError },
+    PutComplete {
+        key: DhtKeyId,
+    },
+    GetResult {
+        key: DhtKeyId,
+        values: Vec<DhtEntry>,
+    },
+    Error {
+        error: DhtError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,14 +172,6 @@ pub struct DhtEntry {
     pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum GossipEvent {
-    Subscribed { topic: TopicId },
-    BroadcastComplete { topic: TopicId },
-    Unsubscribed { topic: TopicId },
-    Error { error: GossipError },
 }
 
 #[derive(Debug, PartialEq)]

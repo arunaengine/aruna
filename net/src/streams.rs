@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
+use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
 use crate::telemetry::{
     duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
@@ -190,13 +191,13 @@ impl std::fmt::Debug for StreamsService {
 #[tracing::instrument(
     name = "iroh.stream.accept_loop",
     level = "debug",
-    skip(endpoint, dht_handler, gossip_handler, stream_handler, shutdown)
+    skip(endpoint, dht_handler, stream_handler, shutdown)
 )]
 pub async fn run_accept_loop(
     endpoint: Endpoint,
     dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
-    gossip_handler: mpsc::Sender<(Connection, NodeId)>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    document_sync: std::sync::Arc<DocumentSyncService>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -206,8 +207,8 @@ pub async fn run_accept_loop(
                 let Some(incoming) = incoming else { break };
 
                 let dht_handler = dht_handler.clone();
-                let gossip_handler = gossip_handler.clone();
                 let stream_handler = stream_handler.clone();
+                let document_sync = document_sync.clone();
 
                 tokio::spawn(async move {
                     let accepting = match incoming.accept() {
@@ -238,20 +239,10 @@ pub async fn run_accept_loop(
                         Some(Alpn::Dht) => {
                             run_dht_connection(conn, dht_handler, peer_id).await;
                         }
-                        Some(Alpn::Gossip) => {
-                            match gossip_handler.try_send((conn, peer_id)) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full((conn, _))) => {
-                                    warn!(node_id = %peer_id, "Dropping inbound gossip connection: queue full");
-                                    conn.close(0u32.into(), b"gossip queue full");
-                                }
-                                Err(TrySendError::Closed((conn, _))) => {
-                                    warn!(node_id = %peer_id, "Dropping inbound gossip connection: queue closed");
-                                    conn.close(0u32.into(), b"gossip queue closed");
-                                }
+                        Some(alpn @ (Alpn::Bao | Alpn::DocumentSync | Alpn::Metadata)) => {
+                            if alpn == Alpn::DocumentSync {
+                                document_sync.register_inbound_connection(&conn);
                             }
-                        }
-                        Some(alpn @ (Alpn::Bao | Alpn::Automerge | Alpn::Metadata)) => {
                             run_app_connection(conn, alpn, stream_handler, peer_id).await;
                         }
                         None => {

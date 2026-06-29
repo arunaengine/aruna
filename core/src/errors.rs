@@ -1,5 +1,4 @@
 use crate::structs::SourceConnectorKind;
-use automerge::AutomergeError;
 use std::array::TryFromSliceError;
 use thiserror::Error;
 
@@ -101,7 +100,7 @@ pub enum SourceConnectorResolutionError {
     ResolveFailed,
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error, PartialEq, Clone)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,
@@ -117,6 +116,8 @@ pub enum StorageError {
     WriteError,
     #[error("Delete error")]
     DeleteError,
+    #[error("Persist error: {0}")]
+    PersistError(String),
     #[error("Channel closed")]
     ChannelClosed,
     #[error("Queue full")]
@@ -135,18 +136,6 @@ pub enum DhtError {
     StoreFailed(String),
     #[error("Storage full")]
     StorageFull,
-    #[error("Other: {0}")]
-    Other(String),
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum GossipError {
-    #[error("Already subscribed")]
-    AlreadySubscribed,
-    #[error("Not subscribed")]
-    NotSubscribed,
-    #[error("Broadcast failed: {0}")]
-    BroadcastFailed(String),
     #[error("Other: {0}")]
     Other(String),
 }
@@ -193,12 +182,6 @@ pub enum ConversionError {
     PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
     #[error("Invalid string `{0}` for Operation")]
     InvalidOperationConversion(String),
-    #[error(transparent)]
-    ReconcileError(#[from] autosurgeon::ReconcileError),
-    #[error(transparent)]
-    HydrateError(#[from] autosurgeon::HydrateError),
-    #[error(transparent)]
-    AutomergeError(#[from] AutomergeError),
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
 }

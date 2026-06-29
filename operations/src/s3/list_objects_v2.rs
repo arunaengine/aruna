@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -7,7 +7,8 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
     SourceMetadata, VersionKey,
 };
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::util::prefix_upper_bound;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -18,8 +19,8 @@ pub enum ListObjectsV2State {
     Init,
     StartTransaction,
     ReadHeads,
-    ReadVersion,
-    ReadBlobLocation,
+    ReadVersions,
+    ReadBlobLocations,
     CommitTransaction,
     Finish,
     Error,
@@ -86,20 +87,27 @@ pub struct ListObjectsV2Result {
 }
 
 #[derive(Debug, PartialEq)]
+enum ResolvedEntry {
+    Object(ListObjectsV2Object),
+    AwaitingLocation(BlobHeadKey),
+}
+
+#[derive(Debug, PartialEq)]
 pub struct ListObjectsV2Operation {
     input: ListObjectsV2Input,
     state: ListObjectsV2State,
     txn_id: Option<Ulid>,
     pending: Vec<(BlobHeadKey, Ulid)>,
+    resolved: Vec<ResolvedEntry>,
     objects: Vec<ListObjectsV2Object>,
     common_prefixes: Vec<String>,
     continuation_token: Option<ListObjectsV2ContinuationToken>,
-    current_head: Option<BlobHeadKey>,
     scan_prefix: Vec<u8>,
     scan_limit: usize,
     scan_rounds: usize,
     resume_common_prefix: Option<String>,
     cursor_group: Option<String>,
+    cursor_group_prefix: Option<Vec<u8>>,
     last_consumed_key: Option<Vec<u8>>,
     output: Option<Result<ListObjectsV2Result, ListObjectsV2Error>>,
 }
@@ -114,15 +122,16 @@ impl ListObjectsV2Operation {
             state: ListObjectsV2State::Init,
             txn_id: None,
             pending: Vec::new(),
+            resolved: Vec::new(),
             objects: Vec::new(),
             common_prefixes: Vec::new(),
             continuation_token: None,
-            current_head: None,
             scan_prefix: Vec::new(),
             scan_limit: 0,
             scan_rounds: 0,
             resume_common_prefix: None,
             cursor_group: None,
+            cursor_group_prefix: None,
             last_consumed_key: None,
             output: None,
         }
@@ -178,18 +187,26 @@ impl ListObjectsV2Operation {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
-        let iter_start_key = match (&self.input.continuation_token, &self.input.start_after) {
-            (Some(token), _) => {
-                self.resume_common_prefix = token.last_common_prefix.clone();
-                Some(token.last_key.clone())
+        let iter_start_key = if let Some(token) = self.input.continuation_token.clone() {
+            if let Err(error) = self.resume_scan_state(&token) {
+                return self.emit_error(error);
             }
-            (None, Some(start_after)) if !start_after.is_empty() => {
-                match BlobHeadKey::object_prefix(&self.input.bucket, start_after) {
-                    Ok(key) => Some(key),
-                    Err(err) => return self.emit_error(err.into()),
+            Some(token.last_key)
+        } else {
+            match self
+                .input
+                .start_after
+                .as_deref()
+                .filter(|start_after| !start_after.is_empty())
+            {
+                Some(start_after) => {
+                    match BlobHeadKey::object_prefix(&self.input.bucket, start_after) {
+                        Ok(key) => Some(key),
+                        Err(err) => return self.emit_error(err.into()),
+                    }
                 }
+                None => None,
             }
-            _ => None,
         };
         if let Some(start) = iter_start_key.as_ref()
             && start.as_slice() > prefix.as_slice()
@@ -203,16 +220,56 @@ impl ListObjectsV2Operation {
         self.issue_scan_round()
     }
 
+    /// Restore the group cursor from a continuation token so the first scan
+    /// round can seek past a fully emitted common-prefix group instead of
+    /// re-reading its keys one round at a time.
+    fn resume_scan_state(
+        &mut self,
+        token: &ListObjectsV2ContinuationToken,
+    ) -> Result<(), ListObjectsV2Error> {
+        self.resume_common_prefix = token.last_common_prefix.clone();
+        let Some(group) = token.last_common_prefix.as_deref() else {
+            return Ok(());
+        };
+        let Ok(head) = BlobHeadKey::from_bytes(&token.last_key) else {
+            return Ok(());
+        };
+        if head.bucket != self.input.bucket
+            || self.common_prefix_of(&head.key).as_deref() != Some(group)
+        {
+            return Ok(());
+        }
+
+        let group_prefix = BlobHeadKey::object_prefix(&self.input.bucket, group)?;
+        self.cursor_group = Some(group.to_string());
+        self.cursor_group_prefix = Some(group_prefix);
+        Ok(())
+    }
+
     fn issue_scan_round(&mut self) -> Effects {
         let visible = self.pending.len() + self.common_prefixes.len();
         self.scan_limit = self.max_keys().saturating_sub(visible).saturating_add(1);
         self.scan_rounds += 1;
 
+        // While the cursor sits inside an emitted group, seek inclusively to
+        // the first key past the group instead of resuming behind the cursor.
+        let start = match self
+            .cursor_group_prefix
+            .as_deref()
+            .and_then(prefix_upper_bound)
+        {
+            Some(seek) => Some(IterStart::At(seek.into())),
+            None => self
+                .last_consumed_key
+                .clone()
+                .map(|key| IterStart::After(key.into())),
+        };
+
         self.state = ListObjectsV2State::ReadHeads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
-            start_after: self.last_consumed_key.clone().map(Into::into),
+            start,
             limit: self.scan_limit,
             txn_id: self.txn_id,
         })]
@@ -230,8 +287,43 @@ impl ListObjectsV2Operation {
     }
 
     fn finish_scan(&mut self) -> Effects {
-        self.pending.reverse();
-        self.read_next_version_or_finish()
+        if self.pending.is_empty() {
+            return self.commit();
+        }
+
+        let reads = self
+            .pending
+            .iter()
+            .map(|(head, version_id)| {
+                VersionKey::new(&head.bucket, &head.key, *version_id)
+                    .to_bytes()
+                    .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let reads = match reads {
+            Ok(reads) => reads,
+            Err(err) => return self.emit_error(err.into()),
+        };
+
+        self.state = ListObjectsV2State::ReadVersions;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(ListObjectsV2Error::NoTransactionFound);
+        };
+
+        self.state = ListObjectsV2State::CommitTransaction;
+        self.output = Some(Ok(ListObjectsV2Result {
+            objects: std::mem::take(&mut self.objects),
+            common_prefixes: std::mem::take(&mut self.common_prefixes),
+            continuation_token: self.continuation_token.clone(),
+        }));
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn common_prefix_of(&self, key: &str) -> Option<String> {
@@ -253,6 +345,15 @@ impl ListObjectsV2Operation {
         let max_keys = self.max_keys();
         let round_len = values.len();
         for (key, value) in values.into_iter() {
+            // Keys inside the current group need no decode: the group is
+            // already emitted, only the cursor has to advance.
+            if let Some(group_prefix) = self.cursor_group_prefix.as_deref()
+                && key.as_ref().starts_with(group_prefix)
+            {
+                self.last_consumed_key = Some(key.to_vec());
+                continue;
+            }
+
             let head = match BlobHeadKey::from_bytes(key.as_ref()) {
                 Ok(head) => head,
                 Err(err) => return self.emit_error(err.into()),
@@ -275,7 +376,13 @@ impl ListObjectsV2Operation {
                         self.resume_common_prefix = None;
                         self.common_prefixes.push(group.clone());
                     }
+                    let group_prefix = match BlobHeadKey::object_prefix(&self.input.bucket, &group)
+                    {
+                        Ok(group_prefix) => group_prefix,
+                        Err(err) => return self.emit_error(err.into()),
+                    };
                     self.cursor_group = Some(group);
+                    self.cursor_group_prefix = Some(group_prefix);
                     self.last_consumed_key = Some(key.to_vec());
                 }
                 None => {
@@ -284,6 +391,7 @@ impl ListObjectsV2Operation {
                     }
                     self.resume_common_prefix = None;
                     self.cursor_group = None;
+                    self.cursor_group_prefix = None;
                     self.last_consumed_key = Some(key.to_vec());
                     self.pending.push((head, pointer.version_id));
                 }
@@ -300,112 +408,115 @@ impl ListObjectsV2Operation {
         self.issue_scan_round()
     }
 
-    fn read_next_version_or_finish(&mut self) -> Effects {
-        let Some((head, version_id)) = self.pending.pop() else {
-            let Some(txn_id) = self.txn_id else {
-                return self.emit_error(ListObjectsV2Error::NoTransactionFound);
+    fn handle_versions_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+
+        if values.len() != self.pending.len() {
+            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        let mut location_reads = Vec::new();
+        for ((head, _version_id), (_key, value)) in pending.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let version = match BlobVersion::from_bytes(value.as_ref()) {
+                Ok(version) => version,
+                Err(err) => return self.emit_error(err.into()),
             };
 
-            self.state = ListObjectsV2State::CommitTransaction;
-            self.output = Some(Ok(ListObjectsV2Result {
-                objects: std::mem::take(&mut self.objects),
-                common_prefixes: std::mem::take(&mut self.common_prefixes),
-                continuation_token: self.continuation_token.clone(),
-            }));
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        };
+            match version.state {
+                BlobVersionState::Deleted => {}
+                BlobVersionState::Reference {
+                    cached_metadata,
+                    last_refresh,
+                    ..
+                } => {
+                    self.resolved
+                        .push(ResolvedEntry::Object(ListObjectsV2Object {
+                            head,
+                            location: None,
+                            source_metadata: Some(cached_metadata),
+                            last_refresh: Some(last_refresh),
+                        }));
+                }
+                BlobVersionState::Materialized { blob_hash, .. } => {
+                    location_reads.push((
+                        BLOB_LOCATIONS_KEYSPACE.to_string(),
+                        blob_hash.to_vec().into(),
+                    ));
+                    self.resolved.push(ResolvedEntry::AwaitingLocation(head));
+                }
+            }
+        }
 
-        self.current_head = Some(head.clone());
-        let key = match VersionKey::new(&head.bucket, &head.key, version_id).to_bytes() {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(err.into()),
-        };
+        if location_reads.is_empty() {
+            return self.finish_hydration(Vec::new());
+        }
 
-        self.state = ListObjectsV2State::ReadVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
+        self.state = ListObjectsV2State::ReadBlobLocations;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: location_reads,
             txn_id: self.txn_id,
         })]
     }
 
-    fn handle_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+    fn handle_locations_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
 
-        let Some(value) = value else {
-            return self.read_next_version_or_finish();
-        };
-
-        let version = match BlobVersion::from_bytes(value.as_ref()) {
-            Ok(version) => version,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        match version.state {
-            BlobVersionState::Deleted => self.read_next_version_or_finish(),
-            BlobVersionState::Reference {
-                cached_metadata,
-                last_refresh,
-                ..
-            } => {
-                let Some(head) = self.current_head.clone() else {
-                    return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
-                };
-
-                self.objects.push(ListObjectsV2Object {
-                    head,
-                    location: None,
-                    source_metadata: Some(cached_metadata),
-                    last_refresh: Some(last_refresh),
-                });
-                self.read_next_version_or_finish()
-            }
-            BlobVersionState::Materialized { blob_hash, .. } => {
-                self.state = ListObjectsV2State::ReadBlobLocation;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: blob_hash.to_vec().into(),
-                    txn_id: self.txn_id,
-                })]
-            }
+        let awaiting = self
+            .resolved
+            .iter()
+            .filter(|entry| matches!(entry, ResolvedEntry::AwaitingLocation(_)))
+            .count();
+        if values.len() != awaiting {
+            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
         }
+
+        self.finish_hydration(values)
     }
 
-    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
+    fn finish_hydration(&mut self, locations: Vec<(Key, Option<Value>)>) -> Effects {
+        let mut locations = locations.into_iter();
+        for entry in std::mem::take(&mut self.resolved) {
+            match entry {
+                ResolvedEntry::Object(object) => self.objects.push(object),
+                ResolvedEntry::AwaitingLocation(head) => {
+                    let Some((_key, value)) = locations.next() else {
+                        return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+                    };
+                    // Objects without a stored backend location stay hidden.
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let location = match BackendLocation::from_bytes(value.as_ref()) {
+                        Ok(location) => location,
+                        Err(err) => return self.emit_error(err.into()),
+                    };
+                    self.objects.push(ListObjectsV2Object {
+                        head,
+                        location: Some(location),
+                        source_metadata: None,
+                        last_refresh: None,
+                    });
+                }
+            }
+        }
 
-        let Some(value) = value else {
-            return self.read_next_version_or_finish();
-        };
-
-        let location = match BackendLocation::from_bytes(value.as_ref()) {
-            Ok(location) => location,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        let Some(head) = self.current_head.clone() else {
-            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
-        };
-
-        self.objects.push(ListObjectsV2Object {
-            head,
-            location: Some(location),
-            source_metadata: None,
-            last_refresh: None,
-        });
-        self.read_next_version_or_finish()
+        self.commit()
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -439,8 +550,8 @@ impl Operation for ListObjectsV2Operation {
             ListObjectsV2State::Init => self.handle_init(),
             ListObjectsV2State::StartTransaction => self.handle_transaction_started(event),
             ListObjectsV2State::ReadHeads => self.handle_heads_read(event),
-            ListObjectsV2State::ReadVersion => self.handle_version_read(event),
-            ListObjectsV2State::ReadBlobLocation => self.handle_blob_location_read(event),
+            ListObjectsV2State::ReadVersions => self.handle_versions_read(event),
+            ListObjectsV2State::ReadBlobLocations => self.handle_locations_read(event),
             ListObjectsV2State::CommitTransaction => self.handle_transaction_committed(event),
             ListObjectsV2State::Finish | ListObjectsV2State::Error => smallvec![],
         }
@@ -499,7 +610,6 @@ mod test {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -715,7 +825,6 @@ mod test {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -844,7 +953,6 @@ mod test {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -881,7 +989,6 @@ mod test {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -979,7 +1086,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         }
@@ -1249,6 +1355,237 @@ mod test {
             all_prefixes.extend(result.common_prefixes);
             pages += 1;
             assert!(pages < 10);
+
+            continuation_token = result.continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(all_keys, vec!["a", "z"]);
+        assert_eq!(all_prefixes, vec!["dir/"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_batched_hydration_preserves_key_order() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+
+        seed_materialized_keys(&storage_handle, "bucket", &["alpha", "delta"], created_by).await;
+
+        let source_metadata = SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("ref-etag-1".to_string()),
+            last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
+            source_version: None,
+        };
+        let reference = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "source/path".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: None,
+            },
+            source_metadata.clone(),
+            created_at,
+            created_by,
+            last_refresh,
+        );
+        let deleted = BlobVersion::deleted(created_at, created_by);
+
+        for (key, version) in [("beta", reference), ("gamma", deleted)] {
+            let version_id = Ulid::new();
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new("bucket", key).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: None,
+                })
+                .await;
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: VersionKey::new("bucket", key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: version.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        let result = drive(
+            ListObjectsV2Operation::new(ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                group_id: Ulid::new(),
+                continuation_token: None,
+                max_keys: Some(10),
+                prefix: None,
+                delimiter: None,
+                start_after: None,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let keys: Vec<_> = result
+            .objects
+            .iter()
+            .map(|object| object.head.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["alpha", "beta", "delta"]);
+        assert!(result.objects[0].location.is_some());
+        assert_eq!(result.objects[1].source_metadata, Some(source_metadata));
+        assert!(result.objects[2].location.is_some());
+    }
+
+    fn delimiter_input(
+        max_keys: usize,
+        continuation_token: Option<ListObjectsV2ContinuationToken>,
+        delimiter: Option<&str>,
+    ) -> ListObjectsV2Input {
+        ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            group_id: Ulid::new(),
+            continuation_token,
+            max_keys: Some(max_keys),
+            prefix: None,
+            delimiter: delimiter.map(str::to_string),
+            start_after: None,
+        }
+    }
+
+    fn step_transaction_started(operation: &mut ListObjectsV2Operation) -> Effects {
+        let effects = operation.start();
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::StartTransaction { .. })
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::new(),
+        }))
+    }
+
+    #[test]
+    fn scan_round_ending_inside_group_seeks_past_group() {
+        let mut operation = ListObjectsV2Operation::new(delimiter_input(1, None, Some("/")));
+
+        let effects = step_transaction_started(&mut operation);
+        let Effect::Storage(StorageEffect::Iter {
+            start: None, limit, ..
+        }) = &effects[0]
+        else {
+            panic!("expected initial scan round: {:?}", effects[0]);
+        };
+
+        let pointer: aruna_core::types::Value = CurrentVersionPointer::new(Ulid::new())
+            .to_bytes()
+            .unwrap()
+            .into();
+        let values = (0..*limit)
+            .map(|index| {
+                (
+                    BlobHeadKey::new("bucket", format!("dir/{index}"))
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    pointer.clone(),
+                )
+            })
+            .collect();
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }));
+
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            panic!("expected follow-up scan round: {:?}", effects[0]);
+        };
+        assert_eq!(start, &Some(IterStart::At(b"bucket/dir0".to_vec().into())));
+    }
+
+    #[test]
+    fn resume_inside_group_seeks_past_group() {
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::new("bucket", "dir/5").to_bytes().unwrap(),
+            last_common_prefix: Some("dir/".to_string()),
+        };
+
+        let mut operation =
+            ListObjectsV2Operation::new(delimiter_input(10, Some(token.clone()), Some("/")));
+        let effects = step_transaction_started(&mut operation);
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            panic!("expected resumed scan round: {:?}", effects[0]);
+        };
+        assert_eq!(start, &Some(IterStart::At(b"bucket/dir0".to_vec().into())));
+
+        // Without the delimiter the group no longer applies: resume behind
+        // the exclusive cursor instead of seeking.
+        let mut operation =
+            ListObjectsV2Operation::new(delimiter_input(10, Some(token.clone()), None));
+        let effects = step_transaction_started(&mut operation);
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            panic!("expected resumed scan round: {:?}", effects[0]);
+        };
+        assert_eq!(
+            start,
+            &Some(IterStart::After(token.last_key.clone().into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_paginates_past_large_group() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        let group_keys: Vec<String> = (0..30).map(|index| format!("dir/{index:02}")).collect();
+        let mut keys: Vec<&str> = vec!["a"];
+        keys.extend(group_keys.iter().map(String::as_str));
+        keys.push("z");
+        seed_materialized_keys(&storage_handle, "bucket", &keys, created_by).await;
+
+        let mut continuation_token = None;
+        let mut all_keys = Vec::new();
+        let mut all_prefixes = Vec::new();
+        let mut pages = 0;
+
+        loop {
+            let result = list_page(
+                &driver_ctx,
+                "bucket",
+                Some("/"),
+                2,
+                continuation_token.take(),
+            )
+            .await;
+            all_keys.extend(result.objects.into_iter().map(|object| object.head.key));
+            all_prefixes.extend(result.common_prefixes);
+            pages += 1;
+            assert!(pages <= 3);
 
             continuation_token = result.continuation_token;
             if continuation_token.is_none() {

@@ -1,5 +1,5 @@
 # Build Stage
-FROM rust:1-alpine3.23 AS builder
+FROM rust:1-alpine3.24 AS builder
 WORKDIR /build
 RUN apk update
 RUN apk upgrade
@@ -9,9 +9,9 @@ RUN apk add llvm cmake gcc ca-certificates libc-dev pkgconfig openssl-dev musl-d
 COPY . .
 RUN cargo build --release -p aruna
 RUN cargo build --release -p aruna-doctor
-RUN cargo install --root target iroh-doctor
+RUN cargo install --locked --root target iroh-doctor
 
-FROM alpine:3.23
+FROM alpine:3.24
 WORKDIR /run
 RUN apk update
 RUN apk upgrade

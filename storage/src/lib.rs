@@ -1,4 +1,4 @@
 pub mod errors;
 pub mod storage;
 
-pub use storage::{FjallStorage, StorageHandle};
+pub use storage::{FjallPersistPolicy, FjallStorage, StorageHandle};

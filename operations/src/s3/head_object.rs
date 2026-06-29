@@ -484,7 +484,6 @@ mod tests {
             storage_handle: storage_handle.clone(),
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -591,7 +590,6 @@ mod tests {
             storage_handle: storage_handle.clone(),
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -683,7 +681,6 @@ mod tests {
             storage_handle: storage_handle.clone(),
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };

@@ -1,6 +1,7 @@
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
+use aruna_operations::auth::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -32,6 +33,8 @@ pub enum ServerError {
     BadRequest,
     #[error("Bad gateway")]
     BadGateway,
+    #[error("Service unavailable")]
+    ServiceUnavailable,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +51,8 @@ pub enum TokenError {
     Expired,
     #[error("Invalid server token")]
     InvalidServerToken,
+    #[error("Error decoding AuthContext")]
+    AuthContextConversion(#[from] ConversionError),
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
@@ -58,6 +63,28 @@ pub enum TokenError {
     JWTError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+impl From<ArunaBearerTokenError> for TokenError {
+    fn from(error: ArunaBearerTokenError) -> Self {
+        match error {
+            ArunaBearerTokenError::RealmNotTrusted => Self::RealmNotTrusted,
+            ArunaBearerTokenError::TokenRevoked => Self::TokenBlacklisted,
+            ArunaBearerTokenError::InvalidIssuerKey => Self::InvalidIssuerKey,
+            ArunaBearerTokenError::Expired => Self::Expired,
+            ArunaBearerTokenError::InvalidServerToken => Self::InvalidServerToken,
+            ArunaBearerTokenError::AuthContextConversion(error) => {
+                Self::AuthContextConversion(error)
+            }
+            ArunaBearerTokenError::PublicKeyError(error) => Self::PublicKeyError(error),
+            ArunaBearerTokenError::FromSliceError(error) => Self::FromSliceError(error),
+            ArunaBearerTokenError::PublicKeyConversionError(error) => {
+                Self::PublicKeyConversionError(error)
+            }
+            ArunaBearerTokenError::JwtError(error) => Self::JWTError(error),
+            ArunaBearerTokenError::Base64Error(error) => Self::Base64Error(error),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -145,7 +172,14 @@ impl IntoResponse for ServerError {
 
         let body = ErrorResponse::new(&message).with_code(code);
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if matches!(self, ServerError::ServiceUnavailable) {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
@@ -159,6 +193,7 @@ impl ServerError {
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::BadRequest => StatusCode::BAD_REQUEST,
             ServerError::BadGateway => StatusCode::BAD_GATEWAY,
+            ServerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -171,6 +206,7 @@ impl ServerError {
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::BadRequest => "Bad request".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),
+            ServerError::ServiceUnavailable => "Service unavailable".to_string(),
         }
     }
 

@@ -2,6 +2,7 @@ use crate::blob::blob_keyspace_helper::{
     HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
     write_blob_location_effect, write_blob_version_effect,
 };
+use crate::replication::queue::write_live_replication_obligation_effect;
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -13,9 +14,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
+    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
+    VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -42,6 +44,7 @@ pub enum CompleteMultipartUploadState {
     WriteBlobVersionRecord,
     WriteObjectMetadata,
     DeleteUploadRecords,
+    WriteLiveReplicationObligation,
     CommitFinalizeTransaction,
     RegisterBlobInDht,
     CleanupDuplicate,
@@ -293,7 +296,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: None,
+            start: None,
             limit: 10_000,
             txn_id: None,
         })]
@@ -707,6 +710,38 @@ impl CompleteMultipartUploadOperation {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
+        self.write_live_replication_obligation()
+    }
+
+    fn write_live_replication_obligation(&mut self) -> Effects {
+        let Some(version_id) = self.version_id else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let effect = match write_live_replication_obligation_effect(
+            self.input.node_id,
+            AuthContext {
+                user_id: self.input.created_by,
+                realm_id: self.input.realm_id,
+                path_restrictions: None,
+            },
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            version_id,
+            false,
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+        self.state = CompleteMultipartUploadState::WriteLiveReplicationObligation;
+        smallvec![effect]
+    }
+
+    fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
         let Some(txn_id) = self.txn_id else {
             return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
         };
@@ -729,8 +764,8 @@ impl CompleteMultipartUploadOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.begin_cleanup_part_blobs();
         };
-        let key: [u8; 32] = match blake3_hash.try_into() {
-            Ok(key) => key,
+        let key = match blake3_hash.try_into() {
+            Ok(key) => aruna_core::id::DhtKeyId::from_bytes(key),
             Err(_) => return self.begin_cleanup_part_blobs(),
         };
 
@@ -953,6 +988,9 @@ impl Operation for CompleteMultipartUploadOperation {
             }
             CompleteMultipartUploadState::DeleteUploadRecords => {
                 self.handle_upload_records_deleted(event)
+            }
+            CompleteMultipartUploadState::WriteLiveReplicationObligation => {
+                self.handle_live_replication_obligation_written(event)
             }
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)

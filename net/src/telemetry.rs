@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use aruna_core::DistributedTraceContext;
+pub(crate) use aruna_core::telemetry::{duration_ms, record_duration_ms};
 use opentelemetry::Context;
 use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};
@@ -73,14 +74,6 @@ pub(crate) fn current_trace_context() -> Option<DistributedTraceContext> {
 pub(crate) fn extract_trace_context(trace_context: &DistributedTraceContext) -> Context {
     let carrier = TraceContextCarrier::from_trace_context(trace_context);
     global::get_text_map_propagator(|propagator| propagator.extract(&carrier))
-}
-
-pub(crate) fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-pub(crate) fn record_duration_ms(span: &Span, field: &'static str, duration: Duration) {
-    span.record(field, duration_ms(duration));
 }
 
 pub(crate) fn warn_if_slow_iroh_phase(

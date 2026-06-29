@@ -13,9 +13,6 @@ pub enum NetError {
     #[error("DHT error: {0}")]
     Dht(String),
 
-    #[error("Gossip error: {0}")]
-    Gossip(String),
-
     #[error("Stream error: {0}")]
     Stream(String),
 

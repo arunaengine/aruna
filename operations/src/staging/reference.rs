@@ -164,6 +164,13 @@ pub async fn materialize_reference(
     })
 }
 
+pub async fn stage_reference_blob(
+    context: &DriverContext,
+    input: MaterializeReferenceInput,
+) -> Result<MaterializeReferenceResult, MaterializeReferenceError> {
+    materialize_reference(context, input).await
+}
+
 async fn apply_storage_effect(
     context: &DriverContext,
     effect: Effect,
@@ -293,7 +300,6 @@ mod tests {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };

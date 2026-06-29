@@ -3,11 +3,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::UserId;
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
+    DocumentSyncTarget,
+};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::metadata::{MetadataEffect, MetadataEvent};
-use aruna_core::structs::{Actor, RealmId};
+use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::metadata::{
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
+    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
+};
+use aruna_core::storage_entries::{
+    metadata_create_event_write_entry, metadata_document_lifecycle_revision_change,
+    metadata_event_log_key,
+};
+use aruna_core::structs::{
+    Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::util::unix_timestamp_millis;
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -21,6 +37,9 @@ use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::projector::{
+    project_metadata_create_events, replay_metadata_event_log,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
@@ -31,7 +50,7 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -40,7 +59,8 @@ struct TestNode {
 }
 
 #[tokio::test]
-async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn std::error::Error>> {
+async fn metadata_creation_replicates_to_all_three_holders()
+-> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::new();
@@ -73,16 +93,13 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
         }),
         nodes[0].context.as_ref(),
     )
-    .await?;
+    .await?
+    .record;
 
-    let expected_holders: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
+    assert_eq!(created.holder_node_ids, vec![nodes[0].net.node_id()]);
     assert_eq!(
-        created
-            .holder_node_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>(),
-        expected_holders
+        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
+        1
     );
 
     wait_for_metadata_convergence(&nodes, group_id, document_id, &created.graph_iri).await?;
@@ -91,7 +108,7 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn metadata_updates_and_deletes_replicate_to_holders()
+async fn metadata_updates_and_deletes_apply_to_local_holder()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
@@ -120,12 +137,17 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
     )
     .await?;
 
+    assert_eq!(
+        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
+        1
+    );
+
     wait_for_metadata_state(
         &nodes,
         group_id,
         document_id,
-        &created.graph_iri,
-        nodes.len(),
+        &created.record.graph_iri,
+        3,
         "Initial Dataset",
     )
     .await?;
@@ -172,11 +194,11 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
     assert!(updated.public);
 
     wait_for_metadata_state(
-        &nodes[1..],
+        &nodes,
         group_id,
         document_id,
-        &created.graph_iri,
-        nodes.len(),
+        &created.record.graph_iri,
+        3,
         "Updated Dataset",
     )
     .await?;
@@ -195,7 +217,196 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
     )
     .await?;
 
-    wait_for_metadata_absence(&nodes[1..], group_id, document_id, &created.graph_iri).await?;
+    wait_for_metadata_absence(&nodes, group_id, document_id, &created.record.graph_iri).await?;
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn batched_metadata_create_projection_materializes_many_documents()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([43u8; 32]);
+    let nodes = vec![spawn_node(realm_id).await?];
+    let node = &nodes[0];
+    let group_id = Ulid::new();
+    let mut events = Vec::new();
+
+    for index in 0..8u8 {
+        let document_id = Ulid::new();
+        let now = unix_timestamp_millis().saturating_add(index.into());
+        let document_path = format!("datasets/batch-{index}");
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.clone(),
+            graph_iri,
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![node.net.node_id()],
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_event_id: Ulid::nil(),
+        };
+        events.push(MetadataCreateEventRecord {
+            event_id: Ulid::new(),
+            record,
+            user_id: UserId::local(Ulid::new(), realm_id),
+            node_id: node.net.node_id(),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: format!("Batch Dataset {index}"),
+                description: "Projected from one metadata batch".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: now,
+        });
+    }
+
+    let writes = events
+        .iter()
+        .map(metadata_create_event_write_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { entries }) => {
+            assert_eq!(entries.len(), events.len())
+        }
+        other => return Err(format!("unexpected metadata event batch write: {other:?}").into()),
+    }
+
+    let projected = project_metadata_create_events(
+        node.context.as_ref(),
+        events.clone(),
+        Some(node.net.node_id()),
+    )
+    .await?;
+    assert_eq!(projected, events.len());
+
+    wait_for_batched_metadata_projection(node, group_id, &events).await?;
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([44u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let document_path = "datasets/reordered-delete";
+    let event_id = Ulid::new();
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    let record = MetadataRegistryRecord {
+        realm_id,
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        graph_iri: graph_iri.clone(),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm_id,
+            group_id,
+            document_path,
+            document_id,
+        ),
+        holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_event_id: event_id,
+    };
+    let create_event = MetadataCreateEventRecord {
+        event_id,
+        record: record.clone(),
+        user_id: UserId::local(Ulid::new(), realm_id),
+        node_id: nodes[0].net.node_id(),
+        payload: MetadataCreateEventPayload::Scaffold {
+            name: "Reordered Delete".to_string(),
+            description: "Stale create follows tombstone".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+        },
+        occurred_at_ms: 1,
+    };
+    let tombstone =
+        MetadataGraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
+    let delete_event_id = Ulid::new();
+    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+        event: MetadataDocumentDeleteRecord {
+            event_id: delete_event_id,
+            tombstone,
+            deleted_after_event_id: event_id,
+        },
+    };
+    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    publish_document_to_peer(
+        &nodes[0],
+        delete_event_id,
+        lifecycle_target.clone(),
+        postcard::to_allocvec(&lifecycle)?,
+        nodes[1].net.node_id(),
+    )
+    .await?;
+    nodes[1]
+        .net
+        .sync_document_topic_with_peers(
+            lifecycle_target.sync_topic_id(),
+            vec![nodes[0].net.node_id()],
+        )
+        .await?;
+    let delete_result = nodes[1]
+        .net
+        .reconcile_document_sync_topics(vec![lifecycle_target.sync_topic_id()])
+        .await?;
+    assert_eq!(delete_result.metadata_create_events.len(), 0);
+
+    let stale_target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id,
+    };
+    publish_document_to_peer(
+        &nodes[0],
+        Ulid::new(),
+        stale_target.clone(),
+        postcard::to_allocvec(&create_event)?,
+        nodes[1].net.node_id(),
+    )
+    .await?;
+    nodes[1]
+        .net
+        .sync_document_topic_with_peers(stale_target.sync_topic_id(), vec![nodes[0].net.node_id()])
+        .await?;
+    let stale_result = nodes[1]
+        .net
+        .reconcile_document_sync_topics(vec![stale_target.sync_topic_id()])
+        .await?;
+
+    assert!(stale_result.metadata_create_events.is_empty());
+    assert!(
+        read_metadata_event_log_value(&nodes[1], document_id, event_id)
+            .await?
+            .is_none()
+    );
+    let fetched = drive(
+        GetMetadataDocumentOperation::new(group_id, document_id),
+        nodes[1].context.as_ref(),
+    )
+    .await;
+    assert!(fetched.is_err());
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -206,7 +417,7 @@ async fn build_realm_nodes(
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        nodes.push(spawn_node().await?);
+        nodes.push(spawn_node(*realm_id).await?);
     }
 
     for i in 0..nodes.len() {
@@ -235,15 +446,17 @@ async fn build_realm_nodes(
     }
 
     wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
 
-async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
+async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
             ..NetConfig::default()
@@ -257,13 +470,14 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
         net.node_id(),
         storage.clone(),
         Some(net.clone()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
     )?;
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        automerge_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
@@ -276,6 +490,133 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
         net,
         context,
     })
+}
+
+async fn install_realm_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    for node in nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+
+    for node in nodes {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: UserId::nil(*realm_id),
+            realm_id: *realm_id,
+        };
+        let bytes = config.to_bytes(&actor)?;
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: bytes.into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
+        }
+        node.net.refresh_realm_peers_from_document(&config).await?;
+    }
+
+    Ok(())
+}
+
+async fn publish_document_to_peer(
+    node: &TestNode,
+    event_id: Ulid,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+    peer: aruna_core::NodeId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match node
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    change: document_change_for_publish(node.net.node_id(), &target, &bytes)?,
+                    bytes,
+                }],
+                peers: vec![peer],
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+            targets,
+        })) => {
+            assert_eq!(targets, vec![target]);
+            Ok(())
+        }
+        other => Err(format!("unexpected publish event: {other:?}").into()),
+    }
+}
+
+fn document_change_for_publish(
+    node_id: aruna_core::NodeId,
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> Result<DocumentSyncChange, Box<dyn std::error::Error>> {
+    match target {
+        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+            let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+            if lifecycle.document_id() != *document_id {
+                return Err("metadata document lifecycle target mismatch".into());
+            }
+            Ok(metadata_document_lifecycle_revision_change(
+                &lifecycle, node_id,
+            ))
+        }
+        DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        } => {
+            let record: MetadataCreateEventRecord = postcard::from_bytes(bytes)?;
+            if record.record.document_id != *document_id || record.event_id != *event_id {
+                return Err("metadata create-event target mismatch".into());
+            }
+            Ok(DocumentSyncChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: record.record.updated_at_ms,
+                    event_id: record.event_id,
+                    actor: record.node_id,
+                    updated_at_ms: record.occurred_at_ms,
+                },
+                kind: DocumentSyncChangeKind::Upsert,
+            })
+        }
+        _ => Err("unsupported test publish target".into()),
+    }
+}
+
+async fn read_metadata_event_log_value(
+    node: &TestNode,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<Option<aruna_core::types::Value>, Box<dyn std::error::Error>> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key: metadata_event_log_key(document_id, event_id),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected event log read event: {other:?}").into()),
+    }
 }
 
 async fn wait_for_realm_node_convergence(
@@ -338,12 +679,20 @@ async fn wait_for_metadata_state(
     expected_text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let expected_holders = nodes
+        .iter()
+        .map(|node| node.net.node_id())
+        .collect::<HashSet<_>>();
     let mut last_states = Vec::new();
 
     loop {
         let mut converged = true;
         last_states.clear();
+
         for node in nodes {
+            if !converged {
+                break;
+            }
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
@@ -353,6 +702,13 @@ async fn wait_for_metadata_state(
                 Ok(document)
                     if document.record.graph_iri == graph_iri
                         && document.record.holder_node_ids.len() == expected_holder_count
+                        && document
+                            .record
+                            .holder_node_ids
+                            .iter()
+                            .copied()
+                            .collect::<HashSet<_>>()
+                            == expected_holders
                         && document.jsonld.contains(expected_text) =>
                 {
                     last_states.push(format!("node={} converged", node.net.node_id()));
@@ -417,14 +773,18 @@ async fn wait_for_metadata_absence(
     loop {
         let mut converged = true;
         last_states.clear();
+
         for node in nodes {
+            if !converged {
+                break;
+            }
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
             {
-                Err(_) => {
+                Err(error) => {
                     let graph_state = match node
                         .context
                         .metadata_handle
@@ -439,8 +799,10 @@ async fn wait_for_metadata_absence(
                         _ => "graph-present",
                     };
                     if graph_state != "graph-missing" {
-                        last_states
-                            .push(format!("node={} graph still present", node.net.node_id()));
+                        last_states.push(format!(
+                            "node={} error={error:?} graph still present",
+                            node.net.node_id()
+                        ));
                         converged = false;
                         break;
                     }
@@ -462,6 +824,65 @@ async fn wait_for_metadata_absence(
         }
         if Instant::now() >= deadline {
             return Err(format!("metadata deletion did not converge: {last_states:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_batched_metadata_projection(
+    node: &TestNode,
+    group_id: Ulid,
+    events: &[MetadataCreateEventRecord],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut last_states = Vec::new();
+
+    loop {
+        let mut converged = true;
+        last_states.clear();
+
+        for event in events {
+            let document_id = event.record.document_id;
+            let expected_name = match &event.payload {
+                MetadataCreateEventPayload::Scaffold { name, .. } => name.as_str(),
+                _ => "",
+            };
+            match drive(
+                GetMetadataDocumentOperation::new(group_id, document_id),
+                node.context.as_ref(),
+            )
+            .await
+            {
+                Ok(document)
+                    if document.record.graph_iri == event.record.graph_iri
+                        && document.record.holder_node_ids == vec![node.net.node_id()]
+                        && document.jsonld.contains(expected_name) => {}
+                Ok(document) => {
+                    last_states.push(format!(
+                        "document={} holders={} jsonld_contains={}",
+                        document_id,
+                        document.record.holder_node_ids.len(),
+                        document.jsonld.contains(expected_name)
+                    ));
+                    converged = false;
+                    break;
+                }
+                Err(error) => {
+                    last_states.push(format!("document={document_id} error={error:?}"));
+                    converged = false;
+                    break;
+                }
+            }
+        }
+
+        if converged {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "batched metadata projection did not materialize: {last_states:?}"
+            )
+            .into());
         }
         sleep(Duration::from_millis(50)).await;
     }

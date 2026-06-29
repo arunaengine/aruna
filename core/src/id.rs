@@ -6,6 +6,24 @@ use ulid::Ulid;
 
 pub type NodeId = iroh::PublicKey;
 
+pub const SHORT_DISPLAY_ID_CHARS: usize = 8;
+pub const HEX_PREFIX_BYTES: usize = 8;
+
+pub fn short_display_id(id: impl fmt::Display) -> String {
+    id.to_string()
+        .chars()
+        .take(SHORT_DISPLAY_ID_CHARS)
+        .collect()
+}
+
+pub fn hex_prefix(bytes: &[u8]) -> String {
+    hex_prefix_bytes(bytes, HEX_PREFIX_BYTES)
+}
+
+pub fn hex_prefix_bytes(bytes: &[u8], max_bytes: usize) -> String {
+    hex::encode(&bytes[..bytes.len().min(max_bytes)])
+}
+
 pub trait NodeIdExt {
     fn xor_distance(&self, other: &NodeId) -> [u8; 32];
     fn bucket_index(&self, other: &NodeId) -> usize;
@@ -56,13 +74,13 @@ impl DhtKeyId {
 
 impl fmt::Debug for DhtKeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DhtKeyId({})", hex::encode(&self.0[..8]))
+        write!(f, "DhtKeyId({})", hex_prefix(&self.0))
     }
 }
 
 impl fmt::Display for DhtKeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0[..8]))
+        write!(f, "{}", hex_prefix(&self.0))
     }
 }
 
@@ -194,13 +212,6 @@ impl TopicId {
             _ => None,
         }
     }
-
-    #[inline]
-    pub fn to_iroh_topic(&self) -> iroh_gossip::TopicId {
-        let bytes = self.to_bytes();
-        let hash = blake3::hash(&bytes);
-        (*hash.as_bytes()).into()
-    }
 }
 
 impl fmt::Debug for TopicId {
@@ -267,6 +278,13 @@ mod tests {
         let key3 = DhtKeyId::from_data(b"world");
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn display_helpers_use_stable_prefixes() {
+        assert_eq!(hex_prefix(&[0xab; 16]), "abababababababab");
+        assert_eq!(hex_prefix_bytes(&[0xab; 2], 8), "abab");
+        assert_eq!(short_display_id("abcdef123456"), "abcdef12");
     }
 
     #[test]

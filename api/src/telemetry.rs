@@ -1,7 +1,9 @@
-use std::time::Instant;
+use std::sync::{LazyLock, OnceLock};
+use std::time::{Duration, Instant};
 
 use aruna_core::structs::AuthContext;
-use axum::extract::Request;
+use aruna_core::telemetry::{LatencyAggregator, RequestStages, duration_ms};
+use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use http::{HeaderMap, Method};
@@ -10,6 +12,31 @@ use opentelemetry::propagation::Extractor;
 use tracing::{Instrument, Span, error, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
+
+const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 500;
+const SLOW_REQUEST_THRESHOLD_ENV: &str = "ARUNA_SLOW_REQUEST_THRESHOLD_MS";
+
+// Unbiased per-route request latency histograms flushed as `latency.summary`.
+static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggregator::new("http"));
+
+fn slow_request_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        parse_slow_request_threshold(std::env::var(SLOW_REQUEST_THRESHOLD_ENV).ok().as_deref())
+    })
+}
+
+fn parse_slow_request_threshold(value: Option<&str>) -> Duration {
+    Duration::from_millis(
+        value
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SLOW_REQUEST_THRESHOLD_MS),
+    )
+}
+
+fn is_slow_request(elapsed: Duration, threshold: Duration) -> bool {
+    elapsed >= threshold
+}
 
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
@@ -27,6 +54,13 @@ pub async fn request_tracing_middleware(request: Request, next: Next) -> Respons
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
+    // Router::layer middleware runs after route matching, so the matched
+    // route template is available and keeps the latency key cardinality low.
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
     let span = make_request_span("http", request.headers(), &method, &path);
     let started = Instant::now();
 
@@ -42,8 +76,28 @@ pub async fn request_tracing_middleware(request: Request, next: Next) -> Respons
         );
     }
 
-    let response = next.run(request).instrument(span.clone()).await;
+    let stages = RequestStages::default();
+    let response = stages
+        .clone()
+        .scope(next.run(request).instrument(span.clone()))
+        .await;
+    let elapsed = started.elapsed();
     emit_request_completed(&span, "http", response.status().as_u16(), started);
+    let route_key = format!("{method} {route}");
+    HTTP_LATENCY.record(&route_key, elapsed);
+    if is_slow_request(elapsed, slow_request_threshold()) {
+        let _guard = span.enter();
+        warn!(
+            event = "request.slow",
+            method = %method,
+            route = %route_key,
+            status_code = response.status().as_u16(),
+            total_ms = duration_ms(elapsed),
+            threshold_ms = duration_ms(slow_request_threshold()),
+            stages = %stages.render(),
+            "Slow HTTP request"
+        );
+    }
     response
 }
 
@@ -112,7 +166,7 @@ pub fn emit_request_completed(
         );
     }
     let _guard = span.enter();
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let latency_ms = duration_ms(started.elapsed());
     match status_code {
         500.. => error!(
             event = "request.failed",
@@ -135,5 +189,46 @@ pub fn emit_request_completed(
             latency_ms,
             "Completed request"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_request_threshold_defaults_to_500ms() {
+        assert_eq!(
+            parse_slow_request_threshold(None),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_slow_request_threshold(Some("garbage")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_slow_request_threshold(Some("")),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn slow_request_threshold_parses_override() {
+        assert_eq!(
+            parse_slow_request_threshold(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            parse_slow_request_threshold(Some(" 1000 ")),
+            Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn slow_request_gating_is_inclusive_at_threshold() {
+        let threshold = parse_slow_request_threshold(Some("500"));
+        assert!(!is_slow_request(Duration::from_millis(499), threshold));
+        assert!(is_slow_request(Duration::from_millis(500), threshold));
+        assert!(is_slow_request(Duration::from_millis(750), threshold));
     }
 }

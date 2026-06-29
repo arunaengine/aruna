@@ -1,15 +1,15 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
-use crate::automerge::AutomergeEffect;
-use crate::id::NodeId;
+use crate::document::DocumentSyncEffect;
+use crate::id::{DhtKeyId, NodeId};
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{BackendLocation, RealmId, ResolvedSourceAccess};
 use crate::task::TaskEffect;
 use crate::types::UserId;
-use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
+use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
 use ulid::Ulid;
@@ -20,7 +20,6 @@ pub enum Effect {
     StagingSource(StagingSourceEffect),
     Storage(StorageEffect),
     Net(NetEffect),
-    Automerge(AutomergeEffect),
     Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
     Task(TaskEffect),
@@ -113,6 +112,10 @@ pub enum StorageEffect {
         key: Key,
         txn_id: Option<TxnId>,
     },
+    BatchRead {
+        reads: Vec<(KeySpace, Key)>,
+        txn_id: Option<TxnId>,
+    },
     Write {
         key_space: KeySpace,
         key: Key,
@@ -135,47 +138,59 @@ pub enum StorageEffect {
     AbortTransaction {
         txn_id: TxnId,
     },
+    /// Persist all pending storage data with `SyncAll` durability.
+    SyncAll,
     /// Iterate over keys in a keyspace with optional prefix and pagination.
     ///
     /// Iteration order is lexicographic by key bytes.
     /// - `prefix`: restricts results to keys with this prefix
-    /// - `start_after`: exclusive cursor key
+    /// - `start`: lower bound for the first returned key
     /// - `limit`: maximum number of entries to return
     Iter {
         key_space: KeySpace,
         prefix: Option<Key>,
-        start_after: Option<Key>,
+        start: Option<IterStart>,
         limit: usize,
         txn_id: Option<TxnId>,
     },
 }
 
+/// Lower bound for a [`StorageEffect::Iter`] scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterStart {
+    /// Exclusive cursor: iteration begins at the first key greater than this.
+    After(Key),
+    /// Inclusive seek: iteration begins at this key if it exists.
+    At(Key),
+}
+
+impl IterStart {
+    pub fn key(&self) -> &Key {
+        match self {
+            IterStart::After(key) | IterStart::At(key) => key,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
-    Gossip(GossipEffect),
+    DocumentSync(DocumentSyncEffect),
     Stream(StreamEffect),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DhtEffect {
     Put {
-        key: DhtKey,
+        key: DhtKeyId,
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
     },
     Get {
-        key: DhtKey,
+        key: DhtKeyId,
         realm_filter: Option<RealmId>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum GossipEffect {
-    Subscribe { topic: TopicId },
-    Broadcast { topic: TopicId, message: Vec<u8> },
-    Unsubscribe { topic: TopicId },
 }
 
 #[derive(Debug, Clone, PartialEq)]

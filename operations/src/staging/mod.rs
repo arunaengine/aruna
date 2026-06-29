@@ -28,7 +28,6 @@ pub(crate) fn describe_event(event: &Event) -> String {
         },
         Event::Storage(_) => "Event::Storage".to_string(),
         Event::Net(_) => "Event::Net".to_string(),
-        Event::Automerge(_) => "Event::Automerge".to_string(),
         Event::Metadata(_) => "Event::Metadata".to_string(),
         Event::SubOperation(suboperation_event) => match suboperation_event {
             SubOperationEvent::DepthLimitExceeded { .. } => {
@@ -40,11 +39,8 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::RealmNodesResult { .. } => {
                 "Event::SubOperation(SubOperationEvent::RealmNodesResult)".to_string()
             }
-            SubOperationEvent::AutomergeSyncResult { .. } => {
-                "Event::SubOperation(SubOperationEvent::AutomergeSyncResult)".to_string()
-            }
-            SubOperationEvent::TopicAnnouncementResult { .. } => {
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)".to_string()
+            SubOperationEvent::DocumentSyncResult { .. } => {
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)".to_string()
             }
             SubOperationEvent::SourceConnectorResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)".to_string()
@@ -119,7 +115,6 @@ pub(crate) mod test_utils {
                 storage_handle,
                 net_handle: None,
                 blob_handle: Some(blob_handle),
-                automerge_handle: None,
                 metadata_handle: None,
                 task_handle: None,
             },

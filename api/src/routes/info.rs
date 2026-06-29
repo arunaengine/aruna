@@ -1,23 +1,37 @@
+use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
+use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+use aruna_operations::driver::drive;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::get_realm_description::{
+    GetRealmDescriptionError, GetRealmDescriptionOperation,
+};
+use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::status::load_node_observability_status;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::warn;
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info)
+    paths(get_info, get_realm_info)
 )]
 pub struct InfoApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/info", get(get_info))
+    Router::new()
+        .route("/info", get(get_info))
+        .route("/info/realm", get(get_realm_info))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -180,104 +194,191 @@ pub struct InterfaceStatus {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RealmInfoResponse {
+    pub realm_id: String,
+    pub description: Option<String>,
+    pub metadata_replication: RealmMetadataReplicationResponse,
+    pub oidc_providers: Vec<RealmOidcProviderResponse>,
+    #[schema(value_type = Object)]
+    pub discovery: Value,
+    pub nodes: Vec<RealmNodeInfoResponse>,
+    pub interfaces: InterfaceServicesStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmMetadataReplicationResponse {
+    pub default_replication_factor: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmOidcProviderResponse {
+    pub id: String,
+    pub issuer: String,
+    pub audience: String,
+    pub discovery_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeInfoResponse {
+    pub node_id: String,
+    pub kind: RealmNodeKindInfo,
+    pub configured: bool,
+    pub present: bool,
+    pub connection_status: RealmNodeConnectionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RealmNodeKindInfo {
+    Management,
+    Server,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RealmNodeConnectionStatus {
+    Connected,
+    Configured,
+}
+
+impl From<&RealmNodeKind> for RealmNodeKindInfo {
+    fn from(value: &RealmNodeKind) -> Self {
+        match value {
+            RealmNodeKind::Management => Self::Management,
+            RealmNodeKind::Server => Self::Server,
+            RealmNodeKind::Local => Self::Local,
+        }
+    }
+}
+
 #[utoipa::path(
     get,
-    path = "/info",
+    path = "/info/realm",
     tag = "info",
     responses(
-        (status = 200, description = "Node information", body = InfoResponse)
+        (status = 200, description = "Realm information", body = RealmInfoResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
     )
 )]
-pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<InfoResponse>) {
-    let (network, my_addresses, connections, warnings) = match &state.get_ctx().net_handle {
-        Some(net) => {
-            let info = net.get_status().await;
-            (
-                NetworkServiceStatus {
-                    status: ServiceStatus::Available,
-                    discovery: info.discovery_methods,
-                    relay: Some(info.relay_method),
-                    relay_urls: info.relay_urls,
-                    routing_table_size: info.routing_table_size,
-                    requests: RequestSummary::from_state(&info.requests),
+pub async fn get_realm_info(
+    State(state): State<Arc<ServerState>>,
+) -> ServerResult<(StatusCode, Json<RealmInfoResponse>)> {
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+            ServerError::NotFound
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let description = load_realm_description(&state).await?;
+    let present_nodes = load_realm_presence_best_effort(&state).await;
+    let response = map_realm_info_response(
+        &state,
+        config,
+        description,
+        present_nodes,
+        interface_services_status(&state).await,
+    )?;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+fn map_realm_info_response(
+    state: &ServerState,
+    config: RealmConfigDocument,
+    description: Option<String>,
+    present_nodes: HashSet<aruna_core::NodeId>,
+    interfaces: InterfaceServicesStatus,
+) -> ServerResult<RealmInfoResponse> {
+    let discovery = serde_json::to_value(&config.discovery)
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let current_node = state.get_node_id();
+    let nodes = config
+        .nodes
+        .iter()
+        .map(|node| {
+            let is_current = node.node_id == current_node.to_string();
+            let present = is_current
+                || node
+                    .node_id
+                    .parse::<aruna_core::NodeId>()
+                    .ok()
+                    .is_some_and(|node_id| present_nodes.contains(&node_id));
+            RealmNodeInfoResponse {
+                node_id: node.node_id.clone(),
+                kind: RealmNodeKindInfo::from(&node.kind),
+                configured: true,
+                present,
+                connection_status: if present {
+                    RealmNodeConnectionStatus::Connected
+                } else {
+                    RealmNodeConnectionStatus::Configured
                 },
-                info.endpoint_addr
-                    .addrs
-                    .iter()
-                    .map(transport_addr_to_string)
-                    .collect(),
-                info.connections
-                    .iter()
-                    .map(|peer| PeerConnectionInfo {
-                        peer_id: peer.node_id.to_string(),
-                        status: PeerStatus::from(peer.status),
-                        active_addresses: peer
-                            .active_addresses
-                            .iter()
-                            .map(|address| ConnectionAddressInfo {
-                                status: AddressStatus::from(address.status),
-                                address: address.address.clone(),
-                                rtt_ms: address.rtt_ms,
-                                protocol_connections: address
-                                    .protocol_connections
-                                    .iter()
-                                    .map(|connection| ProtocolConnectionInfo {
-                                        connection_id: connection.connection_id,
-                                        protocol: protocol_name(connection.alpn),
-                                        side: side_name(connection.side),
-                                        status: ProtocolConnectionStatus::Open,
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                        last_error: peer.last_error.clone(),
-                        next_retry_secs: peer.next_retry_in_secs,
-                    })
-                    .collect(),
-                info.warnings,
-            )
-        }
-        None => (
-            NetworkServiceStatus {
-                status: ServiceStatus::Unavailable,
-                discovery: Vec::new(),
-                relay: None,
-                relay_urls: Vec::new(),
-                routing_table_size: None,
-                requests: RequestSummary::default(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
-
-    let blob = match &state.get_ctx().blob_handle {
-        Some(blob) => {
-            let info = blob.get_status().await;
-            BlobServiceStatus {
-                status: ServiceStatus::from(info.status),
-                backend: Some(info.backend_type.to_string()),
-                max_bucket_size: info.max_bucket_size,
-                multipart_bucket: info.multipart_bucket,
-                timeouts_secs: Some(TimeoutConfigSecs {
-                    connect: info.timeouts.control_plane_connect_timeout.as_secs(),
-                    io: info.timeouts.control_plane_io_timeout.as_secs(),
-                    transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
-                }),
             }
-        }
-        None => BlobServiceStatus {
-            status: ServiceStatus::NotConfigured,
-            backend: None,
-            max_bucket_size: None,
-            multipart_bucket: None,
-            timeouts_secs: None,
-        },
-    };
+        })
+        .collect();
 
+    Ok(RealmInfoResponse {
+        realm_id: config.realm_id.to_string(),
+        description,
+        metadata_replication: RealmMetadataReplicationResponse {
+            default_replication_factor: config.metadata_replication.default_replication_factor,
+        },
+        oidc_providers: config
+            .oidc_providers
+            .into_iter()
+            .map(|provider| RealmOidcProviderResponse {
+                id: provider.id,
+                issuer: provider.issuer,
+                audience: provider.audience,
+                discovery_url: provider.discovery_url,
+            })
+            .collect(),
+        discovery,
+        nodes,
+        interfaces,
+    })
+}
+
+async fn load_realm_description(state: &ServerState) -> ServerResult<Option<String>> {
+    drive(
+        GetRealmDescriptionOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_realm_description_error)
+}
+
+fn map_realm_description_error(error: GetRealmDescriptionError) -> ServerError {
+    ServerError::InternalError(error.to_string())
+}
+
+async fn load_realm_presence_best_effort(state: &ServerState) -> HashSet<aruna_core::NodeId> {
+    match drive(
+        GetRealmNodesOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(mut nodes) => {
+            nodes.insert(state.get_node_id());
+            nodes
+        }
+        Err(error) => {
+            warn!(error = %error, "realm node discovery failed for realm info response");
+            HashSet::from([state.get_node_id()])
+        }
+    }
+}
+
+async fn interface_services_status(state: &ServerState) -> InterfaceServicesStatus {
     let interface_runtime = state.interface_state().await;
-    let interfaces = InterfaceServicesStatus {
+    InterfaceServicesStatus {
         rest: match interface_runtime.rest {
             Some(rest) => InterfaceStatus {
                 status: ServiceStatus::Available,
@@ -302,20 +403,107 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                 url: None,
             },
         },
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/info",
+    tag = "info",
+    responses(
+        (status = 200, description = "Node information", body = InfoResponse)
+    )
+)]
+pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<InfoResponse>) {
+    let ctx = state.get_ctx();
+    let observability = load_node_observability_status(ctx.as_ref()).await;
+
+    let (network, my_addresses, connections, warnings) = match observability.network {
+        Some(info) => (
+            NetworkServiceStatus {
+                status: ServiceStatus::Available,
+                discovery: info.discovery_methods,
+                relay: Some(info.relay_method),
+                relay_urls: info.relay_urls,
+                routing_table_size: info.routing_table_size,
+                requests: RequestSummary::from_state(&info.requests),
+            },
+            info.endpoint_addr
+                .addrs
+                .iter()
+                .map(transport_addr_to_string)
+                .collect(),
+            info.connections
+                .iter()
+                .map(|peer| PeerConnectionInfo {
+                    peer_id: peer.node_id.to_string(),
+                    status: PeerStatus::from(peer.status),
+                    active_addresses: peer
+                        .active_addresses
+                        .iter()
+                        .map(|address| ConnectionAddressInfo {
+                            status: AddressStatus::from(address.status),
+                            address: address.address.clone(),
+                            rtt_ms: address.rtt_ms,
+                            protocol_connections: address
+                                .protocol_connections
+                                .iter()
+                                .map(|connection| ProtocolConnectionInfo {
+                                    connection_id: connection.connection_id,
+                                    protocol: protocol_name(connection.alpn),
+                                    side: side_name(connection.side),
+                                    status: ProtocolConnectionStatus::Open,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    last_error: peer.last_error.clone(),
+                    next_retry_secs: peer.next_retry_in_secs,
+                })
+                .collect(),
+            info.warnings,
+        ),
+        None => (
+            NetworkServiceStatus {
+                status: ServiceStatus::Unavailable,
+                discovery: Vec::new(),
+                relay: None,
+                relay_urls: Vec::new(),
+                routing_table_size: None,
+                requests: RequestSummary::default(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
-    let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
-    let database = DatabaseServiceStatus {
-        status: if storage_metrics.channel_closed {
-            ServiceStatus::Unavailable
-        } else {
-            ServiceStatus::Available
+    let blob = match observability.blob {
+        Some(info) => BlobServiceStatus {
+            status: ServiceStatus::from(info.status),
+            backend: Some(info.backend_type.to_string()),
+            max_bucket_size: info.max_bucket_size,
+            multipart_bucket: info.multipart_bucket,
+            timeouts_secs: Some(TimeoutConfigSecs {
+                connect: info.timeouts.control_plane_connect_timeout.as_secs(),
+                io: info.timeouts.control_plane_io_timeout.as_secs(),
+                transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
+            }),
         },
-        requests: RequestSummary::from_counts(
-            storage_metrics.requests_total,
-            storage_metrics.failed_total,
-            storage_metrics.last_error,
-        ),
+        None => BlobServiceStatus {
+            status: ServiceStatus::NotConfigured,
+            backend: None,
+            max_bucket_size: None,
+            multipart_bucket: None,
+            timeouts_secs: None,
+        },
+    };
+
+    let interfaces = interface_services_status(&state).await;
+
+    let database = DatabaseServiceStatus {
+        status: ServiceStatus::from(observability.database.status),
+        requests: RequestSummary::from_state(&observability.database.requests),
     };
 
     (
@@ -384,9 +572,8 @@ impl From<ConnectionAddressStatus> for AddressStatus {
 fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
     alpn.map(|alpn| match alpn {
         Alpn::Dht => "dht".to_string(),
-        Alpn::Gossip => "gossip".to_string(),
         Alpn::Bao => "bao".to_string(),
-        Alpn::Automerge => "automerge".to_string(),
+        Alpn::DocumentSync => "document_sync".to_string(),
         Alpn::Metadata => "metadata".to_string(),
     })
 }
@@ -433,7 +620,6 @@ mod tests {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         });

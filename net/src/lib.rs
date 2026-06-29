@@ -3,30 +3,35 @@
 
 mod connection_pool;
 pub mod dht;
+#[path = "irokle.rs"]
+pub mod document_sync;
 mod effect_handlers;
 pub mod error;
-pub mod gossip;
 pub mod streams;
 mod telemetry;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
+use aruna_core::document::{DocumentSyncReconcileResult, DocumentSyncTarget};
+use aruna_core::effects::StorageEffect;
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent};
+use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::{NodeId, TopicId};
+use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmEndpointAnnouncement, RealmId, realm_endpoint_announcement_signing_bytes,
+    RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
+    realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_storage::StorageHandle;
+use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use crossfire::TrySendError;
 use iroh::address_lookup::memory::MemoryLookup;
@@ -39,13 +44,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
 
+pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
+pub use document_sync::DocumentSyncService;
 pub use error::{NetError, Result};
-pub use gossip::GossipService;
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
-const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 256;
+const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
 
@@ -61,6 +67,9 @@ pub struct NetConfig {
     pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
+    pub document_sync_storage_path: Option<PathBuf>,
+    pub document_sync_runtime: Option<IrohRuntimeConfig>,
+    pub fjall_persist_policy: FjallPersistPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +270,9 @@ impl Default for NetConfig {
             relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
             max_concurrent_uni_streams: None,
+            document_sync_storage_path: None,
+            document_sync_runtime: None,
+            fjall_persist_policy: FjallPersistPolicy::default(),
         }
     }
 }
@@ -279,6 +291,7 @@ impl std::fmt::Debug for NetConfig {
             )
             .field("discovery_method", &self.discovery_method)
             .field("relay_method", &self.relay_method)
+            .field("fjall_persist_policy", &self.fjall_persist_policy)
             .finish()
     }
 }
@@ -332,7 +345,6 @@ enum PeerConnectivityEvent {
 
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
-    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>);
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
 }
 
@@ -344,15 +356,17 @@ pub struct NetHandle {
 
 struct NetInner {
     effect_tx: mpsc::Sender<EffectHandle>,
+    storage: StorageHandle,
     node_id: NodeId,
     realm_id: RealmId,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
+    realm_peers: Arc<RwLock<Vec<NodeId>>>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
-    gossip: Arc<GossipService>,
+    document_sync: Arc<DocumentSyncService>,
     streams: Arc<StreamsService>,
     connection_pool: ConnectionPool,
     peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
@@ -392,18 +406,19 @@ impl NetHandle {
 
         let monitor = Monitor::new();
 
+        let app_alpns = vec![
+            Alpn::Dht.as_bytes().to_vec(),
+            Alpn::Bao.as_bytes().to_vec(),
+            Alpn::DocumentSync.as_bytes().to_vec(),
+            Alpn::Metadata.as_bytes().to_vec(),
+        ];
+
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .hooks(monitor.clone())
             .transport_config(transport_config.build())
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
-            .alpns(vec![
-                Alpn::Dht.as_bytes().to_vec(),
-                Alpn::Gossip.as_bytes().to_vec(),
-                Alpn::Bao.as_bytes().to_vec(),
-                Alpn::Automerge.as_bytes().to_vec(),
-                Alpn::Metadata.as_bytes().to_vec(),
-            ]);
+            .alpns(app_alpns.clone());
 
         match &config.relay_method {
             RelayMethod::None => {
@@ -460,19 +475,32 @@ impl NetHandle {
         for endpoint_addr in &peer_endpoints {
             address_lookup.set_endpoint_info(endpoint_addr.clone());
         }
-        let mut peer_nodes = config.peer_nodes.clone();
-        peer_nodes.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
-        let peer_nodes = unique_peer_nodes(peer_nodes, node_id);
-        let dht_signed_authorized_nodes = Arc::new(RwLock::new(peer_nodes.clone()));
+        let mut peer_hints = config.peer_nodes.clone();
+        peer_hints.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
+        let peer_hints = unique_peer_nodes(peer_hints, node_id);
+        let realm_peer_nodes = read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id)
+            .await?
+            .unwrap_or_default();
+        let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
-            &peer_nodes,
+            &realm_peer_nodes,
             "realm_config",
         )));
         let network_diagnostics = Arc::new(Mutex::new(NetworkDiagnosticsState::default()));
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
+        for node_id in &peer_hints {
+            send_peer_connectivity_event(
+                &peer_connectivity_tx,
+                PeerConnectivityEvent::ManagePeer {
+                    node_id: *node_id,
+                    source: "configured_peer".to_string(),
+                    immediate: true,
+                },
+            );
+        }
         let shutdown = CancellationToken::new();
 
-        let (gossip_msg_tx, mut gossip_msg_rx) = mpsc::channel::<(TopicId, NodeId, Vec<u8>)>(1024);
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
@@ -486,20 +514,31 @@ impl NetHandle {
             shutdown.child_token(),
         )?;
         let dht = Arc::new(dht_handle);
+        for node_id in peer_hints.iter().chain(realm_peer_nodes.iter()) {
+            if let Err(err) = dht.add_peer(*node_id) {
+                warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "Failed to add configured peer to DHT routing queue"
+                );
+            }
+        }
 
-        let gossip = Arc::new(
-            GossipService::new(
-                endpoint.clone(),
-                storage.clone(),
-                dht.clone(),
-                config.realm_id,
-                peer_nodes.clone(),
-                shutdown.child_token(),
-                gossip_msg_tx.clone(),
-            )
-            .await?,
-        );
-        gossip.restore_subscriptions().await?;
+        let document_sync_path = config
+            .document_sync_storage_path
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::new()))
+            });
+        let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
+            endpoint.clone(),
+            storage.clone(),
+            document_sync_path,
+            &realm_peer_nodes,
+            app_alpns,
+            config.document_sync_runtime.unwrap_or_default(),
+            config.fjall_persist_policy,
+        )?);
 
         let streams = Arc::new(StreamsService::new(
             connection_pool.clone(),
@@ -510,7 +549,7 @@ impl NetHandle {
 
         let shutdown_for_effects = shutdown.clone();
         let dht_for_effects = dht.clone();
-        let gossip_for_effects = gossip.clone();
+        let document_sync_for_effects = document_sync.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -518,11 +557,11 @@ impl NetHandle {
                     maybe_effect = effect_rx.recv() => {
                         let Some((effect, response_tx, span)) = maybe_effect else { break };
                         let dht = dht_for_effects.clone();
-                        let gossip = gossip_for_effects.clone();
+                        let document_sync = document_sync_for_effects.clone();
                         tokio::spawn(async move {
                             let event = effect_handlers::handle_net_effect(
                                 &dht,
-                                &gossip,
+                                &document_sync,
                                 effect,
                             )
                             .await;
@@ -534,12 +573,10 @@ impl NetHandle {
         });
 
         let (dht_tx, mut dht_rx) = mpsc::channel(64);
-        let (gossip_conn_tx, mut gossip_conn_rx) = mpsc::channel(64);
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
         let dht_for_inbound = dht.clone();
-        let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
                 if let Err(err) = dht_for_inbound.add_peer(peer_id) {
@@ -549,7 +586,6 @@ impl NetHandle {
                         "Failed to add inbound DHT peer to routing queue"
                     );
                 }
-                gossip_for_inbound.add_bootstrap_node(peer_id);
                 match dht_inbound_tx.try_send((send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
@@ -560,47 +596,7 @@ impl NetHandle {
             }
         });
 
-        let dht_for_gossip = dht.clone();
-        let gossip_for_gossip = gossip.clone();
-        let gossip_task = tokio::spawn(async move {
-            while let Some((conn, peer_id)) = gossip_conn_rx.recv().await {
-                if let Err(err) = dht_for_gossip.add_peer(peer_id) {
-                    warn!(
-                        node_id = %peer_id,
-                        error = %err,
-                        "Failed to add gossip peer to routing queue"
-                    );
-                }
-                gossip_for_gossip.add_bootstrap_node(peer_id);
-                if let Err(err) = gossip_for_gossip.gossip().handle_connection(conn).await {
-                    warn!(error = %err, "Failed to hand connection to gossip service");
-                }
-            }
-        });
-
-        let inbound_handler_for_gossip = inbound_handler.clone();
-        let shutdown_for_gossip_events = shutdown.clone();
-        let gossip_event_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_for_gossip_events.cancelled() => break,
-                    maybe_msg = gossip_msg_rx.recv() => {
-                        let Some((topic, sender, data)) = maybe_msg else { break };
-                        let handler = inbound_handler_for_gossip.read().clone();
-                        if let Some(handler) = handler {
-                            tokio::spawn(async move {
-                                handler.handle_gossip_message(topic, sender, data).await;
-                            });
-                        } else {
-                            warn!(topic = %topic, sender = %sender, "Dropping inbound gossip message without registered handler");
-                        }
-                    }
-                }
-            }
-        });
-
         let dht_for_streams = dht.clone();
-        let gossip_for_streams = gossip.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
         let stream_task = tokio::spawn(async move {
@@ -612,8 +608,6 @@ impl NetHandle {
                         "Failed to add inbound stream peer to routing queue"
                     );
                 }
-                gossip_for_streams.add_bootstrap_node(peer_id);
-
                 let handler = inbound_handler_for_streams.read().clone();
                 if let Some(handler) = handler {
                     let Ok(permit) = inbound_stream_handlers.clone().try_acquire_owned() else {
@@ -635,13 +629,14 @@ impl NetHandle {
         });
 
         let endpoint_for_accept = endpoint.clone();
+        let document_sync_for_accept = document_sync.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
             streams::run_accept_loop(
                 endpoint_for_accept,
                 dht_tx,
-                gossip_conn_tx,
                 stream_tx,
+                document_sync_for_accept,
                 shutdown_for_accept,
             )
             .await;
@@ -675,8 +670,6 @@ impl NetHandle {
         tasks.extend(vec![
             effect_task,
             dht_task,
-            gossip_task,
-            gossip_event_task,
             stream_task,
             accept_task,
             peer_connectivity_task,
@@ -684,15 +677,17 @@ impl NetHandle {
 
         let inner = Arc::new(NetInner {
             effect_tx,
+            storage,
             node_id,
             realm_id: config.realm_id,
             endpoint,
             address_lookup,
             discovery_method,
             relay_method,
+            realm_peers,
             dht_signed_authorized_nodes,
             dht,
-            gossip,
+            document_sync,
             streams,
             connection_pool,
             peer_connectivity,
@@ -718,16 +713,80 @@ impl NetHandle {
         local_endpoint_addr(&self.inner.endpoint, &self.inner.relay_method.relay_urls())
     }
 
+    pub fn document_sync_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
+        self.inner.document_sync.node()
+    }
+
+    pub fn document_sync_database(&self) -> fjall::OptimisticTxDatabase {
+        self.inner.document_sync.database()
+    }
+
+    pub async fn sync_document_topic_with_peers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .sync_topic_with_peers(topic_id, peers)
+            .await
+    }
+
+    pub fn allow_document_sync_peers(
+        &self,
+        targets: &[DocumentSyncTarget],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .allow_document_sync_peers(targets, peers)
+    }
+
+    pub fn ensure_document_sync_topics(
+        &self,
+        targets: &[DocumentSyncTarget],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .ensure_document_sync_topics(targets, peers)
+    }
+
+    pub async fn handle_document_sync_stream(
+        &self,
+        stream: streams::BiStream,
+        peer: NodeId,
+    ) -> Result<Vec<::irokle::TopicId>> {
+        self.inner
+            .document_sync
+            .handle_inbound_stream(stream, peer)
+            .await
+    }
+
+    pub async fn reconcile_document_sync_topics(
+        &self,
+        topic_ids: Vec<::irokle::TopicId>,
+    ) -> Result<DocumentSyncReconcileResult> {
+        let applied = self
+            .inner
+            .document_sync
+            .reconcile_document_sync_topics(topic_ids)
+            .await?;
+        if applied
+            .targets
+            .iter()
+            .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }))
+        {
+            self.reload_realm_peers().await?;
+        }
+        Ok(applied)
+    }
+
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
         if endpoint_addr.id == self.inner.node_id {
             return;
         }
 
-        authorize_dht_signed_node(
-            &self.inner.dht_signed_authorized_nodes,
-            endpoint_addr.id,
-            self.inner.node_id,
-        );
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -739,7 +798,6 @@ impl NetHandle {
                 immediate: true,
             },
         );
-        self.inner.gossip.add_bootstrap_node(endpoint_addr.id);
         if let Err(err) = self.inner.dht.add_peer(endpoint_addr.id) {
             warn!(
                 node_id = %endpoint_addr.id,
@@ -754,11 +812,6 @@ impl NetHandle {
             return;
         }
 
-        authorize_dht_signed_node(
-            &self.inner.dht_signed_authorized_nodes,
-            node_id,
-            self.inner.node_id,
-        );
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -767,7 +820,6 @@ impl NetHandle {
                 immediate: true,
             },
         );
-        self.inner.gossip.add_bootstrap_node(node_id);
         if let Err(err) = self.inner.dht.add_peer(node_id) {
             warn!(
                 node_id = %node_id,
@@ -777,8 +829,123 @@ impl NetHandle {
         }
     }
 
+    pub async fn refresh_realm_peers_from_document(
+        &self,
+        document: &RealmConfigDocument,
+    ) -> Result<Vec<NodeId>> {
+        if document.realm_id != self.inner.realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "realm config {} does not match net realm {}",
+                document.realm_id, self.inner.realm_id
+            )));
+        }
+        let peers = unique_peer_nodes(
+            document
+                .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.refresh_realm_peers(peers.clone()).await;
+        Ok(peers)
+    }
+
+    pub async fn refresh_realm_peers_from_bytes(&self, bytes: &[u8]) -> Result<Vec<NodeId>> {
+        let document = RealmConfigDocument::from_bytes(bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.refresh_realm_peers_from_document(&document).await
+    }
+
+    pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: self.inner.realm_id,
+        };
+        let Some(bytes) = self
+            .read_storage(target.storage_keyspace().to_string(), target.storage_key())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.refresh_realm_peers_from_bytes(&bytes).await.map(Some)
+    }
+
+    pub async fn realm_peers(&self) -> Vec<NodeId> {
+        self.inner.realm_peers.read().clone()
+    }
+
+    async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
+        *self.inner.realm_peers.write() = peers.clone();
+        replace_dht_signed_authorized_nodes(
+            &self.inner.dht_signed_authorized_nodes,
+            &peers,
+            self.inner.node_id,
+        );
+        if let Err(err) = self
+            .inner
+            .document_sync
+            .refresh_potential_peer_nodes(peers.clone())
+        {
+            warn!(
+                error = %err,
+                "Failed to refresh document sync potential peers from realm config"
+            );
+        }
+        for node_id in peers {
+            self.register_realm_peer(node_id, true).await;
+        }
+    }
+
+    async fn register_realm_peer(&self, node_id: NodeId, immediate: bool) {
+        if node_id == self.inner.node_id {
+            return;
+        }
+
+        authorize_dht_signed_node(
+            &self.inner.dht_signed_authorized_nodes,
+            node_id,
+            self.inner.node_id,
+        );
+        send_peer_connectivity_event(
+            &self.inner.peer_connectivity_tx,
+            PeerConnectivityEvent::ManagePeer {
+                node_id,
+                source: "realm_config".to_string(),
+                immediate,
+            },
+        );
+        if let Err(err) = self.inner.dht.add_peer(node_id) {
+            warn!(
+                node_id = %node_id,
+                error = %err,
+                "Failed to add realm peer to DHT routing queue"
+            );
+        }
+    }
+
+    async fn read_storage(
+        &self,
+        key_space: String,
+        key: aruna_core::types::Key,
+    ) -> Result<Option<aruna_core::types::Value>> {
+        match self
+            .inner
+            .storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+            other => Err(NetError::Dht(format!(
+                "unexpected storage event while reading realm config: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
-        if matches!(alpn, Alpn::Dht | Alpn::Gossip) {
+        if matches!(alpn, Alpn::Dht) {
             return Err(NetError::Stream(format!(
                 "{alpn} is an internal network protocol"
             )));
@@ -792,7 +959,6 @@ impl NetHandle {
                     "Failed to add stream target peer to DHT"
                 );
             }
-            self.inner.gossip.add_bootstrap_node(node_id);
             send_peer_connectivity_event(
                 &self.inner.peer_connectivity_tx,
                 PeerConnectivityEvent::ManagePeer {
@@ -833,7 +999,6 @@ impl NetHandle {
                             install_dht_signed_endpoint(
                                 &self.inner.address_lookup,
                                 &self.inner.dht,
-                                &self.inner.gossip,
                                 endpoint_addr,
                             );
                             debug!(
@@ -895,13 +1060,11 @@ impl NetHandle {
             return;
         }
 
+        self.inner.shutdown.cancel();
         if let Err(err) = self.inner.dht.shutdown().await {
             warn!(error = %err, "DHT shutdown returned error");
         }
-        self.inner.shutdown.cancel();
-        if let Err(err) = self.inner.gossip.gossip().shutdown().await {
-            warn!(error = %err, "Gossip shutdown returned error");
-        }
+        self.inner.document_sync.shutdown().await;
         if let Err(err) = self.inner.connection_pool.shutdown().await {
             warn!(error = %err, "Connection pool shutdown returned error");
         }
@@ -914,7 +1077,7 @@ impl NetHandle {
     }
 
     pub async fn get_status(&self) -> NetState {
-        let peer_nodes = self.inner.gossip.get_bootstrap_nodes();
+        let peer_nodes = self.inner.realm_peers.read().clone();
         let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
         let mut diagnostics = self.inner.network_diagnostics.lock().await.clone();
@@ -1233,12 +1396,10 @@ fn validate_realm_endpoint_announcement(
 fn install_dht_signed_endpoint(
     address_lookup: &MemoryLookup,
     dht: &DhtHandle,
-    gossip: &GossipService,
     endpoint_addr: EndpointAddr,
 ) {
     let node_id = endpoint_addr.id;
     address_lookup.set_endpoint_info(endpoint_addr);
-    gossip.add_bootstrap_node(node_id);
     if let Err(err) = dht.add_peer(node_id) {
         debug!(
             node_id = %node_id,
@@ -1278,6 +1439,45 @@ fn push_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
     }
 }
 
+async fn read_persisted_realm_peer_nodes(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    local_id: NodeId,
+) -> Result<Option<Vec<NodeId>>> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                let document = RealmConfigDocument::from_bytes(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                if document.realm_id != realm_id {
+                    return Err(NetError::Bootstrap(format!(
+                        "realm config {} does not match net realm {}",
+                        document.realm_id, realm_id
+                    )));
+                }
+                let nodes = document
+                    .node_ids()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                Ok(unique_peer_nodes(nodes, local_id))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(NetError::Bootstrap(error.to_string()))
+        }
+        other => Err(NetError::Bootstrap(format!(
+            "unexpected storage event while reading realm config: {other:?}"
+        ))),
+    }
+}
+
 fn authorize_dht_signed_node(
     authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
     node_id: NodeId,
@@ -1293,6 +1493,14 @@ fn authorize_dht_signed_node(
     }
     nodes.push(node_id);
     nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+}
+
+fn replace_dht_signed_authorized_nodes(
+    authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
+    nodes: &[NodeId],
+    local_id: NodeId,
+) {
+    *authorized_nodes.write() = unique_peer_nodes(nodes.to_vec(), local_id);
 }
 
 fn unique_endpoint_addrs(
@@ -1509,17 +1717,19 @@ async fn run_peer_connectivity_manager(
                     return;
                 }
                 let authorized_nodes = dht_signed_authorized_nodes.read().clone();
-                run_peer_connectivity_attempt(
-                    &dht,
-                    &address_lookup,
-                    &discovery_method,
-                    realm_id,
-                    &authorized_nodes,
-                    &state,
-                    &diagnostics,
-                    peer,
-                )
-                .await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = run_peer_connectivity_attempt(
+                        &dht,
+                        &address_lookup,
+                        &discovery_method,
+                        realm_id,
+                        &authorized_nodes,
+                        &state,
+                        &diagnostics,
+                        peer,
+                    ) => {}
+                }
             }
             continue;
         }
@@ -1876,12 +2086,11 @@ impl Handle for NetHandle {
 fn net_handle_effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Net(NetEffect::Dht(_)) => "dht",
-        Effect::Net(NetEffect::Gossip(_)) => "gossip",
+        Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
-        Effect::Automerge(_) => "automerge",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",
@@ -2202,7 +2411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_endpoint_only_nodes_are_dht_signed_authorized() -> Result<()> {
+    async fn peer_endpoint_only_nodes_are_not_dht_signed_authorized() -> Result<()> {
         let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let storage_a = aruna_storage::FjallStorage::open(
@@ -2243,7 +2452,7 @@ mod tests {
         .await?;
 
         assert!(
-            handle
+            !handle
                 .inner
                 .dht_signed_authorized_nodes
                 .read()
@@ -2261,8 +2470,6 @@ mod tests {
 
     #[async_trait]
     impl InboundEventHandler for HoldingInboundHandler {
-        async fn handle_gossip_message(&self, _topic: TopicId, _sender: NodeId, _data: Vec<u8>) {}
-
         async fn handle_incoming_stream(
             &self,
             _alpn: Alpn,
@@ -2378,6 +2585,43 @@ mod tests {
         }
 
         handle.get_status().await
+    }
+
+    #[tokio::test]
+    async fn refresh_realm_peers_uses_realm_config_nodes_as_source_of_truth() -> Result<()> {
+        let (handle, _dir) = test_net_handle().await?;
+        let peer_a = make_secret(11).public();
+        let peer_b = make_secret(12).public();
+        let mut document = RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
+        document.ensure_node(
+            handle.node_id(),
+            aruna_core::structs::RealmNodeKind::Management,
+        );
+        document.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
+        document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
+        let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
+
+        let peers = handle.refresh_realm_peers_from_document(&document).await?;
+        assert_eq!(peers, expected);
+        assert_eq!(handle.realm_peers().await, expected);
+        assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
+
+        let mut replacement =
+            RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
+        replacement.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
+
+        let peers = handle
+            .refresh_realm_peers_from_document(&replacement)
+            .await?;
+        assert_eq!(peers, vec![peer_b]);
+        assert_eq!(handle.realm_peers().await, vec![peer_b]);
+        assert_eq!(
+            *handle.inner.dht_signed_authorized_nodes.read(),
+            vec![peer_b]
+        );
+
+        handle.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2497,12 +2741,6 @@ mod tests {
                 .connections
                 .iter()
                 .any(|peer| peer.node_id == missing_peer && peer.active_addresses.is_empty())
-        );
-        assert!(
-            status
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("no active addresses"))
         );
         assert!(
             status

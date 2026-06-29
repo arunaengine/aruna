@@ -3,15 +3,14 @@ use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    AuthContext, OidcProviderConfig, Permission, RealmId, TokenClaims, blob_object_permission_path,
+    AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
+use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use http::HeaderMap;
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::jwk::JwkSet;
@@ -341,6 +340,28 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedArunaBearerTokenCarrier {
+    token: String,
+}
+
+impl ValidatedArunaBearerTokenCarrier {
+    fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(token: impl Into<String>) -> Self {
+        Self::new(token)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.token
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AuthorizationError {
     #[error("Error decoding AuthContext")]
@@ -353,79 +374,48 @@ pub enum AuthorizationError {
     ReqwestError(#[from] reqwest::Error),
 }
 
+#[cfg(test)]
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {
-    let token = bearer_token(headers)?;
+    extract_auth_context_and_bearer_token(state, headers)
+        .await
+        .0
+}
 
-    let token = handle_token(state, token).await.ok()?;
-    let auth_context: AuthContext = token.try_into().ok()?;
-    Some(auth_context)
+async fn extract_auth_context_and_bearer_token(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> (
+    Option<AuthContext>,
+    Option<ValidatedArunaBearerTokenCarrier>,
+) {
+    let Some(token) = bearer_token(headers) else {
+        return (None, None);
+    };
+
+    let claims = match handle_token(state, token).await {
+        Ok(claims) => claims,
+        Err(_) => return (None, None),
+    };
+    let auth_context: AuthContext = match claims.try_into() {
+        Ok(auth_context) => auth_context,
+        Err(_) => return (None, None),
+    };
+    (
+        Some(auth_context),
+        Some(ValidatedArunaBearerTokenCarrier::new(token)),
+    )
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
-    let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-
-    // - Check token hash against revocation list
-    if state.is_token_blacklisted(token).await {
-        return Err(TokenError::TokenBlacklisted);
-    }
-
-    let claims = match (
-        unvalidated_claims.claims.issuer_pubkey,
-        unvalidated_claims.claims.delegation_signature.is_some(),
-    ) {
-        (Some(issuer), true) => {
-            let decoding_key = state.get_cached_pubkey(issuer).await?;
-
-            decode::<TokenClaims>(
-                token,
-                &decoding_key,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-        (_, _) => {
-            let pubkey = state
-                .get_cached_pubkey(unvalidated_claims.claims.iss)
-                .await?;
-
-            decode::<TokenClaims>(
-                token,
-                &pubkey,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-    };
-    validate_claims(state, &claims.claims).await?;
-    Ok(claims.claims)
+    decode_aruna_bearer_token(state, token)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {
-    let now = chrono::Utc::now().timestamp() as u64;
-    if now > claims.exp {
-        return Err(TokenError::Expired);
-    }
-
-    if !state
-        .is_trusted_realm(
-            &RealmId::from_base64(&claims.iss).map_err(|_| TokenError::InvalidIssuerKey)?,
-        )
+    validate_aruna_bearer_token_claims(state, claims)
         .await
-    {
-        return Err(TokenError::RealmNotTrusted);
-    }
-
-    // Check server token claims
-    match (&claims.delegation_signature, &claims.issuer_pubkey) {
-        (Some(delegation_token), Some(issuer_pubkey)) => {
-            // Check delegation signature
-            let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&claims.iss)?;
-            let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
-            let signature = Signature::from_str(delegation_token)?;
-            realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (_, _) => Err(TokenError::InvalidServerToken),
-    }
+        .map_err(Into::into)
 }
 
 pub async fn auth_middleware(
@@ -436,11 +426,16 @@ pub async fn auth_middleware(
     // Extract and validate token, get Option<AuthContext>
     // We clone headers to avoid borrowing issues with the async function
     let headers = request.headers().clone();
-    let auth_ctx: Option<AuthContext> = extract_auth_context(&state, &headers).await;
+    let (auth_ctx, bearer_token) = aruna_core::telemetry::time_stage(
+        "auth",
+        extract_auth_context_and_bearer_token(&state, &headers),
+    )
+    .await;
     record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required
     request.extensions_mut().insert(auth_ctx);
+    request.extensions_mut().insert(bearer_token);
 
     // Always continue to handler
     next.run(request).await
@@ -471,13 +466,16 @@ pub(crate) async fn ensure_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
+    let allowed = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth.clone(),
+                path,
+                required_permission,
+            }),
+            &state.get_ctx(),
+        ),
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
@@ -508,8 +506,9 @@ pub(crate) fn bucket_blob_permission_path(
 mod test {
     use crate::auth::{
         OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
-        extract_auth_context,
+        extract_auth_context, extract_auth_context_and_bearer_token, handle_token,
     };
+    use crate::error::TokenError;
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -563,7 +562,6 @@ mod test {
                 storage_handle,
                 net_handle: None,
                 blob_handle: None,
-                automerge_handle: None,
                 metadata_handle: None,
                 task_handle: None,
             }),
@@ -774,6 +772,101 @@ mod test {
             }) => RealmAuthorizationDocument::from_bytes(&bytes).unwrap(),
             other => panic!("unexpected auth doc read result: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_token_carrier_requires_valid_aruna_token() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            blob_handle: None,
+        });
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let node_id = iroh::SecretKey::generate().public();
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id,
+            node_id,
+            capabilities.clone(),
+            false,
+            None,
+        )
+        .await;
+        let token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time: chrono::Utc::now().timestamp() as u64,
+                expiry: None,
+                user_id,
+                realm_id,
+                node_capabilities: capabilities,
+            })
+            .unwrap(),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        let headers_for = |token: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            headers
+        };
+
+        let (auth, carrier) =
+            extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
+        assert_eq!(auth.unwrap().user_id, user_id);
+        assert_eq!(carrier.unwrap().as_str(), token);
+
+        state.add_token_to_blacklist(&token).await;
+        let (auth, carrier) =
+            extract_auth_context_and_bearer_token(&state, &headers_for(&token)).await;
+        assert!(auth.is_none());
+        assert!(carrier.is_none());
+
+        let oidc_signing_key = SigningKey::generate(&mut csprng);
+        let oidc_token = sign_oidc_token(
+            "https://issuer.example",
+            "aruna-api",
+            "subject-1",
+            "main-key",
+            &oidc_signing_key,
+            Algorithm::EdDSA,
+            None,
+        );
+        let (auth, carrier) =
+            extract_auth_context_and_bearer_token(&state, &headers_for(&oidc_token)).await;
+        assert!(auth.is_none());
+        assert!(carrier.is_none());
+
+        let (auth, carrier) =
+            extract_auth_context_and_bearer_token(&state, &headers_for("not-a-jwt")).await;
+        assert!(auth.is_none());
+        assert!(carrier.is_none());
     }
 
     #[tokio::test]
@@ -1103,7 +1196,6 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
             blob_handle: None,
@@ -1284,7 +1376,6 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
             blob_handle: None,
@@ -1381,7 +1472,6 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
             blob_handle: None,
@@ -1470,6 +1560,12 @@ mod test {
         let ctx = extract_auth_context(&state, &headers).await.unwrap();
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
+
+        state.add_token_to_blacklist(&management_token).await;
+        assert!(matches!(
+            handle_token(&state, &management_token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
 
         let old_time = chrono::Utc::now()
             .checked_sub_days(Days::new(10))

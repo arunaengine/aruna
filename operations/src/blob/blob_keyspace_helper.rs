@@ -186,7 +186,7 @@ pub fn iter_hash_path_index_effect(
     Ok(Effect::Storage(StorageEffect::Iter {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
         prefix: Some(HashPathIndexKey::hash_prefix(blake3_hash)?.into()),
-        start_after: None,
+        start: None,
         limit: usize::MAX,
         txn_id,
     }))

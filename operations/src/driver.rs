@@ -1,8 +1,9 @@
 use aruna_blob::blob::BlobHandle;
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -11,22 +12,20 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{Instrument, debug_span, error, trace};
+use tracing::{Instrument, debug_span, error, trace, warn};
 
-use crate::automerge::AutomergeHandle;
 use crate::metadata::MetadataHandle;
-use aruna_core::automerge::AutomergeEvent;
-use aruna_core::automerge::AutomergeSyncError;
+use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
-use aruna_core::task::TaskEvent;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 
 #[derive(Clone, Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
-    pub automerge_handle: Option<AutomergeHandle>,
     pub metadata_handle: Option<MetadataHandle>,
     pub task_handle: Option<TaskHandle>,
 }
@@ -74,29 +73,64 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Storage(storage_effect) => {
-            context
+            let realm_config_write = match &storage_effect {
+                StorageEffect::Write {
+                    key_space,
+                    value,
+                    txn_id: None,
+                    ..
+                } if key_space == REALM_CONFIG_KEYSPACE => Some(value.clone()),
+                _ => None,
+            };
+            let refresh_after_commit =
+                matches!(&storage_effect, StorageEffect::CommitTransaction { .. });
+            let event = context
                 .storage_handle
                 .send_storage_effect(storage_effect)
-                .await
+                .await;
+            if let Some(net_handle) = context.net_handle.as_ref() {
+                match (&event, realm_config_write) {
+                    (
+                        Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
+                        Some(bytes),
+                    ) => {
+                        if let Err(error) = net_handle.refresh_realm_peers_from_bytes(&bytes).await
+                        {
+                            warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                        }
+                    }
+                    (
+                        Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted {
+                            ..
+                        }),
+                        _,
+                    ) if refresh_after_commit => {
+                        if let Err(error) = net_handle.reload_realm_peers().await {
+                            warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            event
         }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 net_handle.send_effect(Effect::Net(net_effect)).await
             } else {
-                Event::Net(NetEvent::Error(NetError::ChannelClosed))
-            }
-        }
-        Effect::Automerge(automerge_effect) => {
-            if let Some(automerge_handle) = &context.automerge_handle {
-                automerge_handle
-                    .send_effect(Effect::Automerge(automerge_effect))
-                    .await
-            } else {
-                Event::Automerge(AutomergeEvent::SyncRejected {
-                    sync_id: ulid::Ulid::new(),
-                    document: None,
-                    error: AutomergeSyncError::Network("automerge handle unavailable".to_string()),
-                })
+                match net_effect {
+                    aruna_core::effects::NetEffect::DocumentSync(
+                        DocumentSyncEffect::PublishDocuments { documents, .. },
+                    ) => Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPublished {
+                            targets: documents
+                                .into_iter()
+                                .map(|document| document.target().clone())
+                                .collect(),
+                        },
+                    )),
+                    _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
+                }
             }
         }
         Effect::Metadata(metadata_effect) => {
@@ -126,6 +160,12 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Task(task_effect) => {
+            if let Err(message) = persist_task_effect(&context.storage_handle, &task_effect).await {
+                return Event::Task(TaskEvent::Error {
+                    key: task_effect_key(&task_effect),
+                    message,
+                });
+            }
             if let Some(task_handle) = &context.task_handle {
                 task_handle.send_effect(Effect::Task(task_effect)).await
             } else {
@@ -161,6 +201,15 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     }
 
     event
+}
+
+fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
+    match effect {
+        TaskEffect::ResetTimer { key, .. }
+        | TaskEffect::ShortenTimer { key, .. }
+        | TaskEffect::CancelTimer { key }
+        | TaskEffect::AbortRunningHandlers { key } => Some(key.clone()),
+    }
 }
 
 fn drive_suboperation<'a>(
@@ -263,7 +312,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
-        Effect::Automerge(_) => "automerge",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",
@@ -278,7 +326,6 @@ fn event_kind(event: &Event) -> &'static str {
         Event::StagingSource(_) => "staging_source",
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
-        Event::Automerge(_) => "automerge",
         Event::Metadata(_) => "metadata",
         Event::SubOperation(_) => "suboperation",
         Event::Task(_) => "task",
@@ -398,7 +445,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -428,9 +474,10 @@ mod test {
         fn start(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![
                 Effect::Task(TaskEffect::CancelTimer {
-                    key: TaskKey::TopicAnnounce(aruna_core::TopicId::group(
-                        ulid::Ulid::from_bytes([0u8; 16]),
-                    )),
+                    key: TaskKey::RealmPresence {
+                        realm_id: aruna_core::structs::RealmId::from_bytes([0u8; 32]),
+                        node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+                    },
                 }),
                 Effect::Search()
             ]
@@ -467,7 +514,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -562,7 +608,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -627,7 +672,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };

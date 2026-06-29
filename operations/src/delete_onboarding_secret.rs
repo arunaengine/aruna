@@ -10,6 +10,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::create_onboarding_secret::secret_record_key;
+use crate::onboarding_secret_state::secret_state_key;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteOnboardingSecretInput {
@@ -139,20 +140,28 @@ impl Operation for DeleteOnboardingSecretOperation {
                     txn_id,
                     record: record.clone(),
                 };
-                smallvec![Effect::Storage(StorageEffect::Delete {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    key: secret_record_key(self.input.enrollment_id),
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes: vec![
+                        (
+                            ONBOARDING_KEYSPACE.to_string(),
+                            secret_record_key(self.input.enrollment_id),
+                        ),
+                        (
+                            ONBOARDING_KEYSPACE.to_string(),
+                            secret_state_key(self.input.enrollment_id),
+                        ),
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }
             DeleteOnboardingSecretState::DeleteRecord { txn_id, record } => {
                 let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+                let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return fail(
                         self,
                         DeleteOnboardingSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
-                            expected: "delete result",
+                            expected: "batch delete result",
                             got,
                         },
                     );

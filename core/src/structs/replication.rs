@@ -53,16 +53,9 @@ impl ArunaArn {
             .ok_or_else(|| ConversionError::FromStrError("ARN missing node id".to_string()))?;
         let realm_id = RealmId::from_base64(realm_id)?;
 
-        let (node_id, resource) =
-            if let Some((node_id, resource)) = resource_remainder.split_once(':') {
-                (node_id, resource)
-            } else if let Some((node_id, resource)) = resource_remainder.split_once('/') {
-                (node_id, resource)
-            } else {
-                return Err(ConversionError::FromStrError(
-                    "ARN missing resource path".to_string(),
-                ));
-            };
+        let (node_id, resource) = resource_remainder.split_once(':').ok_or_else(|| {
+            ConversionError::FromStrError("ARN missing resource path".to_string())
+        })?;
 
         let node_id = NodeId::from_str(node_id)
             .map_err(|err| ConversionError::FromStrError(err.to_string()))?;
@@ -208,23 +201,6 @@ mod tests {
         assert_eq!(parsed.resource_type, ArunaArnType::S3);
         assert_eq!(parsed.path, "mybucket");
         assert_eq!(parsed.to_string(), arn);
-    }
-
-    #[test]
-    fn parses_legacy_s3_arn_and_canonicalizes_output() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let node_id = test_node_id();
-        let legacy = format!("arn:aruna:{realm_id}:{node_id}/s3/mybucket");
-
-        let parsed = ArunaArn::parse(&legacy).unwrap();
-        assert_eq!(parsed.realm_id, realm_id);
-        assert_eq!(parsed.node_id, node_id);
-        assert_eq!(parsed.resource_type, ArunaArnType::S3);
-        assert_eq!(parsed.path, "mybucket");
-        assert_eq!(
-            parsed.to_string(),
-            format!("arn:aruna:{realm_id}:{node_id}:s3/mybucket")
-        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{stale_subject_index_deletes, subject_index_writes};
 use aruna_core::structs::{Actor, User};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
@@ -283,27 +284,12 @@ impl ResolveUserSubjectConflictsOperation {
                 ByteView::from(loser_user_id.to_bytes()),
             ));
         }
-        if let Some(previous_user) = self.previous_user.as_ref() {
-            for subject_id in &previous_user.subject_ids {
-                if !subject_ids.contains(subject_id) {
-                    deletes.push((
-                        USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                        ByteView::from(subject_id.as_bytes().to_vec()),
-                    ));
-                }
-            }
-        }
+        deletes.extend(stale_subject_index_deletes(
+            self.previous_user.as_ref(),
+            Some(&canonical_user),
+        ));
 
-        let writes = subject_ids
-            .into_iter()
-            .map(|subject_id| {
-                (
-                    USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                    ByteView::from(subject_id.into_bytes()),
-                    ByteView::from(canonical_id.to_string().into_bytes()),
-                )
-            })
-            .collect();
+        let writes = subject_index_writes(&canonical_user);
 
         Ok(ConflictResolutionPlan {
             canonical_user,
@@ -422,9 +408,7 @@ impl Operation for ResolveUserSubjectConflictsOperation {
 }
 
 fn parse_index_user_id(value: &[u8]) -> Result<UserId, ConversionError> {
-    let value = std::str::from_utf8(value)
-        .map_err(|error| ConversionError::FromStrError(error.to_string()))?;
-    UserId::from_string(value)
+    UserId::from_storage_key(value)
 }
 
 pub fn rewrite_subject_index_effects(
@@ -432,27 +416,8 @@ pub fn rewrite_subject_index_effects(
     current: &User,
     txn_id: TxnId,
 ) -> Result<Effects, ConversionError> {
-    let mut deletes = Vec::new();
-    let mut writes = Vec::new();
-
-    if let Some(previous) = previous {
-        for subject_id in &previous.subject_ids {
-            if !current.subject_ids.contains(subject_id) {
-                deletes.push((
-                    USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                    ByteView::from(subject_id.as_bytes().to_vec()),
-                ));
-            }
-        }
-    }
-
-    for subject_id in &current.subject_ids {
-        writes.push((
-            USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-            ByteView::from(subject_id.as_bytes().to_vec()),
-            ByteView::from(current.user_id.to_string().into_bytes()),
-        ));
-    }
+    let deletes = stale_subject_index_deletes(previous, Some(current));
+    let writes = subject_index_writes(current);
 
     let mut effects = smallvec![];
     if !deletes.is_empty() {
@@ -547,7 +512,7 @@ mod tests {
                 let (key_space, key, value) = &writes[0];
                 assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
                 assert_eq!(key.as_ref(), subject.as_bytes());
-                assert_eq!(value.as_ref(), user_id.to_string().as_bytes());
+                assert_eq!(value.as_ref(), user_id.to_storage_key().as_slice());
             }
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -583,7 +548,7 @@ mod tests {
         operation.start();
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(subject.clone().into_bytes()),
-            value: Some(ByteView::from(winner_id.to_string().into_bytes())),
+            value: Some(ByteView::from(winner_id.to_storage_key())),
         }));
         assert!(
             matches!(effects.first(), Some(Effect::Storage(StorageEffect::Read { key, .. })) if key.as_ref() == winner_id.to_bytes().as_slice())
@@ -632,7 +597,7 @@ mod tests {
                 assert_eq!(writes.len(), 1);
                 let (_, key, value) = &writes[0];
                 assert_eq!(key.as_ref(), subject.as_bytes());
-                assert_eq!(value.as_ref(), winner_id.to_string().as_bytes());
+                assert_eq!(value.as_ref(), winner_id.to_storage_key().as_slice());
             }
             other => panic!("unexpected effect: {other:?}"),
         }

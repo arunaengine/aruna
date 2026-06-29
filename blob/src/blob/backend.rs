@@ -2,7 +2,7 @@ use super::BlobHandler;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use crate::s3::make_bucket;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -75,7 +75,7 @@ impl BlobHandler {
                         .bucket_prefix
                         .clone()
                         .map(|prefix| prefix.into()),
-                    start_after: start_after.clone(),
+                    start: start_after.clone().map(IterStart::After),
                     limit: 1024,
                     txn_id: None,
                 }))

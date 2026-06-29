@@ -2,7 +2,7 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -10,18 +10,23 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_operations::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
+};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use base64::Engine;
+use aruna_operations::issue_onboarding_sync_ticket::{
+    IssueOnboardingSyncTicketInput, IssueOnboardingSyncTicketOperation,
+    ONBOARDING_SYNC_TICKET_TTL_SECS,
+};
+use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
-use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
@@ -34,12 +39,8 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
-pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
-const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
-
 #[derive(Clone, Debug)]
 pub struct ServerState {
     // Contains neccessary drivers for request handling
@@ -129,6 +130,7 @@ impl ServerState {
         state.persist_trusted_realms().await;
         state
     }
+
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
     }
@@ -181,6 +183,15 @@ impl ServerState {
 
     pub async fn interface_state(&self) -> InterfaceRuntimeState {
         self.interface_state.read().await.clone()
+    }
+
+    pub async fn load_metadata_realm_nodes(&self) -> Vec<NodeId> {
+        aruna_operations::metadata::api::load_metadata_realm_nodes(
+            self.driver_ctx.as_ref(),
+            self.realm_id,
+            self.node_id,
+        )
+        .await
     }
 
     pub async fn get_oidc_provider_by_token(
@@ -245,79 +256,30 @@ impl ServerState {
         match &self.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
-            } => {
-                let mut documents = vec![
-                    AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: self.realm_id,
-                    },
-                    AutomergeDocumentVariant::RealmConfig {
-                        realm_id: self.realm_id,
-                    },
-                ];
-
-                let user_documents = match self
-                    .driver_ctx
-                    .storage_handle
-                    .send_effect(Effect::Storage(StorageEffect::Iter {
-                        key_space: USER_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: None,
-                        limit: 10_000,
-                        txn_id: None,
-                    }))
-                    .await
-                {
-                    Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-                    Event::Storage(StorageEvent::Error { .. }) => {
-                        return Err(OnboardingSecretError::InvalidSecret);
-                    }
-                    _ => return Err(OnboardingSecretError::InvalidSecret),
-                };
-
-                documents.extend(user_documents.into_iter().filter_map(|(key, _)| {
-                    aruna_core::UserId::from_string(std::str::from_utf8(key.as_ref()).ok()?)
-                        .ok()
-                        .filter(|user_id| user_id.realm_id == self.realm_id)
-                        .map(|user_id| AutomergeDocumentVariant::User { user_id })
-                }));
-
-                OnboardingSyncTicket::issue(
-                    realm_signing_key,
-                    &self.realm_id,
+            } => drive(
+                IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
+                    realm_signing_key: realm_signing_key.clone(),
+                    realm_id: self.realm_id,
                     node_id,
-                    chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
-                    documents,
-                )
-            }
+                    now: chrono::Utc::now().timestamp().max(0) as u64,
+                    ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+                }),
+                &self.driver_ctx,
+            )
+            .await
+            .map_err(|_| OnboardingSecretError::InvalidSecret),
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
-        // Just to be double sure this is not producing deadlocks
-        let read_lock = self.issuer_keys.read().await;
-        let key = read_lock.get(&pubkey).cloned();
-        drop(read_lock);
-        if let Some(key) = key {
-            return Ok(key);
-        }
-
-        let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(pubkey.clone())?
-            .try_into()
-            .map_err(|_| TokenError::InvalidIssuerKey)?;
-        let pub_pem_key =
-            VerifyingKey::from_bytes(&issuer_pubkey)?.to_public_key_pem(LineEnding::default())?;
-        let decoding_key = DecodingKey::from_ed_pem(pub_pem_key.as_bytes())?;
-        self.issuer_keys
-            .write()
+        <Self as ArunaBearerTokenValidationState>::decoding_key_for_issuer(self, &pubkey)
             .await
-            .insert(pubkey, decoding_key.clone());
-        Ok(decoding_key)
+            .map_err(Into::into)
     }
 
     pub async fn add_token_to_blacklist(&self, token: &str) {
-        let hash = blake3::hash(token.as_bytes()).to_string();
+        let hash = bearer_token_hash(token);
         self.token_revocation_list.write().await.insert(hash);
         self.persist_token_revocation_list().await;
     }
@@ -327,7 +289,7 @@ impl ServerState {
     }
 
     pub async fn is_token_blacklisted(&self, token: &str) -> bool {
-        let hash = blake3::hash(token.as_bytes()).to_string();
+        let hash = bearer_token_hash(token);
         self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
@@ -440,6 +402,36 @@ impl ServerState {
             &claimed,
         )
         .await;
+    }
+}
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for ServerState {
+    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        self.token_revocation_list.read().await.contains(token_hash)
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.trusted_realms_list.read().await.contains(realm_id)
+    }
+
+    async fn decoding_key_for_issuer(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        let read_lock = self.issuer_keys.read().await;
+        let key = read_lock.get(issuer_pubkey).cloned();
+        drop(read_lock);
+        if let Some(key) = key {
+            return Ok(key);
+        }
+
+        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
+        self.issuer_keys
+            .write()
+            .await
+            .insert(issuer_pubkey.to_string(), decoding_key.clone());
+        Ok(decoding_key)
     }
 }
 

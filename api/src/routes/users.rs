@@ -1,23 +1,31 @@
 use crate::auth::{OidcIdentity, bearer_token};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
-use aruna_core::structs::{Actor, AuthContext, User};
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
+use aruna_core::structs::{
+    Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, Role, User,
+};
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::drive;
+use aruna_operations::ensure_canonical_user_token_subject::{
+    EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
+};
+use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
 use aruna_operations::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
+use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
+use aruna_operations::read_realm_authorization::{
+    ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
+};
+use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
@@ -25,7 +33,6 @@ use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use byteview::ByteView;
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +47,8 @@ use utoipa::{OpenApi, ToSchema};
     paths(
         register_user,
         get_token,
+        get_user_info,
+        patch_user_info,
         list_users,
         get_user,
         update_user,
@@ -51,6 +60,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/users/register", post(register_user))
         .route("/users/token", get(get_token))
+        .route("/users/info", get(get_user_info).patch(patch_user_info))
         .route("/users", get(list_users))
         .route("/users/{id}", get(get_user).patch(update_user))
 }
@@ -92,6 +102,42 @@ pub struct ListUsersResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserInfoRoleResponse {
+    pub role_id: String,
+    pub name: String,
+    pub permissions: HashMap<String, String>,
+    pub assigned_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserInfoRealmResponse {
+    pub realm_id: String,
+    pub roles: Vec<UserInfoRoleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserInfoGroupResponse {
+    pub group_id: String,
+    pub display_name: String,
+    pub roles: Vec<UserInfoRoleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserInfoPreferencesResponse {
+    pub preferred_profile_path: Option<String>,
+    pub favourite_metadata_ids: Vec<String>,
+    pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GetUserInfoResponse {
+    pub user: GetUserResponse,
+    pub realm: UserInfoRealmResponse,
+    pub groups: Vec<UserInfoGroupResponse>,
+    pub preferences: UserInfoPreferencesResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     pub name: Option<String>,
     #[serde(default)]
@@ -99,6 +145,8 @@ pub struct UpdateUserRequest {
     #[serde(default)]
     pub remove_attributes: Vec<String>,
 }
+
+pub type PatchUserInfoRequest = UpdateUserRequest;
 
 const DEFAULT_LIST_USERS_LIMIT: usize = 100;
 const MAX_LIST_USERS_LIMIT: usize = 1_000;
@@ -111,6 +159,43 @@ impl From<User> for GetUserResponse {
             subject_ids: value.subject_ids,
             attributes: value.attributes,
         }
+    }
+}
+
+fn map_user_info_role(role_id: Ulid, role: Role) -> UserInfoRoleResponse {
+    UserInfoRoleResponse {
+        role_id: role_id.to_string(),
+        name: role.name,
+        permissions: role
+            .permissions
+            .iter()
+            .map(|(path, permission)| (path.clone(), permission.to_string()))
+            .collect(),
+        assigned_users: role
+            .assigned_users
+            .iter()
+            .map(|user| user.to_string())
+            .collect(),
+    }
+}
+
+fn user_preferences_from_attributes(
+    attributes: &HashMap<String, String>,
+) -> UserInfoPreferencesResponse {
+    UserInfoPreferencesResponse {
+        preferred_profile_path: attributes.get("ui.preferred_profile_path").cloned(),
+        favourite_metadata_ids: attributes
+            .get("ui.favourite_metadata_ids")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        theme: attributes.get("ui.theme").cloned(),
     }
 }
 
@@ -171,75 +256,124 @@ async fn ensure_canonical_user_token_subject(
     state: &Arc<ServerState>,
     user_id: UserId,
 ) -> ServerResult<()> {
-    let ctx = state.get_ctx();
-    let user = match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
-            txn_id: None,
-        }))
+    drive(
+        EnsureCanonicalUserTokenSubjectOperation::new(user_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_canonical_subject_error)
+}
+
+async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
+    drive(ReadUserDocumentOperation::new(user_id), &state.get_ctx())
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => User::from_bytes(&bytes)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            return Err(ServerError::Unauthorized);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(ServerError::InternalError(error.to_string()));
-        }
-        other => {
-            return Err(ServerError::InternalError(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
+        .map_err(map_read_user_document_error)
+}
 
-    if user.user_id != user_id {
-        return Err(ServerError::Unauthorized);
+async fn read_realm_authorization(
+    state: &ServerState,
+) -> ServerResult<Option<RealmAuthorizationDocument>> {
+    drive(
+        ReadRealmAuthorizationOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_read_realm_authorization_error)
+}
+
+fn map_canonical_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> ServerError {
+    match error {
+        EnsureCanonicalUserTokenSubjectError::Unauthorized => ServerError::Unauthorized,
+        EnsureCanonicalUserTokenSubjectError::Forbidden => ServerError::Forbidden,
+        other => ServerError::InternalError(other.to_string()),
     }
+}
 
-    for subject_id in &user.subject_ids {
-        match ctx
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                key: ByteView::from(subject_id.as_bytes().to_vec()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => {
-                let indexed_user_id = std::str::from_utf8(&bytes)
-                    .map_err(|error| ServerError::InternalError(error.to_string()))
-                    .and_then(|value| {
-                        UserId::from_string(value)
-                            .map_err(|error| ServerError::InternalError(error.to_string()))
-                    })?;
-                if indexed_user_id != user_id {
-                    return Err(ServerError::Forbidden);
-                }
-            }
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                return Err(ServerError::Forbidden);
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(ServerError::InternalError(error.to_string()));
-            }
-            other => {
-                return Err(ServerError::InternalError(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        }
+fn map_read_user_document_error(error: ReadUserDocumentError) -> ServerError {
+    match error {
+        ReadUserDocumentError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
     }
+}
 
-    Ok(())
+fn map_read_realm_authorization_error(error: ReadRealmAuthorizationError) -> ServerError {
+    ServerError::InternalError(error.to_string())
+}
+
+fn collect_user_realm_roles(
+    auth_doc: Option<RealmAuthorizationDocument>,
+    user_id: UserId,
+) -> Vec<UserInfoRoleResponse> {
+    auth_doc
+        .into_iter()
+        .flat_map(|document| document.roles)
+        .filter(|(_, role)| role.assigned_users.contains(&user_id))
+        .map(|(role_id, role)| map_user_info_role(role_id, role))
+        .collect()
+}
+
+fn collect_assigned_group_roles(
+    auth_doc: GroupAuthorizationDocument,
+    user_id: UserId,
+) -> Vec<UserInfoRoleResponse> {
+    auth_doc
+        .roles
+        .into_iter()
+        .filter(|(_, role)| role.assigned_users.contains(&user_id))
+        .map(|(role_id, role)| map_user_info_role(role_id, role))
+        .collect()
+}
+
+async fn collect_user_group_memberships(
+    state: &ServerState,
+    user_id: UserId,
+) -> ServerResult<Vec<UserInfoGroupResponse>> {
+    let groups = drive(ListGroupOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let mut memberships = Vec::new();
+    for Group { group_id, .. } in groups {
+        let (group, auth_doc) = drive(
+            GetGroupOperation::new(GetGroupConfig { group_id }),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let roles = collect_assigned_group_roles(auth_doc, user_id);
+        if roles.is_empty() {
+            continue;
+        }
+        memberships.push(UserInfoGroupResponse {
+            group_id: group.group_id.to_string(),
+            display_name: group.display_name,
+            roles,
+        });
+    }
+    Ok(memberships)
+}
+
+async fn build_user_info_response(
+    state: &ServerState,
+    auth: AuthContext,
+) -> ServerResult<GetUserInfoResponse> {
+    if auth.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+    let user = read_current_user(state, auth.user_id).await?;
+    let preferences = user_preferences_from_attributes(&user.attributes);
+    let realm_roles =
+        collect_user_realm_roles(read_realm_authorization(state).await?, auth.user_id);
+    let groups = collect_user_group_memberships(state, auth.user_id).await?;
+
+    Ok(GetUserInfoResponse {
+        user: user.into(),
+        realm: UserInfoRealmResponse {
+            realm_id: state.get_realm_id().to_string(),
+            roles: realm_roles,
+        },
+        groups,
+        preferences,
+    })
 }
 
 async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
@@ -283,11 +417,12 @@ async fn register_admin(
 ) -> Result<User, ServerError> {
     let onboarding_secret =
         OnboardingSecret::decode(&onboarding_secret).map_err(|_| ServerError::Unauthorized)?;
-    let secret_hash = blake3::hash(&onboarding_secret.secret).to_string();
+    let secret_hash = onboarding_secret.secret_hash();
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: secret_hash.clone(),
+            node_id: user_id.to_string(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),
@@ -435,6 +570,93 @@ async fn get_token(
     let token = issue_user_token(&state, user_id, expiry).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/info",
+    tag = "users",
+    responses(
+        (status = 200, description = "Current user information", body = GetUserInfoResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_user_info(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<GetUserInfoResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    Ok((
+        StatusCode::OK,
+        Json(build_user_info_response(&state, auth).await?),
+    ))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/users/info",
+    tag = "users",
+    request_body = PatchUserInfoRequest,
+    responses(
+        (status = 200, description = "Current user updated", body = GetUserInfoResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn patch_user_info(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<PatchUserInfoRequest>,
+) -> ServerResult<(StatusCode, Json<GetUserInfoResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id || auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+
+    drive(
+        UpdateUserOperation::new(UpdateUserInput {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            auth_context: auth.clone(),
+            self_realm_id: realm_id,
+            user_id: auth.user_id.to_string(),
+            name: request.name,
+            set_attributes: request.set_attributes,
+            remove_attributes: request.remove_attributes,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
+        aruna_operations::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+            ServerError::BadRequest
+        }
+        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+            ServerError::Forbidden
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(build_user_info_response(&state, auth).await?),
+    ))
 }
 
 #[utoipa::path(
@@ -624,7 +846,6 @@ mod tests {
     use aruna_operations::announce_realm_presence::{
         AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
-    use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -839,12 +1060,10 @@ mod tests {
         .await
         .unwrap();
         let task_handle = TaskHandle::new();
-        let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
-            automerge_handle: Some(automerge_handle),
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
         });
@@ -1001,7 +1220,7 @@ mod tests {
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {
                     enrollment_id: onboarding_secret.enrollment_id,
-                    secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+                    secret_hash: onboarding_secret.secret_hash(),
                     mode: OnboardingMode::Local,
                     expires_at: u64::MAX,
                     claimed_node_id: None,

@@ -1,4 +1,4 @@
-use crate::id::{DhtKeyId, NodeId, TopicId};
+use crate::id::{DhtKeyId, NodeId};
 use crate::structs::RealmId;
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
@@ -24,13 +24,6 @@ pub fn dht_key_from_domain(domain: &[u8], input: &[u8]) -> DhtKeyId {
     DhtKeyId::from_bytes(derive_key_with_domain(domain, input))
 }
 
-/// Derive a DHT key for finding gossip peers for a topic.
-#[must_use]
-#[inline]
-pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
-    dht_key_from_domain(b"gossip", &topic.to_bytes())
-}
-
 /// Derive a DHT key for active realm node presence announcements.
 #[must_use]
 #[inline]
@@ -46,18 +39,4 @@ pub fn realm_endpoint_key(realm_id: &RealmId, node_id: &NodeId) -> DhtKeyId {
     input.extend_from_slice(realm_id.as_bytes());
     input.extend_from_slice(node_id.as_bytes());
     dht_key_from_domain(b"realm-endpoint-v1", &input)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ulid::Ulid;
-
-    #[test]
-    fn test_gossip_peer_key() {
-        let topic = TopicId::group(Ulid::new());
-        let key1 = gossip_peer_key(&topic);
-        let key2 = gossip_peer_key(&topic);
-        assert_eq!(key1, key2);
-    }
 }

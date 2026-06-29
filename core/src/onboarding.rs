@@ -1,5 +1,6 @@
 use crate::NodeId;
-use crate::automerge::{AutomergeDocumentVariant, InitAuthProof};
+use crate::auth::credential_hash;
+use crate::document::DocumentSyncTarget;
 use crate::structs::RealmId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -31,6 +32,31 @@ pub struct OnboardingSecretRecord {
     pub mode: OnboardingMode,
     pub expires_at: u64,
     pub claimed_node_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingSecretStateRecord {
+    pub enrollment_id: Ulid,
+    pub state: OnboardingSecretState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnboardingSecretState {
+    Available,
+    Reserved { node_id: String, expires_at: u64 },
+    Finalizing { node_id: String },
+    Consumed { node_id: String },
+}
+
+impl OnboardingSecretState {
+    pub fn claimed_node_id(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Reserved { node_id, .. }
+            | Self::Finalizing { node_id }
+            | Self::Consumed { node_id } => Some(node_id),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +92,7 @@ pub struct OnboardingSyncTicketPayload {
     pub realm_id: String,
     pub node_id: String,
     pub expires_at: u64,
-    pub documents: Vec<AutomergeDocumentVariant>,
+    pub documents: Vec<DocumentSyncTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +128,10 @@ pub enum OnboardingSecretError {
 }
 
 impl OnboardingSecret {
+    pub fn secret_hash(&self) -> String {
+        credential_hash(self.secret)
+    }
+
     pub fn encode(&self) -> Result<String, OnboardingSecretError> {
         let bytes = postcard::to_allocvec(self)?;
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
@@ -125,7 +155,7 @@ impl OnboardingSyncTicket {
         realm_id: &RealmId,
         node_id: NodeId,
         expires_at: u64,
-        documents: Vec<AutomergeDocumentVariant>,
+        documents: Vec<DocumentSyncTarget>,
     ) -> Result<Self, OnboardingSecretError> {
         let payload = OnboardingSyncTicketPayload {
             realm_id: realm_id.to_string(),
@@ -151,7 +181,7 @@ impl OnboardingSyncTicket {
     pub fn verify(
         &self,
         expected_node_id: NodeId,
-        expected_document: &AutomergeDocumentVariant,
+        expected_document: &DocumentSyncTarget,
         now: u64,
     ) -> Result<(), OnboardingSecretError> {
         if self.payload.node_id != expected_node_id.to_string() {
@@ -180,21 +210,6 @@ impl OnboardingSyncTicket {
             .verify(&payload_bytes, &signature)
             .map_err(|_| OnboardingSecretError::InvalidSignature)
     }
-
-    pub fn into_auth_proof(self) -> InitAuthProof {
-        InitAuthProof {
-            payload: self
-                .encode()
-                .expect("onboarding sync ticket encoding should succeed")
-                .into_bytes(),
-        }
-    }
-
-    pub fn from_auth_proof(auth: &InitAuthProof) -> Result<Self, OnboardingSecretError> {
-        let encoded =
-            std::str::from_utf8(&auth.payload).map_err(|_| OnboardingSecretError::InvalidSecret)?;
-        Self::decode(encoded)
-    }
 }
 
 pub fn bootstrap_node_proof_message(
@@ -219,8 +234,8 @@ pub fn bootstrap_issuer_proof_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
-    use crate::automerge::AutomergeDocumentVariant;
+    use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket, credential_hash};
+    use crate::document::DocumentSyncTarget;
     use crate::structs::RealmId;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
@@ -240,12 +255,24 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_secret_hash_matches_existing_blake3_hex() {
+        let secret = OnboardingSecret {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            enrollment_id: Ulid::new(),
+            secret: [7u8; 32],
+            mode: OnboardingMode::Server,
+        };
+
+        assert_eq!(secret.secret_hash(), credential_hash(secret.secret));
+    }
+
+    #[test]
     fn onboarding_sync_ticket_roundtrip_and_verify() {
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let document = AutomergeDocumentVariant::RealmAuthorization { realm_id };
+        let document = DocumentSyncTarget::RealmAuthorization { realm_id };
 
         let ticket = OnboardingSyncTicket::issue(
             &realm_signing_key,

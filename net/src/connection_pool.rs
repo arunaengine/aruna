@@ -56,8 +56,6 @@ pub enum PoolConnectError {
     Timeout,
     #[error("too many pooled connections")]
     TooManyConnections,
-    #[error("gossip connections are not pooled")]
-    GossipUnsupported,
     #[error("connection failed: {0}")]
     Connection(String),
 }
@@ -328,10 +326,6 @@ impl ConnectionPool {
         node_id: NodeId,
         alpn: Alpn,
     ) -> std::result::Result<ConnectionLease, PoolConnectError> {
-        if alpn == Alpn::Gossip {
-            return Err(PoolConnectError::GossipUnsupported);
-        }
-
         let key = ConnectionKey { node_id, alpn };
         let (tx, rx) = oneshot::channel();
         self.tx

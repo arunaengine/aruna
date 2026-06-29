@@ -4,17 +4,17 @@ use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
+use aruna_core::id::DhtKeyId;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::DhtKey;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-const REALM_PRESENCE_TTL: Duration = Duration::from_secs(30);
-const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
+const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnounceRealmPresenceConfig {
@@ -62,8 +62,8 @@ impl AnnounceRealmPresenceOperation {
         }
     }
 
-    fn presence_key(&self) -> DhtKey {
-        *realm_presence_key(&self.config.realm_id).as_bytes()
+    fn presence_key(&self) -> DhtKeyId {
+        realm_presence_key(&self.config.realm_id)
     }
 
     fn task_key(&self) -> TaskKey {
@@ -160,6 +160,25 @@ impl Operation for AnnounceRealmPresenceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_ttl_outlives_refresh_and_dht_tick() {
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            realm_id,
+            node_id,
+            schedule_refresh: true,
+        });
+
+        let effects = op.start();
+
+        let [Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. }))] = effects.as_slice() else {
+            panic!("expected one DHT put effect");
+        };
+        assert!(*ttl > REALM_PRESENCE_REFRESH_AFTER);
+        assert!(*ttl > aruna_net::dht::constants::DRIVER_TICK_INTERVAL);
+    }
 
     #[test]
     fn dht_put_error_fails_operation() {

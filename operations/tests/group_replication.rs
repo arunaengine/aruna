@@ -1,17 +1,17 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::{
+    Actor, Group, GroupAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_operations::automerge::AutomergeHandle;
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -59,7 +59,7 @@ async fn build_realm_nodes(
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        nodes.push(spawn_node().await?);
+        nodes.push(spawn_node(*realm_id).await?);
     }
 
     for i in 0..nodes.len() {
@@ -75,28 +75,17 @@ async fn build_realm_nodes(
         }
     }
 
-    for node in &nodes {
-        drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-                realm_id: *realm_id,
-                node_id: node.net.node_id(),
-                schedule_refresh: true,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
-    }
-
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
+    install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
 
-async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
+async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
             ..NetConfig::default()
@@ -105,13 +94,11 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net.clone()));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        automerge_handle: Some(automerge_handle),
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });
@@ -126,39 +113,40 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
     })
 }
 
-async fn wait_for_realm_node_convergence(
+async fn install_realm_config(
     nodes: &[TestNode],
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-
-    loop {
-        let mut converged = true;
-        for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => {
-                    converged = false;
-                    break;
-                }
-            }
-        }
-
-        if converged {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("realm nodes did not converge".into());
-        }
-
-        sleep(Duration::from_millis(50)).await;
+    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    for node in nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
+
+    for node in nodes {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: aruna_core::UserId::nil(*realm_id),
+            realm_id: *realm_id,
+        };
+        let bytes = config.to_bytes(&actor)?;
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: bytes.into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
+        }
+        node.net.refresh_realm_peers_from_document(&config).await?;
+    }
+
+    Ok(())
 }
 
 async fn wait_for_group_convergence(

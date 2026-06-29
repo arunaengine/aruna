@@ -490,8 +490,21 @@ log "Reading the initial onboarding secret from ${NODE_NAMES[0]}"
 INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "${NODE_DIRS[0]}/${NODE_NAMES[0]}.log" "$NODE_1_PID")"
 
 log "Generating the bootstrap admin token from ${NODE_NAMES[0]}"
+if [[ "$WITH_KEYCLOAK" != "1" ]]; then
+  log "Stopping ${NODE_NAMES[0]} to unlock local storage for bootstrap token creation"
+  kill "$NODE_1_PID" >/dev/null 2>&1 || true
+  wait "$NODE_1_PID" 2>/dev/null || true
+  PIDS=()
+fi
 INITIAL_ADMIN_TOKEN="$(generate_test_token "${NODE_DIRS[0]}" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
 printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
+
+if [[ "$WITH_KEYCLOAK" != "1" ]]; then
+  log "Restarting ${NODE_NAMES[0]} after bootstrap token creation"
+  start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
+  NODE_1_PID="$STARTED_PID"
+  wait_for_http "${NODE_NAMES[0]}" "$NODE_1_BASE_URL" "$NODE_1_PID"
+fi
 
 for node_index in "${!NODE_NAMES[@]}"; do
   if [[ $node_index -eq 0 ]]; then

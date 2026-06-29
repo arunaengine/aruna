@@ -24,7 +24,6 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
@@ -396,30 +395,40 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
     group_id: &str,
     path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    let response = reqwest::Client::new()
-        .post(format!("{base_url}/api/v1/users/credentials"))
-        .bearer_auth(bearer_token)
-        .json(&CreateS3CredentialsRequest {
-            group_id: group_id.to_string(),
-            expires_in_seconds: Some(600),
-            path_restrictions,
-        })
-        .send()
-        .await?;
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
 
-    if response.status() != StatusCode::CREATED {
-        return Err(std::io::Error::other(format!(
-            "unexpected create credentials status: {}",
-            response.status()
-        ))
-        .into());
+    loop {
+        let response = client
+            .post(format!("{base_url}/api/v1/users/credentials"))
+            .bearer_auth(bearer_token)
+            .json(&CreateS3CredentialsRequest {
+                group_id: group_id.to_string(),
+                expires_in_seconds: Some(600),
+                path_restrictions: path_restrictions.clone(),
+            })
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::CREATED {
+            let response: CreateS3CredentialsResponse = response.json().await?;
+            return Ok(S3Credentials {
+                access_key_id: response.access_key_id,
+                access_secret: response.access_secret,
+            });
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "unexpected create credentials status after retry: {} body={}",
+                status, body
+            ))
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
     }
-
-    let response: CreateS3CredentialsResponse = response.json().await?;
-    Ok(S3Credentials {
-        access_key_id: response.access_key_id,
-        access_secret: response.access_secret,
-    })
 }
 
 pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
@@ -602,6 +611,9 @@ async fn spawn_joiner_node_with_mode(
             relay_method: RelayMethod::None,
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
+            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            document_sync_runtime: Some(config.document_sync_runtime),
+            fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),
     )
@@ -668,7 +680,6 @@ async fn initialize_context(
     full_storage_config: Option<&FullNodeStorageConfig>,
 ) -> TestResult<Arc<DriverContext>> {
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net.clone()));
     let metadata_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
         Some(MetadataHandle::new(
@@ -676,6 +687,8 @@ async fn initialize_context(
             net.node_id(),
             storage_handle.clone(),
             Some(net.clone()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
         )?)
     } else {
         None
@@ -696,7 +709,6 @@ async fn initialize_context(
         storage_handle,
         net_handle: Some(net),
         blob_handle,
-        automerge_handle: Some(automerge_handle),
         metadata_handle,
         task_handle: Some(task_handle.clone()),
     });

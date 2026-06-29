@@ -11,13 +11,19 @@ use smallvec::SmallVec;
 use super::constants::{DRIVER_TICK_INTERVAL, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, RPC_TIMEOUT_TICKS};
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
-    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
-    DhtOutputValue, INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
+    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetCompletedReason, DhtGetStats, DhtInput, DhtIo,
+    DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue, DhtPeerError, INTERNAL_OP_START,
+    InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue, signed_put_value_bytes};
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, live_entries, merge_entry};
 
+const MIN_TTL_SECS: u64 = 1;
+
 type PendingMap = HashMap<PendingKey, PendingMeta>;
+
+const LOOKUP_LOG_PEER_LIMIT: usize = 16;
+const LOOKUP_LOG_ERROR_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMeta {
@@ -127,6 +133,10 @@ struct GetOp {
     values: Vec<DhtEntry>,
     seen_publishers: HashSet<(NodeId, RealmId)>,
     frontier: LookupFrontier,
+    local_value_count: usize,
+    remote_value_count: usize,
+    peer_error_count: usize,
+    peer_errors: Vec<DhtPeerError>,
     trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
@@ -320,7 +330,7 @@ impl DhtStateMachine {
             return;
         }
 
-        let ttl_secs = ttl.as_secs();
+        let ttl_secs = ttl.as_secs().max(MIN_TTL_SECS);
         let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
         let signature = self.secret_key.sign(&signed_data);
 
@@ -369,6 +379,10 @@ impl DhtStateMachine {
             values: Vec::new(),
             seen_publishers: HashSet::new(),
             frontier: LookupFrontier::default(),
+            local_value_count: 0,
+            remote_value_count: 0,
+            peer_error_count: 0,
+            peer_errors: Vec::new(),
             trace_context,
             pending: HashMap::new(),
         });
@@ -572,7 +586,7 @@ impl DhtStateMachine {
             return;
         }
 
-        self.handle_rpc_error_state(op_id, phase, error, op_state, out);
+        self.handle_rpc_error_state(op_id, phase, peer, error, op_state, out);
     }
 
     #[tracing::instrument(
@@ -592,7 +606,7 @@ impl DhtStateMachine {
     ) {
         match op_state {
             OpState::Put(op) => self.handle_rpc_response_put(op_id, phase, response, op, out),
-            OpState::Get(op) => self.handle_rpc_response_get(op_id, phase, response, op, out),
+            OpState::Get(op) => self.handle_rpc_response_get(op_id, phase, peer, response, op, out),
             OpState::Bootstrap(op) => {
                 self.handle_rpc_response_bootstrap(op_id, phase, peer, response, op, out)
             }
@@ -654,6 +668,7 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
+        peer: NodeId,
         response: DhtResponse,
         mut op: GetOp,
         out: &mut SmallVec<[DhtEffect; 4]>,
@@ -668,6 +683,7 @@ impl DhtStateMachine {
                 entries,
                 closer_nodes,
             } => {
+                let value_count_before = op.values.len();
                 let now = self.now_secs;
                 for entry in entries {
                     if entry.expires_at <= now {
@@ -685,6 +701,9 @@ impl DhtStateMachine {
                         });
                     }
                 }
+                op.remote_value_count = op
+                    .remote_value_count
+                    .saturating_add(op.values.len().saturating_sub(value_count_before));
 
                 for node_id in &closer_nodes {
                     self.routing_table.insert(PeerInfo::new(*node_id));
@@ -697,7 +716,10 @@ impl DhtStateMachine {
                 }
                 op.frontier.add_candidates(nodes, self.local_id);
             }
-            DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
+            DhtResponse::Error { code, .. } => {
+                record_get_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
+            }
+            DhtResponse::Pong | DhtResponse::Stored => {}
         }
 
         if !op.values.is_empty() {
@@ -791,13 +813,14 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
+        peer: NodeId,
         error: DhtIoError,
         op_state: OpState,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         match op_state {
             OpState::Put(op) => self.handle_rpc_error_put(op_id, phase, error, op, out),
-            OpState::Get(op) => self.handle_rpc_error_get(op_id, phase, op, out),
+            OpState::Get(op) => self.handle_rpc_error_get(op_id, phase, peer, error, op, out),
             OpState::Bootstrap(op) => self.handle_rpc_error_bootstrap(op_id, phase, error, op, out),
             OpState::EvictionPing(op) => self.handle_rpc_error_eviction_ping(op_id, phase, op),
             OpState::MaintenancePing(op) => {
@@ -841,6 +864,8 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
+        peer: NodeId,
+        error: DhtIoError,
         mut op: GetOp,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
@@ -849,6 +874,7 @@ impl DhtStateMachine {
             return;
         }
 
+        record_get_peer_error(&mut op, peer, dht_io_error_label(&error));
         self.dispatch_get_requests(op_id, &mut op, out);
         self.maybe_complete_get(op_id, op, out);
     }
@@ -950,6 +976,7 @@ impl DhtStateMachine {
                 }
 
                 let now = self.now_secs;
+                let value_count_before = op.values.len();
                 for entry in live_entries(entries, now) {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
@@ -963,6 +990,9 @@ impl DhtStateMachine {
                         });
                     }
                 }
+                op.local_value_count = op
+                    .local_value_count
+                    .saturating_add(op.values.len().saturating_sub(value_count_before));
 
                 if !op.values.is_empty() {
                     self.maybe_complete_get(op_id, op, out);
@@ -1312,6 +1342,17 @@ impl DhtStateMachine {
                     return;
                 };
 
+                if ttl_secs == 0 {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "TTL must be greater than zero".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
                 let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
 
                 if publisher.verify(&signed_data, &signature).is_err() {
@@ -1466,14 +1507,17 @@ impl DhtStateMachine {
         fields(op_id, key = %op.key, value_count = op.values.len())
     )]
     fn maybe_complete_get(&mut self, op_id: OpId, op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if !op.values.is_empty()
-            || (pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
-                && op.frontier.pending_exhausted())
+        if !op.values.is_empty() {
+            let completed_reason = if op.remote_value_count > 0 {
+                DhtGetCompletedReason::RemoteValue
+            } else {
+                DhtGetCompletedReason::LocalValue
+            };
+            complete_get(op_id, op, completed_reason, out);
+        } else if pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
+            && op.frontier.pending_exhausted()
         {
-            out.push(DhtEffect::Output(DhtOutput::Completed {
-                op_id,
-                result: DhtOutputValue::GetValues(op.values),
-            }));
+            complete_get(op_id, op, DhtGetCompletedReason::LookupExhausted, out);
         } else {
             self.ops.insert(op_id, OpState::Get(op));
         }
@@ -1769,6 +1813,69 @@ impl DhtStateMachine {
         let op_id = self.next_internal_op_id;
         self.next_internal_op_id = self.next_internal_op_id.saturating_add(1);
         op_id
+    }
+}
+
+fn complete_get(
+    op_id: OpId,
+    op: GetOp,
+    completed_reason: DhtGetCompletedReason,
+    out: &mut SmallVec<[DhtEffect; 4]>,
+) {
+    let stats = get_stats(&op, completed_reason);
+    out.push(DhtEffect::Output(DhtOutput::Completed {
+        op_id,
+        result: DhtOutputValue::GetValues {
+            values: op.values,
+            stats,
+        },
+    }));
+}
+
+fn get_stats(op: &GetOp, completed_reason: DhtGetCompletedReason) -> DhtGetStats {
+    let queried_peers = limited_sorted_peers(&op.frontier.queried, LOOKUP_LOG_PEER_LIMIT);
+    let queried_peer_count = op.frontier.queried.len();
+
+    DhtGetStats {
+        completed_reason,
+        local_value_count: op.local_value_count,
+        remote_value_count: op.remote_value_count,
+        queried_peer_count,
+        queried_peers,
+        queried_peers_truncated: queried_peer_count > LOOKUP_LOG_PEER_LIMIT,
+        peer_error_count: op.peer_error_count,
+        peer_errors: op.peer_errors.clone(),
+        peer_errors_truncated: op.peer_error_count > op.peer_errors.len(),
+    }
+}
+
+fn limited_sorted_peers(peers: &HashSet<NodeId>, limit: usize) -> Vec<NodeId> {
+    let mut peers: Vec<_> = peers.iter().copied().collect();
+    peers.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    peers.truncate(limit);
+    peers
+}
+
+fn record_get_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>) {
+    op.peer_error_count = op.peer_error_count.saturating_add(1);
+    if op.peer_errors.len() >= LOOKUP_LOG_ERROR_LIMIT {
+        return;
+    }
+
+    op.peer_errors.push(DhtPeerError {
+        peer,
+        error: error.into(),
+    });
+}
+
+fn dht_io_error_label(error: &DhtIoError) -> &'static str {
+    match error {
+        DhtIoError::QueueFull => "queue_full",
+        DhtIoError::Shutdown => "shutdown",
+        DhtIoError::Timeout => "timeout",
+        DhtIoError::Network(_) => "network",
+        DhtIoError::Storage(_) => "storage",
+        DhtIoError::InvalidResponse(_) => "invalid_response",
     }
 }
 
@@ -2200,6 +2307,54 @@ mod tests {
     }
 
     #[test]
+    fn put_with_zero_ttl_clamps_to_minimum_before_local_write() {
+        let local_secret = iroh::SecretKey::from_bytes(&[61u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let key = DhtKeyId::from_data(b"zero-ttl-local-put");
+        let realm_id = make_realm(1);
+        let value = b"value".to_vec();
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 24,
+            key,
+            realm_id,
+            value: value.clone(),
+            ttl: std::time::Duration::ZERO,
+            trace_context: None,
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 24,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let entries = effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::StorageWrite {
+                        stage: StorageStage::PutLocalWrite,
+                        entries,
+                        ..
+                    } = &(**inner)
+                {
+                    Some(entries)
+                } else {
+                    None
+                }
+            })
+            .expect("put should enqueue local storage write");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expires_at, 1_000 + MIN_TTL_SECS);
+
+        let signature = entries[0].signature.as_ref().expect("put is signed");
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, MIN_TTL_SECS);
+        assert!(local_id.verify(&signed_data, signature).is_ok());
+    }
+
+    #[test]
     fn put_succeeds_when_store_rpc_times_out() {
         let local_secret = iroh::SecretKey::from_bytes(&[42u8; 32]);
         let local_id = local_secret.public();
@@ -2485,8 +2640,13 @@ mod tests {
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 15,
-                    result: DhtOutputValue::GetValues(values)
+                    result: DhtOutputValue::GetValues { values, stats }
                 }) if values.iter().any(|entry| entry.value == b"cached".to_vec())
+                    && stats.completed_reason == DhtGetCompletedReason::LocalValue
+                    && stats.local_value_count == 1
+                    && stats.remote_value_count == 0
+                    && stats.queried_peer_count == 0
+                    && stats.peer_error_count == 0
             )
         }));
         assert!(!effects.iter().any(|effect| {
@@ -2534,8 +2694,11 @@ mod tests {
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 22,
-                    result: DhtOutputValue::GetValues(values)
+                    result: DhtOutputValue::GetValues { values, stats }
                 }) if values.is_empty()
+                    && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
+                    && stats.local_value_count == 0
+                    && stats.remote_value_count == 0
             )
         }));
     }
@@ -2647,8 +2810,12 @@ mod tests {
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 16,
-                    result: DhtOutputValue::GetValues(values)
+                    result: DhtOutputValue::GetValues { values, stats }
                 }) if values.iter().any(|entry| entry.value == b"first".to_vec())
+                    && stats.completed_reason == DhtGetCompletedReason::RemoteValue
+                    && stats.local_value_count == 0
+                    && stats.remote_value_count == 1
+                    && stats.queried_peer_count == lookup_peers.len()
             )
         }));
         assert!(!response_effects.iter().any(|effect| {
@@ -2674,6 +2841,114 @@ mod tests {
             },
         }));
         assert!(late_effects.is_empty());
+    }
+
+    #[test]
+    fn get_stats_include_peer_errors_until_remote_value() {
+        let local_secret = iroh::SecretKey::from_bytes(&[61u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let peer_a = make_node(28);
+        let peer_b = make_node(29);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_a }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_b }));
+
+        let op_id = 24;
+        let key = DhtKeyId::from_data(b"get-stats-peer-errors");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id,
+            key,
+            realm_filter: None,
+            trace_context: None,
+        }));
+
+        let local_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let mut lookup_peers = Vec::new();
+        for effect in &local_effects {
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    op_id: request_op_id,
+                    phase: RpcPhase::GetLookup,
+                    peer,
+                    ..
+                } = **inner
+                && request_op_id == op_id
+            {
+                lookup_peers.push(peer);
+            }
+        }
+        assert_eq!(lookup_peers.len(), 2);
+
+        let failed_peer = lookup_peers[0];
+        let value_peer = lookup_peers[1];
+        let error_effects = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id,
+            phase: RpcPhase::GetLookup,
+            peer: failed_peer,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(
+            error_effects
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let response_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id,
+            phase: RpcPhase::GetLookup,
+            peer: value_peer,
+            response: DhtResponse::Value {
+                entries: vec![StoredValue {
+                    publisher: make_node(30),
+                    realm_id: make_realm(1),
+                    value: b"after-error".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                }],
+                closer_nodes: Vec::new(),
+            },
+        }));
+
+        let (values, stats) = response_effects
+            .iter()
+            .find_map(|effect| {
+                if let DhtEffect::Output(DhtOutput::Completed {
+                    op_id: completed_op_id,
+                    result: DhtOutputValue::GetValues { values, stats },
+                }) = effect
+                    && *completed_op_id == op_id
+                {
+                    Some((values, stats))
+                } else {
+                    None
+                }
+            })
+            .expect("get should complete after remote value");
+
+        assert!(
+            values
+                .iter()
+                .any(|entry| entry.value == b"after-error".to_vec())
+        );
+        assert_eq!(stats.completed_reason, DhtGetCompletedReason::RemoteValue);
+        assert_eq!(stats.local_value_count, 0);
+        assert_eq!(stats.remote_value_count, 1);
+        assert_eq!(stats.queried_peer_count, lookup_peers.len());
+        assert!(
+            lookup_peers
+                .iter()
+                .all(|peer| stats.queried_peers.contains(peer))
+        );
+        assert_eq!(stats.peer_error_count, 1);
+        assert_eq!(stats.peer_errors.len(), 1);
+        assert_eq!(stats.peer_errors[0].peer, failed_peer);
+        assert_eq!(stats.peer_errors[0].error, "timeout");
     }
 
     #[test]
@@ -2788,8 +3063,9 @@ mod tests {
                 effect,
                 DhtEffect::Output(DhtOutput::Completed {
                     op_id: 19,
-                    result: DhtOutputValue::GetValues(values)
+                    result: DhtOutputValue::GetValues { values, stats }
                 }) if values.is_empty()
+                    && stats.completed_reason == DhtGetCompletedReason::LookupExhausted
             )
         }));
     }
@@ -2831,6 +3107,58 @@ mod tests {
                 ),
                 _ => false,
             }
+        }));
+    }
+
+    #[test]
+    fn inbound_put_zero_ttl_returns_invalid_request_error() {
+        let local_secret = iroh::SecretKey::from_bytes(&[62u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let publisher_secret = iroh::SecretKey::from_bytes(&[63u8; 32]);
+        let key = DhtKeyId::from_data(b"zero-ttl-inbound-put");
+        let realm_id = make_realm(1);
+        let value = b"value".to_vec();
+        let ttl_secs = 0;
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
+        let signature = publisher_secret.sign(&signed_data);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 11,
+            peer: make_node(28),
+            request: DhtRequest::PutValue {
+                key,
+                realm_id,
+                value,
+                ttl_secs,
+                publisher: publisher_secret.public(),
+                signature: Some(signature),
+            },
+            trace_context: None,
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    &(**inner),
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 11,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message,
+                        }
+                    } if message.contains("TTL")
+                ),
+                _ => false,
+            }
+        }));
+        assert!(!effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(inner)
+                    if matches!(&**inner, DhtIoRequest::StorageRead { .. })
+            )
         }));
     }
 

@@ -1,16 +1,15 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
-use crate::types::{GroupId, RoleId, autosurgeon_ulid};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
+use crate::types::{GroupId, RoleId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use ulid::Ulid;
 
 pub const REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
@@ -67,32 +66,24 @@ impl fmt::Display for RealmId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Hydrate, Reconcile, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Realm {
-    #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
     pub description: String,
 }
 
 impl Realm {
-    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmAuthorizationDocument {
-    #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
-    #[autosurgeon(with = "autosurgeon_role_map")]
     pub roles: HashMap<RoleId, Role>,
-    #[autosurgeon(with = "autosurgeon_operation_map")]
     pub operation_restrictions: HashMap<RealmLevelOperation, HashSet<Ulid>>,
 }
 
@@ -153,23 +144,18 @@ impl RealmAuthorizationDocument {
         }
     }
 
-    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
 pub const DEFAULT_METADATA_REPLICATION_FACTOR: u32 = 3;
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmConfigDocument {
-    #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
     pub metadata_replication: MetadataReplicationConfig,
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -177,7 +163,7 @@ pub struct RealmConfigDocument {
     pub nodes: Vec<RealmNode>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum RealmDiscoveryConfig {
     Static {
         endpoints: Vec<StaticRealmEndpoint>,
@@ -187,7 +173,7 @@ pub enum RealmDiscoveryConfig {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum DynamicDiscoveryMethod {
     IrohDns {
         origins: Vec<String>,
@@ -199,27 +185,27 @@ pub enum DynamicDiscoveryMethod {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum RelayPolicy {
     Disabled,
     Default,
     Custom { relays: Vec<String> },
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmNode {
     pub node_id: String,
     pub kind: RealmNodeKind,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum RealmNodeKind {
     Management,
     Server,
     Local,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct StaticRealmEndpoint {
     pub node_id: String,
     pub endpoint_addr: String,
@@ -255,7 +241,7 @@ pub fn realm_endpoint_announcement_signing_bytes(
     ))
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct OidcProviderConfig {
     pub id: String,
     pub issuer: String,
@@ -305,13 +291,22 @@ impl RealmConfigDocument {
         self.nodes.iter().any(|node| node.node_id == node_id)
     }
 
+    pub fn node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                NodeId::from_str(&node.node_id)
+                    .map_err(|error| ConversionError::FromStrError(error.to_string()))
+            })
+            .collect()
+    }
+
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
         self.reconcile_bytes(None, actor)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
+        Ok(postcard::from_bytes(bytes)?)
     }
 
     pub fn reconcile_bytes(
@@ -319,14 +314,8 @@ impl RealmConfigDocument {
         current: Option<&[u8]>,
         actor: &Actor,
     ) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = match current {
-            Some(bytes) if !bytes.is_empty() => automerge::AutoCommit::load(bytes)?,
-            _ => automerge::AutoCommit::new(),
-        };
-        doc.set_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+        let _ = (current, actor);
+        Ok(postcard::to_allocvec(self)?)
     }
 }
 
@@ -345,7 +334,7 @@ pub fn default_realm_discovery_config() -> RealmDiscoveryConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct MetadataReplicationConfig {
     pub default_replication_factor: u32,
     pub group_overrides: Vec<MetadataGroupReplicationOverride>,
@@ -386,16 +375,14 @@ impl MetadataReplicationConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct MetadataGroupReplicationOverride {
-    #[autosurgeon(with = "autosurgeon_ulid")]
     pub group_id: GroupId,
     pub replication_factor: u32,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct MetadataPathReplicationOverride {
-    #[autosurgeon(with = "autosurgeon_ulid")]
     pub group_id: GroupId,
     pub path_prefix: String,
     pub replication_factor: u32,
@@ -405,83 +392,6 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
     replication_factor.max(1) as usize
 }
 
-pub mod autosurgeon_realm_id {
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-
-    use crate::structs::RealmId;
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<RealmId, HydrateError> {
-        let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
-        let realm_id = RealmId(inner.as_slice().try_into().map_err(|_| {
-            HydrateError::unexpected("&[u8; 32]", "Invalid slice of bytes".to_string())
-        })?);
-        Ok(realm_id)
-    }
-    pub fn reconcile<R: Reconciler>(bytes: &RealmId, mut reconciler: R) -> Result<(), R::Error> {
-        reconciler.bytes(bytes.0)
-    }
-}
-
-pub mod autosurgeon_operation_map {
-    use std::collections::{HashMap, HashSet};
-
-    use autosurgeon::reconcile::MapReconciler;
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-    use ulid::Ulid;
-
-    use crate::errors::ConversionError;
-    use crate::structs::RealmLevelOperation;
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<HashMap<RealmLevelOperation, HashSet<Ulid>>, HydrateError> {
-        let inner: HashMap<String, HashMap<String, String>> = HashMap::hydrate(doc, obj, prop)?;
-        let role_set = inner
-            .into_iter()
-            .map(
-                |(operation, users)| -> Result<(RealmLevelOperation, HashSet<Ulid>), ConversionError> {
-                    let operation: RealmLevelOperation = operation.try_into()?;
-                    let user_map: Result<HashSet<Ulid>, ConversionError> = users.keys().map(|u| {
-                            Ulid::from_string(u).map_err(|_e| ConversionError::InvalidUserId)
-                        })
-                        .collect();
-
-                    Ok((operation, user_map?))
-                },
-            )
-            .collect::<Result<HashMap<RealmLevelOperation, HashSet<Ulid>>, ConversionError>>()
-            .map_err(|e| {
-                HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
-            })?;
-        Ok(role_set)
-    }
-    pub fn reconcile<R: Reconciler>(
-        operation_map: &HashMap<RealmLevelOperation, HashSet<Ulid>>,
-        mut reconciler: R,
-    ) -> Result<(), R::Error> {
-        let mut map = reconciler.map()?;
-        map.retain(|operation, _| {
-            RealmLevelOperation::try_from(operation.to_string())
-                .ok()
-                .is_some_and(|operation| operation_map.contains_key(&operation))
-        })?;
-        for (operation, users) in operation_map.iter() {
-            map.put(
-                operation.to_string(),
-                users
-                    .iter()
-                    .map(|u| (u.to_string(), String::new()))
-                    .collect::<HashMap<String, String>>(),
-            )?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod test {
     use crate::structs::{
@@ -489,19 +399,18 @@ mod test {
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
         RealmConfigDocument, RealmDiscoveryConfig, RealmId, default_realm_discovery_config,
     };
-    use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 
     #[test]
     pub fn test_realm_auth_doc_conversion() {
         let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(RealmId([0u8; 32]));
-        let mut automerge_doc = automerge::AutoCommit::new();
-        reconcile(&mut automerge_doc, &auth_doc).unwrap();
-
-        let bytes = automerge_doc.save();
-
-        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
-        let hydrated_auth_doc: RealmAuthorizationDocument = hydrate(&stored_automerge_doc).unwrap();
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: crate::UserId::new(Ulid::new(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
+        };
+        let bytes = auth_doc.to_bytes(&actor).unwrap();
+        let hydrated_auth_doc = RealmAuthorizationDocument::from_bytes(&bytes).unwrap();
 
         assert_eq!(auth_doc, hydrated_auth_doc);
         assert!(

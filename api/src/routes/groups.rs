@@ -58,6 +58,8 @@ pub struct ApiGroup {
     pub display_name: String,
     pub group_id: String,
     pub realm_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<RoleResponse>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -73,7 +75,27 @@ pub struct PaginationParams {
     pub offset: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
+pub struct ListGroupsQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub include: Option<String>,
+}
+
 impl PaginationParams {
+    pub fn limit_or(&self, default: u32) -> u32 {
+        self.limit.unwrap_or(default)
+    }
+
+    pub fn offset_or(&self, default: u32) -> u32 {
+        self.offset.unwrap_or(default)
+    }
+}
+
+impl ListGroupsQuery {
     pub fn limit_or(&self, default: u32) -> u32 {
         self.limit.unwrap_or(default)
     }
@@ -225,7 +247,8 @@ pub async fn create_group(
     tag = "groups",
     params(
         ("limit" = Option<u32>, Query, description = "Maximum number of groups to return"),
-        ("offset" = Option<u32>, Query, description = "Number of groups to skip")
+        ("offset" = Option<u32>, Query, description = "Number of groups to skip"),
+        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports roles")
     ),
     responses(
         (status = 200, description = "List groups", body = ListGroupsResponse),
@@ -236,11 +259,12 @@ pub async fn create_group(
 pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Query(pagination): Query<PaginationParams>,
+    Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
     let _auth = auth.ok_or(ServerError::Unauthorized)?;
-    let limit = pagination.limit_or(100).clamp(1, 1_000);
-    let offset = pagination.offset_or(0);
+    let include_roles = parse_list_groups_include(query.include.as_deref())?;
+    let limit = query.limit_or(100).clamp(1, 1_000);
+    let offset = query.offset_or(0);
     let result = drive(
         ListGroupOperation::with_pagination(limit as usize, offset as usize),
         &state.get_ctx(),
@@ -250,16 +274,56 @@ pub async fn list_groups(
     Ok((
         StatusCode::OK,
         Json(ListGroupsResponse {
-            groups: result
-                .iter()
-                .map(|g| ApiGroup {
-                    display_name: g.display_name.clone(),
-                    group_id: g.group_id.to_string(),
-                    realm_id: g.realm_id.to_string(),
-                })
-                .collect(),
+            groups: build_api_groups(&state, result, include_roles).await?,
         }),
     ))
+}
+
+fn parse_list_groups_include(include: Option<&str>) -> ServerResult<bool> {
+    let Some(include) = include else {
+        return Ok(false);
+    };
+    let mut include_roles = false;
+    for value in include.split(',').map(str::trim) {
+        if value.is_empty() {
+            continue;
+        }
+        match value {
+            "roles" => include_roles = true,
+            _ => return Err(ServerError::BadRequest),
+        }
+    }
+    Ok(include_roles)
+}
+
+async fn build_api_groups(
+    state: &ServerState,
+    groups: Vec<aruna_core::structs::Group>,
+    include_roles: bool,
+) -> ServerResult<Vec<ApiGroup>> {
+    let mut response = Vec::with_capacity(groups.len());
+    for group in groups {
+        let roles = if include_roles {
+            let (_, auth_doc) = drive(
+                GetGroupOperation::new(GetGroupConfig {
+                    group_id: group.group_id,
+                }),
+                &state.get_ctx(),
+            )
+            .await
+            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            Some(map_roles(auth_doc))
+        } else {
+            None
+        };
+        response.push(ApiGroup {
+            display_name: group.display_name,
+            group_id: group.group_id.to_string(),
+            realm_id: group.realm_id.to_string(),
+            roles,
+        });
+    }
+    Ok(response)
 }
 
 #[utoipa::path(
