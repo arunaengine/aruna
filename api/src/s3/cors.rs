@@ -358,3 +358,192 @@ fn append_vary_headers(headers: &mut http::HeaderMap, values: &[&str]) {
         headers.insert(VARY, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_cors_configuration_between_dto_and_core() {
+        let dto = CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: Some(vec!["content-type".to_string(), "x-amz-meta-*".to_string()]),
+                allowed_methods: vec!["GET".to_string(), "PUT".to_string()],
+                allowed_origins: vec!["https://example.org".to_string()],
+                expose_headers: Some(vec!["etag".to_string()]),
+                id: Some("rule-1".to_string()),
+                max_age_seconds: Some(60),
+            }],
+        };
+
+        let core = dto_to_bucket_cors(dto.clone()).unwrap();
+        assert_eq!(core.rules.len(), 1);
+        assert_eq!(core.rules[0].allowed_methods, vec!["GET", "PUT"]);
+        assert_eq!(core.rules[0].allowed_origins, vec!["https://example.org"]);
+
+        let output = bucket_cors_to_get_output(core);
+        let roundtrip = CORSConfiguration {
+            cors_rules: output.cors_rules.unwrap(),
+        };
+        assert_eq!(roundtrip, dto);
+    }
+
+    #[test]
+    fn rejects_invalid_cors_configuration() {
+        let err = dto_to_bucket_cors(CORSConfiguration { cors_rules: vec![] }).unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::MalformedXML);
+
+        let err = dto_to_bucket_cors(CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: None,
+                allowed_methods: vec!["OPTIONS".to_string()],
+                allowed_origins: vec!["https://example.org".to_string()],
+                expose_headers: None,
+                id: None,
+                max_age_seconds: None,
+            }],
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn matches_preflight_rules_with_case_insensitive_header_checks() {
+        let config = BucketCorsConfiguration {
+            rules: vec![BucketCorsRule {
+                id: None,
+                allowed_origins: vec!["https://*.example.org".to_string()],
+                allowed_methods: vec!["GET".to_string(), "PUT".to_string()],
+                allowed_headers: vec!["content-type".to_string(), "x-amz-meta-*".to_string()],
+                expose_headers: vec![],
+                max_age_seconds: Some(300),
+            }],
+        };
+
+        let matched = match_preflight_rule(
+            &config,
+            "https://bucket.example.org",
+            "PUT",
+            &parse_requested_headers("Content-Type, X-Amz-Meta-Test"),
+        )
+        .unwrap();
+
+        assert_eq!(matched.allow_origin, "https://bucket.example.org");
+        assert_eq!(
+            matched.allow_headers,
+            vec!["content-type", "x-amz-meta-test"]
+        );
+        assert_eq!(matched.max_age_seconds, Some(300));
+    }
+
+    #[test]
+    fn matches_actual_rules_with_wildcard_origin() {
+        let config = BucketCorsConfiguration {
+            rules: vec![BucketCorsRule {
+                id: None,
+                allowed_origins: vec!["*".to_string()],
+                allowed_methods: vec!["GET".to_string()],
+                allowed_headers: vec![],
+                expose_headers: vec!["etag".to_string()],
+                max_age_seconds: None,
+            }],
+        };
+
+        let matched = match_actual_rule(&config, "https://example.org", &Method::GET).unwrap();
+
+        assert_eq!(matched.allow_origin, "*");
+        assert_eq!(matched.expose_headers, vec!["etag"]);
+    }
+
+    #[test]
+    fn rejects_preflight_when_requested_header_is_not_allowed() {
+        let config = BucketCorsConfiguration {
+            rules: vec![BucketCorsRule {
+                id: None,
+                allowed_origins: vec!["https://example.org".to_string()],
+                allowed_methods: vec!["PUT".to_string()],
+                allowed_headers: vec!["content-type".to_string()],
+                expose_headers: vec![],
+                max_age_seconds: None,
+            }],
+        };
+
+        let matched = match_preflight_rule(
+            &config,
+            "https://example.org",
+            "PUT",
+            &parse_requested_headers("x-custom-header"),
+        );
+
+        assert!(matched.is_none());
+    }
+
+    fn matched_rule() -> MatchedCorsRule {
+        MatchedCorsRule {
+            allow_origin: "https://example.org".to_string(),
+            allow_methods: vec!["GET".to_string(), "PUT".to_string()],
+            allow_headers: vec!["content-type".to_string(), "x-test".to_string()],
+            expose_headers: vec!["etag".to_string()],
+            max_age_seconds: Some(60),
+        }
+    }
+
+    #[test]
+    fn builds_preflight_success_response_with_expected_headers() {
+        let response = build_preflight_response(matched_rule());
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://example.org"
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-methods"],
+            "GET, PUT"
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-headers"],
+            "content-type, x-test"
+        );
+        assert_eq!(response.headers()["access-control-max-age"], "60");
+        assert_eq!(
+            response.headers()[VARY],
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        );
+    }
+
+    #[test]
+    fn builds_preflight_failure_response_without_allow_headers() {
+        let response = build_preflight_forbidden_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        assert_eq!(
+            response.headers()[VARY],
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        );
+    }
+
+    #[test]
+    fn injects_actual_cors_headers_and_preserves_existing_vary_entries() {
+        let mut response = HttpResponse::new(s3s::Body::empty());
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+
+        inject_actual_cors_headers(&mut response, matched_rule());
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://example.org"
+        );
+        assert_eq!(response.headers()["access-control-expose-headers"], "etag");
+        assert_eq!(response.headers()[VARY], "Accept-Encoding, Origin");
+    }
+}
