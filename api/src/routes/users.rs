@@ -780,6 +780,9 @@ async fn search_users(
         .limit
         .unwrap_or(MAX_SEARCH_USERS_LIMIT)
         .clamp(1, MAX_SEARCH_USERS_LIMIT);
+    if let Some(start_after) = &query.start_after {
+        UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
+    }
 
     let output = drive(
         SearchUsersOperation::new(SearchUsersInput {
