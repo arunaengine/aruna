@@ -178,20 +178,24 @@ impl Service<Request<Incoming>> for WrappingService {
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();
         Box::pin(async move {
-            let bucket_cors = match load_bucket_cors_config(driver_ctx, bucket).await {
-                Ok(bucket_cors) => bucket_cors,
-                Err(error) => {
-                    span.record("status_code", 500);
-                    let _guard = span.enter();
-                    error!(
-                        event = "request.failed",
-                        protocol = "s3",
-                        latency_ms = started.elapsed().as_millis() as u64,
-                        error = ?error,
-                        "Failed to query bucket CORS configuration"
-                    );
-                    return Err(HttpError::new(error.into()));
+            let bucket_cors = if origin_header.is_some() {
+                match load_bucket_cors_config(driver_ctx, bucket).await {
+                    Ok(bucket_cors) => bucket_cors,
+                    Err(error) => {
+                        span.record("status_code", 500);
+                        let _guard = span.enter();
+                        error!(
+                            event = "request.failed",
+                            protocol = "s3",
+                            latency_ms = started.elapsed().as_millis() as u64,
+                            error = ?error,
+                            "Failed to query bucket CORS configuration"
+                        );
+                        return Err(HttpError::new(error.into()));
+                    }
                 }
+            } else {
+                None
             };
 
             // Answer CORS preflight before s3s signature validation: an unsigned
