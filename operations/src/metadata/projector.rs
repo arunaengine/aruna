@@ -18,8 +18,8 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     metadata_document_lifecycle_revision_change, metadata_event_log_key,
     metadata_graph_lifecycle_key, metadata_materialization_status_key,
-    metadata_pending_projection_delete_entry, metadata_pending_projection_target,
-    metadata_registry_delete_entries,
+    metadata_pending_projection_delete_entry, metadata_pending_projection_key,
+    metadata_pending_projection_target, metadata_registry_delete_entries,
 };
 use aruna_core::structs::{
     MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument, RealmId,
@@ -61,7 +61,8 @@ pub struct PendingMetadataProjectionDrainResult {
 
 /// Conflict resolution is last-writer-wins on wall-clock time, so an event
 /// stamped far in the future would win every conflict forever. Inbound
-/// events beyond the configured skew are rejected; operators must run NTP.
+/// events beyond the configured skew are deferred until retry; operators must
+/// run NTP.
 const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -98,6 +99,8 @@ pub enum MetadataProjectionError {
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
     MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
+    ClockSkewDeferred { deferred: usize },
     #[error("unexpected event while projecting metadata create event: {0}")]
     UnexpectedEvent(String),
 }
@@ -393,11 +396,13 @@ pub async fn project_metadata_create_events(
     let mut repaired_records = Vec::new();
     let mut outboxes = Vec::new();
     let mut pending_projection_delete_targets = BTreeSet::new();
+    let mut pending_projection_retry_targets = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
 
     for event in events {
+        let document_id = event.record.document_id;
         let now_ms = aruna_core::util::unix_timestamp_millis();
         if exceeds_clock_skew(&event, now_ms, max_clock_skew_ms()) {
             let rejected_total = CLOCK_SKEW_REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -411,11 +416,11 @@ pub async fn project_metadata_create_events(
                 occurred_at_ms = event.occurred_at_ms,
                 now_ms,
                 rejected_total,
-                "Rejecting metadata event stamped too far in the future; check NTP on the emitting node"
+                "Deferring metadata event stamped too far in the future; check NTP on the emitting node"
             );
+            pending_projection_retry_targets.insert((document_id, event.event_id));
             continue;
         }
-        let document_id = event.record.document_id;
         pending_projection_delete_targets.insert((document_id, event.event_id));
         if metadata_graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache)
             .await?
@@ -576,9 +581,49 @@ pub async fn project_metadata_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
+    write_pending_projection_markers(context, &pending_projection_retry_targets).await?;
     delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
 
+    if !pending_projection_retry_targets.is_empty() {
+        return Err(MetadataProjectionError::ClockSkewDeferred {
+            deferred: pending_projection_retry_targets.len(),
+        });
+    }
+
     Ok(projected)
+}
+
+async fn write_pending_projection_markers(
+    context: &DriverContext,
+    targets: &BTreeSet<(Ulid, Ulid)>,
+) -> Result<(), MetadataProjectionError> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let writes = targets
+        .iter()
+        .map(|(document_id, event_id)| {
+            (
+                METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                metadata_pending_projection_key(*document_id, *event_id),
+                ByteView::from(Vec::new()),
+            )
+        })
+        .collect();
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 async fn delete_pending_projection_markers(
@@ -1229,6 +1274,77 @@ mod tests {
             },
             occurred_at_ms,
         }
+    }
+
+    #[tokio::test]
+    async fn skewed_direct_projection_writes_pending_marker_for_retry() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let now_ms = aruna_core::util::unix_timestamp_millis();
+        let event = skew_event(now_ms + max_clock_skew_ms() + 60_000, now_ms);
+        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        write_entries(
+            &storage,
+            vec![metadata_create_event_write_entry(&event).expect("event log entry")],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let error = project_metadata_create_events(&context, vec![event], None)
+            .await
+            .expect_err("skewed event should be deferred");
+
+        assert!(matches!(
+            error,
+            MetadataProjectionError::ClockSkewDeferred { deferred: 1 }
+        ));
+        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
+    }
+
+    #[tokio::test]
+    async fn skewed_queue_projection_keeps_pending_marker_for_retry() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let now_ms = aruna_core::util::unix_timestamp_millis();
+        let event = skew_event(now_ms + max_clock_skew_ms() + 60_000, now_ms);
+        let marker_key = metadata_pending_projection_key(event.record.document_id, event.event_id);
+        write_entries(
+            &storage,
+            vec![
+                metadata_create_event_write_entry(&event).expect("event log entry"),
+                (
+                    METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                    marker_key.clone(),
+                    ByteView::from(Vec::new()),
+                ),
+            ],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let error = drain_pending_metadata_projection_queue(&context)
+            .await
+            .expect_err("skewed queued event should be deferred");
+
+        assert!(matches!(
+            error,
+            MetadataProjectionError::ClockSkewDeferred { deferred: 1 }
+        ));
+        assert!(pending_projection_marker_exists(&storage, marker_key.to_vec()).await);
     }
 
     #[test]
