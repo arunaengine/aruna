@@ -312,7 +312,7 @@ pub async fn create_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_unrestricted(auth)?;
     let realm_id = state.get_realm_id();
     let request_span = Span::current();
     request_span.record("group_name", field::display(&request.name));
@@ -741,7 +741,7 @@ pub async fn create_group_role(
     Path(group_id): Path<String>,
     Json(request): Json<CreateGroupRoleRequest>,
 ) -> ServerResult<(StatusCode, Json<RoleResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
 
@@ -823,7 +823,7 @@ pub async fn delete_group_role(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, role_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
 
