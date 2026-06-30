@@ -137,6 +137,12 @@ impl AdminDocumentReducerState {
             }
             (
                 AdminDocumentTarget::Group { .. },
+                AdminDocumentOperation::GroupRoleRemoved { role_id },
+            ) => {
+                self.apply_group_role_removed(event, role_id);
+            }
+            (
+                AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
             ) => {
                 self.apply_group_role_user_assignment(
@@ -531,6 +537,20 @@ impl AdminDocumentReducerState {
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_role_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_group_role_removed(&mut self, event: &AdminDocumentEvent, role_id: &RoleId) {
+        let path = group_role_path(role_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, None) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -1205,6 +1225,16 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::GroupRoleCreated { role },
+        )
+    }
+
+    fn remove_group_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
+        group_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::GroupRoleRemoved { role_id },
         )
     }
 
@@ -1900,6 +1930,28 @@ mod tests {
     }
 
     #[test]
+    fn observed_group_role_removal_clears_role_and_assignments() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state.apply(&add_group_role(1, 1, role_id)).unwrap();
+        state
+            .apply(&assign_group_role_user(2, 2, role_id, user_id))
+            .unwrap();
+        state
+            .apply_operation(
+                &actor(node(3)),
+                AdminDocumentOperation::GroupRoleRemoved { role_id },
+            )
+            .unwrap();
+
+        assert!(state.materialized_group_roles().is_empty());
+        assert!(state.materialized_group_role_user_assignments().is_empty());
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
     fn realm_role_body_creation_materializes_role_id_and_records_body() {
         let mut state = realm_state();
         let role_id = role_id(3);
@@ -1949,6 +2001,31 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some(second_value.as_str()))
         );
+    }
+
+    #[test]
+    fn concurrent_group_role_create_remove_conflict_fails_closed() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let role = role_definition(role_id, "Group reader");
+
+        state.apply(&create_group_role(1, 1, role.clone())).unwrap();
+        state.apply(&remove_group_role(2, 2, role_id)).unwrap();
+
+        assert!(state.materialized_group_roles().is_empty());
+        let conflict = state
+            .conflicts
+            .get(&format!("group.roles.{role_id}"))
+            .expect("conflict is recorded");
+        let role_value = role_definition_value(&role);
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(role_value.as_str()))
+        );
+        assert!(conflict.values.iter().any(|value| value.value.is_none()));
     }
 
     #[test]

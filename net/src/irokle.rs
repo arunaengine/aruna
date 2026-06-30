@@ -1828,13 +1828,19 @@ fn overlay_group_role_set_reducer_materialization(
     group: &mut Group,
     reducer_state: &AdminDocumentReducerState,
 ) {
-    for role_id in reducer_state.materialized_group_roles() {
-        group.roles.insert(role_id);
-    }
-
     for path in reducer_state.conflicts.keys() {
         if let Some(role_id) = group_role_id_from_path(path) {
             group.roles.remove(&role_id);
+        }
+    }
+
+    for (path, version) in &reducer_state.user_subject_ids {
+        let Some(role_id) = group_role_id_from_path(path) else {
+            continue;
+        };
+        group.roles.remove(&role_id);
+        if version.value.is_some() && !reducer_state.conflicts.contains_key(path) {
+            group.roles.insert(role_id);
         }
     }
 }
@@ -2437,11 +2443,12 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         AdminDocumentOperation::GroupCreated { .. }
             | AdminDocumentOperation::GroupRoleAdded { .. }
             | AdminDocumentOperation::GroupRoleCreated { .. }
+            | AdminDocumentOperation::GroupRoleRemoved { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports group creation, role seeds, role creation, and role user assignment updates"
+            "group admin operation sync only supports group creation, role seeds, role creation/removal, and role user assignment updates"
                 .to_string(),
         ));
     }
@@ -2708,6 +2715,11 @@ fn materialize_group_authorization_admin_document_operation(
 ) {
     if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
         materialize_group_authorization_role(auth_doc, reducer_state, role);
+        return;
+    }
+
+    if let AdminDocumentOperation::GroupRoleRemoved { role_id } = &event.op {
+        auth_doc.roles.remove(role_id);
         return;
     }
 
@@ -5122,6 +5134,99 @@ mod tests {
                 .roles
                 .contains_key(&role_id)
         );
+    }
+
+    #[tokio::test]
+    async fn group_role_remove_admin_operation_updates_group_and_auth_docs() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([37; 32]);
+        let group_id = Ulid::from_parts(198, 1);
+        let role_id = Ulid::from_parts(199, 1);
+        let assigned_user_id = UserId::local(Ulid::from_parts(200, 1), realm_id);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(201, 1), realm_id),
+            realm_id,
+        );
+        let group = Group {
+            display_name: "Durable group".to_string(),
+            group_id,
+            realm_id,
+            roles: HashSet::from([role_id]),
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "custom_role".to_string(),
+                    permissions: HashMap::from([(
+                        "/group/custom/**".to_string(),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::from([assigned_user_id]),
+                },
+            )]),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+                (
+                    AUTH_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    auth_doc
+                        .to_bytes(&actor)
+                        .expect("auth doc serializes")
+                        .into(),
+                ),
+            ],
+        )
+        .await
+        .expect("group and auth docs write");
+
+        let target = AdminDocumentTarget::Group { group_id };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            test_admin_event(
+                Ulid::from_parts(202, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::GroupRoleRemoved { role_id },
+            ),
+        )
+        .await
+        .expect("role remove applies");
+
+        assert!(
+            !read_group_doc(&storage, group_id)
+                .await
+                .roles
+                .contains(&role_id)
+        );
+        assert!(
+            !read_group_auth_doc(&storage, group_id)
+                .await
+                .roles
+                .contains_key(&role_id)
+        );
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert!(!reducer_state.materialized_group_roles().contains(&role_id));
     }
 
     #[tokio::test]
