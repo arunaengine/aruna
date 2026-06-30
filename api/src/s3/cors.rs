@@ -1,20 +1,10 @@
 use crate::cors::{S3_PREFLIGHT_VARY, append_vary_headers};
 use aruna_core::structs::{BucketCorsConfiguration, BucketCorsRule};
-use http::header::{HeaderName, HeaderValue};
+use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use s3s::HttpResponse;
 use s3s::dto::{CORSConfiguration, CORSRule, GetBucketCorsOutput};
 use s3s::{S3Error, s3_error};
-
-pub(crate) const ORIGIN_HEADER: &str = "Origin";
-pub(crate) const REQUEST_METHOD_HEADER: &str = "Access-Control-Request-Method";
-pub(crate) const REQUEST_HEADERS_HEADER: &str = "Access-Control-Request-Headers";
-
-pub(crate) const ALLOW_ORIGIN_HEADER: &str = "access-control-allow-origin";
-pub(crate) const ALLOW_METHODS_HEADER: &str = "access-control-allow-methods";
-pub(crate) const ALLOW_HEADERS_HEADER: &str = "access-control-allow-headers";
-pub(crate) const EXPOSE_HEADERS_HEADER: &str = "access-control-expose-headers";
-pub(crate) const MAX_AGE_HEADER: &str = "access-control-max-age";
 
 const WILDCARD: &str = "*";
 const VALID_CORS_METHODS: &[&str] = &["GET", "PUT", "HEAD", "POST", "DELETE"];
@@ -271,14 +261,14 @@ pub(crate) fn build_preflight_response(matched_rule: MatchedCorsRule) -> HttpRes
     if !matched_rule.allow_headers.is_empty() {
         append_header(
             &mut response,
-            HeaderName::from_static(ALLOW_HEADERS_HEADER),
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
             &matched_rule.allow_headers.join(", "),
         );
     }
     if let Some(max_age_seconds) = matched_rule.max_age_seconds {
         append_header(
             &mut response,
-            HeaderName::from_static(MAX_AGE_HEADER),
+            header::ACCESS_CONTROL_MAX_AGE,
             &max_age_seconds.to_string(),
         );
     }
@@ -301,22 +291,22 @@ pub(crate) fn inject_actual_cors_headers(
     if !matched_rule.expose_headers.is_empty() {
         append_header(
             response,
-            HeaderName::from_static(EXPOSE_HEADERS_HEADER),
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
             &matched_rule.expose_headers.join(", "),
         );
     }
-    append_vary_headers(response.headers_mut(), &[ORIGIN_HEADER]);
+    append_vary_headers(response.headers_mut(), &[header::ORIGIN]);
 }
 
 fn append_allow_origin_and_methods(response: &mut HttpResponse, matched_rule: &MatchedCorsRule) {
     append_header(
         response,
-        HeaderName::from_static(ALLOW_ORIGIN_HEADER),
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
         &matched_rule.allow_origin,
     );
     append_header(
         response,
-        HeaderName::from_static(ALLOW_METHODS_HEADER),
+        header::ACCESS_CONTROL_ALLOW_METHODS,
         &matched_rule.allow_methods.join(", "),
     );
 }
@@ -477,7 +467,7 @@ mod tests {
         assert_eq!(response.headers()["access-control-max-age"], "60");
         assert_eq!(
             response.headers()[VARY],
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+            "origin, access-control-request-method, access-control-request-headers"
         );
     }
 
@@ -494,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             response.headers()[VARY],
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+            "origin, access-control-request-method, access-control-request-headers"
         );
     }
 
@@ -513,6 +503,6 @@ mod tests {
             "https://example.org"
         );
         assert_eq!(response.headers()["access-control-expose-headers"], "etag");
-        assert_eq!(response.headers()[VARY], "Accept-Encoding, Origin");
+        assert_eq!(response.headers()[VARY], "Accept-Encoding, origin");
     }
 }

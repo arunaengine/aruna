@@ -1,5 +1,6 @@
 use axum::http::Method;
 use http::HeaderMap;
+use http::HeaderName;
 use http::HeaderValue;
 use http::header;
 use std::time::Duration;
@@ -12,10 +13,10 @@ const S3_DEFAULT_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
      aruna-source-etag,aruna-source-last-modified,aruna-last-refresh";
-pub(crate) const S3_PREFLIGHT_VARY: &[&str] = &[
-    "Origin",
-    "Access-Control-Request-Method",
-    "Access-Control-Request-Headers",
+pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
+    header::ORIGIN,
+    header::ACCESS_CONTROL_REQUEST_METHOD,
+    header::ACCESS_CONTROL_REQUEST_HEADERS,
 ];
 
 /// Allowed cross-origin request origins, shared by the REST and S3 interfaces.
@@ -154,11 +155,11 @@ impl CorsConfig {
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             HeaderValue::from_static(S3_EXPOSED_HEADERS),
         );
-        headers.append(header::VARY, HeaderValue::from_static("origin"));
+        append_vary_headers(headers, &[header::ORIGIN]);
     }
 }
 
-pub(crate) fn append_vary_headers(headers: &mut HeaderMap, values: &[&str]) {
+pub(crate) fn append_vary_headers(headers: &mut HeaderMap, values: &[HeaderName]) {
     let mut vary_values = headers
         .get(header::VARY)
         .and_then(|value| value.to_str().ok())
@@ -175,9 +176,9 @@ pub(crate) fn append_vary_headers(headers: &mut HeaderMap, values: &[&str]) {
     for value in values {
         if !vary_values
             .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(value))
+            .any(|existing| existing.eq_ignore_ascii_case(value.as_str()))
         {
-            vary_values.push((*value).to_string());
+            vary_values.push(value.as_str().to_string());
         }
     }
 
@@ -270,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             headers.get(header::VARY).unwrap(),
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+            "origin, access-control-request-method, access-control-request-headers"
         );
     }
 }
