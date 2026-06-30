@@ -234,6 +234,7 @@ pub enum RealmNodeKindInfo {
     Management,
     Server,
     Local,
+    User,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -249,6 +250,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
             RealmNodeKind::Management => Self::Management,
             RealmNodeKind::Server => Self::Server,
             RealmNodeKind::Local => Self::Local,
+            RealmNodeKind::User => Self::User,
         }
     }
 }

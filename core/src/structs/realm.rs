@@ -203,6 +203,15 @@ pub enum RealmNodeKind {
     Management,
     Server,
     Local,
+    /// Owner-bound user device (laptop). Never a sync/holder target.
+    User,
+}
+
+impl RealmNodeKind {
+    /// User nodes must never become document holders or sync targets.
+    pub fn is_sync_eligible(&self) -> bool {
+        !matches!(self, RealmNodeKind::User)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -294,6 +303,19 @@ impl RealmConfigDocument {
     pub fn node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
         self.nodes
             .iter()
+            .map(|node| {
+                NodeId::from_str(&node.node_id)
+                    .map_err(|error| ConversionError::FromStrError(error.to_string()))
+            })
+            .collect()
+    }
+
+    /// Node ids eligible as sync peers / document holders (excludes User
+    /// kind nodes).
+    pub fn sync_eligible_node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
+        self.nodes
+            .iter()
+            .filter(|node| node.kind.is_sync_eligible())
             .map(|node| {
                 NodeId::from_str(&node.node_id)
                     .map_err(|error| ConversionError::FromStrError(error.to_string()))
@@ -394,10 +416,12 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 
 #[cfg(test)]
 mod test {
+    use crate::NodeId;
     use crate::structs::{
         Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
         MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, default_realm_discovery_config,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        default_realm_discovery_config,
     };
     use ulid::Ulid;
 
@@ -523,5 +547,23 @@ mod test {
             }
             other => panic!("unexpected default discovery config: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_eligible_node_ids_excludes_user_kind_nodes() {
+        fn node_id(seed: u8) -> NodeId {
+            let mut bytes = [0u8; 32];
+            bytes[0] = seed;
+            iroh::SecretKey::from_bytes(&bytes).public()
+        }
+
+        let server = node_id(1);
+        let user_device = node_id(2);
+        let mut document = RealmConfigDocument::new(RealmId::from_bytes([9u8; 32]), Vec::new(), 3);
+        document.ensure_node(server, RealmNodeKind::Server);
+        document.ensure_node(user_device, RealmNodeKind::User);
+
+        assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
+        assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
     }
 }

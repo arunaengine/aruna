@@ -848,6 +848,7 @@ fn realm_node_kind_value(kind: &RealmNodeKind) -> String {
         RealmNodeKind::Management => "management",
         RealmNodeKind::Server => "server",
         RealmNodeKind::Local => "local",
+        RealmNodeKind::User => "user",
     }
     .to_string()
 }
@@ -926,6 +927,7 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
         "management" => Some(RealmNodeKind::Management),
         "server" => Some(RealmNodeKind::Server),
         "local" => Some(RealmNodeKind::Local),
+        "user" => Some(RealmNodeKind::User),
         _ => None,
     }
 }
