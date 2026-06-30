@@ -1,19 +1,29 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::admin_documents::{
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::storage_entries::{
+    admin_document_conflict_write_entries, admin_document_reducer_state_key,
+    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+};
 use aruna_core::structs::{Actor, AuthContext, GroupAuthorizationDocument, Permission};
-use aruna_core::types::{GroupId, RoleId, TxnId, UserId};
+use aruna_core::task::TaskEvent;
+use aruna_core::types::{Effects, GroupId, KeySpace, RoleId, TxnId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::replicate_documents::replicate_documents_effect;
-use aruna_core::types::Effects;
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoveUserFromGroupInput {
@@ -46,17 +56,26 @@ pub enum RemoveUserFromGroupState {
     Init,
     Auth,
     StartTransaction,
-    GetAuthDoc {
+    ReadAuthDocAndAdminState {
         txn_id: TxnId,
     },
-    UpdateAuthDoc {
+    WriteAuthDocAndAdminState {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
+    },
+    DeleteStaleAdminConflicts {
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     },
     CommitTransaction {
+        txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     },
-    AnnounceAuthDoc {
+    ScheduleAdminDocumentOutboxDrain {
         auth_doc: GroupAuthorizationDocument,
     },
     Finish,
@@ -69,6 +88,8 @@ pub enum RemoveUserFromGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("No transaction found")]
@@ -111,7 +132,7 @@ impl RemoveUserFromGroupOperation {
                 got,
             );
         };
-        match self.emit_get_auth_doc(txn_id) {
+        match self.emit_read_auth_doc_and_admin_state(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -155,36 +176,61 @@ impl RemoveUserFromGroupOperation {
         }
     }
 
-    fn emit_get_auth_doc(&mut self, txn_id: TxnId) -> Result<Effects, RemoveUserFromGroupError> {
-        self.state = RemoveUserFromGroupState::GetAuthDoc { txn_id };
-        let key = self.input.group_id.to_bytes().into();
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key,
+    fn emit_read_auth_doc_and_admin_state(
+        &mut self,
+        txn_id: TxnId,
+    ) -> Result<Effects, RemoveUserFromGroupError> {
+        self.state = RemoveUserFromGroupState::ReadAuthDocAndAdminState { txn_id };
+        let target = AdminDocumentTarget::Group {
+            group_id: self.input.group_id,
+        };
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    AUTH_KEYSPACE.to_string(),
+                    ByteView::from(self.input.group_id.to_bytes()),
+                ),
+                (
+                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    admin_document_reducer_state_key(&target),
+                ),
+            ],
             txn_id: Some(txn_id),
         })])
     }
 
-    fn handle_get_auth_doc(&mut self, event: Event, txn_id: TxnId) -> Effects {
+    fn handle_read_auth_doc_and_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::Storage(StorageEvent::ReadResult)",
+                "Event::Storage(StorageEvent::BatchReadResult)",
+                got,
+            );
+        };
+        let [(_, auth_doc_value), (_, reducer_state_value)] = values.as_slice() else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values",
                 got,
             );
         };
 
-        match self.emit_update_auth_doc(txn_id, value) {
+        match self.emit_write_auth_doc_and_admin_state(
+            txn_id,
+            auth_doc_value.clone(),
+            reducer_state_value.clone(),
+        ) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_update_auth_doc(
+    fn emit_write_auth_doc_and_admin_state(
         &mut self,
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
+        reducer_state_value: Option<ByteView>,
     ) -> Result<Effects, RemoveUserFromGroupError> {
         let mut auth_doc = GroupAuthorizationDocument::from_bytes(
             &auth_doc.ok_or_else(|| RemoveUserFromGroupError::AuthDocNotFound)?,
@@ -199,20 +245,71 @@ impl RemoveUserFromGroupOperation {
             })
             .collect();
 
-        match &self.input.role_ids {
+        let role_ids = match &self.input.role_ids {
             Some(role_ids) => {
-                for role_id in role_ids {
+                let mut sorted_role_ids: Vec<_> = role_ids.iter().copied().collect();
+                sorted_role_ids.sort();
+                for role_id in &sorted_role_ids {
                     let role = auth_doc
                         .roles
                         .get_mut(role_id)
                         .ok_or_else(|| RemoveUserFromGroupError::RoleNotFound)?;
                     role.assigned_users.remove(&self.input.user_id);
                 }
+                sorted_role_ids
             }
             None => {
-                for role in auth_doc.roles.values_mut() {
-                    role.assigned_users.remove(&self.input.user_id);
+                let mut sorted_role_ids = Vec::new();
+                for (role_id, role) in auth_doc.roles.iter_mut() {
+                    if role.assigned_users.remove(&self.input.user_id) {
+                        sorted_role_ids.push(*role_id);
+                    }
                 }
+                sorted_role_ids.sort();
+                sorted_role_ids
+            }
+        };
+
+        let target = AdminDocumentTarget::Group {
+            group_id: self.input.group_id,
+        };
+        let previous_reducer_state = reducer_state_value
+            .as_ref()
+            .map(|value| {
+                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
+                    .map_err(ConversionError::from)
+            })
+            .transpose()?;
+        if previous_reducer_state
+            .as_ref()
+            .is_some_and(|state| state.target != target)
+        {
+            return Err(AdminDocumentReducerError::TargetMismatch.into());
+        }
+
+        let mut reducer_state = previous_reducer_state
+            .clone()
+            .unwrap_or_else(|| AdminDocumentReducerState::new(target));
+        let admin_events = apply_admin_reducer_updates(
+            &mut reducer_state,
+            &self.input.actor,
+            self.input.user_id,
+            &role_ids,
+        )?;
+
+        let materialized_assignments = reducer_state.materialized_group_role_user_assignments();
+        for role_id in &role_ids {
+            let role = auth_doc
+                .roles
+                .get_mut(role_id)
+                .ok_or_else(|| RemoveUserFromGroupError::RoleNotFound)?;
+            if materialized_assignments
+                .get(role_id)
+                .is_some_and(|users| users.contains(&self.input.user_id))
+            {
+                role.assigned_users.insert(self.input.user_id);
+            } else {
+                role.assigned_users.remove(&self.input.user_id);
             }
         }
 
@@ -227,35 +324,116 @@ impl RemoveUserFromGroupOperation {
             return Err(RemoveUserFromGroupError::LastAdmin);
         }
 
-        let key = auth_doc.group_id.to_bytes().into();
-        let value = auth_doc.to_bytes(&self.input.actor)?.into();
+        let stale_conflict_delete_keys: Vec<_> = stale_admin_document_conflict_delete_entries(
+            previous_reducer_state.as_ref(),
+            Some(&reducer_state),
+        )
+        .into_iter()
+        .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
+        .collect();
+        let mut writes = vec![
+            (
+                AUTH_KEYSPACE.to_string(),
+                auth_doc.group_id.to_bytes().into(),
+                auth_doc.to_bytes(&self.input.actor)?.into(),
+            ),
+            admin_document_reducer_state_write_entry(&reducer_state)?,
+        ];
+        let document_target = DocumentSyncTarget::GroupAuthorization {
+            group_id: self.input.group_id,
+        };
+        for event in &admin_events {
+            let record = new_outbox_record_with_id(
+                event.event_id,
+                self.input.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(event.clone()),
+                },
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
+        writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
-        self.state = RemoveUserFromGroupState::UpdateAuthDoc { txn_id, auth_doc };
+        self.state = RemoveUserFromGroupState::WriteAuthDocAndAdminState {
+            txn_id,
+            auth_doc,
+            admin_outbox_written: !admin_events.is_empty(),
+            stale_conflict_delete_keys,
+        };
 
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key,
-            value,
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
             txn_id: Some(txn_id),
         })])
     }
 
-    fn handle_update_auth_doc(
+    fn handle_write_auth_doc_and_admin_state(
         &mut self,
         event: Event,
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::Storage(StorageEvent::WriteResult)",
+                "Event::Storage(StorageEvent::BatchWriteResult)",
                 got,
             );
         };
 
-        self.state = RemoveUserFromGroupState::CommitTransaction { auth_doc };
+        if !stale_conflict_delete_keys.is_empty() {
+            self.state = RemoveUserFromGroupState::DeleteStaleAdminConflicts {
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+            };
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: stale_conflict_delete_keys
+                    .into_iter()
+                    .map(|(key_space, key)| (key_space, ByteView::from(key)))
+                    .collect(),
+                txn_id: Some(txn_id),
+            })];
+        }
+
+        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
+    }
+
+    fn handle_delete_stale_admin_conflicts(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::BatchDeleteResult)",
+                got,
+            );
+        };
+
+        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
+    }
+
+    fn emit_commit_transaction(
+        &mut self,
+        txn_id: TxnId,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    ) -> Effects {
+        self.state = RemoveUserFromGroupState::CommitTransaction {
+            txn_id,
+            auth_doc,
+            admin_outbox_written,
+        };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -263,6 +441,7 @@ impl RemoveUserFromGroupOperation {
         &mut self,
         event: Event,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
@@ -272,38 +451,34 @@ impl RemoveUserFromGroupOperation {
                 got,
             );
         };
-        self.state = RemoveUserFromGroupState::AnnounceAuthDoc {
-            auth_doc: auth_doc.clone(),
-        };
-        let document = DocumentSyncTarget::GroupAuthorization {
-            group_id: auth_doc.group_id,
-        };
-        smallvec![replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![document],
-        )]
+        if admin_outbox_written {
+            self.state = RemoveUserFromGroupState::ScheduleAdminDocumentOutboxDrain { auth_doc };
+            return smallvec![schedule_outbox_drain_effect()];
+        }
+
+        self.state = RemoveUserFromGroupState::Finish;
+        self.output = Some(Ok(auth_doc));
+        smallvec![]
     }
 
-    fn handle_announce_auth_doc(
+    fn handle_schedule_admin_document_outbox_drain(
         &mut self,
         event: Event,
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. })
+            | Event::Task(TaskEvent::Error { .. }) => {
+                self.state = RemoveUserFromGroupState::Finish;
+                self.output = Some(Ok(auth_doc));
+                smallvec![]
+            }
+            other => self.unexpected_event(
                 self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-        if let Err(error) = result {
-            return self.fail(RemoveUserFromGroupError::TopicAnnouncement(error));
+                "admin document outbox drain timer schedule",
+                format!("{other:?}"),
+            ),
         }
-        self.state = RemoveUserFromGroupState::Finish;
-        self.output = Some(Ok(auth_doc));
-        smallvec![]
     }
 
     fn fail(&mut self, err: RemoveUserFromGroupError) -> Effects {
@@ -387,17 +562,38 @@ impl Operation for RemoveUserFromGroupOperation {
         match self.state.clone() {
             RemoveUserFromGroupState::Auth => self.handle_authorization(event),
             RemoveUserFromGroupState::StartTransaction => self.handle_start_transaction(event),
-            RemoveUserFromGroupState::GetAuthDoc { txn_id } => {
-                self.handle_get_auth_doc(event, txn_id)
+            RemoveUserFromGroupState::ReadAuthDocAndAdminState { txn_id } => {
+                self.handle_read_auth_doc_and_admin_state(event, txn_id)
             }
-            RemoveUserFromGroupState::UpdateAuthDoc { txn_id, auth_doc } => {
-                self.handle_update_auth_doc(event, txn_id, auth_doc)
-            }
-            RemoveUserFromGroupState::CommitTransaction { auth_doc } => {
-                self.handle_commit_transaction(event, auth_doc)
-            }
-            RemoveUserFromGroupState::AnnounceAuthDoc { auth_doc } => {
-                self.handle_announce_auth_doc(event, auth_doc)
+            RemoveUserFromGroupState::WriteAuthDocAndAdminState {
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+                stale_conflict_delete_keys,
+            } => self.handle_write_auth_doc_and_admin_state(
+                event,
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+                stale_conflict_delete_keys,
+            ),
+            RemoveUserFromGroupState::DeleteStaleAdminConflicts {
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+            } => self.handle_delete_stale_admin_conflicts(
+                event,
+                txn_id,
+                auth_doc,
+                admin_outbox_written,
+            ),
+            RemoveUserFromGroupState::CommitTransaction {
+                auth_doc,
+                admin_outbox_written,
+                ..
+            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written),
+            RemoveUserFromGroupState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
+                self.handle_schedule_admin_document_outbox_drain(event, auth_doc)
             }
             RemoveUserFromGroupState::Init
             | RemoveUserFromGroupState::Finish
@@ -421,8 +617,10 @@ impl Operation for RemoveUserFromGroupOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            RemoveUserFromGroupState::GetAuthDoc { txn_id }
-            | RemoveUserFromGroupState::UpdateAuthDoc { txn_id, .. } => {
+            RemoveUserFromGroupState::ReadAuthDocAndAdminState { txn_id }
+            | RemoveUserFromGroupState::WriteAuthDocAndAdminState { txn_id, .. }
+            | RemoveUserFromGroupState::DeleteStaleAdminConflicts { txn_id, .. }
+            | RemoveUserFromGroupState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -431,13 +629,55 @@ impl Operation for RemoveUserFromGroupOperation {
     }
 }
 
+fn apply_admin_reducer_updates(
+    state: &mut AdminDocumentReducerState,
+    actor: &Actor,
+    user_id: UserId,
+    role_ids: &[RoleId],
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    let mut admin_events = Vec::new();
+    for role_id in role_ids {
+        if should_seed_group_role(state, *role_id) {
+            let event = state.apply_operation(
+                actor,
+                AdminDocumentOperation::GroupRoleAdded { role_id: *role_id },
+            )?;
+            admin_events.push(event);
+        }
+        let event = state.apply_operation(
+            actor,
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+                role_id: *role_id,
+                user_id,
+            },
+        )?;
+        admin_events.push(event);
+    }
+
+    Ok(admin_events)
+}
+
+fn should_seed_group_role(state: &AdminDocumentReducerState, role_id: RoleId) -> bool {
+    !state.materialized_group_roles().contains(&role_id)
+        && !state
+            .conflicts
+            .contains_key(&format!("group.roles.{role_id}"))
+}
+
 #[cfg(test)]
 pub mod test {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
+    use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use aruna_core::document::{
+        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
+    };
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
-    use aruna_core::types::RoleId;
+    use aruna_core::types::{RoleId, TxnId};
+    use aruna_core::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, structs::Permission, structs::Role};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -511,6 +751,95 @@ pub mod test {
             .iter()
             .filter_map(|(k, v)| (v.name == name).then_some(*k))
             .collect()
+    }
+
+    #[test]
+    fn queues_admin_operation_outbox_events_for_member_removal() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let member_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let role_id = Ulid::from_bytes([6u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: owner_id,
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "user".to_string(),
+                    permissions: HashMap::from([("/test".to_string(), Permission::READ)]),
+                    assigned_users: HashSet::from([member_id]),
+                },
+            )]),
+        };
+        let mut operation = RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
+            actor: actor.clone(),
+            group_id,
+            user_id: member_id,
+            role_ids: Some(HashSet::from([role_id])),
+        });
+
+        let effects = operation
+            .emit_write_auth_doc_and_admin_state(
+                TxnId::new(),
+                Some(auth_doc.to_bytes(&actor).unwrap().into()),
+                None,
+            )
+            .unwrap();
+
+        let (stored_auth_doc, outbox_records) = match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
+                let auth_write = writes
+                    .iter()
+                    .find(|(keyspace, _, _)| keyspace == AUTH_KEYSPACE)
+                    .expect("auth doc write is included");
+                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                    .iter()
+                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
+                    .collect();
+                (
+                    GroupAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap(),
+                    outbox_records,
+                )
+            }
+            other => panic!("unexpected write effect: {other:?}"),
+        };
+
+        assert!(
+            !stored_auth_doc.roles[&role_id]
+                .assigned_users
+                .contains(&member_id)
+        );
+        assert_eq!(outbox_records.len(), 2);
+        assert!(outbox_records.iter().all(|record| {
+            record.target == (DocumentSyncTarget::GroupAuthorization { group_id })
+        }));
+        let events: Vec<_> = outbox_records
+            .iter()
+            .map(|record| match &record.event {
+                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                other => panic!("unexpected outbox event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(events[0].target, AdminDocumentTarget::Group { group_id });
+        assert!(matches!(
+            &events[0].op,
+            AdminDocumentOperation::GroupRoleAdded { role_id: event_role_id }
+                if *event_role_id == role_id
+        ));
+        assert!(matches!(
+            &events[1].op,
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+                role_id: event_role_id,
+                user_id: event_user_id,
+            } if *event_role_id == role_id && *event_user_id == member_id
+        ));
     }
 
     #[tokio::test]
