@@ -717,15 +717,23 @@ fn expand_create_event_holders(
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
-    if !holders.contains(&event.node_id) {
+
+    let Some(realm_config) = realm_config else {
+        if !holders.contains(&event.node_id) {
+            holders.push(event.node_id);
+        }
+        sort_node_ids(&mut holders);
+        event.record.holder_node_ids = holders;
+        return Ok(event);
+    };
+
+    let candidates = realm_config.sync_eligible_node_ids()?;
+    holders.retain(|node_id| candidates.contains(node_id));
+    if candidates.contains(&event.node_id) && !holders.contains(&event.node_id) {
         holders.push(event.node_id);
     }
     sort_node_ids(&mut holders);
 
-    let Some(realm_config) = realm_config else {
-        event.record.holder_node_ids = holders;
-        return Ok(event);
-    };
     if local_node_id != Some(event.node_id) {
         event.record.holder_node_ids = holders;
         return Ok(event);
@@ -738,7 +746,6 @@ fn expand_create_event_holders(
         event.record.group_id,
         Some(event.record.document_path.as_str()),
     );
-    let candidates = realm_config.sync_eligible_node_ids()?;
 
     event.record.holder_node_ids =
         complete_authoritative_holders(&target, &candidates, &holders, desired_holder_count);
@@ -1190,6 +1197,25 @@ mod tests {
         assert_eq!(expanded.record.holder_node_ids.len(), 3);
         assert!(expanded.record.holder_node_ids.contains(&event.node_id));
         assert_eq!(expanded.record.last_event_id, event.event_id);
+    }
+
+    #[test]
+    fn metadata_origin_excludes_user_node_from_holders() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids = vec![node(1)];
+        let mut config = RealmConfigDocument::new(event.record.realm_id, Vec::new(), 3);
+        config.ensure_node(node(1), RealmNodeKind::User);
+        config.ensure_node(node(2), RealmNodeKind::Server);
+        config.ensure_node(node(3), RealmNodeKind::Server);
+        config.ensure_node(node(4), RealmNodeKind::Server);
+
+        let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
+            .expect("holders expand");
+
+        let mut expected = vec![node(2), node(3), node(4)];
+        sort_node_ids(&mut expected);
+        assert_eq!(expanded.record.holder_node_ids, expected);
     }
 
     #[test]
