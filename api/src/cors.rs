@@ -133,7 +133,7 @@ impl CorsConfig {
             header::ACCESS_CONTROL_MAX_AGE,
             HeaderValue::from(CORS_MAX_AGE.as_secs()),
         );
-        headers.insert(header::VARY, HeaderValue::from_static("origin"));
+        append_vary_headers(&mut headers, S3_PREFLIGHT_VARY);
         Some(headers)
     }
 
@@ -267,6 +267,10 @@ mod tests {
         assert_eq!(
             headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap(),
             &requested
+        );
+        assert_eq!(
+            headers.get(header::VARY).unwrap(),
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
         );
     }
 }
