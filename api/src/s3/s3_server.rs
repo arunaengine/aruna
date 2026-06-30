@@ -157,24 +157,19 @@ impl Service<Request<Incoming>> for WrappingService {
             .get(header::HOST)
             .and_then(|value| value.to_str().ok());
         let bucket = extract_bucket_name(host, &path, &self.domain);
-        let origin = parts
-            .headers
-            .get(ORIGIN_HEADER)
+        let origin_header = parts.headers.get(ORIGIN_HEADER).cloned();
+        let origin = origin_header
+            .as_ref()
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let origin_header = parts.headers.get(header::ORIGIN).cloned();
         let requested_method = parts
             .headers
             .get(REQUEST_METHOD_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let requested_headers_value = parts
-            .headers
-            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .cloned();
-        let requested_headers = parts
-            .headers
-            .get(REQUEST_HEADERS_HEADER)
+        let requested_headers_value = parts.headers.get(REQUEST_HEADERS_HEADER).cloned();
+        let requested_headers = requested_headers_value
+            .as_ref()
             .and_then(|value| value.to_str().ok())
             .map(parse_requested_headers)
             .unwrap_or_default();
