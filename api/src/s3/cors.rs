@@ -1,5 +1,6 @@
+use crate::cors::{S3_PREFLIGHT_VARY, append_vary_headers};
 use aruna_core::structs::{BucketCorsConfiguration, BucketCorsRule};
-use http::header::{HeaderName, HeaderValue, VARY};
+use http::header::{HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use s3s::HttpResponse;
 use s3s::dto::{CORSConfiguration, CORSRule, GetBucketCorsOutput};
@@ -17,9 +18,6 @@ pub(crate) const MAX_AGE_HEADER: &str = "access-control-max-age";
 
 const WILDCARD: &str = "*";
 const VALID_CORS_METHODS: &[&str] = &["GET", "PUT", "HEAD", "POST", "DELETE"];
-
-pub(crate) const PREFLIGHT_VARY: &[&str] =
-    &[ORIGIN_HEADER, REQUEST_METHOD_HEADER, REQUEST_HEADERS_HEADER];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatchedCorsRule {
@@ -284,14 +282,14 @@ pub(crate) fn build_preflight_response(matched_rule: MatchedCorsRule) -> HttpRes
             &max_age_seconds.to_string(),
         );
     }
-    append_vary_headers(response.headers_mut(), PREFLIGHT_VARY);
+    append_vary_headers(response.headers_mut(), S3_PREFLIGHT_VARY);
     response
 }
 
 pub(crate) fn build_preflight_forbidden_response() -> HttpResponse {
     let mut response = HttpResponse::new(s3s::Body::empty());
     *response.status_mut() = StatusCode::FORBIDDEN;
-    append_vary_headers(response.headers_mut(), PREFLIGHT_VARY);
+    append_vary_headers(response.headers_mut(), S3_PREFLIGHT_VARY);
     response
 }
 
@@ -329,39 +327,10 @@ fn append_header<T>(response: &mut http::Response<T>, name: HeaderName, value: &
     }
 }
 
-fn append_vary_headers(headers: &mut http::HeaderMap, values: &[&str]) {
-    let mut vary_values = headers
-        .get(VARY)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    for value in values {
-        if !vary_values
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(value))
-        {
-            vary_values.push((*value).to_string());
-        }
-    }
-
-    if !vary_values.is_empty()
-        && let Ok(value) = HeaderValue::from_str(&vary_values.join(", "))
-    {
-        headers.insert(VARY, value);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::header::VARY;
 
     #[test]
     fn converts_cors_configuration_between_dto_and_core() {

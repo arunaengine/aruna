@@ -12,6 +12,11 @@ const S3_DEFAULT_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
      aruna-source-etag,aruna-source-last-modified,aruna-last-refresh";
+pub(crate) const S3_PREFLIGHT_VARY: &[&str] = &[
+    "Origin",
+    "Access-Control-Request-Method",
+    "Access-Control-Request-Headers",
+];
 
 /// Allowed cross-origin request origins, shared by the REST and S3 interfaces.
 /// An empty configuration denies all cross-origin access (no CORS headers are
@@ -150,6 +155,36 @@ impl CorsConfig {
             HeaderValue::from_static(S3_EXPOSED_HEADERS),
         );
         headers.append(header::VARY, HeaderValue::from_static("origin"));
+    }
+}
+
+pub(crate) fn append_vary_headers(headers: &mut HeaderMap, values: &[&str]) {
+    let mut vary_values = headers
+        .get(header::VARY)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for value in values {
+        if !vary_values
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            vary_values.push((*value).to_string());
+        }
+    }
+
+    if !vary_values.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&vary_values.join(", "))
+    {
+        headers.insert(header::VARY, value);
     }
 }
 
