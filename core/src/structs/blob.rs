@@ -167,10 +167,36 @@ impl BackendLocation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCorsConfiguration {
+    pub rules: Vec<BucketCorsRule>,
+}
+
+impl BucketCorsConfiguration {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCorsRule {
+    pub id: Option<String>,
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age_seconds: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketInfo {
     pub group_id: Ulid,
     pub created_at: SystemTime,
     pub created_by: UserId,
+    pub cors_configuration: Option<BucketCorsConfiguration>,
 }
 
 impl BucketInfo {
@@ -571,8 +597,9 @@ impl UserAccess {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
-        blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+        BlobHeadKey, BlobVersion, BucketCorsConfiguration, BucketCorsRule, CurrentVersionPointer,
+        HashPathIndexKey, blob_bucket_permission_path, blob_group_permission_path,
+        blob_object_permission_path,
     };
     use crate::NodeId;
     use crate::structs::{
@@ -742,5 +769,23 @@ mod tests {
         assert!(deleted.blob_hash().is_none());
         assert!(!deleted.is_materialized());
         assert!(deleted.is_deleted());
+    }
+
+    #[test]
+    fn bucket_cors_configuration_roundtrip_preserves_rules() {
+        let config = BucketCorsConfiguration {
+            rules: vec![BucketCorsRule {
+                id: Some("rule-1".to_string()),
+                allowed_origins: vec!["https://example.org".to_string()],
+                allowed_methods: vec!["GET".to_string(), "PUT".to_string()],
+                allowed_headers: vec!["authorization".to_string()],
+                expose_headers: vec!["etag".to_string()],
+                max_age_seconds: Some(600),
+            }],
+        };
+
+        let restored = BucketCorsConfiguration::from_bytes(&config.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(config, restored);
     }
 }

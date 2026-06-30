@@ -1,3 +1,4 @@
+use crate::cors::CorsConfig;
 use crate::error::ServerSetupError;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
@@ -8,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -19,6 +20,8 @@ pub struct Server {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub http_addr: SocketAddr,
+    pub max_http_body_size: usize,
+    pub cors: CorsConfig,
 }
 
 impl Server {
@@ -31,14 +34,18 @@ impl Server {
 
         // Build the root router with body size limit for REST API
 
-        Router::new()
+        let mut router = Router::new()
             .route(
                 "/",
                 axum::routing::get(|| async { Redirect::permanent("/swagger-ui") }),
             )
             .nest("/api/v1", api_v1)
-            .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
-            .merge(swagger_ui())
+            .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
+            .merge(swagger_ui());
+        if let Some(cors_layer) = self.config.cors.rest_layer() {
+            router = router.layer(cors_layer);
+        }
+        router
     }
 
     pub async fn run(self) -> Result<(), ServerSetupError> {

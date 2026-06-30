@@ -1586,6 +1586,7 @@ mod tests {
             group_id: Ulid::new(),
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            cors_configuration: None,
         }
     }
 

@@ -354,7 +354,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = Server::new(state, ServerConfig { http_addr: addr });
+        let server = Server::new(
+            state,
+            ServerConfig {
+                http_addr: addr,
+                max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: aruna_api::cors::CorsConfig::default(),
+            },
+        );
         let server_task = tokio::spawn(async move {
             server.run_with_listener(listener).await.unwrap();
         });

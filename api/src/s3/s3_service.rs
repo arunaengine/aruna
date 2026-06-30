@@ -4,6 +4,7 @@ use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_upload_checksum_request,
 };
+use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
@@ -23,6 +24,9 @@ use aruna_operations::replication::queue::{
 };
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
+};
+use aruna_operations::s3::bucket_cors::{
+    DeleteBucketCorsOperation, GetBucketCorsOperation, PutBucketCorsOperation,
 };
 use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
@@ -58,15 +62,17 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
-    DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
-    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
-    Destination, ETag, EncodingType, GetBucketReplicationInput, GetBucketReplicationOutput,
-    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
-    HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, Object, Owner, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
-    ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
+    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
+    EncodingType, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
+    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, LastModified,
+    ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, Owner,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
+    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -571,6 +577,7 @@ impl S3 for ArunaS3Service {
                 group_id: user_access.group_id,
                 created_at: SystemTime::now(),
                 created_by: user_access.user_identity,
+                cors_configuration: None,
             },
         );
 
@@ -632,6 +639,78 @@ impl S3 for ArunaS3Service {
             owner: None,
             prefix: req.input.prefix,
         }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        debug!(bucket = %req.input.bucket, "Received PUT BUCKET CORS Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let config = dto_to_bucket_cors(req.input.cors_configuration.clone())?;
+
+        drive(
+            PutBucketCorsOperation::new(req.input.bucket.clone(), config),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to put bucket CORS configuration"))?;
+
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        debug!(bucket = %req.input.bucket, "Received GET BUCKET CORS Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let config = drive(
+            GetBucketCorsOperation::new(req.input.bucket.clone()),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to get bucket CORS configuration"))?;
+
+        Ok(S3Response::new(bucket_cors_to_get_output(config)))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        debug!(bucket = %req.input.bucket, "Received DELETE BUCKET CORS Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        drive(
+            DeleteBucketCorsOperation::new(req.input.bucket.clone()),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket CORS configuration"))?;
+
+        Ok(S3Response::new(DeleteBucketCorsOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1093,7 +1172,10 @@ impl S3 for ArunaS3Service {
         &self,
         _req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        unimplemented!()
+        Err(s3_error!(
+            NotImplemented,
+            "GetObjectAttributes is not implemented"
+        ))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1821,6 +1903,7 @@ mod tests {
             group_id,
             created_at: UNIX_EPOCH,
             created_by,
+            cors_configuration: None,
         }
     }
 

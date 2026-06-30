@@ -1,6 +1,9 @@
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
+use aruna_operations::s3::bucket_cors::{
+    DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
+};
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadError;
 use aruna_operations::s3::create_bucket::CreateBucketError;
 use aruna_operations::s3::create_multipart_upload::CreateMultipartUploadError;
@@ -62,6 +65,10 @@ fn replication_configuration_not_found_error() -> S3Error {
         ReplicationConfigurationNotFoundError,
         "Replication configuration not found"
     )
+}
+
+fn cors_configuration_not_found_error() -> S3Error {
+    s3_error!(NoSuchCORSConfiguration, "CORS configuration not found")
 }
 
 fn checksum_mismatch_s3_error(algorithm: &'static str, operation: &'static str) -> S3Error {
@@ -237,6 +244,34 @@ impl IntoS3Error for DeleteBucketError {
 impl IntoS3Error for PutBucketReplicationError {
     fn into_s3_error(self) -> S3Error {
         internal_error(self)
+    }
+}
+
+impl IntoS3Error for PutBucketCorsError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            PutBucketCorsError::NotFound => bucket_not_found_error(),
+            err => internal_error(err),
+        }
+    }
+}
+
+impl IntoS3Error for GetBucketCorsError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            GetBucketCorsError::BucketNotFound => bucket_not_found_error(),
+            GetBucketCorsError::CorsNotFound => cors_configuration_not_found_error(),
+            err => internal_error(err),
+        }
+    }
+}
+
+impl IntoS3Error for DeleteBucketCorsError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            DeleteBucketCorsError::NotFound => bucket_not_found_error(),
+            err => internal_error(err),
+        }
     }
 }
 

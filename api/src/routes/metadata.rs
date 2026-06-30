@@ -2367,6 +2367,59 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn list_with_summary_tolerates_pending_projection() {
+        let test = setup_state().await;
+
+        let (_, Json(_created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/pending-summary".to_string(),
+                    name: "Pending Summary".to_string(),
+                    description: "Summary projection in flight".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        let summary_query = ListMetadataQuery {
+            include: Some("summary".to_string()),
+            ..ListMetadataQuery::default()
+        };
+
+        // No drain_metadata_background: the graph projection is still pending,
+        // the list must stay 200 with a null summary for that document.
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(summary_query.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert!(listed.documents[0].rocrate_summary.is_none());
+
+        drain_metadata_background(test.state.as_ref()).await;
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(summary_query),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert!(listed.documents[0].rocrate_summary.is_some());
+    }
+
     #[test]
     fn metadata_openapi_includes_examples_and_public_field_names() {
         let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();
