@@ -29,6 +29,8 @@ pub enum ServerError {
     Forbidden,
     #[error("{0}")]
     InternalError(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("Bad request")]
     BadRequest,
     #[error("Bad gateway")]
@@ -191,6 +193,7 @@ impl ServerError {
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::Conflict(_) => StatusCode::CONFLICT,
             ServerError::BadRequest => StatusCode::BAD_REQUEST,
             ServerError::BadGateway => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -204,6 +207,7 @@ impl ServerError {
             ServerError::Unauthorized => "Not authorized".to_string(),
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),
+            ServerError::Conflict(_) => "Conflict".to_string(),
             ServerError::BadRequest => "Bad request".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),
             ServerError::ServiceUnavailable => "Service unavailable".to_string(),

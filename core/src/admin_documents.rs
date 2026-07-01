@@ -123,6 +123,9 @@ pub enum AdminDocumentOperation {
     GroupRoleCreated {
         role: AdminDocumentRoleDefinition,
     },
+    GroupRoleRemoved {
+        role_id: RoleId,
+    },
     RealmRoleCreated {
         role: AdminDocumentRoleDefinition,
     },
@@ -230,6 +233,7 @@ mod tests {
             AdminDocumentOperation::GroupRoleCreated {
                 role: role_definition(role_id),
             },
+            AdminDocumentOperation::GroupRoleRemoved { role_id },
             AdminDocumentOperation::RealmRoleCreated {
                 role: role_definition(role_id),
             },

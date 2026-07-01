@@ -29,6 +29,7 @@ use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocume
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -50,6 +51,7 @@ use utoipa::{OpenApi, ToSchema};
         get_user_info,
         patch_user_info,
         list_users,
+        search_users,
         get_user,
         update_user,
     )
@@ -62,6 +64,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/users/token", get(get_token))
         .route("/users/info", get(get_user_info).patch(patch_user_info))
         .route("/users", get(list_users))
+        .route("/users/search", get(search_users))
         .route("/users/{id}", get(get_user).patch(update_user))
 }
 
@@ -98,6 +101,27 @@ pub struct ListUsersQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListUsersResponse {
     pub users: Vec<GetUserResponse>,
+    pub next_start_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchUsersQuery {
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub start_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchUserResult {
+    pub user_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchUsersResponse {
+    pub users: Vec<SearchUserResult>,
     pub next_start_after: Option<String>,
 }
 
@@ -150,6 +174,8 @@ pub type PatchUserInfoRequest = UpdateUserRequest;
 
 const DEFAULT_LIST_USERS_LIMIT: usize = 100;
 const MAX_LIST_USERS_LIMIT: usize = 1_000;
+const MIN_SEARCH_QUERY_CHARS: usize = 2;
+const MAX_SEARCH_USERS_LIMIT: usize = 20;
 
 impl From<User> for GetUserResponse {
     fn from(value: User) -> Self {
@@ -715,6 +741,72 @@ async fn list_users(
         StatusCode::OK,
         Json(ListUsersResponse {
             users: output.users.into_iter().map(Into::into).collect(),
+            next_start_after: output.next_start_after,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/search",
+    tag = "users",
+    params(
+        ("q" = String, Query, description = "Substring to match against user name or email; minimum 2 characters"),
+        ("limit" = Option<usize>, Query, description = "Maximum results, capped at 20"),
+        ("start_after" = Option<String>, Query, description = "Pagination cursor")
+    ),
+    responses(
+        (status = 200, description = "Matching users", body = SearchUsersResponse),
+        (status = 400, description = "Query too short", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn search_users(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<SearchUsersQuery>,
+) -> ServerResult<(StatusCode, Json<SearchUsersResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+    let q = query.q.trim().to_string();
+    if q.chars().count() < MIN_SEARCH_QUERY_CHARS {
+        return Err(ServerError::BadRequest);
+    }
+    let limit = query
+        .limit
+        .unwrap_or(MAX_SEARCH_USERS_LIMIT)
+        .clamp(1, MAX_SEARCH_USERS_LIMIT);
+    if let Some(start_after) = &query.start_after {
+        UserId::from_string(start_after).map_err(|_| ServerError::BadRequest)?;
+    }
+
+    let output = drive(
+        SearchUsersOperation::new(SearchUsersInput {
+            realm_id,
+            query: q,
+            limit,
+            start_after: query.start_after,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(SearchUsersResponse {
+            users: output
+                .users
+                .into_iter()
+                .map(|user| SearchUserResult {
+                    user_id: user.user_id.to_string(),
+                    name: user.name,
+                })
+                .collect(),
             next_start_after: output.next_start_after,
         }),
     ))
