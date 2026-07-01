@@ -764,6 +764,7 @@ pub mod test {
             group_id,
             realm_id,
             roles: HashSet::from([role_id]),
+            owner: user_id,
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,

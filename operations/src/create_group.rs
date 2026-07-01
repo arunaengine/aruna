@@ -191,6 +191,7 @@ impl CreateGroupOperation {
             AdminDocumentOperation::GroupCreated {
                 realm_id: self.config.actor.realm_id,
                 display_name: self.config.display_name.clone(),
+                owner: self.config.actor.user_id,
             },
         )?);
 
@@ -585,6 +586,7 @@ mod test {
         CreateGroupConfig {
             actor,
             display_name: "Test group".to_string(),
+            owner_cap: None,
         }
     }
 
@@ -620,6 +622,7 @@ mod test {
             group_id: auth_doc.group_id,
             realm_id: actor.realm_id,
             roles: auth_doc.roles.keys().copied().collect(),
+            owner: actor.user_id,
         };
         let mut operation = CreateGroupOperation::new(config(actor));
         operation.txn_id = Some(txn_id);
@@ -721,7 +724,10 @@ mod test {
             AdminDocumentOperation::GroupCreated {
                 realm_id,
                 display_name,
-            } if *realm_id == group.realm_id && display_name == &group.display_name
+                owner,
+            } if *realm_id == group.realm_id
+                && display_name == &group.display_name
+                && *owner == group.owner
         ));
         let role_names = events[1..=auth_doc.roles.len()]
             .iter()

@@ -146,6 +146,7 @@ pub enum AdminDocumentOperation {
     GroupCreated {
         realm_id: RealmId,
         display_name: String,
+        owner: UserId,
     },
 }
 
@@ -205,12 +206,18 @@ mod tests {
     #[test]
     fn admin_document_operations_roundtrip() {
         let role_id = role_id(1);
-        let user_id = user_id(2);
+        let assigned_user_id = user_id(2);
         let realm_id = RealmId::from_bytes([9; 32]);
         let operations = vec![
             AdminDocumentOperation::GroupRoleAdded { role_id },
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
-            AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                role_id,
+                user_id: assigned_user_id,
+            },
+            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+                role_id,
+                user_id: assigned_user_id,
+            },
             AdminDocumentOperation::UserAttributeSet {
                 key: "department".to_string(),
                 value: "biology".to_string(),
@@ -228,8 +235,14 @@ mod tests {
                 subject_id: "subject-1".to_string(),
             },
             AdminDocumentOperation::RealmRoleAdded { role_id },
-            AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
-            AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+            AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                role_id,
+                user_id: assigned_user_id,
+            },
+            AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+                role_id,
+                user_id: assigned_user_id,
+            },
             AdminDocumentOperation::GroupRoleCreated {
                 role: role_definition(role_id),
             },
@@ -256,6 +269,7 @@ mod tests {
             AdminDocumentOperation::GroupCreated {
                 realm_id,
                 display_name: "Engineering".to_string(),
+                owner: user_id(3),
             },
         ];
 
@@ -326,6 +340,7 @@ mod tests {
         let operation = AdminDocumentOperation::GroupCreated {
             realm_id: RealmId::from_bytes([9; 32]),
             display_name: "Engineering".to_string(),
+            owner: user_id(3),
         };
 
         assert_eq!(postcard_roundtrip(operation.clone()), operation);
