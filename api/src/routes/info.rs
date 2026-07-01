@@ -1,4 +1,5 @@
 use crate::error::{ServerError, ServerResult};
+pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
@@ -43,33 +44,6 @@ pub struct InfoResponse {
     pub connections: Vec<PeerConnectionInfo>,
     pub services: ServicesStatus,
     pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PortalStatus {
-    pub installed: bool,
-    pub mode: String,
-    pub version: Option<String>,
-    pub source: Option<String>,
-    pub url: Option<String>,
-    pub checksum: Option<String>,
-    pub fetched_at: Option<String>,
-    pub last_error: Option<String>,
-}
-
-impl Default for PortalStatus {
-    fn default() -> Self {
-        Self {
-            installed: false,
-            mode: "disabled".to_string(),
-            version: None,
-            source: None,
-            url: None,
-            checksum: None,
-            fetched_at: None,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -547,7 +521,7 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                 capabilities: NodeCapabilityKind::from(state.node_capabilities()),
             },
             api_version: env!("CARGO_PKG_VERSION").to_string(),
-            portal: PortalStatus::default(),
+            portal: state.portal_status().await,
             my_addresses,
             connections,
             services: ServicesStatus {

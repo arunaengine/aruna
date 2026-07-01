@@ -22,6 +22,9 @@ blake3 = { workspace = true }
 crypto_box = { workspace = true }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
@@ -30,6 +33,9 @@ opentelemetry_sdk = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -43,6 +49,3 @@ rand = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tempfile = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
-hex = { workspace = true }
