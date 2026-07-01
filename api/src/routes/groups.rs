@@ -627,11 +627,15 @@ pub async fn add_group_member(
             .collect::<ServerResult<_>>()?,
         _ => {
             let (_, auth_doc) = load_group(&state, group_id).await?;
-            auth_doc
+            let role_ids = auth_doc
                 .roles
                 .iter()
                 .filter_map(|(role_id, role)| (role.name == "user").then_some(*role_id))
-                .collect()
+                .collect::<HashSet<_>>();
+            if role_ids.len() != 1 {
+                return Err(ServerError::BadRequest);
+            }
+            role_ids
         }
     };
     if role_ids.is_empty() {
@@ -767,7 +771,7 @@ pub async fn create_group_role(
     let realm_id = state.get_realm_id();
 
     let name = request.name.trim().to_string();
-    if name.is_empty() || name == "admin" {
+    if name.is_empty() || matches!(name.as_str(), "admin" | "user") {
         return Err(ServerError::BadRequest);
     }
 
