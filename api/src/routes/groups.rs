@@ -348,8 +348,8 @@ pub async fn create_group(
         _ => ServerError::InternalError(err.to_string()),
     })?;
 
-    // Self-service path: any unrestricted realm member may create groups,
-    // capped by the realm quota config; realm admins are exempt.
+    // Self-service path: any unrestricted same-realm token subject may create
+    // groups, capped by the realm quota config; realm admins are exempt.
     let owner_cap = if is_realm_admin {
         None
     } else {
