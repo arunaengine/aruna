@@ -26,13 +26,17 @@ pub async fn initialize(config: PortalConfig, state: Arc<ServerState>) {
                 .set_portal_status(artifact_status_base(&config, false))
                 .await;
             tokio::spawn(async move {
+                let artifact_dir = artifact_dir(&config);
                 let status = prepare_artifact_status(config).await;
                 if status.installed {
                     info!("Portal artifact cache prepared");
+                    state.set_portal_artifact(status, artifact_dir).await;
                 } else if let Some(error) = &status.last_error {
                     warn!(error = %error, "Portal artifact preparation failed");
+                    state.set_portal_status(status).await;
+                } else {
+                    state.set_portal_status(status).await;
                 }
-                state.set_portal_status(status).await;
             });
         }
     }
