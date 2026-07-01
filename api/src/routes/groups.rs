@@ -313,7 +313,8 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
         (status = 201, description = "Group created", body = CreateGroupResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Group creation conflict", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
