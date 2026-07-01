@@ -6,14 +6,16 @@ use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, Role,
 };
 use aruna_core::types::RoleId;
-use aruna_operations::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
+use aruna_operations::add_group_role::{
+    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
+};
 use aruna_operations::add_user_to_group::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::remove_group_role::{
     RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
@@ -269,7 +271,14 @@ async fn load_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))
+    .map_err(map_get_group_error)
+}
+
+fn map_get_group_error(error: GetGroupError) -> ServerError {
+    match error {
+        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 impl From<(Group, GroupAuthorizationDocument)> for CreateGroupResponse {
@@ -514,6 +523,17 @@ fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
     }
 }
 
+fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
+    match error {
+        AddGroupRoleError::Unauthorized => ServerError::Forbidden,
+        AddGroupRoleError::GroupNotFound => ServerError::NotFound,
+        AddGroupRoleError::CheckPermissionsError(
+            AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
+        ) => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
 fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     match error {
         RemoveUserFromGroupError::Unauthorized => ServerError::Forbidden,
@@ -731,7 +751,8 @@ pub async fn leave_group(
         (status = 201, description = "Role created", body = RoleResponse),
         (status = 400, description = "Invalid request or foreign permission path", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Group not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -790,7 +811,7 @@ pub async fn create_group_role(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(map_add_role_error)?;
 
     let role = map_roles(auth_doc)
         .into_iter()
