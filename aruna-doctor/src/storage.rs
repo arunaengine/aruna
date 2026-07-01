@@ -685,6 +685,7 @@ mod tests {
                         realm_id: config.realm_id,
                     },
                     display_name: "Snapshot Test Group".to_string(),
+                    owner_cap: None,
                 }),
                 context.as_ref(),
             )

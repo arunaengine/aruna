@@ -313,6 +313,7 @@ mod test {
         let group_config = CreateGroupConfig {
             actor,
             display_name: "Test group".to_string(),
+            owner_cap: None,
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());
         let create_result = drive(group_operation, &context).await.unwrap();

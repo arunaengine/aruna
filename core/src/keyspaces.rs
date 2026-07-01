@@ -1,5 +1,6 @@
 pub const AUTH_KEYSPACE: &str = "auth";
 pub const GROUP_KEYSPACE: &str = "groups";
+pub const GROUP_OWNER_INDEX_KEYSPACE: &str = "group_owner_index";
 pub const REALM_KEYSPACE: &str = "realms";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";

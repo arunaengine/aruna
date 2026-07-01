@@ -119,9 +119,10 @@ impl AdminDocumentReducerState {
                 AdminDocumentOperation::GroupCreated {
                     realm_id,
                     display_name,
+                    owner,
                 },
             ) => {
-                self.apply_group_created(event, realm_id, display_name);
+                self.apply_group_created(event, realm_id, display_name, owner);
             }
             (
                 AdminDocumentTarget::Group { .. },
@@ -312,6 +313,17 @@ impl AdminDocumentReducerState {
             .get(GROUP_REALM_ID_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| RealmId::from_base64(value).ok())
+    }
+
+    pub fn materialized_group_owner(&self) -> Option<UserId> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(GROUP_OWNER_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| UserId::from_string(value).ok())
     }
 
     pub fn materialized_group_roles(&self) -> BTreeSet<RoleId> {
@@ -510,6 +522,7 @@ impl AdminDocumentReducerState {
         event: &AdminDocumentEvent,
         realm_id: &RealmId,
         display_name: &str,
+        owner: &UserId,
     ) {
         self.apply_group_field(
             event,
@@ -517,6 +530,7 @@ impl AdminDocumentReducerState {
             Some(display_name.to_string()),
         );
         self.apply_group_field(event, GROUP_REALM_ID_PATH, Some(realm_id.to_string()));
+        self.apply_group_field(event, GROUP_OWNER_PATH, Some(owner.to_string()));
     }
 
     fn apply_group_field(&mut self, event: &AdminDocumentEvent, path: &str, value: Option<String>) {
@@ -805,6 +819,7 @@ impl AdminDocumentReducerState {
 pub const USER_NAME_PATH: &str = "user.name";
 pub const GROUP_DISPLAY_NAME_PATH: &str = "group.display_name";
 pub const GROUP_REALM_ID_PATH: &str = "group.realm_id";
+pub const GROUP_OWNER_PATH: &str = "group.owner";
 pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
     "realm_config.settings.metadata_replication";
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
@@ -1200,6 +1215,7 @@ mod tests {
             AdminDocumentOperation::GroupCreated {
                 realm_id,
                 display_name: display_name.to_string(),
+                owner: user_id_with_seed(5),
             },
         )
     }
@@ -1754,9 +1770,10 @@ mod tests {
     }
 
     #[test]
-    fn group_created_materializes_display_name_and_realm_id() {
+    fn group_created_materializes_display_name_realm_id_and_owner() {
         let mut state = group_state();
         let realm_id = realm_id();
+        let owner = user_id_with_seed(5);
 
         state
             .apply(&create_group(1, 1, "Engineering", realm_id))
@@ -1767,6 +1784,7 @@ mod tests {
             Some("Engineering")
         );
         assert_eq!(state.materialized_group_realm_id(), Some(realm_id));
+        assert_eq!(state.materialized_group_owner(), Some(owner));
         assert!(state.conflicts.is_empty());
     }
 
@@ -1858,6 +1876,7 @@ mod tests {
             AdminDocumentOperation::GroupCreated {
                 realm_id: realm_id(),
                 display_name: "Engineering".to_string(),
+                owner: user_id_with_seed(5),
             },
         );
 

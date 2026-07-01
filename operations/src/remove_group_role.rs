@@ -728,6 +728,7 @@ pub mod test {
         let group_operation = CreateGroupOperation::new(CreateGroupConfig {
             actor: actor.clone(),
             display_name: "Test group".to_string(),
+            owner_cap: None,
         });
         let (group, auth_doc) = drive(group_operation, context).await.unwrap();
         (actor, group, auth_doc)
@@ -763,6 +764,7 @@ pub mod test {
             group_id,
             realm_id,
             roles: HashSet::from([role_id]),
+            owner: user_id,
         };
         let auth_doc = GroupAuthorizationDocument {
             group_id,

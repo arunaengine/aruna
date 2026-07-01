@@ -1639,6 +1639,7 @@ mod tests {
             group_id,
             realm_id,
             roles: Default::default(),
+            owner: aruna_core::UserId::local(Ulid::new(), realm_id),
         };
 
         {

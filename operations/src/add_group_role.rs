@@ -804,6 +804,7 @@ pub mod test {
             group_id,
             realm_id,
             roles: auth_doc.roles.keys().copied().collect(),
+            owner: user_id,
         };
         let auth_context = aruna_core::structs::AuthContext {
             user_id,

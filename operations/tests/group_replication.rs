@@ -43,6 +43,7 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
         CreateGroupOperation::new(CreateGroupConfig {
             actor: creator,
             display_name: "replicated group".to_string(),
+            owner_cap: None,
         }),
         nodes[0].context.as_ref(),
     )

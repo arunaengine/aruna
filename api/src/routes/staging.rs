@@ -567,12 +567,14 @@ mod tests {
             display_name: "bucket-group".to_string(),
             group_id: bucket_group_id,
             realm_id,
+            owner: user_with_source_read,
             roles: bucket_auth.roles.keys().copied().collect(),
         };
         let source_group = Group {
             display_name: "source-group".to_string(),
             group_id: source_group_id,
             realm_id,
+            owner: user_with_source_read,
             roles: source_auth.roles.keys().copied().collect(),
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);

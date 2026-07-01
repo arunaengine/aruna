@@ -1083,6 +1083,7 @@ pub mod test {
                 realm_id,
             },
             display_name: "Test group".to_string(),
+            owner_cap: None,
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());
         let (group, auth_doc) = drive(group_operation, &context).await.unwrap();

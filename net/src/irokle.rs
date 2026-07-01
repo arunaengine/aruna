@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
-    AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH,
+    AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
     USER_NAME_PATH, group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
     group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
@@ -24,7 +24,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -43,7 +44,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, Role, User,
+    RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -1821,6 +1822,12 @@ fn overlay_group_reducer_materialization(
         group.realm_id = realm_id;
     }
 
+    if !reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
+        && let Some(owner) = reducer_state.materialized_group_owner()
+    {
+        group.owner = owner;
+    }
+
     overlay_group_role_set_reducer_materialization(group, reducer_state);
 }
 
@@ -1850,6 +1857,7 @@ fn group_metadata_conflicted(reducer_state: &AdminDocumentReducerState) -> bool 
         .conflicts
         .contains_key(GROUP_DISPLAY_NAME_PATH)
         || reducer_state.conflicts.contains_key(GROUP_REALM_ID_PATH)
+        || reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
 }
 
 fn group_reducer_materialized_group(
@@ -1864,6 +1872,7 @@ fn group_reducer_materialized_group(
         display_name: reducer_state.materialized_group_display_name()?,
         group_id,
         realm_id: reducer_state.materialized_group_realm_id()?,
+        owner: reducer_state.materialized_group_owner()?,
         roles: reducer_state
             .materialized_group_roles()
             .into_iter()
@@ -2042,6 +2051,7 @@ fn realm_config_from_reducer_materialization(
         oidc_providers: Vec::new(),
         discovery,
         nodes: Vec::new(),
+        quota: Default::default(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -2379,11 +2389,11 @@ async fn apply_user_admin_document_operation_to_storage(
     storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
 }
 
-async fn group_write_entry_from_reducer(
+async fn group_write_entries_from_reducer(
     storage: &StorageHandle,
     group_id: Ulid,
     reducer_state: &AdminDocumentReducerState,
-) -> Result<Option<(String, ByteView, Value)>> {
+) -> Result<Vec<(String, ByteView, Value)>> {
     let target = DocumentSyncTarget::Group { group_id };
     let group =
         match storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await? {
@@ -2401,18 +2411,25 @@ async fn group_write_entry_from_reducer(
             }
             None => {
                 let Some(group) = group_reducer_materialized_group(group_id, reducer_state) else {
-                    return Ok(None);
+                    return Ok(Vec::new());
                 };
                 group
             }
         };
 
-    Ok(Some(target_write_entry(
-        target,
-        postcard::to_allocvec(&group)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?
-            .into(),
-    )))
+    Ok(vec![
+        target_write_entry(
+            target,
+            postcard::to_allocvec(&group)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        (
+            GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            group_owner_index_key(group.owner, group.group_id).into(),
+            ByteView::from(Vec::new()),
+        ),
+    ])
 }
 
 async fn apply_group_authorization_admin_document_operation_to_storage(
@@ -2486,7 +2503,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         roles: Default::default(),
     });
     materialize_group_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
-    let group_write = group_write_entry_from_reducer(storage, group_id, &reducer_state).await?;
+    let group_writes = group_write_entries_from_reducer(storage, group_id, &reducer_state).await?;
 
     let mut writes = vec![
         (
@@ -2500,9 +2517,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         admin_document_reducer_state_write_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
-    if let Some(group_write) = group_write {
-        writes.push(group_write);
-    }
+    writes.extend(group_writes);
     writes.extend(
         admin_document_conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -4898,6 +4913,7 @@ mod tests {
                 AdminDocumentOperation::GroupCreated {
                     realm_id,
                     display_name: "Reduced group".to_string(),
+                    owner: actor.user_id,
                 },
             ),
         )
@@ -4910,8 +4926,18 @@ mod tests {
                 display_name: "Reduced group".to_string(),
                 group_id,
                 realm_id,
+                owner: actor.user_id,
                 roles: HashSet::new(),
             }
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                GROUP_OWNER_INDEX_KEYSPACE,
+                group_owner_index_key(actor.user_id, group_id).into(),
+            )
+            .await
+            .is_some()
         );
     }
 
@@ -4940,6 +4966,7 @@ mod tests {
                 AdminDocumentOperation::GroupCreated {
                     realm_id,
                     display_name: "Reduced group".to_string(),
+                    owner: actor.user_id,
                 },
             ),
         )
@@ -4995,6 +5022,7 @@ mod tests {
             display_name: "Durable group".to_string(),
             group_id,
             realm_id,
+            owner: actor.user_id,
             roles: HashSet::from([existing_role_id, conflicted_role_id]),
         };
         storage_batch_write_to(
@@ -5152,6 +5180,7 @@ mod tests {
             display_name: "Durable group".to_string(),
             group_id,
             realm_id,
+            owner: actor.user_id,
             roles: HashSet::from([role_id]),
         };
         let auth_doc = GroupAuthorizationDocument {

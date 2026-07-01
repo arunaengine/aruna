@@ -2,7 +2,7 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::structs::{Permission, Role};
-use crate::types::{GroupId, RoleId};
+use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -161,6 +161,57 @@ pub struct RealmConfigDocument {
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub discovery: RealmDiscoveryConfig,
     pub nodes: Vec<RealmNode>,
+    pub quota: QuotaConfig,
+}
+
+/// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
+/// everywhere) so enforcement is local and group admins cannot raise their
+/// own limits.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct QuotaConfig {
+    pub default_group_quota_bytes: Option<u64>,
+    pub grace_factor_percent: u32,
+    pub warn_threshold_percent: u32,
+    pub group_overrides: Vec<GroupQuotaOverride>,
+    pub max_groups_per_user: Option<u32>,
+    pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GroupQuotaOverride {
+    pub group_id: GroupId,
+    pub quota_bytes: Option<u64>,
+    pub grace_factor_percent: Option<u32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct UserGroupCapOverride {
+    pub user_id: UserId,
+    pub max_groups: Option<u32>,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            default_group_quota_bytes: None,
+            grace_factor_percent: 110,
+            warn_threshold_percent: 85,
+            group_overrides: Vec::new(),
+            max_groups_per_user: Some(3),
+            user_group_cap_overrides: Vec::new(),
+        }
+    }
+}
+
+impl QuotaConfig {
+    /// None = unlimited.
+    pub fn max_groups_for(&self, user_id: &UserId) -> Option<u32> {
+        self.user_group_cap_overrides
+            .iter()
+            .find(|over| over.user_id == *user_id)
+            .map(|over| over.max_groups)
+            .unwrap_or(self.max_groups_per_user)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -270,6 +321,7 @@ impl RealmConfigDocument {
             oidc_providers,
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
+            quota: QuotaConfig::default(),
         }
     }
 
@@ -470,6 +522,7 @@ mod test {
             }],
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
+            quota: super::QuotaConfig::default(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -511,6 +564,7 @@ mod test {
             oidc_providers: vec![],
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
+            quota: super::QuotaConfig::default(),
         };
 
         assert_eq!(
