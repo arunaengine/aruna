@@ -386,8 +386,8 @@ mod tests {
     use super::*;
     use aruna_api::routes::info::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
-        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, RequestSummary,
-        ServicesStatus,
+        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
+        RequestSummary, ServicesStatus,
     };
     use aruna_core::structs::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -411,6 +411,8 @@ mod tests {
                 peer_id: node_id.to_string(),
                 capabilities: NodeCapabilityKind::Management,
             },
+            api_version: "test".to_string(),
+            portal: PortalStatus::default(),
             my_addresses,
             connections: Vec::new(),
             services: ServicesStatus {
