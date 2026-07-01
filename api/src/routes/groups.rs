@@ -353,9 +353,6 @@ pub async fn create_group(
     let owner_cap = if is_realm_admin {
         None
     } else {
-        if auth.path_restrictions.is_some() {
-            return Err(ServerError::Forbidden);
-        }
         let realm_config = drive(GetRealmConfigOperation::new(realm_id), &state.get_ctx())
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
