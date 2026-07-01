@@ -85,8 +85,27 @@ async fn concurrent_creates_cannot_slip_past_the_cap() -> TestResult<()> {
         .iter()
         .filter(|status| matches!(status, Ok(status) if *status == StatusCode::CREATED))
         .count();
+    let conflicts = statuses
+        .iter()
+        .filter(|status| matches!(status, Ok(status) if *status == StatusCode::CONFLICT))
+        .count();
+    let unexpected: Vec<_> = statuses
+        .iter()
+        .filter(|status| {
+            !matches!(
+                status,
+                Ok(status) if *status == StatusCode::CREATED || *status == StatusCode::CONFLICT
+            )
+        })
+        .collect();
+    assert!(unexpected.is_empty(), "unexpected responses: {statuses:?}");
     assert!(created >= 1, "at least one create succeeds: {statuses:?}");
     assert!(created <= 3, "cap held under concurrency: {statuses:?}");
+    assert_eq!(
+        conflicts,
+        statuses.len() - created,
+        "failed concurrent attempts return conflict: {statuses:?}"
+    );
 
     seed.shutdown().await;
     Ok(())

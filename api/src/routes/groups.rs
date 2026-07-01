@@ -1,7 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
-use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, Role,
 };
@@ -394,6 +394,9 @@ pub async fn create_group(
     .map_err(|err| match err {
         CreateGroupError::OwnedGroupLimitReached { limit } => {
             ServerError::Conflict(format!("owned group limit reached ({limit})"))
+        }
+        CreateGroupError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent group creation conflict; retry".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
