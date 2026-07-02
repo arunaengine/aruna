@@ -1,4 +1,5 @@
 use crate::error::{ServerError, ServerResult};
+pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
@@ -37,6 +38,8 @@ pub fn router() -> Router<Arc<ServerState>> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
     pub node: NodeStatus,
+    pub api_version: String,
+    pub portal: PortalStatus,
     pub my_addresses: Vec<String>,
     pub connections: Vec<PeerConnectionInfo>,
     pub services: ServicesStatus,
@@ -517,6 +520,8 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                 peer_id: state.get_node_id().to_string(),
                 capabilities: NodeCapabilityKind::from(state.node_capabilities()),
             },
+            api_version: env!("CARGO_PKG_VERSION").to_string(),
+            portal: state.portal_status().await,
             my_addresses,
             connections,
             services: ServicesStatus {
@@ -599,8 +604,8 @@ fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
 mod tests {
     use super::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
-        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, RequestSummary,
-        ServiceStatus, ServicesStatus, get_info,
+        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
+        RequestSummary, ServiceStatus, ServicesStatus, get_info,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -664,6 +669,17 @@ mod tests {
             response,
             InfoResponse {
                 node: expected_node,
+                api_version: env!("CARGO_PKG_VERSION").to_string(),
+                portal: PortalStatus {
+                    installed: false,
+                    mode: "disabled".to_string(),
+                    version: None,
+                    source: None,
+                    url: None,
+                    checksum: None,
+                    fetched_at: None,
+                    last_error: None,
+                },
                 my_addresses: Vec::new(),
                 connections: Vec::new(),
                 services: ServicesStatus {

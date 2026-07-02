@@ -30,13 +30,15 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::warn;
+use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
@@ -61,6 +63,40 @@ pub struct ServerState {
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
     interface_state: Arc<RwLock<InterfaceRuntimeState>>,
+    portal: Arc<RwLock<PortalRuntimeState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PortalStatus {
+    pub installed: bool,
+    pub mode: String,
+    pub version: Option<String>,
+    pub source: Option<String>,
+    pub url: Option<String>,
+    pub checksum: Option<String>,
+    pub fetched_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for PortalStatus {
+    fn default() -> Self {
+        Self {
+            installed: false,
+            mode: "disabled".to_string(),
+            version: None,
+            source: None,
+            url: None,
+            checksum: None,
+            fetched_at: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PortalRuntimeState {
+    pub status: PortalStatus,
+    pub portal_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,6 +162,7 @@ impl ServerState {
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
             initial_admin_claim,
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
+            portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
         };
         state.persist_trusted_realms().await;
         state
@@ -183,6 +220,28 @@ impl ServerState {
 
     pub async fn interface_state(&self) -> InterfaceRuntimeState {
         self.interface_state.read().await.clone()
+    }
+
+    pub async fn portal_status(&self) -> PortalStatus {
+        self.portal.read().await.status.clone()
+    }
+
+    pub async fn portal_runtime_state(&self) -> PortalRuntimeState {
+        self.portal.read().await.clone()
+    }
+
+    pub async fn set_portal_status(&self, status: PortalStatus) {
+        let mut portal = self.portal.write().await;
+        if !status.installed {
+            portal.portal_dir = None;
+        }
+        portal.status = status;
+    }
+
+    pub async fn set_portal_dir(&self, status: PortalStatus, portal_dir: PathBuf) {
+        let mut portal = self.portal.write().await;
+        portal.portal_dir = status.installed.then_some(portal_dir);
+        portal.status = status;
     }
 
     pub async fn load_metadata_realm_nodes(&self) -> Vec<NodeId> {
