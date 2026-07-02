@@ -508,7 +508,7 @@ mod tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
@@ -767,7 +767,6 @@ mod tests {
         let before = read_database_contents(&snapshot_source_db_path).unwrap();
         assert!(before.contains_key(NODE_STATE_KEYSPACE));
         assert!(before.contains_key(API_STATE_KEYSPACE));
-        assert!(before.contains_key(REALM_KEYSPACE));
         assert!(before.contains_key(REALM_CONFIG_KEYSPACE));
         assert!(before.contains_key(AUTH_KEYSPACE));
         assert!(before.contains_key(GROUP_KEYSPACE));

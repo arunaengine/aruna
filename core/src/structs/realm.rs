@@ -66,20 +66,6 @@ impl fmt::Display for RealmId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Realm {
-    pub realm_id: RealmId,
-    pub description: String,
-}
-
-impl Realm {
-    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct RealmAuthorizationDocument {
     pub realm_id: RealmId,
@@ -162,6 +148,7 @@ pub struct RealmConfigDocument {
     pub discovery: RealmDiscoveryConfig,
     pub nodes: Vec<RealmNode>,
     pub quota: QuotaConfig,
+    pub description: String,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -322,6 +309,7 @@ impl RealmConfigDocument {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: QuotaConfig::default(),
+            description: String::new(),
         }
     }
 
@@ -523,6 +511,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            description: "Example Realm".to_string(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -565,6 +554,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            description: String::new(),
         };
 
         assert_eq!(

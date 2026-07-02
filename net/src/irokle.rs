@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
-    USER_NAME_PATH, group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-    group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
+    GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, group_role_id_from_path,
+    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
+    realm_config_node_id_from_path, realm_config_node_path,
     realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
     realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
 };
@@ -2003,6 +2004,14 @@ fn overlay_realm_config_reducer_materialization(
         config.discovery = discovery;
     }
 
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_DESCRIPTION_PATH)
+        && let Some(description) = reducer_state.materialized_realm_config_description()
+    {
+        config.description = description;
+    }
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -2052,6 +2061,7 @@ fn realm_config_from_reducer_materialization(
         discovery,
         nodes: Vec::new(),
         quota: Default::default(),
+        description: String::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -2650,9 +2660,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
             | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
             | AdminDocumentOperation::RealmConfigSettingsSet { .. }
+            | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, and settings updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, and description updates"
                 .to_string(),
         ));
     }
@@ -4257,6 +4268,67 @@ mod tests {
         assert_eq!(
             reducer_state.materialized_realm_config_discovery(),
             Some(discovery)
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_config_description_admin_op_materializes_existing_config() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([53; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_415, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let mut seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        seed_config.description = "Old Realm".to_string();
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_416, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigDescriptionSet {
+                    description: "Replicated Realm".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config description applies");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.description, "Replicated Realm");
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state
+                .materialized_realm_config_description()
+                .as_deref(),
+            Some("Replicated Realm")
         );
     }
 

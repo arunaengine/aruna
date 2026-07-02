@@ -169,6 +169,7 @@ async fn ensure_realm_node_once(
             target_node_id: input.node_id,
             target_node_kind: kind,
             default_metadata_replication_factor: DEFAULT_METADATA_REPLICATION_FACTOR,
+            realm_description: String::new(),
             create_if_missing: false,
             reject_kind_mismatch: true,
         }),

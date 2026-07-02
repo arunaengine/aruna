@@ -213,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         target_node_kind: RealmNodeKind::Management,
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
+                        realm_description: config.realm_description.clone(),
                         create_if_missing: true,
                         reject_kind_mismatch: false,
                     }),

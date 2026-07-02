@@ -249,6 +249,16 @@ impl AdminDocumentReducerState {
             ) => {
                 self.apply_realm_config_settings(event, metadata_replication, discovery);
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigDescriptionSet { description },
+            ) => {
+                self.apply_realm_config_setting(
+                    event,
+                    REALM_CONFIG_DESCRIPTION_PATH,
+                    description.clone(),
+                );
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -467,6 +477,16 @@ impl AdminDocumentReducerState {
             .get(REALM_CONFIG_DISCOVERY_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(realm_discovery_from_value)
+    }
+
+    pub fn materialized_realm_config_description(&self) -> Option<String> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_DESCRIPTION_PATH)
+            .and_then(|version| version.value.clone())
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -823,6 +843,7 @@ pub const GROUP_OWNER_PATH: &str = "group.owner";
 pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
     "realm_config.settings.metadata_replication";
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
+pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -971,13 +992,14 @@ fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
 mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
-        GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DISCOVERY_PATH,
-        REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, group_role_id_from_path,
-        group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
-        metadata_replication_value, oidc_provider_value, realm_config_node_id_from_path,
-        realm_config_node_path, realm_config_oidc_provider_id_from_path,
-        realm_config_oidc_provider_path, realm_discovery_value, realm_role_id_from_path,
-        realm_role_path, realm_role_user_assignment_from_path, realm_role_user_assignment_path,
+        GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH,
+        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH,
+        group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
+        group_role_user_assignment_path, metadata_replication_value, oidc_provider_value,
+        realm_config_node_id_from_path, realm_config_node_path,
+        realm_config_oidc_provider_id_from_path, realm_config_oidc_provider_path,
+        realm_discovery_value, realm_role_id_from_path, realm_role_path,
+        realm_role_user_assignment_from_path, realm_role_user_assignment_path,
         role_definition_value, user_attribute_path, user_subject_id_path,
     };
     use crate::admin_documents::{
@@ -1385,6 +1407,22 @@ mod tests {
         )
     }
 
+    fn set_realm_config_description(
+        event_seed: u8,
+        origin_seed: u8,
+        description: &str,
+    ) -> AdminDocumentEvent {
+        realm_config_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: description.to_string(),
+            },
+        )
+    }
+
     #[test]
     fn apply_operation_uses_next_origin_sequence_and_applies_event() {
         let mut state = user_state();
@@ -1438,6 +1476,7 @@ mod tests {
             REALM_CONFIG_DISCOVERY_PATH,
             "realm_config.settings.discovery"
         );
+        assert_eq!(REALM_CONFIG_DESCRIPTION_PATH, "realm_config.description");
         assert_eq!(
             user_attribute_path("department"),
             "user.attributes.department"
@@ -2514,6 +2553,21 @@ mod tests {
             Some(metadata_replication)
         );
         assert_eq!(state.materialized_realm_config_discovery(), Some(discovery));
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_config_description_materializes() {
+        let mut state = realm_config_state();
+
+        state
+            .apply(&set_realm_config_description(1, 1, "Demo Realm"))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_description().as_deref(),
+            Some("Demo Realm")
+        );
         assert!(state.conflicts.is_empty());
     }
 
