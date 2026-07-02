@@ -90,9 +90,9 @@ pub enum PortalConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortalArtifactConfig {
-    pub artifact_url: String,
-    pub artifact_sha256: String,
-    pub cache_dir: PathBuf,
+    pub artifact_url: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub portal_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -451,17 +451,20 @@ fn portal_config_env() -> Result<PortalConfig, SetupError> {
     match normalize_env_value(&mode).as_str() {
         "disabled" => Ok(PortalConfig::Disabled),
         "artifact" => {
-            let artifact_url = required_nonempty_env("PORTAL_ARTIFACT_URL")?;
-            reqwest::Url::parse(&artifact_url).map_err(|error| {
-                invalid_config_value("PORTAL_ARTIFACT_URL", &artifact_url, error)
-            })?;
-            let artifact_sha256 = required_nonempty_env("PORTAL_ARTIFACT_SHA256")?;
-            let artifact_sha256 = normalize_sha256_env("PORTAL_ARTIFACT_SHA256", &artifact_sha256)?;
-            let cache_dir = PathBuf::from(required_nonempty_env("PORTAL_CACHE_DIR")?);
+            let artifact_url = optional_nonempty_env("PORTAL_ARTIFACT_URL")?;
+            if let Some(artifact_url) = &artifact_url {
+                reqwest::Url::parse(artifact_url).map_err(|error| {
+                    invalid_config_value("PORTAL_ARTIFACT_URL", artifact_url, error)
+                })?;
+            }
+            let artifact_sha256 = optional_nonempty_env("PORTAL_ARTIFACT_SHA256")?
+                .map(|value| normalize_sha256_env("PORTAL_ARTIFACT_SHA256", &value))
+                .transpose()?;
+            let portal_dir = PathBuf::from(required_nonempty_env("PORTAL_DIR")?);
             Ok(PortalConfig::Artifact(PortalArtifactConfig {
                 artifact_url,
                 artifact_sha256,
-                cache_dir,
+                portal_dir,
             }))
         }
         _ => Err(invalid_config_value(
@@ -469,6 +472,15 @@ fn portal_config_env() -> Result<PortalConfig, SetupError> {
             mode,
             "expected one of: disabled, artifact",
         )),
+    }
+}
+
+fn optional_nonempty_env(key: &'static str) -> Result<Option<String>, SetupError> {
+    match dotenvy::var(key) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1216,7 +1228,7 @@ mod tests {
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_CACHE_DIR",
+            "PORTAL_DIR",
         ]
     }
 
@@ -1378,7 +1390,7 @@ mod tests {
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_CACHE_DIR",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
@@ -1424,7 +1436,7 @@ mod tests {
             .iter()
             .map(|key| ((*key).to_string(), std::env::var(key).ok()))
             .collect();
-        let cache_dir = tempdir().unwrap();
+        let portal_dir = tempdir().unwrap();
         unsafe {
             std::env::set_var("PORTAL_MODE", "artifact");
             std::env::set_var("PORTAL_ARTIFACT_URL", "https://example.test/portal.tar.gz");
@@ -1432,24 +1444,27 @@ mod tests {
                 "PORTAL_ARTIFACT_SHA256",
                 "0DCA71F9A1193B09A55843B1D5ABC1E99445A9E1226CE42FBA05EDBC80B5DB61",
             );
-            std::env::set_var("PORTAL_CACHE_DIR", cache_dir.path());
+            std::env::set_var("PORTAL_DIR", portal_dir.path());
         }
 
         let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
             panic!("expected artifact portal config");
         };
-        assert_eq!(config.artifact_url, "https://example.test/portal.tar.gz");
         assert_eq!(
-            config.artifact_sha256,
-            "0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61"
+            config.artifact_url.as_deref(),
+            Some("https://example.test/portal.tar.gz")
         );
-        assert_eq!(config.cache_dir, cache_dir.path());
+        assert_eq!(
+            config.artifact_sha256.as_deref(),
+            Some("0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61")
+        );
+        assert_eq!(config.portal_dir, portal_dir.path());
 
         restore_env(previous);
     }
 
     #[tokio::test]
-    async fn portal_config_requires_artifact_fields() {
+    async fn portal_config_requires_portal_dir() {
         let _guard = env_lock().lock().await;
         let previous: Vec<_> = portal_env_keys()
             .iter()
@@ -1461,8 +1476,32 @@ mod tests {
         let error = portal_config_env().expect_err("missing artifact fields should fail");
         assert!(matches!(
             error,
-            super::SetupError::MissingConfigValue("PORTAL_ARTIFACT_URL")
+            super::SetupError::MissingConfigValue("PORTAL_DIR")
         ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_allows_existing_portal_without_download_fields() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        let portal_dir = tempdir().unwrap();
+        clear_portal_env();
+        unsafe {
+            std::env::set_var("PORTAL_MODE", "artifact");
+            std::env::set_var("PORTAL_DIR", portal_dir.path());
+        }
+
+        let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
+            panic!("expected artifact portal config");
+        };
+        assert_eq!(config.artifact_url, None);
+        assert_eq!(config.artifact_sha256, None);
+        assert_eq!(config.portal_dir, portal_dir.path());
 
         restore_env(previous);
     }
@@ -1574,7 +1613,7 @@ mod tests {
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_CACHE_DIR",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
@@ -1642,7 +1681,7 @@ mod tests {
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_CACHE_DIR",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
@@ -1704,7 +1743,7 @@ mod tests {
             "PORTAL_MODE",
             "PORTAL_ARTIFACT_URL",
             "PORTAL_ARTIFACT_SHA256",
-            "PORTAL_CACHE_DIR",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()

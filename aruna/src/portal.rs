@@ -2,7 +2,7 @@ use crate::config::{PortalArtifactConfig, PortalConfig};
 use aruna_api::server_state::{PortalStatus, ServerState};
 use chrono::{SecondsFormat, Utc};
 use flate2::read::GzDecoder;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Cursor};
@@ -13,8 +13,8 @@ use tar::Archive;
 use thiserror::Error;
 use tracing::{info, warn};
 
-const CACHE_METADATA_FILE: &str = ".aruna-portal-cache.json";
 const MANIFEST_FILE: &str = "portal-manifest.json";
+const CHECKSUM_FILE: &str = "aruna-portal-dist.tar.gz.sha256";
 
 pub async fn initialize(config: PortalConfig, state: Arc<ServerState>) {
     match config {
@@ -26,11 +26,11 @@ pub async fn initialize(config: PortalConfig, state: Arc<ServerState>) {
                 .set_portal_status(artifact_status_base(&config, false))
                 .await;
             tokio::spawn(async move {
-                let artifact_dir = artifact_dir(&config);
+                let portal_dir = portal_dir(&config);
                 let status = prepare_artifact_status(config).await;
                 if status.installed {
                     info!("Portal artifact cache prepared");
-                    state.set_portal_artifact(status, artifact_dir).await;
+                    state.set_portal_dir(status, portal_dir).await;
                 } else if let Some(error) = &status.last_error {
                     warn!(error = %error, "Portal artifact preparation failed");
                     state.set_portal_status(status).await;
@@ -42,9 +42,15 @@ pub async fn initialize(config: PortalConfig, state: Arc<ServerState>) {
     }
 }
 
+pub async fn update_artifact(
+    config: PortalArtifactConfig,
+) -> Result<PortalStatus, PortalArtifactError> {
+    download_and_install(config).await
+}
+
 async fn prepare_artifact_status(config: PortalArtifactConfig) -> PortalStatus {
     let mut cache_error = None;
-    match load_cached_status(&config) {
+    match load_existing_status(&config) {
         Ok(Some(status)) => return status,
         Ok(None) => {}
         Err(error) => cache_error = Some(error.to_string()),
@@ -70,112 +76,130 @@ async fn prepare_artifact_status(config: PortalArtifactConfig) -> PortalStatus {
 async fn download_and_install(
     config: PortalArtifactConfig,
 ) -> Result<PortalStatus, PortalArtifactError> {
-    let response = reqwest::get(&config.artifact_url).await?;
+    let artifact_url = config
+        .artifact_url
+        .clone()
+        .ok_or(PortalArtifactError::MissingArtifactUrl)?;
+    let checksum_file =
+        download_checksum_file(&artifact_url, config.artifact_sha256.as_deref()).await?;
+
+    let response = reqwest::get(&artifact_url).await?;
     if !response.status().is_success() {
         return Err(PortalArtifactError::HttpStatus(response.status().as_u16()));
     }
     let bytes = response.bytes().await?;
-    verify_sha256(&bytes, &config.artifact_sha256)?;
+    verify_sha256(&bytes, &checksum_file.checksum)?;
     let fetched_at = current_timestamp();
 
-    tokio::task::spawn_blocking(move || install_verified_artifact(&config, &bytes, fetched_at))
-        .await?
+    tokio::task::spawn_blocking(move || {
+        install_verified_artifact(&config, &bytes, checksum_file, fetched_at)
+    })
+    .await?
+}
+
+async fn download_checksum_file(
+    artifact_url: &str,
+    pinned_checksum: Option<&str>,
+) -> Result<DownloadedChecksumFile, PortalArtifactError> {
+    let checksum_url = format!("{artifact_url}.sha256");
+    let response = reqwest::get(&checksum_url).await?;
+    if !response.status().is_success() {
+        return Err(PortalArtifactError::ChecksumHttpStatus(
+            response.status().as_u16(),
+        ));
+    }
+
+    let bytes = response.bytes().await?.to_vec();
+    let checksum = parse_checksum_file(&bytes)?;
+    if let Some(pinned_checksum) = pinned_checksum.map(str::to_ascii_lowercase)
+        && checksum != pinned_checksum
+    {
+        return Err(PortalArtifactError::ChecksumSidecarMismatch {
+            expected: pinned_checksum,
+            actual: checksum,
+        });
+    }
+
+    Ok(DownloadedChecksumFile { bytes, checksum })
 }
 
 fn install_verified_artifact(
     config: &PortalArtifactConfig,
     archive_bytes: &[u8],
+    checksum_file: DownloadedChecksumFile,
     fetched_at: String,
 ) -> Result<PortalStatus, PortalArtifactError> {
-    fs::create_dir_all(&config.cache_dir)?;
-    let artifact_dir = artifact_dir(config);
-    let temp_dir = TempInstallDir::create(&config.cache_dir, &config.artifact_sha256)?;
+    let portal_dir = portal_dir(config);
+    let parent = install_parent(&portal_dir)?;
+    fs::create_dir_all(&parent)?;
+    let temp_dir = TempInstallDir::create(&parent)?;
 
     unpack_archive(archive_bytes, temp_dir.path())?;
     require_index_html(temp_dir.path())?;
     let manifest = read_manifest(temp_dir.path())?;
-    let metadata = CacheMetadata::from_manifest(config, manifest.as_ref(), fetched_at.clone());
-    write_cache_metadata(temp_dir.path(), &metadata)?;
+    write_checksum_file(temp_dir.path(), &checksum_file.bytes)?;
 
-    if artifact_dir.exists() {
-        fs::remove_dir_all(&artifact_dir)?;
-    }
-    temp_dir.persist(&artifact_dir)?;
+    remove_existing_path(&portal_dir)?;
+    temp_dir.persist(&portal_dir)?;
 
     Ok(status_from_parts(
         config,
         true,
-        metadata.version,
-        metadata.source,
+        Some(checksum_file.checksum),
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest.version.clone()),
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest.source.clone()),
         Some(fetched_at),
         None,
     ))
 }
 
-fn load_cached_status(
+fn load_existing_status(
     config: &PortalArtifactConfig,
 ) -> Result<Option<PortalStatus>, PortalArtifactError> {
-    let artifact_dir = artifact_dir(config);
-    if !artifact_dir.exists() {
+    let portal_dir = portal_dir(config);
+    if !portal_dir.join("index.html").is_file() {
         return Ok(None);
     }
 
-    require_index_html(&artifact_dir)?;
-    Ok(Some(installed_status_from_dir(config, &artifact_dir)?))
+    Ok(Some(installed_status_from_dir(config, &portal_dir)))
 }
 
-fn installed_status_from_dir(
-    config: &PortalArtifactConfig,
-    dir: &Path,
-) -> Result<PortalStatus, PortalArtifactError> {
-    let manifest = read_manifest(dir)?;
-    let metadata = read_cache_metadata(dir)?;
-    if let Some(metadata) = &metadata
-        && metadata.checksum != config.artifact_sha256
-    {
-        return Err(PortalArtifactError::CacheChecksumMismatch {
-            expected: config.artifact_sha256.clone(),
-            actual: metadata.checksum.clone(),
-        });
-    }
+fn installed_status_from_dir(config: &PortalArtifactConfig, dir: &Path) -> PortalStatus {
+    let manifest = read_manifest(dir).ok().flatten();
+    let checksum = read_checksum_file(dir).or_else(|| config.artifact_sha256.clone());
+    let version = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.version.clone());
+    let source = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.source.clone());
+    let fetched_at = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.fetched_at.clone());
 
-    let version = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.version.clone())
-        .or_else(|| {
-            manifest
-                .as_ref()
-                .and_then(|manifest| manifest.version.clone())
-        });
-    let source = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.source.clone())
-        .or_else(|| {
-            manifest
-                .as_ref()
-                .and_then(|manifest| manifest.source.clone())
-        });
-    let fetched_at = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.fetched_at.clone())
-        .or_else(|| {
-            manifest
-                .as_ref()
-                .and_then(|manifest| manifest.fetched_at.clone())
-        });
-
-    Ok(status_from_parts(
-        config, true, version, source, fetched_at, None,
-    ))
+    status_from_parts(config, true, checksum, version, source, fetched_at, None)
 }
 
 fn artifact_status_base(config: &PortalArtifactConfig, installed: bool) -> PortalStatus {
-    status_from_parts(config, installed, None, None, None, None)
+    status_from_parts(
+        config,
+        installed,
+        config.artifact_sha256.clone(),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn status_from_parts(
     config: &PortalArtifactConfig,
     installed: bool,
+    checksum: Option<String>,
     version: Option<String>,
     source: Option<String>,
     fetched_at: Option<String>,
@@ -186,15 +210,38 @@ fn status_from_parts(
         mode: "artifact".to_string(),
         version,
         source,
-        url: Some(config.artifact_url.clone()),
-        checksum: Some(config.artifact_sha256.clone()),
+        url: config.artifact_url.clone(),
+        checksum,
         fetched_at,
         last_error,
     }
 }
 
-fn artifact_dir(config: &PortalArtifactConfig) -> PathBuf {
-    config.cache_dir.join(&config.artifact_sha256)
+fn portal_dir(config: &PortalArtifactConfig) -> PathBuf {
+    config.portal_dir.clone()
+}
+
+fn install_parent(path: &Path) -> Result<PathBuf, PortalArtifactError> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            if path.is_relative() {
+                Some(PathBuf::from("."))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| PortalArtifactError::InvalidPortalDirectory(path.to_path_buf()))
+}
+
+fn remove_existing_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), PortalArtifactError> {
@@ -285,8 +332,27 @@ fn read_manifest(dir: &Path) -> Result<Option<PortalManifest>, PortalArtifactErr
     read_optional_json(&dir.join(MANIFEST_FILE))
 }
 
-fn read_cache_metadata(dir: &Path) -> Result<Option<CacheMetadata>, PortalArtifactError> {
-    read_optional_json(&dir.join(CACHE_METADATA_FILE))
+fn read_checksum_file(dir: &Path) -> Option<String> {
+    let contents = fs::read(dir.join(CHECKSUM_FILE)).ok()?;
+    parse_checksum_file(&contents).ok()
+}
+
+fn write_checksum_file(dir: &Path, contents: &[u8]) -> io::Result<()> {
+    fs::write(dir.join(CHECKSUM_FILE), contents)
+}
+
+fn parse_checksum_file(contents: &[u8]) -> Result<String, PortalArtifactError> {
+    let contents =
+        std::str::from_utf8(contents).map_err(|_| PortalArtifactError::InvalidChecksumFile)?;
+    let checksum = contents
+        .split_whitespace()
+        .next()
+        .ok_or(PortalArtifactError::InvalidChecksumFile)?;
+    if checksum.len() == 64 && checksum.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(checksum.to_ascii_lowercase())
+    } else {
+        Err(PortalArtifactError::InvalidChecksumFile)
+    }
 }
 
 fn read_optional_json<T: for<'de> Deserialize<'de>>(
@@ -297,12 +363,6 @@ fn read_optional_json<T: for<'de> Deserialize<'de>>(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-fn write_cache_metadata(dir: &Path, metadata: &CacheMetadata) -> Result<(), PortalArtifactError> {
-    let bytes = serde_json::to_vec_pretty(metadata)?;
-    fs::write(dir.join(CACHE_METADATA_FILE), bytes)?;
-    Ok(())
 }
 
 fn current_timestamp() -> String {
@@ -316,29 +376,9 @@ struct PortalManifest {
     fetched_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CacheMetadata {
-    url: String,
+struct DownloadedChecksumFile {
+    bytes: Vec<u8>,
     checksum: String,
-    fetched_at: Option<String>,
-    version: Option<String>,
-    source: Option<String>,
-}
-
-impl CacheMetadata {
-    fn from_manifest(
-        config: &PortalArtifactConfig,
-        manifest: Option<&PortalManifest>,
-        fetched_at: String,
-    ) -> Self {
-        Self {
-            url: config.artifact_url.clone(),
-            checksum: config.artifact_sha256.clone(),
-            fetched_at: Some(fetched_at),
-            version: manifest.and_then(|manifest| manifest.version.clone()),
-            source: manifest.and_then(|manifest| manifest.source.clone()),
-        }
-    }
 }
 
 struct TempInstallDir {
@@ -347,16 +387,13 @@ struct TempInstallDir {
 }
 
 impl TempInstallDir {
-    fn create(parent: &Path, checksum: &str) -> io::Result<Self> {
+    fn create(parent: &Path) -> io::Result<Self> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         for attempt in 0..100 {
-            let path = parent.join(format!(
-                ".portal-{checksum}-{}-{now}-{attempt}",
-                std::process::id()
-            ));
+            let path = parent.join(format!(".portal-{}-{now}-{attempt}", std::process::id()));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     return Ok(Self {
@@ -395,11 +432,19 @@ impl Drop for TempInstallDir {
 }
 
 #[derive(Debug, Error)]
-enum PortalArtifactError {
-    #[error("portal artifact cache metadata checksum mismatch: expected {expected}, got {actual}")]
-    CacheChecksumMismatch { expected: String, actual: String },
+pub enum PortalArtifactError {
+    #[error("portal artifact URL is required to download the portal")]
+    MissingArtifactUrl,
+    #[error("portal directory {0:?} cannot be replaced safely")]
+    InvalidPortalDirectory(PathBuf),
+    #[error("portal artifact checksum file is invalid")]
+    InvalidChecksumFile,
+    #[error("portal artifact checksum file mismatch: expected {expected}, got {actual}")]
+    ChecksumSidecarMismatch { expected: String, actual: String },
     #[error("portal artifact checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
+    #[error("portal artifact checksum download returned HTTP status {0}")]
+    ChecksumHttpStatus(u16),
     #[error("portal artifact download returned HTTP status {0}")]
     HttpStatus(u16),
     #[error("portal artifact archive path {path:?} is unsafe: {reason}")]
@@ -423,8 +468,8 @@ enum PortalArtifactError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PortalArtifactError, artifact_dir, installed_status_from_dir, safe_archive_path,
-        unpack_archive, verify_sha256,
+        CHECKSUM_FILE, PortalArtifactError, installed_status_from_dir, portal_dir,
+        safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::config::PortalArtifactConfig;
     use flate2::Compression;
@@ -436,12 +481,13 @@ mod tests {
     use tar::{Builder, EntryType, Header};
     use tempfile::tempdir;
 
-    fn config(cache_dir: &Path) -> PortalArtifactConfig {
+    fn config(portal_dir: &Path) -> PortalArtifactConfig {
         PortalArtifactConfig {
-            artifact_url: "https://example.test/portal.tar.gz".to_string(),
-            artifact_sha256: "0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61"
-                .to_string(),
-            cache_dir: cache_dir.to_path_buf(),
+            artifact_url: Some("https://example.test/portal.tar.gz".to_string()),
+            artifact_sha256: Some(
+                "0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61".to_string(),
+            ),
+            portal_dir: portal_dir.to_path_buf(),
         }
     }
 
@@ -476,9 +522,14 @@ mod tests {
     fn manifest_populates_status_without_trusting_manifest_checksum() {
         let tempdir = tempdir().unwrap();
         let config = config(tempdir.path());
-        let dir = artifact_dir(&config);
+        let dir = portal_dir(&config);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("index.html"), "<html></html>").unwrap();
+        fs::write(
+            dir.join(CHECKSUM_FILE),
+            "0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61  aruna-portal-dist.tar.gz\n",
+        )
+        .unwrap();
         fs::write(
             dir.join("portal-manifest.json"),
             r#"{
@@ -490,7 +541,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = installed_status_from_dir(&config, &dir).unwrap();
+        let status = installed_status_from_dir(&config, &dir);
 
         assert!(status.installed);
         assert_eq!(status.mode, "artifact");
@@ -498,7 +549,7 @@ mod tests {
         assert_eq!(status.source.as_deref(), Some("github-release"));
         assert_eq!(
             status.checksum.as_deref(),
-            Some(config.artifact_sha256.as_str())
+            config.artifact_sha256.as_deref()
         );
         assert_eq!(status.fetched_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }

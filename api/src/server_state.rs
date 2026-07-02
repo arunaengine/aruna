@@ -96,7 +96,7 @@ impl Default for PortalStatus {
 #[derive(Clone, Debug, Default)]
 pub struct PortalRuntimeState {
     pub status: PortalStatus,
-    pub artifact_dir: Option<PathBuf>,
+    pub portal_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -233,14 +233,14 @@ impl ServerState {
     pub async fn set_portal_status(&self, status: PortalStatus) {
         let mut portal = self.portal.write().await;
         if !status.installed {
-            portal.artifact_dir = None;
+            portal.portal_dir = None;
         }
         portal.status = status;
     }
 
-    pub async fn set_portal_artifact(&self, status: PortalStatus, artifact_dir: PathBuf) {
+    pub async fn set_portal_dir(&self, status: PortalStatus, portal_dir: PathBuf) {
         let mut portal = self.portal.write().await;
-        portal.artifact_dir = status.installed.then_some(artifact_dir);
+        portal.portal_dir = status.installed.then_some(portal_dir);
         portal.status = status;
     }
 
