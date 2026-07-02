@@ -2,22 +2,26 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, BlobVersion, BlobVersionState, BucketInfo, USAGE_GLOBAL_KEY, UsageCounters,
-    UsageDelta, VersionKey, usage_group_key,
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
+    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
+    usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key, usage_group_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    CounterError(#[from] UsageCounterError),
     #[error("usage counter update received unexpected event: {0:?}")]
     UnexpectedEvent(Event),
 }
@@ -43,7 +47,7 @@ impl UsageCounterUpdate {
     pub fn for_group(group_id: GroupId, delta: UsageDelta) -> Self {
         Self {
             entries: vec![
-                (USAGE_GLOBAL_KEY.to_vec(), delta),
+                (usage_global_key_for_group(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
             phase: UsageUpdatePhase::Pending,
@@ -57,7 +61,7 @@ impl UsageCounterUpdate {
     ) -> Self {
         Self {
             entries: vec![
-                (USAGE_GLOBAL_KEY.to_vec(), global_delta),
+                (usage_global_key_for_group(group_id), global_delta),
                 (usage_group_key(group_id), group_delta),
             ],
             phase: UsageUpdatePhase::Pending,
@@ -98,7 +102,7 @@ impl UsageCounterUpdate {
                         Some(value) => UsageCounters::from_bytes(value.as_ref())?,
                         None => UsageCounters::default(),
                     };
-                    counters.apply(delta);
+                    counters.apply(delta)?;
                     writes.push((
                         USAGE_STATS_KEYSPACE.to_string(),
                         key.clone().into(),
@@ -131,9 +135,12 @@ pub enum RebuildUsageStatsState {
     Init,
     ScanBuckets,
     ScanBlobs,
+    ScanHeads,
     ScanVersions,
+    ScanCounters,
     StartWriteTransaction,
     WriteCounters,
+    DeleteStaleCounters,
     CommitTransaction,
     Finish,
     Error,
@@ -145,6 +152,8 @@ pub enum RebuildUsageStatsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    CounterError(#[from] UsageCounterError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
         state: RebuildUsageStatsState,
@@ -158,18 +167,20 @@ pub enum RebuildUsageStatsError {
 /// Recomputes all usage counters from the underlying keyspaces and writes
 /// them in one transaction. Runs at startup when counters are missing and
 /// doubles as a repair tool; it is not safe to run concurrently with writes.
-/// An object counts as live when its newest version is not a delete marker,
-/// matching the pointer transitions the write operations maintain.
+/// An object counts as live when its current head points at a non-delete
+/// version, matching the pointer transitions the write operations maintain.
 #[derive(Debug, PartialEq)]
 pub struct RebuildUsageStatsOperation {
     state: RebuildUsageStatsState,
     txn_id: Option<TxnId>,
     bucket_groups: HashMap<String, GroupId>,
     blob_sizes: HashMap<Vec<u8>, u64>,
-    current_object: Option<(String, String)>,
-    current_newest: Option<(ulid::Ulid, bool)>,
+    current_versions: HashMap<(String, String), ulid::Ulid>,
     global: UsageCounters,
+    global_shards: Vec<UsageCounters>,
     groups: HashMap<GroupId, UsageCounters>,
+    existing_counter_keys: Vec<Vec<u8>>,
+    stale_counter_deletes: Vec<(String, Key)>,
     output: Option<Result<UsageCounters, RebuildUsageStatsError>>,
 }
 
@@ -188,10 +199,12 @@ impl RebuildUsageStatsOperation {
             txn_id: None,
             bucket_groups: HashMap::new(),
             blob_sizes: HashMap::new(),
-            current_object: None,
-            current_newest: None,
+            current_versions: HashMap::new(),
             global: UsageCounters::default(),
+            global_shards: vec![UsageCounters::default(); USAGE_GLOBAL_SHARD_COUNT],
             groups: HashMap::new(),
+            existing_counter_keys: Vec::new(),
+            stale_counter_deletes: Vec::new(),
             output: None,
         }
     }
@@ -216,7 +229,9 @@ impl RebuildUsageStatsOperation {
         match self.state {
             RebuildUsageStatsState::ScanBuckets => Some(S3_BUCKET_KEYSPACE),
             RebuildUsageStatsState::ScanBlobs => Some(BLOB_LOCATIONS_KEYSPACE),
+            RebuildUsageStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
             RebuildUsageStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
+            RebuildUsageStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
     }
@@ -225,31 +240,23 @@ impl RebuildUsageStatsOperation {
         self.groups.entry(group_id).or_default()
     }
 
-    fn finalize_current_object(&mut self) {
-        let Some((bucket, _)) = self.current_object.take() else {
-            return;
-        };
-        let live = self
-            .current_newest
-            .take()
-            .is_some_and(|(_, deleted)| !deleted);
-        if !live {
-            return;
-        }
-        self.global.objects += 1;
-        if let Some(group_id) = self.bucket_groups.get(&bucket).copied() {
-            self.group_entry(group_id).objects += 1;
-        }
+    fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
+        &mut self.global_shards[usage_global_shard_index(group_id)]
     }
 
-    fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), ConversionError> {
+    fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
         match self.state {
             RebuildUsageStatsState::ScanBuckets => {
                 for (key, value) in values {
                     let info = BucketInfo::from_bytes(value.as_ref())?;
-                    let bucket = String::from_utf8(key.to_vec())?;
-                    self.global.buckets += 1;
-                    self.group_entry(info.group_id).buckets += 1;
+                    let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+                    let delta = UsageCounters {
+                        buckets: 1,
+                        ..Default::default()
+                    };
+                    self.global.add(&delta)?;
+                    self.group_entry(info.group_id).add(&delta)?;
+                    self.global_shard_entry(info.group_id).add(&delta)?;
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
@@ -259,10 +266,22 @@ impl RebuildUsageStatsOperation {
                     if location.staging || location.partial {
                         continue;
                     }
-                    self.global.stored_blobs += 1;
-                    self.global.stored_bytes =
-                        self.global.stored_bytes.saturating_add(location.blob_size);
+                    let delta = UsageCounters {
+                        stored_blobs: 1,
+                        stored_bytes: location.blob_size,
+                        ..Default::default()
+                    };
+                    self.global.add(&delta)?;
+                    self.global_shards[0].add(&delta)?;
                     self.blob_sizes.insert(key.to_vec(), location.blob_size);
+                }
+            }
+            RebuildUsageStatsState::ScanHeads => {
+                for (key, value) in values {
+                    let head_key = BlobHeadKey::from_bytes(key.as_ref())?;
+                    let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+                    self.current_versions
+                        .insert((head_key.bucket, head_key.key), pointer.version_id);
                 }
             }
             RebuildUsageStatsState::ScanVersions => {
@@ -270,16 +289,24 @@ impl RebuildUsageStatsOperation {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
                     let object = (version_key.bucket.clone(), version_key.key.clone());
-                    if self.current_object.as_ref() != Some(&object) {
-                        self.finalize_current_object();
-                        self.current_object = Some(object);
-                    }
-                    let deleted = version.is_deleted();
                     if self
-                        .current_newest
-                        .is_none_or(|(newest, _)| version_key.version_id > newest)
+                        .current_versions
+                        .get(&object)
+                        .is_some_and(|version_id| *version_id == version_key.version_id)
+                        && !version.is_deleted()
                     {
-                        self.current_newest = Some((version_key.version_id, deleted));
+                        let delta = UsageCounters {
+                            objects: 1,
+                            ..Default::default()
+                        };
+                        self.global.add(&delta)?;
+                        if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied()
+                        {
+                            self.group_entry(group_id).add(&delta)?;
+                            self.global_shard_entry(group_id).add(&delta)?;
+                        } else {
+                            self.global_shards[0].add(&delta)?;
+                        }
                     }
 
                     let BlobVersionState::Materialized { blob_hash, .. } = version.state else {
@@ -288,12 +315,22 @@ impl RebuildUsageStatsOperation {
                     let Some(size) = self.blob_sizes.get(blob_hash.as_slice()).copied() else {
                         continue;
                     };
-                    self.global.logical_bytes = self.global.logical_bytes.saturating_add(size);
+                    let delta = UsageCounters {
+                        logical_bytes: size,
+                        ..Default::default()
+                    };
+                    self.global.add(&delta)?;
                     if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        let group = self.group_entry(group_id);
-                        group.logical_bytes = group.logical_bytes.saturating_add(size);
+                        self.group_entry(group_id).add(&delta)?;
+                        self.global_shard_entry(group_id).add(&delta)?;
+                    } else {
+                        self.global_shards[0].add(&delta)?;
                     }
                 }
+            }
+            RebuildUsageStatsState::ScanCounters => {
+                self.existing_counter_keys
+                    .extend(values.iter().map(|(key, _)| key.to_vec()));
             }
             _ => {}
         }
@@ -303,9 +340,10 @@ impl RebuildUsageStatsOperation {
     fn next_scan(&mut self) -> Effects {
         let next = match self.state {
             RebuildUsageStatsState::ScanBuckets => RebuildUsageStatsState::ScanBlobs,
-            RebuildUsageStatsState::ScanBlobs => RebuildUsageStatsState::ScanVersions,
-            RebuildUsageStatsState::ScanVersions => {
-                self.finalize_current_object();
+            RebuildUsageStatsState::ScanBlobs => RebuildUsageStatsState::ScanHeads,
+            RebuildUsageStatsState::ScanHeads => RebuildUsageStatsState::ScanVersions,
+            RebuildUsageStatsState::ScanVersions => RebuildUsageStatsState::ScanCounters,
+            RebuildUsageStatsState::ScanCounters => {
                 self.state = RebuildUsageStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
                     read: false
@@ -335,7 +373,7 @@ impl RebuildUsageStatsOperation {
         };
 
         if let Err(err) = self.consume_values(&values) {
-            return self.emit_error(err.into());
+            return self.emit_error(err);
         }
 
         if let Some(start_after) = next_start_after {
@@ -359,27 +397,32 @@ impl RebuildUsageStatsOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let mut writes = Vec::with_capacity(1 + self.groups.len());
-        let global = match self.global.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        writes.push((
-            USAGE_STATS_KEYSPACE.to_string(),
-            USAGE_GLOBAL_KEY.to_vec().into(),
-            global.into(),
-        ));
-        for (group_id, counters) in &self.groups {
+        let mut writes = Vec::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
+        let mut write_keys = HashSet::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
+        for (shard, counters) in self.global_shards.iter().enumerate() {
+            let key = usage_global_shard_key(shard);
             let bytes = match counters.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.emit_error(err.into()),
             };
-            writes.push((
-                USAGE_STATS_KEYSPACE.to_string(),
-                usage_group_key(*group_id).into(),
-                bytes.into(),
-            ));
+            write_keys.insert(key.clone());
+            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
         }
+        for (group_id, counters) in &self.groups {
+            let key = usage_group_key(*group_id);
+            let bytes = match counters.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            write_keys.insert(key.clone());
+            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
+        }
+        self.stale_counter_deletes = self
+            .existing_counter_keys
+            .iter()
+            .filter(|key| !write_keys.contains(*key))
+            .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
+            .collect();
 
         self.state = RebuildUsageStatsState::WriteCounters;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -393,6 +436,28 @@ impl RebuildUsageStatsOperation {
             return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                received: event,
+            });
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(RebuildUsageStatsError::RebuildFailed);
+        };
+        if !self.stale_counter_deletes.is_empty() {
+            self.state = RebuildUsageStatsState::DeleteStaleCounters;
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes: std::mem::take(&mut self.stale_counter_deletes),
+                txn_id: Some(txn_id),
+            })];
+        }
+        self.state = RebuildUsageStatsState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_stale_counters_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
+            return self.emit_error(RebuildUsageStatsError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
                 received: event,
             });
         };
@@ -435,11 +500,16 @@ impl Operation for RebuildUsageStatsOperation {
             RebuildUsageStatsState::Init => self.start(),
             RebuildUsageStatsState::ScanBuckets
             | RebuildUsageStatsState::ScanBlobs
-            | RebuildUsageStatsState::ScanVersions => self.handle_page(event),
+            | RebuildUsageStatsState::ScanHeads
+            | RebuildUsageStatsState::ScanVersions
+            | RebuildUsageStatsState::ScanCounters => self.handle_page(event),
             RebuildUsageStatsState::StartWriteTransaction => {
                 self.handle_write_transaction_started(event)
             }
             RebuildUsageStatsState::WriteCounters => self.handle_counters_written(event),
+            RebuildUsageStatsState::DeleteStaleCounters => {
+                self.handle_stale_counters_deleted(event)
+            }
             RebuildUsageStatsState::CommitTransaction => self.handle_transaction_committed(event),
             RebuildUsageStatsState::Finish | RebuildUsageStatsState::Error => smallvec![],
         }
@@ -475,7 +545,9 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::s3::create_bucket::CreateBucketOperation;
-    use aruna_core::structs::{BlobHeadKey, BucketInfo, CurrentVersionPointer};
+    use aruna_core::structs::{
+        BlobHeadKey, BucketInfo, CurrentVersionPointer, usage_global_shard_keys,
+    };
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -507,7 +579,7 @@ mod tests {
         }
     }
 
-    async fn read_counters(ctx: &DriverContext, key: Vec<u8>) -> UsageCounters {
+    async fn read_optional_counters(ctx: &DriverContext, key: Vec<u8>) -> Option<UsageCounters> {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
@@ -519,12 +591,22 @@ mod tests {
         {
             Event::Storage(StorageEvent::ReadResult {
                 value: Some(bytes), ..
-            }) => UsageCounters::from_bytes(&bytes).unwrap(),
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                UsageCounters::default()
-            }
+            }) => Some(UsageCounters::from_bytes(&bytes).unwrap()),
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    async fn read_counters(ctx: &DriverContext, key: Vec<u8>) -> UsageCounters {
+        read_optional_counters(ctx, key).await.unwrap_or_default()
+    }
+
+    async fn read_global_counters(ctx: &DriverContext) -> UsageCounters {
+        let mut total = UsageCounters::default();
+        for key in usage_global_shard_keys() {
+            total.add(&read_counters(ctx, key).await).unwrap();
+        }
+        total
     }
 
     #[test]
@@ -556,7 +638,7 @@ mod tests {
                 Event::Storage(StorageEvent::BatchReadResult {
                     values: vec![
                         (
-                            USAGE_GLOBAL_KEY.to_vec().into(),
+                            usage_global_key_for_group(group_id).into(),
                             Some(existing.to_bytes().unwrap().into()),
                         ),
                         (usage_group_key(group_id).into(), None),
@@ -602,6 +684,7 @@ mod tests {
                     group_id,
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
+                    cors_configuration: None,
                 },
             ),
             &ctx,
@@ -611,7 +694,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let global = read_counters(&ctx, USAGE_GLOBAL_KEY.to_vec()).await;
+        let global = read_global_counters(&ctx).await;
         assert_eq!(global.buckets, 1);
         let group = read_counters(&ctx, usage_group_key(group_id)).await;
         assert_eq!(group.buckets, 1);
@@ -637,6 +720,7 @@ mod tests {
                 group_id,
                 created_at: SystemTime::now(),
                 created_by: Default::default(),
+                cors_configuration: None,
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -669,7 +753,7 @@ mod tests {
         // alpha/live.txt: one materialized version, live.
         // alpha/gone.txt: materialized version superseded by a delete marker.
         // beta/shared.bin: two materialized versions of the shared blob.
-        let mut write_version = async |bucket: &str, key: &str, version: BlobVersion| {
+        let write_version = async |bucket: &str, key: &str, version: BlobVersion| {
             let version_id = Ulid::new();
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -684,10 +768,23 @@ mod tests {
                 .await;
             version_id
         };
+        let write_head = async |bucket: &str, key: &str, version_id: Ulid| {
+            ctx.storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: Some(txn_id),
+                })
+                .await;
+        };
 
         let now = SystemTime::now();
         let user = Default::default();
-        write_version(
+        let alpha_live_head = write_version(
             "alpha",
             "live.txt",
             BlobVersion::materialized(hashes[0], now, user, None),
@@ -699,7 +796,8 @@ mod tests {
             BlobVersion::materialized(hashes[1], now, user, None),
         )
         .await;
-        write_version("alpha", "gone.txt", BlobVersion::deleted(now, user)).await;
+        let alpha_gone_head =
+            write_version("alpha", "gone.txt", BlobVersion::deleted(now, user)).await;
         write_version(
             "beta",
             "shared.bin",
@@ -713,20 +811,9 @@ mod tests {
         )
         .await;
 
-        ctx.storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::BLOB_HEAD_KEYSPACE.to_string(),
-                key: BlobHeadKey::new("beta", "shared.bin")
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-                value: CurrentVersionPointer::new(beta_head)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-                txn_id: Some(txn_id),
-            })
-            .await;
+        write_head("alpha", "live.txt", alpha_live_head).await;
+        write_head("alpha", "gone.txt", alpha_gone_head).await;
+        write_head("beta", "shared.bin", beta_head).await;
 
         ctx.storage_handle
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -746,7 +833,7 @@ mod tests {
         // 100 + 40 + 40 + 40: every materialized version counts logically.
         assert_eq!(global.logical_bytes, 220);
 
-        let stored_global = read_counters(&ctx, USAGE_GLOBAL_KEY.to_vec()).await;
+        let stored_global = read_global_counters(&ctx).await;
         assert_eq!(stored_global, global);
 
         let alpha = read_counters(&ctx, usage_group_key(group_a)).await;
@@ -758,5 +845,61 @@ mod tests {
         assert_eq!(beta.buckets, 1);
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
+    }
+
+    #[tokio::test]
+    async fn rebuild_removes_stale_usage_counter_keys() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let stale_group = Ulid::new();
+        let stale_key = usage_group_key(stale_group);
+
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        USAGE_STATS_KEYSPACE.to_string(),
+                        stale_key.clone().into(),
+                        UsageCounters {
+                            buckets: 9,
+                            ..Default::default()
+                        }
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    ),
+                    (
+                        USAGE_STATS_KEYSPACE.to_string(),
+                        b"global".to_vec().into(),
+                        UsageCounters {
+                            objects: 9,
+                            ..Default::default()
+                        }
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await;
+
+        drive(RebuildUsageStatsOperation::new(), &ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(read_optional_counters(&ctx, stale_key).await.is_none());
+        assert!(
+            read_optional_counters(&ctx, b"global".to_vec())
+                .await
+                .is_none()
+        );
+        assert!(
+            read_optional_counters(&ctx, usage_global_shard_key(0))
+                .await
+                .is_some()
+        );
     }
 }
