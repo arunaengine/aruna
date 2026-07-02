@@ -20,7 +20,8 @@ KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
 PORTAL_CORS_ORIGINS=""
 WITH_KEYCLOAK=0
-REQUIRE_PORTAL_DIR=0
+AUTO_PORTAL_DIR=0
+AUTO_PORTAL_DOWNLOAD=0
 PIDS=()
 NODE_NAMES=()
 NODE_DIRS=()
@@ -42,7 +43,7 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: bash scripts/local_cluster_deploy.sh [--with-keycloak] [--node-count N] [--portal-dir P]
-                                           [--require-portal-dir]
+                                           [--auto-portal-dir]
 
 Behavior:
   default          Build the workspace in release mode and launch 3 local Aruna nodes.
@@ -50,8 +51,9 @@ Behavior:
   --node-count N   Launch N total Aruna nodes. Defaults to 3.
   --portal-dir P   Serve the portal dist at P from every node's REST port and
                    allow the node origins via CORS on REST and S3.
-  --require-portal-dir
-                   Fail before building unless a portal dist directory is set.
+  --auto-portal-dir
+                   If no portal dir is set, download the latest portal prerelease
+                   from arunaengine/website into the deployment temp directory.
 
 Environment overrides:
   ARUNA_TEST_DEPLOY_BASE_PORT
@@ -458,8 +460,8 @@ while (($# > 0)); do
     --portal-dir=*)
       PORTAL_DIR="${1#*=}"
       ;;
-    --require-portal-dir)
-      REQUIRE_PORTAL_DIR=1
+    --auto-portal-dir)
+      AUTO_PORTAL_DIR=1
       ;;
     --help|-h)
       usage
@@ -474,11 +476,12 @@ done
 
 [[ "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--node-count must be a positive integer"
 
-if [[ "$REQUIRE_PORTAL_DIR" == "1" && -z "$PORTAL_DIR" ]]; then
-  die "preview requires a portal dist directory; pass portal_dir=/path/to/dist or set ARUNA_TEST_DEPLOY_PORTAL_DIR"
+if [[ "$AUTO_PORTAL_DIR" == "1" && -z "$PORTAL_DIR" ]]; then
+  PORTAL_DIR="$DEPLOY_ROOT/portal"
+  AUTO_PORTAL_DOWNLOAD=1
 fi
 
-if [[ -n "$PORTAL_DIR" ]]; then
+if [[ -n "$PORTAL_DIR" && "$AUTO_PORTAL_DOWNLOAD" != "1" ]]; then
   portal_dir_arg=$PORTAL_DIR
   PORTAL_DIR="$(cd -- "$portal_dir_arg" 2>/dev/null && pwd)" \
     || die "portal dist directory not found: $portal_dir_arg"
@@ -521,6 +524,15 @@ cargo build --workspace --release --locked
 
 [[ -x "$ARUNA_BIN" ]] || die "missing binary: $ARUNA_BIN"
 [[ -x "$ARUNA_DOCTOR_BIN" ]] || die "missing binary: $ARUNA_DOCTOR_BIN"
+
+if [[ "$AUTO_PORTAL_DOWNLOAD" == "1" ]]; then
+  log "Downloading the latest arunaengine/website portal prerelease"
+  "$ARUNA_DOCTOR_BIN" portal update \
+    --portal-dir "$PORTAL_DIR" \
+    --latest-website-prerelease
+  [[ -f "$PORTAL_DIR/index.html" ]] \
+    || die "downloaded portal dist missing index.html: $PORTAL_DIR"
+fi
 
 NODE_1_BASE_URL="${NODE_BASE_URLS[0]}"
 

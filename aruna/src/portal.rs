@@ -320,8 +320,17 @@ fn unpack_archive(archive_bytes: &[u8], dest: &Path) -> Result<(), PortalArtifac
     for entry in archive.entries()? {
         let mut entry = entry?;
         let raw_path = entry.path()?.into_owned();
-        let relative_path = safe_archive_path(&raw_path)?;
         let entry_type = entry.header().entry_type();
+        let Some(relative_path) = safe_archive_path(&raw_path)? else {
+            if entry_type.is_dir() {
+                continue;
+            }
+
+            return Err(PortalArtifactError::UnsafeArchivePath {
+                path: raw_path.display().to_string(),
+                reason: "empty paths are not allowed".to_string(),
+            });
+        };
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(PortalArtifactError::ArchiveLink(
                 raw_path.display().to_string(),
@@ -347,7 +356,7 @@ fn unpack_archive(archive_bytes: &[u8], dest: &Path) -> Result<(), PortalArtifac
     Ok(())
 }
 
-fn safe_archive_path(path: &Path) -> Result<PathBuf, PortalArtifactError> {
+fn safe_archive_path(path: &Path) -> Result<Option<PathBuf>, PortalArtifactError> {
     let mut relative = PathBuf::new();
     for component in path.components() {
         match component {
@@ -369,13 +378,10 @@ fn safe_archive_path(path: &Path) -> Result<PathBuf, PortalArtifactError> {
     }
 
     if relative.as_os_str().is_empty() {
-        return Err(PortalArtifactError::UnsafeArchivePath {
-            path: path.display().to_string(),
-            reason: "empty paths are not allowed".to_string(),
-        });
+        return Ok(None);
     }
 
-    Ok(relative)
+    Ok(Some(relative))
 }
 
 fn require_index_html(dir: &Path) -> Result<(), PortalArtifactError> {
@@ -561,8 +567,9 @@ mod tests {
         ));
         assert_eq!(
             safe_archive_path(Path::new("./assets/app.js")).unwrap(),
-            Path::new("assets/app.js")
+            Some(Path::new("assets/app.js").to_path_buf())
         );
+        assert_eq!(safe_archive_path(Path::new("./")).unwrap(), None);
     }
 
     #[test]
@@ -574,6 +581,14 @@ mod tests {
             unpack_archive(&archive, tempdir.path()),
             Err(PortalArtifactError::ArchiveLink(_))
         ));
+    }
+
+    #[test]
+    fn unpack_skips_archive_root_directory() {
+        let archive = archive_with_entry("./", b"", EntryType::Directory);
+        let tempdir = tempdir().unwrap();
+
+        unpack_archive(&archive, tempdir.path()).unwrap();
     }
 
     #[test]

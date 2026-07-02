@@ -135,6 +135,8 @@ pub enum PortalCommands {
         artifact_url: Option<String>,
         #[arg(long)]
         artifact_sha256: Option<String>,
+        #[arg(long)]
+        latest_website_prerelease: bool,
     },
 }
 
@@ -202,7 +204,16 @@ pub async fn main() -> Result<(), CliError> {
                 portal_dir,
                 artifact_url,
                 artifact_sha256,
-            } => update_portal(portal_dir, artifact_url, artifact_sha256).await?,
+                latest_website_prerelease,
+            } => {
+                update_portal(
+                    portal_dir,
+                    artifact_url,
+                    artifact_sha256,
+                    latest_website_prerelease,
+                )
+                .await?
+            }
         },
         Commands::Info => print_info().await?,
     };

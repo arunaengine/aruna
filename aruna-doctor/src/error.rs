@@ -64,6 +64,11 @@ pub enum CliError {
     PortalArtifactError(#[from] PortalArtifactError),
     #[error("portal config value {0} is required")]
     MissingPortalConfig(&'static str),
+    #[error("no prerelease in {repo} contains portal artifact {asset}")]
+    MissingPortalWebsiteArtifact {
+        repo: &'static str,
+        asset: &'static str,
+    },
     #[error("OIDC provider '{0}' is not configured")]
     OidcProviderNotFound(String),
     #[error("OIDC flow requires both --oidc-username and --oidc-password")]
