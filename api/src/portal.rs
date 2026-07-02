@@ -1,6 +1,7 @@
 use crate::server_state::{PortalRuntimeState, ServerState};
+use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -11,6 +12,9 @@ use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
 const API_BASE_URL: &str = "/api/v1";
+const ASSETS_PREFIX: &str = "/assets/";
+const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+const NO_CACHE: &str = "no-cache";
 
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
@@ -40,11 +44,13 @@ async fn serve_portal(State(state): State<Arc<ServerState>>, request: Request) -
 }
 
 async fn serve_portal_request(state: &ServerState, request: Request) -> Response {
-    if is_reserved_path(request.uri().path()) {
+    let request_path = request.uri().path().to_string();
+    if is_reserved_path(&request_path) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if request.method() != Method::GET && request.method() != Method::HEAD {
+    let method = request.method().clone();
+    if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
 
@@ -53,13 +59,55 @@ async fn serve_portal_request(state: &ServerState, request: Request) -> Response
         Err(error) => return error.into_response(),
     };
 
-    let service = ServeDir::new(&portal_dir)
-        .append_index_html_on_directories(true)
-        .fallback(ServeFile::new(portal_dir.join("index.html")));
+    let service = ServeDir::new(&portal_dir).append_index_html_on_directories(true);
     match service.oneshot(request).await {
-        Ok(response) => response.into_response(),
+        Ok(response) if response.status() != StatusCode::NOT_FOUND => {
+            let mut response = response.into_response();
+            apply_cache_headers(&mut response, &request_path, false);
+            response
+        }
+        Ok(_) if request_path.starts_with(ASSETS_PREFIX) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => serve_portal_index_fallback(&portal_dir, method, &request_path).await,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+async fn serve_portal_index_fallback(
+    portal_dir: &std::path::Path,
+    method: Method,
+    request_path: &str,
+) -> Response {
+    let request = Request::builder()
+        .method(method)
+        .uri("/index.html")
+        .body(Body::empty())
+        .expect("portal fallback request must build");
+    match ServeFile::new(portal_dir.join("index.html"))
+        .oneshot(request)
+        .await
+    {
+        Ok(response) => {
+            let mut response = response.into_response();
+            apply_cache_headers(&mut response, request_path, true);
+            response
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn apply_cache_headers(response: &mut Response, request_path: &str, fallback_to_index: bool) {
+    if response.status() != StatusCode::OK {
+        return;
+    }
+
+    let value = if request_path.starts_with(ASSETS_PREFIX) && !fallback_to_index {
+        IMMUTABLE_CACHE
+    } else {
+        NO_CACHE
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
 }
 
 async fn portal_dir(state: &ServerState) -> Result<PathBuf, PortalServeError> {
@@ -85,6 +133,8 @@ fn is_reserved_path(path: &str) -> bool {
         || path.starts_with("/swagger-ui/")
         || path == "/api-docs"
         || path.starts_with("/api-docs/")
+        || path == "/.well-known"
+        || path.starts_with("/.well-known/")
 }
 
 enum PortalServeError {
@@ -104,7 +154,7 @@ impl IntoResponse for PortalServeError {
 
 #[cfg(test)]
 mod tests {
-    use super::serve_portal_request;
+    use super::{IMMUTABLE_CACHE, NO_CACHE, serve_portal_request};
     use crate::server_state::{PortalStatus, ServerState};
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;
@@ -188,6 +238,10 @@ mod tests {
             index.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html"
         );
+        assert_eq!(
+            index.headers().get(header::CACHE_CONTROL).unwrap(),
+            NO_CACHE
+        );
         let body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>portal</html>");
 
@@ -196,6 +250,10 @@ mod tests {
         assert_eq!(
             asset.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/javascript"
+        );
+        assert_eq!(
+            asset.headers().get(header::CACHE_CONTROL).unwrap(),
+            IMMUTABLE_CACHE
         );
         let body = to_bytes(asset.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"console.log('portal');");
@@ -213,8 +271,27 @@ mod tests {
             serve_portal_request(&state, request(Method::GET, "/groups/test-group")).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            NO_CACHE
+        );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"<html>portal</html>");
+    }
+
+    #[tokio::test]
+    async fn missing_assets_do_not_fall_back_to_index() {
+        let (state, tempdir) = setup_state().await;
+        let portal_dir = tempdir.path().join("portal");
+        std::fs::create_dir_all(&portal_dir).unwrap();
+        std::fs::write(portal_dir.join("index.html"), "<html>portal</html>").unwrap();
+        enable_portal(&state, &portal_dir).await;
+
+        let response =
+            serve_portal_request(&state, request(Method::GET, "/assets/missing.js")).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
     }
 
     #[tokio::test]
@@ -271,6 +348,7 @@ mod tests {
             "/swagger-ui/missing",
             "/s3/missing",
             "/info",
+            "/.well-known/openid-configuration",
         ] {
             let response = serve_portal_request(&state, request(Method::GET, path)).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
