@@ -139,7 +139,7 @@ fn install_verified_artifact(
     let manifest = read_manifest(temp_dir.path())?;
     write_checksum_file(temp_dir.path(), &checksum_file.bytes)?;
 
-    remove_existing_path(&portal_dir)?;
+    replace_existing_path(&portal_dir)?;
     temp_dir.persist(&portal_dir)?;
 
     Ok(status_from_parts(
@@ -161,6 +161,7 @@ fn load_existing_status(
     config: &PortalArtifactConfig,
 ) -> Result<Option<PortalStatus>, PortalArtifactError> {
     let portal_dir = portal_dir(config);
+    validate_install_target(&portal_dir)?;
     if !portal_dir.join("index.html").is_file() {
         return Ok(None);
     }
@@ -222,6 +223,8 @@ fn portal_dir(config: &PortalArtifactConfig) -> PathBuf {
 }
 
 fn install_parent(path: &Path) -> Result<PathBuf, PortalArtifactError> {
+    validate_install_target(path)?;
+
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
@@ -235,12 +238,67 @@ fn install_parent(path: &Path) -> Result<PathBuf, PortalArtifactError> {
         .ok_or_else(|| PortalArtifactError::InvalidPortalDirectory(path.to_path_buf()))
 }
 
-fn remove_existing_path(path: &Path) -> io::Result<()> {
+fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
+    if path.as_os_str().is_empty() {
+        return Err(PortalArtifactError::InvalidPortalDirectory(
+            path.to_path_buf(),
+        ));
+    }
+
+    let mut normal_components = 0;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => normal_components += 1,
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(PortalArtifactError::InvalidPortalDirectory(
+                    path.to_path_buf(),
+                ));
+            }
+        }
+    }
+
+    if normal_components == 0 || path.is_absolute() && normal_components == 1 {
+        return Err(PortalArtifactError::InvalidPortalDirectory(
+            path.to_path_buf(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn replace_existing_path(path: &Path) -> Result<(), PortalArtifactError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
+        Ok(metadata) if metadata.is_dir() => {
+            if can_replace_existing_dir(path)? {
+                fs::remove_dir_all(path)?;
+                Ok(())
+            } else {
+                Err(PortalArtifactError::InvalidPortalDirectory(
+                    path.to_path_buf(),
+                ))
+            }
+        }
+        Ok(_) => Err(PortalArtifactError::InvalidPortalDirectory(
+            path.to_path_buf(),
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn can_replace_existing_dir(path: &Path) -> io::Result<bool> {
+    if fs::symlink_metadata(path.join(CHECKSUM_FILE))
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    match fs::read_dir(path)?.next() {
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(error),
+        None => Ok(true),
     }
 }
 
@@ -468,8 +526,8 @@ pub enum PortalArtifactError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKSUM_FILE, PortalArtifactError, installed_status_from_dir, portal_dir,
-        safe_archive_path, unpack_archive, verify_sha256,
+        CHECKSUM_FILE, PortalArtifactError, install_parent, installed_status_from_dir, portal_dir,
+        replace_existing_path, safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::config::PortalArtifactConfig;
     use flate2::Compression;
@@ -516,6 +574,81 @@ mod tests {
             unpack_archive(&archive, tempdir.path()),
             Err(PortalArtifactError::ArchiveLink(_))
         ));
+    }
+
+    #[test]
+    fn install_parent_rejects_unsafe_targets() {
+        for path in ["", ".", "..", "../portal", "/", "/run", "/tmp"] {
+            assert!(
+                matches!(
+                    install_parent(Path::new(path)),
+                    Err(PortalArtifactError::InvalidPortalDirectory(_))
+                ),
+                "expected {path:?} to be rejected"
+            );
+        }
+
+        assert_eq!(install_parent(Path::new("portal")).unwrap(), Path::new("."));
+        assert_eq!(
+            install_parent(Path::new("target/portal")).unwrap(),
+            Path::new("target")
+        );
+        assert_eq!(
+            install_parent(Path::new("/run/portal")).unwrap(),
+            Path::new("/run")
+        );
+    }
+
+    #[test]
+    fn replace_existing_path_rejects_existing_files() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        fs::write(&target, "important data").unwrap();
+
+        assert!(matches!(
+            replace_existing_path(&target),
+            Err(PortalArtifactError::InvalidPortalDirectory(_))
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "important data");
+    }
+
+    #[test]
+    fn replace_existing_path_rejects_unowned_non_empty_dirs() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("important.txt"), "important data").unwrap();
+
+        assert!(matches!(
+            replace_existing_path(&target),
+            Err(PortalArtifactError::InvalidPortalDirectory(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(target.join("important.txt")).unwrap(),
+            "important data"
+        );
+    }
+
+    #[test]
+    fn replace_existing_path_allows_empty_or_installer_owned_dirs() {
+        let tempdir = tempdir().unwrap();
+        let empty = tempdir.path().join("empty-portal");
+        fs::create_dir_all(&empty).unwrap();
+
+        replace_existing_path(&empty).unwrap();
+        assert!(!empty.exists());
+
+        let installed = tempdir.path().join("installed-portal");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("index.html"), "<html></html>").unwrap();
+        fs::write(
+            installed.join(CHECKSUM_FILE),
+            "0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61  aruna-portal-dist.tar.gz\n",
+        )
+        .unwrap();
+
+        replace_existing_path(&installed).unwrap();
+        assert!(!installed.exists());
     }
 
     #[test]
