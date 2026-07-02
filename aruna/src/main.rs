@@ -349,14 +349,14 @@ async fn ensure_usage_counters(
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::USAGE_GLOBAL_KEY;
+    use aruna_core::structs::usage_global_shard_key;
     use aruna_operations::usage_stats::RebuildUsageStatsOperation;
 
     let event = driver_ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: USAGE_GLOBAL_KEY.to_vec().into(),
+            key: usage_global_shard_key(0).into(),
             txn_id: None,
         })
         .await;

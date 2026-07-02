@@ -575,8 +575,10 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     params(("id" = String, Path, description = "Group id")),
     responses(
         (status = 200, description = "Group storage usage", body = crate::routes::info::UsageResponse),
+        (status = 400, description = "Invalid group id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Group not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
