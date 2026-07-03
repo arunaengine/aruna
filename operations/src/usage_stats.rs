@@ -225,14 +225,10 @@ impl Operation for LoadUsageCountersOperation {
     fn start(&mut self) -> Effects {
         if self.key.as_slice() == USAGE_GLOBAL_KEY {
             self.state = LoadUsageCountersState::ReadGlobal;
-            let mut reads = usage_global_shard_keys()
+            let reads = usage_global_shard_keys()
                 .into_iter()
                 .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
                 .collect::<Vec<_>>();
-            reads.push((
-                USAGE_STATS_KEYSPACE.to_string(),
-                USAGE_GLOBAL_KEY.to_vec().into(),
-            ));
             smallvec![Effect::Storage(StorageEffect::BatchRead {
                 reads,
                 txn_id: None,
@@ -277,28 +273,16 @@ fn sum_global_usage_counters(
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<UsageCounters, LoadUsageCountersError> {
     let mut total = UsageCounters::default();
-    let mut saw_shard = false;
-    let mut legacy = None;
-    let shard_count = values.len().saturating_sub(1);
 
-    for (index, (_, value)) in values.into_iter().enumerate() {
+    for (_, value) in values {
         let Some(bytes) = value else {
             continue;
         };
         let counters = UsageCounters::from_bytes(bytes.as_ref())?;
-        if index < shard_count {
-            saw_shard = true;
-            total.add(&counters)?;
-        } else {
-            legacy = Some(counters);
-        }
+        total.add(&counters)?;
     }
 
-    if saw_shard {
-        Ok(total)
-    } else {
-        Ok(legacy.unwrap_or_default())
-    }
+    Ok(total)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -918,13 +902,8 @@ mod tests {
             logical_bytes: 7,
             ..Default::default()
         };
-        let legacy = UsageCounters {
-            buckets: 99,
-            ..Default::default()
-        };
         write_counters(&ctx, usage_global_shard_key(0), shard_zero).await;
         write_counters(&ctx, usage_global_shard_key(1), shard_one).await;
-        write_counters(&ctx, USAGE_GLOBAL_KEY.to_vec(), legacy).await;
 
         let loaded = drive(
             LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
@@ -937,16 +916,24 @@ mod tests {
         expected.add(&shard_one).unwrap();
         assert_eq!(loaded, expected);
 
-        let legacy_temp = tempdir().unwrap();
-        let legacy_ctx = test_ctx(legacy_temp.path().to_str().unwrap());
-        write_counters(&legacy_ctx, USAGE_GLOBAL_KEY.to_vec(), legacy).await;
+        let stale_global_temp = tempdir().unwrap();
+        let stale_global_ctx = test_ctx(stale_global_temp.path().to_str().unwrap());
+        write_counters(
+            &stale_global_ctx,
+            USAGE_GLOBAL_KEY.to_vec(),
+            UsageCounters {
+                buckets: 99,
+                ..Default::default()
+            },
+        )
+        .await;
         let loaded = drive(
             LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
-            &legacy_ctx,
+            &stale_global_ctx,
         )
         .await
         .unwrap();
-        assert_eq!(loaded, legacy);
+        assert_eq!(loaded, UsageCounters::default());
     }
 
     #[tokio::test]
