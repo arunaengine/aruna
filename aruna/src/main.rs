@@ -112,6 +112,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         task_handle: Some(task_handle.clone()),
     });
 
+    ensure_usage_counters(driver_ctx.as_ref()).await?;
+
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
 
@@ -340,12 +342,72 @@ async fn shutdown_runtime(
     }
 }
 
+/// Ensures the maintained usage counter shards exist before background writes start.
+async fn ensure_usage_counters(
+    driver_ctx: &DriverContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::usage_global_shard_keys;
+    use aruna_operations::usage_stats::RebuildUsageStatsOperation;
+
+    let shard_keys = usage_global_shard_keys();
+    let event = driver_ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads: shard_keys
+                .iter()
+                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
+                .collect(),
+            txn_id: None,
+        })
+        .await;
+
+    match event {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            if values.len() != shard_keys.len() {
+                return Err(format!(
+                    "usage counter probe returned {} values for {} shards",
+                    values.len(),
+                    shard_keys.len()
+                )
+                .into());
+            }
+            if values.iter().any(|(_, value)| value.is_none()) {
+                drive(RebuildUsageStatsOperation::new(), driver_ctx).await?;
+            }
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(format!("usage counter probe failed: {error}").into());
+        }
+        other => {
+            return Err(format!("usage counter probe received unexpected event: {other:?}").into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::{UsageCounters, usage_global_shard_keys};
     use std::thread;
+    use tempfile::tempdir;
+
+    fn test_driver_ctx(storage_handle: StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        }
+    }
 
     #[tokio::test]
     async fn shutdown_runtime_syncs_storage_without_net() {
@@ -360,6 +422,82 @@ mod tests {
 
         shutdown_runtime(None, None, &storage_handle).await;
 
+        worker.join().expect("storage responder should finish");
+    }
+
+    #[tokio::test]
+    async fn ensure_usage_counters_rebuilds_missing_shards() {
+        let temp = tempdir().expect("temp dir");
+        let storage_handle = aruna_storage::FjallStorage::open(
+            temp.path().to_str().expect("temp path should be utf8"),
+        )
+        .expect("storage opens");
+        let driver_ctx = test_driver_ctx(storage_handle.clone());
+
+        ensure_usage_counters(&driver_ctx).await.unwrap();
+
+        for key in usage_global_shard_keys() {
+            let event = storage_handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: USAGE_STATS_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: None,
+                })
+                .await;
+            let Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) = event
+            else {
+                panic!("expected rebuilt usage shard, got {event:?}");
+            };
+            assert_eq!(
+                UsageCounters::from_bytes(bytes.as_ref()).unwrap(),
+                UsageCounters::default()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_usage_counters_returns_probe_errors() {
+        let (storage_handle, receiver) = StorageHandle::new();
+        let worker = thread::spawn(move || {
+            let (effect, response_tx, _span, _queued_at) = receiver
+                .recv()
+                .expect("usage counter ensure should probe storage");
+            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
+            response_tx.send(StorageEvent::Error {
+                error: StorageError::ReadError,
+            });
+        });
+        let driver_ctx = test_driver_ctx(storage_handle);
+
+        let error = ensure_usage_counters(&driver_ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("usage counter probe failed"));
+        worker.join().expect("storage responder should finish");
+    }
+
+    #[tokio::test]
+    async fn ensure_usage_counters_rejects_unexpected_probe_events() {
+        let (storage_handle, receiver) = StorageHandle::new();
+        let worker = thread::spawn(move || {
+            let (effect, response_tx, _span, _queued_at) = receiver
+                .recv()
+                .expect("usage counter ensure should probe storage");
+            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
+            response_tx.send(StorageEvent::SyncAllFinished);
+        });
+        let driver_ctx = test_driver_ctx(storage_handle);
+
+        let error = ensure_usage_counters(&driver_ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("usage counter probe received unexpected event"));
         worker.join().expect("storage responder should finish");
     }
 }

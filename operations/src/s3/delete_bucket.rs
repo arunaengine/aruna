@@ -1,3 +1,4 @@
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -6,8 +7,8 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobHeadKey, BucketInfo, MultipartUpload, VersionKey};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::structs::{BlobHeadKey, BucketInfo, MultipartUpload, UsageDelta, VersionKey};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -20,6 +21,7 @@ pub enum DeleteBucketState {
     CheckVersions,
     CheckMultipartUploads,
     DeleteBucket,
+    UpdateUsage,
     CommitTransaction,
     Finish,
     Error,
@@ -43,6 +45,8 @@ pub enum DeleteBucketError {
         expected: &'static str,
         received: Event,
     },
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
     #[error("DeleteBucket failed")]
     DeleteBucketFailed,
 }
@@ -52,6 +56,8 @@ pub struct DeleteBucketOperation {
     bucket: String,
     state: DeleteBucketState,
     txn_id: Option<TxnId>,
+    group_id: Option<GroupId>,
+    usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -63,6 +69,8 @@ impl DeleteBucketOperation {
             bucket,
             state: DeleteBucketState::Init,
             txn_id: None,
+            group_id: None,
+            usage_update: None,
             output: None,
         }
     }
@@ -110,8 +118,9 @@ impl DeleteBucketOperation {
         let Some(value) = value else {
             return self.emit_error(DeleteBucketError::NotFound);
         };
-        if let Err(err) = BucketInfo::from_bytes(value.as_ref()) {
-            return self.emit_error(err.into());
+        match BucketInfo::from_bytes(value.as_ref()) {
+            Ok(info) => self.group_id = Some(info.group_id),
+            Err(err) => return self.emit_error(err.into()),
         }
 
         let prefix = match BlobHeadKey::bucket_prefix(&self.bucket) {
@@ -226,9 +235,38 @@ impl DeleteBucketOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteBucketError::TransactionMissing);
         };
+        let Some(group_id) = self.group_id else {
+            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
+        };
 
-        self.state = DeleteBucketState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let mut update = UsageCounterUpdate::for_group(
+            group_id,
+            UsageDelta {
+                buckets: -1,
+                ..Default::default()
+            },
+        );
+        self.state = DeleteBucketState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage_update = Some(update);
+        effects
+    }
+
+    fn handle_usage_update(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(DeleteBucketError::TransactionMissing);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self.emit_error(DeleteBucketError::DeleteBucketFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = DeleteBucketState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -266,6 +304,7 @@ impl Operation for DeleteBucketOperation {
                 self.handle_multipart_uploads_checked(event)
             }
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
+            DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteBucketState::Finish => smallvec![],
             DeleteBucketState::Error => smallvec![],
@@ -300,6 +339,7 @@ impl Operation for DeleteBucketOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -343,22 +383,22 @@ mod test {
         };
 
         let bucket = "bucket-a".to_string();
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: BucketInfo {
+        drive(
+            CreateBucketOperation::new(
+                bucket.clone(),
+                BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-                txn_id: None,
-            })
-            .await;
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
         let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
@@ -405,22 +445,22 @@ mod test {
         };
 
         let bucket = "bucket-a".to_string();
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: BucketInfo {
+        drive(
+            CreateBucketOperation::new(
+                bucket.clone(),
+                BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-                txn_id: None,
-            })
-            .await;
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),

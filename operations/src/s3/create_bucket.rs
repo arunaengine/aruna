@@ -1,9 +1,10 @@
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::BucketInfo;
+use aruna_core::structs::{BucketInfo, UsageDelta};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -14,6 +15,7 @@ pub enum CreateBucketState {
     StartTransaction,
     CheckExists,
     CreateBucket,
+    UpdateUsage,
     CommitTransaction,
     Finish,
     Error,
@@ -40,6 +42,8 @@ pub enum CreateBucketError {
         expected: &'static str,
         received: Event,
     },
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
     #[error("CreateBucket failed")]
     CreateBucketFailed,
 }
@@ -50,6 +54,7 @@ pub struct CreateBucketOperation {
     bucket_info: BucketInfo,
     state: CreateBucketState,
     txn_id: Option<ulid::Ulid>,
+    usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<BucketInfo, CreateBucketError>>,
 }
 
@@ -60,6 +65,7 @@ impl CreateBucketOperation {
             bucket_info,
             state: CreateBucketState::Init,
             txn_id: None,
+            usage_update: None,
             output: None,
         }
     }
@@ -144,8 +150,34 @@ impl CreateBucketOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateBucketError::NoTransactionFound);
         };
-        self.state = CreateBucketState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let mut update = UsageCounterUpdate::for_group(
+            self.bucket_info.group_id,
+            UsageDelta {
+                buckets: 1,
+                ..Default::default()
+            },
+        );
+        self.state = CreateBucketState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage_update = Some(update);
+        effects
+    }
+
+    fn handle_usage_update(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(CreateBucketError::NoTransactionFound);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self.emit_error(CreateBucketError::CreateBucketFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = CreateBucketState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -178,6 +210,7 @@ impl Operation for CreateBucketOperation {
             CreateBucketState::StartTransaction => self.handle_transaction_started(event),
             CreateBucketState::CheckExists => self.handle_bucket_checked(event),
             CreateBucketState::CreateBucket => self.handle_bucket_created(event),
+            CreateBucketState::UpdateUsage => self.handle_usage_update(event),
             CreateBucketState::CommitTransaction => self.handle_transaction_committed(event),
             CreateBucketState::Finish => smallvec![],
             CreateBucketState::Error => self.abort(),
