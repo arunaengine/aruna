@@ -5,14 +5,17 @@ use crate::explorer::{
 };
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
+use crate::portal::update_portal;
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod error;
 mod explorer;
 mod info;
 mod iroh_check;
+mod portal;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -71,6 +74,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: IrohCommands,
     },
+    Portal {
+        #[command(subcommand)]
+        command: PortalCommands,
+    },
     Info,
 }
 
@@ -116,6 +123,20 @@ pub enum IrohCommands {
         info_url: Option<String>,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PortalCommands {
+    Update {
+        #[arg(long)]
+        portal_dir: Option<PathBuf>,
+        #[arg(long)]
+        artifact_url: Option<String>,
+        #[arg(long)]
+        artifact_sha256: Option<String>,
+        #[arg(long)]
+        latest_website_prerelease: bool,
     },
 }
 
@@ -177,6 +198,22 @@ pub async fn main() -> Result<(), CliError> {
                 info_url,
                 timeout_secs,
             } => print_iroh_check(info_url, timeout_secs).await?,
+        },
+        Commands::Portal { command } => match command {
+            PortalCommands::Update {
+                portal_dir,
+                artifact_url,
+                artifact_sha256,
+                latest_website_prerelease,
+            } => {
+                update_portal(
+                    portal_dir,
+                    artifact_url,
+                    artifact_sha256,
+                    latest_website_prerelease,
+                )
+                .await?
+            }
         },
         Commands::Info => print_info().await?,
     };

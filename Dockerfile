@@ -13,11 +13,17 @@ RUN cargo install --locked --root target iroh-doctor
 
 FROM alpine:3.24
 WORKDIR /run
+ARG PORTAL_EMBED_DIR=docker/portal
+ARG PORTAL_MODE=disabled
 RUN apk update
 RUN apk upgrade
 RUN apk add libgcc gcompat ca-certificates
 COPY --from=builder /build/target/release/aruna .
 COPY --from=builder /build/target/release/aruna-doctor .
 COPY --from=builder /build/target/bin/iroh-doctor .
+COPY ${PORTAL_EMBED_DIR}/ /run/portal/
+RUN rm -f /run/portal/.gitkeep
+ENV PORTAL_MODE=${PORTAL_MODE}
+ENV PORTAL_DIR=/run/portal
 
 CMD [ "/run/aruna" ]

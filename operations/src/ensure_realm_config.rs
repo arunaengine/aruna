@@ -33,6 +33,7 @@ pub struct EnsureRealmConfigConfig {
     pub target_node_id: NodeId,
     pub target_node_kind: RealmNodeKind,
     pub default_metadata_replication_factor: u32,
+    pub realm_description: String,
     pub create_if_missing: bool,
     pub reject_kind_mismatch: bool,
 }
@@ -144,11 +145,15 @@ impl EnsureRealmConfigOperation {
         };
         let mut document = match document_value.as_deref() {
             Some(value) => RealmConfigDocument::from_bytes(value)?,
-            None if self.config.create_if_missing => RealmConfigDocument::new(
-                self.config.actor.realm_id,
-                Vec::new(),
-                self.config.default_metadata_replication_factor,
-            ),
+            None if self.config.create_if_missing => {
+                let mut document = RealmConfigDocument::new(
+                    self.config.actor.realm_id,
+                    Vec::new(),
+                    self.config.default_metadata_replication_factor,
+                );
+                document.description = self.config.realm_description.clone();
+                document
+            }
             None => return Err(EnsureRealmConfigError::RealmConfigNotFound),
         };
 
@@ -534,6 +539,7 @@ mod tests {
             target_node_kind: RealmNodeKind::Management,
             actor,
             default_metadata_replication_factor: factor,
+            realm_description: "Ensured Realm".to_string(),
             create_if_missing: true,
             reject_kind_mismatch: false,
         }
@@ -606,6 +612,7 @@ mod tests {
         let outbox: DocumentSyncOutboxRecord =
             postcard::from_bytes(write_value(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)).unwrap();
         assert_eq!(stored.metadata_replication.default_replication_factor, 7);
+        assert_eq!(stored.description, "Ensured Realm");
         assert!(stored.has_node(actor.node_id));
         assert_eq!(
             state.materialized_realm_config_nodes()[&actor.node_id],

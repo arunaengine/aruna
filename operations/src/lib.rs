@@ -29,7 +29,6 @@ pub mod get_group;
 pub mod get_metadata_document;
 pub mod get_oidc_user;
 pub mod get_realm_config;
-pub mod get_realm_description;
 pub mod get_realm_nodes;
 pub mod get_user;
 pub mod incoming;

@@ -1,6 +1,7 @@
 use crate::explorer::ExplorerError;
 use crate::storage::SnapshotError;
 use aruna::config::SetupError;
+use aruna::portal::PortalArtifactError;
 use aruna_core::onboarding::OnboardingSecretError;
 use aruna_operations::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
@@ -59,6 +60,15 @@ pub enum CliError {
     TokioJoinError(#[from] JoinError),
     #[error(transparent)]
     ExplorerError(#[from] ExplorerError),
+    #[error(transparent)]
+    PortalArtifactError(#[from] PortalArtifactError),
+    #[error("portal config value {0} is required")]
+    MissingPortalConfig(&'static str),
+    #[error("no prerelease in {repo} contains portal artifact {asset}")]
+    MissingPortalWebsiteArtifact {
+        repo: &'static str,
+        asset: &'static str,
+    },
     #[error("OIDC provider '{0}' is not configured")]
     OidcProviderNotFound(String),
     #[error("OIDC flow requires both --oidc-username and --oidc-password")]

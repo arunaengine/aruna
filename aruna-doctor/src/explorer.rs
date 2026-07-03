@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
     HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
     SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -20,7 +20,7 @@ use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, BucketInfo, BucketReplicationConfig, CurrentVersionPointer, Group,
     GroupAuthorizationDocument, HashPathIndexKey, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, Realm,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
@@ -156,9 +156,6 @@ enum DecodedValue {
     },
     GroupAuthorizationDocument {
         data: GroupAuthorizationDocument,
-    },
-    Realm {
-        data: JsonRealm,
     },
     RealmAuthorizationDocument {
         data: JsonRealmAuthorizationDocument,
@@ -418,21 +415,6 @@ impl Serialize for JsonGroup {
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct JsonRealm(Realm);
-
-impl Serialize for JsonRealm {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("Realm", 2)?;
-        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("description", &self.0.description)?;
-        state.end()
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct JsonRealmAuthorizationDocument(RealmAuthorizationDocument);
 
@@ -457,8 +439,9 @@ impl Serialize for JsonRealmConfigDocument {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("RealmConfigDocument", 2)?;
+        let mut state = serializer.serialize_struct("RealmConfigDocument", 3)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("description", &self.0.description)?;
         state.serialize_field("metadata_replication", &self.0.metadata_replication)?;
         state.end()
     }
@@ -1044,7 +1027,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 33] {
+fn defined_keyspaces() -> [&'static str; 32] {
     [
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
         ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -1069,7 +1052,6 @@ fn defined_keyspaces() -> [&'static str; 33] {
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE,
         S3_BUCKET_KEYSPACE,
         S3_BUCKET_REPLICATION_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
@@ -1205,7 +1187,7 @@ fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
 fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
     match keyspace_name {
         GROUP_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
-        REALM_KEYSPACE | REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
+        REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
         CRAQLE_TERMS_KEYSPACE => decode_craqle_term_id(key, "craqle term key")
             .map(|value| DecodedField::CraqleTermId {
                 value: craqle_term_id_string(value),
@@ -1259,9 +1241,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
     match keyspace_name {
         GROUP_KEYSPACE => decode_value_with(value, Group::from_bytes, |data| DecodedValue::Group {
             data: JsonGroup(data),
-        }),
-        REALM_KEYSPACE => decode_value_with(value, Realm::from_bytes, |data| DecodedValue::Realm {
-            data: JsonRealm(data),
         }),
         REALM_CONFIG_KEYSPACE => {
             decode_value_with(value, RealmConfigDocument::from_bytes, |data| {
@@ -1497,7 +1476,7 @@ mod tests {
         BUCKET_STATS_DB, DHT_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_STATE_KEYSPACE,
-        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE,
+        ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
         S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
         S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
         SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
@@ -1508,7 +1487,8 @@ mod tests {
         Actor, BackendLocation, BlobHeadKey, BlobVersion, BucketReplicationConfig,
         BucketReplicationTarget, Group, HashPathIndexKey, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, Realm, RealmId,
+        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmConfigDocument,
+        RealmId,
     };
     use aruna_net::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
@@ -1578,7 +1558,6 @@ mod tests {
             NODE_STATE_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
-            REALM_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
             S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
@@ -1681,9 +1660,9 @@ mod tests {
     }
 
     #[test]
-    fn decodes_realm_key() {
+    fn decodes_realm_config_key() {
         let realm_id = RealmId::from_bytes([5_u8; 32]);
-        let entry = decode_entry(REALM_KEYSPACE, realm_id.as_bytes(), b"not-a-realm");
+        let entry = decode_entry(REALM_CONFIG_KEYSPACE, realm_id.as_bytes(), b"not-a-config");
         assert_eq!(
             entry.key,
             DecodedField::RealmId {
@@ -1700,29 +1679,29 @@ mod tests {
     }
 
     #[test]
-    fn decodes_typed_realm_value_with_raw_error_fallback() {
+    fn decodes_typed_realm_config_value_with_raw_error_fallback() {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
             user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
             realm_id,
         };
-        let realm = Realm {
-            realm_id,
-            description: "Explorer Realm".to_string(),
-        };
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.description = "Explorer Realm".to_string();
 
         let decoded = decode_entry(
-            REALM_KEYSPACE,
+            REALM_CONFIG_KEYSPACE,
             realm_id.as_bytes(),
-            &realm.to_bytes(&actor).unwrap(),
+            &realm_config.to_bytes(&actor).unwrap(),
         );
         match decoded.value {
-            DecodedValue::Realm { data } => assert_eq!(data.0.description, "Explorer Realm"),
-            other => panic!("expected realm, got {other:?}"),
+            DecodedValue::RealmConfigDocument { data } => {
+                assert_eq!(data.0.description, "Explorer Realm")
+            }
+            other => panic!("expected realm config, got {other:?}"),
         }
 
-        let fallback = decode_entry(REALM_KEYSPACE, realm_id.as_bytes(), b"broken");
+        let fallback = decode_entry(REALM_CONFIG_KEYSPACE, realm_id.as_bytes(), b"broken");
         match fallback.value {
             DecodedValue::Raw {
                 decode_error: Some(_),

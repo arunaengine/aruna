@@ -5,6 +5,7 @@ use aruna::bootstrap::{
     fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna::portal;
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
@@ -212,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         target_node_kind: RealmNodeKind::Management,
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
+                        realm_description: config.realm_description.clone(),
                         create_if_missing: true,
                         reject_kind_mismatch: false,
                     }),
@@ -256,6 +258,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await,
     );
+    portal::initialize(config.portal.clone(), state.clone()).await;
 
     let cors = CorsConfig::new(config.cors_allowed_origins.clone());
     let server_config = ServerConfig {

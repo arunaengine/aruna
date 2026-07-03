@@ -148,6 +148,9 @@ pub enum AdminDocumentOperation {
         display_name: String,
         owner: UserId,
     },
+    RealmConfigDescriptionSet {
+        description: String,
+    },
 }
 
 #[cfg(test)]
@@ -271,6 +274,9 @@ mod tests {
                 display_name: "Engineering".to_string(),
                 owner: user_id(3),
             },
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "Demo Realm".to_string(),
+            },
         ];
 
         for op in operations {
@@ -341,6 +347,15 @@ mod tests {
             realm_id: RealmId::from_bytes([9; 32]),
             display_name: "Engineering".to_string(),
             owner: user_id(3),
+        };
+
+        assert_eq!(postcard_roundtrip(operation.clone()), operation);
+    }
+
+    #[test]
+    fn realm_config_description_operation_roundtrips() {
+        let operation = AdminDocumentOperation::RealmConfigDescriptionSet {
+            description: "Demo Realm".to_string(),
         };
 
         assert_eq!(postcard_roundtrip(operation.clone()), operation);

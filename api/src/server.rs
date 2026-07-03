@@ -1,10 +1,10 @@
 use crate::cors::CorsConfig;
 use crate::error::ServerSetupError;
+use crate::portal;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::response::Redirect;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -35,13 +35,10 @@ impl Server {
         // Build the root router with body size limit for REST API
 
         let mut router = Router::new()
-            .route(
-                "/",
-                axum::routing::get(|| async { Redirect::permanent("/swagger-ui") }),
-            )
             .nest("/api/v1", api_v1)
             .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
-            .merge(swagger_ui());
+            .merge(swagger_ui())
+            .merge(portal::router(self.state.clone()));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }

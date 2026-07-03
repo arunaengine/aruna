@@ -57,6 +57,7 @@ data-encoding = "2.11.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "pem"] }
 fjall = "3.1.4"
+flate2 = "1.1.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
@@ -118,11 +119,13 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.1"
 spargebra = "0.4.6"
+tar = "0.4.44"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tokio-util = "0.7.18"
-tower-http = { version = "0.6.7", features = ["cors"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.7", features = ["cors", "fs"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [

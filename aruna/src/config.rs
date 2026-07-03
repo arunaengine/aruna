@@ -77,8 +77,23 @@ pub struct Config {
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
+    pub realm_description: String,
+    pub portal: PortalConfig,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortalConfig {
+    Disabled,
+    Artifact(PortalArtifactConfig),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortalArtifactConfig {
+    pub artifact_url: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub portal_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +177,8 @@ pub enum SetupError {
     OnboardingBootstrapFailed(String),
     #[error("missing onboarding bootstrap material for {0:?} node")]
     MissingOnboardingMaterial(OnboardingMode),
+    #[error("missing required config value {0}")]
+    MissingConfigValue(&'static str),
     #[error("onboarding mode mismatch between secret and bootstrap response")]
     OnboardingModeMismatch,
     #[error("unexpected storage event while loading node state: {0}")]
@@ -271,6 +288,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     let oidc_providers = load_oidc_providers_from_env()?;
+    let portal = portal_config_env()?;
 
     let storage_handle =
         FjallStorage::open_with_persist_policy(&storage_path, fjall_persist_policy)?;
@@ -373,6 +391,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             s3_address,
             onboarding_secret,
             oidc_providers,
+            realm_description,
+            portal,
             startup_mode,
             node_state,
         },
@@ -422,6 +442,68 @@ fn fjall_persist_policy_env() -> Result<FjallPersistPolicy, SetupError> {
     value
         .parse::<FjallPersistPolicy>()
         .map_err(|message| invalid_config_value(KEY, value, message))
+}
+
+fn portal_config_env() -> Result<PortalConfig, SetupError> {
+    const MODE_KEY: &str = "PORTAL_MODE";
+    let Some(mode) = dotenvy::var(MODE_KEY).ok() else {
+        return Ok(PortalConfig::Disabled);
+    };
+
+    match normalize_env_value(&mode).as_str() {
+        "disabled" => Ok(PortalConfig::Disabled),
+        "artifact" => {
+            let artifact_url = optional_nonempty_env("PORTAL_ARTIFACT_URL")?;
+            if let Some(artifact_url) = &artifact_url {
+                reqwest::Url::parse(artifact_url).map_err(|error| {
+                    invalid_config_value("PORTAL_ARTIFACT_URL", artifact_url, error)
+                })?;
+            }
+            let artifact_sha256 = optional_nonempty_env("PORTAL_ARTIFACT_SHA256")?
+                .map(|value| normalize_sha256_env("PORTAL_ARTIFACT_SHA256", &value))
+                .transpose()?;
+            let portal_dir = PathBuf::from(required_nonempty_env("PORTAL_DIR")?);
+            Ok(PortalConfig::Artifact(PortalArtifactConfig {
+                artifact_url,
+                artifact_sha256,
+                portal_dir,
+            }))
+        }
+        _ => Err(invalid_config_value(
+            MODE_KEY,
+            mode,
+            "expected one of: disabled, artifact",
+        )),
+    }
+}
+
+fn optional_nonempty_env(key: &'static str) -> Result<Option<String>, SetupError> {
+    match dotenvy::var(key) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
+    match dotenvy::var(key) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(value) => Err(invalid_config_value(key, value, "must not be empty")),
+        Err(_) => Err(SetupError::MissingConfigValue(key)),
+    }
+}
+
+fn normalize_sha256_env(key: &'static str, value: &str) -> Result<String, SetupError> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(invalid_config_value(
+            key,
+            value,
+            "expected 64 hex characters",
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
 }
 
 fn parse_list_env(key: &str) -> Vec<String> {
@@ -1114,8 +1196,9 @@ async fn persist_node_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         fjall_persist_policy_env, load, load_oidc_providers_from_env, persist_node_state,
+        portal_config_env,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -1139,6 +1222,21 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var(key, value) },
                 None => unsafe { std::env::remove_var(key) },
             }
+        }
+    }
+
+    fn portal_env_keys() -> [&'static str; 4] {
+        [
+            "PORTAL_MODE",
+            "PORTAL_ARTIFACT_URL",
+            "PORTAL_ARTIFACT_SHA256",
+            "PORTAL_DIR",
+        ]
+    }
+
+    fn clear_portal_env() {
+        for key in portal_env_keys() {
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -1278,6 +1376,7 @@ mod tests {
                 "OIDC_MAIN_DISCOVERY_URL",
                 "https://issuer.example/.well-known/openid-configuration".to_string(),
             ),
+            ("PORTAL_MODE", "disabled".to_string()),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
@@ -1290,6 +1389,10 @@ mod tests {
             "OIDC_MAIN_ISSUER",
             "OIDC_MAIN_AUDIENCE",
             "OIDC_MAIN_DISCOVERY_URL",
+            "PORTAL_MODE",
+            "PORTAL_ARTIFACT_URL",
+            "PORTAL_ARTIFACT_SHA256",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
@@ -1306,6 +1409,123 @@ mod tests {
         assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
         assert_eq!(config.relay_method, RelayMethod::N0);
         assert_eq!(config.fjall_persist_policy, FjallPersistPolicy::SyncAll);
+        assert!(matches!(config.portal, PortalConfig::Disabled));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_defaults_to_disabled() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_portal_env();
+
+        assert!(matches!(
+            portal_config_env().unwrap(),
+            PortalConfig::Disabled
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_accepts_artifact_mode() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        let portal_dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PORTAL_MODE", "artifact");
+            std::env::set_var("PORTAL_ARTIFACT_URL", "https://example.test/portal.tar.gz");
+            std::env::set_var(
+                "PORTAL_ARTIFACT_SHA256",
+                "0DCA71F9A1193B09A55843B1D5ABC1E99445A9E1226CE42FBA05EDBC80B5DB61",
+            );
+            std::env::set_var("PORTAL_DIR", portal_dir.path());
+        }
+
+        let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
+            panic!("expected artifact portal config");
+        };
+        assert_eq!(
+            config.artifact_url.as_deref(),
+            Some("https://example.test/portal.tar.gz")
+        );
+        assert_eq!(
+            config.artifact_sha256.as_deref(),
+            Some("0dca71f9a1193b09a55843b1d5abc1e99445a9e1226ce42fba05edbc80b5db61")
+        );
+        assert_eq!(config.portal_dir, portal_dir.path());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_requires_portal_dir() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_portal_env();
+        unsafe { std::env::set_var("PORTAL_MODE", "artifact") };
+
+        let error = portal_config_env().expect_err("missing artifact fields should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::MissingConfigValue("PORTAL_DIR")
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_allows_existing_portal_without_download_fields() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        let portal_dir = tempdir().unwrap();
+        clear_portal_env();
+        unsafe {
+            std::env::set_var("PORTAL_MODE", "artifact");
+            std::env::set_var("PORTAL_DIR", portal_dir.path());
+        }
+
+        let PortalConfig::Artifact(config) = portal_config_env().unwrap() else {
+            panic!("expected artifact portal config");
+        };
+        assert_eq!(config.artifact_url, None);
+        assert_eq!(config.artifact_sha256, None);
+        assert_eq!(config.portal_dir, portal_dir.path());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn portal_config_rejects_invalid_mode() {
+        let _guard = env_lock().lock().await;
+        let previous: Vec<_> = portal_env_keys()
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        clear_portal_env();
+        unsafe { std::env::set_var("PORTAL_MODE", "local") };
+
+        let error = portal_config_env().expect_err("invalid portal mode should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "PORTAL_MODE",
+                ..
+            }
+        ));
 
         restore_env(previous);
     }
@@ -1382,6 +1602,7 @@ mod tests {
                 "P2P_ADDITIONAL_RELAY_URLS",
                 "https://relay-a.example, https://relay-b.example".to_string(),
             ),
+            ("PORTAL_MODE", "disabled".to_string()),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
@@ -1391,6 +1612,10 @@ mod tests {
             "S3_ADDRESS",
             "ARUNA_FJALL_PERSIST_MODE",
             "P2P_ADDITIONAL_RELAY_URLS",
+            "PORTAL_MODE",
+            "PORTAL_ARTIFACT_URL",
+            "PORTAL_ARTIFACT_SHA256",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
@@ -1445,10 +1670,24 @@ mod tests {
                 "ONBOARDING_SECRET",
                 "definitely-not-a-valid-secret".to_string(),
             ),
+            ("PORTAL_MODE", "disabled".to_string()),
         ];
-        let previous: Vec<_> = vars
+        let cleanup_keys = [
+            "STORAGE_PATH",
+            "SOCKET_ADDRESS",
+            "P2P_SOCKET_ADDRESS",
+            "S3_HOST",
+            "S3_ADDRESS",
+            "ARUNA_FJALL_PERSIST_MODE",
+            "ONBOARDING_SECRET",
+            "PORTAL_MODE",
+            "PORTAL_ARTIFACT_URL",
+            "PORTAL_ARTIFACT_SHA256",
+            "PORTAL_DIR",
+        ];
+        let previous: Vec<_> = cleanup_keys
             .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
             .collect();
 
         for (key, value) in &vars {
@@ -1493,6 +1732,7 @@ mod tests {
             ("S3_HOST", "127.0.0.1:1337".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             ("ARUNA_FJALL_PERSIST_MODE", "buffer".to_string()),
+            ("PORTAL_MODE", "disabled".to_string()),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
@@ -1502,6 +1742,10 @@ mod tests {
             "S3_ADDRESS",
             "ARUNA_FJALL_PERSIST_MODE",
             "ONBOARDING_SECRET",
+            "PORTAL_MODE",
+            "PORTAL_ARTIFACT_URL",
+            "PORTAL_ARTIFACT_SHA256",
+            "PORTAL_DIR",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
