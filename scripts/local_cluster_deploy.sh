@@ -511,7 +511,7 @@ mkdir -p "$DEPLOY_ROOT"
 prepare_nodes
 
 if [[ -n "$PORTAL_DIR" ]]; then
-  PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),http://localhost:5173"
+  PORTAL_CORS_ORIGINS="$(IFS=,; printf '%s' "${NODE_BASE_URLS[*]}"),$(printf 'http://127.0.0.1:%s,' "${NODE_S3_PORTS[@]}")http://localhost:5173"
 fi
 
 assert_node_ports_free
