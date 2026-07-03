@@ -339,6 +339,7 @@ impl Operation for DeleteBucketOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::s3::create_bucket::CreateBucketOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -382,22 +383,22 @@ mod test {
         };
 
         let bucket = "bucket-a".to_string();
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: BucketInfo {
+        drive(
+            CreateBucketOperation::new(
+                bucket.clone(),
+                BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: Default::default(),
                     cors_configuration: None,
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-                txn_id: None,
-            })
-            .await;
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
         let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
@@ -444,22 +445,22 @@ mod test {
         };
 
         let bucket = "bucket-a".to_string();
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.clone().into(),
-                value: BucketInfo {
+        drive(
+            CreateBucketOperation::new(
+                bucket.clone(),
+                BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
                     created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-                txn_id: None,
-            })
-            .await;
+                },
+            ),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),

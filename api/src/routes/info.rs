@@ -2,17 +2,14 @@ use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters, usage_global_shard_keys};
+use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::status::load_node_observability_status;
+use aruna_operations::usage_stats::LoadUsageCountersOperation;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -316,88 +313,9 @@ impl From<UsageCounters> for UsageResponse {
 }
 
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
-    if key.as_slice() == USAGE_GLOBAL_KEY {
-        return load_global_usage_counters(state).await;
-    }
-
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        }))
+    drive(LoadUsageCountersOperation::new(key), &state.get_ctx())
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => UsageCounters::from_bytes(&bytes)
-            .map_err(|error| ServerError::InternalError(error.to_string())),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Ok(UsageCounters::default())
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-async fn load_global_usage_counters(state: &ServerState) -> ServerResult<UsageCounters> {
-    let mut reads = usage_global_shard_keys()
-        .into_iter()
-        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
-        .collect::<Vec<_>>();
-    reads.push((
-        USAGE_STATS_KEYSPACE.to_string(),
-        USAGE_GLOBAL_KEY.to_vec().into(),
-    ));
-
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            let mut total = UsageCounters::default();
-            let mut saw_shard = false;
-            let mut legacy = None;
-            let shard_count = values.len().saturating_sub(1);
-            for (index, (_, value)) in values.into_iter().enumerate() {
-                let Some(bytes) = value else {
-                    continue;
-                };
-                let counters = UsageCounters::from_bytes(&bytes)
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-                if index < shard_count {
-                    saw_shard = true;
-                    total
-                        .add(&counters)
-                        .map_err(|error| ServerError::InternalError(error.to_string()))?;
-                } else {
-                    legacy = Some(counters);
-                }
-            }
-            if saw_shard {
-                Ok(total)
-            } else {
-                Ok(legacy.unwrap_or_default())
-            }
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
+        .map_err(|error| ServerError::InternalError(error.to_string()))
 }
 
 #[utoipa::path(

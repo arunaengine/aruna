@@ -8,8 +8,9 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
-    usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key, usage_group_key,
+    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
+    VersionKey, usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key,
+    usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -127,6 +128,176 @@ impl UsageCounterUpdate {
 
     pub fn is_done(&self) -> bool {
         self.phase == UsageUpdatePhase::Done
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LoadUsageCountersState {
+    Init,
+    ReadCounter,
+    ReadGlobal,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum LoadUsageCountersError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    CounterError(#[from] UsageCounterError),
+    #[error(
+        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received:?}"
+    )]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        received: Event,
+    },
+    #[error("usage counter read did not finish")]
+    NotFinished,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct LoadUsageCountersOperation {
+    key: Vec<u8>,
+    state: LoadUsageCountersState,
+    output: Option<Result<UsageCounters, LoadUsageCountersError>>,
+}
+
+impl LoadUsageCountersOperation {
+    pub fn new(key: Vec<u8>) -> Self {
+        Self {
+            key,
+            state: LoadUsageCountersState::Init,
+            output: None,
+        }
+    }
+
+    fn finish(&mut self, result: Result<UsageCounters, LoadUsageCountersError>) -> Effects {
+        self.state = if result.is_ok() {
+            LoadUsageCountersState::Finish
+        } else {
+            LoadUsageCountersState::Error
+        };
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn unexpected_event(&mut self, expected: &'static str, received: Event) -> Effects {
+        self.finish(Err(LoadUsageCountersError::UnexpectedEvent {
+            state: format!("{:?}", self.state),
+            expected,
+            received,
+        }))
+    }
+
+    fn handle_counter_read(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => self.finish(UsageCounters::from_bytes(&bytes).map_err(Into::into)),
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                self.finish(Ok(UsageCounters::default()))
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
+            other => self.unexpected_event("storage read result", other),
+        }
+    }
+
+    fn handle_global_read(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                self.finish(sum_global_usage_counters(values))
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
+            other => self.unexpected_event("storage batch read result", other),
+        }
+    }
+}
+
+impl Operation for LoadUsageCountersOperation {
+    type Output = UsageCounters;
+    type Error = LoadUsageCountersError;
+
+    fn start(&mut self) -> Effects {
+        if self.key.as_slice() == USAGE_GLOBAL_KEY {
+            self.state = LoadUsageCountersState::ReadGlobal;
+            let mut reads = usage_global_shard_keys()
+                .into_iter()
+                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
+                .collect::<Vec<_>>();
+            reads.push((
+                USAGE_STATS_KEYSPACE.to_string(),
+                USAGE_GLOBAL_KEY.to_vec().into(),
+            ));
+            smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            })]
+        } else {
+            self.state = LoadUsageCountersState::ReadCounter;
+            smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: self.key.clone().into(),
+                txn_id: None,
+            })]
+        }
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            LoadUsageCountersState::ReadCounter => self.handle_counter_read(event),
+            LoadUsageCountersState::ReadGlobal => self.handle_global_read(event),
+            LoadUsageCountersState::Init
+            | LoadUsageCountersState::Finish
+            | LoadUsageCountersState::Error => smallvec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            LoadUsageCountersState::Finish | LoadUsageCountersState::Error
+        )
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.ok_or(LoadUsageCountersError::NotFinished)?
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+fn sum_global_usage_counters(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<UsageCounters, LoadUsageCountersError> {
+    let mut total = UsageCounters::default();
+    let mut saw_shard = false;
+    let mut legacy = None;
+    let shard_count = values.len().saturating_sub(1);
+
+    for (index, (_, value)) in values.into_iter().enumerate() {
+        let Some(bytes) = value else {
+            continue;
+        };
+        let counters = UsageCounters::from_bytes(bytes.as_ref())?;
+        if index < shard_count {
+            saw_shard = true;
+            total.add(&counters)?;
+        } else {
+            legacy = Some(counters);
+        }
+    }
+
+    if saw_shard {
+        Ok(total)
+    } else {
+        Ok(legacy.unwrap_or_default())
     }
 }
 
@@ -609,6 +780,22 @@ mod tests {
         total
     }
 
+    async fn write_counters(ctx: &DriverContext, key: Vec<u8>, counters: UsageCounters) {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: key.into(),
+                value: counters.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     #[test]
     fn counter_update_applies_deltas_with_synthetic_events() {
         let group_id = Ulid::new();
@@ -698,6 +885,68 @@ mod tests {
         assert_eq!(global.buckets, 1);
         let group = read_counters(&ctx, usage_group_key(group_id)).await;
         assert_eq!(group.buckets, 1);
+    }
+
+    #[tokio::test]
+    async fn load_usage_counters_reads_group_and_global_counters() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::new();
+        let group = UsageCounters {
+            buckets: 1,
+            objects: 2,
+            logical_bytes: 3,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_group_key(group_id), group).await;
+
+        let loaded = drive(
+            LoadUsageCountersOperation::new(usage_group_key(group_id)),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded, group);
+
+        let shard_zero = UsageCounters {
+            buckets: 4,
+            stored_bytes: 5,
+            ..Default::default()
+        };
+        let shard_one = UsageCounters {
+            objects: 6,
+            logical_bytes: 7,
+            ..Default::default()
+        };
+        let legacy = UsageCounters {
+            buckets: 99,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_global_shard_key(0), shard_zero).await;
+        write_counters(&ctx, usage_global_shard_key(1), shard_one).await;
+        write_counters(&ctx, USAGE_GLOBAL_KEY.to_vec(), legacy).await;
+
+        let loaded = drive(
+            LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let mut expected = UsageCounters::default();
+        expected.add(&shard_zero).unwrap();
+        expected.add(&shard_one).unwrap();
+        assert_eq!(loaded, expected);
+
+        let legacy_temp = tempdir().unwrap();
+        let legacy_ctx = test_ctx(legacy_temp.path().to_str().unwrap());
+        write_counters(&legacy_ctx, USAGE_GLOBAL_KEY.to_vec(), legacy).await;
+        let loaded = drive(
+            LoadUsageCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()),
+            &legacy_ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded, legacy);
     }
 
     #[tokio::test]
