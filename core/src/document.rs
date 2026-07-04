@@ -8,13 +8,13 @@ use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
 };
-use crate::structs::RealmId;
+use crate::structs::{RealmId, node_usage_global_key, node_usage_group_key};
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
 
@@ -48,6 +48,11 @@ pub enum DocumentSyncTarget {
     },
     MetadataGraphLifecycle {
         graph_iri: String,
+    },
+    NodeUsage {
+        realm_id: RealmId,
+        node_id: NodeId,
+        group_id: Option<GroupId>,
     },
 }
 
@@ -275,6 +280,7 @@ impl DocumentSyncTarget {
             Self::MetadataGraphLifecycle { graph_iri } => {
                 TopicId::metadata(metadata_graph_lifecycle_topic_id(graph_iri))
             }
+            Self::NodeUsage { realm_id, .. } => TopicId::realm(*realm_id),
         }
     }
 
@@ -288,6 +294,7 @@ impl DocumentSyncTarget {
             Self::MetadataCreateEvent { .. } => METADATA_EVENT_LOG_KEYSPACE,
             Self::MetadataDocumentLifecycle { .. } => METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+            Self::NodeUsage { .. } => USAGE_NODE_STATS_KEYSPACE,
         }
     }
 
@@ -317,6 +324,12 @@ impl DocumentSyncTarget {
                 metadata_document_lifecycle_key(*document_id)
             }
             Self::MetadataGraphLifecycle { graph_iri } => metadata_graph_lifecycle_key(graph_iri),
+            Self::NodeUsage {
+                node_id, group_id, ..
+            } => match group_id {
+                Some(group_id) => ByteView::from(node_usage_group_key(*group_id, *node_id)),
+                None => ByteView::from(node_usage_global_key(*node_id)),
+            },
         }
     }
 
@@ -348,6 +361,9 @@ impl DocumentSyncTarget {
                 bytes.extend_from_slice(b"/metadata-graph-lifecycle/");
                 bytes.extend_from_slice(graph_iri.as_bytes());
             }
+            // No node id in the suffix: every node's usage snapshot flows over a
+            // single shared realm-scoped topic that all realm nodes subscribe to.
+            Self::NodeUsage { .. } => bytes.extend_from_slice(b"/node-usage"),
         }
         irokle::TopicId::hash(bytes)
     }
@@ -690,6 +706,55 @@ mod tests {
     #[test]
     fn document_sync_event_type_id_is_stable() {
         assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+    }
+
+    #[test]
+    fn node_usage_targets_share_one_realm_topic_and_map_to_snapshot_keys() {
+        use crate::keyspaces::USAGE_NODE_STATS_KEYSPACE;
+        use crate::structs::{node_usage_global_key, node_usage_group_key};
+
+        let realm_id = test_realm(2);
+        let node_id = test_node(1);
+        let group_id = test_ulid(4);
+
+        let global = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        };
+        let group = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: Some(group_id),
+        };
+
+        // Both map onto the realm domain topic and the single shared sync topic.
+        assert_eq!(global.topic_id(), TopicId::realm(realm_id));
+        assert_eq!(global.topic_id(), group.topic_id());
+        assert_eq!(global.sync_topic_id(), group.sync_topic_id());
+
+        // A different node's usage rides the very same shared topic.
+        let other = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id: test_node(9),
+            group_id: None,
+        };
+        assert_eq!(global.sync_topic_id(), other.sync_topic_id());
+        // But is distinct from the realm-config topic on the same domain.
+        assert_ne!(
+            global.sync_topic_id(),
+            DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id()
+        );
+
+        assert_eq!(global.storage_keyspace(), USAGE_NODE_STATS_KEYSPACE);
+        assert_eq!(
+            global.storage_key().as_ref(),
+            node_usage_global_key(node_id).as_slice()
+        );
+        assert_eq!(
+            group.storage_key().as_ref(),
+            node_usage_group_key(group_id, node_id).as_slice()
+        );
     }
 
     #[test]
