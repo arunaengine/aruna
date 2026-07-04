@@ -162,6 +162,7 @@ pub struct QuotaConfig {
     pub group_overrides: Vec<GroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
+    pub max_devices_per_user: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -186,6 +187,7 @@ impl Default for QuotaConfig {
             group_overrides: Vec::new(),
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
+            max_devices_per_user: None,
         }
     }
 }
