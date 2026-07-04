@@ -500,23 +500,30 @@ mod tests {
 
     #[test]
     fn validate_quota_rejects_out_of_range_warn_threshold() {
-        let mut quota = QuotaConfig::default();
-        quota.warn_threshold_percent = 0;
+        let too_low = QuotaConfig {
+            warn_threshold_percent: 0,
+            ..QuotaConfig::default()
+        };
         assert!(matches!(
-            validate_quota(&quota),
+            validate_quota(&too_low),
             Err(SetRealmQuotaError::InvalidQuota { .. })
         ));
-        quota.warn_threshold_percent = 101;
+        let too_high = QuotaConfig {
+            warn_threshold_percent: 101,
+            ..QuotaConfig::default()
+        };
         assert!(matches!(
-            validate_quota(&quota),
+            validate_quota(&too_high),
             Err(SetRealmQuotaError::InvalidQuota { .. })
         ));
     }
 
     #[test]
     fn validate_quota_rejects_low_grace_factor() {
-        let mut quota = QuotaConfig::default();
-        quota.grace_factor_percent = 99;
+        let quota = QuotaConfig {
+            grace_factor_percent: 99,
+            ..QuotaConfig::default()
+        };
         assert!(matches!(
             validate_quota(&quota),
             Err(SetRealmQuotaError::InvalidQuota { .. })
