@@ -53,6 +53,7 @@ pub mod replication;
 pub mod reserve_onboarding_secret;
 pub mod s3;
 pub mod search_users;
+pub mod set_realm_quota;
 pub mod staging;
 pub mod startup;
 pub mod status;
