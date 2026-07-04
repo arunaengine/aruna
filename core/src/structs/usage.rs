@@ -1,3 +1,4 @@
+use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,90 @@ use thiserror::Error;
 
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const USAGE_GLOBAL_SHARD_COUNT: usize = 64;
+
+/// Keys in the node-usage keyspace. Per-node snapshots use fixed-length keys so
+/// their prefixes are unambiguous: `n/` + node id for a node's global total,
+/// `g/` + group id + node id for a node's per-group total (group first so all
+/// nodes' snapshots for one group form a single scan range). Local-only keys use
+/// text prefixes (`dirty/`, `summary/`) that never collide with the binary
+/// snapshot prefixes.
+pub const NODE_USAGE_GLOBAL_PREFIX: &[u8] = b"n/";
+pub const NODE_USAGE_GROUP_PREFIX: &[u8] = b"g/";
+pub const NODE_USAGE_DIRTY_PREFIX: &[u8] = b"dirty/";
+pub const NODE_USAGE_DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
+pub const NODE_USAGE_DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
+pub const NODE_USAGE_SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
+pub const NODE_USAGE_SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
+
+/// A single node's usage total distributed over the sync layer. Single writer
+/// per key (each node writes only its own snapshots), so ingest is last-write-wins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeUsageSnapshot {
+    pub node_id: NodeId,
+    pub counters: UsageCounters,
+}
+
+impl NodeUsageSnapshot {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn node_usage_global_key(node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_GLOBAL_PREFIX.len() + 32);
+    key.extend_from_slice(NODE_USAGE_GLOBAL_PREFIX);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+pub fn node_usage_group_prefix(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn node_usage_group_key(group_id: GroupId, node_id: NodeId) -> Vec<u8> {
+    let mut key = node_usage_group_prefix(group_id);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+/// Recovers the owning node id from a snapshot key produced by
+/// [`node_usage_global_key`] or [`node_usage_group_key`].
+pub fn node_usage_key_node_id(key: &[u8]) -> Option<NodeId> {
+    let tail = match key.strip_prefix(NODE_USAGE_GLOBAL_PREFIX) {
+        Some(rest) => rest,
+        None => key.strip_prefix(NODE_USAGE_GROUP_PREFIX)?.get(16..)?,
+    };
+    let bytes: [u8; 32] = tail.try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
+}
+
+pub fn node_usage_dirty_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_DIRTY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_DIRTY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+/// Recovers the group id from a `dirty/group/<ulid>` marker key.
+pub fn node_usage_dirty_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(NODE_USAGE_DIRTY_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
+pub fn node_usage_summary_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_SUMMARY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_SUMMARY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
 
 pub fn usage_global_shard_index(group_id: GroupId) -> usize {
     group_id
@@ -199,5 +284,44 @@ mod tests {
         };
         let bytes = counters.to_bytes().unwrap();
         assert_eq!(UsageCounters::from_bytes(&bytes).unwrap(), counters);
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn node_usage_snapshot_round_trips() {
+        let snapshot = NodeUsageSnapshot {
+            node_id: node(7),
+            counters: UsageCounters {
+                buckets: 2,
+                logical_bytes: 9,
+                ..Default::default()
+            },
+        };
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(NodeUsageSnapshot::from_bytes(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn node_usage_keys_recover_node_and_group_ids() {
+        let node_id = node(3);
+        let group_id = ulid::Ulid::from_bytes([5u8; 16]);
+
+        let global_key = node_usage_global_key(node_id);
+        assert!(global_key.starts_with(NODE_USAGE_GLOBAL_PREFIX));
+        assert_eq!(node_usage_key_node_id(&global_key), Some(node_id));
+
+        let group_key = node_usage_group_key(group_id, node_id);
+        assert!(group_key.starts_with(&node_usage_group_prefix(group_id)));
+        assert_eq!(node_usage_key_node_id(&group_key), Some(node_id));
+
+        // Group snapshots for one group form a contiguous scan range.
+        assert!(group_key.starts_with(NODE_USAGE_GROUP_PREFIX));
+
+        let dirty_key = node_usage_dirty_group_key(group_id);
+        assert_eq!(node_usage_dirty_group_id(&dirty_key), Some(group_id));
+        assert_eq!(node_usage_dirty_group_id(NODE_USAGE_DIRTY_GLOBAL_KEY), None);
     }
 }
