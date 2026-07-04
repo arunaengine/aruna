@@ -3800,9 +3800,10 @@ mod tests {
         subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, MetadataReplicationConfig, OidcProviderConfig,
-        Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint,
+        Actor, Group, GroupAuthorizationDocument, GroupQuotaOverride, MetadataReplicationConfig,
+        OidcProviderConfig, Permission, QuotaConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+        StaticRealmEndpoint, UserGroupCapOverride,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
@@ -4572,6 +4573,76 @@ mod tests {
             reducer_state.materialized_realm_config_discovery(),
             Some(discovery)
         );
+    }
+
+    #[tokio::test]
+    async fn quota_survives_reducer_materialization_without_existing_config_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_384, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(9_000),
+            grace_factor_percent: 130,
+            warn_threshold_percent: 70,
+            group_overrides: vec![GroupQuotaOverride {
+                group_id: Ulid::from_parts(1_385, 1),
+                quota_bytes: Some(4_500),
+                grace_factor_percent: Some(140),
+            }],
+            max_groups_per_user: Some(7),
+            user_group_cap_overrides: vec![UserGroupCapOverride {
+                user_id: UserId::local(Ulid::from_parts(1_386, 1), realm_id),
+                max_groups: Some(2),
+            }],
+            max_devices_per_user: Some(6),
+        };
+
+        // Quota lands before any config doc exists; it must be recorded in the
+        // reducer and later carried through realm_config_from_reducer_materialization.
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_387, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigQuotaSet {
+                    quota: quota.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config quota op applies");
+
+        let metadata_replication = MetadataReplicationConfig::new(5);
+        let discovery = test_discovery(23, "https://quota-materialization.example:443");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_388, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: metadata_replication.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config settings op bootstraps config doc");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.quota, quota);
+        assert_eq!(config.metadata_replication, metadata_replication);
     }
 
     #[tokio::test]
