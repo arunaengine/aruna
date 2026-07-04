@@ -41,6 +41,7 @@ pub const BLOB_REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
+pub const USAGE_NODE_STATS_KEYSPACE: &str = "usage_node_stats";
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
