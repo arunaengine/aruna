@@ -11,8 +11,8 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind,
+    Actor, MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -259,6 +259,12 @@ impl AdminDocumentReducerState {
                     description.clone(),
                 );
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigQuotaSet { quota },
+            ) => {
+                self.apply_realm_config_setting(event, REALM_CONFIG_QUOTA_PATH, quota_value(quota));
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -487,6 +493,17 @@ impl AdminDocumentReducerState {
         self.user_subject_ids
             .get(REALM_CONFIG_DESCRIPTION_PATH)
             .and_then(|version| version.value.clone())
+    }
+
+    pub fn materialized_realm_config_quota(&self) -> Option<QuotaConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_QUOTA_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(quota_from_value)
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -844,6 +861,7 @@ pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
     "realm_config.settings.metadata_replication";
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
+pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -893,6 +911,10 @@ fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) 
 
 fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
     serde_json::to_string(discovery).expect("admin document realm discovery config serializes")
+}
+
+fn quota_value(quota: &QuotaConfig) -> String {
+    serde_json::to_string(quota).expect("admin document quota config serializes")
 }
 
 fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
@@ -975,6 +997,10 @@ fn metadata_replication_from_value(value: &str) -> Option<MetadataReplicationCon
 }
 
 fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
+    serde_json::from_str(value).ok()
+}
+
+fn quota_from_value(value: &str) -> Option<QuotaConfig> {
     serde_json::from_str(value).ok()
 }
 
