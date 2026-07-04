@@ -5,8 +5,8 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind, Role,
+    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -151,6 +151,9 @@ pub enum AdminDocumentOperation {
     RealmConfigDescriptionSet {
         description: String,
     },
+    RealmConfigQuotaSet {
+        quota: QuotaConfig,
+    },
 }
 
 #[cfg(test)]
@@ -158,8 +161,8 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
     use crate::structs::{
-        MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind,
+        MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
+        RealmDiscoveryConfig, RealmId, RealmNodeKind,
     };
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
@@ -276,6 +279,9 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigDescriptionSet {
                 description: "Demo Realm".to_string(),
+            },
+            AdminDocumentOperation::RealmConfigQuotaSet {
+                quota: QuotaConfig::default(),
             },
         ];
 
