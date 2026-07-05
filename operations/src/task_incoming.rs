@@ -50,6 +50,7 @@ use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
+use crate::usage_stats::restore_usage_snapshot_publish_timer;
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
@@ -491,6 +492,40 @@ impl OperationsTaskHandler {
         Ok(())
     }
 
+    async fn publish_usage_snapshots(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!("Cannot publish usage snapshots without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        let realm_id = *net_handle.realm_id();
+        match crate::usage_stats::publish_usage_snapshots(&self.context, node_id, realm_id, false)
+            .await
+        {
+            Ok(published) if !published.is_empty() => {
+                if let Err(error) = crate::usage_stats::recompute_realm_usage_summary(
+                    &self.context,
+                    node_id,
+                    published.global,
+                    published.groups,
+                )
+                .await
+                {
+                    warn!(error = %error, "Failed to refresh realm usage summary after publishing snapshots");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = %error, "Failed to publish usage snapshots");
+                self.reschedule_timer(
+                    TaskKey::PublishUsageSnapshots,
+                    crate::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
+        }
+    }
+
     async fn drain_metadata_materialization_queue(&self) {
         match process_metadata_materialization_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
@@ -684,6 +719,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -699,6 +735,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     spawn_durable_queue_rearm(&context, &task_handle);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+    restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -816,6 +853,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainDocumentSyncOutbox => {
                 self.drain_document_sync_outbox().await;
+            }
+            TaskKey::PublishUsageSnapshots => {
+                self.publish_usage_snapshots().await;
             }
             TaskKey::DrainMetadataProjectionQueue => {
                 self.drain_metadata_projection_queue().await;
