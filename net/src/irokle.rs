@@ -1651,6 +1651,26 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
+                    DocumentSyncEvent::Delete {
+                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        ..
+                    } => {
+                        // Node-usage snapshots only ever sync as owner-validated
+                        // upserts. A signed Delete or AdminOperation on the shared
+                        // realm topic would otherwise `?`-propagate through the
+                        // generic arm and wedge every peer's reconcile forever, so
+                        // skip it and let the cursor advance past the hostile op.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported non-upsert node usage document event"
+                        );
+                        continue;
+                    }
                     DocumentSyncEvent::Upsert { ref target, .. }
                     | DocumentSyncEvent::Delete { ref target, .. }
                         if admin_document_target_for_reduced_document(target).is_some() =>
@@ -7973,5 +7993,132 @@ mod tests {
             validate_node_usage_upsert(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes)
                 .is_err()
         );
+    }
+
+    // A forged non-upsert node-usage event (here a signed Delete) on the shared
+    // realm topic must be skipped, not `?`-propagated: otherwise every peer's
+    // reconcile of that topic errors at the op forever and realm usage freezes.
+    #[tokio::test]
+    async fn reconcile_skips_forged_non_upsert_node_usage_event() {
+        use aruna_core::structs::UsageCounters;
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(53).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let realm_id = RealmId::from_bytes([53u8; 32]);
+        let target = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id: local_node,
+            group_id: None,
+        };
+        let topic_id = target.sync_topic_id();
+
+        let change = |kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind,
+        };
+
+        let snapshot = NodeUsageSnapshot {
+            node_id: local_node,
+            counters: UsageCounters {
+                buckets: 5,
+                ..Default::default()
+            },
+        };
+        let snapshot_bytes = snapshot.to_bytes().expect("snapshot serializes");
+
+        // Hostile Delete first, then a legitimate owner-signed Upsert on the same
+        // topic. Publishing appends both ops and advances the local cursor.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Delete {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        change: change(DocumentSyncChangeKind::Delete),
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: snapshot_bytes.clone(),
+                        change: change(DocumentSyncChangeKind::Upsert),
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
+        // peer receiving them via sync would (its cursor has not yet advanced).
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        // (a) Reconcile completes without error despite the hostile Delete.
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips the forged delete instead of wedging");
+
+        // (c) The legitimate upsert on the same topic still applied.
+        assert!(result.targets.contains(&target));
+        let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .expect("node usage snapshot applied");
+        assert_eq!(
+            NodeUsageSnapshot::from_bytes(&stored).expect("snapshot decodes"),
+            snapshot
+        );
+
+        // (b) The cursor advanced past the hostile op.
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the hostile op"
+        );
+
+        service.shutdown().await;
     }
 }
