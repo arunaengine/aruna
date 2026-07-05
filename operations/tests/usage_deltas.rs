@@ -604,6 +604,7 @@ async fn aborted_multipart_upload_leaves_counters_untouched() {
 // would push a group's realm-wide logical_bytes above the resolved ceiling.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 async fn try_put_object(
     h: &Harness,
     bucket: &str,
@@ -850,6 +851,7 @@ async fn delete_object_is_never_gated_by_quota() {
     assert_matches_rebuild(&h.driver).await;
 }
 
+#[allow(clippy::result_large_err)]
 async fn try_complete_multipart(
     h: &Harness,
     bucket: &str,
