@@ -15,6 +15,9 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
+use aruna_operations::s3::delete_object::{
+    DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
+};
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -122,6 +125,31 @@ async fn put_object(
             checksum_type: None,
             exists: false,
             version_source: None,
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+}
+
+async fn delete_object(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    group_id: Ulid,
+    version_id: Option<Ulid>,
+) -> DeleteObjectResult {
+    drive(
+        DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            group_id,
+            realm_id: h.realm_id,
+            node_id: h.node_id,
+            deleted_by: h.created_by,
         }),
         &h.driver,
     )
@@ -304,6 +332,88 @@ async fn overwrite_put_same_content_double_counts_logical_bytes() {
     assert_eq!(global.stored_blobs, 1);
     assert_eq!(global.stored_bytes, data.len() as u64);
     assert_eq!(global.logical_bytes, 2 * data.len() as u64);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn delete_marker_drops_object_but_keeps_logical_bytes() {
+    let h = setup().await;
+    let group_id = Ulid::new();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let data = b"payload";
+    put_object(&h, "bucket", "obj.txt", group_id, data).await;
+
+    // A versioned delete (version_id: None) writes a delete marker over the live
+    // head: the object stops being live but its materialized version and stored
+    // blob remain, so only the object count drops.
+    let result = delete_object(&h, "bucket", "obj.txt", group_id, None).await;
+    assert!(result.delete_marker);
+
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 0);
+    assert_eq!(global.stored_blobs, 1);
+    assert_eq!(global.stored_bytes, data.len() as u64);
+    assert_eq!(global.logical_bytes, data.len() as u64);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 0);
+    assert_eq!(group.logical_bytes, data.len() as u64);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn put_over_delete_marker_revives_object() {
+    let h = setup().await;
+    let group_id = Ulid::new();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let first = b"first-body";
+    let second = b"second-body-2";
+    put_object(&h, "bucket", "obj.txt", group_id, first).await;
+    delete_object(&h, "bucket", "obj.txt", group_id, None).await;
+    put_object(&h, "bucket", "obj.txt", group_id, second).await;
+
+    // The key is live again. Both materialized versions still count logically and
+    // both distinct blobs are stored; the delete marker contributes nothing.
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 1);
+    assert_eq!(global.stored_blobs, 2);
+    assert_eq!(global.stored_bytes, (first.len() + second.len()) as u64);
+    assert_eq!(global.logical_bytes, (first.len() + second.len()) as u64);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 1);
+    assert_eq!(group.logical_bytes, (first.len() + second.len()) as u64);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn permanent_delete_of_live_version_frees_logical_bytes() {
+    let h = setup().await;
+    let group_id = Ulid::new();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let data = b"payload";
+    let put = put_object(&h, "bucket", "obj.txt", group_id, data).await;
+
+    // A permanent delete by version id removes the only (live) version: the
+    // object and its logical bytes are freed. The content-addressed blob is left
+    // in place, so stored_* are unchanged and the rebuild still counts them.
+    delete_object(&h, "bucket", "obj.txt", group_id, Some(put.version_id)).await;
+
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 0);
+    assert_eq!(global.logical_bytes, 0);
+    assert_eq!(global.stored_blobs, 1);
+    assert_eq!(global.stored_bytes, data.len() as u64);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 0);
+    assert_eq!(group.logical_bytes, 0);
 
     assert_matches_rebuild(&h.driver).await;
 }
