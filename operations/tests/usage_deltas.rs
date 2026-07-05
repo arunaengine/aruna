@@ -7,13 +7,23 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    Backend, BackendConfig, BucketInfo, RealmId, UsageCounters, usage_global_shard_keys,
-    usage_group_key,
+    Backend, BackendConfig, BucketInfo, MultipartChecksumType, RealmId, UsageCounters,
+    usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::types::NodeId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::s3::abort_multipart_upload::{
+    AbortMultipartUploadInput, AbortMultipartUploadOperation,
+};
+use aruna_operations::s3::complete_multipart_upload::{
+    CompleteMultipartPart, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
+    CompleteMultipartUploadResult,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
+use aruna_operations::s3::create_multipart_upload::{
+    CreateMultipartUploadInput, CreateMultipartUploadOperation,
+};
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
@@ -21,6 +31,7 @@ use aruna_operations::s3::delete_object::{
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation, UploadPartResult};
 use aruna_operations::usage_stats::RebuildUsageStatsOperation;
 use aruna_storage::storage;
 use tempfile::TempDir;
@@ -150,6 +161,91 @@ async fn delete_object(
             realm_id: h.realm_id,
             node_id: h.node_id,
             deleted_by: h.created_by,
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+}
+
+async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> Ulid {
+    drive(
+        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            group_id,
+            created_by: h.created_by,
+            checksum_hint: None,
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+    .record
+    .upload_id
+}
+
+async fn upload_part(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    upload_id: Ulid,
+    part_number: u16,
+    bytes: &[u8],
+) -> UploadPartResult {
+    drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id,
+            part_number,
+            content_length: Some(bytes.len() as u64),
+            body: Some(stream_from_bytes(bytes)),
+            created_by: h.created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![],
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+}
+
+async fn complete_upload(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    upload_id: Ulid,
+    parts: &[UploadPartResult],
+    object_size: u64,
+) -> CompleteMultipartUploadResult {
+    drive(
+        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id,
+            realm_id: h.realm_id,
+            node_id: h.node_id,
+            completed_parts: parts
+                .iter()
+                .enumerate()
+                .map(|(idx, part)| CompleteMultipartPart {
+                    part_number: (idx + 1) as u16,
+                    etag: Some(hex::encode(part.location.hashes.get("md5").unwrap())),
+                    expected_checksums: vec![],
+                })
+                .collect(),
+            expected_checksums: vec![],
+            checksum_type: MultipartChecksumType::FullObject,
+            object_size: Some(object_size),
+            created_by: h.created_by,
         }),
         &h.driver,
     )
@@ -414,6 +510,88 @@ async fn permanent_delete_of_live_version_frees_logical_bytes() {
     let group = read_group(&h.driver, group_id).await;
     assert_eq!(group.objects, 0);
     assert_eq!(group.logical_bytes, 0);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn multipart_staging_counts_nothing_until_completion() {
+    let h = setup().await;
+    let group_id = Ulid::new();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let part1 = b"hello ";
+    let part2 = b"world!!";
+    let upload_id = create_upload(&h, "bucket", "big.bin", group_id).await;
+    upload_part(&h, "bucket", "big.bin", upload_id, 1, part1).await;
+    upload_part(&h, "bucket", "big.bin", upload_id, 2, part2).await;
+
+    // Staged parts live outside the content-addressed blob keyspace: an initiated
+    // but never-completed upload contributes nothing to the counters, and the
+    // rebuild (which scans only completed blobs) agrees.
+    let staged = read_global(&h.driver).await;
+    assert_eq!(staged.objects, 0);
+    assert_eq!(staged.stored_blobs, 0);
+    assert_eq!(staged.stored_bytes, 0);
+    assert_eq!(staged.logical_bytes, 0);
+    assert_matches_rebuild(&h.driver).await;
+
+    // Completion charges the object exactly once, for the assembled blob.
+    let part1_result = upload_part(&h, "bucket", "big.bin", upload_id, 1, part1).await;
+    let part2_result = upload_part(&h, "bucket", "big.bin", upload_id, 2, part2).await;
+    let size = (part1.len() + part2.len()) as u64;
+    complete_upload(
+        &h,
+        "bucket",
+        "big.bin",
+        upload_id,
+        &[part1_result, part2_result],
+        size,
+    )
+    .await;
+
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.objects, 1);
+    assert_eq!(global.stored_blobs, 1);
+    assert_eq!(global.stored_bytes, size);
+    assert_eq!(global.logical_bytes, size);
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, 1);
+    assert_eq!(group.logical_bytes, size);
+
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn aborted_multipart_upload_leaves_counters_untouched() {
+    let h = setup().await;
+    let group_id = Ulid::new();
+    create_bucket(&h, "bucket", group_id).await;
+
+    let upload_id = create_upload(&h, "bucket", "abort.bin", group_id).await;
+    upload_part(&h, "bucket", "abort.bin", upload_id, 1, b"discard me").await;
+
+    drive(
+        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "abort.bin".to_string(),
+            upload_id,
+        }),
+        &h.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    // Abort touches no counters; only the bucket remains accounted for.
+    let global = read_global(&h.driver).await;
+    assert_eq!(global.buckets, 1);
+    assert_eq!(global.objects, 0);
+    assert_eq!(global.stored_blobs, 0);
+    assert_eq!(global.stored_bytes, 0);
+    assert_eq!(global.logical_bytes, 0);
 
     assert_matches_rebuild(&h.driver).await;
 }
