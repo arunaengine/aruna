@@ -1,21 +1,37 @@
+use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
-    USAGE_STATS_KEYSPACE,
+    USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta,
-    VersionKey, usage_global_key_for_group, usage_global_shard_index, usage_global_shard_key,
-    usage_global_shard_keys, usage_group_key,
+    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
+    NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, RealmId, USAGE_GLOBAL_KEY,
+    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
+    node_usage_dirty_group_id, node_usage_dirty_group_key, node_usage_global_key,
+    node_usage_group_key, node_usage_group_prefix, node_usage_key_node_id,
+    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
+    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_storage::StorageHandle;
+use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::Duration;
 use thiserror::Error;
+use tracing::warn;
+
+use crate::driver::{DriverContext, drive};
+use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -41,6 +57,7 @@ enum UsageUpdatePhase {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCounterUpdate {
     entries: Vec<(Vec<u8>, UsageDelta)>,
+    dirty_group: GroupId,
     phase: UsageUpdatePhase,
 }
 
@@ -51,6 +68,7 @@ impl UsageCounterUpdate {
                 (usage_global_key_for_group(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
+            dirty_group: group_id,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -65,8 +83,27 @@ impl UsageCounterUpdate {
                 (usage_global_key_for_group(group_id), global_delta),
                 (usage_group_key(group_id), group_delta),
             ],
+            dirty_group: group_id,
             phase: UsageUpdatePhase::Pending,
         }
+    }
+
+    /// Writes, in the same transaction as the counter update, the dirty markers
+    /// the debounced publisher scans to rebuild and distribute node snapshots.
+    fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
+        let marker = ByteView::from(&[][..]);
+        vec![
+            (
+                USAGE_NODE_STATS_KEYSPACE.to_string(),
+                ByteView::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+                marker.clone(),
+            ),
+            (
+                USAGE_NODE_STATS_KEYSPACE.to_string(),
+                ByteView::from(node_usage_dirty_group_key(self.dirty_group)),
+                marker,
+            ),
+        ]
     }
 
     pub fn is_noop(&self) -> bool {
@@ -97,7 +134,7 @@ impl UsageCounterUpdate {
                 UsageUpdatePhase::Reading,
                 Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => {
-                let mut writes = Vec::with_capacity(self.entries.len());
+                let mut writes = Vec::with_capacity(self.entries.len() + 2);
                 for ((key, delta), (_, value)) in self.entries.iter().zip(values) {
                     let mut counters = match value {
                         Some(value) => UsageCounters::from_bytes(value.as_ref())?,
@@ -110,6 +147,7 @@ impl UsageCounterUpdate {
                         counters.to_bytes()?.into(),
                     ));
                 }
+                writes.extend(self.dirty_marker_writes());
                 self.phase = UsageUpdatePhase::Writing;
                 Ok(Some(smallvec![Effect::Storage(
                     StorageEffect::BatchWrite {
@@ -695,6 +733,458 @@ impl Operation for RebuildUsageStatsOperation {
     }
 }
 
+/// Debounce window for the coalesced node-usage snapshot publisher. `ShortenTimer`
+/// makes the timer fire this long after the *first* dirty write of a burst and
+/// keeps every later write inside the same window, so bursts collapse into one
+/// publish run with bounded latency.
+pub const USAGE_SNAPSHOT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Schedules (or shortens toward) the debounced snapshot publish task.
+pub fn schedule_usage_snapshot_publish_effect() -> Effect {
+    Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishUsageSnapshots,
+        after: USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+    })
+}
+
+/// Groups/global scope touched by a publish run, so callers can refresh exactly
+/// the affected realm summary cache entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishedUsage {
+    pub global: bool,
+    pub groups: Vec<GroupId>,
+}
+
+impl PublishedUsage {
+    pub fn is_empty(&self) -> bool {
+        !self.global && self.groups.is_empty()
+    }
+
+    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentSyncTarget> {
+        let mut targets = Vec::with_capacity(self.groups.len() + usize::from(self.global));
+        if self.global {
+            targets.push(DocumentSyncTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: None,
+            });
+        }
+        for group_id in &self.groups {
+            targets.push(DocumentSyncTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: Some(*group_id),
+            });
+        }
+        targets
+    }
+}
+
+/// Which realm-wide counter a caller wants to read from the summed cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealmUsageScope {
+    Global,
+    Group(GroupId),
+}
+
+async fn iter_all(
+    storage: &StorageHandle,
+    key_space: &str,
+    prefix: Option<Key>,
+) -> Result<Vec<(Key, Value)>, String> {
+    let mut collected = Vec::new();
+    let mut start = None;
+    loop {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: prefix.clone(),
+                start: start.map(IterStart::After),
+                limit: 1_000,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => {
+                collected.extend(values);
+                match next_start_after {
+                    Some(next) => start = Some(next),
+                    None => break,
+                }
+            }
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected iter event: {other:?}")),
+        }
+    }
+    Ok(collected)
+}
+
+async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
+    let reads = usage_global_shard_keys()
+        .into_iter()
+        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+        .collect();
+    match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            let mut total = UsageCounters::default();
+            for (_, value) in values {
+                if let Some(bytes) = value {
+                    let counters =
+                        UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?;
+                    total.add(&counters).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(total)
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected global read event: {other:?}")),
+    }
+}
+
+async fn read_local_group(
+    storage: &StorageHandle,
+    group_id: GroupId,
+) -> Result<UsageCounters, String> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(usage_group_key(group_id)),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Ok(UsageCounters::default())
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected group read event: {other:?}")),
+    }
+}
+
+/// Sums remote nodes' snapshots under `prefix`, skipping the local node's own
+/// snapshot so it is never double-counted against the live local counters.
+async fn sum_remote_snapshots(
+    storage: &StorageHandle,
+    prefix: Vec<u8>,
+    local_node_id: NodeId,
+) -> Result<UsageCounters, String> {
+    let entries = iter_all(storage, USAGE_NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
+    let mut total = UsageCounters::default();
+    for (key, value) in entries {
+        if node_usage_key_node_id(key.as_ref()) == Some(local_node_id) {
+            continue;
+        }
+        let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+    }
+    Ok(total)
+}
+
+/// Rebuilds this node's snapshot documents from live local counters and
+/// distributes them over the sync layer. In dirty mode only groups with a
+/// pending marker are refreshed; in full mode every group plus the global total
+/// is republished (used at startup and after a counter rebuild).
+pub async fn publish_usage_snapshots(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    full: bool,
+) -> Result<PublishedUsage, String> {
+    let storage = &ctx.storage_handle;
+
+    let dirty = iter_all(
+        storage,
+        USAGE_NODE_STATS_KEYSPACE,
+        Some(Key::from(NODE_USAGE_DIRTY_PREFIX.to_vec())),
+    )
+    .await?;
+    let marker_keys: Vec<Key> = dirty.iter().map(|(key, _)| key.clone()).collect();
+
+    let mut groups: BTreeSet<GroupId> = BTreeSet::new();
+    let mut global = false;
+    for (key, _) in &dirty {
+        if key.as_ref() == NODE_USAGE_DIRTY_GLOBAL_KEY {
+            global = true;
+        } else if let Some(group_id) = node_usage_dirty_group_id(key.as_ref()) {
+            groups.insert(group_id);
+        }
+    }
+
+    if full {
+        global = true;
+        for (key, _) in iter_all(
+            storage,
+            USAGE_STATS_KEYSPACE,
+            Some(Key::from(b"group/".to_vec())),
+        )
+        .await?
+        {
+            if let Some(rest) = key.as_ref().strip_prefix(b"group/")
+                && let Ok(bytes) = <[u8; 16]>::try_from(rest)
+            {
+                groups.insert(GroupId::from_bytes(bytes));
+            }
+        }
+    }
+
+    if !global && groups.is_empty() {
+        return Ok(PublishedUsage::default());
+    }
+
+    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
+    if global {
+        let counters = read_local_global(storage).await?;
+        let snapshot = NodeUsageSnapshot { node_id, counters };
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(node_usage_global_key(node_id)),
+            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
+        ));
+    }
+    let group_list: Vec<GroupId> = groups.into_iter().collect();
+    for group_id in &group_list {
+        let counters = read_local_group(storage, *group_id).await?;
+        let snapshot = NodeUsageSnapshot { node_id, counters };
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(node_usage_group_key(*group_id, node_id)),
+            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
+        ));
+    }
+
+    commit_snapshot_writes(storage, writes, marker_keys).await?;
+
+    let published = PublishedUsage {
+        global,
+        groups: group_list,
+    };
+    let targets = published.targets(realm_id, node_id);
+    if let Err(error) = drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents: targets,
+        }),
+        ctx,
+    )
+    .await
+    {
+        warn!(error = ?error, "Failed to queue node usage snapshot replication");
+    }
+
+    Ok(published)
+}
+
+/// Writes the refreshed snapshot documents and clears the consumed dirty markers
+/// in a single transaction. New markers set concurrently keep their own entries
+/// for the next run.
+async fn commit_snapshot_writes(
+    storage: &StorageHandle,
+    writes: Vec<(String, Key, Value)>,
+    marker_keys: Vec<Key>,
+) -> Result<(), String> {
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        return Err("failed to start snapshot publish transaction".to_string());
+    };
+
+    if !writes.is_empty() {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => {
+                storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(format!("snapshot write failed: {other:?}"));
+            }
+        }
+    }
+    if !marker_keys.is_empty() {
+        let deletes = marker_keys
+            .into_iter()
+            .map(|key| (USAGE_NODE_STATS_KEYSPACE.to_string(), key))
+            .collect();
+        match storage
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            other => {
+                storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(format!("dirty marker delete failed: {other:?}"));
+            }
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(format!("snapshot publish commit failed: {other:?}")),
+    }
+}
+
+/// Recomputes the persisted realm-wide summed cache for the requested scopes:
+/// realm total = live local counters + every remote node's snapshot.
+pub async fn recompute_realm_usage_summary(
+    ctx: &DriverContext,
+    local_node_id: NodeId,
+    include_global: bool,
+    groups: Vec<GroupId>,
+) -> Result<(), String> {
+    let storage = &ctx.storage_handle;
+    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
+
+    if include_global {
+        let total = realm_global_usage(storage, local_node_id).await?;
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
+            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+        ));
+    }
+    for group_id in groups {
+        let total = realm_group_usage(storage, local_node_id, group_id).await?;
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(node_usage_summary_group_key(group_id)),
+            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+        ));
+    }
+
+    if writes.is_empty() {
+        return Ok(());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected summary write event: {other:?}")),
+    }
+}
+
+async fn realm_global_usage(
+    storage: &StorageHandle,
+    local_node_id: NodeId,
+) -> Result<UsageCounters, String> {
+    let mut total = read_local_global(storage).await?;
+    let remote =
+        sum_remote_snapshots(storage, NODE_USAGE_GLOBAL_PREFIX.to_vec(), local_node_id).await?;
+    total.add(&remote).map_err(|e| e.to_string())?;
+    Ok(total)
+}
+
+async fn realm_group_usage(
+    storage: &StorageHandle,
+    local_node_id: NodeId,
+    group_id: GroupId,
+) -> Result<UsageCounters, String> {
+    let mut total = read_local_group(storage, group_id).await?;
+    let remote =
+        sum_remote_snapshots(storage, node_usage_group_prefix(group_id), local_node_id).await?;
+    total.add(&remote).map_err(|e| e.to_string())?;
+    Ok(total)
+}
+
+/// Reads the realm-wide total from the summed cache, falling back to an
+/// on-the-fly recompute when the cache entry has not been materialized yet.
+pub async fn load_realm_usage(
+    ctx: &DriverContext,
+    local_node_id: NodeId,
+    scope: RealmUsageScope,
+) -> Result<UsageCounters, String> {
+    let storage = &ctx.storage_handle;
+    let cache_key = match scope {
+        RealmUsageScope::Global => Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
+        RealmUsageScope::Group(group_id) => Key::from(node_usage_summary_group_key(group_id)),
+    };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key: cache_key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => match scope {
+            RealmUsageScope::Global => realm_global_usage(storage, local_node_id).await,
+            RealmUsageScope::Group(group_id) => {
+                realm_group_usage(storage, local_node_id, group_id).await
+            }
+        },
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected realm usage read event: {other:?}")),
+    }
+}
+
+/// Re-arms the debounced publish task when dirty markers survived a restart.
+pub async fn restore_usage_snapshot_publish_timer(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+) {
+    let has_markers = match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(Key::from(NODE_USAGE_DIRTY_PREFIX.to_vec())),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan node usage dirty markers");
+            return;
+        }
+        other => {
+            warn!(event = ?other, "Unexpected event while scanning node usage dirty markers");
+            return;
+        }
+    };
+    if has_markers
+        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(schedule_usage_snapshot_publish_effect())
+            .await
+    {
+        warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1624,270 @@ mod tests {
         );
         assert!(
             read_optional_counters(&ctx, usage_global_shard_key(0))
+                .await
+                .is_some()
+        );
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    async fn read_node_stat(ctx: &DriverContext, key: Vec<u8>) -> Option<Vec<u8>> {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: key.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|b| b.to_vec()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    async fn write_node_stat(ctx: &DriverContext, key: Vec<u8>, value: Vec<u8>) {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_update_writes_dirty_markers_in_transaction() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::new();
+
+        drive(
+            CreateBucketOperation::new(
+                "counted".to_string(),
+                BucketInfo {
+                    group_id,
+                    created_at: SystemTime::now(),
+                    created_by: Default::default(),
+                    cors_configuration: None,
+                },
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
+        assert!(
+            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_consumes_markers_and_writes_snapshots() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let node_id = node(1);
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let group_id = Ulid::new();
+
+        let counters = UsageCounters {
+            buckets: 1,
+            logical_bytes: 10,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, usage_group_key(group_id), counters).await;
+        write_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(), Vec::new()).await;
+        write_node_stat(&ctx, node_usage_dirty_group_key(group_id), Vec::new()).await;
+
+        let published = publish_usage_snapshots(&ctx, node_id, realm_id, false)
+            .await
+            .unwrap();
+        assert!(published.global);
+        assert_eq!(published.groups, vec![group_id]);
+
+        // Markers were consumed.
+        assert!(
+            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_none()
+        );
+        assert!(
+            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+                .await
+                .is_none()
+        );
+
+        // Snapshot documents were written under this node's keys.
+        let global = NodeUsageSnapshot::from_bytes(
+            &read_node_stat(&ctx, node_usage_global_key(node_id))
+                .await
+                .expect("global snapshot written"),
+        )
+        .unwrap();
+        assert_eq!(global.node_id, node_id);
+        assert_eq!(global.counters.logical_bytes, 10);
+        let group = NodeUsageSnapshot::from_bytes(
+            &read_node_stat(&ctx, node_usage_group_key(group_id, node_id))
+                .await
+                .expect("group snapshot written"),
+        )
+        .unwrap();
+        assert_eq!(group.counters.logical_bytes, 10);
+    }
+
+    #[tokio::test]
+    async fn realm_summary_sums_local_and_remote_excluding_own_snapshot() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let local = node(1);
+        let remote = node(2);
+        let group_id = Ulid::new();
+
+        let local_counters = UsageCounters {
+            logical_bytes: 10,
+            objects: 1,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_global_key_for_group(group_id), local_counters).await;
+        write_counters(&ctx, usage_group_key(group_id), local_counters).await;
+
+        let remote_snapshot = |counters| NodeUsageSnapshot {
+            node_id: remote,
+            counters,
+        };
+        let remote_counters = UsageCounters {
+            logical_bytes: 5,
+            objects: 1,
+            ..Default::default()
+        };
+        write_node_stat(
+            &ctx,
+            node_usage_global_key(remote),
+            remote_snapshot(remote_counters).to_bytes().unwrap(),
+        )
+        .await;
+        write_node_stat(
+            &ctx,
+            node_usage_group_key(group_id, remote),
+            remote_snapshot(remote_counters).to_bytes().unwrap(),
+        )
+        .await;
+        // This node's own stale snapshot must be ignored in favor of live counters.
+        write_node_stat(
+            &ctx,
+            node_usage_global_key(local),
+            NodeUsageSnapshot {
+                node_id: local,
+                counters: UsageCounters {
+                    logical_bytes: 999,
+                    ..Default::default()
+                },
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        recompute_realm_usage_summary(&ctx, local, true, vec![group_id])
+            .await
+            .unwrap();
+
+        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+            .await
+            .unwrap();
+        assert_eq!(global.logical_bytes, 15);
+        assert_eq!(global.objects, 2);
+        let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
+            .await
+            .unwrap();
+        assert_eq!(group.logical_bytes, 15);
+        assert_eq!(group.objects, 2);
+    }
+
+    #[tokio::test]
+    async fn load_realm_usage_falls_back_to_on_the_fly_recompute() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let local = node(1);
+        let remote = node(2);
+
+        write_counters(
+            &ctx,
+            usage_global_shard_key(0),
+            UsageCounters {
+                logical_bytes: 3,
+                ..Default::default()
+            },
+        )
+        .await;
+        write_node_stat(
+            &ctx,
+            node_usage_global_key(remote),
+            NodeUsageSnapshot {
+                node_id: remote,
+                counters: UsageCounters {
+                    logical_bytes: 4,
+                    ..Default::default()
+                },
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        // No summary/global cache entry exists, so the read recomputes on the fly.
+        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+            .await
+            .unwrap();
+        assert_eq!(global.logical_bytes, 7);
+    }
+
+    #[tokio::test]
+    async fn rebuild_leaves_node_usage_keyspace_intact() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let remote = node(2);
+        let snapshot_key = node_usage_global_key(remote);
+        let snapshot = NodeUsageSnapshot {
+            node_id: remote,
+            counters: UsageCounters {
+                logical_bytes: 42,
+                ..Default::default()
+            },
+        };
+        write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
+        write_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
+
+        drive(RebuildUsageStatsOperation::new(), &ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            read_node_stat(&ctx, snapshot_key).await,
+            Some(snapshot.to_bytes().unwrap())
+        );
+        assert!(
+            read_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );

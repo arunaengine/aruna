@@ -58,7 +58,7 @@ pub async fn announce_core_documents(
     let driver_ctx = driver_ctx.clone();
     let realm_id = *realm_id;
     tokio::spawn(async move {
-        let documents = match core_document_targets(&driver_ctx, realm_id).await {
+        let documents = match core_document_targets(&driver_ctx, node_id, realm_id).await {
             Ok(documents) => documents,
             Err(error) => {
                 warn!(error = %error, "Failed to collect core documents for replication");
@@ -92,11 +92,19 @@ pub async fn announce_core_documents(
 
 async fn core_document_targets(
     driver_ctx: &DriverContext,
+    node_id: NodeId,
     realm_id: aruna_core::structs::RealmId,
 ) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
     let mut documents = vec![
         DocumentSyncTarget::RealmAuthorization { realm_id },
         DocumentSyncTarget::RealmConfig { realm_id },
+        // Announce the shared realm-scoped node-usage topic so every realm node
+        // subscribes to it and receives all peers' usage snapshots.
+        DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        },
     ];
 
     match driver_ctx

@@ -306,6 +306,22 @@ impl AnnounceTopicOperation {
                     kind: DocumentSyncChangeKind::Upsert,
                 })
             }
+            // Node usage snapshots are single-writer per key and applied as plain
+            // upserts (last event wins), so the change only needs a monotonic
+            // wall-clock generation from this node.
+            DocumentSyncTarget::NodeUsage { .. } => {
+                let now = aruna_core::util::unix_timestamp_millis();
+                Ok(DocumentSyncChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: now,
+                        event_id: Ulid::new(),
+                        actor: self.local_node_id,
+                        updated_at_ms: now,
+                    },
+                    kind: DocumentSyncChangeKind::Upsert,
+                })
+            }
         }
     }
 
