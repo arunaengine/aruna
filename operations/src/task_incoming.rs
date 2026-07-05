@@ -44,9 +44,8 @@ use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
-    NOTIFICATION_OUTBOX_MAX_PAGES_PER_DRAIN, NOTIFICATION_OUTBOX_RETENTION_MS,
-    delete_notification_outbox_records, read_notification_outbox_batch,
-    restore_notification_outbox_timer,
+    NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
+    read_notification_outbox_batch, restore_notification_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
@@ -727,7 +726,10 @@ impl OperationsTaskHandler {
         // holder already found unreachable are marked retry without another RPC.
         let mut failed_holders: HashSet<aruna_core::NodeId> = HashSet::new();
 
-        for _ in 0..NOTIFICATION_OUTBOX_MAX_PAGES_PER_DRAIN {
+        // Scan the whole outbox every run, not a fixed page count: a healthy
+        // holder's records must be attempted regardless of how many retry-marked
+        // rows (e.g. a dead holder's backlog) sit ahead of them in the FIFO.
+        loop {
             let batch = match read_notification_outbox_batch(
                 &self.context.storage_handle,
                 start_after.clone(),

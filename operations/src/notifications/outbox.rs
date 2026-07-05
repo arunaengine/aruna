@@ -13,7 +13,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 pub const NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE: usize = 512;
-pub const NOTIFICATION_OUTBOX_MAX_PAGES_PER_DRAIN: usize = 8;
 pub const NOTIFICATION_DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const NOTIFICATION_OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
