@@ -93,6 +93,10 @@ pub struct RoleResponse {
     /// Only present when the caller is a member of the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_users: Option<Vec<String>>,
+    /// True when the role applies to every principal, including anonymous
+    /// requests (it is assigned to the Everyone principal).
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -123,6 +127,10 @@ pub struct CreateGroupRoleRequest {
     pub permissions: HashMap<String, String>,
     #[serde(default)]
     pub assigned_users: Vec<String>,
+    /// Public roles apply to every principal — including anonymous requests —
+    /// by assigning the Everyone principal (the nil user id).
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -216,14 +224,21 @@ fn map_roles_with_visibility(
         .into_iter()
         .map(|(role_id, role)| RoleResponse {
             role_id: role_id.to_string(),
-            name: role.name,
+            name: role.name.clone(),
             permissions: role
                 .permissions
                 .iter()
                 .map(|(k, v)| (k.clone(), v.to_string()))
                 .collect(),
-            assigned_users: include_members
-                .then(|| role.assigned_users.iter().map(|u| u.to_string()).collect()),
+            public: role.is_public(),
+            // The Everyone principal is surfaced via `public`, not as a member.
+            assigned_users: include_members.then(|| {
+                role.assigned_users
+                    .iter()
+                    .filter(|u| !u.user_ulid.is_nil())
+                    .map(|u| u.to_string())
+                    .collect()
+            }),
         })
         .collect()
 }
@@ -867,11 +882,14 @@ pub async fn create_group_role(
         permissions.insert(path.clone(), permission);
     }
 
-    let assigned_users = request
+    let mut assigned_users = request
         .assigned_users
         .iter()
         .map(|user_id| parse_user_id(user_id))
         .collect::<ServerResult<HashSet<UserId>>>()?;
+    if request.public {
+        assigned_users.insert(UserId::nil(realm_id));
+    }
 
     let role_id = Ulid::new();
     let (_, auth_doc) = drive(
