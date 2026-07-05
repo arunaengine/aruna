@@ -162,10 +162,6 @@ pub struct QuotaConfig {
     pub group_overrides: Vec<GroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
-    /// Added after the initial `QuotaConfig` shape. `#[serde(default)]` lets JSON
-    /// reducer state persisted before this field materialize; the postcard wire
-    /// shape is handled by the legacy fallback in `RealmConfigDocument::from_bytes`.
-    #[serde(default)]
     pub max_devices_per_user: Option<u32>,
 }
 
@@ -394,17 +390,7 @@ impl RealmConfigDocument {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        // Try the current wire shape first; fall back to the pre-`max_devices_per_user`
-        // layout so realm configs persisted by an earlier build still decode. This
-        // repo is pre-GA (issue #286 will add real format versioning), so a minimal
-        // try-then-legacy chain with no on-wire version tag is sufficient.
-        match postcard::from_bytes::<Self>(bytes) {
-            Ok(document) => Ok(document),
-            Err(_) => {
-                let legacy: LegacyRealmConfigDocument = postcard::from_bytes(bytes)?;
-                Ok(legacy.into())
-            }
-        }
+        Ok(postcard::from_bytes(bytes)?)
     }
 
     pub fn reconcile_bytes(
@@ -414,61 +400,6 @@ impl RealmConfigDocument {
     ) -> Result<Vec<u8>, ConversionError> {
         let _ = (current, actor);
         Ok(postcard::to_allocvec(self)?)
-    }
-}
-
-/// Pre-`max_devices_per_user` mirror of [`QuotaConfig`], used only to decode
-/// realm configs persisted before that field existed. Keep field order identical
-/// to the historical layout.
-#[derive(Deserialize)]
-struct LegacyQuotaConfig {
-    default_group_quota_bytes: Option<u64>,
-    grace_factor_percent: u32,
-    warn_threshold_percent: u32,
-    group_overrides: Vec<GroupQuotaOverride>,
-    max_groups_per_user: Option<u32>,
-    user_group_cap_overrides: Vec<UserGroupCapOverride>,
-}
-
-impl From<LegacyQuotaConfig> for QuotaConfig {
-    fn from(legacy: LegacyQuotaConfig) -> Self {
-        Self {
-            default_group_quota_bytes: legacy.default_group_quota_bytes,
-            grace_factor_percent: legacy.grace_factor_percent,
-            warn_threshold_percent: legacy.warn_threshold_percent,
-            group_overrides: legacy.group_overrides,
-            max_groups_per_user: legacy.max_groups_per_user,
-            user_group_cap_overrides: legacy.user_group_cap_overrides,
-            max_devices_per_user: None,
-        }
-    }
-}
-
-/// Pre-`max_devices_per_user` mirror of [`RealmConfigDocument`] (only the `quota`
-/// field differs). Used as the postcard fallback in
-/// [`RealmConfigDocument::from_bytes`].
-#[derive(Deserialize)]
-struct LegacyRealmConfigDocument {
-    realm_id: RealmId,
-    metadata_replication: MetadataReplicationConfig,
-    oidc_providers: Vec<OidcProviderConfig>,
-    discovery: RealmDiscoveryConfig,
-    nodes: Vec<RealmNode>,
-    quota: LegacyQuotaConfig,
-    description: String,
-}
-
-impl From<LegacyRealmConfigDocument> for RealmConfigDocument {
-    fn from(legacy: LegacyRealmConfigDocument) -> Self {
-        Self {
-            realm_id: legacy.realm_id,
-            metadata_replication: legacy.metadata_replication,
-            oidc_providers: legacy.oidc_providers,
-            discovery: legacy.discovery,
-            nodes: legacy.nodes,
-            quota: legacy.quota.into(),
-            description: legacy.description,
-        }
     }
 }
 
@@ -614,81 +545,6 @@ mod test {
         let restored = RealmConfigDocument::from_bytes(&bytes).expect("from bytes");
 
         assert_eq!(document, restored);
-    }
-
-    #[test]
-    fn from_bytes_decodes_legacy_pre_max_devices_quota() {
-        use serde::Serialize;
-
-        #[derive(Serialize)]
-        struct LegacyQuota {
-            default_group_quota_bytes: Option<u64>,
-            grace_factor_percent: u32,
-            warn_threshold_percent: u32,
-            group_overrides: Vec<super::GroupQuotaOverride>,
-            max_groups_per_user: Option<u32>,
-            user_group_cap_overrides: Vec<super::UserGroupCapOverride>,
-        }
-
-        #[derive(Serialize)]
-        struct LegacyDoc {
-            realm_id: RealmId,
-            metadata_replication: super::MetadataReplicationConfig,
-            oidc_providers: Vec<OidcProviderConfig>,
-            discovery: RealmDiscoveryConfig,
-            nodes: Vec<super::RealmNode>,
-            quota: LegacyQuota,
-            description: String,
-        }
-
-        let legacy = LegacyDoc {
-            realm_id: RealmId::from_bytes([3u8; 32]),
-            metadata_replication: super::MetadataReplicationConfig::new(3),
-            oidc_providers: Vec::new(),
-            discovery: default_realm_discovery_config(),
-            nodes: Vec::new(),
-            quota: LegacyQuota {
-                default_group_quota_bytes: Some(4_096),
-                grace_factor_percent: 110,
-                warn_threshold_percent: 85,
-                group_overrides: vec![super::GroupQuotaOverride {
-                    group_id: Ulid::from_bytes([2u8; 16]),
-                    quota_bytes: Some(1_000),
-                    grace_factor_percent: Some(120),
-                }],
-                max_groups_per_user: Some(3),
-                user_group_cap_overrides: Vec::new(),
-            },
-            description: "Legacy Realm".to_string(),
-        };
-
-        let bytes = postcard::to_allocvec(&legacy).expect("legacy postcard encode");
-        let restored = RealmConfigDocument::from_bytes(&bytes).expect("legacy config decodes");
-
-        assert_eq!(restored.realm_id, RealmId::from_bytes([3u8; 32]));
-        assert_eq!(restored.quota.default_group_quota_bytes, Some(4_096));
-        assert_eq!(restored.quota.group_overrides.len(), 1);
-        assert_eq!(restored.quota.max_groups_per_user, Some(3));
-        assert_eq!(restored.quota.max_devices_per_user, None);
-        assert_eq!(restored.description, "Legacy Realm");
-    }
-
-    #[test]
-    fn quota_config_json_tolerates_missing_max_devices_per_user() {
-        // JSON reducer state persisted before `max_devices_per_user` existed must
-        // still materialize via `#[serde(default)]`.
-        let legacy_json = r#"{
-            "default_group_quota_bytes": 4096,
-            "grace_factor_percent": 110,
-            "warn_threshold_percent": 85,
-            "group_overrides": [],
-            "max_groups_per_user": 3,
-            "user_group_cap_overrides": []
-        }"#;
-        let quota: super::QuotaConfig =
-            serde_json::from_str(legacy_json).expect("legacy quota json decodes");
-        assert_eq!(quota.default_group_quota_bytes, Some(4_096));
-        assert_eq!(quota.max_devices_per_user, None);
     }
 
     #[test]
