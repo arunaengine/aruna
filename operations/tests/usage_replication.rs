@@ -364,7 +364,6 @@ async fn bootstrap_node_usage_genesis(
         sleep(Duration::from_millis(50)).await;
     }
 }
-
 async fn read_node_stats(node: &TestNode, key: Vec<u8>) -> Option<Vec<u8>> {
     match node
         .context
