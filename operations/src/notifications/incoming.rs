@@ -1,0 +1,554 @@
+use aruna_core::NodeId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_net::NetHandle;
+use aruna_net::streams::BiStream;
+use byteview::ByteView;
+use tracing::{debug, warn};
+
+use crate::driver::DriverContext;
+use crate::notifications::client::{
+    close_stream, drain_request_stream, read_message, write_message,
+};
+use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
+
+#[tracing::instrument(
+    name = "notifications.incoming.stream",
+    level = "debug",
+    skip(context, stream),
+    fields(peer = %peer)
+)]
+pub async fn handle_notification_stream(
+    context: &DriverContext,
+    mut stream: BiStream,
+    peer: NodeId,
+) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        warn!(peer = %peer, "Dropping inbound notification stream without net handle");
+        return;
+    };
+
+    let message = match read_message(&mut stream).await {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(peer = %peer, error = %error, "Failed to read notification message");
+            return;
+        }
+    };
+    debug!(peer = %peer, message = notification_message_kind(&message), "Received notification message");
+
+    let response = build_response(context, net_handle, peer, message).await;
+
+    if let Err(error) = drain_request_stream(&mut stream).await {
+        warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
+    }
+    if let Err(error) = write_message(&mut stream, &response).await {
+        warn!(peer = %peer, error = %error, "Failed to write notification response");
+    }
+    close_stream(&mut stream).await;
+}
+
+async fn build_response(
+    context: &DriverContext,
+    net_handle: &NetHandle,
+    peer: NodeId,
+    message: NotificationTransportMessage,
+) -> NotificationTransportMessage {
+    let realm_id = match message_realm(&message) {
+        Ok(realm_id) => realm_id,
+        Err(reason) => return NotificationTransportMessage::Reject(reason),
+    };
+    if let Err(reason) = authorize_peer(context, net_handle, peer, realm_id).await {
+        return NotificationTransportMessage::Reject(reason);
+    }
+
+    match message {
+        NotificationTransportMessage::DeliverBatch { records } => {
+            match upsert_inbox_records(&context.storage_handle, &records).await {
+                Ok(written) => NotificationTransportMessage::DeliverAck {
+                    written: written as u32,
+                },
+                Err(error) => NotificationTransportMessage::Reject(error),
+            }
+        }
+        NotificationTransportMessage::List { .. }
+        | NotificationTransportMessage::UnreadCount { .. }
+        | NotificationTransportMessage::MarkRead { .. } => {
+            NotificationTransportMessage::Reject("unsupported notification request".to_string())
+        }
+        NotificationTransportMessage::DeliverAck { .. }
+        | NotificationTransportMessage::ListResult { .. }
+        | NotificationTransportMessage::UnreadCountResult { .. }
+        | NotificationTransportMessage::MarkReadResult { .. }
+        | NotificationTransportMessage::Reject(_) => NotificationTransportMessage::Reject(
+            "unexpected notification control message".to_string(),
+        ),
+    }
+}
+
+// The recipient realm is peer-asserted; an empty DeliverBatch has no record to
+// derive it from and must be rejected before any indexing.
+fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, String> {
+    match message {
+        NotificationTransportMessage::DeliverBatch { records } => {
+            let Some(first) = records.first() else {
+                return Err("empty batch".to_string());
+            };
+            let realm_id = first.recipient.realm_id;
+            if records
+                .iter()
+                .any(|record| record.recipient.realm_id != realm_id)
+            {
+                return Err("mixed-realm batch".to_string());
+            }
+            Ok(realm_id)
+        }
+        NotificationTransportMessage::List { recipient, .. }
+        | NotificationTransportMessage::UnreadCount { recipient }
+        | NotificationTransportMessage::MarkRead { recipient, .. } => Ok(recipient.realm_id),
+        NotificationTransportMessage::DeliverAck { .. }
+        | NotificationTransportMessage::ListResult { .. }
+        | NotificationTransportMessage::UnreadCountResult { .. }
+        | NotificationTransportMessage::MarkReadResult { .. }
+        | NotificationTransportMessage::Reject(_) => {
+            Err("unexpected notification control message".to_string())
+        }
+    }
+}
+
+// Deliberately stricter than the metadata `has_node` gate: only sync-eligible
+// (server-class) realm nodes are trusted to assert recipient identity.
+async fn authorize_peer(
+    context: &DriverContext,
+    net_handle: &NetHandle,
+    peer: NodeId,
+    realm_id: RealmId,
+) -> Result<(), String> {
+    if realm_id != *net_handle.realm_id() {
+        return Err(format!(
+            "notification peer `{peer}` addressed foreign realm `{realm_id}`"
+        ));
+    }
+    let Some(config) = read_realm_config(context, realm_id).await? else {
+        return Err(format!("realm `{realm_id}` config unavailable"));
+    };
+    let eligible = config
+        .sync_eligible_node_ids()
+        .map_err(|error| error.to_string())?;
+    if eligible.contains(&peer) {
+        Ok(())
+    } else {
+        Err(format!(
+            "notification peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
+        ))
+    }
+}
+
+async fn read_realm_config(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> Result<Option<RealmConfigDocument>, String> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => RealmConfigDocument::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incoming::initialize_net_incoming;
+    use crate::notifications::client::{deliver_remote, send_notification_request};
+    use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, NotificationClass, NotificationKind, NotificationRecord, RealmNodeKind,
+    };
+    use aruna_core::types::UserId;
+    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::FjallStorage;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    struct Node {
+        _dir: TempDir,
+        net: NetHandle,
+        context: Arc<DriverContext>,
+    }
+
+    async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        initialize_net_incoming(context.clone());
+        Node {
+            _dir: dir,
+            net,
+            context,
+        }
+    }
+
+    async fn connect(from: &Node, to: &Node) {
+        from.net.add_peer_addr(to.net.endpoint_addr()).await;
+    }
+
+    async fn install_config(node: &Node, realm_id: RealmId, members: &[(NodeId, RealmNodeKind)]) {
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        for (node_id, kind) in members {
+            config.ensure_node(*node_id, kind.clone());
+        }
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let bytes = config.to_bytes(&actor).expect("config serializes");
+        match node
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write event: {other:?}"),
+        }
+    }
+
+    async fn read_inbox(node: &Node) -> Vec<NotificationRecord> {
+        match node
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1024,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| NotificationRecord::from_bytes(&value).expect("record decodes"))
+                .collect(),
+            other => panic!("unexpected inbox iter event: {other:?}"),
+        }
+    }
+
+    fn record(recipient: UserId, seed: u8) -> NotificationRecord {
+        NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::from_bytes([seed; 16]),
+                actor_user_id: recipient,
+            },
+            1_700_000_000_000 + seed as u64,
+        )
+    }
+
+    #[tokio::test]
+    async fn deliver_remote_upserts_on_holder() {
+        let realm_id = RealmId::from_bytes([40u8; 32]);
+        let a = spawn(realm_id, [40u8; 32]).await;
+        let b = spawn(realm_id, [41u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let mut records = vec![record(recipient, 1), record(recipient, 2)];
+        let written = deliver_remote(&a.net, b.net.node_id(), records.clone())
+            .await
+            .expect("delivery succeeds");
+        assert_eq!(written, records.len() as u32);
+
+        let mut inbox = read_inbox(&b).await;
+        inbox.sort_by_key(|record| record.notification_id);
+        records.sort_by_key(|record| record.notification_id);
+        assert_eq!(inbox, records);
+    }
+
+    #[tokio::test]
+    async fn duplicate_remote_delivery_is_idempotent() {
+        let realm_id = RealmId::from_bytes([42u8; 32]);
+        let a = spawn(realm_id, [42u8; 32]).await;
+        let b = spawn(realm_id, [43u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let records = vec![record(recipient, 1), record(recipient, 2)];
+
+        let first = deliver_remote(&a.net, b.net.node_id(), records.clone())
+            .await
+            .expect("first delivery succeeds");
+        assert_eq!(first, records.len() as u32);
+        let second = deliver_remote(&a.net, b.net.node_id(), records.clone())
+            .await
+            .expect("second delivery succeeds");
+        assert_eq!(second, 0);
+
+        assert_eq!(read_inbox(&b).await.len(), records.len());
+    }
+
+    #[tokio::test]
+    async fn unknown_peer_is_rejected() {
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let a = spawn(realm_id, [44u8; 32]).await;
+        let b = spawn(realm_id, [45u8; 32]).await;
+        let c = spawn(realm_id, [46u8; 32]).await;
+        connect(&c, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
+            .await
+            .expect_err("unknown peer must be rejected");
+        assert!(
+            error.contains("not a sync-eligible node"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_realm_batch_is_rejected() {
+        let realm_id = RealmId::from_bytes([47u8; 32]);
+        let other_realm = RealmId::from_bytes([48u8; 32]);
+        let a = spawn(realm_id, [47u8; 32]).await;
+        let b = spawn(realm_id, [49u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let records = vec![
+            record(UserId::new(Ulid::new(), realm_id), 1),
+            record(UserId::new(Ulid::new(), other_realm), 2),
+        ];
+        let error = deliver_remote(&a.net, b.net.node_id(), records)
+            .await
+            .expect_err("mixed-realm batch must be rejected");
+        assert!(
+            error.contains("mixed-realm batch"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_rejected() {
+        let realm_id = RealmId::from_bytes([50u8; 32]);
+        let a = spawn(realm_id, [50u8; 32]).await;
+        let b = spawn(realm_id, [51u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let response = send_notification_request(
+            &a.net,
+            b.net.node_id(),
+            NotificationTransportMessage::DeliverBatch { records: vec![] },
+        )
+        .await
+        .expect("request completes");
+        assert!(
+            matches!(&response, NotificationTransportMessage::Reject(reason) if reason.contains("empty batch")),
+            "unexpected response: {response:?}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_kind_peer_is_rejected() {
+        let realm_id = RealmId::from_bytes([52u8; 32]);
+        let b = spawn(realm_id, [53u8; 32]).await;
+        let c = spawn(realm_id, [54u8; 32]).await;
+        connect(&c, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (b.net.node_id(), RealmNodeKind::Server),
+                (c.net.node_id(), RealmNodeKind::User),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let deliver_error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
+            .await
+            .expect_err("user-kind peer must be rejected");
+        assert!(
+            deliver_error.contains("not a sync-eligible node"),
+            "unexpected reject reason: {deliver_error}"
+        );
+
+        let list = send_notification_request(
+            &c.net,
+            b.net.node_id(),
+            NotificationTransportMessage::UnreadCount { recipient },
+        )
+        .await
+        .expect("request completes");
+        assert!(
+            matches!(&list, NotificationTransportMessage::Reject(reason) if reason.contains("not a sync-eligible node")),
+            "unexpected response: {list:?}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_path_messages_are_rejected_for_now() {
+        let realm_id = RealmId::from_bytes([55u8; 32]);
+        let a = spawn(realm_id, [55u8; 32]).await;
+        let b = spawn(realm_id, [56u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let response = send_notification_request(
+            &a.net,
+            b.net.node_id(),
+            NotificationTransportMessage::List {
+                recipient: UserId::new(Ulid::new(), realm_id),
+                cursor: None,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("request completes");
+        assert!(
+            matches!(&response, NotificationTransportMessage::Reject(reason) if reason.contains("unsupported notification request")),
+            "unexpected response: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_refused() {
+        let realm_id = RealmId::from_bytes([57u8; 32]);
+        let a = spawn(realm_id, [57u8; 32]).await;
+        let b = spawn(realm_id, [58u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let sample = record(recipient, 1);
+        let per_record = postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
+            records: vec![sample.clone(), sample.clone()],
+        })
+        .expect("encodes")
+        .len()
+            - postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
+                records: vec![sample.clone()],
+            })
+            .expect("encodes")
+            .len();
+        let count = crate::notifications::protocol::NOTIFICATION_MAX_MESSAGE_SIZE
+            / per_record.max(1)
+            + 1_000;
+        let records = vec![sample; count];
+
+        let error = deliver_remote(&a.net, b.net.node_id(), records)
+            .await
+            .expect_err("oversized message must be refused");
+        assert!(
+            error.contains("exceeds maximum size"),
+            "unexpected error: {error}"
+        );
+    }
+}
