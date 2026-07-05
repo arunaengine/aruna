@@ -3,17 +3,21 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
 use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
+use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
+use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 
 #[tracing::instrument(
     name = "notifications.incoming.stream",
@@ -74,11 +78,58 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
-        NotificationTransportMessage::List { .. }
-        | NotificationTransportMessage::UnreadCount { .. }
-        | NotificationTransportMessage::MarkRead { .. } => {
-            NotificationTransportMessage::Reject("unsupported notification request".to_string())
-        }
+        NotificationTransportMessage::List {
+            recipient,
+            cursor,
+            limit,
+        } => match drive(
+            ListNotificationsOperation::new(ListNotificationsInput {
+                recipient,
+                cursor,
+                limit: limit as usize,
+            }),
+            context,
+        )
+        .await
+        {
+            Ok(output) => NotificationTransportMessage::ListResult {
+                records: output.records,
+                next_cursor: output.next_cursor,
+            },
+            Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+        },
+        NotificationTransportMessage::UnreadCount { recipient } => match drive(
+            UnreadCountOperation::new(UnreadCountInput { recipient }),
+            context,
+        )
+        .await
+        {
+            Ok(output) => NotificationTransportMessage::UnreadCountResult {
+                count: output.count as u32,
+                capped: output.capped,
+            },
+            Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+        },
+        NotificationTransportMessage::MarkRead {
+            recipient,
+            ids,
+            up_to_ms,
+        } => match drive(
+            MarkReadOperation::new(MarkReadInput {
+                recipient,
+                ids,
+                up_to_ms,
+                now_ms: unix_timestamp_millis(),
+            }),
+            context,
+        )
+        .await
+        {
+            Ok(output) => NotificationTransportMessage::MarkReadResult {
+                marked: output.marked as u32,
+            },
+            Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+        },
         NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
         | NotificationTransportMessage::UnreadCountResult { .. }
@@ -175,7 +226,10 @@ async fn read_realm_config(
 mod tests {
     use super::*;
     use crate::incoming::initialize_net_incoming;
-    use crate::notifications::client::{deliver_remote, send_notification_request};
+    use crate::notifications::client::{
+        deliver_remote, list_remote, mark_read_remote, send_notification_request,
+        unread_count_remote,
+    };
     use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
     use aruna_core::structs::{
         Actor, NotificationClass, NotificationKind, NotificationRecord, RealmNodeKind,
@@ -477,8 +531,15 @@ mod tests {
         assert!(read_inbox(&b).await.is_empty());
     }
 
+    async fn seed_inbox(node: &Node, records: &[NotificationRecord]) {
+        assert_eq!(
+            upsert_inbox_records(&node.context.storage_handle, records).await,
+            Ok(records.len())
+        );
+    }
+
     #[tokio::test]
-    async fn read_path_messages_are_rejected_for_now() {
+    async fn rpc_list_roundtrip() {
         let realm_id = RealmId::from_bytes([55u8; 32]);
         let a = spawn(realm_id, [55u8; 32]).await;
         let b = spawn(realm_id, [56u8; 32]).await;
@@ -493,20 +554,117 @@ mod tests {
         )
         .await;
 
-        let response = send_notification_request(
-            &a.net,
-            b.net.node_id(),
-            NotificationTransportMessage::List {
-                recipient: UserId::new(Ulid::new(), realm_id),
-                cursor: None,
-                limit: 10,
-            },
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let records = vec![
+            record(recipient, 1),
+            record(recipient, 2),
+            record(recipient, 3),
+        ];
+        seed_inbox(&b, &records).await;
+
+        let (page1, cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 2)
+            .await
+            .expect("first page");
+        let cursor = cursor.expect("cursor for second page");
+        let (page2, next) = list_remote(&a.net, b.net.node_id(), recipient, Some(cursor), 2)
+            .await
+            .expect("second page");
+        assert_eq!(next, None);
+
+        let seen: Vec<u64> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|record| record.created_at_ms)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                1_700_000_000_000 + 3,
+                1_700_000_000_000 + 2,
+                1_700_000_000_000 + 1,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_unread_and_mark_read_roundtrip() {
+        let realm_id = RealmId::from_bytes([59u8; 32]);
+        let a = spawn(realm_id, [59u8; 32]).await;
+        let b = spawn(realm_id, [60u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
         )
-        .await
-        .expect("request completes");
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let records = vec![
+            record(recipient, 1),
+            record(recipient, 2),
+            record(recipient, 3),
+        ];
+        seed_inbox(&b, &records).await;
+
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count"),
+            (3, false)
+        );
+
+        let ids: Vec<Ulid> = records
+            .iter()
+            .map(|record| record.notification_id)
+            .collect();
+        assert_eq!(
+            mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
+                .await
+                .expect("mark read"),
+            3
+        );
+        assert_eq!(
+            mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+                .await
+                .expect("mark read again"),
+            0
+        );
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count after"),
+            (0, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_read_path_still_gated() {
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let a = spawn(realm_id, [61u8; 32]).await;
+        let b = spawn(realm_id, [62u8; 32]).await;
+        let c = spawn(realm_id, [63u8; 32]).await;
+        connect(&c, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let error = list_remote(&c.net, b.net.node_id(), recipient, None, 10)
+            .await
+            .expect_err("unknown peer must be rejected on the read path");
         assert!(
-            matches!(&response, NotificationTransportMessage::Reject(reason) if reason.contains("unsupported notification request")),
-            "unexpected response: {response:?}"
+            error.contains("not a sync-eligible node"),
+            "unexpected reject reason: {error}"
         );
     }
 

@@ -1,4 +1,5 @@
 pub mod client;
+pub mod dispatch;
 pub mod emit;
 pub mod inbox;
 pub mod incoming;

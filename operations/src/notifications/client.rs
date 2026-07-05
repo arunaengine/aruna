@@ -3,9 +3,11 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::structs::NotificationRecord;
+use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tokio::time::timeout;
+use ulid::Ulid;
 
 use crate::notifications::protocol::{
     NotificationTransportMessage, read_notification_message, write_notification_message,
@@ -42,6 +44,75 @@ pub async fn deliver_remote(
     .await?
     {
         NotificationTransportMessage::DeliverAck { written } => Ok(written),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn list_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    recipient: UserId,
+    cursor: Option<Vec<u8>>,
+    limit: u32,
+) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::List {
+            recipient,
+            cursor,
+            limit,
+        },
+    )
+    .await?
+    {
+        NotificationTransportMessage::ListResult {
+            records,
+            next_cursor,
+        } => Ok((records, next_cursor)),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn unread_count_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    recipient: UserId,
+) -> Result<(u32, bool), String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::UnreadCount { recipient },
+    )
+    .await?
+    {
+        NotificationTransportMessage::UnreadCountResult { count, capped } => Ok((count, capped)),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn mark_read_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    recipient: UserId,
+    ids: Vec<Ulid>,
+    up_to_ms: Option<u64>,
+) -> Result<u32, String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::MarkRead {
+            recipient,
+            ids,
+            up_to_ms,
+        },
+    )
+    .await?
+    {
+        NotificationTransportMessage::MarkReadResult { marked } => Ok(marked),
         NotificationTransportMessage::Reject(reason) => Err(reason),
         _ => Err("unexpected notification response".to_string()),
     }
