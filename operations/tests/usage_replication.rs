@@ -7,7 +7,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::{
     Actor, BucketInfo, RealmConfigDocument, RealmId, RealmNodeKind, UsageCounters,
-    node_usage_global_key,
+    node_usage_global_key, usage_global_key_for_group, usage_group_key,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
@@ -125,6 +125,122 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
 
     shutdown_nodes(nodes).await;
     Ok(())
+}
+
+// A snapshot carrying every counter field (objects, blobs, stored/logical bytes)
+// is the real ingest hazard: apply must fold it into node B's realm-wide
+// aggregate (which lives in the node-usage keyspace) while leaving B's live
+// incremental counter keyspace (`USAGE_STATS_KEYSPACE`) completely empty.
+#[tokio::test]
+async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([41u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let node_a = &nodes[0];
+    let node_b = &nodes[1];
+    let group_id = Ulid::new();
+
+    // Seed node A's live counters with a full, non-trivial usage total, then let
+    // the real publisher distribute it as node-usage snapshot documents.
+    let rich = UsageCounters {
+        buckets: 2,
+        objects: 5,
+        stored_blobs: 3,
+        stored_bytes: 4096,
+        logical_bytes: 8192,
+    };
+    write_usage_stat(node_a, usage_global_key_for_group(group_id), rich).await;
+    write_usage_stat(node_a, usage_group_key(group_id), rich).await;
+
+    publish_usage_snapshots(
+        node_a.context.as_ref(),
+        node_a.net.node_id(),
+        realm_id,
+        true,
+    )
+    .await?;
+
+    let a_snapshot_key = node_usage_global_key(node_a.net.node_id());
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        let received = read_node_stats(node_b, a_snapshot_key.clone())
+            .await
+            .is_some();
+        let global = load_realm_usage(
+            node_b.context.as_ref(),
+            node_b.net.node_id(),
+            RealmUsageScope::Global,
+        )
+        .await
+        .unwrap_or_default();
+        let group = load_realm_usage(
+            node_b.context.as_ref(),
+            node_b.net.node_id(),
+            RealmUsageScope::Group(group_id),
+        )
+        .await
+        .unwrap_or_default();
+        if received && global.objects == rich.objects && group.objects == rich.objects {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "node B never observed A's rich usage snapshot; received={received} global={global:?} group={group:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Every field of A's snapshot surfaces in B's realm aggregate.
+    let realm_global = load_realm_usage(
+        node_b.context.as_ref(),
+        node_b.net.node_id(),
+        RealmUsageScope::Global,
+    )
+    .await?;
+    assert_eq!(
+        realm_global, rich,
+        "realm global aggregate must equal A's snapshot"
+    );
+    let realm_group = load_realm_usage(
+        node_b.context.as_ref(),
+        node_b.net.node_id(),
+        RealmUsageScope::Group(group_id),
+    )
+    .await?;
+    assert_eq!(
+        realm_group, rich,
+        "realm group aggregate must equal A's snapshot"
+    );
+
+    // Ingest never wrote a single live incremental counter on B.
+    let local_stats = iter_usage_stats(node_b).await;
+    assert!(
+        local_stats.is_empty(),
+        "counter-bearing snapshot ingest must not touch B's live counter keyspace, found {} keys",
+        local_stats.len()
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+async fn write_usage_stat(node: &TestNode, key: Vec<u8>, counters: UsageCounters) {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: key.into(),
+            value: counters.to_bytes().unwrap().into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected usage stat write event: {other:?}"),
+    }
 }
 
 async fn read_node_stats(node: &TestNode, key: Vec<u8>) -> Option<Vec<u8>> {
