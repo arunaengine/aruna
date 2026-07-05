@@ -42,6 +42,9 @@ pub const BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replicati
 pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
 pub const USAGE_NODE_STATS_KEYSPACE: &str = "usage_node_stats";
+pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
+pub const NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
+pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
