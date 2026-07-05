@@ -133,6 +133,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
             name: "escalation".to_string(),
             permissions: HashMap::from([(format!("/{realm_id}/admin/**"), "write".to_string())]),
             assigned_users: Vec::new(),
+            public: false,
         })
         .send()
         .await?;
@@ -149,6 +150,7 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
                 "read".to_string(),
             )]),
             assigned_users: Vec::new(),
+            public: false,
         })
         .send()
         .await?;
