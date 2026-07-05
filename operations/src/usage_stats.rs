@@ -886,10 +886,17 @@ async fn sum_remote_snapshots(
     let entries = iter_all(storage, USAGE_NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
     let mut total = UsageCounters::default();
     for (key, value) in entries {
-        if node_usage_key_node_id(key.as_ref()) == Some(local_node_id) {
+        let key_node_id = node_usage_key_node_id(key.as_ref());
+        if key_node_id == Some(local_node_id) {
             continue;
         }
         let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        // Defensive: ingest ties a snapshot's node id to its storage key, but
+        // never sum one whose embedded node id disagrees with its key so a
+        // misattributed snapshot can never inflate the realm aggregate.
+        if key_node_id != Some(snapshot.node_id) {
+            continue;
+        }
         total.add(&snapshot.counters).map_err(|e| e.to_string())?;
     }
     Ok(total)

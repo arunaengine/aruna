@@ -45,8 +45,9 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeUsageSnapshot,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
+    node_usage_key_node_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -1512,7 +1513,7 @@ impl DocumentSyncService {
             // merged clock is the new applied watermark.
             cursor.merge(&topic_clock);
             let mut deferred_creates = false;
-            for event in events {
+            for (event, actor_id) in events {
                 let target_topic_id = event.target().sync_topic_id();
                 if target_topic_id != topic_id {
                     warn!(
@@ -1523,6 +1524,47 @@ impl DocumentSyncService {
                     continue;
                 }
                 match event {
+                    DocumentSyncEvent::Upsert {
+                        target:
+                            target @ DocumentSyncTarget::NodeUsage {
+                                node_id: snapshot_node,
+                                ..
+                            },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        // Node-usage snapshots ride a single shared realm topic
+                        // that every realm publisher can write, so validate that
+                        // the signed publisher owns the claimed node and that the
+                        // payload's own node id matches its target before applying.
+                        // A rejected event is skipped (never `?`) so the cursor
+                        // still advances past it and a forgery cannot wedge the
+                        // topic's reconcile loop.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&snapshot_node),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                node_id = %snapshot_node,
+                                "Rejecting node usage snapshot: publisher is not the owning node"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_node_usage_upsert(&target, &bytes) {
+                            warn!(
+                                %topic_id,
+                                node_id = %snapshot_node,
+                                %reason,
+                                "Rejecting invalid node usage snapshot"
+                            );
+                            continue;
+                        }
+                        self.apply_upsert(target.clone(), bytes, change).await?;
+                        applied_targets.push(target);
+                    }
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
@@ -1663,18 +1705,22 @@ impl DocumentSyncService {
     }
 
     /// Returns the decoded document events above the applied cursor, reading
-    /// only the unapplied portion of the topic history where possible.
+    /// only the unapplied portion of the topic history where possible. Each
+    /// event is paired with the authenticated `actor_id` of the op that carried
+    /// it: irokle admits an op only after verifying its signature against
+    /// `body.author` and enforcing `actor_id == actor_id_for(topic, author)`, so
+    /// the returned actor id is a trustworthy proxy for the signed publisher.
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
-    ) -> Result<Vec<DocumentSyncEvent>> {
+    ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId)>> {
         match self.node.open_topic::<DocumentSyncEvent>(topic_id) {
             Ok(topic) => Ok(topic
                 .history_after(cursor, HistoryOrder::OldestFirst)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .into_iter()
-                .map(|record| record.event)
+                .map(|record| (record.event, record.meta.actor_id))
                 .collect()),
             // Topics we hold ops for without being a listed member still
             // reconcile via the full history.
@@ -1691,14 +1737,16 @@ impl DocumentSyncService {
                     if cursor.get(&op.signed.body.actor_id) >= op.signed.body.actor_seq {
                         continue;
                     }
+                    let actor_id = op.signed.body.actor_id;
                     let TopicPayload::Event(envelope) = op.signed.body.payload else {
                         continue;
                     };
-                    events.push(
+                    events.push((
                         envelope
                             .decode_event::<DocumentSyncEvent>()
                             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                    );
+                        actor_id,
+                    ));
                 }
                 Ok(events)
             }
@@ -1900,6 +1948,13 @@ impl DocumentSyncService {
                 .apply_metadata_graph_lifecycle(record, bytes)
                 .await
                 .map(|_| ());
+        }
+        if let DocumentSyncTarget::NodeUsage { .. } = target {
+            // Structural guard for the shared node-usage keyspace. The reconcile
+            // loop already validated the signed publisher and this payload, but
+            // re-check the snapshot's self-consistency here so the generic
+            // storage write below can never persist an unvalidated snapshot.
+            validate_node_usage_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -3469,6 +3524,36 @@ fn metadata_document_delete_write_entries(
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
+}
+
+/// Validates the self-consistency of a replicated node-usage snapshot against
+/// its sync target: the payload must decode, its embedded `node_id` must match
+/// the target's node, and the target's derived storage key must attribute back
+/// to that same node. Returns a human-readable reason on rejection. Does not
+/// check the publisher's identity (the caller enforces that against the signed
+/// actor). A zero-counter snapshot is valid: stale-group cleanup publishes them.
+fn validate_node_usage_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::NodeUsage { node_id, .. } = target else {
+        return Err("target is not a node usage snapshot".to_string());
+    };
+    let snapshot = NodeUsageSnapshot::from_bytes(bytes)
+        .map_err(|error| format!("undecodable node usage snapshot: {error}"))?;
+    if snapshot.node_id != *node_id {
+        return Err(format!(
+            "snapshot node id {} does not match target node id {node_id}",
+            snapshot.node_id
+        ));
+    }
+    let key = target.storage_key();
+    if node_usage_key_node_id(key.as_ref()) != Some(*node_id) {
+        return Err(format!(
+            "node usage storage key does not attribute to target node id {node_id}"
+        ));
+    }
+    Ok(())
 }
 
 fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
@@ -7834,5 +7919,59 @@ mod tests {
         );
 
         service.shutdown().await;
+    }
+    #[test]
+    fn validate_node_usage_upsert_accepts_owner_and_rejects_forgeries() {
+        use aruna_core::structs::UsageCounters;
+
+        let node_id = node(7);
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let global = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        };
+        let group = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: Some(group_id),
+        };
+
+        // The owning node's own snapshot validates as global and per-group.
+        let owned = NodeUsageSnapshot {
+            node_id,
+            counters: UsageCounters {
+                buckets: 3,
+                ..Default::default()
+            },
+        };
+        let owned_bytes = owned.to_bytes().unwrap();
+        assert!(validate_node_usage_upsert(&global, &owned_bytes).is_ok());
+        assert!(validate_node_usage_upsert(&group, &owned_bytes).is_ok());
+
+        // Zero-counter snapshots (stale-group cleanup) are legitimate upserts.
+        let zero = NodeUsageSnapshot {
+            node_id,
+            counters: UsageCounters::default(),
+        };
+        assert!(validate_node_usage_upsert(&global, &zero.to_bytes().unwrap()).is_ok());
+
+        // A snapshot whose embedded node id is a different node is rejected.
+        let misattributed = NodeUsageSnapshot {
+            node_id: node(9),
+            counters: UsageCounters {
+                buckets: 99,
+                ..Default::default()
+            },
+        };
+        assert!(validate_node_usage_upsert(&global, &misattributed.to_bytes().unwrap()).is_err());
+
+        // Undecodable payloads and non node-usage targets are rejected.
+        assert!(validate_node_usage_upsert(&global, b"not-a-snapshot").is_err());
+        assert!(
+            validate_node_usage_upsert(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes)
+                .is_err()
+        );
     }
 }
