@@ -250,8 +250,15 @@ impl CheckPermissionsOperation {
             roles.extend(group.roles.clone());
         }
         roles.retain(|_id, role| {
-            role.assigned_users
-                .contains(&self.config.auth_context.user_id)
+            // Public roles (assigned to the Everyone principal, UserId::nil)
+            // apply to every request — anonymous ones authenticate as exactly
+            // that nil user (AuthContext::anonymous), and authenticated users
+            // inherit public grants too so signed requests are never weaker
+            // than unsigned ones.
+            role.is_public()
+                || role
+                    .assigned_users
+                    .contains(&self.config.auth_context.user_id)
         });
         Ok(roles)
     }
@@ -475,6 +482,175 @@ mod test {
             permission: Permission::DENY,
         }]);
         assert!(!operation.check_path_restrictions().unwrap());
+    }
+
+    #[tokio::test]
+    pub async fn public_roles_apply_to_everyone_and_deny_wins() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+
+        let context = DriverContext {
+            storage_handle,
+            blob_handle: None,
+            net_handle: Some(net_handle.clone()),
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        };
+
+        let realm_id = RealmId([3u8; 32]);
+        let admin_id = UserId::local(Ulid::new(), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let actor = Actor {
+            node_id,
+            user_id: admin_id,
+            realm_id,
+        };
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "Public role test realm".to_string(),
+                oidc_providers: Vec::new(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: actor.clone(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let (group, _) = drive(
+            CreateGroupOperation::new(CreateGroupConfig {
+                actor: actor.clone(),
+                display_name: "Public group".to_string(),
+                owner_cap: None,
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let group_id = group.group_id;
+
+        // A role assigned to the Everyone principal grants READ on the public path.
+        drive(
+            AddGroupRoleOperation::new(AddGroupRoleConfig {
+                auth_context: AuthContext {
+                    user_id: admin_id,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                realm_id,
+                actor: actor.clone(),
+                group_id,
+                role: aruna_core::structs::Role {
+                    role_id: Ulid::new(),
+                    name: "public-read".to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/g/{group_id}/data/**"),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::from([UserId::nil(realm_id)]),
+                },
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let data_path = format!("/{realm_id}/g/{group_id}/data/node/bucket/key");
+        let check = |auth_context: AuthContext, path: String, permission: Permission| {
+            let context = &context;
+            async move {
+                drive(
+                    CheckPermissionsOperation::new(CheckPermissionsConfig {
+                        auth_context,
+                        path,
+                        required_permission: permission,
+                    }),
+                    context,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Anonymous requests (the Everyone principal itself) may read…
+        let anonymous = AuthContext::anonymous(realm_id);
+        assert!(check(anonymous.clone(), data_path.clone(), Permission::READ).await);
+        // …but never write, and never outside the granted path.
+        assert!(!check(anonymous.clone(), data_path.clone(), Permission::WRITE).await);
+        assert!(
+            !check(
+                anonymous.clone(),
+                format!("/{realm_id}/g/{group_id}/meta/doc"),
+                Permission::READ
+            )
+            .await
+        );
+
+        // Authenticated strangers inherit public grants — signed access is
+        // never weaker than unsigned access.
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        assert!(check(stranger.clone(), data_path.clone(), Permission::READ).await);
+
+        // A public DENY role wins over everything, even the admin's own grant.
+        drive(
+            AddGroupRoleOperation::new(AddGroupRoleConfig {
+                auth_context: AuthContext {
+                    user_id: admin_id,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                realm_id,
+                actor: actor.clone(),
+                group_id,
+                role: aruna_core::structs::Role {
+                    role_id: Ulid::new(),
+                    name: "public-deny-quarantine".to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/g/{group_id}/data/node/bucket/quarantined/**"),
+                        Permission::DENY,
+                    )]),
+                    assigned_users: HashSet::from([UserId::nil(realm_id)]),
+                },
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let quarantined = format!("/{realm_id}/g/{group_id}/data/node/bucket/quarantined/key");
+        assert!(!check(anonymous.clone(), quarantined.clone(), Permission::READ).await);
+        let admin_auth = AuthContext {
+            user_id: admin_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        assert!(!check(admin_auth, quarantined, Permission::READ).await);
+
+        net_handle.shutdown().await;
     }
 
     #[tokio::test]
