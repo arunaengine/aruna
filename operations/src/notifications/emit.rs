@@ -5,10 +5,13 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::notification_outbox_write_entry;
 use aruna_core::structs::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use tracing::warn;
 use ulid::Ulid;
+
+use crate::notifications::outbox::schedule_notification_outbox_drain_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmitNotificationsInput {
@@ -27,6 +30,7 @@ pub enum EmitNotificationsState {
     StartTransaction,
     WriteOutbox { txn_id: TxnId },
     CommitTransaction { txn_id: TxnId },
+    ScheduleDrain,
     Finish,
 }
 
@@ -91,6 +95,14 @@ impl EmitNotificationsOperation {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.drop_emission(got, Some(txn_id));
         };
+        self.state = EmitNotificationsState::ScheduleDrain;
+        smallvec![schedule_notification_outbox_drain_effect()]
+    }
+
+    fn handle_schedule_drain(&mut self, event: Event) -> Effects {
+        if let Event::Task(TaskEvent::Error { message, .. }) = event {
+            warn!(message = %message, "Failed to schedule notification outbox drain after emit");
+        }
         self.state = EmitNotificationsState::Finish;
         smallvec![]
     }
@@ -120,6 +132,7 @@ impl Operation for EmitNotificationsOperation {
             EmitNotificationsState::CommitTransaction { txn_id } => {
                 self.handle_commit_transaction(event, txn_id)
             }
+            EmitNotificationsState::ScheduleDrain => self.handle_schedule_drain(event),
             EmitNotificationsState::Init | EmitNotificationsState::Finish => smallvec![],
         }
     }
@@ -162,9 +175,26 @@ mod tests {
     use aruna_core::structs::{
         NotificationClass, NotificationKind, RealmId, notification_outbox_key,
     };
+    use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::UserId;
     use aruna_storage::storage;
+    use aruna_tasks::{InboundTaskHandler, TaskHandle};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
+    use tokio::sync::mpsc;
+
+    struct RecordingTaskHandler {
+        seen: mpsc::Sender<TaskKey>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for RecordingTaskHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            let _ = self.seen.send(key).await;
+        }
+    }
 
     fn make_user(realm: u8, user: u8) -> UserId {
         UserId::new(Ulid::from_bytes([user; 16]), RealmId([realm; 32]))
@@ -432,5 +462,95 @@ mod tests {
         for (_, row) in &rows {
             assert_eq!(row.record, record);
         }
+    }
+
+    #[test]
+    fn commit_schedules_drain_then_finishes() {
+        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+            records: vec![make_record(1, 2)],
+        });
+        operation.start();
+        let txn_id = TxnId::new();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        match effects.as_slice() {
+            [Effect::Task(TaskEffect::ResetTimer { key, after })] => {
+                assert_eq!(*key, TaskKey::DrainNotificationOutbox);
+                assert_eq!(*after, Duration::ZERO);
+            }
+            other => panic!("expected a drain schedule effect, got {other:?}"),
+        }
+        assert!(!operation.is_complete());
+
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn commit_schedule_drain_swallows_task_error() {
+        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+            records: vec![make_record(1, 2)],
+        });
+        operation.start();
+        let txn_id = TxnId::new();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![],
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "scheduler unavailable".to_string(),
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn emit_schedules_drain_timer_after_commit_end_to_end() {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle),
+        };
+
+        let result = drive(
+            EmitNotificationsOperation::new(EmitNotificationsInput {
+                records: vec![make_record(1, 2)],
+            }),
+            &context,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+
+        let key = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("drain timer should fire")
+            .expect("recording handler should receive timer key");
+        assert_eq!(key, TaskKey::DrainNotificationOutbox);
+        assert_eq!(read_outbox_rows(&context).await.len(), 1);
     }
 }
