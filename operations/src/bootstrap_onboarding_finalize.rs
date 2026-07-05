@@ -3,8 +3,11 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
-use aruna_core::structs::{Actor, DEFAULT_METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind, ResourceEvent,
+};
 use aruna_core::types::UserId;
+use aruna_core::util::unix_timestamp_millis;
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 use tracing::warn;
@@ -21,7 +24,10 @@ use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
+use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
+use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::process_placements::{PlacementConfig, PlacementError, ProcessPlacementsOperation};
+use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
 };
@@ -122,10 +128,49 @@ pub async fn bootstrap_onboarding_finalize(
     )
     .await?;
 
+    emit_node_onboarded_notification(input.realm_id, input.node_id, context.as_ref()).await;
+
     Ok(BootstrapOnboardingFinalizeOutput {
         mode: reserved.mode,
         onboarding_sync_ticket: encoded_ticket,
     })
+}
+
+async fn emit_node_onboarded_notification(
+    realm_id: RealmId,
+    node_id: NodeId,
+    context: &DriverContext,
+) {
+    let realm_auth = match drive(ReadRealmAuthorizationOperation::new(realm_id), context).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            warn!(realm_id = %realm_id, "Skipping node onboarding notification: no realm authorization document");
+            return;
+        }
+        Err(error) => {
+            warn!(error = ?error, "Skipping node onboarding notification: realm authorization read failed");
+            return;
+        }
+    };
+    let records = route_resource_event(
+        &ResourceEvent::NodeOnboarded { realm_id, node_id },
+        RoutingContext {
+            group_auth: None,
+            realm_auth: Some(&realm_auth),
+        },
+        unix_timestamp_millis(),
+    );
+    if records.is_empty() {
+        return;
+    }
+    if let Err(never) = drive(
+        EmitNotificationsOperation::new(EmitNotificationsInput { records }),
+        context,
+    )
+    .await
+    {
+        match never {}
+    }
 }
 
 async fn ensure_realm_node_with_retries(
@@ -207,7 +252,7 @@ async fn process_pending_placements(
 mod tests {
     use super::{
         BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-        bootstrap_onboarding_finalize,
+        bootstrap_onboarding_finalize, emit_node_onboarded_notification,
     };
     use crate::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -220,11 +265,13 @@ mod tests {
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
         OnboardingMode, OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
     };
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{
+        Actor, NotificationKind, NotificationOutboxRecord, RealmAuthorizationDocument, RealmId,
+    };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
@@ -382,6 +429,51 @@ mod tests {
         )
     }
 
+    async fn write_realm_admins(fixture: &FinalizeFixture, admins: &[UserId]) {
+        let mut doc = RealmAuthorizationDocument::new_default_realm_doc(fixture.realm_id);
+        for role in doc.roles.values_mut() {
+            if role.name == "realm_admin" {
+                role.assigned_users = admins.iter().copied().collect();
+            }
+        }
+        let actor = Actor {
+            node_id: fixture.local_node_id,
+            user_id: UserId::nil(fixture.realm_id),
+            realm_id: fixture.realm_id,
+        };
+        let value = doc.to_bytes(&actor).unwrap();
+        fixture
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: (*fixture.realm_id.as_bytes()).into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn read_outbox_rows(
+        storage_handle: &storage::StorageHandle,
+    ) -> Vec<NotificationOutboxRecord> {
+        match storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1024,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| postcard::from_bytes(&value).unwrap())
+                .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn failure_after_realm_membership_before_consume_marks_secret_finalizing() {
         let fixture = setup_finalize_fixture().await;
@@ -472,5 +564,121 @@ mod tests {
                 ReserveOnboardingSecretError::AlreadyClaimed
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn onboarding_emits_to_realm_admins() {
+        let fixture = setup_finalize_fixture().await;
+        let admin_one = UserId::new(Ulid::from_bytes([40u8; 16]), fixture.realm_id);
+        let admin_two = UserId::new(Ulid::from_bytes([41u8; 16]), fixture.realm_id);
+        write_realm_admins(&fixture, &[admin_one, admin_two]).await;
+
+        let first = bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            fixture.context.clone(),
+        )
+        .await;
+        assert_eq!(
+            first,
+            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
+        );
+
+        let (retry_context, net_handle) = context_with_net(&fixture).await;
+        let retry = bootstrap_onboarding_finalize(
+            finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                ONBOARDING_SECRET_EXPIRES_AT + 1,
+            ),
+            retry_context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.mode, OnboardingMode::Server);
+
+        let rows = read_outbox_rows(&fixture.storage_handle).await;
+        assert_eq!(rows.len(), 2);
+        let mut recipients: Vec<UserId> = rows.iter().map(|row| row.record.recipient).collect();
+        recipients.sort();
+        let mut expected = vec![admin_one, admin_two];
+        expected.sort();
+        assert_eq!(recipients, expected);
+        for row in &rows {
+            assert_eq!(
+                row.record.kind,
+                NotificationKind::NodeOnboarded {
+                    realm_id: fixture.realm_id,
+                    node_id: fixture.joiner_node_id,
+                }
+            );
+        }
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn emit_helper_warns_when_realm_auth_document_absent() {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+
+        emit_node_onboarded_notification(realm_id, node_id, &context).await;
+
+        assert!(read_outbox_rows(&storage_handle).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn onboarding_succeeds_when_admin_role_unassigned() {
+        let fixture = setup_finalize_fixture().await;
+
+        let first = bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            fixture.context.clone(),
+        )
+        .await;
+        assert_eq!(
+            first,
+            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
+        );
+
+        let (retry_context, net_handle) = context_with_net(&fixture).await;
+        let retry = bootstrap_onboarding_finalize(
+            finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                ONBOARDING_SECRET_EXPIRES_AT + 1,
+            ),
+            retry_context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.mode, OnboardingMode::Server);
+
+        assert!(read_outbox_rows(&fixture.storage_handle).await.is_empty());
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_finalize_emits_nothing() {
+        let fixture = setup_finalize_fixture().await;
+
+        let result = bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            fixture.context.clone(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(BootstrapOnboardingFinalizeError::NetHandleUnavailable)
+        );
+
+        assert!(read_outbox_rows(&fixture.storage_handle).await.is_empty());
     }
 }
