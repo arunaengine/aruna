@@ -472,6 +472,48 @@ pub struct UsageResponse {
     pub logical_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realm: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<GroupQuotaStatus>,
+}
+
+/// Per-group quota status derived from the realm quota config. Attached only to
+/// the group usage endpoint; `/info/usage` and the plain constructors leave it
+/// `None` so their output is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct GroupQuotaStatus {
+    /// Effective pre-grace group quota (override else default). `None` = unlimited.
+    pub quota_bytes: Option<u64>,
+    /// Enforced hard cap (quota x grace). `None` = unlimited.
+    pub ceiling_bytes: Option<u64>,
+    pub warn_threshold_percent: u32,
+    /// True when the group's realm-wide `logical_bytes` has reached
+    /// `quota_bytes * warn_threshold_percent / 100`; always false when unlimited.
+    pub warning: bool,
+}
+
+impl GroupQuotaStatus {
+    /// Builds the status from the realm quota config and the group's realm-wide
+    /// `logical_bytes` — the same counter the put-object `QuotaGate` enforces.
+    pub fn resolve(
+        quota: &QuotaConfig,
+        group_id: &aruna_core::types::GroupId,
+        realm_group_logical_bytes: u64,
+    ) -> Self {
+        let quota_bytes = quota.effective_group_quota_bytes(group_id);
+        let warning = match quota_bytes {
+            Some(limit) => {
+                let threshold = u128::from(limit) * u128::from(quota.warn_threshold_percent) / 100;
+                u128::from(realm_group_logical_bytes) >= threshold
+            }
+            None => false,
+        };
+        Self {
+            quota_bytes,
+            ceiling_bytes: quota.effective_group_ceiling(group_id),
+            warn_threshold_percent: quota.warn_threshold_percent,
+            warning,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -508,6 +550,7 @@ impl UsageResponse {
             stored_bytes: local.stored_bytes,
             logical_bytes: local.logical_bytes,
             realm,
+            quota: None,
         }
     }
 }
@@ -1144,6 +1187,40 @@ mod tests {
             response.realm.is_none(),
             "unauthenticated callers must not see realm-wide totals"
         );
+    }
+
+    #[test]
+    fn group_quota_status_reports_warning_and_unlimited() {
+        let group = Ulid::new();
+        let unlimited_group = Ulid::new();
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            warn_threshold_percent: 85,
+            group_overrides: vec![aruna_core::structs::GroupQuotaOverride {
+                group_id: unlimited_group,
+                quota_bytes: None,
+                grace_factor_percent: None,
+            }],
+            ..QuotaConfig::default()
+        };
+
+        // Finite default quota, usage below the 850-byte warn threshold.
+        let below = super::GroupQuotaStatus::resolve(&quota, &group, 800);
+        assert_eq!(below.quota_bytes, Some(1_000));
+        assert_eq!(below.ceiling_bytes, Some(1_100));
+        assert_eq!(below.warn_threshold_percent, 85);
+        assert!(!below.warning);
+
+        // At the threshold the warning fires.
+        let at = super::GroupQuotaStatus::resolve(&quota, &group, 850);
+        assert!(at.warning);
+
+        // An override with quota_bytes: None is unlimited and never warns.
+        let unlimited = super::GroupQuotaStatus::resolve(&quota, &unlimited_group, u64::MAX);
+        assert_eq!(unlimited.quota_bytes, None);
+        assert_eq!(unlimited.ceiling_bytes, None);
+        assert!(!unlimited.warning);
     }
 
     #[test]

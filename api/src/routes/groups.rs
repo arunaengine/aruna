@@ -600,10 +600,26 @@ pub async fn get_group_usage(
         aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
     )
     .await?;
-    Ok((
-        StatusCode::OK,
-        Json(crate::routes::info::UsageResponse::new(local, realm)),
-    ))
+
+    // The QuotaGate enforces against the group's realm-wide logical_bytes, so the
+    // warning threshold is evaluated against the same counter.
+    let realm_group_logical_bytes = realm.logical_bytes;
+    let mut response = crate::routes::info::UsageResponse::new(local, realm);
+    // Best effort: omit the quota block rather than failing the request if the
+    // realm config is unavailable.
+    if let Ok(config) = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        response.quota = Some(crate::routes::info::GroupQuotaStatus::resolve(
+            &config.quota,
+            &group_id,
+            realm_group_logical_bytes,
+        ));
+    }
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
