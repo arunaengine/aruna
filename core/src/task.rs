@@ -28,6 +28,7 @@ pub enum TaskKey {
     DrainMetadataGraphPruneQueue,
     DrainBlobReplicationQueue,
     DrainReferenceMetadataRefreshQueue,
+    DrainNotificationOutbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
