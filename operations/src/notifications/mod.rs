@@ -8,4 +8,5 @@ pub mod mark_read;
 pub mod outbox;
 pub mod placement;
 pub mod protocol;
+pub mod routing;
 pub mod unread;
