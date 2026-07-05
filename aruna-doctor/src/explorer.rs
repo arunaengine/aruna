@@ -566,6 +566,11 @@ enum JsonDocumentSyncTarget {
     MetadataGraphLifecycle {
         graph_iri: String,
     },
+    NodeUsage {
+        realm_id: String,
+        node_id: String,
+        group_id: Option<String>,
+    },
 }
 
 fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
@@ -613,6 +618,15 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
                 graph_iri: graph_iri.clone(),
             }
         }
+        DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id,
+        } => JsonDocumentSyncTarget::NodeUsage {
+            realm_id: realm_id.to_string(),
+            node_id: node_id.to_string(),
+            group_id: group_id.map(|group_id| group_id.to_string()),
+        },
     }
 }
 
