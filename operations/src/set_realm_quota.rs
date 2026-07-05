@@ -393,14 +393,22 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
                 reason: format!("duplicate group override for group {}", over.group_id),
             });
         }
-        if let Some(grace_factor_percent) = over.grace_factor_percent
-            && grace_factor_percent < 100
-        {
-            return Err(SetRealmQuotaError::InvalidQuota {
-                reason: format!(
-                    "group override grace_factor_percent must be at least 100, got {grace_factor_percent}"
-                ),
-            });
+        if let Some(grace_factor_percent) = over.grace_factor_percent {
+            if grace_factor_percent < 100 {
+                return Err(SetRealmQuotaError::InvalidQuota {
+                    reason: format!(
+                        "group override grace_factor_percent must be at least 100, got {grace_factor_percent}"
+                    ),
+                });
+            }
+            if over.quota_bytes.is_none() {
+                return Err(SetRealmQuotaError::InvalidQuota {
+                    reason: format!(
+                        "group override for group {} sets grace_factor_percent without quota_bytes; grace is incoherent on an unlimited quota",
+                        over.group_id
+                    ),
+                });
+            }
         }
     }
     let mut seen_users = BTreeSet::new();
@@ -632,6 +640,22 @@ mod tests {
             ..QuotaConfig::default()
         };
         assert!(validate_quota(&quota).is_ok());
+    }
+
+    #[test]
+    fn validate_quota_rejects_grace_override_on_unlimited_group_quota() {
+        let quota = QuotaConfig {
+            group_overrides: vec![GroupQuotaOverride {
+                group_id: Ulid::from_bytes([6; 16]),
+                quota_bytes: None,
+                grace_factor_percent: Some(110),
+            }],
+            ..QuotaConfig::default()
+        };
+        assert!(matches!(
+            validate_quota(&quota),
+            Err(SetRealmQuotaError::InvalidQuota { .. })
+        ));
     }
 
     #[test]
