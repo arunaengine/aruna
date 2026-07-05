@@ -57,6 +57,7 @@ pub enum SubOperationEvent {
     ReplicationApplyResult {
         result: Result<(), String>,
     },
+    NotificationsEmitted,
 }
 
 #[derive(Debug, PartialEq)]

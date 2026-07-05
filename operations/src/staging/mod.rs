@@ -57,6 +57,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::ReplicationApplyResult { .. } => {
                 "Event::SubOperation(SubOperationEvent::ReplicationApplyResult)".to_string()
             }
+            SubOperationEvent::NotificationsEmitted => {
+                "Event::SubOperation(SubOperationEvent::NotificationsEmitted)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),
