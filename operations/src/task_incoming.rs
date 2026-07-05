@@ -40,6 +40,7 @@ use crate::metadata::prune_queue::{
     metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
+use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
@@ -747,6 +748,10 @@ impl OperationsTaskHandler {
 
             let mut local_records: Vec<NotificationRecord> = Vec::new();
             let mut local_keys: Vec<Vec<u8>> = Vec::new();
+            let mut remote_groups: HashMap<
+                aruna_core::NodeId,
+                (Vec<NotificationRecord>, Vec<Vec<u8>>),
+            > = HashMap::new();
 
             for (record_key, outbox_record) in batch.records {
                 let age_ms =
@@ -796,11 +801,12 @@ impl OperationsTaskHandler {
                 if holder == local_node_id {
                     local_records.push(record);
                     local_keys.push(record_key);
-                } else {
-                    if failed_holders.insert(holder) {
-                        warn!(holder = %holder, "remote notification delivery requires the notification RPC");
-                    }
+                } else if failed_holders.contains(&holder) {
                     retry_needed = true;
+                } else {
+                    let group = remote_groups.entry(holder).or_default();
+                    group.0.push(record);
+                    group.1.push(record_key);
                 }
             }
 
@@ -819,6 +825,25 @@ impl OperationsTaskHandler {
                     }
                     Err(error) => {
                         warn!(error = %error, "Failed to deliver notifications to local inbox");
+                        retry_needed = true;
+                    }
+                }
+            }
+
+            for (holder, (records, keys)) in remote_groups {
+                match deliver_remote(net_handle, holder, records).await {
+                    Ok(_) => {
+                        if let Err(error) =
+                            delete_notification_outbox_records(&self.context.storage_handle, keys)
+                                .await
+                        {
+                            warn!(error = %error, "Failed to delete delivered notification outbox records");
+                            retry_needed = true;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(holder = %holder, error = %error, "Failed to deliver notifications to remote holder");
+                        failed_holders.insert(holder);
                         retry_needed = true;
                     }
                 }
@@ -1718,6 +1743,74 @@ mod tests {
 
         assert!(read_inbox_records(&storage).await.is_empty());
         let remaining = read_notification_outbox_batch(&storage, None, 1024)
+            .await
+            .expect("outbox read");
+        assert!(remaining.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_drain_delivers_to_remote_holder() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+
+        let dir_a = tempdir().expect("temp dir");
+        let storage_a =
+            FjallStorage::open(dir_a.path().to_str().expect("temp path")).expect("storage opens");
+        let net_a = make_net_handle(realm_id, &storage_a, [24u8; 32]).await;
+
+        let dir_b = tempdir().expect("temp dir");
+        let storage_b =
+            FjallStorage::open(dir_b.path().to_str().expect("temp path")).expect("storage opens");
+        let net_b = make_net_handle(realm_id, &storage_b, [25u8; 32]).await;
+
+        net_a.add_peer_addr(net_b.endpoint_addr()).await;
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(net_a.node_id(), RealmNodeKind::Server);
+        config.ensure_node(net_b.node_id(), RealmNodeKind::Server);
+        write_realm_config(&storage_a, realm_id, &config, net_a.node_id()).await;
+        write_realm_config(&storage_b, realm_id, &config, net_b.node_id()).await;
+
+        let b_id = net_b.node_id();
+        let recipient = loop {
+            let candidate = UserId::new(Ulid::new(), realm_id);
+            if resolve_inbox_holder(&candidate, &config).expect("resolve holder") == Some(b_id) {
+                break candidate;
+            }
+        };
+
+        let record = NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::from_bytes([1u8; 16]),
+                actor_user_id: recipient,
+            },
+            1_700_000_000_000,
+        );
+        let outbox = new_notification_outbox_record(record.clone());
+        write_notification_outbox(&storage_a, &outbox).await;
+
+        let context_b = Arc::new(DriverContext {
+            storage_handle: storage_b.clone(),
+            net_handle: Some(net_b),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        crate::incoming::initialize_net_incoming(context_b.clone());
+
+        let context_a = Arc::new(DriverContext {
+            storage_handle: storage_a.clone(),
+            net_handle: Some(net_a),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context_a);
+        handler.drain_notification_outbox().await;
+
+        assert_eq!(read_inbox_records(&storage_b).await, vec![record]);
+        let remaining = read_notification_outbox_batch(&storage_a, None, 1024)
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());

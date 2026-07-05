@@ -304,6 +304,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!(error = ?err, "Failed to process inbound metadata stream");
                     }
                 }
+                Alpn::Notification => {
+                    crate::notifications::incoming::handle_notification_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    )
+                    .await;
+                }
                 Alpn::Dht => {
                     warn!(
                         node_id = %node_id,
