@@ -17,14 +17,18 @@ use crate::keyspaces::{
     METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
+    NOTIFICATION_OUTBOX_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
     MetadataGraphPruneJobRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord,
 };
-use crate::structs::{MetadataRegistryRecord, User};
+use crate::structs::{
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, User,
+    notification_inbox_key, notification_outbox_key, notification_prune_index_key,
+};
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
 pub fn subject_index_key(subject_id: &str) -> Key {
@@ -372,6 +376,68 @@ pub fn metadata_graph_prune_job_write_entry(
     Ok((
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
         metadata_graph_prune_job_key(record),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn notification_inbox_write_entries(
+    record: &NotificationRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    Ok(vec![
+        (
+            NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            notification_inbox_key(
+                record.recipient,
+                record.created_at_ms,
+                record.notification_id,
+            ),
+            record.to_bytes()?.into(),
+        ),
+        (
+            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+            notification_prune_index_key(record),
+            ByteView::from(Vec::new()),
+        ),
+    ])
+}
+
+pub fn notification_inbox_delete_entries(record: &NotificationRecord) -> Vec<(KeySpace, Key)> {
+    vec![
+        (
+            NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            notification_inbox_key(
+                record.recipient,
+                record.created_at_ms,
+                record.notification_id,
+            ),
+        ),
+        (
+            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+            notification_prune_index_key(record),
+        ),
+    ]
+}
+
+pub fn notification_inbox_update_entry(
+    record: &NotificationRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        NOTIFICATION_INBOX_KEYSPACE.to_string(),
+        notification_inbox_key(
+            record.recipient,
+            record.created_at_ms,
+            record.notification_id,
+        ),
+        record.to_bytes()?.into(),
+    ))
+}
+
+pub fn notification_outbox_write_entry(
+    record: &NotificationOutboxRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+        notification_outbox_key(record.outbox_id),
         postcard::to_allocvec(record)?.into(),
     ))
 }
