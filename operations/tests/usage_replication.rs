@@ -6,8 +6,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::{
-    Actor, BucketInfo, RealmConfigDocument, RealmId, RealmNodeKind, UsageCounters,
-    node_usage_global_key, usage_global_key_for_group, usage_group_key,
+    Actor, BucketInfo, NODE_USAGE_DIRTY_GLOBAL_KEY, RealmConfigDocument, RealmId, RealmNodeKind,
+    UsageCounters, node_usage_global_key, usage_global_key_for_group, usage_group_key,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
@@ -22,6 +22,9 @@ use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+// Comfortably above the durable re-arm interval (5s) plus the publish debounce
+// (2s) so the steady-state publish is observed without flaking.
+const STEADY_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -221,6 +224,59 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
         "counter-bearing snapshot ingest must not touch B's live counter keyspace, found {} keys",
         local_stats.len()
     );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// A steady-state counter write on a long-running node (no restart) must lead to
+// a published node-usage snapshot within a bounded window. The only thing that
+// turns a durable dirty marker into a publish during steady state is the durable
+// re-arm loop, so this proves that loop closes the gap the marker write leaves.
+#[tokio::test]
+async fn steady_state_write_publishes_snapshot_without_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([53u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 1).await?;
+    let node = &nodes[0];
+    let group_id = Ulid::new();
+
+    // A normal write commit updates counters and stamps dirty markers, but never
+    // schedules a publish itself and never restarts the node.
+    drive(
+        CreateBucketOperation::new(
+            "steady-bucket".to_string(),
+            BucketInfo {
+                group_id,
+                created_at: std::time::SystemTime::now(),
+                created_by: Default::default(),
+                cors_configuration: None,
+            },
+        ),
+        node.context.as_ref(),
+    )
+    .await?
+    .unwrap()
+    .unwrap();
+
+    let snapshot_key = node_usage_global_key(node.net.node_id());
+    let deadline = Instant::now() + STEADY_STATE_TIMEOUT;
+    loop {
+        let published = read_node_stats(node, snapshot_key.clone()).await.is_some();
+        let dirty_cleared = read_node_stats(node, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            .await
+            .is_none();
+        if published && dirty_cleared {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "steady-state write never published a snapshot; published={published} dirty_cleared={dirty_cleared}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 
     shutdown_nodes(nodes).await;
     Ok(())
