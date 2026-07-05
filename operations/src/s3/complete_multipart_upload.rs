@@ -3,7 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -48,6 +48,7 @@ pub enum CompleteMultipartUploadState {
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteLiveReplicationObligation,
+    EnforceQuota,
     UpdateUsage,
     CommitFinalizeTransaction,
     RegisterBlobInDht,
@@ -96,6 +97,10 @@ pub enum CompleteMultipartUploadError {
     PartEtagMismatch,
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
+    #[error(transparent)]
+    QuotaGateError(#[from] QuotaGateError),
+    #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
+    QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
     CompleteMultipartUploadFailed,
 }
@@ -119,6 +124,10 @@ pub struct CompleteMultipartUploadInput {
     pub checksum_type: MultipartChecksumType,
     pub object_size: Option<u64>,
     pub created_by: UserId,
+    /// Hard ceiling (bytes) the group's realm-wide `logical_bytes` may reach,
+    /// resolved from the realm quota config at the request surface. `None` =
+    /// unlimited, so no gate is enforced.
+    pub quota_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +154,7 @@ pub struct CompleteMultipartUploadOperation {
     new_blob: bool,
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
+    quota_gate: Option<QuotaGate>,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -167,6 +177,7 @@ impl CompleteMultipartUploadOperation {
             new_blob: false,
             was_live: false,
             usage_update: None,
+            quota_gate: None,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -810,11 +821,68 @@ impl CompleteMultipartUploadOperation {
             stored_bytes: if self.new_blob { size } else { 0 },
             ..group_delta
         };
-        let mut update = UsageCounterUpdate::with_global(group_id, group_delta, global_delta);
+        self.usage_update = Some(UsageCounterUpdate::with_global(
+            group_id,
+            group_delta,
+            global_delta,
+        ));
+
+        // Enforce the hard group quota before the counters commit. Only a positive
+        // logical-bytes delta can push a group over its ceiling.
+        let object_size = self
+            .final_location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .unwrap_or(0);
+        if let Some(ceiling) = self.input.quota_ceiling
+            && object_size > 0
+        {
+            let mut gate = QuotaGate::new(ceiling, object_size, group_id, self.input.node_id);
+            self.state = CompleteMultipartUploadState::EnforceQuota;
+            let effects = gate.start(txn_id);
+            self.quota_gate = Some(gate);
+            effects
+        } else {
+            self.start_usage_update(txn_id)
+        }
+    }
+
+    fn start_usage_update(&mut self, txn_id: TxnId) -> Effects {
         self.state = CompleteMultipartUploadState::UpdateUsage;
-        let effects = update.start(txn_id);
-        self.usage_update = Some(update);
-        effects
+        match self.usage_update.as_mut() {
+            Some(update) => update.start(txn_id),
+            None => {
+                self.schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed)
+            }
+        }
+    }
+
+    fn handle_enforce_quota(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+        };
+        let Some(gate) = self.quota_gate.as_mut() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        match gate.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                if gate.is_exceeded() {
+                    let limit = gate.ceiling();
+                    let usage = gate.projected_usage();
+                    // schedule_error resets the upload back to Open and cleans up
+                    // the composed blob, mirroring every other finalize-phase error.
+                    self.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+                        limit,
+                        usage,
+                    })
+                } else {
+                    self.start_usage_update(txn_id)
+                }
+            }
+            Err(err) => self.schedule_error(err.into()),
+        }
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -1081,6 +1149,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            CompleteMultipartUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteMultipartUploadState::UpdateUsage => self.handle_usage_update(event),
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)

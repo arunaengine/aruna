@@ -1086,6 +1086,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1236,6 +1237,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )

@@ -18,12 +18,24 @@ use aruna_operations::s3::put_bucket_replication::{
 };
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::s3::upload_part::UploadPartError;
-use s3s::{S3Error, s3_error};
+use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;
 
 fn internal_error<E: Display>(err: E) -> S3Error {
     s3_error!(InternalError, "{}", err)
+}
+
+/// A group storage quota rejection. S3 has no standard quota code, so we return a
+/// custom `QuotaExceeded` code with an explicit 403 status, matching the
+/// convention used by S3-compatible object stores.
+fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("QuotaExceeded".into()),
+        format!("Group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes"),
+    );
+    error.set_status_code(http::StatusCode::FORBIDDEN);
+    error
 }
 
 fn no_such_upload_error() -> S3Error {
@@ -115,6 +127,7 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::MissingExpectedChecksum(algorithm) => {
                 missing_expected_checksum_s3_error(algorithm, "PutObject")
             }
+            PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
             err => internal_error(err),
         }
     }
@@ -165,6 +178,9 @@ impl IntoS3Error for CompleteMultipartUploadError {
                     InvalidPart,
                     "The part ETag did not match the uploaded part."
                 )
+            }
+            CompleteMultipartUploadError::QuotaExceeded { limit, usage } => {
+                quota_exceeded_error(limit, usage)
             }
             err => internal_error(err),
         }

@@ -19,6 +19,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -155,6 +156,22 @@ impl ArunaS3Service {
         )
         .await
         .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
+    }
+
+    /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes`
+    /// from the realm quota config, mirroring the create_group pattern of reading
+    /// realm config at the request surface. `None` means the group is unlimited.
+    async fn resolve_quota_ceiling(
+        &self,
+        group_id: aruna_core::types::GroupId,
+    ) -> S3Result<Option<u64>> {
+        let realm_config = drive(GetRealmConfigOperation::new(self.realm_id), &self.state)
+            .await
+            .map_err(|err| {
+                error!(error = %err, "Failed to load realm config for quota enforcement");
+                s3_error!(InternalError, "Failed to load realm quota configuration")
+            })?;
+        Ok(realm_config.quota.effective_group_ceiling(&group_id))
     }
 
     fn parse_replication_targets(
@@ -850,13 +867,15 @@ impl S3 for ArunaS3Service {
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
 
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
             user_id: user_access.user_identity,
-            group_id: bucket_info
-                .as_ref()
-                .map(|bucket_info| bucket_info.group_id)
-                .unwrap_or(user_access.group_id),
+            group_id,
             realm_id: self.realm_id,
             node_id: self.node_id,
             request: input,
@@ -864,6 +883,7 @@ impl S3 for ArunaS3Service {
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
             version_source: None,
             exists: false,
+            quota_ceiling,
         };
         let operation = PutObjectOperation::new(config);
 
@@ -999,6 +1019,12 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
@@ -1031,6 +1057,7 @@ impl S3 for ArunaS3Service {
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
             object_size: req.input.mpu_object_size.map(|size| size as u64),
             created_by: user_access.user_identity,
+            quota_ceiling,
         });
 
         let result = drive(operation, &self.state)

@@ -81,6 +81,9 @@ pub async fn materialize_snapshot(
             checksum_type: None,
             exists: false,
             version_source: Some(version_source.clone()),
+            // Staging materialization runs without realm-config access, so no
+            // quota ceiling is resolved here; enforcement lives on the S3 surface.
+            quota_ceiling: None,
         }),
         context,
     )
