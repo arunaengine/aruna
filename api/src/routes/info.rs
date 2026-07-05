@@ -460,8 +460,9 @@ pub async fn set_realm_quota(
 }
 
 /// Storage usage. The flat fields report this node's local counters (kept for
-/// backward compatibility); `realm` reports the realm-wide total summed across
-/// every node in the realm.
+/// backward compatibility) and are always present. `realm` reports the
+/// realm-wide total summed across every node and is only included for
+/// authenticated callers, so unauthenticated requests never disclose it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UsageResponse {
     pub buckets: u64,
@@ -469,7 +470,8 @@ pub struct UsageResponse {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
-    pub realm: UsageTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<UsageTotals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -495,13 +497,17 @@ impl From<UsageCounters> for UsageTotals {
 
 impl UsageResponse {
     pub fn new(local: UsageCounters, realm: UsageCounters) -> Self {
+        Self::with_realm(local, Some(realm.into()))
+    }
+
+    pub fn with_realm(local: UsageCounters, realm: Option<UsageTotals>) -> Self {
         Self {
             buckets: local.buckets,
             objects: local.objects,
             stored_blobs: local.stored_blobs,
             stored_bytes: local.stored_bytes,
             logical_bytes: local.logical_bytes,
-            realm: realm.into(),
+            realm,
         }
     }
 }
@@ -526,15 +532,31 @@ pub async fn load_realm_usage(
     path = "/info/usage",
     tag = "info",
     responses(
-        (status = 200, description = "Local and realm-wide storage usage", body = UsageResponse)
-    )
+        (
+            status = 200,
+            description = "Local storage usage always; realm-wide totals only for authenticated callers",
+            body = UsageResponse
+        )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
-    let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
-    Ok((StatusCode::OK, Json(UsageResponse::new(local, realm))))
+    let realm = match auth {
+        Some(_) => Some(
+            load_realm_usage(&state, RealmUsageScope::Global)
+                .await?
+                .into(),
+        ),
+        None => None,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(UsageResponse::with_realm(local, realm)),
+    ))
 }
 
 fn map_realm_info_response(
@@ -1041,22 +1063,19 @@ mod tests {
         assert!(openapi.paths.paths.contains_key("/info"));
     }
 
-    #[tokio::test]
-    async fn get_usage_reports_local_and_realm_totals() {
+    async fn seed_usage_state(state: &Arc<ServerState>) {
         use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
         use aruna_core::structs::{
-            NodeUsageSnapshot, UsageCounters, node_usage_global_key, usage_global_shard_key,
+            NodeUsageSnapshot, node_usage_global_key, usage_global_shard_key,
         };
 
-        let (state, _tempdir) = setup_state().await;
         let ctx = state.get_ctx();
-
         // This node's live local total.
         ctx.storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: USAGE_STATS_KEYSPACE.to_string(),
                 key: usage_global_shard_key(0).into(),
-                value: UsageCounters {
+                value: aruna_core::structs::UsageCounters {
                     buckets: 2,
                     ..Default::default()
                 }
@@ -1074,7 +1093,7 @@ mod tests {
                 key: node_usage_global_key(remote).into(),
                 value: NodeUsageSnapshot {
                     node_id: remote,
-                    counters: UsageCounters {
+                    counters: aruna_core::structs::UsageCounters {
                         buckets: 3,
                         ..Default::default()
                     },
@@ -1085,11 +1104,46 @@ mod tests {
                 txn_id: None,
             })
             .await;
+    }
 
-        let (status, Json(response)) = get_usage(State(state)).await.unwrap();
+    fn test_auth_context(state: &Arc<ServerState>) -> AuthContext {
+        AuthContext {
+            user_id: UserId::local(Ulid::new(), state.get_realm_id()),
+            realm_id: state.get_realm_id(),
+            path_restrictions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_usage_reports_realm_totals_for_authenticated_callers() {
+        let (state, _tempdir) = setup_state().await;
+        seed_usage_state(&state).await;
+
+        let auth = test_auth_context(&state);
+        let (status, Json(response)) = get_usage(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.buckets, 2, "flat fields report local total");
-        assert_eq!(response.realm.buckets, 5, "realm sums local and remote");
+        let realm = response.realm.expect("authenticated caller sees realm");
+        assert_eq!(realm.buckets, 5, "realm sums local and remote");
+    }
+
+    #[tokio::test]
+    async fn get_usage_omits_realm_totals_for_unauthenticated_callers() {
+        let (state, _tempdir) = setup_state().await;
+        seed_usage_state(&state).await;
+
+        let (status, Json(response)) = get_usage(State(state), Extension(None)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.buckets, 2,
+            "flat local fields stay unauthenticated"
+        );
+        assert!(
+            response.realm.is_none(),
+            "unauthenticated callers must not see realm-wide totals"
+        );
     }
 
     #[test]
