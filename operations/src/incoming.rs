@@ -15,7 +15,7 @@ use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
-use crate::usage_stats::recompute_realm_usage_summary;
+use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -177,7 +177,7 @@ async fn reconcile_inbound_document_sync_topics(
             error!(error = ?error, "Failed to process pending placements after document sync reconciliation");
         }
     }
-    refresh_realm_usage_summary(context, &net_handle, &targets.targets).await;
+    refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_metadata_create_events(context, targets).await;
     let project_elapsed = project_started.elapsed();
@@ -193,41 +193,6 @@ async fn reconcile_inbound_document_sync_topics(
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
-}
-
-/// Refreshes the persisted realm usage summed cache for the scopes touched by an
-/// inbound reconcile. Remote node snapshots landed via the generic apply path, so
-/// this re-sums live local counters plus every node's snapshot for those scopes.
-async fn refresh_realm_usage_summary(
-    context: &Arc<DriverContext>,
-    net_handle: &aruna_net::NetHandle,
-    targets: &[DocumentSyncTarget],
-) {
-    let mut include_global = false;
-    let mut groups = BTreeSet::new();
-    for target in targets {
-        if let DocumentSyncTarget::NodeUsage { group_id, .. } = target {
-            match group_id {
-                Some(group_id) => {
-                    groups.insert(*group_id);
-                }
-                None => include_global = true,
-            }
-        }
-    }
-    if !include_global && groups.is_empty() {
-        return;
-    }
-    if let Err(error) = recompute_realm_usage_summary(
-        context,
-        net_handle.node_id(),
-        include_global,
-        groups.into_iter().collect(),
-    )
-    .await
-    {
-        error!(error = %error, "Failed to refresh realm usage summary after document sync reconciliation");
-    }
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {

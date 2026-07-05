@@ -50,7 +50,9 @@ use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
-use crate::usage_stats::restore_usage_snapshot_publish_timer;
+use crate::usage_stats::{
+    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
+};
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
@@ -373,6 +375,14 @@ impl OperationsTaskHandler {
             })) => {
                 process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
                     .await;
+                if let Some(net_handle) = self.context.net_handle.as_ref() {
+                    refresh_realm_usage_summary_for_targets(
+                        self.context.as_ref(),
+                        net_handle.node_id(),
+                        &targets,
+                    )
+                    .await;
+                }
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -775,6 +785,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
                             metadata_graph_tombstones,
                         )
                         .await;
+                        refresh_realm_usage_summary_for_targets(
+                            self.context.as_ref(),
+                            net_handle.node_id(),
+                            &targets,
+                        )
+                        .await;
                         if self
                             .project_reconciled_metadata_create_events(
                                 &retry_key,
@@ -1173,5 +1189,134 @@ mod tests {
         let jobs = read_graph_prune_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
+    }
+
+    #[tokio::test]
+    async fn drain_reconcile_refreshes_realm_usage_summary() {
+        use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+        use aruna_core::structs::{
+            NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, node_usage_global_key,
+            usage_global_shard_key,
+        };
+        use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+
+        async fn write_stat(
+            storage: &aruna_storage::StorageHandle,
+            key_space: &str,
+            key: Vec<u8>,
+            value: Vec<u8>,
+        ) {
+            match storage
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                }))
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected write event: {other:?}"),
+            }
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let remote = node(2);
+
+        // Local global counters (10) plus a remote node's snapshot (5) should sum
+        // to 15 in the refreshed realm summary cache.
+        write_stat(
+            &storage,
+            USAGE_STATS_KEYSPACE,
+            usage_global_shard_key(0),
+            UsageCounters {
+                logical_bytes: 10,
+                ..Default::default()
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+        write_stat(
+            &storage,
+            USAGE_NODE_STATS_KEYSPACE,
+            node_usage_global_key(remote),
+            NodeUsageSnapshot {
+                node_id: remote,
+                counters: UsageCounters {
+                    logical_bytes: 5,
+                    ..Default::default()
+                },
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                Vec::new(),
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsReconciled {
+                        applied: 1,
+                        targets: vec![DocumentSyncTarget::NodeUsage {
+                            realm_id,
+                            node_id: remote,
+                            group_id: None,
+                        }],
+                        metadata_create_events: Vec::new(),
+                        metadata_graph_tombstones: Vec::new(),
+                    },
+                )),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(!outcome.retry_needed);
+        let summary = match storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected read event: {other:?}"),
+        };
+        let summary = summary.expect("realm usage summary refreshed by drain reconcile");
+        assert_eq!(
+            UsageCounters::from_bytes(summary.as_ref())
+                .unwrap()
+                .logical_bytes,
+            15
+        );
+
+        net.shutdown().await;
     }
 }
