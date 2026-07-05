@@ -34,11 +34,20 @@ pub fn select_sync_peers(
     excluded: &[NodeId],
     desired_count: usize,
 ) -> Vec<NodeId> {
+    let topic_id = target.sync_topic_id().to_string();
+    select_topic_peers(topic_id.as_bytes(), candidates, excluded, desired_count)
+}
+
+pub fn select_topic_peers(
+    topic_id: &[u8],
+    candidates: &[NodeId],
+    excluded: &[NodeId],
+    desired_count: usize,
+) -> Vec<NodeId> {
     if desired_count == 0 {
         return Vec::new();
     }
 
-    let topic_id = target.sync_topic_id().to_string();
     let mut candidates = candidates
         .iter()
         .copied()
@@ -47,8 +56,8 @@ pub fn select_sync_peers(
     candidates.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     candidates.dedup();
     candidates.sort_unstable_by(|left, right| {
-        let left_score = selector_score(topic_id.as_bytes(), *left);
-        let right_score = selector_score(topic_id.as_bytes(), *right);
+        let left_score = selector_score(topic_id, *left);
+        let right_score = selector_score(topic_id, *right);
         left_score
             .cmp(&right_score)
             .then_with(|| left.as_bytes().cmp(right.as_bytes()))
@@ -230,6 +239,18 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn select_topic_peers_matches_select_sync_peers() {
+        let candidates = vec![node(1), node(2), node(3), node(4), node(5)];
+        let target = target();
+        let topic_id = target.sync_topic_id().to_string();
+
+        assert_eq!(
+            select_sync_peers(&target, &candidates, &[node(1)], 3),
+            select_topic_peers(topic_id.as_bytes(), &candidates, &[node(1)], 3),
+        );
     }
 
     #[test]
