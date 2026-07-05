@@ -43,6 +43,7 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
             | TaskKey::DrainBlobReplicationQueue
             | TaskKey::DrainReferenceMetadataRefreshQueue
             | TaskKey::DrainNotificationOutbox
+            | TaskKey::PruneNotifications
     )
 }
 
@@ -337,6 +338,25 @@ mod tests {
         )
         .await
         .expect("notification drain timer persistence is redundant");
+
+        assert_eq!(storage.snapshot_metrics().requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_timer_reset_is_not_persisted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::PruneNotifications,
+                after: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("prune timer persistence is redundant");
 
         assert_eq!(storage.snapshot_metrics().requests_total, 0);
     }

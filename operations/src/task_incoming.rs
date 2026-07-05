@@ -49,6 +49,10 @@ use crate::notifications::outbox::{
     restore_notification_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
+use crate::notifications::prune::{
+    NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
+    process_notification_prune_batch, restore_notification_prune_timer,
+};
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
@@ -913,6 +917,22 @@ impl OperationsTaskHandler {
             self.reschedule_timer(retry_key, Duration::ZERO).await;
         }
     }
+
+    async fn prune_notifications(&self) {
+        let after = match process_notification_prune_batch(&self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => outcome
+                .next_due_after
+                .unwrap_or(NOTIFICATION_PRUNE_POLL_AFTER)
+                .min(NOTIFICATION_PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(error = %error, "Failed to prune notifications");
+                NOTIFICATION_PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneNotifications, after)
+            .await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -944,6 +964,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
@@ -961,6 +982,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+    restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
 }
@@ -1105,6 +1127,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainNotificationOutbox => {
                 self.drain_notification_outbox().await;
+            }
+            TaskKey::PruneNotifications => {
+                self.prune_notifications().await;
             }
         }
     }
