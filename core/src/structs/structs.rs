@@ -54,6 +54,19 @@ pub struct Role {
     pub assigned_users: HashSet<UserId>,
 }
 
+impl Role {
+    /// A role assigned to the Everyone principal (the nil user id) applies to
+    /// every request in the realm — including anonymous, unauthenticated ones
+    /// (see `AuthContext::anonymous`). Encoding publicness as a member instead
+    /// of a struct field keeps stored auth documents (postcard, positional)
+    /// readable without a migration.
+    pub fn is_public(&self) -> bool {
+        self.assigned_users
+            .iter()
+            .any(|user| user.user_ulid.is_nil())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
@@ -162,6 +175,19 @@ pub struct AuthContext {
     pub user_id: UserId,
     pub realm_id: RealmId,
     pub path_restrictions: Option<Vec<PathRestriction>>,
+}
+
+impl AuthContext {
+    /// The Everyone principal: unauthenticated requests are permission-checked
+    /// as the nil user, so exactly the roles that assign `UserId::nil` (public
+    /// roles, `Role::is_public`) grant them access.
+    pub fn anonymous(realm_id: RealmId) -> Self {
+        Self {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+        }
+    }
 }
 
 impl TryFrom<TokenClaims> for AuthContext {
