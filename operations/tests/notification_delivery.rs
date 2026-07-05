@@ -15,11 +15,13 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::notifications::client::{list_remote, mark_read_remote, unread_count_remote};
-use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
-use aruna_operations::notifications::list::{
-    LIST_NOTIFICATIONS_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
+use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
+use aruna_operations::notifications::dispatch::{
+    NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
+    unread_count_for_user,
 };
+use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
+use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::outbox::NOTIFICATION_DELIVERY_RETRY_AFTER;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::task_incoming::initialize_task_incoming;
@@ -235,6 +237,109 @@ async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+#[tokio::test]
+async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([66u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let config = realm_config_for(&nodes, realm_id);
+    let holder = nodes[2].net.node_id();
+    let recipient = user_with_holder(&config, holder, realm_id);
+    // Neither the emitter nor the holder: every op it serves must proxy one hop
+    // to the holder through the dispatch remote arms.
+    let reader_ctx = nodes[1].context.clone();
+    let reader_id = nodes[1].net.node_id();
+
+    let now = unix_timestamp_millis();
+    let records: Vec<NotificationRecord> = (0..3)
+        .map(|offset| added_to_group_record(recipient, realm_id, now + offset))
+        .collect();
+    let ids: Vec<Ulid> = vec![records[0].notification_id, records[1].notification_id];
+
+    emit_on(&nodes[0], records).await?;
+    wait_for(POLL_TIMEOUT, || {
+        let reader_ctx = reader_ctx.clone();
+        async move {
+            list_notifications_for_user(
+                reader_ctx.as_ref(),
+                reader_id,
+                recipient,
+                None,
+                LIST_LIMIT as usize,
+            )
+            .await
+            .map(|(records, _)| records.len() >= 3)
+            .unwrap_or(false)
+        }
+    })
+    .await?;
+
+    let (count, capped) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    assert_eq!((count, capped), (3, false));
+
+    let marked =
+        mark_read_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
+    assert_eq!(marked, 2);
+
+    let (count, _) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    assert_eq!(count, 1);
+
+    // A resolvable remote holder with no net handle is Unavailable, not a 500.
+    let no_net = Arc::new(DriverContext {
+        storage_handle: reader_ctx.storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+    });
+    let unavailable = list_notifications_for_user(
+        no_net.as_ref(),
+        reader_id,
+        recipient,
+        None,
+        LIST_LIMIT as usize,
+    )
+    .await
+    .expect_err("missing net handle must be Unavailable");
+    assert!(matches!(
+        unavailable,
+        NotificationDispatchError::Unavailable
+    ));
+
+    // An unreachable holder surfaces as a Remote proxy error (mapped to 502).
+    nodes[2].net.shutdown().await;
+    let remote = wait_for_dispatch_error(reader_ctx.as_ref(), reader_id, recipient).await;
+    assert!(matches!(remote, NotificationDispatchError::Remote(_)));
+
+    nodes[0].net.shutdown().await;
+    nodes[1].net.shutdown().await;
+    Ok(())
+}
+
+async fn wait_for_dispatch_error(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    recipient: UserId,
+) -> NotificationDispatchError {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        match list_notifications_for_user(
+            context,
+            local_node_id,
+            recipient,
+            None,
+            LIST_LIMIT as usize,
+        )
+        .await
+        {
+            Err(error) => return error,
+            Ok(_) => {
+                assert!(Instant::now() < deadline, "holder never became unreachable");
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 fn added_to_group_record(
     recipient: UserId,
     realm_id: RealmId,
@@ -287,27 +392,16 @@ async fn emit_on(
 }
 
 async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
-    let holder = resolve_holder_on(node, recipient)
-        .await
-        .expect("resolve inbox holder");
-    if holder == node.net.node_id() {
-        drive(
-            ListNotificationsOperation::new(ListNotificationsInput {
-                recipient,
-                cursor: None,
-                limit: LIST_LIMIT as usize,
-            }),
-            node.context.as_ref(),
-        )
-        .await
-        .expect("local list notifications")
-        .records
-    } else {
-        list_remote(&node.net, holder, recipient, None, LIST_LIMIT)
-            .await
-            .expect("remote list notifications")
-            .0
-    }
+    list_notifications_for_user(
+        node.context.as_ref(),
+        node.net.node_id(),
+        recipient,
+        None,
+        LIST_LIMIT as usize,
+    )
+    .await
+    .expect("dispatch list notifications")
+    .0
 }
 
 async fn resolve_holder_on(
