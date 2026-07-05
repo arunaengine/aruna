@@ -3,7 +3,7 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -35,6 +35,8 @@ pub enum PutObjectState {
     WriteHashPathIndex,
     CreateBlobVersionRecord,
     WriteLiveReplicationObligation,
+    EnforceQuota,
+    QuotaRejectAbort,
     UpdateUsage,
     CommitTransaction,
     RegisterBlobInDht,
@@ -67,6 +69,10 @@ pub enum PutObjectError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
+    #[error(transparent)]
+    QuotaGateError(#[from] QuotaGateError),
+    #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
+    QuotaExceeded { limit: u64, usage: u64 },
     #[error("Something went wrong ...")]
     PutObjectFailed,
 }
@@ -90,6 +96,10 @@ pub struct PutObjectConfig {
     pub checksum_type: Option<String>,
     pub exists: bool, //Note: For version shenanigans which will be implemented later
     pub version_source: Option<VersionSourceBinding>,
+    /// Hard ceiling (bytes) the group's realm-wide `logical_bytes` may reach,
+    /// resolved from the realm quota config at the request surface. `None` =
+    /// unlimited, so no gate is enforced.
+    pub quota_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +120,7 @@ pub struct PutObjectOperation {
     new_blob: bool,
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
+    quota_gate: Option<QuotaGate>,
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
 }
@@ -127,6 +138,7 @@ impl PutObjectOperation {
             new_blob: false,
             was_live: false,
             usage_update: None,
+            quota_gate: None,
             pending_error: None,
             output: None,
         }
@@ -482,21 +494,95 @@ impl PutObjectOperation {
                     stored_bytes: if self.new_blob { size } else { 0 },
                     ..group_delta
                 };
-                let mut update = UsageCounterUpdate::with_global(
+                self.usage_update = Some(UsageCounterUpdate::with_global(
                     self.config.group_id,
                     group_delta,
                     global_delta,
-                );
-                self.state = PutObjectState::UpdateUsage;
-                let effects = update.start(txn_id);
-                self.usage_update = Some(update);
-                effects
+                ));
+
+                // Enforce the hard group quota before the counters commit. Only a
+                // positive logical-bytes delta can push a group over its ceiling;
+                // deletes and zero-length writes are never gated.
+                if let Some(ceiling) = self.config.quota_ceiling
+                    && location.blob_size > 0
+                {
+                    let mut gate = QuotaGate::new(
+                        ceiling,
+                        location.blob_size,
+                        self.config.group_id,
+                        self.config.node_id,
+                    );
+                    self.state = PutObjectState::EnforceQuota;
+                    let effects = gate.start(txn_id);
+                    self.quota_gate = Some(gate);
+                    effects
+                } else {
+                    self.start_usage_update(txn_id)
+                }
             } else {
                 self.emit_error(PutObjectError::NoTransactionFound)
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
+    }
+
+    fn start_usage_update(&mut self, txn_id: Ulid) -> Effects {
+        self.state = PutObjectState::UpdateUsage;
+        match self.usage_update.as_mut() {
+            Some(update) => update.start(txn_id),
+            None => self.emit_error(PutObjectError::PutObjectFailed),
+        }
+    }
+
+    fn handle_enforce_quota(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let Some(gate) = self.quota_gate.as_mut() else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        match gate.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                if gate.is_exceeded() {
+                    self.pending_error = Some(PutObjectError::QuotaExceeded {
+                        limit: gate.ceiling(),
+                        usage: gate.projected_usage(),
+                    });
+                    self.reject_over_quota()
+                } else {
+                    self.start_usage_update(txn_id)
+                }
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
+    }
+
+    /// Unwinds the pending write after a quota rejection: aborts the open
+    /// transaction, then deletes the orphaned blob, before surfacing the error.
+    fn reject_over_quota(&mut self) -> Effects {
+        self.state = PutObjectState::QuotaRejectAbort;
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => self.cleanup_orphan_blob(),
+        }
+    }
+
+    fn handle_quota_reject_abort(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. })
+            | Event::Storage(StorageEvent::Error { .. }) => self.cleanup_orphan_blob(),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn cleanup_orphan_blob(&mut self) -> Effects {
+        self.state = PutObjectState::CleanupFailedWrite;
+        self.get_written_location().cloned().map_or_else(
+            || self.emit_pending_error(),
+            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
+        )
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -651,6 +737,8 @@ impl Operation for PutObjectOperation {
             PutObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
+            PutObjectState::QuotaRejectAbort => self.handle_quota_reject_abort(event),
             PutObjectState::UpdateUsage => self.handle_usage_update(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::RegisterBlobInDht => self.handle_blob_registered_in_dht(event),
@@ -804,6 +892,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            quota_ceiling: None,
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -1004,6 +1093,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1030,6 +1120,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1121,6 +1212,7 @@ mod test {
             checksum_type: None,
             exists: false,
             version_source: None,
+            quota_ceiling: None,
         });
         let version_id = Ulid::new();
         op.version_id = Some(version_id);
@@ -1219,6 +1311,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1245,6 +1338,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1400,6 +1494,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )

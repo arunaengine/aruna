@@ -173,6 +173,142 @@ impl UsageCounterUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum QuotaGatePhase {
+    Pending,
+    ReadLocal,
+    ScanRemote,
+    Done,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum QuotaGateError {
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("quota gate received unexpected event: {0:?}")]
+    UnexpectedEvent(Event),
+}
+
+/// Embeddable read side of the hard per-group quota gate. Sums the group's
+/// realm-wide `logical_bytes` — the live local group counter plus every remote
+/// node's replicated group snapshot — inside the caller's write transaction right
+/// before it commits the counters, so a concurrent same-group write conflicts on
+/// the group counter key and cannot slip a second write past the ceiling.
+///
+/// `ceiling` already folds in the grace factor; that headroom is deliberately the
+/// budget for remote snapshot staleness, since remote group totals lag the
+/// authoritative counters that produced them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaGate {
+    ceiling: u64,
+    delta_logical_bytes: u64,
+    group_key: Vec<u8>,
+    remote_prefix: Vec<u8>,
+    local_node_id: NodeId,
+    usage: u64,
+    phase: QuotaGatePhase,
+}
+
+impl QuotaGate {
+    const SCAN_LIMIT: usize = 1_000;
+
+    pub fn new(
+        ceiling: u64,
+        delta_logical_bytes: u64,
+        group_id: GroupId,
+        local_node_id: NodeId,
+    ) -> Self {
+        Self {
+            ceiling,
+            delta_logical_bytes,
+            group_key: usage_group_key(group_id),
+            remote_prefix: node_usage_group_prefix(group_id),
+            local_node_id,
+            usage: 0,
+            phase: QuotaGatePhase::Pending,
+        }
+    }
+
+    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+        self.phase = QuotaGatePhase::ReadLocal;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: self.group_key.clone().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn scan_effect(&self, start_after: Option<Key>, txn_id: TxnId) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(self.remote_prefix.clone().into()),
+            start: start_after.map(IterStart::After),
+            limit: Self::SCAN_LIMIT,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Returns `Ok(Some(effects))` while more storage work is needed and
+    /// `Ok(None)` once the group's realm-wide usage has been summed.
+    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
+        match (&self.phase, event) {
+            (QuotaGatePhase::ReadLocal, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                if let Some(bytes) = value {
+                    let counters = UsageCounters::from_bytes(bytes.as_ref())?;
+                    self.usage = self.usage.saturating_add(counters.logical_bytes);
+                }
+                self.phase = QuotaGatePhase::ScanRemote;
+                Ok(Some(self.scan_effect(None, txn_id)))
+            }
+            (
+                QuotaGatePhase::ScanRemote,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                for (key, value) in values {
+                    // Skip our own snapshot: the live local counter already accounts
+                    // for it. Mirror `sum_remote_snapshots` — never trust a snapshot
+                    // whose embedded node id disagrees with its storage key.
+                    let key_node_id = node_usage_key_node_id(key.as_ref());
+                    if key_node_id == Some(self.local_node_id) {
+                        continue;
+                    }
+                    let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref())?;
+                    if key_node_id != Some(snapshot.node_id) {
+                        continue;
+                    }
+                    self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                }
+                match next_start_after {
+                    Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
+                    None => {
+                        self.phase = QuotaGatePhase::Done;
+                        Ok(None)
+                    }
+                }
+            }
+            (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
+        }
+    }
+
+    /// Projected group-wide `logical_bytes` if the pending write commits.
+    pub fn projected_usage(&self) -> u64 {
+        self.usage.saturating_add(self.delta_logical_bytes)
+    }
+
+    /// True when committing the pending write would push the group's realm-wide
+    /// `logical_bytes` past the ceiling. At-ceiling passes; one byte over fails.
+    pub fn is_exceeded(&self) -> bool {
+        self.projected_usage() > self.ceiling
+    }
+
+    pub fn ceiling(&self) -> u64 {
+        self.ceiling
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LoadUsageCountersState {
     Init,
     ReadCounter,
