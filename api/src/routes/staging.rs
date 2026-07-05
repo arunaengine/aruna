@@ -12,6 +12,7 @@ use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::staging::head_source::HeadStagingSourceError;
 use aruna_operations::staging::read_source::ReadStagingSourceError;
 use aruna_operations::staging::reference::{
@@ -316,6 +317,9 @@ fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
     match error {
         MaterializeSnapshotError::Read(error) => map_read_staging_error(error),
+        MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
+            ServerError::Forbidden
+        }
         MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.to_string()),
     }
 }
@@ -531,6 +535,17 @@ mod tests {
             .is_some(),
             "durable obligation should remain repairable when staging queue kick fails"
         );
+    }
+
+    #[test]
+    fn snapshot_quota_exceeded_maps_to_forbidden() {
+        let error = map_snapshot_error(MaterializeSnapshotError::Write(
+            PutObjectError::QuotaExceeded {
+                limit: 100,
+                usage: 200,
+            },
+        ));
+        assert!(matches!(error, ServerError::Forbidden));
     }
 
     #[test]
