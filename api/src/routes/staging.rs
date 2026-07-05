@@ -7,6 +7,7 @@ use crate::server_state::ServerState;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{AuthContext, BucketInfo, Permission};
 use aruna_operations::driver::drive;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -131,6 +132,8 @@ async fn snapshot_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
+    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
+
     let result = stage_snapshot_blob(
         &state.get_ctx(),
         MaterializeSnapshotInput {
@@ -142,6 +145,7 @@ async fn snapshot_blob(
             source_path: request.source_path,
             bucket: request.bucket.clone(),
             key: request.key.clone(),
+            quota_ceiling,
         },
     )
     .await
@@ -222,6 +226,22 @@ async fn reference_blob(
             last_modified: result.source_metadata.last_modified.map(format_system_time),
         }),
     ))
+}
+
+/// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
+/// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
+/// `None` means the group is unlimited.
+async fn resolve_group_quota_ceiling(
+    state: &ServerState,
+    group_id: ulid::Ulid,
+) -> ServerResult<Option<u64>> {
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    Ok(config.quota.effective_group_ceiling(&group_id))
 }
 
 async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
