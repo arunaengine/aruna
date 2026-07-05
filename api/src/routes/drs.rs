@@ -263,7 +263,7 @@ pub async fn get_object(
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Response {
-    let auth = match require_drs_auth(state.as_ref(), auth) {
+    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -294,7 +294,7 @@ pub async fn post_objects(
     headers: HeaderMap,
     Json(body): Json<DrsBulkObjectsRequestBody>,
 ) -> Response {
-    let auth = match require_drs_auth(state.as_ref(), auth) {
+    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -333,7 +333,7 @@ pub async fn download_object(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let Ok(auth) = require_realm_auth(state.as_ref(), auth) else {
+    let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
     let resolved = match resolve_object(state.as_ref(), &auth, &query.object_id).await {
@@ -450,6 +450,19 @@ fn require_drs_auth(
     auth: Option<AuthContext>,
 ) -> Result<AuthContext, DrsError> {
     require_realm_auth(state, auth).map_err(|_| DrsError::forbidden("Forbidden"))
+}
+
+/// Requests without a bearer token resolve as the Everyone principal — public
+/// roles are then the only grants that can make an object readable, so private
+/// data keeps returning 403/404 exactly as before.
+fn drs_auth_or_anonymous(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> Result<AuthContext, DrsError> {
+    match auth {
+        Some(_) => require_drs_auth(state, auth),
+        None => Ok(AuthContext::anonymous(state.get_realm_id())),
+    }
 }
 
 async fn resolve_object(
