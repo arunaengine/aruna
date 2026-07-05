@@ -17,7 +17,7 @@ use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
 use aruna_operations::status::load_node_observability_status;
-use aruna_operations::usage_stats::LoadUsageCountersOperation;
+use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, put};
@@ -459,6 +459,9 @@ pub async fn set_realm_quota(
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
 }
 
+/// Storage usage. The flat fields report this node's local counters (kept for
+/// backward compatibility); `realm` reports the realm-wide total summed across
+/// every node in the realm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UsageResponse {
     pub buckets: u64,
@@ -466,9 +469,19 @@ pub struct UsageResponse {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
+    pub realm: UsageTotals,
 }
 
-impl From<UsageCounters> for UsageResponse {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageTotals {
+    pub buckets: u64,
+    pub objects: u64,
+    pub stored_blobs: u64,
+    pub stored_bytes: u64,
+    pub logical_bytes: u64,
+}
+
+impl From<UsageCounters> for UsageTotals {
     fn from(counters: UsageCounters) -> Self {
         Self {
             buckets: counters.buckets,
@@ -480,10 +493,32 @@ impl From<UsageCounters> for UsageResponse {
     }
 }
 
+impl UsageResponse {
+    pub fn new(local: UsageCounters, realm: UsageCounters) -> Self {
+        Self {
+            buckets: local.buckets,
+            objects: local.objects,
+            stored_blobs: local.stored_blobs,
+            stored_bytes: local.stored_bytes,
+            logical_bytes: local.logical_bytes,
+            realm: realm.into(),
+        }
+    }
+}
+
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
     drive(LoadUsageCountersOperation::new(key), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+pub async fn load_realm_usage(
+    state: &ServerState,
+    scope: RealmUsageScope,
+) -> ServerResult<UsageCounters> {
+    aruna_operations::usage_stats::load_realm_usage(&state.get_ctx(), state.get_node_id(), scope)
+        .await
+        .map_err(ServerError::InternalError)
 }
 
 #[utoipa::path(
@@ -491,14 +526,15 @@ pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerRes
     path = "/info/usage",
     tag = "info",
     responses(
-        (status = 200, description = "Aggregate storage usage on this node", body = UsageResponse)
+        (status = 200, description = "Local and realm-wide storage usage", body = UsageResponse)
     )
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    let counters = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
-    Ok((StatusCode::OK, Json(UsageResponse::from(counters))))
+    let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
+    let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
+    Ok((StatusCode::OK, Json(UsageResponse::new(local, realm))))
 }
 
 fn map_realm_info_response(
@@ -801,7 +837,7 @@ mod tests {
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
         RealmQuotaConfig, RequestSummary, ServiceStatus, ServicesStatus, get_info, get_realm_info,
-        set_realm_quota,
+        get_usage, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -1003,6 +1039,57 @@ mod tests {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/info"));
+    }
+
+    #[tokio::test]
+    async fn get_usage_reports_local_and_realm_totals() {
+        use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+        use aruna_core::structs::{
+            NodeUsageSnapshot, UsageCounters, node_usage_global_key, usage_global_shard_key,
+        };
+
+        let (state, _tempdir) = setup_state().await;
+        let ctx = state.get_ctx();
+
+        // This node's live local total.
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: usage_global_shard_key(0).into(),
+                value: UsageCounters {
+                    buckets: 2,
+                    ..Default::default()
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+        // A remote node's replicated snapshot.
+        let remote = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: node_usage_global_key(remote).into(),
+                value: NodeUsageSnapshot {
+                    node_id: remote,
+                    counters: UsageCounters {
+                        buckets: 3,
+                        ..Default::default()
+                    },
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+
+        let (status, Json(response)) = get_usage(State(state)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.buckets, 2, "flat fields report local total");
+        assert_eq!(response.realm.buckets, 5, "realm sums local and remote");
     }
 
     #[test]

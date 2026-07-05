@@ -594,9 +594,16 @@ pub async fn get_group_usage(
         return Err(ServerError::Forbidden);
     }
 
-    let counters =
-        crate::routes::info::load_usage_counters(&state, usage_group_key(group_id)).await?;
-    Ok((StatusCode::OK, Json(counters.into())))
+    let local = crate::routes::info::load_usage_counters(&state, usage_group_key(group_id)).await?;
+    let realm = crate::routes::info::load_realm_usage(
+        &state,
+        aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(crate::routes::info::UsageResponse::new(local, realm)),
+    ))
 }
 
 #[utoipa::path(
