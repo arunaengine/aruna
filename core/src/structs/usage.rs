@@ -84,6 +84,13 @@ pub fn node_usage_dirty_group_id(key: &[u8]) -> Option<GroupId> {
     Some(GroupId::from_bytes(bytes))
 }
 
+/// Recovers the group id from a `g/<group><node>` per-group snapshot key.
+pub fn node_usage_group_key_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(NODE_USAGE_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.get(..16)?.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
 pub fn node_usage_summary_group_key(group_id: GroupId) -> Vec<u8> {
     let mut key = Vec::with_capacity(NODE_USAGE_SUMMARY_GROUP_PREFIX.len() + 16);
     key.extend_from_slice(NODE_USAGE_SUMMARY_GROUP_PREFIX);
@@ -316,6 +323,8 @@ mod tests {
         let group_key = node_usage_group_key(group_id, node_id);
         assert!(group_key.starts_with(&node_usage_group_prefix(group_id)));
         assert_eq!(node_usage_key_node_id(&group_key), Some(node_id));
+        assert_eq!(node_usage_group_key_group_id(&group_key), Some(group_id));
+        assert_eq!(node_usage_group_key_group_id(&global_key), None);
 
         // Group snapshots for one group form a contiguous scan range.
         assert!(group_key.starts_with(NODE_USAGE_GROUP_PREFIX));
