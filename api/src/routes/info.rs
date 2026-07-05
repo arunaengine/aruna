@@ -282,8 +282,12 @@ impl RealmQuotaConfig {
             .into_iter()
             .map(|over| {
                 Ok(GroupQuotaOverride {
-                    group_id: Ulid::from_string(&over.group_id)
-                        .map_err(|_| ServerError::BadRequest)?,
+                    group_id: Ulid::from_string(&over.group_id).map_err(|_| {
+                        ServerError::BadRequestReason(format!(
+                            "invalid group id in group_overrides: {}",
+                            over.group_id
+                        ))
+                    })?,
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
                 })
@@ -294,8 +298,12 @@ impl RealmQuotaConfig {
             .into_iter()
             .map(|over| {
                 Ok(UserGroupCapOverride {
-                    user_id: UserId::from_string(&over.user_id)
-                        .map_err(|_| ServerError::BadRequest)?,
+                    user_id: UserId::from_string(&over.user_id).map_err(|_| {
+                        ServerError::BadRequestReason(format!(
+                            "invalid user id in user_group_cap_overrides: {}",
+                            over.user_id
+                        ))
+                    })?,
                     max_groups: over.max_groups,
                 })
             })
@@ -453,7 +461,7 @@ pub async fn set_realm_quota(
     .await
     .map_err(|error| match error {
         SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
-        SetRealmQuotaError::InvalidQuota { .. } => ServerError::BadRequest,
+        SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
         other => ServerError::InternalError(other.to_string()),
     })?;
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
@@ -1342,5 +1350,41 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(info.quota.default_group_quota_bytes, Some(4096));
         assert_eq!(info.quota.max_devices_per_user, Some(2));
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_surfaces_invalid_reason_in_bad_request_body() {
+        use axum::response::IntoResponse;
+
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.warn_threshold_percent = 0;
+
+        let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::BadRequestReason(_)));
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: crate::error::ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed.code.as_deref(),
+            Some("Bad request"),
+            "machine code stays identical to plain BadRequest"
+        );
+        assert!(
+            parsed.error.contains("warn_threshold_percent"),
+            "body must carry the validation reason, got: {}",
+            parsed.error
+        );
     }
 }
