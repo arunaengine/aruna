@@ -1,9 +1,9 @@
 use super::util::get_s3_operation_permission;
-use aruna_core::NodeId;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
 };
+use aruna_core::{NodeId, UserId};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -59,15 +59,15 @@ impl S3Access for AuthProvider {
         let action = get_s3_operation_permission(cx.s3_op().name())
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
+        // Unsigned requests are checked as the Everyone principal: read-only,
+        // and only where a public role grants READ.
+        let access_key_id = match cx.credentials() {
+            Some(credentials) => credentials.access_key.clone(),
+            None => return self.check_anonymous(cx, action).await,
+        };
+
         // Fetch user access -> GetUserAccess state machine
-        let access_key_id = &cx
-            .credentials()
-            .ok_or(s3_error!(
-                AccessDenied,
-                "Credentials missing in access context"
-            ))?
-            .access_key;
-        let user_access = self.query_user_access(access_key_id).await?;
+        let user_access = self.query_user_access(&access_key_id).await?;
 
         if user_access.issued_by != *self.node_id.as_bytes() {
             return Err(s3_error!(InvalidAccessKeyId, "Credential issuer mismatch"));
@@ -113,6 +113,70 @@ impl S3Access for AuthProvider {
 }
 
 impl AuthProvider {
+    /// Anonymous access: read-only, addressed to a concrete bucket (never the
+    /// account-level ops like ListBuckets), and allowed only when a public
+    /// role — one assigned to the Everyone principal — grants READ on the
+    /// bucket/object permission path. The bucket's own group scopes that path,
+    /// so the authenticated flow's group-ownership check has no analogue here.
+    async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
+        if !matches!(action, Action::Read) {
+            return Err(s3_error!(AccessDenied, "Anonymous requests are read-only"));
+        }
+        let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
+            return Err(s3_error!(
+                AccessDenied,
+                "Anonymous requests must address a bucket"
+            ));
+        };
+        let key = cx.s3_path().get_object_key().map(str::to_owned);
+        let Some(bucket_info) = self.find_bucket_info(&bucket).await? else {
+            return Err(s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist."
+            ));
+        };
+        let group_id = bucket_info.group_id;
+
+        let path = match &key {
+            Some(key) => {
+                blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, key)
+            }
+            None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
+        };
+
+        let allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext::anonymous(self.realm_id),
+                path,
+                required_permission: Permission::READ,
+            }),
+            self.driver_ctx.as_ref(),
+        )
+        .await
+        .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
+
+        if !allowed {
+            return Err(s3_error!(AccessDenied, "Permission denied"));
+        }
+
+        // Handlers read UserAccess/BucketInfo from the request extensions;
+        // hand them the Everyone principal scoped to the bucket's group. The
+        // key/secret fields are blank — nothing downstream signs with them —
+        // and expiry is irrelevant because this access was just checked.
+        cx.extensions_mut().insert(bucket_info);
+        cx.extensions_mut().insert(UserAccess {
+            access_key: String::new(),
+            user_identity: UserId::nil(self.realm_id),
+            group_id,
+            secret: String::new(),
+            expiry: SystemTime::now(),
+            path_restrictions: None,
+            issued_by: *self.node_id.as_bytes(),
+            revoked_at: None,
+        });
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: &str) -> S3Result<UserAccess> {
         let operation = GetUserAccessOperation::new(access_key_id.to_string());
