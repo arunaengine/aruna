@@ -6,7 +6,7 @@ pub mod selector;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument, bucket_for_subject,
+    PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument, shard_for_subject,
 };
 
 pub use resolver::{
@@ -14,28 +14,28 @@ pub use resolver::{
     resolve_holders, strategy_for_target, subject_bytes,
 };
 
-/// Canonical rendezvous subject for a bucket's holder resolution:
-/// `strategy_id(16) ‖ epoch(8, little-endian) ‖ bucket(4, big-endian)`. Every
-/// document hashing into the bucket resolves the same holder set from this, so
-/// one sync topic per bucket has one authoritative holder set (unlike stage 1,
+/// Canonical rendezvous subject for a shard's holder resolution:
+/// `strategy_id(16) ‖ epoch(8, little-endian) ‖ shard(4, big-endian)`. Every
+/// document hashing into the shard resolves the same holder set from this, so
+/// one sync topic per shard has one authoritative holder set (unlike stage 1,
 /// where the rendezvous subject was the individual document).
-pub fn bucket_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
+pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(28);
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
     bytes.extend_from_slice(&placement.epoch.to_le_bytes());
-    bytes.extend_from_slice(&placement.bucket.to_be_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
     bytes
 }
 
-/// Holder pin/exclude override for a bucket: matched on the bucket subject, not
-/// a document subject, because one bucket topic has exactly one holder set.
+/// Holder pin/exclude override for a shard: matched on the shard subject, not
+/// a document subject, because one shard topic has exactly one holder set.
 /// Per-document overrides still steer strategy selection (see
 /// [`strategy_for_target`]); their pin/exclude lists are inert for holders.
-fn bucket_override<'a>(
+fn shard_override<'a>(
     config: &'a RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Option<&'a PlacementOverride> {
-    let subject = bucket_subject_bytes(placement);
+    let subject = shard_subject_bytes(placement);
     config
         .placement_overrides
         .iter()
@@ -57,14 +57,14 @@ pub fn placement_ref_for_target(
         Some((strategy, _)) => PlacementRef {
             strategy_id: strategy.strategy_id,
             epoch: 0,
-            bucket: bucket_for_subject(&subject_bytes(target), strategy.bucket_count),
+            shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
         },
         None => PlacementRef::NIL,
     }
 }
 
-/// Placement plan for a document `target`: its bucket's rank-ordered holder set
-/// (the same set every document in the bucket resolves), the nominal replica
+/// Placement plan for a document `target`: its shard's rank-ordered holder set
+/// (the same set every document in the shard resolves), the nominal replica
 /// target the pending machinery tops up toward, and the envelope reference.
 /// `None` when no strategy governs the target.
 pub struct TargetPlacementPlan {
@@ -82,9 +82,9 @@ pub fn plan_target_placement(
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
         epoch: 0,
-        bucket: bucket_for_subject(&subject_bytes(target), strategy.bucket_count),
+        shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
-    let holders = resolve_bucket_holders_with(config, strategy, &placement);
+    let holders = resolve_shard_holders_with(config, strategy, &placement);
     let desired_count = match strategy.replica_count {
         Some(count) => count as usize,
         None => holders.len(),
@@ -96,9 +96,9 @@ pub fn plan_target_placement(
     })
 }
 
-/// Full eligible-node ranking for the bucket that `target` hashes into
+/// Full eligible-node ranking for the shard that `target` hashes into
 /// (ignoring the strategy's replica cap) so callers can top up beyond
-/// `replica_count`. Rank order is the bucket's, not the individual document's.
+/// `replica_count`. Rank order is the shard's, not the individual document's.
 pub fn rank_eligible_holders(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
@@ -110,7 +110,7 @@ pub fn rank_eligible_holders(
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
         epoch: 0,
-        bucket: bucket_for_subject(&subject_bytes(target), strategy.bucket_count),
+        shard: shard_for_subject(&subject_bytes(target), strategy.shard_count),
     };
     let mut uncapped = strategy.clone();
     uncapped.replica_count = None;
@@ -118,28 +118,28 @@ pub fn rank_eligible_holders(
     resolve_holders(
         &view,
         &uncapped,
-        &bucket_subject_bytes(&placement),
+        &shard_subject_bytes(&placement),
         placement.epoch,
-        bucket_override(config, &placement),
+        shard_override(config, &placement),
     )
 }
 
-/// Rank-ordered holders of a specific bucket (capped by the strategy's
+/// Rank-ordered holders of a specific shard (capped by the strategy's
 /// `replica_count`, or all eligible for an everywhere strategy). Used by the
 /// placement reconciler and the startup restore to enumerate the co-holders of
-/// each bucket the local node is responsible for. Returns `Vec::new()` when the
+/// each shard the local node is responsible for. Returns `Vec::new()` when the
 /// referenced strategy is unknown.
-pub fn resolve_bucket_holders(
+pub fn resolve_shard_holders(
     config: &RealmConfigDocument,
     placement: &PlacementRef,
 ) -> Vec<NodeId> {
     let Some(strategy) = config.strategy(&placement.strategy_id) else {
         return Vec::new();
     };
-    resolve_bucket_holders_with(config, strategy, placement)
+    resolve_shard_holders_with(config, strategy, placement)
 }
 
-fn resolve_bucket_holders_with(
+fn resolve_shard_holders_with(
     config: &RealmConfigDocument,
     strategy: &PlacementStrategy,
     placement: &PlacementRef,
@@ -148,9 +148,9 @@ fn resolve_bucket_holders_with(
     resolve_holders(
         &view,
         strategy,
-        &bucket_subject_bytes(placement),
+        &shard_subject_bytes(placement),
         placement.epoch,
-        bucket_override(config, placement),
+        shard_override(config, placement),
     )
 }
 
@@ -172,7 +172,7 @@ mod tests {
             replica_count: Some(2),
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: 64,
+            shard_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy.clone()];
@@ -184,35 +184,35 @@ mod tests {
             PlacementRef {
                 strategy_id: strategy.strategy_id,
                 epoch: 0,
-                bucket: 7,
+                shard: 7,
             },
         )
     }
 
     #[test]
-    fn bucket_subject_override_pins_and_excludes_holders() {
+    fn shard_subject_override_pins_and_excludes_holders() {
         let (mut config, placement) = config_and_placement();
-        let baseline = resolve_bucket_holders(&config, &placement);
+        let baseline = resolve_shard_holders(&config, &placement);
         assert_eq!(baseline.len(), 2);
 
         let pinned = *baseline.last().unwrap();
         let excluded = baseline[0];
         config.placement_overrides = vec![PlacementOverride {
-            subject: bucket_subject_bytes(&placement),
+            subject: shard_subject_bytes(&placement),
             pinned: vec![pinned],
             excluded: vec![excluded],
             strategy_id: None,
         }];
 
-        let overridden = resolve_bucket_holders(&config, &placement);
+        let overridden = resolve_shard_holders(&config, &placement);
         assert_eq!(overridden[0], pinned);
         assert!(!overridden.contains(&excluded));
     }
 
     #[test]
-    fn document_subject_override_does_not_touch_bucket_holders() {
+    fn document_subject_override_does_not_touch_shard_holders() {
         let (mut config, placement) = config_and_placement();
-        let baseline = resolve_bucket_holders(&config, &placement);
+        let baseline = resolve_shard_holders(&config, &placement);
 
         // Same pin/exclude, but keyed by a document subject: holder resolution
         // ignores it (strategy selection is its only remaining effect).
@@ -223,6 +223,6 @@ mod tests {
             strategy_id: None,
         }];
 
-        assert_eq!(resolve_bucket_holders(&config, &placement), baseline);
+        assert_eq!(resolve_shard_holders(&config, &placement), baseline);
     }
 }

@@ -166,7 +166,7 @@ pub async fn fetch_core_onboarding_documents(
     let realm_id = *realm_id;
 
     // Fetch the shared realm documents first (they include the realm config), so
-    // the bucket-classed user documents can then be routed onto their bucket
+    // the shard-classed user documents can then be routed onto their shard
     // topics via the freshly synced config.
     let mut user_documents = Vec::new();
     for document in onboarding_sync_ticket.payload.documents.clone() {
@@ -186,7 +186,7 @@ pub async fn fetch_core_onboarding_documents(
                 None => aruna_core::structs::PlacementRef::NIL,
             };
             if placement == aruna_core::structs::PlacementRef::NIL {
-                warn!(document = ?document, "Skipping onboarding user document without a bucket placement");
+                warn!(document = ?document, "Skipping onboarding user document without a shard placement");
                 continue;
             }
             let topic = document.sync_topic_id(realm_id, &placement);

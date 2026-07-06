@@ -125,7 +125,7 @@ pub struct DocumentSyncService {
     // receiver once via `take_eviction_receiver` and re-emits the payloads.
     eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
-    // Realm this service serves; bucket-classed targets carry no realm id of
+    // Realm this service serves; shard-classed targets carry no realm id of
     // their own, so their topic derivation reads it from here.
     realm_id: RealmId,
 }
@@ -685,7 +685,7 @@ impl DocumentSyncService {
                 Ok(true) => topic_ids_out.push(topic_id),
                 Ok(false) => {
                     // Join-only: an unknown topic whose genesis is nowhere to be
-                    // found yet (e.g. an empty bucket whose rank-0 holder has not
+                    // found yet (e.g. an empty shard whose rank-0 holder has not
                     // created it) is skipped, not fatal — it arrives via gossip
                     // or a later anti-entropy pass.
                     match self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
@@ -822,11 +822,11 @@ impl DocumentSyncService {
             };
             let target = event.target().clone();
             let topic_id = target.sync_topic_id(self.realm_id, &event.placement());
-            // Bucket topics are join-only here: only the bucket's rank-0 holder
+            // Shard topics are join-only here: only the shard's rank-0 holder
             // creates the genesis (eagerly, via the placement reconciler), so a
-            // publish onto a genesis-less bucket topic fails and the outbox
+            // publish onto a genesis-less shard topic fails and the outbox
             // drain defers the record instead.
-            let may_create_topic = !target.uses_bucket_topic();
+            let may_create_topic = !target.uses_shard_topic();
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -903,7 +903,7 @@ impl DocumentSyncService {
             .is_none();
         if topic_missing && !may_create_topic {
             return Err(NetError::Bootstrap(format!(
-                "bucket topic {topic_id} has no genesis yet; only its rank-0 holder creates it"
+                "shard topic {topic_id} has no genesis yet; only its rank-0 holder creates it"
             )));
         }
         if topic_missing {
@@ -1064,7 +1064,7 @@ impl DocumentSyncService {
     }
 
     /// Whether the topic's genesis is known locally. The outbox drain uses this
-    /// to defer bucket-topic records until the rank-0 holder's genesis arrives.
+    /// to defer shard-topic records until the rank-0 holder's genesis arrives.
     pub fn topic_exists(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
         self.has_topic(topic_id)
     }
@@ -5505,7 +5505,7 @@ mod tests {
         PlacementRef {
             strategy_id: Ulid::from_parts(99, 7),
             epoch: 0,
-            bucket: 11,
+            shard: 11,
         }
     }
 
@@ -6239,7 +6239,7 @@ mod tests {
             replica_count: Some(3),
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: 64,
+            shard_count: 64,
         };
         let binding = StrategyBinding {
             scope: BindingScope::Class(DocumentClass::MetadataRegistry),
@@ -8724,11 +8724,11 @@ mod tests {
         runtime.block_on(async {
             let service = open_restart_service(&root, "child-storage").await;
             let target = restart_target();
-            // Bucket topics are join-only at publish time; this node plays the
-            // bucket's rank-0 holder and creates the genesis eagerly first.
+            // Shard topics are join-only at publish time; this node plays the
+            // shard's rank-0 holder and creates the genesis eagerly first.
             service
                 .ensure_document_sync_topics(&[restart_topic()], Vec::new())
-                .expect("restart bucket topic genesis");
+                .expect("restart shard topic genesis");
             let event = service
                 .publish_documents(
                     vec![DocumentSyncPublish::Upsert {

@@ -31,7 +31,7 @@ use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealm
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
-use aruna_operations::startup::restore_bucket_subscriptions;
+use aruna_operations::startup::restore_shard_subscriptions;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -302,11 +302,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to publish initial node usage snapshots");
     }
 
-    // All startup modes: join the held bucket topics (a freshly onboarded node
-    // pulls existing bucket data from its co-holders here), then create the
-    // geneses of the buckets this node is rank-0 holder of.
-    restore_bucket_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
-    aruna_operations::process_placements::process_bucket_placements(
+    // All startup modes: join the held shard topics (a freshly onboarded node
+    // pulls existing shard data from its co-holders here), then create the
+    // geneses of the shards this node is rank-0 holder of.
+    restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
+    aruna_operations::process_placements::process_shard_placements(
         &driver_ctx,
         config.realm_id,
         config.node_id,

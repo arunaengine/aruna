@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingScope, DEFAULT_BUCKET_COUNT, DocumentClass, NodePlacementEntry,
-    PlacementOverride, PlacementStrategy, StrategyBinding,
+    Actor, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, NodePlacementEntry, PlacementOverride,
+    PlacementStrategy, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -383,7 +383,7 @@ impl RealmConfigDocument {
             replica_count: Some(self.metadata_replication.default_replication_factor),
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: DEFAULT_BUCKET_COUNT,
+            shard_count: DEFAULT_SHARD_COUNT,
         };
         let everywhere_strategy = PlacementStrategy {
             strategy_id: Ulid::r#gen(),
@@ -391,7 +391,7 @@ impl RealmConfigDocument {
             replica_count: None,
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: DEFAULT_BUCKET_COUNT,
+            shard_count: DEFAULT_SHARD_COUNT,
         };
         self.default_strategy_id = Some(default_strategy.strategy_id);
         self.strategy_bindings = vec![

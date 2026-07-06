@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::document::{
-    DocumentSyncNetEvent, DocumentSyncReconcileResult, DocumentSyncTarget, bucket_topic_id,
+    DocumentSyncNetEvent, DocumentSyncReconcileResult, DocumentSyncTarget, shard_topic_id,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -18,7 +18,7 @@ use crate::metadata::projector::{
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
-use crate::placement::resolve_bucket_holders;
+use crate::placement::resolve_shard_holders;
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
@@ -37,16 +37,16 @@ fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5]
     ]
 }
 
-/// Restarts the local node's document-sync subscriptions from the buckets it
+/// Restarts the local node's document-sync subscriptions from the shards it
 /// holds instead of re-announcing every stored document.
 ///
-/// Loads the realm config, and for each bound strategy × bucket the local node
-/// resolves into a holder of, ensures the bucket sync topic with its co-holders
+/// Loads the realm config, and for each bound strategy × shard the local node
+/// resolves into a holder of, ensures the shard sync topic with its co-holders
 /// and runs one anti-entropy pass against them (digest exchange, not a
 /// per-document re-announce). The fixed shared realm topics are restored the
 /// same way. Topics that share a co-holder set are batched into one ensure and
-/// one sync so a restart costs O(held buckets), not O(stored documents).
-pub async fn restore_bucket_subscriptions(
+/// one sync so a restart costs O(held shards), not O(stored documents).
+pub async fn restore_shard_subscriptions(
     context: &Arc<DriverContext>,
     node_id: NodeId,
     realm_id: RealmId,
@@ -55,7 +55,7 @@ pub async fn restore_bucket_subscriptions(
         return;
     };
     let Some(config) = load_realm_config(context, realm_id).await else {
-        // No config yet (fresh/onboarding node): nothing bucketed to restore.
+        // No config yet (fresh/onboarding node): nothing sharded to restore.
         return;
     };
 
@@ -66,9 +66,9 @@ pub async fn restore_bucket_subscriptions(
         .filter(|candidate| *candidate != node_id)
         .collect();
 
-    // Group topics by their co-holder peer set so co-located buckets ride one
+    // Group topics by their co-holder peer set so co-located shards ride one
     // ensure + one sync instead of one round trip each. Only topics the local
-    // node may create the genesis of (shared realm topics, and buckets it is
+    // node may create the genesis of (shared realm topics, and shards it is
     // rank-0 holder of) are ensured; the rest are join-only — synced if their
     // genesis is known or bootstrappable from a co-holder, otherwise left for
     // the rank-0 holder's gossip to deliver.
@@ -86,13 +86,13 @@ pub async fn restore_bucket_subscriptions(
     }
 
     for strategy in &config.strategies {
-        for bucket in 0..strategy.bucket_count {
+        for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
                 epoch: 0,
-                bucket,
+                shard,
             };
-            let holders = resolve_bucket_holders(&config, &placement);
+            let holders = resolve_shard_holders(&config, &placement);
             if !holders.contains(&node_id) {
                 continue;
             }
@@ -105,7 +105,7 @@ pub async fn restore_bucket_subscriptions(
             if co_holders.is_empty() {
                 continue;
             }
-            let topic = bucket_topic_id(realm_id, &placement);
+            let topic = shard_topic_id(realm_id, &placement);
             let groups = if local_is_rank0 {
                 &mut ensure_groups
             } else {
@@ -121,7 +121,7 @@ pub async fn restore_bucket_subscriptions(
                 continue;
             }
             if may_create {
-                // Join-before-create: rank-0 may have just inherited a bucket
+                // Join-before-create: rank-0 may have just inherited a shard
                 // whose genesis a previous rank-0 created — adopt that genesis
                 // from a co-holder rather than forking a second one. Only what
                 // no peer knows either is created fresh.
@@ -141,7 +141,7 @@ pub async fn restore_bucket_subscriptions(
                     apply_restored_reconcile(context, node_id, event).await;
                 }
                 if let Err(error) = net_handle.ensure_document_sync_topics(&topics, peers.clone()) {
-                    warn!(error = %error, "Failed to ensure held bucket topics on restart");
+                    warn!(error = %error, "Failed to ensure held shard topics on restart");
                 }
             }
             let event = net_handle.sync_document_topics(topics, peers).await;
@@ -172,11 +172,11 @@ pub(crate) async fn apply_restored_reconcile(
             }
         }
         DocumentSyncNetEvent::Error { error, .. } => {
-            warn!(error = %error, "Failed to sync held bucket topics on restart");
+            warn!(error = %error, "Failed to sync held shard topics on restart");
             return;
         }
         other => {
-            warn!(event = ?other, "Unexpected restart bucket sync result");
+            warn!(event = ?other, "Unexpected restart shard sync result");
             return;
         }
     };

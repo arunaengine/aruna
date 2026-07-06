@@ -864,7 +864,7 @@ impl NetHandle {
         self.inner.document_sync.topic_exists(topic)
     }
 
-    /// Bucket-topic anti-entropy for the startup restore and placement
+    /// Shard-topic anti-entropy for the startup restore and placement
     /// reconciler: ensures the topics locally, syncs them with `peers`, and
     /// reconciles the applied events.
     pub async fn sync_document_topics(

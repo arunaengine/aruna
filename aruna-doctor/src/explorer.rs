@@ -2,7 +2,7 @@ use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
-use aruna_core::document::{PendingBucketPlacement, bucket_topic_id};
+use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
@@ -86,7 +86,7 @@ struct TopicListEntry {
     topic_id: String,
     strategy_id: String,
     epoch: u64,
-    bucket: u32,
+    shard: u32,
     status: &'static str,
     selected_peer_count: usize,
 }
@@ -489,19 +489,19 @@ impl Serialize for JsonPersistedNodeState {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct JsonPendingDocumentPlacement(PendingBucketPlacement);
+struct JsonPendingDocumentPlacement(PendingShardPlacement);
 
 impl Serialize for JsonPendingDocumentPlacement {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingBucketPlacement", 8)?;
+        let mut state = serializer.serialize_struct("PendingShardPlacement", 8)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
         state.serialize_field("strategy_id", &self.0.placement.strategy_id.to_string())?;
         state.serialize_field("epoch", &self.0.placement.epoch)?;
-        state.serialize_field("bucket", &self.0.placement.bucket)?;
+        state.serialize_field("shard", &self.0.placement.shard)?;
         state.serialize_field(
             "authoritative_node_id",
             &self.0.authoritative_node_id.to_string(),
@@ -520,8 +520,8 @@ impl Serialize for JsonPendingDocumentPlacement {
     }
 }
 
-fn placement_topic_id(placement: &PendingBucketPlacement) -> String {
-    bucket_topic_id(placement.realm_id, &placement.placement).to_string()
+fn placement_topic_id(placement: &PendingShardPlacement) -> String {
+    shard_topic_id(placement.realm_id, &placement.placement).to_string()
 }
 
 #[derive(Debug)]
@@ -1005,7 +1005,7 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
             topic_id: placement_topic_id(&placement),
             strategy_id: placement.placement.strategy_id.to_string(),
             epoch: placement.placement.epoch,
-            bucket: placement.placement.bucket,
+            shard: placement.placement.shard,
             status: "under_replicated",
             selected_peer_count: placement.selected_peers.len(),
         })
@@ -1062,7 +1062,7 @@ fn topic_placements_output(
 
 fn load_pending_placements(
     database_path: &str,
-) -> Result<Vec<PendingBucketPlacement>, ExplorerError> {
+) -> Result<Vec<PendingShardPlacement>, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let keyspace_names = db.list_keyspace_names();
     if !keyspace_names
@@ -1675,7 +1675,7 @@ mod tests {
         let placement_ref = aruna_core::structs::PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9_u8; 16]),
             epoch: 0,
-            bucket: 5,
+            shard: 5,
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
         let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();

@@ -13,7 +13,7 @@ use crate::metadata::projector::{
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
-use crate::process_placements::process_bucket_placements;
+use crate::process_placements::process_shard_placements;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
@@ -169,7 +169,7 @@ async fn reconcile_inbound_document_sync_topics(
         .iter()
         .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }));
     if realm_config_changed {
-        process_bucket_placements(context, *net_handle.realm_id(), net_handle.node_id()).await;
+        process_shard_placements(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
     refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_watch_interest_for_targets(context, &targets.targets).await;

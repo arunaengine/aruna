@@ -341,11 +341,11 @@ mod tests {
         }
     }
 
-    fn placement(bucket: u32) -> aruna_core::structs::PlacementRef {
+    fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
         aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
             epoch: 0,
-            bucket,
+            shard,
         }
     }
 
@@ -691,7 +691,7 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             false,
         );
-        let bucketed = new_outbox_record_with_id(
+        let sharded = new_outbox_record_with_id(
             outbox_id,
             node(1),
             target,
@@ -701,7 +701,7 @@ mod tests {
             false,
         );
         // The FIFO key layout must not depend on the placement field.
-        assert_ne!(nil.placement, bucketed.placement);
-        assert_eq!(outbox_key(&nil), outbox_key(&bucketed));
+        assert_ne!(nil.placement, sharded.placement);
+        assert_eq!(outbox_key(&nil), outbox_key(&sharded));
     }
 }

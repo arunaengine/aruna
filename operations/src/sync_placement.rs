@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingBucketPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingShardPlacement};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
@@ -17,7 +17,7 @@ use crate::placement::rank_eligible_holders;
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-/// Retry interval for outbox records deferred on a missing bucket-topic
+/// Retry interval for outbox records deferred on a missing shard-topic
 /// genesis. Short: the genesis is usually one gossip push away (the rank-0
 /// holder creates it eagerly on config apply).
 pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -56,13 +56,13 @@ pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
 }
 
-/// Bucket-scoped record key: `realm(32) ‖ strategy(16) ‖ epoch(8, le) ‖
-/// bucket(4, be)`. One record per bucket the local node authoritatively holds.
+/// Shard-scoped record key: `realm(32) ‖ strategy(16) ‖ epoch(8, le) ‖
+/// shard(4, be)`. One record per shard the local node authoritatively holds.
 pub fn placement_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
     let mut bytes = realm_id.as_bytes().to_vec();
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
     bytes.extend_from_slice(&placement.epoch.to_le_bytes());
-    bytes.extend_from_slice(&placement.bucket.to_be_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
     ByteView::from(bytes)
 }
 
@@ -71,10 +71,10 @@ pub fn new_placement(
     placement: PlacementRef,
     authoritative_node_id: NodeId,
     mut selected_peers: Vec<NodeId>,
-) -> PendingBucketPlacement {
+) -> PendingShardPlacement {
     selected_peers.retain(|node_id| *node_id != authoritative_node_id);
     sort_node_ids(&mut selected_peers);
-    PendingBucketPlacement {
+    PendingShardPlacement {
         realm_id,
         placement,
         selected_peers,
@@ -83,9 +83,9 @@ pub fn new_placement(
     }
 }
 
-/// Co-holders still to add to a bucket to reach `desired_peer_count` total
+/// Co-holders still to add to a shard to reach `desired_peer_count` total
 /// holders (the authoritative node counts as one).
-pub fn missing_peer_count(record: &PendingBucketPlacement, desired_peer_count: usize) -> usize {
+pub fn missing_peer_count(record: &PendingShardPlacement, desired_peer_count: usize) -> usize {
     let mut selected_peers = record.selected_peers.clone();
     selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
     sort_node_ids(&mut selected_peers);
@@ -96,7 +96,7 @@ pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize
     selected_peer_count.saturating_add(1) >= desired_peer_count
 }
 
-pub fn write_placement_effect(record: &PendingBucketPlacement) -> Result<Effect, postcard::Error> {
+pub fn write_placement_effect(record: &PendingShardPlacement) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
         key: placement_key(record.realm_id, &record.placement),
@@ -131,7 +131,7 @@ pub fn schedule_placement_retry_after(
     })
 }
 
-pub fn decode_placement(value: &[u8]) -> Result<PendingBucketPlacement, postcard::Error> {
+pub fn decode_placement(value: &[u8]) -> Result<PendingShardPlacement, postcard::Error> {
     postcard::from_bytes(value)
 }
 
@@ -170,7 +170,7 @@ mod tests {
             replica_count: None,
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: 64,
+            shard_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy];
@@ -207,27 +207,27 @@ mod tests {
         assert!(first.contains(&node(2)));
     }
 
-    fn placement(bucket: u32) -> PlacementRef {
+    fn placement(shard: u32) -> PlacementRef {
         PlacementRef {
             strategy_id: Ulid::from_bytes([9u8; 16]),
             epoch: 0,
-            bucket,
+            shard,
         }
     }
 
     #[test]
-    fn placement_key_is_realm_and_bucket_scoped() {
+    fn placement_key_is_realm_and_shard_scoped() {
         let first_realm = RealmId::from_bytes([1u8; 32]);
         let second_realm = RealmId::from_bytes([2u8; 32]);
 
         let first_key = placement_key(first_realm, &placement(3));
         let second_key = placement_key(second_realm, &placement(3));
-        let other_bucket = placement_key(first_realm, &placement(4));
+        let other_shard = placement_key(first_realm, &placement(4));
 
         assert_ne!(first_key, second_key);
-        assert_ne!(first_key, other_bucket);
+        assert_ne!(first_key, other_shard);
         assert!(first_key.as_ref().starts_with(first_realm.as_bytes()));
-        // Layout: realm(32) ‖ strategy(16) ‖ epoch(8) ‖ bucket(4) = 60 bytes.
+        // Layout: realm(32) ‖ strategy(16) ‖ epoch(8) ‖ shard(4) = 60 bytes.
         assert_eq!(first_key.as_ref().len(), 60);
         assert_eq!(
             placement_prefix(first_realm).as_ref(),

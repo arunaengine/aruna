@@ -514,8 +514,8 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
             deleted_after_event_id: event_id,
         },
     };
-    // All records of this document share a subject and so one bucket topic.
-    // The placement comes from the installed realm config, so the bucket
+    // All records of this document share a subject and so one shard topic.
+    // The placement comes from the installed realm config, so the shard
     // topic's genesis exists (created eagerly by its rank-0 holder during
     // install); the publisher below only joins it, never creates it.
     let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
@@ -525,22 +525,22 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
         None,
     );
     assert_ne!(placement, aruna_core::structs::PlacementRef::NIL);
-    let bucket_topic = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
-    // Make sure the publisher knows the bucket topic before publishing onto it:
+    let shard_topic_of = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
+    // Make sure the publisher knows the shard topic before publishing onto it:
     // sync_document_topics bootstraps the genesis from the co-holder when
     // rank-0 was the other node (the singular sync never bootstraps).
     nodes[0]
         .net
         .sync_document_topics(
-            vec![bucket_topic(&lifecycle_target)],
+            vec![shard_topic_of(&lifecycle_target)],
             vec![nodes[1].net.node_id()],
         )
         .await;
     assert!(
         nodes[0]
             .net
-            .document_sync_topic_exists(bucket_topic(&lifecycle_target))?,
-        "bucket topic genesis unavailable on both nodes after install"
+            .document_sync_topic_exists(shard_topic_of(&lifecycle_target))?,
+        "shard topic genesis unavailable on both nodes after install"
     );
     publish_document_to_peer(
         &nodes[0],
@@ -554,13 +554,13 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     nodes[1]
         .net
         .sync_document_topic_with_peers(
-            bucket_topic(&lifecycle_target),
+            shard_topic_of(&lifecycle_target),
             vec![nodes[0].net.node_id()],
         )
         .await?;
     let delete_result = nodes[1]
         .net
-        .reconcile_document_sync_topics(vec![bucket_topic(&lifecycle_target)])
+        .reconcile_document_sync_topics(vec![shard_topic_of(&lifecycle_target)])
         .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
@@ -579,11 +579,11 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     .await?;
     nodes[1]
         .net
-        .sync_document_topic_with_peers(bucket_topic(&stale_target), vec![nodes[0].net.node_id()])
+        .sync_document_topic_with_peers(shard_topic_of(&stale_target), vec![nodes[0].net.node_id()])
         .await?;
     let stale_result = nodes[1]
         .net
-        .reconcile_document_sync_topics(vec![bucket_topic(&stale_target)])
+        .reconcile_document_sync_topics(vec![shard_topic_of(&stale_target)])
         .await?;
 
     assert!(stale_result.metadata_create_events.is_empty());
@@ -716,10 +716,10 @@ async fn install_realm_config(
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
-    // Config apply hook: the bucket's rank-0 holder eagerly creates each
-    // bucket topic genesis (mirrors the production realm-config apply path).
+    // Config apply hook: the shard's rank-0 holder eagerly creates each
+    // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_bucket_placements(
+        aruna_operations::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),
