@@ -149,14 +149,16 @@ pub async fn read_node_info_document(
 }
 
 /// Reads the persisted info documents for the given nodes, skipping those with
-/// no document yet. Keyed by node id for the realm-nodes read surface.
+/// no document yet. Keyed by node id for the realm-nodes read surface. Takes the
+/// driver context so API routes drive this through the operations layer rather
+/// than touching the storage handle directly.
 pub async fn read_node_info_documents(
-    storage: &StorageHandle,
+    ctx: &DriverContext,
     node_ids: &[NodeId],
 ) -> Result<BTreeMap<NodeId, NodeInfoDocument>, String> {
     let mut documents = BTreeMap::new();
     for node_id in node_ids {
-        if let Some(document) = read_node_info_document(storage, *node_id).await? {
+        if let Some(document) = read_node_info_document(&ctx.storage_handle, *node_id).await? {
             documents.insert(*node_id, document);
         }
     }
