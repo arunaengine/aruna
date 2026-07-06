@@ -1114,6 +1114,72 @@ mod tests {
         assert_eq!(after_recheck, 1);
     }
 
+    // The remote arm polls the holder and emits only on change: the initial poll
+    // reports the current count, a later poll reports it again once it moved.
+    #[tokio::test]
+    async fn stream_remote_arm_emits_initial_and_on_change() {
+        let realm_id = realm_id(13);
+        let (_dir, state, _net) = build_state_with_net(realm_id, [13u8; 32]).await;
+        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let mut events = Box::pin(unread_count_stream(
+            state.get_ctx(),
+            state.get_node_id(),
+            user_id,
+            UnreadStreamMode::Remote,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        ));
+
+        let (initial, _) = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("initial event arrives")
+            .expect("stream open");
+        assert_eq!(initial, 0);
+
+        upsert_inbox_records(
+            &state.get_ctx().storage_handle,
+            &[direct_record(user_id, 1)],
+        )
+        .await
+        .expect("seed inbox");
+
+        let (changed, _) = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("poll emits once the count changed")
+            .expect("stream open");
+        assert_eq!(changed, 1);
+    }
+
+    // A poll that cannot reach the holder is skipped silently: the stream neither
+    // emits nor ends, it just keeps polling.
+    #[tokio::test]
+    async fn stream_remote_arm_skips_silently_on_poll_failure() {
+        let realm_id = realm_id(14);
+        let (_dir, state, _net) = build_state_with_net(realm_id, [14u8; 32]).await;
+        // The holder is a node that is in no mesh, so every remote poll fails.
+        install_local_holder_config(&state, realm_id, node(200)).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let mut events = Box::pin(unread_count_stream(
+            state.get_ctx(),
+            state.get_node_id(),
+            user_id,
+            UnreadStreamMode::Remote,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        ));
+
+        // Nothing is ever emitted and the stream stays open (times out) rather than
+        // ending on the unreachable-holder errors.
+        let outcome = timeout(Duration::from_millis(800), events.next()).await;
+        assert!(
+            outcome.is_err(),
+            "a failing poll must be skipped silently, not emitted or ended: {outcome:?}"
+        );
+    }
+
     #[test]
     fn notification_response_maps_deep_link_ids() {
         let realm_id = RealmId::from_bytes([4u8; 32]);

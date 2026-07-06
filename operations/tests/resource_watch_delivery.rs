@@ -8,9 +8,9 @@ use aruna_core::keyspaces::{
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, NotificationClass, NotificationKind, NotificationRecord, RealmConfigDocument, RealmId,
-    RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask, WatchSubscription,
-    watch_notification_id,
+    Actor, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass, NotificationKind,
+    NotificationRecord, RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail,
+    WatchEventKind, WatchEventMask, WatchSubscription, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
@@ -18,7 +18,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::dispatch::{
-    create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
+    WatchDispatchError, create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
@@ -296,6 +296,51 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
             .nodes(realm_id)
             .is_none(),
         "the realm's interest entry drops once its last node retracts"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// The per-user watch cap is enforced on the holder. Filling it through a
+// non-holder node and then overflowing proves the holder's cap sentinel string
+// round-trips over the wire and maps back to the typed `CapExceeded`, not a
+// generic remote-proxy failure.
+#[tokio::test]
+async fn remote_create_surfaces_cap_conflict_over_the_wire()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([94u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let config = realm_config_for(&nodes, realm_id);
+    let holder = nodes[0].net.node_id();
+    let owner = user_with_holder(&config, holder, realm_id);
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+
+    // Node B is not the holder, so every create proxies to node A over the wire.
+    for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+        create_watch_for_user(
+            nodes[1].context.as_ref(),
+            nodes[1].net.node_id(),
+            owner,
+            format!("bucket/{index}/"),
+            mask,
+        )
+        .await
+        .expect("remote create under cap succeeds");
+    }
+
+    let error = create_watch_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        owner,
+        "bucket/overflow/".to_string(),
+        mask,
+    )
+    .await
+    .expect_err("cap must be enforced over the wire");
+    assert!(
+        matches!(error, WatchDispatchError::CapExceeded),
+        "expected CapExceeded, got {error:?}"
     );
 
     shutdown_nodes(nodes).await;
