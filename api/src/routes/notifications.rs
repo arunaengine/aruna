@@ -873,6 +873,7 @@ mod tests {
 
     async fn install_local_holder_config(state: &ServerState, realm_id: RealmId, holder: NodeId) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
         config.ensure_node(holder, RealmNodeKind::Server);
         let actor = Actor {
             node_id: holder,
