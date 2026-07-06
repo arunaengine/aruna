@@ -149,6 +149,11 @@ pub struct WatchListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateWatchRequest {
+    /// Watched path prefix, matched as a plain string prefix against event
+    /// paths. Data events use `{bucket}/{key}`; metadata events use
+    /// `meta/{group_id}/{document_id}`. No leading slash. Matching is a plain
+    /// prefix, so `reports` also matches a bucket named `reports-private`; add a
+    /// trailing slash (`reports/`) to scope to exactly one bucket/segment.
     pub path_prefix: String,
     pub events: Vec<String>,
 }
@@ -609,10 +614,11 @@ pub async fn list_watches(
     post,
     path = "/notifications/watches",
     tag = "notifications",
+    description = "Create a watch subscription. The path prefix is matched as a plain string prefix against event paths: data events use `{bucket}/{key}` and metadata events use `meta/{group_id}/{document_id}`, both without a leading slash. Because matching is a plain prefix, `reports` also matches a bucket named `reports-private`; add a trailing slash (`reports/`) to scope to exactly one bucket/segment. A leading slash is rejected with 400.",
     request_body = CreateWatchRequest,
     responses(
         (status = 201, description = "Watch subscription created", body = WatchResponse),
-        (status = 400, description = "Invalid path prefix or event name", body = ErrorResponse),
+        (status = 400, description = "Invalid path prefix (empty, leading slash, or too long) or event name", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 409, description = "Per-user watch cap reached", body = ErrorResponse),
@@ -628,6 +634,7 @@ pub async fn create_watch(
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     if request.path_prefix.is_empty()
+        || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
         || request.events.is_empty()
     {
@@ -1155,14 +1162,14 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(CreateWatchRequest {
-                path_prefix: "/bucket/prefix".to_string(),
+                path_prefix: "bucket/prefix".to_string(),
                 events: vec!["metadata_created".to_string(), "data_uploaded".to_string()],
             }),
         )
         .await
         .expect("create succeeds");
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.path_prefix, "/bucket/prefix");
+        assert_eq!(created.path_prefix, "bucket/prefix");
         assert_eq!(created.events, vec!["metadata_created", "data_uploaded"]);
 
         let (_, listed) = list_watches(
@@ -1207,11 +1214,23 @@ mod tests {
         .expect_err("empty prefix must be rejected");
         assert!(matches!(empty_prefix, ServerError::BadRequest));
 
-        let empty_events = create_watch(
+        let leading_slash = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(CreateWatchRequest {
                 path_prefix: "/bucket".to_string(),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("leading-slash prefix must be rejected");
+        assert!(matches!(leading_slash, ServerError::BadRequest));
+
+        let empty_events = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: "bucket".to_string(),
                 events: Vec::new(),
             }),
         )
@@ -1223,7 +1242,7 @@ mod tests {
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(CreateWatchRequest {
-                path_prefix: "/bucket".to_string(),
+                path_prefix: "bucket".to_string(),
                 events: vec!["not_an_event".to_string()],
             }),
         )
@@ -1267,7 +1286,7 @@ mod tests {
             State(state.clone()),
             Extension(Some(auth.clone())),
             Json(CreateWatchRequest {
-                path_prefix: "/bucket".to_string(),
+                path_prefix: "bucket".to_string(),
                 events: vec!["metadata_created".to_string()],
             }),
         )

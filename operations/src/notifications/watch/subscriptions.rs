@@ -28,6 +28,8 @@ pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscriptio
 pub enum WatchSubscriptionError {
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
+    #[error("watch path prefix must not start with a slash")]
+    LeadingSlash,
     #[error("watch path prefix exceeds maximum length")]
     PrefixTooLong,
     #[error("watch event mask must select at least one event")]
@@ -53,6 +55,12 @@ pub async fn create_watch_subscription(
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     if path_prefix.is_empty() {
         return Err(WatchSubscriptionError::EmptyPrefix);
+    }
+    // Emitted event paths carry no leading slash (`{bucket}/{key}`,
+    // `meta/{group_id}/{document_id}`), so a leading-slash prefix could never
+    // match; reject it as a backstop behind the API-layer validation.
+    if path_prefix.starts_with('/') {
+        return Err(WatchSubscriptionError::LeadingSlash);
     }
     if path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN {
         return Err(WatchSubscriptionError::PrefixTooLong);
@@ -395,7 +403,7 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
         let created =
-            create_watch_subscription(&storage, owner, "/bucket".to_string(), mask(), 1_000)
+            create_watch_subscription(&storage, owner, "bucket".to_string(), mask(), 1_000)
                 .await
                 .expect("create succeeds");
 
@@ -415,6 +423,10 @@ mod tests {
             Err(WatchSubscriptionError::EmptyPrefix)
         );
         assert_eq!(
+            create_watch_subscription(&storage, owner, "/bucket".to_string(), mask(), 1).await,
+            Err(WatchSubscriptionError::LeadingSlash)
+        );
+        assert_eq!(
             create_watch_subscription(
                 &storage,
                 owner,
@@ -429,7 +441,7 @@ mod tests {
             create_watch_subscription(
                 &storage,
                 owner,
-                "/bucket".to_string(),
+                "bucket".to_string(),
                 WatchEventMask::empty(),
                 1
             )
@@ -449,13 +461,12 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-            create_watch_subscription(&storage, owner, format!("/p/{index}"), mask(), index as u64)
+            create_watch_subscription(&storage, owner, format!("p/{index}"), mask(), index as u64)
                 .await
                 .expect("create under cap succeeds");
         }
         assert_eq!(
-            create_watch_subscription(&storage, owner, "/overflow".to_string(), mask(), 9_999)
-                .await,
+            create_watch_subscription(&storage, owner, "overflow".to_string(), mask(), 9_999).await,
             Err(WatchSubscriptionError::CapExceeded)
         );
         assert_eq!(
@@ -473,11 +484,11 @@ mod tests {
         let alice = user(1, 1);
         let bob = user(1, 2);
         for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
-            create_watch_subscription(&storage, alice, format!("/a/{index}"), mask(), index as u64)
+            create_watch_subscription(&storage, alice, format!("a/{index}"), mask(), index as u64)
                 .await
                 .expect("alice fills her cap");
         }
-        create_watch_subscription(&storage, bob, "/b".to_string(), mask(), 1)
+        create_watch_subscription(&storage, bob, "b".to_string(), mask(), 1)
             .await
             .expect("bob is unaffected by alice's cap");
 
@@ -494,7 +505,7 @@ mod tests {
     async fn delete_is_idempotent_and_owner_scoped() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
-        let created = create_watch_subscription(&storage, owner, "/x".to_string(), mask(), 1)
+        let created = create_watch_subscription(&storage, owner, "x".to_string(), mask(), 1)
             .await
             .expect("create succeeds");
 
@@ -525,13 +536,13 @@ mod tests {
         let bob = user(1, 2);
         let outsider = UserId::new(Ulid::from_bytes([3u8; 16]), other_realm);
 
-        create_watch_subscription(&storage, alice, "/a".to_string(), mask(), 1)
+        create_watch_subscription(&storage, alice, "a".to_string(), mask(), 1)
             .await
             .expect("alice create");
-        create_watch_subscription(&storage, bob, "/b".to_string(), mask(), 2)
+        create_watch_subscription(&storage, bob, "b".to_string(), mask(), 2)
             .await
             .expect("bob create");
-        create_watch_subscription(&storage, outsider, "/c".to_string(), mask(), 3)
+        create_watch_subscription(&storage, outsider, "c".to_string(), mask(), 3)
             .await
             .expect("outsider create");
 

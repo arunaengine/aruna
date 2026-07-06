@@ -1192,13 +1192,13 @@ mod tests {
             &a.net,
             b.net.node_id(),
             owner,
-            "/bucket/prefix".to_string(),
+            "bucket/prefix".to_string(),
             mask,
         )
         .await
         .expect("create succeeds");
         assert_eq!(created.owner, owner);
-        assert_eq!(created.path_prefix, "/bucket/prefix");
+        assert_eq!(created.path_prefix, "bucket/prefix");
         assert_eq!(created.event_mask, mask);
 
         let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
@@ -1389,7 +1389,7 @@ mod tests {
             &c.net,
             b.net.node_id(),
             owner,
-            "/bucket".to_string(),
+            "bucket".to_string(),
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         )
         .await
