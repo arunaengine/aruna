@@ -515,6 +515,44 @@ mod tests {
     }
 
     #[test]
+    fn every_admin_document_target_refuses_whole_document_announce() {
+        let local_node_id = local_node_id();
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = GroupId::new();
+        let (user_id, _) = user_document();
+        let admin_targets = [
+            DocumentSyncTarget::Group { group_id },
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentSyncTarget::User { user_id },
+        ];
+
+        for target in admin_targets {
+            assert!(target.is_admin_document(), "misclassified {target:?}");
+            let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+                target.topic_id(),
+                local_node_id,
+                target.clone(),
+                Vec::new(),
+                b"whole admin document".to_vec(),
+            );
+
+            let effects = operation.start();
+            assert!(effects.is_empty(), "unexpected outbox write for {target:?}");
+            assert!(operation.is_complete());
+            assert!(
+                matches!(
+                    operation.finalize(),
+                    Err(AnnounceTopicError::DocumentSync(error))
+                        if error.contains("admin documents must sync as operations")
+                ),
+                "whole-document announce must refuse {target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn user_document_announcement_fails_without_revision() {
         let local_node_id = local_node_id();
         let (_, document) = user_document();
