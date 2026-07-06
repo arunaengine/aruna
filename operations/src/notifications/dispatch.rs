@@ -58,6 +58,17 @@ impl From<NotificationDispatchError> for WatchDispatchError {
     }
 }
 
+/// Resolves the node currently holding `recipient`'s inbox, using the same
+/// placement the read/write dispatch paths use. Exposed so the live-stream
+/// endpoint can pick between the wake-driven local arm and the holder-polling
+/// remote arm.
+pub async fn resolve_inbox_holder_for_user(
+    context: &DriverContext,
+    recipient: UserId,
+) -> Result<NodeId, NotificationDispatchError> {
+    resolve_holder(context, recipient).await
+}
+
 async fn resolve_holder(
     context: &DriverContext,
     recipient: UserId,

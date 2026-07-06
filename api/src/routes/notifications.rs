@@ -1,29 +1,47 @@
 use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
     NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
 };
+use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
     NotificationDispatchError, WatchDispatchError, create_watch_for_user, delete_watch_for_user,
-    list_notifications_for_user, list_watches_for_user, mark_read_for_user, unread_count_for_user,
+    list_notifications_for_user, list_watches_for_user, mark_read_for_user,
+    resolve_inbox_holder_for_user, unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_core::Stream;
+use futures_util::StreamExt;
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 const DEFAULT_LIST_LIMIT: usize = 50;
+/// Burst-coalescing window on the local wake arm: after a wake, wait briefly and
+/// drain further wakes so a delivery storm collapses into one unread refetch.
+const NOTIFICATION_STREAM_COALESCE: Duration = Duration::from_millis(200);
+/// Remote-holder poll interval; emits only when the unread count changed.
+const NOTIFICATION_STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
+/// Keep-alive comment cadence so proxies do not cut an idle stream.
+const NOTIFICATION_STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -31,6 +49,7 @@ const DEFAULT_LIST_LIMIT: usize = 50;
     paths(
         list_notifications,
         unread_count,
+        stream_notifications,
         mark_read,
         list_watches,
         create_watch,
@@ -43,6 +62,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/notifications", get(list_notifications))
         .route("/notifications/unread", get(unread_count))
+        .route("/notifications/stream", get(stream_notifications))
         .route("/notifications/read", post(mark_read))
         .route(
             "/notifications/watches",
@@ -358,6 +378,161 @@ pub async fn unread_count(
     ))
 }
 
+/// Transport for the live unread-count stream. The local arm reacts to the
+/// per-node wake bus; the remote arm degrades to polling the holder, keeping the
+/// notification RPC surface unchanged.
+enum UnreadStreamMode {
+    Local(broadcast::Receiver<UserId>),
+    Remote,
+}
+
+struct UnreadStreamState {
+    context: Arc<DriverContext>,
+    local_node_id: NodeId,
+    recipient: UserId,
+    mode: UnreadStreamMode,
+    initial_done: bool,
+    last_emitted: Option<u64>,
+}
+
+enum StreamStep {
+    Emit,
+    Wait,
+    End,
+}
+
+fn drain_pending_wakes(rx: &mut broadcast::Receiver<UserId>) {
+    // Collapse any wakes buffered during the coalesce window into the single
+    // refetch that follows; a closed/lagged channel simply stops the drain.
+    while rx.try_recv().is_ok() {}
+}
+
+async fn fetch_unread_count(state: &UnreadStreamState) -> Option<u64> {
+    unread_count_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
+        .await
+        .ok()
+        .map(|(count, _capped)| count as u64)
+}
+
+/// Yields the recipient's unread count: once initially, then whenever it may have
+/// changed. Ends only when the wake channel closes or the consumer drops the
+/// stream (client disconnect); transient count-fetch failures are skipped so a
+/// blip never tears the stream down.
+fn unread_count_stream(
+    context: Arc<DriverContext>,
+    local_node_id: NodeId,
+    recipient: UserId,
+    mode: UnreadStreamMode,
+) -> impl Stream<Item = u64> + Send {
+    let state = UnreadStreamState {
+        context,
+        local_node_id,
+        recipient,
+        mode,
+        initial_done: false,
+        last_emitted: None,
+    };
+    stream::unfold(state, |mut state| async move {
+        loop {
+            if !state.initial_done {
+                state.initial_done = true;
+                if let Some(count) = fetch_unread_count(&state).await {
+                    state.last_emitted = Some(count);
+                    return Some((count, state));
+                }
+            }
+
+            let step = match &mut state.mode {
+                UnreadStreamMode::Local(rx) => {
+                    use broadcast::error::RecvError;
+                    match rx.recv().await {
+                        Ok(woken) if woken == state.recipient => {
+                            tokio::time::sleep(NOTIFICATION_STREAM_COALESCE).await;
+                            drain_pending_wakes(rx);
+                            StreamStep::Emit
+                        }
+                        Ok(_) => StreamStep::Wait,
+                        // Never tear the stream down for lag; refetch instead.
+                        Err(RecvError::Lagged(_)) => StreamStep::Emit,
+                        Err(RecvError::Closed) => StreamStep::End,
+                    }
+                }
+                UnreadStreamMode::Remote => {
+                    tokio::time::sleep(NOTIFICATION_STREAM_REMOTE_POLL).await;
+                    StreamStep::Emit
+                }
+            };
+
+            match step {
+                StreamStep::End => return None,
+                StreamStep::Wait => continue,
+                StreamStep::Emit => {
+                    let Some(count) = fetch_unread_count(&state).await else {
+                        continue;
+                    };
+                    // The remote arm only emits on change; the wake-driven local
+                    // arm emits on every wake (the bell refetches the list).
+                    if matches!(state.mode, UnreadStreamMode::Remote)
+                        && state.last_emitted == Some(count)
+                    {
+                        continue;
+                    }
+                    state.last_emitted = Some(count);
+                    return Some((count, state));
+                }
+            }
+        }
+    })
+}
+
+fn unread_stream_event(count: u64) -> Event {
+    let data = serde_json::to_string(&UnreadCountApiResponse {
+        count: count as u32,
+        capped: false,
+    })
+    .unwrap_or_else(|_| format!("{{\"count\":{count}}}"));
+    Event::default().event("unread").data(data)
+}
+
+#[utoipa::path(
+    get,
+    path = "/notifications/stream",
+    tag = "notifications",
+    responses(
+        (status = 200, description = "Server-sent event stream of the recipient's unread count. Emits `event: unread` frames whose JSON data is `{\"count\": <u64>}` on connect and again whenever the count may have changed; the bell refetches the list on each wake and the stream itself never carries notification bodies. Keep-alive comments are sent about every 20s and the stream ends on client disconnect.", content_type = "text/event-stream"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn stream_notifications(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<Sse<impl Stream<Item = Result<Event, Infallible>> + Send>> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let context = state.get_ctx();
+    let local_node_id = state.get_node_id();
+    let recipient = auth.user_id;
+
+    let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
+        .await
+        .map_err(|error| map_dispatch_error(error, "stream"))?;
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(ServerError::ServiceUnavailable)?;
+    let mode = if holder == local_node_id {
+        UnreadStreamMode::Local(net_handle.subscribe_notification_wakes())
+    } else {
+        UnreadStreamMode::Remote
+    };
+
+    let events = unread_count_stream(context.clone(), local_node_id, recipient, mode)
+        .map(|count| Ok::<_, Infallible>(unread_stream_event(count)));
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(NOTIFICATION_STREAM_KEEP_ALIVE)))
+}
+
 #[utoipa::path(
     post,
     path = "/notifications/read",
@@ -519,11 +694,13 @@ mod tests {
         Actor, NodeCapabilities, PathRestriction, Permission, RealmConfigDocument, RealmId,
         RealmNodeKind,
     };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::notifications::inbox::upsert_inbox_records;
     use aruna_storage::storage::FjallStorage;
     use byteview::ByteView;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -560,6 +737,46 @@ mod tests {
         )
         .await;
         (dir, Arc::new(state))
+    }
+
+    async fn build_state_with_net(
+        realm_id: RealmId,
+        secret: [u8; 32],
+    ) -> (TempDir, Arc<ServerState>, NetHandle) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let node_id = net.node_id();
+        let ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let state = ServerState::new(
+            ctx,
+            realm_id,
+            node_id,
+            NodeCapabilities::local_node(realm_id).expect("capabilities"),
+            false,
+            None,
+        )
+        .await;
+        (dir, Arc::new(state), net)
     }
 
     async fn install_local_holder_config(state: &ServerState, realm_id: RealmId, holder: NodeId) {
@@ -754,6 +971,41 @@ mod tests {
                 .await
                 .expect("unread after succeeds");
         assert_eq!(unread_after.count, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_local_arm_emits_initial_and_on_wake() {
+        let realm_id = realm_id(11);
+        let (_dir, state, net) = build_state_with_net(realm_id, [11u8; 32]).await;
+        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let mut events = Box::pin(unread_count_stream(
+            state.get_ctx(),
+            state.get_node_id(),
+            user_id,
+            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+        ));
+
+        let initial = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("initial event arrives")
+            .expect("stream open");
+        assert_eq!(initial, 0);
+
+        upsert_inbox_records(
+            &state.get_ctx().storage_handle,
+            &[direct_record(user_id, 1)],
+        )
+        .await
+        .expect("seed inbox");
+        net.notify_inbox_activity(user_id);
+
+        let after_wake = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("wake event arrives")
+            .expect("stream open");
+        assert_eq!(after_wake, 1);
     }
 
     #[test]
