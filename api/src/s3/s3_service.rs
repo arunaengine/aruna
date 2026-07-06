@@ -1442,13 +1442,15 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, NOTIFICATION_WATCH_OUTBOX_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
         BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
         PortableSourceDescriptor, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        VersionSourceBinding, WatchEventMask, WatchForwardOutboxRecord, WatchInterestEntry,
+        WatchInterestTable,
     };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::replication::queue::{
         LiveReplicationObligationRecord, live_replication_obligation_key,
@@ -1553,6 +1555,174 @@ mod tests {
             .is_some(),
             "durable obligation should remain repairable when queue kick fails"
         );
+    }
+
+    async fn build_watch_context(
+        realm_id: RealmId,
+        secret: [u8; 32],
+    ) -> (TempDir, Arc<DriverContext>, NetHandle) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        (storage_dir, context, net)
+    }
+
+    fn data_uploaded_interest(realm_id: RealmId, holder: NodeId) -> WatchInterestTable {
+        let mut table = WatchInterestTable::default();
+        table.insert(
+            realm_id,
+            holder,
+            vec![WatchInterestEntry {
+                path_prefix: "bucket/".to_string(),
+                event_mask: WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            }],
+        );
+        table
+    }
+
+    async fn read_watch_outbox_rows(context: &DriverContext) -> Vec<WatchForwardOutboxRecord> {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_WATCH_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1024,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| WatchForwardOutboxRecord::from_bytes(&value).unwrap())
+                .collect(),
+            other => panic!("unexpected outbox iter event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_object_emits_watch_event_through_forward_outbox() {
+        let realm_id = RealmId([41u8; 32]);
+        let (_storage_dir, context, net) = build_watch_context(realm_id, [41u8; 32]).await;
+        let holder = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        net.replace_watch_interest(data_uploaded_interest(realm_id, holder));
+
+        let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        let checksum_request = UploadChecksumRequest {
+            expected: Vec::new(),
+            response_algorithm: None,
+            checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        };
+
+        service
+            .put_object_response(
+                &checksum_request,
+                auth,
+                "bucket".to_string(),
+                "object".to_string(),
+                PutObjectResult {
+                    location: response_location(user_id),
+                    version_id: Ulid::new(),
+                },
+            )
+            .await
+            .expect("committed PUT response should succeed");
+
+        let rows = read_watch_outbox_rows(context.as_ref()).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "one interested holder yields exactly one outbox row"
+        );
+        let record = &rows[0];
+        assert_eq!(record.holder_node, holder);
+        assert_eq!(record.event.realm_id, realm_id);
+        assert_eq!(record.event.kind, WatchEventKind::DataUploaded);
+        assert_eq!(record.event.path, "bucket/object");
+        assert_eq!(record.event.actor, user_id);
+        match &record.event.detail {
+            WatchEventDetail::DataUploaded {
+                bucket,
+                key,
+                size_bytes,
+            } => {
+                assert_eq!(bucket, "bucket");
+                assert_eq!(key, "object");
+                // response_location reports a 2-byte blob.
+                assert_eq!(*size_bytes, 2);
+            }
+            other => panic!("unexpected watch event detail: {other:?}"),
+        }
+
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn put_object_with_anonymous_actor_emits_no_watch_event() {
+        let realm_id = RealmId([42u8; 32]);
+        let (_storage_dir, context, net) = build_watch_context(realm_id, [42u8; 32]).await;
+        let holder = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        net.replace_watch_interest(data_uploaded_interest(realm_id, holder));
+
+        let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
+        let anonymous = UserId::nil(realm_id);
+        let auth = AuthContext {
+            user_id: anonymous,
+            realm_id,
+            path_restrictions: None,
+        };
+        let checksum_request = UploadChecksumRequest {
+            expected: Vec::new(),
+            response_algorithm: None,
+            checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        };
+
+        service
+            .put_object_response(
+                &checksum_request,
+                auth,
+                "bucket".to_string(),
+                "object".to_string(),
+                PutObjectResult {
+                    location: response_location(anonymous),
+                    version_id: Ulid::new(),
+                },
+            )
+            .await
+            .expect("committed PUT response should succeed");
+
+        assert!(
+            read_watch_outbox_rows(context.as_ref()).await.is_empty(),
+            "an anonymous actor must not emit a watch event"
+        );
+
+        net.shutdown().await;
     }
 
     #[tokio::test]
