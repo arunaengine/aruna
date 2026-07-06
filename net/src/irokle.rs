@@ -59,8 +59,10 @@ use irokle_crate::history::HistoryOrder;
 use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
 use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
-use irokle_crate::{EventEnvelope, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
-use parking_lot::RwLock;
+use irokle_crate::{
+    EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
+};
+use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -96,6 +98,12 @@ pub struct DocumentSyncService {
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
+    // Genesis tie-break evictions from every admission path (irokle's own
+    // accept/resync loops via the net sink, plus this service's bootstrap and
+    // batch-sync paths) funnel into this sender; the embedder drains the
+    // receiver once via `take_eviction_receiver` and re-emits the payloads.
+    eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
+    eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -149,12 +157,14 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let (eviction_tx, eviction_rx) = tokio::sync::mpsc::unbounded_channel();
         let net = Arc::new(
-            irokle_crate::net::IrohNet::new_with_alpns_and_config(
+            irokle_crate::net::IrohNet::new_with_alpns_config_and_sink(
                 endpoint,
                 node.clone(),
                 alpns,
                 runtime,
+                Some(eviction_tx.clone()),
             )
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
@@ -169,11 +179,118 @@ impl DocumentSyncService {
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
+            eviction_tx,
+            eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
         })
     }
 
     pub fn node(&self) -> irokle_crate::Irokle<irokle_crate::FjallStorage> {
         self.node.clone()
+    }
+
+    /// Takes the genesis tie-break eviction receiver. The embedder calls this
+    /// once to drive the re-emission consumer; later calls return `None`.
+    pub fn take_eviction_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>> {
+        self.eviction_rx.lock().take()
+    }
+
+    /// Decodes a genesis tie-break eviction into the document publishes that
+    /// must be re-emitted onto the winning chain. Every publish sets
+    /// `allow_genesis: false` so the loser replays through the normal outbox
+    /// drain instead of minting a rival genesis, and admin events keep their
+    /// embedded event id (appliers dedupe on it). Control ops are skipped,
+    /// whole-document admin poison is dropped with a warning (mirroring the
+    /// reconcile skip arm), and ops not authored by the local node are rejected
+    /// since an eviction is by construction the local node's own chain.
+    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncPublish> {
+        let local_peer = self.node.peer_id();
+        let mut documents = Vec::new();
+        for evicted in eviction.evicted {
+            if evicted.author != local_peer {
+                warn!(
+                    topic_id = %eviction.topic_id,
+                    author = %evicted.author,
+                    "Skipping evicted op not authored by the local node"
+                );
+                continue;
+            }
+            let TopicPayload::Event(envelope) = evicted.payload else {
+                // Non-event control op (e.g. AddPeer/RemovePeer): nothing to re-emit.
+                continue;
+            };
+            let event = match envelope.decode_event::<DocumentSyncEvent>() {
+                Ok(event) => event,
+                Err(error) => {
+                    warn!(
+                        topic_id = %eviction.topic_id,
+                        op_id = %evicted.op_id,
+                        %error,
+                        "Skipping evicted op that is not a document sync event"
+                    );
+                    continue;
+                }
+            };
+            match event {
+                DocumentSyncEvent::AdminOperation { target, event } => {
+                    documents.push(DocumentSyncPublish::AdminOperation {
+                        target,
+                        event,
+                        allow_genesis: false,
+                    });
+                }
+                DocumentSyncEvent::Upsert {
+                    event_id,
+                    target,
+                    bytes,
+                    change,
+                } => {
+                    if admin_document_target_for_reduced_document(&target).is_some() {
+                        warn!(
+                            topic_id = %eviction.topic_id,
+                            ?target,
+                            "Dropping evicted whole-document admin upsert"
+                        );
+                        continue;
+                    }
+                    documents.push(DocumentSyncPublish::Upsert {
+                        event_id,
+                        target,
+                        bytes,
+                        change,
+                        allow_genesis: false,
+                    });
+                }
+                DocumentSyncEvent::Delete {
+                    event_id,
+                    target,
+                    change,
+                } => {
+                    if admin_document_target_for_reduced_document(&target).is_some() {
+                        warn!(
+                            topic_id = %eviction.topic_id,
+                            ?target,
+                            "Dropping evicted whole-document admin delete"
+                        );
+                        continue;
+                    }
+                    documents.push(DocumentSyncPublish::Delete {
+                        event_id,
+                        target,
+                        change,
+                        allow_genesis: false,
+                    });
+                }
+            }
+        }
+        documents
+    }
+
+    /// Forwards evictions produced by this service's own admission paths into
+    /// the shared eviction sink.
+    fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
+        forward_evictions_to(&self.eviction_tx, evictions);
     }
 
     fn local_node_id(&self) -> Result<NodeId> {
@@ -1108,8 +1225,17 @@ impl DocumentSyncService {
         let node = self.node.clone();
         let net = self.net.clone();
         let data_known = known_topics.clone();
+        let eviction_tx = self.eviction_tx.clone();
         let (failed_topics, followup) = tokio::task::spawn_blocking(move || {
-            process_batch_data_responses(&node, &net, peer, &data_known, failed_topics, responses)
+            process_batch_data_responses(
+                &node,
+                &net,
+                peer,
+                &data_known,
+                failed_topics,
+                responses,
+                &eviction_tx,
+            )
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
@@ -1236,10 +1362,11 @@ impl DocumentSyncService {
             match response {
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
                 SyncMessage::Data(data) if data.topic_id == topic_id => {
-                    let ack = self
+                    let (ack, evictions) = self
                         .node
-                        .receive_sync_data_from(peer, data)
+                        .receive_sync_data_from_evicting(peer, data)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                    self.forward_evictions(evictions);
                     received_data = true;
                     followup.push(SyncMessage::Ack(ack));
                 }
@@ -3492,6 +3619,17 @@ fn process_batch_summary_responses(
     Ok((responded_topics, failed_topics, sync_messages))
 }
 
+fn forward_evictions_to(
+    sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
+    evictions: Vec<TopicEviction>,
+) {
+    for eviction in evictions {
+        if sink.send(eviction).is_err() {
+            warn!("Document sync eviction consumer closed; dropping re-emitted payloads");
+        }
+    }
+}
+
 fn process_batch_data_responses(
     node: &irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: &irokle_crate::net::IrohNet<irokle_crate::FjallStorage>,
@@ -3499,6 +3637,7 @@ fn process_batch_data_responses(
     known_topics: &BTreeSet<irokle_crate::TopicId>,
     mut failed_topics: BTreeSet<irokle_crate::TopicId>,
     responses: Vec<SyncMessage>,
+    eviction_tx: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
 ) -> Result<(BTreeSet<irokle_crate::TopicId>, Vec<SyncMessage>)> {
     let mut followup = Vec::new();
     let mut acks = Vec::new();
@@ -3512,8 +3651,11 @@ fn process_batch_data_responses(
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
             SyncMessage::Data(data) if known_topics.contains(&data.topic_id) => {
                 let topic_id = data.topic_id;
-                let ack = match node.receive_sync_data_from(peer, data) {
-                    Ok(ack) => ack,
+                let ack = match node.receive_sync_data_from_evicting(peer, data) {
+                    Ok((ack, evictions)) => {
+                        forward_evictions_to(eviction_tx, evictions);
+                        ack
+                    }
                     Err(error) => {
                         warn!(
                             %peer,
