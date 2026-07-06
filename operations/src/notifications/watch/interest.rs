@@ -575,7 +575,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let owner = user(1, 2);
 
-        create_watch_subscription(&ctx.storage_handle, owner, "/a".to_string(), mask(), 1)
+        create_watch_subscription(&ctx.storage_handle, owner, "a".to_string(), mask(), 1)
             .await
             .expect("create succeeds");
 
@@ -589,10 +589,10 @@ mod tests {
         let node_id = node(5);
         let owner = user(1, 2);
 
-        create_watch_subscription(&ctx.storage_handle, owner, "/a".to_string(), mask(), 1)
+        create_watch_subscription(&ctx.storage_handle, owner, "a".to_string(), mask(), 1)
             .await
             .expect("create a");
-        create_watch_subscription(&ctx.storage_handle, owner, "/b".to_string(), mask(), 2)
+        create_watch_subscription(&ctx.storage_handle, owner, "b".to_string(), mask(), 2)
             .await
             .expect("create b");
 
@@ -611,7 +611,7 @@ mod tests {
             .iter()
             .map(|entry| entry.path_prefix.as_str())
             .collect();
-        assert_eq!(prefixes, vec!["/a", "/b"]);
+        assert_eq!(prefixes, vec!["a", "b"]);
 
         // Markers consumed once the digest is durable.
         assert!(read_marker(&ctx, owner.realm_id).await.is_none());
@@ -631,7 +631,7 @@ mod tests {
         let owner = user(1, 2);
 
         let created =
-            create_watch_subscription(&ctx.storage_handle, owner, "/a".to_string(), mask(), 1)
+            create_watch_subscription(&ctx.storage_handle, owner, "a".to_string(), mask(), 1)
                 .await
                 .expect("create");
         assert!(
@@ -718,7 +718,7 @@ mod tests {
             &WatchInterestDigest {
                 node_id: holder,
                 entries: vec![WatchInterestEntry {
-                    path_prefix: "/bucket/".to_string(),
+                    path_prefix: "bucket/".to_string(),
                     event_mask: mask(),
                 }],
             },
@@ -737,7 +737,7 @@ mod tests {
 
         let table = rebuild_watch_interest_table(&ctx.storage_handle).await;
         assert_eq!(
-            table.matching_nodes(realm_id, "/bucket/object", WatchEventKind::MetadataCreated),
+            table.matching_nodes(realm_id, "bucket/object", WatchEventKind::MetadataCreated),
             vec![holder]
         );
         assert_eq!(table.nodes(realm_id).map(|nodes| nodes.len()), Some(1));
@@ -757,7 +757,7 @@ mod tests {
             &WatchInterestDigest {
                 node_id: holder,
                 entries: vec![WatchInterestEntry {
-                    path_prefix: "/data/".to_string(),
+                    path_prefix: "data/".to_string(),
                     event_mask: mask(),
                 }],
             },
@@ -772,7 +772,7 @@ mod tests {
 
         let snapshot = net.watch_interest_snapshot();
         assert_eq!(
-            snapshot.matching_nodes(realm_id, "/data/x", WatchEventKind::MetadataCreated),
+            snapshot.matching_nodes(realm_id, "data/x", WatchEventKind::MetadataCreated),
             vec![holder]
         );
     }

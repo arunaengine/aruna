@@ -404,4 +404,27 @@ mod tests {
         let actor = user(2);
         assert!(route_watch_event(&upload_event(actor, "bucket/object"), &[]).is_empty());
     }
+
+    #[test]
+    fn watch_prefix_matching_is_plain_string_prefix() {
+        let owner = user(1);
+        let actor = user(2);
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+
+        // A bare prefix is a plain string prefix, so it also spans sibling names
+        // that merely start with it.
+        let unscoped = vec![watch_subscription(owner, "reports", mask)];
+        assert_eq!(
+            route_watch_event(&upload_event(actor, "reports-private/x"), &unscoped).len(),
+            1
+        );
+
+        // A trailing slash scopes the prefix to exactly one bucket/segment.
+        let scoped = vec![watch_subscription(owner, "reports/", mask)];
+        assert!(route_watch_event(&upload_event(actor, "reports-private/x"), &scoped).is_empty());
+        assert_eq!(
+            route_watch_event(&upload_event(actor, "reports/x"), &scoped).len(),
+            1
+        );
+    }
 }
