@@ -66,18 +66,19 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
+    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
     EncodingType, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-    HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, Object, Owner, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput, PutObjectOutput,
+    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, LastModified,
+    ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, Owner,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
     ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StreamingBlob,
     UploadPartInput, UploadPartOutput,
 };
@@ -676,6 +677,52 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to head bucket"))?;
 
         Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        debug!(bucket = %req.input.bucket, "Received GET BUCKET VERSIONING Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status: Some(BucketVersioningStatus::from_static(
+                BucketVersioningStatus::ENABLED,
+            )),
+            mfa_delete: None,
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        debug!(bucket = %req.input.bucket, "Received PUT BUCKET VERSIONING Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        match req
+            .input
+            .versioning_configuration
+            .status
+            .as_ref()
+            .map(BucketVersioningStatus::as_str)
+        {
+            Some(BucketVersioningStatus::ENABLED) => {
+                Ok(S3Response::new(PutBucketVersioningOutput::default()))
+            }
+            _ => Err(s3_error!(NotImplemented, "Versioning cannot be suspended")),
+        }
     }
 
     #[tracing::instrument(err, skip(self, req))]
