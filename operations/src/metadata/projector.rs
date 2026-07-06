@@ -817,6 +817,7 @@ pub fn create_event_outbox_record(
                 .expect("metadata document lifecycle event serializes"),
             change,
         },
+        placement,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
     }

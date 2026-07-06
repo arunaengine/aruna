@@ -384,6 +384,7 @@ impl UpdateUserOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event.clone()),
                 },
+                placement,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

@@ -22,6 +22,7 @@ use ulid::Ulid;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::placement::placement_ref_for_target;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -224,6 +225,9 @@ impl CreateRealmOperation {
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let realm_auth_placement = placement_ref_for_target(config_doc, &realm_auth_target, None);
+        let realm_config_placement =
+            placement_ref_for_target(config_doc, &realm_config_target, None);
         let realm_auth_record = new_outbox_record_with_id(
             realm_role_event.event_id,
             self.config.actor.node_id,
@@ -232,6 +236,7 @@ impl CreateRealmOperation {
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(realm_role_event),
             },
+            realm_auth_placement,
             true,
         );
         let mut writes = vec![
@@ -248,6 +253,7 @@ impl CreateRealmOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
+                realm_config_placement,
                 true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

@@ -1477,6 +1477,7 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_outbox_record(&storage, &record).await;
@@ -1550,6 +1551,7 @@ mod tests {
                 bytes: b"retained work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let key = outbox_key(&record).to_vec();
@@ -1596,6 +1598,7 @@ mod tests {
                 bytes: b"retry after restart".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let key = outbox_key(&record).to_vec();

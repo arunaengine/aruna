@@ -239,6 +239,9 @@ impl ClaimInitialRealmAdminOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event.clone()),
                 },
+                // No realm config in reach here; the stage-2 topic flip resolves
+                // the real ref for this target.
+                aruna_core::structs::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

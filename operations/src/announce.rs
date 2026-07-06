@@ -200,11 +200,14 @@ impl AnnounceTopicOperation {
     ) -> Effects {
         self.current = Some(document.clone());
         self.state = AnnounceTopicState::WriteOutbox;
+        // Announce only ever emits Upsert here, so the record mirrors the
+        // change's placement; the admin fallback is unused.
         let record = new_outbox_record(
             self.local_node_id,
             document,
             self.peers.clone(),
             event,
+            PlacementRef::NIL,
             self.allow_genesis,
         );
         match write_outbox_effect(&record) {
