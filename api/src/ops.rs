@@ -5,15 +5,19 @@
 //! probes hit a container port that is not exposed via Service/Ingress.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+use aruna_core::keyspaces::{
+    BLOB_REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+};
 use aruna_core::metrics::{MetricsSource, NodeMetrics};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::queue_lag::probe_outbox_lag;
+use aruna_operations::queue_lag::{
+    QueueLagSnapshot, probe_materialization_lag, probe_outbox_lag, probe_queue_depth,
+};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -22,7 +26,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use byteview::ByteView;
 use futures_util::future::BoxFuture;
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Unit;
 use serde::Serialize;
 
 /// Upper bound on the readiness storage probe so a wedged effect worker fails
@@ -66,6 +73,7 @@ impl OpsState {
         readiness: Readiness,
     ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
+        register_queue_source(&metrics, ctx.clone()).await;
         Arc::new(Self {
             ctx,
             metrics,
@@ -268,6 +276,94 @@ async fn register_storage_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>)
         .await;
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct QueueLabels {
+    queue: &'static str,
+}
+
+/// Scrape-time source reporting the depth and oldest-record age of the durable
+/// work queues, reusing the same probes as the periodic `queue.lag` monitor.
+struct QueueSource {
+    ctx: Arc<DriverContext>,
+    depth: Family<QueueLabels, Gauge>,
+    oldest_age_seconds: Family<QueueLabels, Gauge<f64, AtomicU64>>,
+    depth_capped: Family<QueueLabels, Gauge>,
+}
+
+impl QueueSource {
+    fn apply(&self, queue: &'static str, probe: Result<QueueLagSnapshot, String>) {
+        // On probe failure the gauges keep their previous scrape value.
+        let Ok(snapshot) = probe else {
+            return;
+        };
+        let labels = QueueLabels { queue };
+        self.depth.get_or_create(&labels).set(snapshot.depth as i64);
+        self.oldest_age_seconds
+            .get_or_create(&labels)
+            .set(snapshot.oldest_age_ms as f64 / 1_000.0);
+        self.depth_capped
+            .get_or_create(&labels)
+            .set(i64::from(snapshot.depth_capped));
+    }
+}
+
+impl MetricsSource for QueueSource {
+    fn refresh(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let storage = &self.ctx.storage_handle;
+            self.apply(
+                "document_sync_outbox",
+                probe_outbox_lag(storage, false).await,
+            );
+            self.apply(
+                "metadata_materialization",
+                probe_materialization_lag(storage, false).await,
+            );
+            self.apply(
+                "blob_replication",
+                probe_queue_depth(storage, BLOB_REPLICATION_JOB_KEYSPACE, false).await,
+            );
+            self.apply(
+                "reference_metadata_refresh",
+                probe_queue_depth(storage, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE, false).await,
+            );
+        })
+    }
+}
+
+async fn register_queue_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
+    let depth = Family::<QueueLabels, Gauge>::default();
+    metrics
+        .register("queue_depth", "Durable work queue depth", depth.clone())
+        .await;
+    let oldest_age_seconds = Family::<QueueLabels, Gauge<f64, AtomicU64>>::default();
+    metrics
+        .register_with_unit(
+            "queue_oldest_age",
+            "Age of the oldest record in a durable work queue",
+            Unit::Seconds,
+            oldest_age_seconds.clone(),
+        )
+        .await;
+    let depth_capped = Family::<QueueLabels, Gauge>::default();
+    metrics
+        .register(
+            "queue_depth_capped",
+            "1 when a queue depth probe stopped at its page cap",
+            depth_capped.clone(),
+        )
+        .await;
+
+    metrics
+        .register_source(Arc::new(QueueSource {
+            ctx,
+            depth,
+            oldest_age_seconds,
+            depth_capped,
+        }))
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +468,10 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("aruna_build_info{version=\""), "{body}");
         assert!(body.contains("aruna_storage_requests_total"), "{body}");
+        assert!(
+            body.contains("aruna_queue_depth{queue=\"document_sync_outbox\"}"),
+            "{body}"
+        );
+        assert!(body.contains("aruna_queue_oldest_age_seconds"), "{body}");
     }
 }
