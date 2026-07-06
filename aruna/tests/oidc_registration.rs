@@ -214,6 +214,8 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             },
             realm_description: "Test Realm".to_string(),
             oidc_providers: vec![provider.clone()],
+            node_location: None,
+            node_weight: None,
         }),
         context.as_ref(),
     )

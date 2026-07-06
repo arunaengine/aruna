@@ -677,6 +677,8 @@ mod test {
                 actor: actor.clone(),
                 realm_description: "Public role test realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
             }),
             &context,
         )
@@ -840,6 +842,8 @@ mod test {
             },
             realm_description: "A description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         };
 
         let realm_operation = CreateRealmOperation::new(realm_config.clone());

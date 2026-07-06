@@ -1142,6 +1142,8 @@ pub mod test {
             },
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_realm, _realm_auth_doc) = drive(realm_operation, &context).await.unwrap();

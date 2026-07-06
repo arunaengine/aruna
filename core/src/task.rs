@@ -23,6 +23,7 @@ pub enum TaskKey {
     },
     DrainDocumentSyncOutbox,
     PublishUsageSnapshots,
+    PublishNodeInfo,
     DrainMetadataProjectionQueue,
     DrainMetadataMaterializationQueue,
     DrainMetadataGraphPruneQueue,

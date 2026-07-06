@@ -1,9 +1,16 @@
 use crate::NodeId;
+use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Derived read-only label carrying a node's `RealmNode.kind`; writes are rejected.
 pub const KIND_LABEL_KEY: &str = "aruna.io/kind";
+
+/// Storage key for a node's info document. One document per node, so the raw
+/// node id is unambiguous within the dedicated `NODE_INFO_KEYSPACE`.
+pub fn node_info_storage_key(node_id: NodeId) -> Vec<u8> {
+    node_id.as_bytes().to_vec()
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct NodeInfoDocument {
@@ -12,6 +19,16 @@ pub struct NodeInfoDocument {
     pub urls: NodeUrls,
     pub utilization: NodeUtilization,
     pub updated_at_ms: u64,
+}
+
+impl NodeInfoDocument {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]

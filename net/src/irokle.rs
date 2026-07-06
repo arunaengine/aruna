@@ -52,8 +52,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
-    NodeUsageSnapshot, RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User,
-    WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
+    NodeInfoDocument, NodeUsageSnapshot, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
     node_usage_key_node_id, watch_interest_dirty_key, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
@@ -1648,6 +1648,43 @@ impl DocumentSyncService {
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
+                    DocumentSyncEvent::Upsert {
+                        target:
+                            target @ DocumentSyncTarget::NodeInfo {
+                                node_id: info_node, ..
+                            },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        // Node info documents ride a single shared realm topic that
+                        // every realm publisher can write, so validate that the
+                        // signed publisher owns the claimed node and that the
+                        // payload's own node id matches its target before applying.
+                        // A rejected event is skipped (never `?`) so the cursor
+                        // advances past it and a forgery cannot wedge the topic.
+                        let expected_actor =
+                            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&info_node));
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                node_id = %info_node,
+                                "Rejecting node info document: publisher is not the owning node"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_node_info_upsert(&target, &bytes) {
+                            warn!(
+                                %topic_id,
+                                node_id = %info_node,
+                                %reason,
+                                "Rejecting invalid node info document"
+                            );
+                            continue;
+                        }
+                        self.apply_upsert(target.clone(), bytes, change).await?;
+                        applied_targets.push(target);
+                    }
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
@@ -1784,6 +1821,24 @@ impl DocumentSyncService {
                             %topic_id,
                             ?target,
                             "Skipping unsupported non-upsert shared document event"
+                        );
+                        continue;
+                    }
+                    DocumentSyncEvent::Delete {
+                        target: target @ DocumentSyncTarget::NodeInfo { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: target @ DocumentSyncTarget::NodeInfo { .. },
+                        ..
+                    } => {
+                        // Node info documents only ever sync as owner-validated
+                        // upserts; skip any signed Delete/AdminOperation on the
+                        // shared realm topic so it cannot wedge the reconcile loop.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported non-upsert node info document event"
                         );
                         continue;
                     }
@@ -2098,6 +2153,12 @@ impl DocumentSyncService {
             // payload, but re-check the digest's self-consistency here so the
             // generic storage write below can never persist an unvalidated digest.
             validate_watch_interest_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+        }
+        if let DocumentSyncTarget::NodeInfo { .. } = target {
+            // Structural guard for the shared node-info keyspace, mirroring the
+            // node-usage guard above so the generic storage write can never
+            // persist an unvalidated node info document.
+            validate_node_info_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -4049,6 +4110,28 @@ fn validate_watch_subscription_target(
     }
     if watch_id.is_nil() {
         return Err("watch subscription id must not be nil".to_string());
+    }
+    Ok(())
+}
+
+/// Validates the self-consistency of a replicated node-info document against its
+/// sync target: the payload must decode and its embedded `node_id` must match the
+/// target's node. Does not check the publisher's identity (the caller enforces
+/// that against the signed actor).
+fn validate_node_info_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::NodeInfo { node_id, .. } = target else {
+        return Err("target is not a node info document".to_string());
+    };
+    let document = NodeInfoDocument::from_bytes(bytes)
+        .map_err(|error| format!("undecodable node info document: {error}"))?;
+    if document.node_id != *node_id {
+        return Err(format!(
+            "node info document node id {} does not match target node id {node_id}",
+            document.node_id
+        ));
     }
     Ok(())
 }
@@ -8630,6 +8713,49 @@ mod tests {
             validate_watch_interest_upsert(
                 &DocumentSyncTarget::RealmConfig { realm_id },
                 &owned_bytes,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_node_info_upsert_accepts_owner_and_rejects_forgeries() {
+        use aruna_core::structs::{NodeInfoDocument, NodeUrls, NodeUtilization};
+
+        let node_id = node(7);
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
+
+        let owned = NodeInfoDocument {
+            node_id,
+            labels: std::collections::BTreeMap::new(),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 1,
+                documents_held: 0,
+                load_permille: 0,
+                heartbeat_at_ms: 5,
+            },
+            updated_at_ms: 5,
+        };
+        assert!(validate_node_info_upsert(&target, &owned.to_bytes().unwrap()).is_ok());
+
+        // A document whose embedded node id is a different node is rejected.
+        let misattributed = NodeInfoDocument {
+            node_id: node(9),
+            ..owned.clone()
+        };
+        assert!(validate_node_info_upsert(&target, &misattributed.to_bytes().unwrap()).is_err());
+
+        // Undecodable payloads and non node-info targets are rejected.
+        assert!(validate_node_info_upsert(&target, b"not-a-document").is_err());
+        assert!(
+            validate_node_info_upsert(
+                &DocumentSyncTarget::RealmConfig { realm_id },
+                &owned.to_bytes().unwrap()
             )
             .is_err()
         );

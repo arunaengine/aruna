@@ -67,6 +67,11 @@ pub struct BootstrapOnboardingRequest {
     pub transport_public_key: Option<String>,
     pub issuer_public_key: Option<String>,
     pub issuer_proof: Option<String>,
+    /// Joiner's placement location (`None` ⇒ realm default). Carried so the
+    /// finalizing node can seed the joiner's placement map entry.
+    pub node_location: Option<String>,
+    /// Joiner's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

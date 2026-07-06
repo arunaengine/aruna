@@ -549,6 +549,8 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
             },
             realm_description: "Test Realm".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         }),
         context.as_ref(),
     )

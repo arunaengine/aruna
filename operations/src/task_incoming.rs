@@ -560,6 +560,28 @@ impl OperationsTaskHandler {
         }
     }
 
+    async fn publish_node_info(&self) {
+        if let Some(net_handle) = self.context.net_handle.as_ref() {
+            let node_id = net_handle.node_id();
+            let realm_id = *net_handle.realm_id();
+            if let Err(error) =
+                crate::node_info::refresh_node_info_heartbeat(&self.context, node_id, realm_id)
+                    .await
+            {
+                warn!(error = %error, "Failed to publish node info heartbeat");
+            }
+        } else {
+            warn!("Cannot publish node info without net handle");
+        }
+        // Periodic heartbeat: always re-arm for the next interval regardless of
+        // outcome so a transient failure never stops the heartbeat.
+        self.reschedule_timer(
+            TaskKey::PublishNodeInfo,
+            crate::node_info::NODE_INFO_PUBLISH_INTERVAL,
+        )
+        .await;
+    }
+
     async fn publish_watch_interest(&self) {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!("Cannot publish watch interest without net handle");
@@ -1051,6 +1073,8 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
+            .await;
         restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
             &task_handle,
@@ -1081,6 +1105,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
     restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
+    crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
@@ -1214,6 +1239,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PublishUsageSnapshots => {
                 self.publish_usage_snapshots().await;
+            }
+            TaskKey::PublishNodeInfo => {
+                self.publish_node_info().await;
             }
             TaskKey::DrainMetadataProjectionQueue => {
                 self.drain_metadata_projection_queue().await;

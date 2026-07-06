@@ -1334,8 +1334,8 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use crate::structs::{
-        Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, KIND_LABEL_KEY,
-        GroupQuotaOverride, LabelMatch, MetadataReplicationConfig, NodePlacementEntry,
+        Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, GroupQuotaOverride,
+        KIND_LABEL_KEY, LabelMatch, MetadataReplicationConfig, NodePlacementEntry,
         OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy, QuotaConfig,
         RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding, UserGroupCapOverride,
     };

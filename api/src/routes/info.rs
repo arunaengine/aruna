@@ -25,7 +25,7 @@ use axum::routing::{get, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
@@ -342,6 +342,40 @@ pub struct RealmNodeInfoResponse {
     pub configured: bool,
     pub present: bool,
     pub connection_status: RealmNodeConnectionStatus,
+    /// Placement map entry (location/weight/status) when the node is mapped.
+    pub placement: Option<RealmNodePlacementResponse>,
+    /// Latest published node info document (labels/urls/utilization) if received.
+    pub info: Option<RealmNodeInfoDocumentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodePlacementResponse {
+    pub location: String,
+    pub weight: u32,
+    pub full: bool,
+    pub draining: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeInfoDocumentResponse {
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub urls: RealmNodeUrlsResponse,
+    pub utilization: RealmNodeUtilizationResponse,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeUrlsResponse {
+    pub api: Option<String>,
+    pub s3: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeUtilizationResponse {
+    pub storage_bytes_used: u64,
+    pub documents_held: u64,
+    pub load_permille: u32,
+    pub heartbeat_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -397,15 +431,59 @@ pub async fn get_realm_info(
         other => ServerError::InternalError(other.to_string()),
     })?;
     let present_nodes = load_realm_presence_best_effort(&state).await;
+    let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
     let response = map_realm_info_response(
         &state,
         config,
         present_nodes,
         interface_services_status(&state).await,
+        node_info_docs,
         auth.as_ref()
             .is_some_and(|auth| auth.realm_id == state.get_realm_id()),
     )?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn load_node_info_documents_best_effort(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument> {
+    let node_ids: Vec<aruna_core::NodeId> = config
+        .nodes
+        .iter()
+        .filter_map(|node| node.node_id.parse().ok())
+        .collect();
+    match aruna_operations::node_info::read_node_info_documents(
+        &state.get_ctx().storage_handle,
+        &node_ids,
+    )
+    .await
+    {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(error = %error, "Failed to load node info documents for realm info");
+            BTreeMap::new()
+        }
+    }
+}
+
+fn map_node_info_document(
+    document: &aruna_core::structs::NodeInfoDocument,
+) -> RealmNodeInfoDocumentResponse {
+    RealmNodeInfoDocumentResponse {
+        labels: document.labels.clone(),
+        urls: RealmNodeUrlsResponse {
+            api: document.urls.api.clone(),
+            s3: document.urls.s3.clone(),
+        },
+        utilization: RealmNodeUtilizationResponse {
+            storage_bytes_used: document.utilization.storage_bytes_used,
+            documents_held: document.utilization.documents_held,
+            load_permille: document.utilization.load_permille,
+            heartbeat_at_ms: document.utilization.heartbeat_at_ms,
+        },
+        updated_at_ms: document.updated_at_ms,
+    }
 }
 
 async fn authorize_realm_config_admin(
@@ -630,6 +708,7 @@ fn map_realm_info_response(
     config: RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     interfaces: InterfaceServicesStatus,
+    node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
     include_user_quota_overrides: bool,
 ) -> ServerResult<RealmInfoResponse> {
     let discovery = serde_json::to_value(&config.discovery)
@@ -639,13 +718,21 @@ fn map_realm_info_response(
         .nodes
         .iter()
         .map(|node| {
+            let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
-            let present = is_current
-                || node
-                    .node_id
-                    .parse::<aruna_core::NodeId>()
-                    .ok()
-                    .is_some_and(|node_id| present_nodes.contains(&node_id));
+            let present =
+                is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id));
+            let placement = parsed
+                .and_then(|node_id| config.placement_entry(node_id))
+                .map(|entry| RealmNodePlacementResponse {
+                    location: entry.effective_location().to_string(),
+                    weight: entry.weight,
+                    full: entry.full,
+                    draining: entry.draining,
+                });
+            let info = parsed
+                .and_then(|node_id| node_info_docs.get(&node_id))
+                .map(map_node_info_document);
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind: RealmNodeKindInfo::from(&node.kind),
@@ -656,6 +743,8 @@ fn map_realm_info_response(
                 } else {
                     RealmNodeConnectionStatus::Configured
                 },
+                placement,
+                info,
             }
         })
         .collect();
@@ -1323,6 +1412,8 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
             }),
             &driver_ctx,
         )
@@ -1450,6 +1541,64 @@ mod tests {
             authenticated.quota.user_group_cap_overrides[0].user_id,
             admin.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn get_realm_info_includes_placement_and_node_info() {
+        use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+        use aruna_core::structs::{
+            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
+        };
+
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let node_id = state.get_node_id();
+
+        // The creating node's placement entry is seeded at realm creation with
+        // the default location/weight. Publish a node info document for it too.
+        let document = NodeInfoDocument {
+            node_id,
+            labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+            urls: NodeUrls {
+                api: None,
+                s3: Some("s3.example".to_string()),
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 4_096,
+                documents_held: 0,
+                load_permille: 0,
+                heartbeat_at_ms: 1_700_000_000_000,
+            },
+            updated_at_ms: 1_700_000_000_500,
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_INFO_KEYSPACE.to_string(),
+                key: node_info_storage_key(node_id).into(),
+                value: document.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let node = info
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id.to_string())
+            .expect("creating node present in realm info");
+
+        let placement = node.placement.as_ref().expect("placement entry present");
+        assert_eq!(placement.location, "default");
+        assert_eq!(placement.weight, 100);
+        assert!(!placement.full);
+        assert!(!placement.draining);
+
+        let node_info = node.info.as_ref().expect("node info document present");
+        assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
+        assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
     }
 
     #[tokio::test]

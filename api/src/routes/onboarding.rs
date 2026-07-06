@@ -95,6 +95,8 @@ pub struct BootstrapOnboardingRequestDoc {
     pub transport_public_key: Option<String>,
     pub issuer_public_key: Option<String>,
     pub issuer_proof: Option<String>,
+    pub node_location: Option<String>,
+    pub node_weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -402,6 +404,8 @@ pub async fn bootstrap_onboarding(
             local_node_id: state.get_node_id(),
             realm_signing_key,
             now: now_timestamp(),
+            node_location: request.node_location.clone(),
+            node_weight: request.node_weight,
         },
         state.get_ctx(),
     )
@@ -668,6 +672,8 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
             }),
             &driver_ctx,
         )
@@ -755,6 +761,8 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some(issuer_signature),
+                node_location: None,
+                node_weight: None,
             }),
         )
         .await
@@ -982,6 +990,8 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some("invalid-signature".to_string()),
+                node_location: None,
+                node_weight: None,
             }),
         )
         .await;
@@ -1009,6 +1019,8 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key),
                 issuer_proof: Some(issuer_signature),
+                node_location: None,
+                node_weight: None,
             }),
         )
         .await;
@@ -1062,6 +1074,8 @@ mod tests {
                 transport_public_key: Some(transport_public_key),
                 issuer_public_key: None,
                 issuer_proof: None,
+                node_location: None,
+                node_weight: None,
             }),
         )
         .await
