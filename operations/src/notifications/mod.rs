@@ -11,3 +11,4 @@ pub mod protocol;
 pub mod prune;
 pub mod routing;
 pub mod unread;
+pub mod watch;
