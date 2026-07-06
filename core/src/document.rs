@@ -223,6 +223,20 @@ pub fn document_sync_apply_decision(
 }
 
 impl DocumentSyncTarget {
+    /// Admin documents (user, group, and realm authorization/config) replicate
+    /// only as `AdminOperation` events over their shared topic; they never take
+    /// placements or sync as whole documents.
+    pub fn is_admin_document(&self) -> bool {
+        matches!(
+            self,
+            Self::Group { .. }
+                | Self::GroupAuthorization { .. }
+                | Self::RealmAuthorization { .. }
+                | Self::RealmConfig { .. }
+                | Self::User { .. }
+        )
+    }
+
     pub fn topic_id(&self) -> TopicId {
         match self {
             Self::Group { group_id } | Self::GroupAuthorization { group_id } => {
