@@ -4,7 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
-    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind, ResourceEvent,
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, DEFAULT_NODE_WEIGHT, NodePlacementEntry, RealmId,
+    RealmNodeKind, ResourceEvent,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -31,6 +32,9 @@ use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
 };
+use crate::set_node_placement::{
+    SetNodePlacementConfig, SetNodePlacementError, SetNodePlacementOperation,
+};
 
 const ONBOARDING_RESERVATION_TTL_SECS: u64 = 300;
 const REALM_NODE_UPDATE_RETRIES: usize = 5;
@@ -44,6 +48,10 @@ pub struct BootstrapOnboardingFinalizeInput {
     pub local_node_id: NodeId,
     pub realm_signing_key: SigningKey,
     pub now: u64,
+    /// Joiner's placement location (`None` ⇒ realm default).
+    pub node_location: Option<String>,
+    /// Joiner's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +66,8 @@ pub enum BootstrapOnboardingFinalizeError {
     Reserve(#[from] ReserveOnboardingSecretError),
     #[error(transparent)]
     EnsureRealmConfig(#[from] EnsureRealmConfigError),
+    #[error(transparent)]
+    SetNodePlacement(#[from] SetNodePlacementError),
     #[error(transparent)]
     Placement(#[from] PlacementError),
     #[error(transparent)]
@@ -90,6 +100,7 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
 
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
+    set_joiner_placement_entry(&input, context.as_ref()).await?;
     process_pending_placements(&input, context.as_ref()).await?;
 
     let ticket = drive(
@@ -225,6 +236,33 @@ async fn ensure_realm_node_once(
     Ok(())
 }
 
+async fn set_joiner_placement_entry(
+    input: &BootstrapOnboardingFinalizeInput,
+    context: &DriverContext,
+) -> Result<(), SetNodePlacementError> {
+    let entry = NodePlacementEntry {
+        node_id: input.node_id,
+        location: input.node_location.clone().unwrap_or_default(),
+        weight: input.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
+        full: false,
+        draining: false,
+        label_overrides: std::collections::BTreeMap::new(),
+    };
+    drive(
+        SetNodePlacementOperation::new(SetNodePlacementConfig {
+            actor: Actor {
+                node_id: input.local_node_id,
+                user_id: UserId::nil(input.realm_id),
+                realm_id: input.realm_id,
+            },
+            entry,
+        }),
+        context,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
     context: &DriverContext,
@@ -318,6 +356,8 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
             }),
             context.as_ref(),
         )
@@ -365,6 +405,8 @@ mod tests {
             local_node_id: fixture.local_node_id,
             realm_signing_key: fixture.realm_signing_key.clone(),
             now,
+            node_location: Some("eu-central".to_string()),
+            node_weight: Some(250),
         }
     }
 
@@ -399,6 +441,23 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id == node_id.to_string())
         );
+    }
+
+    async fn assert_realm_placement_entry(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        location: &str,
+        weight: u32,
+    ) {
+        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+            .await
+            .unwrap();
+        let entry = document
+            .placement_entry(node_id)
+            .expect("joiner placement entry set during finalize");
+        assert_eq!(entry.location, location);
+        assert_eq!(entry.weight, weight);
     }
 
     async fn context_with_net(fixture: &FinalizeFixture) -> (Arc<DriverContext>, NetHandle) {
@@ -490,6 +549,16 @@ mod tests {
             fixture.context.as_ref(),
             fixture.realm_id,
             fixture.joiner_node_id,
+        )
+        .await;
+        // The joiner's location/weight from finalize_input landed in the
+        // placement map next to its RealmConfigNodeEnsured membership.
+        assert_realm_placement_entry(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+            "eu-central",
+            250,
         )
         .await;
 

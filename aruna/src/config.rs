@@ -10,8 +10,8 @@ use aruna_core::onboarding::{
     bootstrap_node_proof_message,
 };
 use aruna_core::structs::{
-    BlobTimeoutConfig, DynamicDiscoveryMethod, NodeCapabilities, OidcProviderConfig,
-    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+    BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
+    OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -32,6 +32,7 @@ use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::path::PathBuf;
@@ -82,6 +83,9 @@ pub struct Config {
     pub portal: PortalConfig,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
+    pub node_labels: BTreeMap<String, String>,
+    pub node_location: Option<String>,
+    pub node_weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +290,16 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     }
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
+    let node_labels = parse_node_labels_env()?;
+    let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let node_weight = dotenvy::var("ARUNA_NODE_WEIGHT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().parse::<u32>())
+        .transpose()?;
     let realm_description = dotenvy::var("REALM_DESCRIPTION")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -304,7 +318,12 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         None => {
             let state = match onboarding_secret.as_deref() {
                 Some(onboarding_secret) => {
-                    let bootstrapped = bootstrap_onboarded_node_state(onboarding_secret).await?;
+                    let bootstrapped = bootstrap_onboarded_node_state(
+                        onboarding_secret,
+                        node_location.clone(),
+                        node_weight,
+                    )
+                    .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
                     bootstrapped.node_state
                 }
@@ -334,7 +353,13 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                         .to_string(),
                 )
             })?;
-            let response = refresh_onboarding_bootstrap(onboarding_secret, &node_state).await?;
+            let response = refresh_onboarding_bootstrap(
+                onboarding_secret,
+                &node_state,
+                node_location.clone(),
+                node_weight,
+            )
+            .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
             node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
             persist_node_state(&storage_handle, &node_state).await?;
@@ -402,6 +427,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             portal,
             startup_mode,
             node_state,
+            node_labels,
+            node_location,
+            node_weight,
         },
         storage_handle,
     ))
@@ -521,6 +549,37 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// Parses `ARUNA_NODE_LABELS` in `k=v,k2=v2` form. Rejects malformed pairs and
+/// the derived-only [`KIND_LABEL_KEY`], which is stamped from `RealmNode.kind`.
+fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
+    const KEY: &str = "ARUNA_NODE_LABELS";
+    let raw = dotenvy::var(KEY).unwrap_or_default();
+    let mut labels = BTreeMap::new();
+    for pair in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        let (label_key, label_value) = pair
+            .split_once('=')
+            .ok_or_else(|| invalid_config_value(KEY, pair, "expected key=value"))?;
+        let label_key = label_key.trim();
+        let label_value = label_value.trim();
+        if label_key.is_empty() {
+            return Err(invalid_config_value(KEY, pair, "empty label key"));
+        }
+        if label_key == KIND_LABEL_KEY {
+            return Err(invalid_config_value(
+                KEY,
+                pair,
+                format!("{KIND_LABEL_KEY} is a reserved derived label"),
+            ));
+        }
+        labels.insert(label_key.to_string(), label_value.to_string());
+    }
+    Ok(labels)
 }
 
 fn load_document_sync_runtime_config() -> Result<IrohRuntimeConfig, SetupError> {
@@ -686,6 +745,8 @@ struct BootstrappedNodeState {
 
 async fn bootstrap_onboarded_node_state(
     onboarding_secret: &str,
+    node_location: Option<String>,
+    node_weight: Option<u32>,
 ) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -744,6 +805,8 @@ async fn bootstrap_onboarded_node_state(
             transport_public_key,
             issuer_public_key,
             issuer_proof,
+            node_location,
+            node_weight,
         })
         .send()
         .await?;
@@ -838,6 +901,8 @@ async fn bootstrap_onboarded_node_state(
 async fn refresh_onboarding_bootstrap(
     onboarding_secret: &str,
     node_state: &PersistedNodeState,
+    node_location: Option<String>,
+    node_weight: Option<u32>,
 ) -> Result<BootstrapOnboardingResponse, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
@@ -906,6 +971,8 @@ async fn refresh_onboarding_bootstrap(
             transport_public_key,
             issuer_public_key,
             issuer_proof,
+            node_location,
+            node_weight,
         })
         .send()
         .await?;
@@ -1204,8 +1271,8 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        fjall_persist_policy_env, load, load_oidc_providers_from_env, persist_node_state,
-        portal_config_env,
+        fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
+        persist_node_state, portal_config_env,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -1289,6 +1356,71 @@ mod tests {
             error,
             super::SetupError::InvalidConfigValue {
                 key: "ARUNA_FJALL_PERSIST_MODE",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_defaults_to_empty() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::remove_var(key) };
+
+        assert!(parse_node_labels_env().unwrap().is_empty());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_parses_comma_separated_pairs() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "tier=hot, zone = eu-west ") };
+
+        let labels = parse_node_labels_env().unwrap();
+        assert_eq!(labels.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(labels.get("zone"), Some(&"eu-west".to_string()));
+        assert_eq!(labels.len(), 2);
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_rejects_reserved_kind_key() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "aruna.io/kind=Server") };
+
+        let error = parse_node_labels_env().expect_err("reserved key should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_rejects_malformed_pair() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "tier") };
+
+        let error = parse_node_labels_env().expect_err("missing '=' should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
                 ..
             }
         ));

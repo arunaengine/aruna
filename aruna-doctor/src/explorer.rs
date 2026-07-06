@@ -575,6 +575,10 @@ enum JsonDocumentSyncTarget {
         realm_id: String,
         node_id: String,
     },
+    NodeInfo {
+        realm_id: String,
+        node_id: String,
+    },
 }
 
 fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
@@ -637,6 +641,10 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
                 node_id: node_id.to_string(),
             }
         }
+        DocumentSyncTarget::NodeInfo { realm_id, node_id } => JsonDocumentSyncTarget::NodeInfo {
+            realm_id: realm_id.to_string(),
+            node_id: node_id.to_string(),
+        },
     }
 }
 

@@ -131,6 +131,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to publish initial node usage snapshots");
     }
 
+    // Seed (or refresh) this node's info document from config so realm peers see
+    // this node's labels, urls, and utilization. The periodic PublishNodeInfo
+    // heartbeat republishes it; here we set the config-sourced labels/urls once.
+    if let Err(error) = aruna_operations::node_info::publish_node_info(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        config.node_labels.clone(),
+        aruna_core::structs::NodeUrls {
+            api: None,
+            s3: Some(config.s3_host.clone()),
+        },
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to publish initial node info document");
+    }
+
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -160,6 +178,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         realm_description: realm_description.clone(),
                         oidc_providers: config.oidc_providers.clone(),
+                        node_location: config.node_location.clone(),
+                        node_weight: config.node_weight,
                     }),
                     driver_ctx.as_ref(),
                 )

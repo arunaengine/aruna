@@ -8,15 +8,16 @@ use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
-    USER_KEYSPACE,
+    NODE_INFO_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
 };
 use crate::structs::{
-    RealmId, node_usage_global_key, node_usage_group_key, watch_interest_node_key,
+    RealmId, node_info_storage_key, node_usage_global_key, node_usage_group_key,
+    watch_interest_node_key,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -58,6 +59,10 @@ pub enum DocumentSyncTarget {
         group_id: Option<GroupId>,
     },
     WatchInterest {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    NodeInfo {
         realm_id: RealmId,
         node_id: NodeId,
     },
@@ -289,6 +294,7 @@ impl DocumentSyncTarget {
             }
             Self::NodeUsage { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
+            Self::NodeInfo { realm_id, .. } => TopicId::realm(*realm_id),
         }
     }
 
@@ -304,6 +310,7 @@ impl DocumentSyncTarget {
             Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
             Self::NodeUsage { .. } => USAGE_NODE_STATS_KEYSPACE,
             Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+            Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
         }
     }
 
@@ -342,6 +349,7 @@ impl DocumentSyncTarget {
             Self::WatchInterest { realm_id, node_id } => {
                 ByteView::from(watch_interest_node_key(*realm_id, *node_id))
             }
+            Self::NodeInfo { node_id, .. } => ByteView::from(node_info_storage_key(*node_id)),
         }
     }
 
@@ -379,6 +387,9 @@ impl DocumentSyncTarget {
             // Likewise realm-shared: every node's watch-interest digest rides one
             // topic so origin nodes receive all holders' interest.
             Self::WatchInterest { .. } => bytes.extend_from_slice(b"/watch-interest"),
+            // Realm-shared: every node's info/heartbeat document rides one topic
+            // (no node id in the suffix) so all realm nodes receive every peer's.
+            Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),
         }
         irokle::TopicId::hash(bytes)
     }
@@ -769,6 +780,44 @@ mod tests {
         assert_eq!(
             group.storage_key().as_ref(),
             node_usage_group_key(group_id, node_id).as_slice()
+        );
+    }
+
+    #[test]
+    fn node_info_targets_share_one_realm_topic_and_map_to_node_keys() {
+        use crate::keyspaces::NODE_INFO_KEYSPACE;
+        use crate::structs::node_info_storage_key;
+
+        let realm_id = test_realm(2);
+        let node_id = test_node(1);
+        let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
+
+        // Rides the realm domain topic and one shared sync topic across nodes.
+        assert_eq!(target.topic_id(), TopicId::realm(realm_id));
+        let other = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: test_node(9),
+        };
+        assert_eq!(target.sync_topic_id(), other.sync_topic_id());
+        // Distinct from the node-usage and watch-interest topics on the same realm.
+        assert_ne!(
+            target.sync_topic_id(),
+            DocumentSyncTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: None,
+            }
+            .sync_topic_id()
+        );
+        assert_ne!(
+            target.sync_topic_id(),
+            DocumentSyncTarget::WatchInterest { realm_id, node_id }.sync_topic_id()
+        );
+
+        assert_eq!(target.storage_keyspace(), NODE_INFO_KEYSPACE);
+        assert_eq!(
+            target.storage_key().as_ref(),
+            node_info_storage_key(node_id).as_slice()
         );
     }
 

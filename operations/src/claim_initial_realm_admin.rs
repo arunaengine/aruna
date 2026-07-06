@@ -646,6 +646,8 @@ mod tests {
             },
             realm_description: "Realm".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         };
         drive(CreateRealmOperation::new(realm_config), &context)
             .await

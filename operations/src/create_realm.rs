@@ -10,8 +10,9 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, BindingScope, DocumentClass, OidcProviderConfig, PlacementStrategy,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, StrategyBinding,
+    Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+    OidcProviderConfig, PlacementStrategy, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmNodeKind, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -28,6 +29,10 @@ pub struct CreateRealmConfig {
     pub actor: Actor,
     pub realm_description: String,
     pub oidc_providers: Vec<OidcProviderConfig>,
+    /// Creating node's placement location (`None` ⇒ realm default).
+    pub node_location: Option<String>,
+    /// Creating node's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
 }
 
 #[derive(PartialEq)]
@@ -96,6 +101,9 @@ impl CreateRealmOperation {
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
         seed_placement_defaults(&mut config_doc);
+        config_doc
+            .placement_map
+            .push(self.creating_node_placement_entry());
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -107,6 +115,17 @@ impl CreateRealmOperation {
             writes,
             txn_id: self.txn_id,
         })])
+    }
+
+    fn creating_node_placement_entry(&self) -> NodePlacementEntry {
+        NodePlacementEntry {
+            node_id: self.config.actor.node_id,
+            location: self.config.node_location.clone().unwrap_or_default(),
+            weight: self.config.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
+            full: false,
+            draining: false,
+            label_overrides: std::collections::BTreeMap::new(),
+        }
     }
 
     fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
@@ -189,6 +208,12 @@ impl CreateRealmOperation {
                 },
             )?);
         }
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: self.creating_node_placement_entry(),
+            },
+        )?);
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -495,8 +520,9 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, OidcProviderConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, RealmNodeKind,
+        Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -523,6 +549,8 @@ mod test {
             actor,
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         }
     }
 
@@ -684,7 +712,7 @@ mod test {
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 11);
+        assert_eq!(outbox_records.len(), 12);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -779,6 +807,19 @@ mod test {
                     10,
                     AdminDocumentOperation::RealmConfigStrategyBindingSet {
                         binding: seeded_bindings[1].clone(),
+                    },
+                ),
+                (
+                    11,
+                    AdminDocumentOperation::RealmConfigNodePlacementSet {
+                        entry: NodePlacementEntry {
+                            node_id: actor.node_id,
+                            location: String::new(),
+                            weight: DEFAULT_NODE_WEIGHT,
+                            full: false,
+                            draining: false,
+                            label_overrides: std::collections::BTreeMap::new(),
+                        },
                     },
                 ),
             ]
@@ -902,6 +943,8 @@ mod test {
             },
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

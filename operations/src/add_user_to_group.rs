@@ -1189,6 +1189,8 @@ pub mod test {
             },
             realm_description: "Test realm".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
         };
         let realm_operation = CreateRealmOperation::new(realm_config);
         let _ = drive(realm_operation, &context).await.unwrap();
@@ -1283,6 +1285,8 @@ pub mod test {
                 actor: actor.clone(),
                 realm_description: "Test realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
             }),
             context,
         )

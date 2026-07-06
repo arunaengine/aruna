@@ -44,6 +44,7 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
             | TaskKey::DrainReferenceMetadataRefreshQueue
             | TaskKey::DrainNotificationOutbox
             | TaskKey::PruneNotifications
+            | TaskKey::PublishNodeInfo
     )
 }
 

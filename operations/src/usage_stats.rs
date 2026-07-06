@@ -1014,7 +1014,7 @@ async fn iter_all(
     Ok(collected)
 }
 
-async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
+pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
     let reads = usage_global_shard_keys()
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
