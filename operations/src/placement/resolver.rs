@@ -445,6 +445,7 @@ mod tests {
             replica_count,
             distinct_locations,
             affinity: Vec::new(),
+            bucket_count: 64,
         }
     }
 
@@ -487,6 +488,7 @@ mod tests {
             replica_count: Some(3),
             distinct_locations: true,
             affinity: Vec::new(),
+            bucket_count: 64,
         }
     }
 
@@ -966,6 +968,28 @@ mod tests {
             document_id: sid(7),
         };
         assert_ne!(subject_bytes(&other), expected);
+    }
+
+    #[test]
+    fn all_document_variants_share_one_bucket() {
+        use aruna_core::structs::bucket_for_subject;
+
+        let document_id = sid(4);
+        let variants = [
+            DocumentSyncTarget::MetadataRegistry {
+                group_id: sid(5),
+                document_id,
+            },
+            DocumentSyncTarget::MetadataCreateEvent {
+                document_id,
+                event_id: sid(6),
+            },
+            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+        ];
+        let expected = bucket_for_subject(&subject_bytes(&variants[0]), 64);
+        for target in &variants {
+            assert_eq!(bucket_for_subject(&subject_bytes(target), 64), expected);
+        }
     }
 
     #[test]

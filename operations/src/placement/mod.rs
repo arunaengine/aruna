@@ -5,7 +5,7 @@ pub mod selector;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument};
+use aruna_core::structs::{PlacementRef, RealmConfigDocument, bucket_for_subject};
 
 pub use resolver::{
     PlacementView, ResolvedNode, build_view, document_class, resolve_holders, strategy_for_target,
@@ -27,6 +27,7 @@ pub fn placement_ref_for_target(
         Some((strategy, _)) => PlacementRef {
             strategy_id: strategy.strategy_id,
             epoch: 0,
+            bucket: bucket_for_subject(&subject_bytes(target), strategy.bucket_count),
         },
         None => PlacementRef::NIL,
     }
@@ -49,8 +50,9 @@ pub fn plan_target_placement(
     metadata_path: Option<&str>,
 ) -> Option<TargetPlacementPlan> {
     let (strategy, override_) = strategy_for_target(config, target, metadata_path)?;
+    let subject = subject_bytes(target);
     let view = build_view(config);
-    let holders = resolve_holders(&view, strategy, &subject_bytes(target), 0, override_);
+    let holders = resolve_holders(&view, strategy, &subject, 0, override_);
     let desired_count = match strategy.replica_count {
         Some(count) => count as usize,
         None => holders.len(),
@@ -61,6 +63,7 @@ pub fn plan_target_placement(
         placement: PlacementRef {
             strategy_id: strategy.strategy_id,
             epoch: 0,
+            bucket: bucket_for_subject(&subject, strategy.bucket_count),
         },
     })
 }

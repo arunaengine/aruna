@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{PlacementStrategy, RealmConfigDocument};
+use aruna_core::structs::{DEFAULT_BUCKET_COUNT, PlacementStrategy, RealmConfigDocument};
 use aruna_core::types::UserId;
 use ulid::Ulid;
 
@@ -24,6 +24,7 @@ fn inbox_strategy() -> PlacementStrategy {
         replica_count: Some(1),
         distinct_locations: false,
         affinity: Vec::new(),
+        bucket_count: DEFAULT_BUCKET_COUNT,
     }
 }
 
