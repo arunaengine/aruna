@@ -574,7 +574,9 @@ fn document_change_for_publish(
                 return Err("metadata document lifecycle target mismatch".into());
             }
             Ok(metadata_document_lifecycle_revision_change(
-                &lifecycle, node_id,
+                &lifecycle,
+                node_id,
+                aruna_core::structs::PlacementRef::NIL,
             ))
         }
         DocumentSyncTarget::MetadataCreateEvent {

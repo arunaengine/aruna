@@ -306,6 +306,7 @@ pub fn document_sync_conflict_write_entry(
 pub fn metadata_document_lifecycle_revision_change(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> DocumentSyncChange {
     match record {
         MetadataDocumentLifecycleRecord::Upsert { event } => DocumentSyncChange {
@@ -317,7 +318,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.occurred_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: PlacementRef::NIL,
+            placement,
         },
         MetadataDocumentLifecycleRecord::Delete { event } => DocumentSyncChange {
             base: None,
@@ -328,7 +329,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.tombstone.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Delete,
-            placement: PlacementRef::NIL,
+            placement,
         },
     }
 }
@@ -336,11 +337,12 @@ pub fn metadata_document_lifecycle_revision_change(
 pub fn metadata_document_lifecycle_revision_write_entry(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    let change = metadata_document_lifecycle_revision_change(record, delete_actor);
+    let change = metadata_document_lifecycle_revision_change(record, delete_actor, placement);
     document_sync_revision_write_entry(&target, &change)
 }
 

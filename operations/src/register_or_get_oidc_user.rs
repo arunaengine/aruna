@@ -9,11 +9,12 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, document_sync_revision_write_entry,
 };
-use aruna_core::structs::{Actor, PlacementRef, User, oidc_subject_key};
+use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
@@ -26,6 +27,7 @@ use ulid::Ulid;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::placement::placement_ref_for_target;
 use crate::user_subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
@@ -39,6 +41,7 @@ pub struct RegisterOrGetOidcUserInput {
 #[derive(Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserOperation {
     input: RegisterOrGetOidcUserInput,
+    realm_config: Option<RealmConfigDocument>,
     state: RegisterOrGetOidcUserState,
     output: Option<Result<User, RegisterOrGetOidcUserError>>,
 }
@@ -79,6 +82,7 @@ impl RegisterOrGetOidcUserOperation {
     pub fn new(input: RegisterOrGetOidcUserInput) -> Self {
         Self {
             input,
+            realm_config: None,
             state: RegisterOrGetOidcUserState::Init,
             output: None,
         }
@@ -133,24 +137,41 @@ impl RegisterOrGetOidcUserOperation {
         txn_id: TxnId,
     ) -> Result<Effects, RegisterOrGetOidcUserError> {
         self.state = RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id };
-        let key = ByteView::from(self.subject_key()?.into_bytes());
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-            key,
+        let subject_key = ByteView::from(self.subject_key()?.into_bytes());
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (USER_SUBJECT_INDEX_KEYSPACE.to_string(), subject_key),
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    ByteView::from(*self.input.actor.realm_id.as_bytes()),
+                ),
+            ],
             txn_id: Some(txn_id),
         })])
     }
 
     fn handle_read_subject_index(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
-                "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
+                "Event::Storage(StorageEvent::BatchReadResult { values })",
                 got,
             );
         };
+        let [(_, subject_value), (_, realm_config_value)] = values.as_slice() else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::BatchReadResult) with subject index and realm config values",
+                got,
+            );
+        };
+        if let Some(bytes) = realm_config_value {
+            match RealmConfigDocument::from_bytes(bytes) {
+                Ok(config) => self.realm_config = Some(config),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
 
-        match value {
+        match subject_value.clone() {
             Some(value) => self.emit_read_existing_user(txn_id, value),
             None => match self.emit_create_user(txn_id) {
                 Ok(effects) => effects,
@@ -188,7 +209,12 @@ impl RegisterOrGetOidcUserOperation {
         let admin_target = AdminDocumentTarget::User {
             user_id: self.input.user_id,
         };
-        let document_revision = initial_user_document_sync_change(&self.input.actor);
+        let placement = self
+            .realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, None))
+            .unwrap_or(PlacementRef::NIL);
+        let document_revision = initial_user_document_sync_change(&self.input.actor, placement);
         let mut reducer_state = AdminDocumentReducerState::new(admin_target);
         let admin_events = seed_user_admin_events(&mut reducer_state, &self.input, subject_id)?;
         let mut writes = vec![
@@ -440,7 +466,7 @@ fn current_timestamp_ms() -> u64 {
     u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
-fn initial_user_document_sync_change(actor: &Actor) -> DocumentSyncChange {
+fn initial_user_document_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentSyncChange {
     let updated_at_ms = current_timestamp_ms();
     DocumentSyncChange {
         base: None,
@@ -451,7 +477,7 @@ fn initial_user_document_sync_change(actor: &Actor) -> DocumentSyncChange {
             updated_at_ms,
         },
         kind: DocumentSyncChangeKind::Upsert,
-        placement: PlacementRef::NIL,
+        placement,
     }
 }
 
@@ -476,6 +502,7 @@ mod tests {
     use aruna_core::structs::{Actor, User, oidc_subject_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
+    use byteview::ByteView;
     use ulid::Ulid;
 
     #[tokio::test]
@@ -512,19 +539,24 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.first().unwrap(),
-            Effect::Storage(StorageEffect::Read { .. })
+            Effect::Storage(StorageEffect::BatchRead { .. })
         ));
         assert_eq!(
             operation.state,
             RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id }
         );
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: oidc_subject_key("https://issuer.example", "subject-1")
-                .unwrap()
-                .into_bytes()
-                .into(),
-            value: None,
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    oidc_subject_key("https://issuer.example", "subject-1")
+                        .unwrap()
+                        .into_bytes()
+                        .into(),
+                    None,
+                ),
+                (ByteView::from(*realm_id.as_bytes()), None),
+            ],
         }));
         let subject_id = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
         let admin_target = AdminDocumentTarget::User { user_id };
@@ -673,12 +705,17 @@ mod tests {
         operation.start();
         let txn_id = TxnId::new();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: oidc_subject_key("https://issuer.example", "subject-3")
-                .unwrap()
-                .into_bytes()
-                .into(),
-            value: None,
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    oidc_subject_key("https://issuer.example", "subject-3")
+                        .unwrap()
+                        .into_bytes()
+                        .into(),
+                    None,
+                ),
+                (ByteView::from(*realm_id.as_bytes()), None),
+            ],
         }));
 
         let [
@@ -742,12 +779,17 @@ mod tests {
         operation.start();
         let txn_id = TxnId::new();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: oidc_subject_key("https://issuer.example", "subject-2")
-                .unwrap()
-                .into_bytes()
-                .into(),
-            value: Some(user_id.to_storage_key().into()),
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    oidc_subject_key("https://issuer.example", "subject-2")
+                        .unwrap()
+                        .into_bytes()
+                        .into(),
+                    Some(user_id.to_storage_key().into()),
+                ),
+                (ByteView::from(*realm_id.as_bytes()), None),
+            ],
         }));
         assert!(matches!(
             effects.first().unwrap(),

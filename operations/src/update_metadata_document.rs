@@ -1,13 +1,15 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
+use byteview::ByteView;
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -53,6 +55,7 @@ pub struct UpdateMetadataDocumentOperation {
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
     update_event: Option<MetadataCreateEventRecord>,
+    realm_config: Option<RealmConfigDocument>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -61,6 +64,7 @@ pub struct UpdateMetadataDocumentOperation {
 enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
+    ReadRealmConfig,
     ValidateMutation,
     StartTransaction,
     WriteUpdateBatch,
@@ -100,6 +104,7 @@ impl UpdateMetadataDocumentOperation {
             txn_id: None,
             record: None,
             update_event: None,
+            realm_config: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -214,7 +219,7 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let outbox = create_event_outbox_record(event, None, false);
+        let outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false);
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
         let writes =
@@ -329,6 +334,28 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let update_event = self.update_event_record(&record);
                     self.update_event = Some(update_event);
                     self.record = Some(record.clone());
+                    self.state = UpdateMetadataDocumentState::ReadRealmConfig;
+                    smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                        key: ByteView::from(*record.realm_id.as_bytes()),
+                        txn_id: None,
+                    })]
+                }
+                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            UpdateMetadataDocumentState::ReadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    if let Some(bytes) = value {
+                        match RealmConfigDocument::from_bytes(&bytes) {
+                            Ok(config) => self.realm_config = Some(config),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                    }
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
                     match self.validation_effect(&record) {
                         Ok(Some(effect)) => {
                             self.state = UpdateMetadataDocumentState::ValidateMutation;
@@ -338,9 +365,8 @@ impl Operation for UpdateMetadataDocumentOperation {
                         Err(error) => self.fail(error.into()),
                     }
                 }
-                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::ValidateMutation => match event {
                 Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
@@ -542,6 +568,13 @@ mod tests {
         })
     }
 
+    fn realm_config_read(record: &MetadataRegistryRecord) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: None,
+        })
+    }
+
     fn assert_no_graph_mutation_or_sync(effects: &[Effect]) {
         for effect in effects {
             match effect {
@@ -650,6 +683,8 @@ mod tests {
 
         assert_no_graph_mutation_or_sync(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
         let [Effect::Metadata(MetadataEffect::ValidateRoCrate { request })] = effects.as_slice()
         else {
             panic!("expected RO-Crate validation before transaction, got {effects:?}");
@@ -684,6 +719,8 @@ mod tests {
         operation.start();
         let effects = operation.step(registry_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -708,6 +745,8 @@ mod tests {
 
         assert_no_graph_mutation_or_sync(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: record.graph_iri.clone(),

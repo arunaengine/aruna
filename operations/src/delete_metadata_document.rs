@@ -4,6 +4,7 @@ use aruna_core::document::{
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{
     MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
@@ -12,10 +13,12 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
 use aruna_core::structs::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
+    RealmConfigDocument,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use aruna_core::util::unix_timestamp_millis;
+use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -33,6 +36,7 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
+use crate::placement::placement_ref_for_target;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -43,6 +47,9 @@ pub struct DeleteMetadataDocumentOperation {
     lifecycle_record: Option<MetadataGraphLifecycleRecord>,
     document_lifecycle_record: Option<MetadataDocumentLifecycleRecord>,
     prune_job_record: Option<MetadataGraphPruneJobRecord>,
+    /// Placement reference for this document, resolved from the realm config so
+    /// every delete envelope carries the same reference as the create/update.
+    placement_ref: PlacementRef,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -52,6 +59,7 @@ pub struct DeleteMetadataDocumentOperation {
 enum DeleteMetadataDocumentState {
     Init,
     ReadRecord,
+    ReadRealmConfig,
     StartTransaction,
     WriteGraphLifecycle,
     WriteGraphPruneJob,
@@ -104,6 +112,7 @@ impl DeleteMetadataDocumentOperation {
             lifecycle_record: None,
             document_lifecycle_record: None,
             prune_job_record: None,
+            placement_ref: PlacementRef::NIL,
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -158,8 +167,11 @@ impl DeleteMetadataDocumentOperation {
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        let change =
-            metadata_document_lifecycle_revision_change(lifecycle_record, self.actor.node_id);
+        let change = metadata_document_lifecycle_revision_change(
+            lifecycle_record,
+            self.actor.node_id,
+            self.placement_ref,
+        );
         // Delete tombstones are published by the document's holder onto its own
         // per-document sync topics; the graph-lifecycle topic in particular is
         // first written here, so these writes must be able to mint their genesis
@@ -209,7 +221,7 @@ impl DeleteMetadataDocumentOperation {
                 updated_at_ms: lifecycle_record.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: PlacementRef::NIL,
+            placement: self.placement_ref,
         };
         let outbox = new_outbox_record_with_id(
             outbox_id,
@@ -244,8 +256,11 @@ impl DeleteMetadataDocumentOperation {
         let Some(lifecycle_record) = self.document_lifecycle_record.as_ref() else {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         };
-        let change =
-            metadata_document_lifecycle_revision_change(lifecycle_record, self.actor.node_id);
+        let change = metadata_document_lifecycle_revision_change(
+            lifecycle_record,
+            self.actor.node_id,
+            self.placement_ref,
+        );
         let outbox = new_outbox_record_with_id(
             lifecycle_record.event_id(),
             self.actor.node_id,
@@ -320,15 +335,49 @@ impl Operation for DeleteMetadataDocumentOperation {
                         unix_timestamp_millis(),
                     ));
                     self.lifecycle_record = Some(lifecycle_record);
+                    let realm_id = record.realm_id;
                     self.record = Some(record);
-                    self.state = DeleteMetadataDocumentState::StartTransaction;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
+                    self.state = DeleteMetadataDocumentState::ReadRealmConfig;
+                    smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                        key: ByteView::from(*realm_id.as_bytes()),
+                        txn_id: None,
                     })]
                 }
                 Ok(None) => self.fail(DeleteMetadataDocumentError::DocumentNotFound),
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            DeleteMetadataDocumentState::ReadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    if let Some(bytes) = value {
+                        match RealmConfigDocument::from_bytes(&bytes) {
+                            Ok(config) => {
+                                let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+                                    document_id: record.document_id,
+                                };
+                                self.placement_ref = placement_ref_for_target(
+                                    &config,
+                                    &target,
+                                    Some(record.document_path.as_str()),
+                                );
+                            }
+                            Err(error) => {
+                                return self
+                                    .fail(DeleteMetadataDocumentError::ConversionError(error));
+                            }
+                        }
+                    }
+                    self.state = DeleteMetadataDocumentState::StartTransaction;
+                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -381,6 +430,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     match write_document_lifecycle_with_revision_effect(
                         document_lifecycle_record,
                         self.actor.node_id,
+                        self.placement_ref,
                         Some(txn_id),
                     ) {
                         Ok(effect) => smallvec![effect],
@@ -752,6 +802,15 @@ mod tests {
                 record.document_id,
             ),
             value: Some(postcard::to_allocvec(&record).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: None,
         }));
         assert!(matches!(
             effects.as_slice(),
