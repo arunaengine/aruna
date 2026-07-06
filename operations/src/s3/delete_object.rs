@@ -820,9 +820,11 @@ impl Operation for DeleteObjectOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -1036,6 +1038,36 @@ mod test {
             [Effect::Storage(StorageEffect::Delete { key_space, .. })]
                 if key_space == BLOB_HEAD_KEYSPACE
         ));
+    }
+
+    #[tokio::test]
+    async fn drive_version_delete_missing_version_returns_no_such_version() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = drive(
+            DeleteObjectOperation::new(DeleteObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "missing.txt".to_string(),
+                version_id: Some(Ulid::new()),
+                group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: iroh::SecretKey::generate().public(),
+                deleted_by: test_user_id(),
+            }),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(DeleteObjectError::NoSuchVersion)));
     }
 
     #[tokio::test]
