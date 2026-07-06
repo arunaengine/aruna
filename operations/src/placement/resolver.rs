@@ -1,0 +1,900 @@
+//! Placement view assembly and holder resolution over the weighted
+//! two-level rendezvous primitives in [`crate::placement::selector`].
+
+use std::collections::{BTreeMap, HashSet};
+use std::str::FromStr;
+
+use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::structs::{
+    AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
+    KIND_LABEL_KEY, LabelMatch, NodeInfoDocument, PlacementOverride, PlacementStrategy,
+    RealmConfigDocument, RealmNodeKind,
+};
+use aruna_core::types::GroupId;
+
+use crate::placement::selector::{ROLE_LOCATION, ROLE_NODE, rank_weighted};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedNode {
+    pub node_id: NodeId,
+    pub kind: RealmNodeKind,
+    pub location: String,
+    pub weight: u32,
+    pub full: bool,
+    pub draining: bool,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementView {
+    pub nodes: Vec<ResolvedNode>,
+}
+
+/// Assembles one [`ResolvedNode`] per configured node with a parseable id.
+///
+/// Placement fields come from the matching `placement_map` entry; unmapped
+/// nodes fall back to [`DEFAULT_LOCATION`] / [`DEFAULT_NODE_WEIGHT`] and clear
+/// status flags. Labels are `NodeInfo` labels, overlaid by the entry's
+/// `label_overrides`, overlaid by the derived read-only kind label.
+pub fn build_view(config: &RealmConfigDocument, node_infos: &[NodeInfoDocument]) -> PlacementView {
+    let mut nodes = Vec::with_capacity(config.nodes.len());
+    for realm_node in &config.nodes {
+        let Ok(node_id) = NodeId::from_str(&realm_node.node_id) else {
+            continue;
+        };
+        let entry = config.placement_entry(node_id);
+        let location = entry
+            .map(|entry| entry.effective_location().to_string())
+            .unwrap_or_else(|| DEFAULT_LOCATION.to_string());
+        let weight = entry
+            .map(|entry| entry.weight)
+            .unwrap_or(DEFAULT_NODE_WEIGHT);
+        let full = entry.is_some_and(|entry| entry.full);
+        let draining = entry.is_some_and(|entry| entry.draining);
+
+        let mut labels = node_infos
+            .iter()
+            .find(|info| info.node_id == node_id)
+            .map(|info| info.labels.clone())
+            .unwrap_or_default();
+        if let Some(entry) = entry {
+            for (key, value) in &entry.label_overrides {
+                labels.insert(key.clone(), value.clone());
+            }
+        }
+        labels.insert(
+            KIND_LABEL_KEY.to_string(),
+            kind_label(&realm_node.kind).to_string(),
+        );
+
+        nodes.push(ResolvedNode {
+            node_id,
+            kind: realm_node.kind.clone(),
+            location,
+            weight,
+            full,
+            draining,
+            labels,
+        });
+    }
+    PlacementView { nodes }
+}
+
+/// Resolves holders for `subject` in rank order (downstream retry order).
+///
+/// Pinned nodes lead (bypassing every check but kind eligibility), then the
+/// weighted two-level walk fills up to `strategy.replica_count` from the
+/// eligible nodes; `None` takes every eligible node.
+pub fn resolve_holders(
+    view: &PlacementView,
+    strategy: &PlacementStrategy,
+    subject: &[u8],
+    epoch: u64,
+    override_: Option<&PlacementOverride>,
+) -> Vec<NodeId> {
+    let target = strategy.replica_count.map(|count| count as usize);
+    let reached = |holders: &[NodeId]| target.is_some_and(|target| holders.len() >= target);
+
+    let excluded: HashSet<NodeId> = override_
+        .map(|over| over.excluded.iter().copied().collect())
+        .unwrap_or_default();
+
+    let mut result: Vec<NodeId> = Vec::new();
+    let mut used_nodes: HashSet<NodeId> = HashSet::new();
+    let mut seen_locations: HashSet<String> = HashSet::new();
+
+    if let Some(over) = override_ {
+        for pin in &over.pinned {
+            if reached(&result) {
+                return result;
+            }
+            if used_nodes.contains(pin) {
+                continue;
+            }
+            let Some(node) = view.nodes.iter().find(|node| node.node_id == *pin) else {
+                continue;
+            };
+            if !node.kind.is_sync_eligible() {
+                continue;
+            }
+            result.push(*pin);
+            used_nodes.insert(*pin);
+            seen_locations.insert(node.location.clone());
+        }
+    }
+
+    let ranked = ranked_locations(view, subject, epoch);
+    'outer: for location in &ranked {
+        if reached(&result) {
+            break;
+        }
+        if location.w_loc == 0 {
+            continue;
+        }
+        if strategy.distinct_locations && seen_locations.contains(location.name) {
+            continue;
+        }
+        for node_index in ranked_nodes(view, &location.members, strategy, subject, epoch) {
+            let node = &view.nodes[node_index];
+            if used_nodes.contains(&node.node_id) {
+                continue;
+            }
+            if !is_eligible(node, strategy, &excluded) {
+                continue;
+            }
+            result.push(node.node_id);
+            used_nodes.insert(node.node_id);
+            seen_locations.insert(node.location.clone());
+            if reached(&result) {
+                break 'outer;
+            }
+            if strategy.distinct_locations {
+                continue 'outer;
+            }
+        }
+    }
+    result
+}
+
+/// Resolves the placement strategy and any subject override for `target`.
+///
+/// Precedence: override strategy id > longest matching metadata path prefix >
+/// group binding > class binding > realm binding > `default_strategy_id`,
+/// falling back to the first configured strategy. Returns `None` only when the
+/// realm has no strategies at all (config is seeded with defaults at creation).
+pub fn strategy_for_target<'a>(
+    config: &'a RealmConfigDocument,
+    target: &DocumentSyncTarget,
+    metadata_path: Option<&str>,
+) -> Option<(&'a PlacementStrategy, Option<&'a PlacementOverride>)> {
+    let subject = subject_bytes(target);
+    let override_ = config
+        .placement_overrides
+        .iter()
+        .find(|over| over.subject == subject);
+
+    let strategy = resolve_strategy(config, target, metadata_path, override_)
+        .or_else(|| config.strategies.first())?;
+    Some((strategy, override_))
+}
+
+/// Coarse document class used for class-scoped strategy bindings.
+pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
+    match target {
+        DocumentSyncTarget::Group { .. } | DocumentSyncTarget::GroupAuthorization { .. } => {
+            DocumentClass::Group
+        }
+        DocumentSyncTarget::User { .. } => DocumentClass::User,
+        DocumentSyncTarget::MetadataRegistry { .. } => DocumentClass::MetadataRegistry,
+        DocumentSyncTarget::MetadataCreateEvent { .. }
+        | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+        | DocumentSyncTarget::MetadataGraphLifecycle { .. } => DocumentClass::Metadata,
+        _ => DocumentClass::Admin,
+    }
+}
+
+/// Canonical grouping subject: all per-document metadata variants of one
+/// document collapse to its document id; realm-shared targets fall back to
+/// their storage key.
+pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
+    match target {
+        DocumentSyncTarget::Group { group_id }
+        | DocumentSyncTarget::GroupAuthorization { group_id } => group_id.to_bytes().to_vec(),
+        DocumentSyncTarget::User { user_id } => user_id.to_bytes(),
+        DocumentSyncTarget::MetadataRegistry { document_id, .. }
+        | DocumentSyncTarget::MetadataCreateEvent { document_id, .. }
+        | DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+            document_id.to_bytes().to_vec()
+        }
+        DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),
+        _ => target.storage_key().as_ref().to_vec(),
+    }
+}
+
+struct RankedLocation<'a> {
+    name: &'a str,
+    w_loc: u64,
+    members: Vec<usize>,
+}
+
+fn ranked_locations<'a>(
+    view: &'a PlacementView,
+    subject: &[u8],
+    epoch: u64,
+) -> Vec<RankedLocation<'a>> {
+    let mut groups: BTreeMap<&'a str, (u64, Vec<usize>)> = BTreeMap::new();
+    for (index, node) in view.nodes.iter().enumerate() {
+        let slot = groups
+            .entry(node.location.as_str())
+            .or_insert((0, Vec::new()));
+        // W_loc sums configured weights only; full/draining are excluded so a
+        // status flip never reshuffles location order (load-bearing invariant).
+        slot.0 = slot.0.saturating_add(u64::from(node.weight));
+        slot.1.push(index);
+    }
+
+    let locations: Vec<RankedLocation<'a>> = groups
+        .into_iter()
+        .map(|(name, (w_loc, members))| RankedLocation {
+            name,
+            w_loc,
+            members,
+        })
+        .collect();
+    let candidates: Vec<(&[u8], u64)> = locations
+        .iter()
+        .map(|location| (location.name.as_bytes(), location.w_loc))
+        .collect();
+    let order = rank_weighted(ROLE_LOCATION, epoch, subject, &candidates);
+
+    let mut slots: Vec<Option<RankedLocation<'a>>> = locations.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|position| slots[position].take().expect("rank is a permutation"))
+        .collect()
+}
+
+fn ranked_nodes(
+    view: &PlacementView,
+    members: &[usize],
+    strategy: &PlacementStrategy,
+    subject: &[u8],
+    epoch: u64,
+) -> Vec<usize> {
+    let candidates: Vec<([u8; 32], u64)> = members
+        .iter()
+        .map(|&index| {
+            let node = &view.nodes[index];
+            (*node.node_id.as_bytes(), effective_weight(node, strategy))
+        })
+        .collect();
+    rank_weighted(ROLE_NODE, epoch, subject, &candidates)
+        .into_iter()
+        .map(|position| members[position])
+        .collect()
+}
+
+fn is_eligible(
+    node: &ResolvedNode,
+    strategy: &PlacementStrategy,
+    excluded: &HashSet<NodeId>,
+) -> bool {
+    node.kind.is_sync_eligible()
+        && !node.full
+        && !node.draining
+        && !excluded.contains(&node.node_id)
+        && passes_filters(node, strategy)
+        && effective_weight(node, strategy) > 0
+}
+
+fn passes_filters(node: &ResolvedNode, strategy: &PlacementStrategy) -> bool {
+    strategy.affinity.iter().all(|rule| match rule.effect {
+        AffinityEffect::Filter => label_matches(&node.labels, &rule.matcher),
+        AffinityEffect::Multiply { .. } => true,
+    })
+}
+
+fn effective_weight(node: &ResolvedNode, strategy: &PlacementStrategy) -> u64 {
+    let mut weight = u64::from(node.weight);
+    for rule in &strategy.affinity {
+        if let AffinityEffect::Multiply { permille } = rule.effect
+            && label_matches(&node.labels, &rule.matcher)
+        {
+            weight = weight.saturating_mul(u64::from(permille)) / 1000;
+        }
+    }
+    weight
+}
+
+fn label_matches(labels: &BTreeMap<String, String>, matcher: &LabelMatch) -> bool {
+    labels
+        .get(&matcher.key)
+        .is_some_and(|value| value == &matcher.value)
+}
+
+fn kind_label(kind: &RealmNodeKind) -> &'static str {
+    match kind {
+        RealmNodeKind::Management => "management",
+        RealmNodeKind::Server => "server",
+        RealmNodeKind::Local => "local",
+        RealmNodeKind::User => "user",
+    }
+}
+
+fn group_id_of(target: &DocumentSyncTarget) -> Option<GroupId> {
+    match target {
+        DocumentSyncTarget::Group { group_id }
+        | DocumentSyncTarget::GroupAuthorization { group_id }
+        | DocumentSyncTarget::MetadataRegistry { group_id, .. } => Some(*group_id),
+        _ => None,
+    }
+}
+
+fn resolve_strategy<'a>(
+    config: &'a RealmConfigDocument,
+    target: &DocumentSyncTarget,
+    metadata_path: Option<&str>,
+    override_: Option<&PlacementOverride>,
+) -> Option<&'a PlacementStrategy> {
+    if let Some(id) = override_.and_then(|over| over.strategy_id)
+        && let Some(strategy) = config.strategy(&id)
+    {
+        return Some(strategy);
+    }
+
+    let class = document_class(target);
+    if matches!(
+        class,
+        DocumentClass::Metadata | DocumentClass::MetadataRegistry
+    ) && let Some(path) = metadata_path
+    {
+        let best = config
+            .strategy_bindings
+            .iter()
+            .filter_map(|binding| match &binding.scope {
+                BindingScope::MetadataPathPrefix(prefix) if path.starts_with(prefix.as_str()) => {
+                    Some((prefix.len(), binding))
+                }
+                _ => None,
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, binding)| binding);
+        if let Some(binding) = best
+            && let Some(strategy) = config.strategy(&binding.strategy_id)
+        {
+            return Some(strategy);
+        }
+    }
+
+    if let Some(group_id) = group_id_of(target)
+        && let Some(strategy) = binding_strategy(config, &BindingScope::Group(group_id))
+    {
+        return Some(strategy);
+    }
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class)) {
+        return Some(strategy);
+    }
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Realm) {
+        return Some(strategy);
+    }
+    if let Some(id) = config.default_strategy_id
+        && let Some(strategy) = config.strategy(&id)
+    {
+        return Some(strategy);
+    }
+    None
+}
+
+fn binding_strategy<'a>(
+    config: &'a RealmConfigDocument,
+    scope: &BindingScope,
+) -> Option<&'a PlacementStrategy> {
+    config
+        .strategy_bindings
+        .iter()
+        .find(|binding| &binding.scope == scope)
+        .and_then(|binding| config.strategy(&binding.strategy_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{
+        AffinityRule, NodePlacementEntry, NodeUrls, NodeUtilization, RealmId, RealmNode,
+        StrategyBinding,
+    };
+    use proptest::prelude::*;
+    use ulid::Ulid;
+
+    fn node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn resolved(seed: u8, kind: RealmNodeKind, location: &str, weight: u32) -> ResolvedNode {
+        ResolvedNode {
+            node_id: node_id(seed),
+            kind,
+            location: location.to_string(),
+            weight,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn strategy(replica_count: Option<u32>, distinct_locations: bool) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: Ulid::from_bytes([1u8; 16]),
+            name: "test".to_string(),
+            replica_count,
+            distinct_locations,
+            affinity: Vec::new(),
+        }
+    }
+
+    fn location_of<'a>(view: &'a PlacementView, node: &NodeId) -> &'a str {
+        view.nodes
+            .iter()
+            .find(|candidate| candidate.node_id == *node)
+            .map(|candidate| candidate.location.as_str())
+            .unwrap()
+    }
+
+    fn filter_rule(key: &str, value: &str) -> AffinityRule {
+        AffinityRule {
+            matcher: LabelMatch {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+            effect: AffinityEffect::Filter,
+        }
+    }
+
+    fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
+        AffinityRule {
+            matcher: LabelMatch {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+            effect: AffinityEffect::Multiply { permille },
+        }
+    }
+
+    fn sid(seed: u8) -> Ulid {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn strat(seed: u8) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: sid(seed),
+            name: format!("s{seed}"),
+            replica_count: Some(3),
+            distinct_locations: true,
+            affinity: Vec::new(),
+        }
+    }
+
+    fn binding(scope: BindingScope, seed: u8) -> StrategyBinding {
+        StrategyBinding {
+            scope,
+            strategy_id: sid(seed),
+        }
+    }
+
+    #[test]
+    fn build_view_applies_defaults_labels_and_skips_unparseable() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mapped = node_id(1);
+        let unmapped = node_id(2);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(mapped, RealmNodeKind::Server);
+        config.ensure_node(unmapped, RealmNodeKind::Local);
+        config.nodes.push(RealmNode {
+            node_id: "not-a-valid-key".to_string(),
+            kind: RealmNodeKind::Server,
+        });
+        config.placement_map.push(NodePlacementEntry {
+            node_id: mapped,
+            location: "eu".to_string(),
+            weight: 250,
+            full: true,
+            draining: false,
+            label_overrides: BTreeMap::from([
+                ("tier".to_string(), "hot".to_string()),
+                (KIND_LABEL_KEY.to_string(), "override-bogus".to_string()),
+            ]),
+        });
+        let node_infos = vec![NodeInfoDocument {
+            node_id: mapped,
+            labels: BTreeMap::from([
+                ("tier".to_string(), "cold".to_string()),
+                ("region".to_string(), "west".to_string()),
+                (KIND_LABEL_KEY.to_string(), "ni-bogus".to_string()),
+            ]),
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 0,
+                documents_held: 0,
+                load_permille: 0,
+                heartbeat_at_ms: 0,
+            },
+            updated_at_ms: 0,
+        }];
+
+        let view = build_view(&config, &node_infos);
+        assert_eq!(view.nodes.len(), 2);
+
+        let a = view.nodes.iter().find(|n| n.node_id == mapped).unwrap();
+        assert_eq!(a.location, "eu");
+        assert_eq!(a.weight, 250);
+        assert!(a.full);
+        assert!(!a.draining);
+        // node_info < label_overrides < derived kind label.
+        assert_eq!(a.labels.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(a.labels.get("region"), Some(&"west".to_string()));
+        assert_eq!(a.labels.get(KIND_LABEL_KEY), Some(&"server".to_string()));
+
+        let b = view.nodes.iter().find(|n| n.node_id == unmapped).unwrap();
+        assert_eq!(b.location, DEFAULT_LOCATION);
+        assert_eq!(b.weight, DEFAULT_NODE_WEIGHT);
+        assert!(!b.full);
+        assert!(!b.draining);
+        assert_eq!(b.labels.get(KIND_LABEL_KEY), Some(&"local".to_string()));
+    }
+
+    #[test]
+    fn resolve_is_deterministic_and_order_independent() {
+        let nodes = vec![
+            resolved(1, RealmNodeKind::Server, "a", 100),
+            resolved(2, RealmNodeKind::Server, "a", 300),
+            resolved(3, RealmNodeKind::Server, "b", 200),
+            resolved(4, RealmNodeKind::Server, "c", 50),
+            resolved(5, RealmNodeKind::Server, "c", 400),
+        ];
+        let view = PlacementView {
+            nodes: nodes.clone(),
+        };
+        let strategy = strategy(Some(3), true);
+
+        let first = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let second = resolve_holders(&view, &strategy, b"subject", 0, None);
+        assert_eq!(first, second);
+
+        let mut reversed = nodes;
+        reversed.reverse();
+        let reversed_view = PlacementView { nodes: reversed };
+        let third = resolve_holders(&reversed_view, &strategy, b"subject", 0, None);
+        assert_eq!(first, third);
+    }
+
+    #[test]
+    fn distinct_locations_yields_pairwise_distinct_holders() {
+        let mut nodes = Vec::new();
+        let mut seed = 1u8;
+        for location in ["a", "b", "c"] {
+            for _ in 0..2 {
+                nodes.push(resolved(seed, RealmNodeKind::Server, location, 100));
+                seed += 1;
+            }
+        }
+        let view = PlacementView { nodes };
+        let strategy = strategy(Some(3), true);
+
+        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        assert_eq!(holders.len(), 3);
+        let locations: HashSet<&str> = holders
+            .iter()
+            .map(|node| location_of(&view, node))
+            .collect();
+        assert_eq!(locations.len(), 3);
+    }
+
+    #[test]
+    fn rejection_stability_replaces_only_full_node() {
+        let nodes: Vec<ResolvedNode> = (1..=5)
+            .map(|seed| resolved(seed, RealmNodeKind::Server, "solo", 100))
+            .collect();
+        let view = PlacementView {
+            nodes: nodes.clone(),
+        };
+
+        let full_order = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        assert_eq!(full_order.len(), 5);
+
+        let baseline = resolve_holders(&view, &strategy(Some(3), false), b"subject", 0, None);
+        assert_eq!(baseline, full_order[..3].to_vec());
+
+        let mut mutated = nodes;
+        for node in mutated.iter_mut() {
+            if node.node_id == full_order[0] {
+                node.full = true;
+            }
+        }
+        let mutated_view = PlacementView { nodes: mutated };
+        let after = resolve_holders(
+            &mutated_view,
+            &strategy(Some(3), false),
+            b"subject",
+            0,
+            None,
+        );
+        // Only the rejected node changes: the next candidate slots in, order held.
+        assert_eq!(after, full_order[1..4].to_vec());
+    }
+
+    #[test]
+    fn zero_weight_and_user_kind_never_selected() {
+        let nodes = vec![
+            resolved(1, RealmNodeKind::Server, "x", 0),
+            resolved(2, RealmNodeKind::User, "x", 100),
+            resolved(3, RealmNodeKind::Server, "x", 100),
+        ];
+        let view = PlacementView { nodes };
+        let holders = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        assert_eq!(holders, vec![node_id(3)]);
+    }
+
+    #[test]
+    fn multiply_permille_zero_makes_node_ineligible() {
+        let mut zeroed = resolved(1, RealmNodeKind::Server, "x", 100);
+        zeroed.labels.insert("tier".to_string(), "cold".to_string());
+        let keep = resolved(2, RealmNodeKind::Server, "x", 100);
+        let view = PlacementView {
+            nodes: vec![zeroed, keep],
+        };
+        let mut strategy = strategy(None, false);
+        strategy.affinity = vec![multiply_rule("tier", "cold", 0)];
+
+        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        assert_eq!(holders, vec![node_id(2)]);
+    }
+
+    #[test]
+    fn filter_rules_are_conjunctive() {
+        let mut both = resolved(1, RealmNodeKind::Server, "x", 100);
+        both.labels.insert("tier".to_string(), "hot".to_string());
+        both.labels.insert("region".to_string(), "eu".to_string());
+        let mut wrong_region = resolved(2, RealmNodeKind::Server, "x", 100);
+        wrong_region
+            .labels
+            .insert("tier".to_string(), "hot".to_string());
+        wrong_region
+            .labels
+            .insert("region".to_string(), "us".to_string());
+        let mut wrong_tier = resolved(3, RealmNodeKind::Server, "x", 100);
+        wrong_tier
+            .labels
+            .insert("tier".to_string(), "cold".to_string());
+        wrong_tier
+            .labels
+            .insert("region".to_string(), "eu".to_string());
+        let view = PlacementView {
+            nodes: vec![both, wrong_region, wrong_tier],
+        };
+        let mut strategy = strategy(None, false);
+        strategy.affinity = vec![filter_rule("tier", "hot"), filter_rule("region", "eu")];
+
+        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        assert_eq!(holders, vec![node_id(1)]);
+    }
+
+    #[test]
+    fn pinned_first_excluded_skipped_and_counts_toward_target() {
+        let mut pinned_full = resolved(3, RealmNodeKind::Server, "c", 100);
+        pinned_full.full = true;
+        pinned_full.draining = true;
+        let view = PlacementView {
+            nodes: vec![
+                resolved(1, RealmNodeKind::Server, "a", 100),
+                resolved(2, RealmNodeKind::Server, "b", 100),
+                pinned_full,
+            ],
+        };
+        let override_ = PlacementOverride {
+            subject: Vec::new(),
+            pinned: vec![node_id(3)],
+            excluded: vec![node_id(2)],
+            strategy_id: None,
+        };
+
+        let holders = resolve_holders(
+            &view,
+            &strategy(Some(2), true),
+            b"subject",
+            0,
+            Some(&override_),
+        );
+        // Pinned bypasses full/draining and leads; excluded never appears; the
+        // pin counts toward the replica target of two.
+        assert_eq!(holders[0], node_id(3));
+        assert!(!holders.contains(&node_id(2)));
+        assert_eq!(holders, vec![node_id(3), node_id(1)]);
+    }
+
+    #[test]
+    fn everywhere_strategy_returns_all_eligible() {
+        let mut full = resolved(4, RealmNodeKind::Server, "b", 100);
+        full.full = true;
+        let view = PlacementView {
+            nodes: vec![
+                resolved(1, RealmNodeKind::Server, "a", 100),
+                resolved(2, RealmNodeKind::User, "a", 100),
+                resolved(3, RealmNodeKind::Server, "b", 100),
+                full,
+                resolved(5, RealmNodeKind::Server, "c", 100),
+            ],
+        };
+
+        let holders = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        let selected: HashSet<NodeId> = holders.iter().copied().collect();
+        assert_eq!(holders.len(), 3);
+        assert_eq!(
+            selected,
+            HashSet::from([node_id(1), node_id(3), node_id(5)])
+        );
+    }
+
+    #[test]
+    fn strategy_for_target_precedence() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = sid(2);
+        let document_id = sid(3);
+        let target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        };
+        let path = Some("/datasets/important/x");
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for seed in [10u8, 11, 12, 13, 14, 15, 16] {
+            config.strategies.push(strat(seed));
+        }
+        config.default_strategy_id = Some(sid(16));
+        config.strategy_bindings = vec![
+            binding(
+                BindingScope::MetadataPathPrefix("/datasets/important".to_string()),
+                11,
+            ),
+            binding(
+                BindingScope::MetadataPathPrefix("/datasets".to_string()),
+                12,
+            ),
+            binding(BindingScope::Group(group_id), 13),
+            binding(BindingScope::Class(DocumentClass::MetadataRegistry), 14),
+            binding(BindingScope::Realm, 15),
+        ];
+        config.placement_overrides = vec![PlacementOverride {
+            subject: subject_bytes(&target),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(sid(10)),
+        }];
+
+        let winner = |config: &RealmConfigDocument| {
+            strategy_for_target(config, &target, path)
+                .unwrap()
+                .0
+                .strategy_id
+        };
+
+        assert_eq!(winner(&config), sid(10)); // override
+        config.placement_overrides.clear();
+        assert_eq!(winner(&config), sid(11)); // longest path prefix
+        config
+            .strategy_bindings
+            .retain(|b| !matches!(&b.scope, BindingScope::MetadataPathPrefix(p) if p == "/datasets/important"));
+        assert_eq!(winner(&config), sid(12)); // shorter path prefix
+        config
+            .strategy_bindings
+            .retain(|b| !matches!(&b.scope, BindingScope::MetadataPathPrefix(_)));
+        assert_eq!(winner(&config), sid(13)); // group
+        config
+            .strategy_bindings
+            .retain(|b| !matches!(&b.scope, BindingScope::Group(_)));
+        assert_eq!(winner(&config), sid(14)); // class
+        config
+            .strategy_bindings
+            .retain(|b| !matches!(&b.scope, BindingScope::Class(_)));
+        assert_eq!(winner(&config), sid(15)); // realm
+        config.strategy_bindings.clear();
+        assert_eq!(winner(&config), sid(16)); // default
+        config.default_strategy_id = None;
+        assert_eq!(winner(&config), sid(10)); // first strategy fallback
+    }
+
+    #[test]
+    fn subject_bytes_groups_document_variants() {
+        let document_id = sid(4);
+        let registry = DocumentSyncTarget::MetadataRegistry {
+            group_id: sid(5),
+            document_id,
+        };
+        let create = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: sid(6),
+        };
+        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+
+        let expected = document_id.to_bytes().to_vec();
+        assert_eq!(subject_bytes(&registry), expected);
+        assert_eq!(subject_bytes(&create), expected);
+        assert_eq!(subject_bytes(&lifecycle), expected);
+
+        let other = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: sid(7),
+        };
+        assert_ne!(subject_bytes(&other), expected);
+    }
+
+    #[test]
+    fn document_class_maps_variants() {
+        assert_eq!(
+            document_class(&DocumentSyncTarget::Group { group_id: sid(1) }),
+            DocumentClass::Group
+        );
+        assert_eq!(
+            document_class(&DocumentSyncTarget::GroupAuthorization { group_id: sid(1) }),
+            DocumentClass::Group
+        );
+        assert_eq!(
+            document_class(&DocumentSyncTarget::MetadataRegistry {
+                group_id: sid(1),
+                document_id: sid(2),
+            }),
+            DocumentClass::MetadataRegistry
+        );
+        assert_eq!(
+            document_class(&DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: sid(2)
+            }),
+            DocumentClass::Metadata
+        );
+        assert_eq!(
+            document_class(&DocumentSyncTarget::RealmConfig {
+                realm_id: RealmId::from_bytes([1u8; 32]),
+            }),
+            DocumentClass::Admin
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn location_order_ignores_status_flips(
+            specs in prop::collection::vec((0u8..6, 1u32..1000, any::<bool>(), any::<bool>()), 1..12),
+        ) {
+            let build = |flip: bool| {
+                let nodes = specs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(location, weight, full, draining))| ResolvedNode {
+                        node_id: node_id((index as u8) + 1),
+                        kind: RealmNodeKind::Server,
+                        location: format!("loc{location}"),
+                        weight,
+                        full: full ^ flip,
+                        draining: draining ^ flip,
+                        labels: BTreeMap::new(),
+                    })
+                    .collect();
+                PlacementView { nodes }
+            };
+
+            let baseline: Vec<String> = ranked_locations(&build(false), b"subject", 0)
+                .iter()
+                .map(|location| location.name.to_string())
+                .collect();
+            let flipped: Vec<String> = ranked_locations(&build(true), b"subject", 0)
+                .iter()
+                .map(|location| location.name.to_string())
+                .collect();
+            prop_assert_eq!(baseline, flipped);
+        }
+    }
+}
