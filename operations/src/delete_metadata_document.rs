@@ -166,6 +166,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
+            false,
         ))
     }
 
@@ -210,6 +211,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
+            false,
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -243,6 +245,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Delete { change },
+            false,
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))

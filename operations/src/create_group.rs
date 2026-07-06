@@ -229,6 +229,7 @@ impl CreateGroupOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
+                true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
@@ -712,6 +713,9 @@ mod test {
                     group_id: group.group_id,
                 })
         }));
+        // create_group originates the group authorization document, so every
+        // outbox record it writes is allowed to mint the topic genesis.
+        assert!(outbox_records.iter().all(|record| record.allow_genesis));
         let events = outbox_records
             .iter()
             .map(|record| match &record.event {
