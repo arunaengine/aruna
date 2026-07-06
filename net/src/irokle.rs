@@ -4277,6 +4277,7 @@ mod tests {
                 updated_at_ms: 1_727_000_000_101,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         }
     }
 
@@ -8717,6 +8718,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
 
         let snapshot = NodeUsageSnapshot {

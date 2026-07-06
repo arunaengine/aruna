@@ -16,7 +16,7 @@ use crate::storage_entries::{
     metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
 };
 use crate::structs::{
-    RealmId, node_info_storage_key, node_usage_global_key, node_usage_group_key,
+    PlacementRef, RealmId, node_info_storage_key, node_usage_global_key, node_usage_group_key,
     watch_interest_node_key,
 };
 use crate::types::{GroupId, Key, UserId};
@@ -76,6 +76,7 @@ pub struct PendingDocumentPlacement {
     pub selected_peers: Vec<NodeId>,
     pub updated_at: u64,
     pub authoritative_node_id: NodeId,
+    pub placement: PlacementRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +128,7 @@ pub struct DocumentSyncChange {
     pub base: Option<DocumentSyncRevision>,
     pub current: DocumentSyncRevision,
     pub kind: DocumentSyncChangeKind,
+    pub placement: PlacementRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +523,7 @@ mod tests {
             base,
             current: revision(generation, event_seed, actor_seed),
             kind,
+            placement: crate::structs::PlacementRef::NIL,
         }
     }
 

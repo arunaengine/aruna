@@ -10,7 +10,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
-use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::{
+    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, PlacementRef,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use aruna_core::util::unix_timestamp_millis;
@@ -207,6 +209,7 @@ impl DeleteMetadataDocumentOperation {
                 updated_at_ms: lifecycle_record.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
         let outbox = new_outbox_record_with_id(
             outbox_id,

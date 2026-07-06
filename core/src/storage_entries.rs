@@ -27,7 +27,7 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, User,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
     WatchForwardOutboxRecord, WatchSubscription, notification_inbox_key, notification_outbox_key,
     notification_prune_index_key, watch_forward_outbox_key, watch_subscription_key,
 };
@@ -317,6 +317,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.occurred_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         },
         MetadataDocumentLifecycleRecord::Delete { event } => DocumentSyncChange {
             base: None,
@@ -327,6 +328,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.tombstone.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Delete,
+            placement: PlacementRef::NIL,
         },
     }
 }
@@ -610,7 +612,7 @@ mod tests {
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
     };
-    use crate::structs::RealmId;
+    use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
     fn node(seed: u8) -> NodeId {
@@ -746,6 +748,7 @@ mod tests {
             base: Some(base),
             current: revision(2, 2),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
 
         let (keyspace, key, value) = document_sync_revision_write_entry(&target, &change).unwrap();
@@ -765,11 +768,13 @@ mod tests {
             base: None,
             current: revision(1, 1),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
         let incoming_change = DocumentSyncChange {
             base: None,
             current: revision(2, 2),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
         let conflict = DocumentSyncConflict {
             target: target.clone(),

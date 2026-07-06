@@ -15,7 +15,7 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, document_sync_revision_key,
     document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, AuthContext, Permission, RealmId, User};
+use aruna_core::structs::{Actor, AuthContext, Permission, PlacementRef, RealmId, User};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
 use aruna_core::user_update_validation::{
@@ -602,6 +602,7 @@ fn local_user_document_sync_change(
             updated_at_ms,
         },
         kind: DocumentSyncChangeKind::Upsert,
+        placement: PlacementRef::NIL,
     }
 }
 
@@ -694,7 +695,7 @@ mod tests {
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
         document_sync_revision_key,
     };
-    use aruna_core::structs::{Actor, AuthContext, RealmId, User};
+    use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{TxnId, UserId};
     use aruna_core::{
@@ -962,6 +963,7 @@ mod tests {
             base: None,
             current: document_revision(21, 42),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
 
         operation.start();

@@ -497,6 +497,7 @@ async fn install_realm_config(
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    config.seed_default_placement();
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
@@ -593,6 +594,7 @@ fn document_change_for_publish(
                     updated_at_ms: record.occurred_at_ms,
                 },
                 kind: DocumentSyncChangeKind::Upsert,
+                placement: aruna_core::structs::PlacementRef::NIL,
             })
         }
         _ => Err("unsupported test publish target".into()),

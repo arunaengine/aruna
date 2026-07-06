@@ -1808,6 +1808,7 @@ mod tests {
             authoritative_node_id,
             3,
             vec![selected_peer],
+            aruna_core::structs::PlacementRef::NIL,
         );
         let value = postcard::to_allocvec(&placement).unwrap();
         let key = aruna_operations::sync_placement::placement_key(realm_id, &target);

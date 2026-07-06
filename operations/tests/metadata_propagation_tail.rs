@@ -559,6 +559,7 @@ async fn spawn_node_with(
 
 async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    config.seed_default_placement();
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
