@@ -8,6 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
+use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_operations::auth::{
@@ -64,6 +65,8 @@ pub struct ServerState {
     oidc_validator: Option<Arc<OidcValidator>>,
     interface_state: Arc<RwLock<InterfaceRuntimeState>>,
     portal: Arc<RwLock<PortalRuntimeState>>,
+    // Per-node Prometheus registry shared with the S3 server and ops listener.
+    metrics: Arc<NodeMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -163,6 +166,7 @@ impl ServerState {
             initial_admin_claim,
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
+            metrics: Arc::new(NodeMetrics::new()),
         };
         state.persist_trusted_realms().await;
         state
@@ -170,6 +174,10 @@ impl ServerState {
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
+    }
+
+    pub fn metrics(&self) -> Arc<NodeMetrics> {
+        self.metrics.clone()
     }
     pub fn get_pubkey(&self) -> [u8; 113] {
         match self.node_capabilities {
