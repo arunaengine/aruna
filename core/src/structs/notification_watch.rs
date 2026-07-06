@@ -1,8 +1,12 @@
+use std::collections::{BTreeMap, HashMap};
+
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::errors::ConversionError;
+use crate::structs::RealmId;
 use crate::types::{Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
@@ -79,6 +83,12 @@ impl WatchEventMask {
         self.0 == 0
     }
 
+    /// Bitwise union of two masks; used to merge subscriptions that share a
+    /// path prefix into a single interest entry.
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     pub fn kinds(self) -> Vec<WatchEventKind> {
         let mut kinds = Vec::new();
         if self.contains(WatchEventKind::MetadataCreated) {
@@ -148,6 +158,195 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
     let owner = UserId::from_storage_key(&key[..48])?;
     let watch_id = Ulid::from_bytes(key[48..64].try_into()?);
     Ok((owner, watch_id))
+}
+
+/// Keys in the watch-interest keyspace. Per-node digests use fixed-length keys
+/// so their prefixes are unambiguous: `n/` + realm id + node id (realm first so
+/// all nodes' digests for one realm form a single scan range). Local-only dirty
+/// markers use a text prefix (`dirty/`) that never collides with the binary
+/// digest prefix.
+pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
+pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
+
+/// One coalesced interest entry: the union of every subscription a node holds
+/// for a realm that shares this path prefix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchInterestEntry {
+    pub path_prefix: String,
+    pub event_mask: WatchEventMask,
+}
+
+/// A single node's realm-wide watch interest distributed over the sync layer.
+/// Single writer per key (each node writes only its own digest per realm), so
+/// ingest is last-write-wins. The owning realm is carried by the storage key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchInterestDigest {
+    pub node_id: NodeId,
+    pub entries: Vec<WatchInterestEntry>,
+}
+
+impl WatchInterestDigest {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Builds a deterministic digest from a node's subscriptions: identical
+    /// prefixes are deduped by OR-ing their masks, and entries are sorted by
+    /// prefix so the encoded bytes are stable regardless of scan order.
+    pub fn from_subscriptions(
+        node_id: NodeId,
+        subscriptions: impl IntoIterator<Item = (String, WatchEventMask)>,
+    ) -> Self {
+        let mut merged: BTreeMap<String, WatchEventMask> = BTreeMap::new();
+        for (path_prefix, mask) in subscriptions {
+            let slot = merged
+                .entry(path_prefix)
+                .or_insert_with(WatchEventMask::empty);
+            *slot = slot.union(mask);
+        }
+        let entries = merged
+            .into_iter()
+            .map(|(path_prefix, event_mask)| WatchInterestEntry {
+                path_prefix,
+                event_mask,
+            })
+            .collect();
+        Self { node_id, entries }
+    }
+}
+
+pub fn watch_interest_node_key(realm_id: RealmId, node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 64);
+    key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+/// Scan prefix over every node's digest, ordered by realm.
+pub fn watch_interest_node_prefix() -> Vec<u8> {
+    WATCH_INTEREST_NODE_PREFIX.to_vec()
+}
+
+/// Scan prefix over one realm's digests (all nodes, contiguous range).
+pub fn watch_interest_realm_prefix(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_NODE_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_NODE_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+/// Recovers the realm id from a `n/<realm><node>` digest key.
+pub fn watch_interest_key_realm_id(key: &[u8]) -> Option<RealmId> {
+    let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
+    let bytes: [u8; 32] = tail.get(..32)?.try_into().ok()?;
+    Some(RealmId::from_bytes(bytes))
+}
+
+/// Recovers the node id from a `n/<realm><node>` digest key.
+pub fn watch_interest_key_node_id(key: &[u8]) -> Option<NodeId> {
+    let tail = key.strip_prefix(WATCH_INTEREST_NODE_PREFIX)?;
+    let bytes: [u8; 32] = tail.get(32..64)?.try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
+}
+
+pub fn watch_interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_DIRTY_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_DIRTY_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+/// Recovers the realm id from a `dirty/<realm>` marker key.
+pub fn watch_interest_dirty_realm_id(key: &[u8]) -> Option<RealmId> {
+    let tail = key.strip_prefix(WATCH_INTEREST_DIRTY_PREFIX)?;
+    let bytes: [u8; 32] = tail.try_into().ok()?;
+    Some(RealmId::from_bytes(bytes))
+}
+
+/// In-memory realm -> node -> interest entries cache rebuilt from the replicated
+/// digests. Consumed by origin nodes to match events against realm-wide watch
+/// interest without a per-event storage read. Only nodes with live watches are
+/// retained, so an empty node map means no held interest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchInterestTable {
+    realms: HashMap<RealmId, HashMap<NodeId, Vec<WatchInterestEntry>>>,
+}
+
+impl WatchInterestTable {
+    pub fn is_empty(&self) -> bool {
+        self.realms.is_empty()
+    }
+
+    /// Records a node's interest entries for a realm. An empty entry set drops
+    /// the node (and the realm once its last node is gone) so the table only
+    /// ever holds nodes with live watches.
+    pub fn insert(&mut self, realm_id: RealmId, node_id: NodeId, entries: Vec<WatchInterestEntry>) {
+        if entries.is_empty() {
+            if let Some(nodes) = self.realms.get_mut(&realm_id) {
+                nodes.remove(&node_id);
+                if nodes.is_empty() {
+                    self.realms.remove(&realm_id);
+                }
+            }
+            return;
+        }
+        self.realms
+            .entry(realm_id)
+            .or_default()
+            .insert(node_id, entries);
+    }
+
+    /// Replaces the entire node map for a realm, dropping empty digests and the
+    /// realm entry itself when nothing remains.
+    pub fn set_realm(
+        &mut self,
+        realm_id: RealmId,
+        nodes: HashMap<NodeId, Vec<WatchInterestEntry>>,
+    ) {
+        let nodes: HashMap<NodeId, Vec<WatchInterestEntry>> = nodes
+            .into_iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+        if nodes.is_empty() {
+            self.realms.remove(&realm_id);
+        } else {
+            self.realms.insert(realm_id, nodes);
+        }
+    }
+
+    pub fn nodes(&self, realm_id: RealmId) -> Option<&HashMap<NodeId, Vec<WatchInterestEntry>>> {
+        self.realms.get(&realm_id)
+    }
+
+    /// Holder nodes in `realm_id` whose interest covers `path` for `kind`: an
+    /// entry matches when its mask selects the kind and its prefix is a prefix
+    /// of the event path. Result is sorted for a deterministic fan-out order.
+    pub fn matching_nodes(
+        &self,
+        realm_id: RealmId,
+        path: &str,
+        kind: WatchEventKind,
+    ) -> Vec<NodeId> {
+        let Some(nodes) = self.realms.get(&realm_id) else {
+            return Vec::new();
+        };
+        let mut matched: Vec<NodeId> = nodes
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|entry| {
+                    entry.event_mask.contains(kind) && path.starts_with(entry.path_prefix.as_str())
+                })
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        matched.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        matched
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +481,138 @@ mod tests {
         let delete = watch_subscription_delete_entry(owner, record.watch_id);
         assert_eq!(delete.0, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE);
         assert_eq!(delete.1, watch_subscription_key(owner, record.watch_id));
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn digest_roundtrips_through_postcard() {
+        let digest = WatchInterestDigest {
+            node_id: node(3),
+            entries: vec![
+                WatchInterestEntry {
+                    path_prefix: "/a".to_string(),
+                    event_mask: WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+                },
+                WatchInterestEntry {
+                    path_prefix: "/b".to_string(),
+                    event_mask: WatchEventMask::from_kinds([
+                        WatchEventKind::MetadataCreated,
+                        WatchEventKind::DataUploaded,
+                    ]),
+                },
+            ],
+        };
+        let bytes = digest.to_bytes().unwrap();
+        assert_eq!(WatchInterestDigest::from_bytes(&bytes).unwrap(), digest);
+    }
+
+    #[test]
+    fn digest_dedupes_prefixes_and_sorts_deterministically() {
+        let node_id = node(4);
+        let metadata = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
+        let data = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+
+        let first = WatchInterestDigest::from_subscriptions(
+            node_id,
+            [
+                ("/z".to_string(), data),
+                ("/a".to_string(), metadata),
+                ("/a".to_string(), data),
+            ],
+        );
+        // Same subscriptions in a different order must encode identically.
+        let second = WatchInterestDigest::from_subscriptions(
+            node_id,
+            [
+                ("/a".to_string(), data),
+                ("/z".to_string(), data),
+                ("/a".to_string(), metadata),
+            ],
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(first.to_bytes().unwrap(), second.to_bytes().unwrap());
+        assert_eq!(
+            first.entries,
+            vec![
+                WatchInterestEntry {
+                    path_prefix: "/a".to_string(),
+                    event_mask: metadata.union(data),
+                },
+                WatchInterestEntry {
+                    path_prefix: "/z".to_string(),
+                    event_mask: data,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn interest_keys_recover_realm_and_node() {
+        let realm_id = RealmId([7u8; 32]);
+        let node_id = node(9);
+
+        let key = watch_interest_node_key(realm_id, node_id);
+        assert!(key.starts_with(WATCH_INTEREST_NODE_PREFIX));
+        assert!(key.starts_with(&watch_interest_realm_prefix(realm_id)));
+        assert!(key.starts_with(&watch_interest_node_prefix()));
+        assert_eq!(watch_interest_key_realm_id(&key), Some(realm_id));
+        assert_eq!(watch_interest_key_node_id(&key), Some(node_id));
+
+        let dirty = watch_interest_dirty_key(realm_id);
+        assert_eq!(watch_interest_dirty_realm_id(&dirty), Some(realm_id));
+        // Marker and digest prefixes never collide.
+        assert_eq!(watch_interest_key_realm_id(&dirty), None);
+        assert_eq!(watch_interest_dirty_realm_id(&key), None);
+    }
+
+    #[test]
+    fn interest_table_matches_by_prefix_and_mask() {
+        let realm_id = RealmId([1u8; 32]);
+        let other_realm = RealmId([2u8; 32]);
+        let holder = node(10);
+        let mut table = WatchInterestTable::default();
+        table.insert(
+            realm_id,
+            holder,
+            vec![WatchInterestEntry {
+                path_prefix: "/bucket/".to_string(),
+                event_mask: WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            }],
+        );
+
+        assert_eq!(
+            table.matching_nodes(realm_id, "/bucket/object", WatchEventKind::MetadataCreated),
+            vec![holder]
+        );
+        // Prefix mismatch and mask mismatch both filter the holder out.
+        assert!(
+            table
+                .matching_nodes(realm_id, "/other", WatchEventKind::MetadataCreated)
+                .is_empty()
+        );
+        assert!(
+            table
+                .matching_nodes(realm_id, "/bucket/object", WatchEventKind::DataUploaded)
+                .is_empty()
+        );
+        // Realm isolation.
+        assert!(
+            table
+                .matching_nodes(
+                    other_realm,
+                    "/bucket/object",
+                    WatchEventKind::MetadataCreated
+                )
+                .is_empty()
+        );
+
+        // An empty entry set drops the holder, and the realm once empty.
+        table.insert(realm_id, holder, Vec::new());
+        assert!(table.nodes(realm_id).is_none());
+        assert!(table.is_empty());
     }
 }
