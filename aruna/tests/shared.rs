@@ -551,6 +551,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
             oidc_providers: Vec::new(),
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         }),
         context.as_ref(),
     )

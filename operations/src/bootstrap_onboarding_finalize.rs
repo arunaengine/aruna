@@ -4,8 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
-    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, DEFAULT_NODE_WEIGHT, NodePlacementEntry, RealmId,
-    RealmNodeKind, ResourceEvent,
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY,
+    NodePlacementEntry, RealmId, RealmNodeKind, ResourceEvent,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -53,6 +53,9 @@ pub struct BootstrapOnboardingFinalizeInput {
     pub node_location: Option<String>,
     /// Joiner's placement weight (`None` ⇒ default weight).
     pub node_weight: Option<u32>,
+    /// Joiner's placement labels. Payload-sourced, so the reserved kind label is
+    /// rejected here (bypasses the config-parse rejection).
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +84,8 @@ pub enum BootstrapOnboardingFinalizeError {
     NetHandleUnavailable,
     #[error("document sync peer admission failed: {0}")]
     PeerAdmission(String),
+    #[error("placement labels must not set the reserved kind label")]
+    ReservedNodeLabel,
 }
 
 pub async fn bootstrap_onboarding_finalize(
@@ -248,14 +253,17 @@ async fn ensure_realm_node_once(
 async fn set_joiner_placement_entry(
     input: &BootstrapOnboardingFinalizeInput,
     context: &DriverContext,
-) -> Result<(), SetNodePlacementError> {
+) -> Result<(), BootstrapOnboardingFinalizeError> {
+    if input.node_labels.contains_key(KIND_LABEL_KEY) {
+        return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel);
+    }
     let entry = NodePlacementEntry {
         node_id: input.node_id,
         location: input.node_location.clone().unwrap_or_default(),
         weight: input.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
         full: false,
         draining: false,
-        label_overrides: std::collections::BTreeMap::new(),
+        labels: input.node_labels.clone(),
     };
     drive(
         SetNodePlacementOperation::new(SetNodePlacementConfig {
@@ -367,6 +375,7 @@ mod tests {
                 oidc_providers: Vec::new(),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
             context.as_ref(),
         )
@@ -416,6 +425,7 @@ mod tests {
             now,
             node_location: Some("eu-central".to_string()),
             node_weight: Some(250),
+            node_labels: Default::default(),
         }
     }
 

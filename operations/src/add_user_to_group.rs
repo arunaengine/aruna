@@ -1285,6 +1285,7 @@ pub mod test {
             oidc_providers: Vec::new(),
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config);
         let _ = drive(realm_operation, &context).await.unwrap();
@@ -1381,6 +1382,7 @@ pub mod test {
                 oidc_providers: Vec::new(),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
             context,
         )

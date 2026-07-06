@@ -216,6 +216,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             oidc_providers: vec![provider.clone()],
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         }),
         context.as_ref(),
     )

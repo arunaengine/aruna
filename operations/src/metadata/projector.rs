@@ -759,7 +759,6 @@ fn expand_create_event_holders(
     // affinity are not needed for the default metadata strategy.
     event.record.holder_node_ids = complete_authoritative_holders(
         realm_config,
-        &[],
         &target,
         Some(&document_path),
         &holders,

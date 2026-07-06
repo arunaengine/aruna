@@ -153,7 +153,7 @@ impl ReplicateDocumentsOperation {
         // Placement plan for the document's bound strategy. `None` means the
         // realm has no strategy for this target (skip, like the old
         // desired_peer_count == 0 case).
-        let Some(plan) = plan_target_placement(realm_config, &[], &document, None) else {
+        let Some(plan) = plan_target_placement(realm_config, &document, None) else {
             return self.emit_next_publish();
         };
         let desired_count = plan.desired_count;
@@ -242,7 +242,7 @@ impl ReplicateDocumentsOperation {
         };
         warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
         let (desired_count, placement) = match self.realm_config.as_ref() {
-            Some(realm_config) => match plan_target_placement(realm_config, &[], &target, None) {
+            Some(realm_config) => match plan_target_placement(realm_config, &target, None) {
                 Some(plan) => (plan.desired_count.max(1), plan.placement),
                 None => (1, placement_ref_for_target(realm_config, &target, None)),
             },

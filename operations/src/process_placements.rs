@@ -167,7 +167,7 @@ impl ProcessPlacementsOperation {
         excluded_peers.push(record.authoritative_node_id);
         sort_node_ids(&mut excluded_peers);
         let newly_selected: Vec<NodeId> = match self.realm_config.as_ref() {
-            Some(config) => rank_eligible_holders(config, &[], &record.target, None)
+            Some(config) => rank_eligible_holders(config, &record.target, None)
                 .into_iter()
                 .filter(|node_id| !excluded_peers.contains(node_id))
                 .take(missing_peer_count)

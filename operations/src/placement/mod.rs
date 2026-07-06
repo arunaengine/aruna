@@ -5,7 +5,7 @@ pub mod selector;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::structs::{NodeInfoDocument, PlacementRef, RealmConfigDocument};
+use aruna_core::structs::{PlacementRef, RealmConfigDocument};
 
 pub use resolver::{
     PlacementView, ResolvedNode, build_view, document_class, resolve_holders, strategy_for_target,
@@ -45,12 +45,11 @@ pub struct TargetPlacementPlan {
 
 pub fn plan_target_placement(
     config: &RealmConfigDocument,
-    node_infos: &[NodeInfoDocument],
     target: &DocumentSyncTarget,
     metadata_path: Option<&str>,
 ) -> Option<TargetPlacementPlan> {
     let (strategy, override_) = strategy_for_target(config, target, metadata_path)?;
-    let view = build_view(config, node_infos);
+    let view = build_view(config);
     let holders = resolve_holders(&view, strategy, &subject_bytes(target), 0, override_);
     let desired_count = match strategy.replica_count {
         Some(count) => count as usize,
@@ -71,7 +70,6 @@ pub fn plan_target_placement(
 /// `distinct_locations` eligibility from the resolved strategy.
 pub fn rank_eligible_holders(
     config: &RealmConfigDocument,
-    node_infos: &[NodeInfoDocument],
     target: &DocumentSyncTarget,
     metadata_path: Option<&str>,
 ) -> Vec<NodeId> {
@@ -80,6 +78,6 @@ pub fn rank_eligible_holders(
     };
     let mut uncapped = strategy.clone();
     uncapped.replica_count = None;
-    let view = build_view(config, node_infos);
+    let view = build_view(config);
     resolve_holders(&view, &uncapped, &subject_bytes(target), 0, override_)
 }

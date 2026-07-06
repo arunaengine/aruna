@@ -822,6 +822,7 @@ pub mod test {
             oidc_providers: Vec::new(),
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         });
         drive(realm_operation, context).await.unwrap();
 

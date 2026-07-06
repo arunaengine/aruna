@@ -35,7 +35,7 @@ pub enum AdminDocumentReducerError {
     UnsupportedTarget,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeValidationError),
-    #[error("placement label overrides must not set the reserved kind label")]
+    #[error("placement labels must not set the reserved kind label")]
     ReservedPlacementLabel,
     #[error("placement strategy replica count must not be zero")]
     ZeroPlacementReplicaCount,
@@ -274,7 +274,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
             ) => {
-                if entry.label_overrides.contains_key(KIND_LABEL_KEY) {
+                if entry.labels.contains_key(KIND_LABEL_KEY) {
                     return Err(AdminDocumentReducerError::ReservedPlacementLabel);
                 }
                 self.apply_realm_config_placement_field(
@@ -3212,7 +3212,7 @@ mod tests {
             weight,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::new(),
+            labels: BTreeMap::new(),
         }
     }
 
@@ -3389,7 +3389,7 @@ mod tests {
         let before = state.clone();
         let mut entry = placement_entry(node(11), 100);
         entry
-            .label_overrides
+            .labels
             .insert(KIND_LABEL_KEY.to_string(), "Server".to_string());
 
         assert_eq!(

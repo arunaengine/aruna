@@ -31,7 +31,7 @@ pub fn resolve_inbox_holder(
     user_id: &UserId,
     realm_config: &RealmConfigDocument,
 ) -> Result<Option<NodeId>, ConversionError> {
-    let view = build_view(realm_config, &[]);
+    let view = build_view(realm_config);
     let subject = inbox_topic_id(user_id);
     Ok(resolve_holders(&view, &inbox_strategy(), &subject, 0, None)
         .into_iter()

@@ -180,6 +180,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         oidc_providers: config.oidc_providers.clone(),
                         node_location: config.node_location.clone(),
                         node_weight: config.node_weight,
+                        node_labels: config.node_labels.clone(),
                     }),
                     driver_ctx.as_ref(),
                 )

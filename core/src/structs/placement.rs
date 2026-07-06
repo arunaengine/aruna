@@ -16,7 +16,7 @@ pub struct NodePlacementEntry {
     pub weight: u32,
     pub full: bool,
     pub draining: bool,
-    pub label_overrides: BTreeMap<String, String>,
+    pub labels: BTreeMap<String, String>,
 }
 
 impl NodePlacementEntry {
@@ -120,7 +120,7 @@ mod tests {
             weight: DEFAULT_NODE_WEIGHT,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::new(),
+            labels: BTreeMap::new(),
         };
         assert_eq!(entry.effective_location(), DEFAULT_LOCATION);
 
@@ -136,7 +136,7 @@ mod tests {
             weight: 250,
             full: true,
             draining: false,
-            label_overrides: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
         };
         let bytes = postcard::to_allocvec(&entry).unwrap();
         assert_eq!(

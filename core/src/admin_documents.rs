@@ -355,7 +355,7 @@ mod tests {
             weight: 100,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
         }
     }
 

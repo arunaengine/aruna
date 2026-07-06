@@ -745,6 +745,7 @@ mod tests {
                 oidc_providers: Vec::new(),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
             context.as_ref(),
         )

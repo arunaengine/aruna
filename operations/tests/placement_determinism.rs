@@ -45,7 +45,7 @@ async fn weight_change_propagates_and_all_nodes_resolve_identically()
         weight: 500,
         full: false,
         draining: false,
-        label_overrides: BTreeMap::new(),
+        labels: BTreeMap::new(),
     };
 
     let actor = Actor {
@@ -135,10 +135,7 @@ fn assert_resolve_holders_identical(configs: &[RealmConfigDocument]) {
         .expect("realm config has a default strategy")
         .clone();
 
-    let views: Vec<_> = configs
-        .iter()
-        .map(|config| build_view(config, &[]))
-        .collect();
+    let views: Vec<_> = configs.iter().map(build_view).collect();
 
     for counter in 0u64..100 {
         let subject = *blake3::hash(&counter.to_le_bytes()).as_bytes();
@@ -244,7 +241,7 @@ fn base_config(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
             weight: weights[index % weights.len()],
             full: false,
             draining: false,
-            label_overrides: BTreeMap::new(),
+            labels: BTreeMap::new(),
         });
     }
     config
