@@ -6,6 +6,7 @@ pub mod create_multipart_upload;
 pub mod create_user_access;
 pub mod delete_bucket;
 pub mod delete_object;
+pub mod delete_objects;
 pub mod get_bucket_info;
 pub mod get_object;
 pub mod get_user_access;

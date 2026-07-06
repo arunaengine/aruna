@@ -43,7 +43,10 @@ use aruna_operations::s3::create_multipart_upload::{
 };
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
-    DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
+    DeleteObjectError, DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
+};
+use aruna_operations::s3::delete_objects::{
+    DeleteObjectsEntry, DeleteObjectsInput as DOSI, delete_objects,
 };
 use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
@@ -71,13 +74,14 @@ use s3s::dto::{
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
-    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
-    EncodingType, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, LastModified,
-    ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, Owner,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+    DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType, Error as S3DeleteError,
+    GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
+    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, Owner, PutBucketCorsInput,
+    PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
     ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StreamingBlob,
     UploadPartInput, UploadPartOutput,
@@ -1426,6 +1430,123 @@ impl S3 for ArunaS3Service {
             result,
         )
         .await
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        debug!("Received DELETE OBJECTS Request: {:#?}", req);
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        if req.input.delete.objects.len() > 1000 {
+            return Err(s3_error!(
+                MalformedXML,
+                "The number of keys in a delete request must not exceed 1000."
+            ));
+        }
+
+        let quiet = req.input.delete.quiet.unwrap_or(false);
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
+        let bucket = req.input.bucket;
+
+        let mut entries = Vec::with_capacity(req.input.delete.objects.len());
+        let mut errors: Vec<S3DeleteError> = Vec::new();
+        for object in req.input.delete.objects {
+            match parse_version_id(object.version_id.clone()) {
+                Ok(version_id) => entries.push(DeleteObjectsEntry {
+                    key: object.key,
+                    version_id,
+                }),
+                Err(_) => errors.push(S3DeleteError {
+                    code: Some("NoSuchVersion".to_string()),
+                    key: Some(object.key),
+                    version_id: object.version_id,
+                    message: Some("The specified version does not exist.".to_string()),
+                }),
+            }
+        }
+
+        let outcomes = delete_objects(
+            &self.state,
+            DOSI {
+                bucket: bucket.clone(),
+                entries,
+                group_id: user_access.group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                deleted_by: user_access.user_identity,
+            },
+        )
+        .await;
+
+        let mut deleted = Vec::new();
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(result) => {
+                    if outcome.requested_version_id.is_none() {
+                        self.queue_live_version_replication(
+                            replication_auth.clone(),
+                            bucket.clone(),
+                            outcome.key.clone(),
+                            result.version_id,
+                            result.delete_marker,
+                        )
+                        .await;
+                    }
+                    let deleted_object = if outcome.requested_version_id.is_none() {
+                        DeletedObject {
+                            key: Some(outcome.key),
+                            delete_marker: Some(result.delete_marker),
+                            delete_marker_version_id: Some(result.version_id.to_string()),
+                            ..Default::default()
+                        }
+                    } else {
+                        DeletedObject {
+                            key: Some(outcome.key),
+                            version_id: Some(result.version_id.to_string()),
+                            delete_marker: Some(result.delete_marker),
+                            delete_marker_version_id: result
+                                .delete_marker
+                                .then(|| result.version_id.to_string()),
+                        }
+                    };
+                    deleted.push(deleted_object);
+                }
+                Err(DeleteObjectError::NoSuchVersion) => errors.push(S3DeleteError {
+                    code: Some("NoSuchVersion".to_string()),
+                    key: Some(outcome.key),
+                    version_id: outcome.requested_version_id.map(|id| id.to_string()),
+                    message: Some("The specified version does not exist.".to_string()),
+                }),
+                Err(err) => {
+                    warn!(error = %err, key = %outcome.key, "DeleteObjects entry failed");
+                    errors.push(S3DeleteError {
+                        code: Some("InternalError".to_string()),
+                        key: Some(outcome.key),
+                        version_id: outcome.requested_version_id.map(|id| id.to_string()),
+                        message: Some(
+                            "We encountered an internal error. Please try again.".to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!quiet).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(err)]
