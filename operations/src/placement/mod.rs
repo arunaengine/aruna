@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod distribution;
 pub mod resolver;
 pub mod selector;
 
