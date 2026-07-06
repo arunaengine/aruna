@@ -1419,6 +1419,19 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
+                    DocumentSyncEvent::Upsert { ref target, .. }
+                    | DocumentSyncEvent::Delete { ref target, .. }
+                        if admin_document_target_for_reduced_document(target).is_some() =>
+                    {
+                        // apply_upsert/apply_delete refuse whole-document admin sync, so
+                        // skip it here to let the cursor advance instead of wedging reconcile.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported whole-document admin sync event"
+                        );
+                        continue;
+                    }
                     event => {
                         let target = event.target().clone();
                         self.apply_document_event(event).await?;
@@ -7027,5 +7040,131 @@ mod tests {
         assert_eq!(prune_jobs[0].graph_iri, tombstone.graph_iri);
         assert_eq!(prune_jobs[0].attempts, 0);
         assert!(prune_jobs[0].last_error.is_none());
+    }
+
+    // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
+    // `?`-propagated that refusal the applied-ops cursor would never advance, so each
+    // reconcile would re-materialize the whole post-cursor history. The upsert/delete
+    // must be skipped while the admin operation on the same topic still applies.
+    #[tokio::test]
+    async fn reconcile_skips_whole_document_admin_sync_events() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(54).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let realm_id = RealmId::from_bytes([54u8; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_400, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let topic_id = target.sync_topic_id();
+
+        let change = |kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: service.local_node_id().expect("local node id"),
+                updated_at_ms: 1,
+            },
+            kind,
+        };
+        let actor = test_actor(8, user_id, realm_id);
+        let admin_event = test_admin_event(
+            Ulid::from_parts(1_401, 1),
+            AdminDocumentTarget::User { user_id },
+            &actor,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "Skip Survivor".to_string(),
+            },
+        );
+
+        // Two hostile whole-document ops (upsert then delete) precede a legitimate
+        // owner-authored admin operation on the same topic.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: b"whole-document-admin-upsert".to_vec(),
+                        change: change(DocumentSyncChangeKind::Upsert),
+                    },
+                    DocumentSyncPublish::Delete {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        change: change(DocumentSyncChangeKind::Delete),
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(admin_event),
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        // Reset the cursor so reconcile reprocesses every op as a fresh peer would.
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        // Reconcile completes despite the hostile whole-document ops.
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips whole-document admin sync instead of wedging");
+
+        // The admin operation on the same topic still applied.
+        assert!(result.targets.contains(&target));
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user materialized by the admin operation");
+        assert_eq!(
+            User::from_bytes(&stored_user).expect("user decodes").name,
+            "Skip Survivor"
+        );
+
+        // The cursor advanced past the hostile ops.
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the hostile ops"
+        );
+
+        service.shutdown().await;
     }
 }
