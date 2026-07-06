@@ -30,6 +30,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::Instant;
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -42,6 +43,11 @@ const NOTIFICATION_STREAM_COALESCE: Duration = Duration::from_millis(200);
 const NOTIFICATION_STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
 /// Keep-alive comment cadence so proxies do not cut an idle stream.
 const NOTIFICATION_STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
+/// Coarse holder re-resolve cadence on the local wake arm. If the inbox holder
+/// re-ranks to another node mid-stream, deliveries land there with no local wake,
+/// so after this much wake silence the arm re-resolves the holder and degrades to
+/// the remote poll when it has moved off this node.
+const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -398,10 +404,19 @@ struct UnreadStreamState {
     mode: UnreadStreamMode,
     initial_done: bool,
     last_emitted: Option<u64>,
+    remote_poll: Duration,
+    local_recheck: Duration,
+    next_holder_recheck: Instant,
 }
 
+#[derive(Clone, Copy)]
 enum StreamStep {
+    /// Unconditional emit: a wake fired (or the wake bus lagged).
     Emit,
+    /// Emit only if the count changed: remote poll tick or local recheck backstop.
+    EmitOnChange,
+    /// Local recheck tick: re-resolve the holder, maybe degrade, then emit on change.
+    Recheck,
     Wait,
     End,
 }
@@ -428,6 +443,8 @@ fn unread_count_stream(
     local_node_id: NodeId,
     recipient: UserId,
     mode: UnreadStreamMode,
+    remote_poll: Duration,
+    local_recheck: Duration,
 ) -> impl Stream<Item = u64> + Send {
     let state = UnreadStreamState {
         context,
@@ -436,6 +453,9 @@ fn unread_count_stream(
         mode,
         initial_done: false,
         last_emitted: None,
+        remote_poll,
+        local_recheck,
+        next_holder_recheck: Instant::now() + local_recheck,
     };
     stream::unfold(state, |mut state| async move {
         loop {
@@ -447,39 +467,61 @@ fn unread_count_stream(
                 }
             }
 
+            let recipient = state.recipient;
+            let remote_poll = state.remote_poll;
+            let recheck_deadline = state.next_holder_recheck;
             let step = match &mut state.mode {
                 UnreadStreamMode::Local(rx) => {
                     use broadcast::error::RecvError;
-                    match rx.recv().await {
-                        Ok(woken) if woken == state.recipient => {
-                            tokio::time::sleep(NOTIFICATION_STREAM_COALESCE).await;
-                            drain_pending_wakes(rx);
-                            StreamStep::Emit
-                        }
-                        Ok(_) => StreamStep::Wait,
-                        // Never tear the stream down for lag; refetch instead.
-                        Err(RecvError::Lagged(_)) => StreamStep::Emit,
-                        Err(RecvError::Closed) => StreamStep::End,
+                    tokio::select! {
+                        biased;
+                        recv = rx.recv() => match recv {
+                            Ok(woken) if woken == recipient => {
+                                tokio::time::sleep(NOTIFICATION_STREAM_COALESCE).await;
+                                drain_pending_wakes(rx);
+                                StreamStep::Emit
+                            }
+                            Ok(_) => StreamStep::Wait,
+                            // Never tear the stream down for lag; refetch instead.
+                            Err(RecvError::Lagged(_)) => StreamStep::Emit,
+                            Err(RecvError::Closed) => StreamStep::End,
+                        },
+                        _ = tokio::time::sleep_until(recheck_deadline) => StreamStep::Recheck,
                     }
                 }
                 UnreadStreamMode::Remote => {
-                    tokio::time::sleep(NOTIFICATION_STREAM_REMOTE_POLL).await;
-                    StreamStep::Emit
+                    tokio::time::sleep(remote_poll).await;
+                    StreamStep::EmitOnChange
                 }
             };
 
             match step {
                 StreamStep::End => return None,
                 StreamStep::Wait => continue,
-                StreamStep::Emit => {
+                StreamStep::Emit | StreamStep::EmitOnChange | StreamStep::Recheck => {
+                    if matches!(step, StreamStep::Recheck) {
+                        // Wake silence for a full recheck period: the inbox holder
+                        // may have re-ranked to another node where deliveries land
+                        // with no local wake. Re-resolve and degrade to the remote
+                        // poll if it moved off this node; a resolution failure is a
+                        // transient skip. Then refetch as a missed-wake backstop.
+                        state.next_holder_recheck = Instant::now() + state.local_recheck;
+                        match resolve_inbox_holder_for_user(state.context.as_ref(), state.recipient)
+                            .await
+                        {
+                            Ok(holder) if holder != state.local_node_id => {
+                                state.mode = UnreadStreamMode::Remote;
+                            }
+                            Ok(_) => {}
+                            Err(_) => continue,
+                        }
+                    }
                     let Some(count) = fetch_unread_count(&state).await else {
                         continue;
                     };
-                    // The remote arm only emits on change; the wake-driven local
-                    // arm emits on every wake (the bell refetches the list).
-                    if matches!(state.mode, UnreadStreamMode::Remote)
-                        && state.last_emitted == Some(count)
-                    {
+                    // Wakes emit unconditionally (the bell refetches the list); the
+                    // poll and recheck backstop emit only when the count changed.
+                    if !matches!(step, StreamStep::Emit) && state.last_emitted == Some(count) {
                         continue;
                     }
                     state.last_emitted = Some(count);
@@ -533,8 +575,15 @@ pub async fn stream_notifications(
         UnreadStreamMode::Remote
     };
 
-    let events = unread_count_stream(context.clone(), local_node_id, recipient, mode)
-        .map(|count| Ok::<_, Infallible>(unread_stream_event(count)));
+    let events = unread_count_stream(
+        context.clone(),
+        local_node_id,
+        recipient,
+        mode,
+        NOTIFICATION_STREAM_REMOTE_POLL,
+        NOTIFICATION_STREAM_LOCAL_RECHECK,
+    )
+    .map(|count| Ok::<_, Infallible>(unread_stream_event(count)));
     Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(NOTIFICATION_STREAM_KEEP_ALIVE)))
 }
 
@@ -992,6 +1041,9 @@ mod tests {
             state.get_node_id(),
             user_id,
             UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+            Duration::from_secs(5),
+            // Long recheck so this test exercises only the wake path.
+            Duration::from_secs(60),
         ));
 
         let initial = timeout(Duration::from_secs(2), events.next())
@@ -1013,6 +1065,51 @@ mod tests {
             .expect("wake event arrives")
             .expect("stream open");
         assert_eq!(after_wake, 1);
+    }
+
+    // The recheck tick is the missed-wake backstop: with no wake fired, the local
+    // arm still periodically re-resolves the holder and refetches, emitting when the
+    // count changed. Driving a live holder re-rank (degrade to the remote arm) in a
+    // single in-process node is impractical — that path needs a real second node
+    // holding the inbox — so it is covered by the multi-node and remote-arm tests;
+    // here we lock in the same-node backstop refetch.
+    #[tokio::test]
+    async fn stream_local_arm_recheck_refetches_on_change_without_wake() {
+        let realm_id = realm_id(12);
+        let (_dir, state, net) = build_state_with_net(realm_id, [12u8; 32]).await;
+        install_local_holder_config(&state, realm_id, state.get_node_id()).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let mut events = Box::pin(unread_count_stream(
+            state.get_ctx(),
+            state.get_node_id(),
+            user_id,
+            UnreadStreamMode::Local(net.subscribe_notification_wakes()),
+            Duration::from_secs(60),
+            // Short recheck so the backstop refetch fires promptly.
+            Duration::from_millis(150),
+        ));
+
+        let initial = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("initial event arrives")
+            .expect("stream open");
+        assert_eq!(initial, 0);
+
+        // Seed a record but deliberately fire no wake: only the recheck backstop
+        // can surface it.
+        upsert_inbox_records(
+            &state.get_ctx().storage_handle,
+            &[direct_record(user_id, 1)],
+        )
+        .await
+        .expect("seed inbox");
+
+        let after_recheck = timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("recheck backstop emits without a wake")
+            .expect("stream open");
+        assert_eq!(after_recheck, 1);
     }
 
     #[test]
