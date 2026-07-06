@@ -535,22 +535,14 @@ mod tests {
         assert!(operation.current.is_none());
     }
 
-    fn node_usage_target() -> DocumentSyncTarget {
-        DocumentSyncTarget::NodeUsage {
-            realm_id: RealmId::from_bytes([8u8; 32]),
-            node_id: node(1),
-            group_id: None,
-        }
-    }
-
-    fn announce_outbox_allow_genesis(effects: Effects) -> bool {
+    fn announce_outbox_allow_genesis(effects: Effects, document_bytes: Vec<u8>) -> bool {
         let Some(Effect::SubOperation(mut sub)) = effects.into_iter().next() else {
             panic!("expected announce sub-operation");
         };
         let _read = sub.start();
         let write_effects = sub.step(Event::Storage(StorageEvent::ReadResult {
             key: Key::from(vec![0u8]),
-            value: Some(aruna_core::types::Value::from(vec![1u8])),
+            value: Some(aruna_core::types::Value::from(document_bytes)),
         }));
         let [Effect::Storage(StorageEffect::Write { value, .. })] = write_effects.as_slice() else {
             panic!("expected announce outbox write, got {write_effects:?}");
@@ -560,44 +552,54 @@ mod tests {
         record.allow_genesis
     }
 
-    #[test]
-    fn announce_allow_genesis_tracks_authoritative_origin() {
-        let realm_id = RealmId::from_bytes([8u8; 32]);
-        let local = node(1);
+    fn graph_lifecycle_fixture() -> (DocumentSyncTarget, Vec<u8>) {
+        let record = aruna_core::metadata::MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:placement-test".to_string(),
+            RealmId::from_bytes([8u8; 32]),
+            aruna_core::types::GroupId::new(),
+            Ulid::from_bytes([9u8; 16]),
+            42,
+        );
+        let bytes = postcard::to_allocvec(&record).expect("lifecycle record serializes");
+        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: record.graph_iri.clone(),
+        };
+        (target, bytes)
+    }
 
-        let mut origin = ProcessPlacementsOperation::new(PlacementConfig {
+    fn placement_announce_allow_genesis(
+        local: NodeId,
+        authoritative: NodeId,
+        target: DocumentSyncTarget,
+        document_bytes: Vec<u8>,
+    ) -> bool {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: local,
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        origin.realm_nodes = vec![local, node(2), node(3)];
-        origin.records = vec![new_placement(
+        operation.realm_nodes = vec![node(1), node(2), node(3), local];
+        operation.records = vec![new_placement(
             realm_id,
-            node_usage_target(),
-            local,
+            target,
+            authoritative,
             3,
             Vec::new(),
         )];
+        announce_outbox_allow_genesis(operation.emit_next_record(), document_bytes)
+    }
+
+    #[test]
+    fn announce_allow_genesis_tracks_authoritative_origin() {
+        let local = node(1);
+        let (target, bytes) = graph_lifecycle_fixture();
         assert!(
-            announce_outbox_allow_genesis(origin.emit_next_record()),
+            placement_announce_allow_genesis(local, local, target.clone(), bytes.clone()),
             "origin (authoritative == local) may mint genesis"
         );
-
-        let mut replica = ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id,
-            local_node_id: node(9),
-            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
-        });
-        replica.realm_nodes = vec![local, node(2), node(3)];
-        replica.records = vec![new_placement(
-            realm_id,
-            node_usage_target(),
-            local,
-            3,
-            Vec::new(),
-        )];
         assert!(
-            !announce_outbox_allow_genesis(replica.emit_next_record()),
+            !placement_announce_allow_genesis(node(9), local, target, bytes),
             "replica-holder (authoritative != local) must not mint genesis"
         );
     }
