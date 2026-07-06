@@ -429,11 +429,11 @@ fn drain_pending_wakes(rx: &mut broadcast::Receiver<UserId>) {
     while rx.try_recv().is_ok() {}
 }
 
-async fn fetch_unread_count(state: &UnreadStreamState) -> Option<u64> {
+async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
     unread_count_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
         .await
         .ok()
-        .map(|(count, _capped)| count as u64)
+        .map(|(count, capped)| (count as u64, capped))
 }
 
 /// Yields the recipient's unread count: once initially, then whenever it may have
@@ -447,7 +447,7 @@ fn unread_count_stream(
     mode: UnreadStreamMode,
     remote_poll: Duration,
     local_recheck: Duration,
-) -> impl Stream<Item = u64> + Send {
+) -> impl Stream<Item = (u64, bool)> + Send {
     let state = UnreadStreamState {
         context,
         local_node_id,
@@ -463,9 +463,9 @@ fn unread_count_stream(
         loop {
             if !state.initial_done {
                 state.initial_done = true;
-                if let Some(count) = fetch_unread_count(&state).await {
+                if let Some((count, capped)) = fetch_unread_count(&state).await {
                     state.last_emitted = Some(count);
-                    return Some((count, state));
+                    return Some(((count, capped), state));
                 }
             }
 
@@ -518,7 +518,7 @@ fn unread_count_stream(
                             Err(_) => continue,
                         }
                     }
-                    let Some(count) = fetch_unread_count(&state).await else {
+                    let Some((count, capped)) = fetch_unread_count(&state).await else {
                         continue;
                     };
                     // Wakes emit unconditionally (the bell refetches the list); the
@@ -527,17 +527,17 @@ fn unread_count_stream(
                         continue;
                     }
                     state.last_emitted = Some(count);
-                    return Some((count, state));
+                    return Some(((count, capped), state));
                 }
             }
         }
     })
 }
 
-fn unread_stream_event(count: u64) -> Event {
+fn unread_stream_event(count: u64, capped: bool) -> Event {
     let data = serde_json::to_string(&UnreadCountApiResponse {
         count: count as u32,
-        capped: false,
+        capped,
     })
     .unwrap_or_else(|_| format!("{{\"count\":{count}}}"));
     Event::default().event("unread").data(data)
@@ -585,7 +585,7 @@ pub async fn stream_notifications(
         NOTIFICATION_STREAM_REMOTE_POLL,
         NOTIFICATION_STREAM_LOCAL_RECHECK,
     )
-    .map(|count| Ok::<_, Infallible>(unread_stream_event(count)));
+    .map(|(count, capped)| Ok::<_, Infallible>(unread_stream_event(count, capped)));
     Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(NOTIFICATION_STREAM_KEEP_ALIVE)))
 }
 
@@ -1080,11 +1080,12 @@ mod tests {
             Duration::from_secs(60),
         ));
 
-        let initial = timeout(Duration::from_secs(2), events.next())
+        let (initial, initial_capped) = timeout(Duration::from_secs(2), events.next())
             .await
             .expect("initial event arrives")
             .expect("stream open");
         assert_eq!(initial, 0);
+        assert!(!initial_capped);
 
         upsert_inbox_records(
             &state.get_ctx().storage_handle,
@@ -1094,11 +1095,12 @@ mod tests {
         .expect("seed inbox");
         net.notify_inbox_activity(user_id);
 
-        let after_wake = timeout(Duration::from_secs(2), events.next())
+        let (after_wake, after_wake_capped) = timeout(Duration::from_secs(2), events.next())
             .await
             .expect("wake event arrives")
             .expect("stream open");
         assert_eq!(after_wake, 1);
+        assert!(!after_wake_capped);
     }
 
     // The recheck tick is the missed-wake backstop: with no wake fired, the local
@@ -1124,7 +1126,7 @@ mod tests {
             Duration::from_millis(150),
         ));
 
-        let initial = timeout(Duration::from_secs(2), events.next())
+        let (initial, _) = timeout(Duration::from_secs(2), events.next())
             .await
             .expect("initial event arrives")
             .expect("stream open");
@@ -1139,7 +1141,7 @@ mod tests {
         .await
         .expect("seed inbox");
 
-        let after_recheck = timeout(Duration::from_secs(2), events.next())
+        let (after_recheck, _) = timeout(Duration::from_secs(2), events.next())
             .await
             .expect("recheck backstop emits without a wake")
             .expect("stream open");
