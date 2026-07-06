@@ -15,7 +15,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.32"
+version = "3.0.0-alpha.34"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -36,14 +36,14 @@ aruna-tasks = { path = "tasks" }
 ahash = "0.8.12"
 async-trait = "0.1.89"
 aws-config = "1.8.18"
-aws-sdk-s3 = "1.135.0"
+aws-sdk-s3 = "1.137.0"
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 bao-tree = "0.16.0"
 base64 = "0.22.1"
 blake3 = { version = "1.8.5", features = ["serde"] }
 byteview = "0.10.1"
-bytes = "1.11.1"
+bytes = "1.12.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 console-subscriber = "0.5.0"
@@ -51,19 +51,19 @@ craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", featu
     "iroh",
 ] }
 crc-fast = "1.10.0"
-crossfire = "3.1.16"
+crossfire = "3.1.18"
 crypto_box = "0.9.1"
 data-encoding = "2.11.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "pem"] }
-fjall = "3.1.4"
+fjall = "3.1.6"
 flate2 = "1.1.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 globset = "0.4.18"
 hex = "0.4.3"
-http = "1.4.1"
+http = "1.4.2"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = [
     "server",
@@ -73,8 +73,8 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-iroh = "1.0.0-rc.1"
-iroh-base = "1.0.0-rc.1"
+iroh = "1.0.1"
+iroh-base = "1.0.1"
 irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
     "fjall",
     "iroh",
@@ -107,25 +107,25 @@ oxrdf = "0.3.3"
 parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 percent-encoding = "2.3.2"
 postcard = { version = "1.1.3", features = ["alloc"] }
-rand = "0.10.1"
+rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "json",
     "rustls",
 ] }
-s3s = { git = "https://github.com/s3s-project/s3s" }
+s3s = "0.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
-smallvec = "1.15.1"
+smallvec = "1.15.2"
 spargebra = "0.4.6"
-tar = "0.4.44"
+tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tokio-util = "0.7.18"
 tower = "0.5.3"
-tower-http = { version = "0.6.7", features = ["cors", "fs"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = [
