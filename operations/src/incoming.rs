@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::document_sync_outbox::{
+    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -13,10 +16,14 @@ use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentSyncReconcileResult, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
+};
 use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::task::TaskEvent;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
@@ -306,6 +313,78 @@ impl InboundEventHandler for OperationsInboundHandler {
         .instrument(span)
         .await;
     }
+
+    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncPublish>) {
+        reemit_evicted_documents(self.context.as_ref(), documents).await;
+    }
+}
+
+/// Re-enqueues the payloads recovered from a genesis tie-break eviction as
+/// document-sync outbox records so they replay onto the winning chain through
+/// the normal drain. Admin operations keep their original embedded event id,
+/// which is the whole safety story: appliers dedupe on it, so replaying an
+/// event that already landed on the winner chain is a no-op. Every record uses
+/// `allow_genesis: false` (the loser must not mint a rival genesis) and empty
+/// peers (resolved to the realm default set at the net layer, exactly like the
+/// mutation operations that originate admin events).
+async fn reemit_evicted_documents(context: &DriverContext, documents: Vec<DocumentSyncPublish>) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        warn!("Cannot re-emit evicted documents without net handle");
+        return;
+    };
+    let node_id = net_handle.node_id();
+    let mut written = 0usize;
+    for publish in documents {
+        let allow_genesis = publish.allow_genesis();
+        let (target, event) = match publish {
+            DocumentSyncPublish::Upsert {
+                target,
+                bytes,
+                change,
+                ..
+            } => (target, DocumentSyncOutboxEvent::Upsert { bytes, change }),
+            DocumentSyncPublish::AdminOperation { target, event, .. } => {
+                (target, DocumentSyncOutboxEvent::AdminOperation { event })
+            }
+            DocumentSyncPublish::Delete { target, change, .. } => {
+                (target, DocumentSyncOutboxEvent::Delete { change })
+            }
+        };
+        let record = new_outbox_record(node_id, target, Vec::new(), event, allow_genesis);
+        let effect = match write_outbox_effect(&record) {
+            Ok(effect) => effect,
+            Err(error) => {
+                warn!(error = %error, "Failed to encode re-emitted eviction outbox record");
+                continue;
+            }
+        };
+        match context.storage_handle.send_effect(effect).await {
+            Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Failed to write re-emitted eviction outbox record");
+            }
+            other => {
+                warn!(event = ?other, "Unexpected event writing re-emitted eviction outbox record");
+            }
+        }
+    }
+    if written == 0 {
+        return;
+    }
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        warn!("Cannot schedule outbox drain for re-emitted evictions without task handle");
+        return;
+    };
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+        .send_effect(schedule_outbox_drain_effect())
+        .await
+    {
+        warn!(message = %message, "Failed to schedule outbox drain after re-emitting evictions");
+    }
+    info!(
+        count = written,
+        "Re-emitted evicted documents to the sync outbox"
+    );
 }
 
 async fn project_inbound_metadata_create_events(
