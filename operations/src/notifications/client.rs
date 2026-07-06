@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::{NotificationRecord, WatchEventMask, WatchSubscription};
+use aruna_core::structs::{NotificationRecord, WatchEvent, WatchEventMask, WatchSubscription};
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -156,6 +156,24 @@ pub async fn delete_watch_remote(
     .await?
     {
         NotificationTransportMessage::WatchDeleted => Ok(()),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn deliver_watch_events_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    events: Vec<WatchEvent>,
+) -> Result<u32, String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::DeliverWatchEvents { events },
+    )
+    .await?
+    {
+        NotificationTransportMessage::WatchEventsAck { written } => Ok(written),
         NotificationTransportMessage::Reject(reason) => Err(reason),
         _ => Err("unexpected notification response".to_string()),
     }

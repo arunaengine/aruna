@@ -1,4 +1,4 @@
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
@@ -294,6 +294,54 @@ pub async fn list_watch_subscriptions(
     Ok(subscriptions)
 }
 
+/// Pages every watch subscription this node holds for `realm_id` (all owners),
+/// used by holder-side watch-event expansion. Subscription keys are realm-first,
+/// so one realm's rows form a single contiguous scan range.
+pub async fn list_realm_watch_subscriptions(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
+    let prefix = UserId::storage_prefix(realm_id);
+    let mut subscriptions = Vec::new();
+    let mut start = None;
+    loop {
+        let (values, next) = match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                prefix: Some(prefix.clone()),
+                start: start.map(IterStart::After),
+                limit: 1_000,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(WatchSubscriptionError::Storage(error.to_string()));
+            }
+            other => {
+                return Err(WatchSubscriptionError::Storage(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        };
+        for (_, value) in values {
+            subscriptions.push(
+                WatchSubscription::from_bytes(&value)
+                    .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
+            );
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => break,
+        }
+    }
+    Ok(subscriptions)
+}
+
 fn classify(error: StorageError) -> CreateFailure {
     if matches!(error, StorageError::TransactionConflict) {
         CreateFailure::Conflict
@@ -466,6 +514,38 @@ mod tests {
                 .expect("list succeeds")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn list_realm_scan_covers_every_owner_in_realm() {
+        let (_dir, storage) = temp_storage();
+        let realm = RealmId([1u8; 32]);
+        let other_realm = RealmId([2u8; 32]);
+        let alice = user(1, 1);
+        let bob = user(1, 2);
+        let outsider = UserId::new(Ulid::from_bytes([3u8; 16]), other_realm);
+
+        create_watch_subscription(&storage, alice, "/a".to_string(), mask(), 1)
+            .await
+            .expect("alice create");
+        create_watch_subscription(&storage, bob, "/b".to_string(), mask(), 2)
+            .await
+            .expect("bob create");
+        create_watch_subscription(&storage, outsider, "/c".to_string(), mask(), 3)
+            .await
+            .expect("outsider create");
+
+        let realm_subs = list_realm_watch_subscriptions(&storage, realm)
+            .await
+            .expect("realm scan succeeds");
+        assert_eq!(realm_subs.len(), 2);
+        assert!(realm_subs.iter().all(|sub| sub.owner.realm_id == realm));
+
+        let other_subs = list_realm_watch_subscriptions(&storage, other_realm)
+            .await
+            .expect("other realm scan succeeds");
+        assert_eq!(other_subs.len(), 1);
+        assert_eq!(other_subs[0].owner, outsider);
     }
 
     #[test]
