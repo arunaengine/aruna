@@ -48,6 +48,7 @@ pub struct AnnounceTopicOperation {
     local_node_id: NodeId,
     peers: Vec<NodeId>,
     document_bytes: Option<Vec<u8>>,
+    allow_genesis: bool,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
     current: Option<DocumentSyncTarget>,
@@ -84,16 +85,17 @@ pub enum AnnounceTopicError {
 }
 
 impl AnnounceTopicOperation {
-    pub fn new(topic: TopicId, _local_node_id: NodeId) -> Self {
-        Self::new_for_document(topic, _local_node_id, None)
+    pub fn new(topic: TopicId, local_node_id: NodeId, allow_genesis: bool) -> Self {
+        Self::new_for_document(topic, local_node_id, None, allow_genesis)
     }
 
     pub fn new_for_document(
         topic: TopicId,
         local_node_id: NodeId,
         document: Option<DocumentSyncTarget>,
+        allow_genesis: bool,
     ) -> Self {
-        Self::new_for_document_with_peers(topic, local_node_id, document, Vec::new())
+        Self::new_for_document_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
     }
 
     pub fn new_for_document_with_peers(
@@ -101,6 +103,7 @@ impl AnnounceTopicOperation {
         local_node_id: NodeId,
         document: Option<DocumentSyncTarget>,
         peers: Vec<NodeId>,
+        allow_genesis: bool,
     ) -> Self {
         Self {
             topic,
@@ -108,6 +111,7 @@ impl AnnounceTopicOperation {
             local_node_id,
             peers,
             document_bytes: None,
+            allow_genesis,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -121,6 +125,7 @@ impl AnnounceTopicOperation {
         document: DocumentSyncTarget,
         peers: Vec<NodeId>,
         bytes: Vec<u8>,
+        allow_genesis: bool,
     ) -> Self {
         Self {
             topic,
@@ -128,6 +133,7 @@ impl AnnounceTopicOperation {
             local_node_id,
             peers,
             document_bytes: Some(bytes),
+            allow_genesis,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -193,17 +199,12 @@ impl AnnounceTopicOperation {
     ) -> Effects {
         self.current = Some(document.clone());
         self.state = AnnounceTopicState::WriteOutbox;
-        // Whole-document announces (metadata registry/create-event/lifecycle,
-        // graph lifecycle and node-usage snapshots) may originate a topic the
-        // announcing node holds, so they retain the ability to mint genesis.
-        // See fix/admin-doc-sync-309 report: origin-gating this path needs an
-        // origin signal AnnounceTopicOperation does not currently carry.
         let record = new_outbox_record(
             self.local_node_id,
             document,
             self.peers.clone(),
             event,
-            true,
+            self.allow_genesis,
         );
         match write_outbox_effect(&record) {
             Ok(effect) => smallvec![effect],
@@ -490,39 +491,43 @@ mod tests {
 
     #[test]
     fn provided_document_bytes_skip_readback_before_outbox_write() {
-        let local_node_id = local_node_id();
-        let lifecycle = MetadataGraphLifecycleRecord::deleted(
-            "urn:graph:announce".to_string(),
-            RealmId::from_bytes([2u8; 32]),
-            GroupId::new(),
-            Ulid::new(),
-            42,
-        );
-        let document = DocumentSyncTarget::MetadataGraphLifecycle {
-            graph_iri: lifecycle.graph_iri.clone(),
-        };
-        let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
-        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
-            document.topic_id(),
-            local_node_id,
-            document.clone(),
-            Vec::new(),
-            bytes.clone(),
-        );
+        for allow_genesis in [false, true] {
+            let local_node_id = local_node_id();
+            let lifecycle = MetadataGraphLifecycleRecord::deleted(
+                "urn:graph:announce".to_string(),
+                RealmId::from_bytes([2u8; 32]),
+                GroupId::new(),
+                Ulid::new(),
+                42,
+            );
+            let document = DocumentSyncTarget::MetadataGraphLifecycle {
+                graph_iri: lifecycle.graph_iri.clone(),
+            };
+            let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
+            let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+                document.topic_id(),
+                local_node_id,
+                document.clone(),
+                Vec::new(),
+                bytes.clone(),
+                allow_genesis,
+            );
 
-        let effects = operation.start();
+            let effects = operation.start();
 
-        let record = written_outbox_record(effects.as_slice());
-        assert_eq!(record.target, document);
-        let DocumentSyncOutboxEvent::Upsert {
-            bytes: actual,
-            change,
-        } = record.event
-        else {
-            panic!("expected revisioned upsert");
-        };
-        assert_eq!(actual, bytes);
-        assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
+            let record = written_outbox_record(effects.as_slice());
+            assert_eq!(record.target, document);
+            assert_eq!(record.allow_genesis, allow_genesis);
+            let DocumentSyncOutboxEvent::Upsert {
+                bytes: actual,
+                change,
+            } = record.event
+            else {
+                panic!("expected revisioned upsert");
+            };
+            assert_eq!(actual, bytes);
+            assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
+        }
     }
 
     #[test]
@@ -547,6 +552,7 @@ mod tests {
                 target.clone(),
                 Vec::new(),
                 b"whole admin document".to_vec(),
+                true,
             );
 
             let effects = operation.start();
@@ -573,6 +579,7 @@ mod tests {
             document,
             Vec::new(),
             b"user whole document".to_vec(),
+            true,
         );
 
         let effects = operation.start();
@@ -596,6 +603,7 @@ mod tests {
             document,
             Vec::new(),
             b"realm config whole document".to_vec(),
+            true,
         );
 
         let effects = operation.start();

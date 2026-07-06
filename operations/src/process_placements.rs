@@ -184,12 +184,16 @@ impl ProcessPlacementsOperation {
         }
 
         self.state = PlacementState::Publish;
+        // Only the placement's authoritative origin may mint the document's topic
+        // genesis; a replica-holder node re-publishing waits for it to replicate in.
+        let allow_genesis = record.authoritative_node_id == self.config.local_node_id;
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document_with_peers(
                 record.target.topic_id(),
                 self.config.local_node_id,
                 Some(record.target),
                 newly_selected,
+                allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
@@ -529,5 +533,72 @@ mod tests {
         assert!(!operation.retry_needed);
         assert_eq!(operation.state, PlacementState::StorePlacement);
         assert!(operation.current.is_none());
+    }
+
+    fn node_usage_target() -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeUsage {
+            realm_id: RealmId::from_bytes([8u8; 32]),
+            node_id: node(1),
+            group_id: None,
+        }
+    }
+
+    fn announce_outbox_allow_genesis(effects: Effects) -> bool {
+        let Some(Effect::SubOperation(mut sub)) = effects.into_iter().next() else {
+            panic!("expected announce sub-operation");
+        };
+        let _read = sub.start();
+        let write_effects = sub.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(vec![0u8]),
+            value: Some(aruna_core::types::Value::from(vec![1u8])),
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = write_effects.as_slice() else {
+            panic!("expected announce outbox write, got {write_effects:?}");
+        };
+        let record: aruna_core::document::DocumentSyncOutboxRecord =
+            postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
+        record.allow_genesis
+    }
+
+    #[test]
+    fn announce_allow_genesis_tracks_authoritative_origin() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let local = node(1);
+
+        let mut origin = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: local,
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        origin.realm_nodes = vec![local, node(2), node(3)];
+        origin.records = vec![new_placement(
+            realm_id,
+            node_usage_target(),
+            local,
+            3,
+            Vec::new(),
+        )];
+        assert!(
+            announce_outbox_allow_genesis(origin.emit_next_record()),
+            "origin (authoritative == local) may mint genesis"
+        );
+
+        let mut replica = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        replica.realm_nodes = vec![local, node(2), node(3)];
+        replica.records = vec![new_placement(
+            realm_id,
+            node_usage_target(),
+            local,
+            3,
+            Vec::new(),
+        )];
+        assert!(
+            !announce_outbox_allow_genesis(replica.emit_next_record()),
+            "replica-holder (authoritative != local) must not mint genesis"
+        );
     }
 }
