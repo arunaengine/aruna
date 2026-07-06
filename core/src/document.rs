@@ -134,15 +134,18 @@ pub enum DocumentSyncPublish {
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
         change: DocumentSyncChange,
+        allow_genesis: bool,
     },
     AdminOperation {
         target: DocumentSyncTarget,
         event: Box<AdminDocumentEvent>,
+        allow_genesis: bool,
     },
     Delete {
         event_id: Ulid,
         target: DocumentSyncTarget,
         change: DocumentSyncChange,
+        allow_genesis: bool,
     },
 }
 
@@ -172,6 +175,14 @@ impl DocumentSyncPublish {
         match self {
             Self::Upsert { event_id, .. } | Self::Delete { event_id, .. } => *event_id,
             Self::AdminOperation { event, .. } => event.event_id,
+        }
+    }
+
+    pub fn allow_genesis(&self) -> bool {
+        match self {
+            Self::Upsert { allow_genesis, .. }
+            | Self::Delete { allow_genesis, .. }
+            | Self::AdminOperation { allow_genesis, .. } => *allow_genesis,
         }
     }
 }
@@ -689,6 +700,7 @@ mod tests {
             target: target.clone(),
             bytes: vec![1, 2],
             change,
+            allow_genesis: true,
         };
         let event = DocumentSyncEvent::Upsert {
             event_id,
@@ -700,6 +712,7 @@ mod tests {
         assert_eq!(outbox.kind(), b"upsert");
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
+        assert!(publish.allow_genesis());
         assert_eq!(event.target(), &target);
         assert_eq!(event.event_id(), event_id);
     }
@@ -716,6 +729,7 @@ mod tests {
             event_id,
             target: target.clone(),
             change,
+            allow_genesis: false,
         };
         let event = DocumentSyncEvent::Delete {
             event_id,
@@ -726,6 +740,7 @@ mod tests {
         assert_eq!(outbox.kind(), b"delete");
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
+        assert!(!publish.allow_genesis());
         assert_eq!(event.target(), &target);
         assert_eq!(event.event_id(), event_id);
     }

@@ -337,7 +337,10 @@ impl DocumentSyncService {
         let mut seen_topics = BTreeSet::new();
         for target in targets {
             if seen_topics.insert(target.sync_topic_id()) {
-                self.ensure_topic(target, &sync_peers)?;
+                // Called on the realm node that already holds these documents to
+                // admit an onboarding peer, so it may create any still-missing
+                // topic genesis for documents it originated/holds.
+                self.ensure_topic(target, &sync_peers, true)?;
             }
         }
 
@@ -616,12 +619,14 @@ impl DocumentSyncService {
         let mut published: BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock> =
             BTreeMap::new();
         for document in documents {
+            let allow_genesis = document.allow_genesis();
             let event = match document {
                 DocumentSyncPublish::Upsert {
                     event_id,
                     target,
                     bytes,
                     change,
+                    ..
                 } => DocumentSyncEvent::Upsert {
                     event_id,
                     target,
@@ -632,12 +637,13 @@ impl DocumentSyncService {
                     event_id,
                     target,
                     change,
+                    ..
                 } => DocumentSyncEvent::Delete {
                     event_id,
                     target,
                     change,
                 },
-                DocumentSyncPublish::AdminOperation { target, event } => {
+                DocumentSyncPublish::AdminOperation { target, event, .. } => {
                     DocumentSyncEvent::AdminOperation { target, event }
                 }
             };
@@ -653,6 +659,7 @@ impl DocumentSyncService {
                 actor_id,
                 envelope,
                 sync_peers,
+                allow_genesis,
                 &mut fast_path,
                 &mut fallback,
             )?;
@@ -682,6 +689,7 @@ impl DocumentSyncService {
         actor_id: irokle_crate::ActorId,
         envelope: EventEnvelope,
         sync_peers: &BTreeSet<PeerId>,
+        allow_genesis: bool,
         fast_path: &mut usize,
         fallback: &mut usize,
     ) -> Result<irokle_crate::Op> {
@@ -695,6 +703,11 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .is_none();
         if topic_missing {
+            // Only the document's origin may mint its topic genesis. Any other
+            // publisher waits (retryable) for that genesis to replicate in.
+            if !allow_genesis {
+                return Err(NetError::TopicNotReady(topic_id.to_string()));
+            }
             let genesis = TopicGenesis {
                 event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
                 initial_peers: sync_peers.clone(),
@@ -718,7 +731,7 @@ impl DocumentSyncService {
                 }
             }
         }
-        let topic_id = self.ensure_topic(target, sync_peers)?;
+        let topic_id = self.ensure_topic(target, sync_peers, allow_genesis)?;
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))
@@ -771,6 +784,7 @@ impl DocumentSyncService {
         &self,
         target: &DocumentSyncTarget,
         peers: &BTreeSet<PeerId>,
+        allow_genesis: bool,
     ) -> Result<irokle_crate::TopicId> {
         let topic_id = target.sync_topic_id();
         let mut genesis_error = None;
@@ -809,6 +823,12 @@ impl DocumentSyncService {
                     self.net.schedule_topic_recheck(topic_id)?;
                 }
                 return Ok(topic_id);
+            }
+
+            // Only the document's origin may mint the genesis; other publishers
+            // wait (retryable) for it to replicate in.
+            if !allow_genesis {
+                return Err(NetError::TopicNotReady(topic_id.to_string()));
             }
 
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
@@ -6340,6 +6360,7 @@ mod tests {
                         target: target.clone(),
                         bytes: restart_payload(),
                         change: revision_change(),
+                        allow_genesis: true,
                     }],
                     Vec::new(),
                 )
@@ -7042,6 +7063,83 @@ mod tests {
         assert!(prune_jobs[0].last_error.is_none());
     }
 
+    // A publisher that is not the document's origin (allow_genesis=false) must not
+    // mint a missing topic's genesis: it gets a retryable error and no topic is
+    // created. The origin (allow_genesis=true) creates the topic and publishes.
+    #[tokio::test]
+    async fn missing_topic_publish_requires_allow_genesis() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(61).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::new(),
+        };
+        let topic_id = target.sync_topic_id();
+        let change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        let blocked = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::new(),
+                    target: target.clone(),
+                    bytes: b"blocked".to_vec(),
+                    change,
+                    allow_genesis: false,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(blocked, DocumentSyncNetEvent::Error { .. }),
+            "non-origin publish must fail retryably: {blocked:?}"
+        );
+        assert!(
+            !service.has_topic(topic_id).expect("topic lookup"),
+            "no genesis may be minted without allow_genesis"
+        );
+
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::new(),
+                    target: target.clone(),
+                    bytes: b"origin".to_vec(),
+                    change,
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "origin publish must succeed: {published:?}"
+        );
+        assert!(
+            service.has_topic(topic_id).expect("topic lookup"),
+            "origin publish must create the topic genesis"
+        );
+    }
+
     // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
     // `?`-propagated that refusal the applied-ops cursor would never advance, so each
     // reconcile would re-materialize the whole post-cursor history. The upsert/delete
@@ -7097,15 +7195,18 @@ mod tests {
                         target: target.clone(),
                         bytes: b"whole-document-admin-upsert".to_vec(),
                         change: change(DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
                     },
                     DocumentSyncPublish::Delete {
                         event_id: Ulid::new(),
                         target: target.clone(),
                         change: change(DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(admin_event),
+                        allow_genesis: true,
                     },
                 ],
                 Vec::new(),

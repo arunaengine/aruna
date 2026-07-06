@@ -19,6 +19,12 @@ pub enum NetError {
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
 
+    /// The document sync topic has no local genesis yet and this publisher is not
+    /// the document's origin, so it may not mint one. Retryable: the write waits
+    /// for the origin's genesis to replicate in.
+    #[error("Document sync topic {0} not ready")]
+    TopicNotReady(String),
+
     #[error("I/O error: {0}")]
     Io(String),
 
