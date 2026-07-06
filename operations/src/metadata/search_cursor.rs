@@ -166,10 +166,19 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
     hits
 }
 
+// Must mirror craqle's limit_search_hits ordering exactly (quantized score key,
+// then graph and subject IRIs) so each node's returned list is a prefix of the
+// merged order; a mismatch would let the watermark permanently skip hits at
+// fetch boundaries. Accepted best-effort gap: exact BM25 ties truncated inside
+// Tantivy's per-graph top-k can still exclude a doc that later resurfaces above
+// the watermark.
+fn score_key(score: f32) -> i64 {
+    (score as f64 * 1_000_000.0) as i64
+}
+
 fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) -> Ordering {
-    right
-        .score
-        .total_cmp(&left.score)
+    score_key(right.score)
+        .cmp(&score_key(left.score))
         .then_with(|| left.graph_iri.cmp(&right.graph_iri))
         .then_with(|| left.subject_iri.cmp(&right.subject_iri))
 }
@@ -259,9 +268,8 @@ pub fn resume_fetch_limit(
 }
 
 fn hit_after_watermark(hit: &MetadataSearchHit, watermark: &SearchWatermark) -> bool {
-    watermark
-        .score
-        .total_cmp(&hit.score)
+    score_key(watermark.score)
+        .cmp(&score_key(hit.score))
         .then_with(|| hit.graph_iri.cmp(&watermark.graph_iri))
         .then_with(|| hit.subject_iri.cmp(&watermark.subject_iri))
         == Ordering::Greater
@@ -410,6 +418,50 @@ mod tests {
                 ("https://w3id.org/aruna/01B", "./file-b.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn paginate_does_not_skip_hits_within_a_score_quantization_bucket() {
+        // Raw f32 order (b above a) opposes the IRI tie-break inside one 1e-6
+        // score bucket; the coordinator must follow craqle's quantized ordering
+        // or page one's watermark would silently drop b forever.
+        let a = hit("01A", "./a", 0.100_000_1);
+        let b = hit("01B", "./b", 0.100_000_4);
+        assert_eq!(score_key(a.score), score_key(b.score));
+        assert!(b.score > a.score);
+
+        // Page 1: the node returns its craqle-ordered top-1 prefix.
+        let page1 = paginate(
+            vec![NodeSearchResult {
+                node_id: node_id(1),
+                hits: vec![a.clone()],
+                saturated: true,
+            }],
+            None,
+            1,
+            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+        );
+        assert_eq!(page1.hits.len(), 1);
+        assert_eq!(page1.hits[0].subject_iri, "./a");
+        let next = page1.next.expect("node was saturated");
+
+        // Page 2: the deeper fetch surfaces b, which must still be emitted.
+        let page2 = paginate(
+            vec![NodeSearchResult {
+                node_id: node_id(1),
+                hits: vec![a, b],
+                saturated: false,
+            }],
+            Some(next.watermark),
+            1,
+            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+        );
+        let subjects: Vec<_> = page2
+            .hits
+            .iter()
+            .map(|hit| hit.subject_iri.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["./b"]);
     }
 
     #[test]
