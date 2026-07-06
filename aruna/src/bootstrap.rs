@@ -53,6 +53,7 @@ pub async fn announce_core_documents(
     driver_ctx: &DriverContext,
     node_id: NodeId,
     realm_id: &aruna_core::structs::RealmId,
+    allow_genesis: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let driver_ctx = driver_ctx.clone();
     let realm_id = *realm_id;
@@ -73,6 +74,10 @@ pub async fn announce_core_documents(
                 local_node_id: node_id,
                 excluded_peers: Vec::new(),
                 documents,
+                // Only the realm-bootstrap node may mint the shared node-usage
+                // genesis; joining/provisioned nodes announce with false and wait
+                // for it to replicate in.
+                allow_genesis,
             }),
             &driver_ctx,
         )

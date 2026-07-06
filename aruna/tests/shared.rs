@@ -553,7 +553,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         context.as_ref(),
     )
     .await?;
-    announce_core_documents(context.as_ref(), net.node_id(), &realm_id).await?;
+    announce_core_documents(context.as_ref(), net.node_id(), &realm_id, true).await?;
     drive(
         ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: Actor {
@@ -644,7 +644,13 @@ async fn spawn_joiner_node_with_mode(
         OnboardingPhase::CoreDocumentsFetched,
     )
     .await?;
-    announce_core_documents(joiner_context.as_ref(), config.node_id, &config.realm_id).await?;
+    announce_core_documents(
+        joiner_context.as_ref(),
+        config.node_id,
+        &config.realm_id,
+        false,
+    )
+    .await?;
     mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     announce_realm_presence(joiner_context.as_ref(), &config.realm_id, config.node_id).await?;
 

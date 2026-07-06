@@ -25,6 +25,11 @@ pub struct ReplicateDocumentsConfig {
     pub local_node_id: NodeId,
     pub excluded_peers: Vec<NodeId>,
     pub documents: Vec<DocumentSyncTarget>,
+    /// Whether announces this run may mint a missing topic genesis. True for the
+    /// document's origin; for the shared node-usage topic only the realm-bootstrap
+    /// node passes true, so joining nodes ride the TopicNotReady retry instead of
+    /// forking the genesis.
+    pub allow_genesis: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -86,6 +91,9 @@ pub fn replicate_documents_effect(
             local_node_id,
             excluded_peers: Vec::new(),
             documents,
+            // The node authoring the change originates every document it replicates
+            // here, so it may mint any missing topic genesis.
+            allow_genesis: true,
         }),
         |result| {
             Event::SubOperation(SubOperationEvent::DocumentSyncResult {
@@ -180,10 +188,7 @@ impl ReplicateDocumentsOperation {
                 self.config.local_node_id,
                 Some(document),
                 selected_peers,
-                // Replication runs on the node that authored the change and stamps
-                // itself as the placement's authoritative origin, so it may mint the
-                // document's topic genesis.
-                true,
+                self.config.allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
@@ -361,6 +366,7 @@ mod tests {
             local_node_id: node(1),
             excluded_peers: Vec::new(),
             documents: Vec::new(),
+            allow_genesis: true,
         });
         operation.state = ReplicateDocumentsState::ScheduleRetry;
         operation.retry_needed = true;
@@ -383,6 +389,7 @@ mod tests {
             local_node_id: node(1),
             excluded_peers: Vec::new(),
             documents: vec![target.clone()],
+            allow_genesis: true,
         });
         operation.realm_nodes = vec![node(2), node(3)];
 
@@ -404,6 +411,7 @@ mod tests {
             local_node_id,
             excluded_peers: Vec::new(),
             documents: vec![target],
+            allow_genesis: true,
         });
         operation.realm_nodes = vec![local_node_id, node(2)];
 
@@ -427,6 +435,7 @@ mod tests {
             local_node_id,
             excluded_peers: Vec::new(),
             documents: vec![target.clone()],
+            allow_genesis: true,
         });
         operation.state = ReplicateDocumentsState::Publish;
         operation.placement_action = Some(PlacementAction::Delete(target));
@@ -457,6 +466,7 @@ mod tests {
             local_node_id: node(1),
             excluded_peers: Vec::new(),
             documents: vec![target.clone()],
+            allow_genesis: true,
         });
         first.realm_nodes = realm_nodes.clone();
         let _ = first.emit_next_publish();
@@ -466,6 +476,7 @@ mod tests {
             local_node_id: node(9),
             excluded_peers: Vec::new(),
             documents: vec![target],
+            allow_genesis: true,
         });
         second.realm_nodes = realm_nodes;
         let _ = second.emit_next_publish();
@@ -490,6 +501,7 @@ mod tests {
             local_node_id: node(1),
             excluded_peers: Vec::new(),
             documents: vec![group_target(4)],
+            allow_genesis: true,
         });
         operation.realm_nodes = vec![node(2), node(3)];
 
