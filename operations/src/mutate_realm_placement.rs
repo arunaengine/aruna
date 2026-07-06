@@ -28,6 +28,7 @@ use ulid::Ulid;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::placement::placement_ref_for_target;
 use crate::sync_placement::schedule_placement_revalidation_effect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +284,7 @@ impl MutateRealmPlacementOperation {
             Some(&reducer_state),
         );
         let document_target = self.document_ref();
+        let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
@@ -299,6 +301,7 @@ impl MutateRealmPlacementOperation {
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(admin_event),
             },
+            placement,
             false,
         );
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

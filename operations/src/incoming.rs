@@ -369,6 +369,7 @@ async fn reemit_evicted_documents(
             document.target,
             Vec::new(),
             document.event,
+            aruna_core::structs::PlacementRef::NIL,
             document.allow_genesis,
         );
         let effect = match write_outbox_effect(&record) {

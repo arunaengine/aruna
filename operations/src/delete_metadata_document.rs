@@ -189,6 +189,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
+            self.placement_ref,
             true,
         ))
     }
@@ -237,6 +238,7 @@ impl DeleteMetadataDocumentOperation {
             DocumentSyncOutboxEvent::Upsert { bytes, change },
             // First (and only) write to the per-graph lifecycle topic, so the
             // deleting holder originates and may mint its genesis.
+            self.placement_ref,
             true,
         );
         Ok(smallvec![
@@ -277,6 +279,7 @@ impl DeleteMetadataDocumentOperation {
             // Registry delete rides the document's own topic and shares the delete
             // publish batch with the tombstones above; keep it consistent so the
             // batch is not blocked mid-flight.
+            self.placement_ref,
             true,
         );
         Ok(smallvec![

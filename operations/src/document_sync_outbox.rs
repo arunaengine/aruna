@@ -5,6 +5,7 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, Do
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+use aruna_core::structs::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_secs;
@@ -47,26 +48,45 @@ pub fn new_outbox_record(
     target: DocumentSyncTarget,
     peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(Ulid::r#gen(), node_id, target, peers, event, allow_genesis)
+    new_outbox_record_with_id(
+        Ulid::r#gen(),
+        node_id,
+        target,
+        peers,
+        event,
+        admin_placement,
+        allow_genesis,
+    )
 }
 
+/// `admin_placement` is only consulted for `AdminOperation` records (which carry
+/// no envelope change); `Upsert`/`Delete` always take their ref from the event's
+/// change so the record and its envelope can never diverge.
 pub fn new_outbox_record_with_id(
     outbox_id: Ulid,
     node_id: NodeId,
     target: DocumentSyncTarget,
     mut peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     crate::sync_placement::sort_node_ids(&mut peers);
+    let placement = match &event {
+        DocumentSyncOutboxEvent::Upsert { change, .. }
+        | DocumentSyncOutboxEvent::Delete { change } => change.placement,
+        DocumentSyncOutboxEvent::AdminOperation { .. } => admin_placement,
+    };
     DocumentSyncOutboxRecord {
         outbox_id,
         node_id,
         target,
         peers,
         event,
+        placement,
         updated_at: unix_timestamp_secs(),
         allow_genesis,
     }
@@ -321,6 +341,14 @@ mod tests {
         }
     }
 
+    fn placement(bucket: u32) -> aruna_core::structs::PlacementRef {
+        aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_parts(42, 1),
+            epoch: 0,
+            bucket,
+        }
+    }
+
     fn change() -> DocumentSyncChange {
         DocumentSyncChange {
             base: None,
@@ -331,7 +359,7 @@ mod tests {
                 updated_at_ms: 9,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: aruna_core::structs::PlacementRef::NIL,
+            placement: placement(5),
         }
     }
 
@@ -456,6 +484,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
@@ -505,6 +534,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -525,6 +555,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -533,6 +564,9 @@ mod tests {
 
         assert_eq!(decoded, record);
         assert!(decoded.allow_genesis);
+        // Upsert mirrors the envelope change's ref, never the admin fallback.
+        assert_eq!(decoded.placement, change().placement);
+        assert_ne!(decoded.placement, aruna_core::structs::PlacementRef::NIL);
     }
 
     #[test]
@@ -544,6 +578,7 @@ mod tests {
             DocumentSyncOutboxEvent::Delete {
                 change: delete_change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -551,6 +586,7 @@ mod tests {
             postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
+        assert_eq!(decoded.placement, delete_change().placement);
     }
 
     #[test]
@@ -559,8 +595,22 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
-        let right = new_outbox_record(node(1), target(), vec![node(2)], event, false);
+        let left = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let right = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event,
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
         let prefix = outbox_prefix(&left.event);
 
         assert_ne!(outbox_key(&left), outbox_key(&right));
@@ -574,7 +624,14 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
+        let mut older = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(
             node(1),
@@ -583,6 +640,7 @@ mod tests {
             },
             vec![node(2)],
             event,
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         newer.outbox_id = Ulid::from_parts(2, 0);
@@ -599,6 +657,7 @@ mod tests {
             target.clone(),
             Vec::new(),
             user_admin_event(user_id, 1),
+            placement(9),
             false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
@@ -607,10 +666,42 @@ mod tests {
             target,
             Vec::new(),
             user_admin_event(user_id, 2),
+            placement(9),
             false,
         );
         later.outbox_id = Ulid::from_parts(1, 1);
 
         assert!(outbox_key(&earlier) < outbox_key(&later));
+        // AdminOperation records take the supplied ref (no envelope change).
+        assert_eq!(earlier.placement, placement(9));
+    }
+
+    #[test]
+    fn outbox_key_is_byte_identical_regardless_of_placement() {
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let event = user_admin_event(user_id, 1);
+        let outbox_id = Ulid::from_parts(5, 5);
+        let target = DocumentSyncTarget::User { user_id };
+        let nil = new_outbox_record_with_id(
+            outbox_id,
+            node(1),
+            target.clone(),
+            Vec::new(),
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let bucketed = new_outbox_record_with_id(
+            outbox_id,
+            node(1),
+            target,
+            Vec::new(),
+            event,
+            placement(17),
+            false,
+        );
+        // The FIFO key layout must not depend on the placement field.
+        assert_ne!(nil.placement, bucketed.placement);
+        assert_eq!(outbox_key(&nil), outbox_key(&bucketed));
     }
 }

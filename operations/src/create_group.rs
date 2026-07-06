@@ -229,6 +229,9 @@ impl CreateGroupOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
+                // No realm config in reach here; the stage-2 topic flip resolves
+                // the real ref for this target.
+                aruna_core::structs::PlacementRef::NIL,
                 true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

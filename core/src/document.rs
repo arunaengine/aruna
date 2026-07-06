@@ -93,6 +93,10 @@ pub struct DocumentSyncOutboxRecord {
     pub target: DocumentSyncTarget,
     pub peers: Vec<NodeId>,
     pub event: DocumentSyncOutboxEvent,
+    /// Placement reference this record rides under: for `Upsert`/`Delete` the
+    /// envelope change's ref, for `AdminOperation` the target's resolved ref.
+    /// Does not affect the outbox FIFO key.
+    pub placement: PlacementRef,
     pub updated_at: u64,
     /// Whether the publisher may mint this document's sync topic genesis when it
     /// is missing. Only the node that originated the document sets this; every
