@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::structs::NotificationRecord;
+use aruna_core::structs::{NotificationRecord, WatchEventMask, WatchSubscription};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use thiserror::Error;
@@ -7,11 +7,18 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use crate::notifications::client::{list_remote, mark_read_remote, unread_count_remote};
+use crate::notifications::client::{
+    create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
+    unread_count_remote,
+};
 use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::subscriptions::{
+    WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_watch_subscription,
+    delete_watch_subscription, list_watch_subscriptions,
+};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the
@@ -24,6 +31,30 @@ pub enum NotificationDispatchError {
     Remote(String),
     #[error("{0}")]
     Internal(String),
+}
+
+/// Watch CRUD dispatch outcome. Distinguishes the per-user cap so the REST layer
+/// can answer 409 instead of a generic proxy failure.
+#[derive(Debug, Error)]
+pub enum WatchDispatchError {
+    #[error("no inbox holder is currently available")]
+    Unavailable,
+    #[error("notification watch subscription cap reached")]
+    CapExceeded,
+    #[error("holder proxy failed: {0}")]
+    Remote(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<NotificationDispatchError> for WatchDispatchError {
+    fn from(error: NotificationDispatchError) -> Self {
+        match error {
+            NotificationDispatchError::Unavailable => WatchDispatchError::Unavailable,
+            NotificationDispatchError::Remote(reason) => WatchDispatchError::Remote(reason),
+            NotificationDispatchError::Internal(reason) => WatchDispatchError::Internal(reason),
+        }
+    }
 }
 
 async fn resolve_holder(
@@ -128,5 +159,86 @@ pub async fn mark_read_for_user(
         mark_read_remote(net_handle, holder, recipient, ids, up_to_ms)
             .await
             .map_err(NotificationDispatchError::Remote)
+    }
+}
+
+pub async fn create_watch_for_user(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+) -> Result<WatchSubscription, WatchDispatchError> {
+    let holder = resolve_holder(context, owner).await?;
+    if holder == local_node_id {
+        create_watch_subscription(
+            &context.storage_handle,
+            owner,
+            path_prefix,
+            event_mask,
+            unix_timestamp_millis(),
+        )
+        .await
+        .map_err(|error| match error {
+            WatchSubscriptionError::CapExceeded => WatchDispatchError::CapExceeded,
+            other => WatchDispatchError::Internal(other.to_string()),
+        })
+    } else {
+        let net_handle = context
+            .net_handle
+            .as_ref()
+            .ok_or(WatchDispatchError::Unavailable)?;
+        create_watch_remote(net_handle, holder, owner, path_prefix, event_mask)
+            .await
+            .map_err(|reason| {
+                if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
+                    WatchDispatchError::CapExceeded
+                } else {
+                    WatchDispatchError::Remote(reason)
+                }
+            })
+    }
+}
+
+pub async fn delete_watch_for_user(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), WatchDispatchError> {
+    let holder = resolve_holder(context, owner).await?;
+    if holder == local_node_id {
+        delete_watch_subscription(&context.storage_handle, owner, watch_id)
+            .await
+            .map_err(|error| WatchDispatchError::Internal(error.to_string()))
+    } else {
+        let net_handle = context
+            .net_handle
+            .as_ref()
+            .ok_or(WatchDispatchError::Unavailable)?;
+        delete_watch_remote(net_handle, holder, owner, watch_id)
+            .await
+            .map_err(WatchDispatchError::Remote)
+    }
+}
+
+pub async fn list_watches_for_user(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    owner: UserId,
+) -> Result<Vec<WatchSubscription>, WatchDispatchError> {
+    let holder = resolve_holder(context, owner).await?;
+    if holder == local_node_id {
+        list_watch_subscriptions(&context.storage_handle, owner)
+            .await
+            .map_err(|error| WatchDispatchError::Internal(error.to_string()))
+    } else {
+        let net_handle = context
+            .net_handle
+            .as_ref()
+            .ok_or(WatchDispatchError::Unavailable)?;
+        list_watches_remote(net_handle, holder, owner)
+            .await
+            .map_err(WatchDispatchError::Remote)
     }
 }

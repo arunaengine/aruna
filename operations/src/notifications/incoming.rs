@@ -23,6 +23,9 @@ use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::subscriptions::{
+    create_watch_subscription, delete_watch_subscription, list_watch_subscriptions,
+};
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -166,11 +169,42 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
+        NotificationTransportMessage::CreateWatch {
+            owner,
+            path_prefix,
+            event_mask,
+        } => match create_watch_subscription(
+            &context.storage_handle,
+            owner,
+            path_prefix,
+            event_mask,
+            unix_timestamp_millis(),
+        )
+        .await
+        {
+            Ok(subscription) => NotificationTransportMessage::WatchCreated { subscription },
+            Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+        },
+        NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
+            match delete_watch_subscription(&context.storage_handle, owner, watch_id).await {
+                Ok(()) => NotificationTransportMessage::WatchDeleted,
+                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+            }
+        }
+        NotificationTransportMessage::ListWatches { owner } => {
+            match list_watch_subscriptions(&context.storage_handle, owner).await {
+                Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
+                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+            }
+        }
         NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
         | NotificationTransportMessage::UnreadCountResult { .. }
         | NotificationTransportMessage::MarkReadResult { .. }
-        | NotificationTransportMessage::Reject(_) => NotificationTransportMessage::Reject(
+        | NotificationTransportMessage::Reject(_)
+        | NotificationTransportMessage::WatchCreated { .. }
+        | NotificationTransportMessage::WatchDeleted
+        | NotificationTransportMessage::WatchList { .. } => NotificationTransportMessage::Reject(
             "unexpected notification control message".to_string(),
         ),
     }
@@ -312,11 +346,17 @@ fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, Stri
         NotificationTransportMessage::List { recipient, .. }
         | NotificationTransportMessage::UnreadCount { recipient }
         | NotificationTransportMessage::MarkRead { recipient, .. } => Ok(recipient.realm_id),
+        NotificationTransportMessage::CreateWatch { owner, .. }
+        | NotificationTransportMessage::DeleteWatch { owner, .. }
+        | NotificationTransportMessage::ListWatches { owner } => Ok(owner.realm_id),
         NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
         | NotificationTransportMessage::UnreadCountResult { .. }
         | NotificationTransportMessage::MarkReadResult { .. }
-        | NotificationTransportMessage::Reject(_) => {
+        | NotificationTransportMessage::Reject(_)
+        | NotificationTransportMessage::WatchCreated { .. }
+        | NotificationTransportMessage::WatchDeleted
+        | NotificationTransportMessage::WatchList { .. } => {
             Err("unexpected notification control message".to_string())
         }
     }
@@ -379,12 +419,13 @@ mod tests {
     use super::*;
     use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
-        deliver_remote, list_remote, mark_read_remote, send_notification_request,
-        unread_count_remote,
+        create_watch_remote, delete_watch_remote, deliver_remote, list_remote, list_watches_remote,
+        mark_read_remote, send_notification_request, unread_count_remote,
     };
     use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
     use aruna_core::structs::{
         Actor, NotificationClass, NotificationKind, NotificationRecord, RealmNodeKind,
+        WatchEventKind, WatchEventMask,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -1049,6 +1090,94 @@ mod tests {
         assert!(
             error.contains("exceeds maximum size"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_watch_crud_roundtrip() {
+        let realm_id = RealmId::from_bytes([64u8; 32]);
+        let a = spawn(realm_id, [64u8; 32]).await;
+        let b = spawn(realm_id, [65u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = UserId::new(Ulid::new(), realm_id);
+        let mask = WatchEventMask::from_kinds([
+            WatchEventKind::MetadataCreated,
+            WatchEventKind::DataUploaded,
+        ]);
+        let created = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            "/bucket/prefix".to_string(),
+            mask,
+        )
+        .await
+        .expect("create succeeds");
+        assert_eq!(created.owner, owner);
+        assert_eq!(created.path_prefix, "/bucket/prefix");
+        assert_eq!(created.event_mask, mask);
+
+        let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
+            .await
+            .expect("list succeeds");
+        assert_eq!(listed, vec![created.clone()]);
+
+        delete_watch_remote(&a.net, b.net.node_id(), owner, created.watch_id)
+            .await
+            .expect("delete succeeds");
+        assert!(
+            list_watches_remote(&a.net, b.net.node_id(), owner)
+                .await
+                .expect("list after delete succeeds")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_path_is_trust_gated() {
+        let realm_id = RealmId::from_bytes([66u8; 32]);
+        let b = spawn(realm_id, [67u8; 32]).await;
+        let c = spawn(realm_id, [68u8; 32]).await;
+        connect(&c, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (b.net.node_id(), RealmNodeKind::Server),
+                (c.net.node_id(), RealmNodeKind::User),
+            ],
+        )
+        .await;
+
+        let owner = UserId::new(Ulid::new(), realm_id);
+        let error = create_watch_remote(
+            &c.net,
+            b.net.node_id(),
+            owner,
+            "/bucket".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        )
+        .await
+        .expect_err("non-eligible peer must be rejected");
+        assert!(
+            error.contains("not a sync-eligible node"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty()
         );
     }
 }
