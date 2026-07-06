@@ -10,7 +10,8 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    Actor, BindingScope, DocumentClass, OidcProviderConfig, PlacementStrategy,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -94,6 +95,7 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
+        seed_placement_defaults(&mut config_doc);
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -163,6 +165,30 @@ impl CreateRealmOperation {
                 description: config_doc.description.clone(),
             },
         )?);
+        for strategy in &config_doc.strategies {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: strategy.clone(),
+                },
+            )?);
+        }
+        if let Some(default_strategy_id) = config_doc.default_strategy_id {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                    strategy_id: default_strategy_id,
+                },
+            )?);
+        }
+        for binding in &config_doc.strategy_bindings {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    binding: binding.clone(),
+                },
+            )?);
+        }
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
@@ -421,6 +447,35 @@ impl Operation for CreateRealmOperation {
     }
 }
 
+fn seed_placement_defaults(config: &mut RealmConfigDocument) {
+    let default_strategy = PlacementStrategy {
+        strategy_id: Ulid::new(),
+        name: "default".to_string(),
+        replica_count: Some(3),
+        distinct_locations: false,
+        affinity: Vec::new(),
+    };
+    let everywhere_strategy = PlacementStrategy {
+        strategy_id: Ulid::new(),
+        name: "everywhere".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+    };
+    config.default_strategy_id = Some(default_strategy.strategy_id);
+    config.strategy_bindings = vec![
+        StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: everywhere_strategy.strategy_id,
+        },
+        StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::Admin),
+            strategy_id: everywhere_strategy.strategy_id,
+        },
+    ];
+    config.strategies = vec![default_strategy, everywhere_strategy];
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -440,8 +495,8 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Actor, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        RealmNodeKind,
+        Actor, BindingScope, DocumentClass, OidcProviderConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -595,11 +650,41 @@ mod test {
             Some(config_doc.description.as_str())
         );
 
+        let seeded_strategies = config_doc.strategies.clone();
+        let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
+        let seeded_bindings = config_doc.strategy_bindings.clone();
+        assert_eq!(seeded_strategies.len(), 2);
+        assert_eq!(seeded_strategies[0].name, "default");
+        assert_eq!(seeded_strategies[0].replica_count, Some(3));
+        assert_eq!(seeded_strategies[1].name, "everywhere");
+        assert_eq!(seeded_strategies[1].replica_count, None);
+        assert_eq!(
+            config_doc.default_strategy_id,
+            Some(seeded_strategies[0].strategy_id)
+        );
+        assert_eq!(seeded_bindings.len(), 2);
+        assert_eq!(
+            config_state.materialized_realm_config_default_strategy(),
+            Some(seeded_default_strategy_id)
+        );
+        assert_eq!(
+            config_state
+                .materialized_realm_config_placement_strategies()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config_state
+                .materialized_realm_config_strategy_bindings()
+                .len(),
+            2
+        );
+
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 6);
+        assert_eq!(outbox_records.len(), 11);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -666,8 +751,83 @@ mod test {
                         description: config_doc.description,
                     },
                 ),
+                (
+                    6,
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: seeded_strategies[0].clone(),
+                    },
+                ),
+                (
+                    7,
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: seeded_strategies[1].clone(),
+                    },
+                ),
+                (
+                    8,
+                    AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                        strategy_id: seeded_default_strategy_id,
+                    },
+                ),
+                (
+                    9,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[0].clone(),
+                    },
+                ),
+                (
+                    10,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[1].clone(),
+                    },
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn seeds_default_and_everywhere_strategies_with_class_bindings() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::new();
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
+
+        let effects = operation.emit_create_config_doc().unwrap();
+        let writes = batch_writes(&effects, txn_id);
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+
+        let default = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "default")
+            .unwrap();
+        let everywhere = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "everywhere")
+            .unwrap();
+        assert_eq!(config_doc.default_strategy_id, Some(default.strategy_id));
+        assert_eq!(default.replica_count, Some(3));
+        assert!(!default.distinct_locations);
+        assert_eq!(everywhere.replica_count, None);
+
+        let bound_scopes = config_doc
+            .strategy_bindings
+            .iter()
+            .filter(|binding| binding.strategy_id == everywhere.strategy_id)
+            .map(|binding| binding.scope.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(config_doc.strategy_bindings.len(), 2);
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
     }
 
     #[test]

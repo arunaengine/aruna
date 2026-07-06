@@ -6,12 +6,17 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
-    group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-    group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
-    realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
-    realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
+    GROUP_REALM_ID_PATH, REALM_CONFIG_DEFAULT_STRATEGY_PATH, REALM_CONFIG_DESCRIPTION_PATH,
+    REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH,
+    USER_NAME_PATH, binding_scope_key, group_role_id_from_path, group_role_path,
+    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    realm_config_node_id_from_path, realm_config_node_path,
+    realm_config_oidc_provider_id_from_path, realm_config_placement_node_id_from_path,
+    realm_config_placement_override_subject_key_from_path,
+    realm_config_placement_strategy_id_from_path,
+    realm_config_strategy_binding_scope_key_from_path, realm_role_path,
+    realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
+    user_subject_id_path,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -2311,6 +2316,15 @@ fn overlay_realm_config_reducer_materialization(
         config.quota = quota;
     }
 
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        && let Some(default_strategy_id) =
+            reducer_state.materialized_realm_config_default_strategy()
+    {
+        config.default_strategy_id = Some(default_strategy_id);
+    }
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -2343,6 +2357,82 @@ fn overlay_realm_config_reducer_materialization(
         }
         if let Some(provider) = materialized_providers.get(provider_id) {
             config.oidc_providers.push(provider.clone());
+        }
+    }
+
+    let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(node_id) = realm_config_placement_node_id_from_path(path) {
+            remove_realm_config_placement_entry(config, &node_id);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(node_id) = realm_config_placement_node_id_from_path(path) else {
+            continue;
+        };
+        remove_realm_config_placement_entry(config, &node_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(entry) = materialized_placement_map.get(&node_id) {
+            config.placement_map.push(entry.clone());
+        }
+    }
+
+    let materialized_strategies = reducer_state.materialized_realm_config_placement_strategies();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) {
+            remove_realm_config_placement_strategy(config, &strategy_id);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) else {
+            continue;
+        };
+        remove_realm_config_placement_strategy(config, &strategy_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(strategy) = materialized_strategies.get(&strategy_id) {
+            config.strategies.push(strategy.clone());
+        }
+    }
+
+    let materialized_bindings = reducer_state.materialized_realm_config_strategy_bindings();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) {
+            remove_realm_config_strategy_binding(config, scope_key);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) else {
+            continue;
+        };
+        remove_realm_config_strategy_binding(config, scope_key);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(binding) = materialized_bindings.get(scope_key) {
+            config.strategy_bindings.push(binding.clone());
+        }
+    }
+
+    let materialized_overrides = reducer_state.materialized_realm_config_placement_overrides();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) {
+            remove_realm_config_placement_override(config, subject_key);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) else {
+            continue;
+        };
+        remove_realm_config_placement_override(config, subject_key);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(record) = materialized_overrides.get(subject_key) {
+            config.placement_overrides.push(record.clone());
         }
     }
 }
@@ -2382,6 +2472,30 @@ fn remove_realm_config_oidc_provider(config: &mut RealmConfigDocument, provider_
     config
         .oidc_providers
         .retain(|provider| provider.id != provider_id);
+}
+
+fn remove_realm_config_placement_entry(config: &mut RealmConfigDocument, node_id: &NodeId) {
+    config
+        .placement_map
+        .retain(|entry| entry.node_id != *node_id);
+}
+
+fn remove_realm_config_placement_strategy(config: &mut RealmConfigDocument, strategy_id: &Ulid) {
+    config
+        .strategies
+        .retain(|strategy| strategy.strategy_id != *strategy_id);
+}
+
+fn remove_realm_config_strategy_binding(config: &mut RealmConfigDocument, scope_key: &str) {
+    config
+        .strategy_bindings
+        .retain(|binding| binding_scope_key(&binding.scope) != scope_key);
+}
+
+fn remove_realm_config_placement_override(config: &mut RealmConfigDocument, subject_key: &str) {
+    config
+        .placement_overrides
+        .retain(|record| hex::encode(&record.subject) != subject_key);
 }
 
 fn admin_document_target_for_reduced_document(
@@ -2968,9 +3082,18 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigSettingsSet { .. }
             | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
             | AdminDocumentOperation::RealmConfigQuotaSet { .. }
+            | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
+            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
+            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, and quota updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
                 .to_string(),
         ));
     }
@@ -3998,10 +4121,11 @@ mod tests {
         subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, GroupQuotaOverride, MetadataReplicationConfig,
-        OidcProviderConfig, Permission, QuotaConfig, RealmAuthorizationDocument,
+        Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
+        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
+        PlacementOverride, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
         RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
-        StaticRealmEndpoint, UserGroupCapOverride,
+        StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
@@ -4715,6 +4839,115 @@ mod tests {
                 .materialized_realm_config_description()
                 .as_deref(),
             Some("Replicated Realm")
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_config_placement_admin_ops_materialize_existing_config() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_500, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let entry = NodePlacementEntry {
+            node_id: actor.node_id,
+            location: "eu-west".to_string(),
+            weight: 250,
+            full: false,
+            draining: false,
+            label_overrides: BTreeMap::new(),
+        };
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_parts(1_501, 1),
+            name: "default".to_string(),
+            replica_count: Some(3),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let binding = StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: strategy.strategy_id,
+        };
+        let record = PlacementOverride {
+            subject: b"document-subject".to_vec(),
+            pinned: vec![actor.node_id],
+            excluded: Vec::new(),
+            strategy_id: Some(strategy.strategy_id),
+        };
+
+        for (index, op) in [
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: entry.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                strategy_id: strategy.strategy_id,
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: binding.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: record.clone(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = index as u64 + 1;
+            apply_admin_document_operation_to_storage(
+                &storage,
+                document_target.clone(),
+                test_admin_event(
+                    Ulid::from_parts(1_502 + seq, 1),
+                    target.clone(),
+                    &actor,
+                    seq,
+                    op,
+                ),
+            )
+            .await
+            .expect("placement op applies");
+        }
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.placement_map, vec![entry]);
+        assert_eq!(config.strategies, vec![strategy.clone()]);
+        assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
+        assert_eq!(config.strategy_bindings, vec![binding]);
+        assert_eq!(config.placement_overrides, vec![record]);
+
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state.materialized_realm_config_default_strategy(),
+            Some(strategy.strategy_id)
         );
     }
 
