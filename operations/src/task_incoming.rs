@@ -52,6 +52,9 @@ use crate::notifications::prune::{
     NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
     process_notification_prune_batch, restore_notification_prune_timer,
 };
+use crate::notifications::watch::interest::{
+    WATCH_INTEREST_PUBLISH_DEBOUNCE, restore_watch_interest_publish_timer,
+};
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
@@ -502,6 +505,25 @@ impl OperationsTaskHandler {
         }
     }
 
+    async fn publish_watch_interest(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!("Cannot publish watch interest without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        if let Err(error) =
+            crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
+                .await
+        {
+            warn!(error = %error, "Failed to publish watch interest");
+            self.reschedule_timer(
+                TaskKey::PublishWatchInterest,
+                WATCH_INTEREST_PUBLISH_DEBOUNCE,
+            )
+            .await;
+        }
+    }
+
     async fn drain_metadata_materialization_queue(&self) {
         match process_metadata_materialization_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
@@ -905,6 +927,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         restore_notification_outbox_timer(
             &context.storage_handle,
             &task_handle,
@@ -928,6 +951,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+    restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
@@ -1077,6 +1101,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PruneNotifications => {
                 self.prune_notifications().await;
+            }
+            TaskKey::PublishWatchInterest => {
+                self.publish_watch_interest().await;
             }
         }
     }

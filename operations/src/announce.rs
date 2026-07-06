@@ -306,10 +306,10 @@ impl AnnounceTopicOperation {
                     kind: DocumentSyncChangeKind::Upsert,
                 })
             }
-            // Node usage snapshots are single-writer per key and applied as plain
-            // upserts (last event wins), so the change only needs a monotonic
-            // wall-clock generation from this node.
-            DocumentSyncTarget::NodeUsage { .. } => {
+            // Node usage snapshots and watch-interest digests are single-writer
+            // per key and applied as plain upserts (last event wins), so the
+            // change only needs a monotonic wall-clock generation from this node.
+            DocumentSyncTarget::NodeUsage { .. } | DocumentSyncTarget::WatchInterest { .. } => {
                 let now = aruna_core::util::unix_timestamp_millis();
                 Ok(DocumentSyncChange {
                     base: None,

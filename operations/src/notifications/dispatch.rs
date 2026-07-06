@@ -15,6 +15,7 @@ use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperat
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_watch_subscription,
     delete_watch_subscription, list_watch_subscriptions,
@@ -171,7 +172,7 @@ pub async fn create_watch_for_user(
 ) -> Result<WatchSubscription, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
-        create_watch_subscription(
+        let subscription = create_watch_subscription(
             &context.storage_handle,
             owner,
             path_prefix,
@@ -182,7 +183,9 @@ pub async fn create_watch_for_user(
         .map_err(|error| match error {
             WatchSubscriptionError::CapExceeded => WatchDispatchError::CapExceeded,
             other => WatchDispatchError::Internal(other.to_string()),
-        })
+        })?;
+        schedule_watch_interest_publish(context).await;
+        Ok(subscription)
     } else {
         let net_handle = context
             .net_handle
@@ -210,7 +213,9 @@ pub async fn delete_watch_for_user(
     if holder == local_node_id {
         delete_watch_subscription(&context.storage_handle, owner, watch_id)
             .await
-            .map_err(|error| WatchDispatchError::Internal(error.to_string()))
+            .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
+        schedule_watch_interest_publish(context).await;
+        Ok(())
     } else {
         let net_handle = context
             .net_handle
