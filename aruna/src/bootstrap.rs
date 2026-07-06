@@ -105,6 +105,10 @@ async fn core_document_targets(
             node_id,
             group_id: None,
         },
+        // Announce the shared realm-scoped node-info topic so every realm node
+        // subscribes at bootstrap and sees late joiners' info within the sync
+        // window (closes the <=60s late-joiner visibility gap).
+        DocumentSyncTarget::NodeInfo { realm_id, node_id },
         // Announce the shared realm-scoped watch-interest topic so every realm
         // node subscribes to it and receives all peers' watch-interest digests.
         DocumentSyncTarget::WatchInterest { realm_id, node_id },

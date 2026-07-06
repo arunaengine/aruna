@@ -347,21 +347,22 @@ impl Operation for SetNodePlacementOperation {
 }
 
 /// Overlays the reducer's materialized placement entry onto the config document,
-/// mirroring the replicated materialization in `net::irokle`: the stored entry is
-/// only updated from a non-conflicted, materialized value, so a conflicted
-/// placement path leaves the last agreed entry untouched.
+/// mirroring the replicated materialization in `net::irokle` and
+/// `ensure_realm_config`: the stored entry is always dropped first, a conflicted
+/// placement path leaves it removed, and only a non-conflicted materialized
+/// value is re-added.
 fn apply_reducer_placement_entry(
     document: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
     entry: &NodePlacementEntry,
 ) {
     let path = realm_config_placement_node_path(&entry.node_id);
-    if reducer_state.conflicts.contains_key(&path) {
-        return;
-    }
     document
         .placement_map
         .retain(|existing| existing.node_id != entry.node_id);
+    if reducer_state.conflicts.contains_key(&path) {
+        return;
+    }
     if let Some(materialized) = reducer_state
         .materialized_realm_config_placement_map()
         .get(&entry.node_id)
@@ -478,5 +479,48 @@ mod tests {
                 AdminDocumentReducerError::ReservedPlacementLabel
             )
         ));
+    }
+
+    #[test]
+    fn conflicted_placement_path_removes_entry() {
+        use aruna_core::admin_document_reducer::{
+            AdminDocumentConflict, AdminDocumentConflictValue,
+        };
+        use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentTarget};
+        use ulid::Ulid;
+
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let entry = NodePlacementEntry {
+            node_id: node(2),
+            location: "eu".to_string(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.placement_map.push(entry.clone());
+
+        let mut reducer_state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let path = realm_config_placement_node_path(&entry.node_id);
+        reducer_state.conflicts.insert(
+            path.clone(),
+            AdminDocumentConflict {
+                path,
+                values: vec![AdminDocumentConflictValue {
+                    value: Some("conflicted".to_string()),
+                    dot: AdminDocumentDot {
+                        event_id: Ulid::from_bytes([3u8; 16]),
+                        origin_node_id: node(3),
+                        origin_seq: 1,
+                    },
+                }],
+            },
+        );
+
+        // Conflicted path: the previously stored entry is removed, not retained.
+        apply_reducer_placement_entry(&mut document, &reducer_state, &entry);
+        assert!(document.placement_entry(entry.node_id).is_none());
     }
 }

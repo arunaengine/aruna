@@ -4,8 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
-    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY,
-    NodePlacementEntry, RealmId, RealmNodeKind, ResourceEvent,
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, KIND_LABEL_KEY, NodePlacementEntry, RealmId,
+    RealmNodeKind, ResourceEvent, normalize_node_placement_input,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -85,6 +85,8 @@ pub enum BootstrapOnboardingFinalizeError {
     PeerAdmission(String),
     #[error("placement labels must not set the reserved kind label")]
     ReservedNodeLabel,
+    #[error("placement location must be at most 64 characters")]
+    NodeLocationTooLong,
 }
 
 pub async fn bootstrap_onboarding_finalize(
@@ -248,10 +250,13 @@ async fn set_joiner_placement_entry(
     if input.node_labels.contains_key(KIND_LABEL_KEY) {
         return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel);
     }
+    let (location, weight) =
+        normalize_node_placement_input(input.node_location.as_deref(), input.node_weight)
+            .map_err(|_| BootstrapOnboardingFinalizeError::NodeLocationTooLong)?;
     let entry = NodePlacementEntry {
         node_id: input.node_id,
-        location: input.node_location.clone().unwrap_or_default(),
-        weight: input.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
+        location,
+        weight,
         full: false,
         draining: false,
         labels: input.node_labels.clone(),
@@ -315,7 +320,8 @@ mod tests {
         OnboardingMode, OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
     };
     use aruna_core::structs::{
-        Actor, NotificationKind, NotificationOutboxRecord, RealmAuthorizationDocument, RealmId,
+        Actor, KIND_LABEL_KEY, NotificationKind, NotificationOutboxRecord,
+        RealmAuthorizationDocument, RealmId,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -758,5 +764,33 @@ mod tests {
         );
 
         assert!(read_outbox_rows(&fixture.storage_handle).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_reserved_node_label() {
+        let fixture = setup_finalize_fixture().await;
+        let mut input = finalize_input(&fixture, fixture.joiner_node_id, 10);
+        input
+            .node_labels
+            .insert(KIND_LABEL_KEY.to_string(), "Server".to_string());
+
+        let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
+        assert_eq!(
+            result,
+            Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel)
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_overlong_location() {
+        let fixture = setup_finalize_fixture().await;
+        let mut input = finalize_input(&fixture, fixture.joiner_node_id, 10);
+        input.node_location = Some("x".repeat(65));
+
+        let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
+        assert_eq!(
+            result,
+            Err(BootstrapOnboardingFinalizeError::NodeLocationTooLong)
+        );
     }
 }
