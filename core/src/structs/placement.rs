@@ -2,10 +2,46 @@ use crate::NodeId;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use thiserror::Error;
 use ulid::Ulid;
 
 pub const DEFAULT_LOCATION: &str = "default";
 pub const DEFAULT_NODE_WEIGHT: u32 = 100;
+/// Upper bound for a configurable node weight; onboarding/config inputs clamp
+/// present values into `1..=MAX_NODE_WEIGHT`.
+pub const MAX_NODE_WEIGHT: u32 = 10_000;
+/// Maximum accepted placement location length (bytes, after trim).
+pub const MAX_NODE_LOCATION_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum NodePlacementInputError {
+    #[error("placement location must be at most {MAX_NODE_LOCATION_LEN} characters")]
+    LocationTooLong,
+}
+
+/// Normalizes onboarding/config-sourced placement inputs: trims the location
+/// (empty-after-trim ⇒ unset), rejects locations longer than
+/// [`MAX_NODE_LOCATION_LEN`], clamps a present weight into `1..=MAX_NODE_WEIGHT`,
+/// and defaults an absent weight to [`DEFAULT_NODE_WEIGHT`].
+pub fn normalize_node_placement_input(
+    location: Option<&str>,
+    weight: Option<u32>,
+) -> Result<(String, u32), NodePlacementInputError> {
+    let location = match location {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.len() > MAX_NODE_LOCATION_LEN {
+                return Err(NodePlacementInputError::LocationTooLong);
+            }
+            trimmed.to_string()
+        }
+        None => String::new(),
+    };
+    let weight = weight
+        .map(|weight| weight.clamp(1, MAX_NODE_WEIGHT))
+        .unwrap_or(DEFAULT_NODE_WEIGHT);
+    Ok((location, weight))
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct NodePlacementEntry {
@@ -209,6 +245,42 @@ mod tests {
                 binding
             );
         }
+    }
+
+    #[test]
+    fn normalize_placement_input_clamps_and_validates() {
+        assert_eq!(
+            normalize_node_placement_input(None, None).unwrap(),
+            (String::new(), DEFAULT_NODE_WEIGHT)
+        );
+        assert_eq!(normalize_node_placement_input(None, Some(0)).unwrap().1, 1);
+        assert_eq!(
+            normalize_node_placement_input(None, Some(50_000))
+                .unwrap()
+                .1,
+            MAX_NODE_WEIGHT
+        );
+        assert_eq!(
+            normalize_node_placement_input(None, Some(250)).unwrap().1,
+            250
+        );
+        assert_eq!(
+            normalize_node_placement_input(Some("  eu-west  "), None)
+                .unwrap()
+                .0,
+            "eu-west"
+        );
+        assert_eq!(
+            normalize_node_placement_input(Some("   "), None).unwrap().0,
+            ""
+        );
+        let long = "x".repeat(MAX_NODE_LOCATION_LEN + 1);
+        assert_eq!(
+            normalize_node_placement_input(Some(&long), None),
+            Err(NodePlacementInputError::LocationTooLong)
+        );
+        let at_limit = "y".repeat(MAX_NODE_LOCATION_LEN);
+        assert!(normalize_node_placement_input(Some(&at_limit), None).is_ok());
     }
 
     #[test]

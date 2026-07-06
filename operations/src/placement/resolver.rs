@@ -105,6 +105,10 @@ pub fn resolve_holders(
             if used_nodes.contains(pin) {
                 continue;
             }
+            // Exclusion wins over a pin: a node listed in both is never selected.
+            if excluded.contains(pin) {
+                continue;
+            }
             let Some(node) = view.nodes.iter().find(|node| node.node_id == *pin) else {
                 continue;
             };
@@ -222,8 +226,12 @@ fn ranked_locations<'a>(
             .entry(node.location.as_str())
             .or_insert((0, Vec::new()));
         // W_loc sums configured weights only; full/draining are excluded so a
-        // status flip never reshuffles location order (load-bearing invariant).
-        slot.0 = slot.0.saturating_add(u64::from(node.weight));
+        // status flip never reshuffles location order, and non-sync-eligible
+        // kinds (User) never contribute — kind is static, so this keeps the
+        // no-reshuffle invariant (both load-bearing).
+        if node.kind.is_sync_eligible() {
+            slot.0 = slot.0.saturating_add(u64::from(node.weight));
+        }
         slot.1.push(index);
     }
 
@@ -719,6 +727,33 @@ mod tests {
     }
 
     #[test]
+    fn pinned_and_excluded_node_is_not_selected() {
+        let view = PlacementView {
+            nodes: vec![
+                resolved(1, RealmNodeKind::Server, "a", 100),
+                resolved(2, RealmNodeKind::Server, "b", 100),
+            ],
+        };
+        // Node 1 is both pinned and excluded: exclusion wins, it never appears.
+        let override_ = PlacementOverride {
+            subject: Vec::new(),
+            pinned: vec![node_id(1)],
+            excluded: vec![node_id(1)],
+            strategy_id: None,
+        };
+
+        let holders = resolve_holders(
+            &view,
+            &strategy(None, false),
+            b"subject",
+            0,
+            Some(&override_),
+        );
+        assert!(!holders.contains(&node_id(1)));
+        assert_eq!(holders, vec![node_id(2)]);
+    }
+
+    #[test]
     fn everywhere_strategy_returns_all_eligible() {
         let mut full = resolved(4, RealmNodeKind::Server, "b", 100);
         full.full = true;
@@ -895,6 +930,43 @@ mod tests {
                 .map(|location| location.name.to_string())
                 .collect();
             prop_assert_eq!(baseline, flipped);
+        }
+
+        #[test]
+        fn location_weight_sum_excludes_non_sync_eligible(
+            specs in prop::collection::vec((0u8..4, 1u32..1000, any::<bool>()), 1..12),
+        ) {
+            let nodes: Vec<ResolvedNode> = specs
+                .iter()
+                .enumerate()
+                .map(|(index, &(location, weight, is_user))| ResolvedNode {
+                    node_id: node_id((index as u8) + 1),
+                    kind: if is_user {
+                        RealmNodeKind::User
+                    } else {
+                        RealmNodeKind::Server
+                    },
+                    location: format!("loc{location}"),
+                    weight,
+                    full: false,
+                    draining: false,
+                    labels: BTreeMap::new(),
+                })
+                .collect();
+            let view = PlacementView { nodes: nodes.clone() };
+
+            // W_loc counts only sync-eligible node weights; User weights never
+            // contribute to a location's rendezvous weight.
+            for location in ranked_locations(&view, b"subject", 0) {
+                let expected: u64 = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.location == location.name && node.kind.is_sync_eligible()
+                    })
+                    .map(|node| u64::from(node.weight))
+                    .sum();
+                prop_assert_eq!(location.w_loc, expected);
+            }
         }
     }
 }

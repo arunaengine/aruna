@@ -10,8 +10,8 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, DEFAULT_NODE_WEIGHT, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmNodeKind,
+    Actor, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmNodeKind, normalize_node_placement_input,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -105,7 +105,7 @@ impl CreateRealmOperation {
         seed_placement_defaults(&mut config_doc);
         config_doc
             .placement_map
-            .push(self.creating_node_placement_entry());
+            .push(self.creating_node_placement_entry()?);
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -119,15 +119,20 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn creating_node_placement_entry(&self) -> NodePlacementEntry {
-        NodePlacementEntry {
+    fn creating_node_placement_entry(&self) -> Result<NodePlacementEntry, CreateRealmError> {
+        let (location, weight) = normalize_node_placement_input(
+            self.config.node_location.as_deref(),
+            self.config.node_weight,
+        )
+        .map_err(|_| CreateRealmError::NodeLocationTooLong)?;
+        Ok(NodePlacementEntry {
             node_id: self.config.actor.node_id,
-            location: self.config.node_location.clone().unwrap_or_default(),
-            weight: self.config.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
+            location,
+            weight,
             full: false,
             draining: false,
             labels: self.config.node_labels.clone(),
-        }
+        })
     }
 
     fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
@@ -213,7 +218,7 @@ impl CreateRealmOperation {
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::RealmConfigNodePlacementSet {
-                entry: self.creating_node_placement_entry(),
+                entry: self.creating_node_placement_entry()?,
             },
         )?);
 
@@ -410,6 +415,8 @@ pub enum CreateRealmError {
     RealmConfigDocNotFound,
     #[error("realm_admin role not found")]
     RealmAdminRoleNotFound,
+    #[error("placement location must be at most 64 characters")]
+    NodeLocationTooLong,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("creating realm did not finish")]
@@ -530,6 +537,28 @@ mod test {
             node_weight: None,
             node_labels: Default::default(),
         }
+    }
+
+    #[test]
+    fn creating_node_placement_entry_clamps_and_rejects() {
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let actor = actor(realm_id, 1, 2);
+
+        let mut clamped = config(actor.clone());
+        clamped.node_weight = Some(50_000);
+        clamped.node_location = Some("  eu-west  ".to_string());
+        let entry = CreateRealmOperation::new(clamped)
+            .creating_node_placement_entry()
+            .unwrap();
+        assert_eq!(entry.weight, aruna_core::structs::MAX_NODE_WEIGHT);
+        assert_eq!(entry.location, "eu-west");
+
+        let mut too_long = config(actor);
+        too_long.node_location = Some("x".repeat(65));
+        assert_eq!(
+            CreateRealmOperation::new(too_long).creating_node_placement_entry(),
+            Err(super::CreateRealmError::NodeLocationTooLong)
+        );
     }
 
     fn oidc_provider(id: &str) -> OidcProviderConfig {

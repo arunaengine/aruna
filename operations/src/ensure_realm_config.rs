@@ -158,6 +158,9 @@ impl EnsureRealmConfigOperation {
                     self.config.default_metadata_replication_factor,
                 );
                 document.description = self.config.realm_description.clone();
+                // Seed default placement so no production path ever constructs a
+                // strategy-less config (placement resolution needs strategies).
+                document.seed_default_placement();
                 document
             }
             None => return Err(EnsureRealmConfigError::RealmConfigNotFound),
@@ -735,6 +738,10 @@ mod tests {
         assert_eq!(stored.metadata_replication.default_replication_factor, 7);
         assert_eq!(stored.description, "Ensured Realm");
         assert!(stored.has_node(actor.node_id));
+        // The create-if-missing path seeds default placement strategies so no
+        // production path builds a strategy-less config.
+        assert!(!stored.strategies.is_empty());
+        assert!(stored.default_strategy_id.is_some());
         assert_eq!(
             state.materialized_realm_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
