@@ -41,6 +41,7 @@ pub mod list_users;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding_secret_state;
+pub mod placement;
 pub mod process_placements;
 mod queue_backoff;
 pub mod queue_lag;
