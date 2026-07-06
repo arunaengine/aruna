@@ -255,6 +255,10 @@ pub struct MetadataSearchParams {
     pub q: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Opaque continuation token from a previous response's `next_cursor`. Bound
+    /// to the original query; a changed query is rejected with `400`.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
 }
@@ -278,6 +282,9 @@ pub struct MetadataSearchHitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchResponse {
     pub hits: Vec<MetadataSearchHitResponse>,
+    /// Continuation token for the next page, or `null` when the results are
+    /// exhausted. Pass it back as `cursor` to fetch the next page.
+    pub next_cursor: Option<String>,
     /// Number of node partitions this search was executed against.
     pub nodes_queried: usize,
     /// Number of node partitions that failed or timed out; a non-zero value
@@ -1167,7 +1174,8 @@ pub async fn query_all_metadata(
     tag = "metadata",
     params(
         ("q" = String, Query, description = "Search query"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of hits"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100). Hits are ordered by descending score"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from a previous response's next_cursor. Bound to the original query; replaying it with a changed query returns 400. Paging is best-effort: results may shift under concurrent metadata churn or node failures"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail")
     ),
     responses(
@@ -1193,7 +1201,7 @@ pub async fn search_metadata(
             graph_iris: None,
             query: params.q,
             limit: params.limit,
-            cursor: None,
+            cursor: params.cursor,
             mode: map_query_mode(params.mode),
             target_nodes: None,
         },
@@ -1204,6 +1212,7 @@ pub async fn search_metadata(
         StatusCode::OK,
         Json(MetadataSearchResponse {
             hits: result.hits.into_iter().map(map_search_hit).collect(),
+            next_cursor: result.next_cursor,
             nodes_queried: result.fanout_stats.nodes_queried,
             nodes_failed: result.fanout_stats.nodes_failed,
         }),
@@ -1332,7 +1341,7 @@ fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::Forbidden => ServerError::Forbidden,
         MetadataApiError::NotFound => ServerError::NotFound,
         MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
-        MetadataApiError::InvalidCursor(_) => ServerError::BadRequest,
+        MetadataApiError::InvalidCursor(message) => ServerError::BadRequestMessage(message),
         MetadataApiError::Internal(message) => ServerError::InternalError(message),
     }
 }
@@ -1849,6 +1858,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
                 limit: Some(10),
+                cursor: None,
                 mode: None,
             }),
         )
@@ -2546,6 +2556,16 @@ mod tests {
             .unwrap();
         assert!(
             search_mode_param["description"]
+                .as_str()
+                .unwrap()
+                .contains("best-effort")
+        );
+        let search_cursor_param = search_params
+            .iter()
+            .find(|param| param["name"] == "cursor")
+            .unwrap();
+        assert!(
+            search_cursor_param["description"]
                 .as_str()
                 .unwrap()
                 .contains("best-effort")
