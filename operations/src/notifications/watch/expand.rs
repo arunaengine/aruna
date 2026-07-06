@@ -1,34 +1,35 @@
 use aruna_core::structs::{RealmId, WatchEvent};
 use aruna_storage::StorageHandle;
 
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::inbox::{InboxWriteOutcome, upsert_inbox_records_reporting};
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
 /// Holder-side expansion of origin watch events into inbox records. Scans every
 /// local watch subscription for `realm_id`, routes each event through
 /// [`route_watch_event`], and idempotently upserts the resulting records.
-/// Returns the number of newly written records. All events must already be
-/// scoped to `realm_id` (the transport gate enforces this).
+/// Returns the write outcome (count plus the distinct recipients actually
+/// written) so the caller can wake their live streams. All events must already
+/// be scoped to `realm_id` (the transport gate enforces this).
 pub async fn expand_watch_events(
     storage: &StorageHandle,
     realm_id: RealmId,
     events: &[WatchEvent],
-) -> Result<usize, String> {
+) -> Result<InboxWriteOutcome, String> {
     if events.is_empty() {
-        return Ok(0);
+        return Ok(InboxWriteOutcome::default());
     }
     let subscriptions = list_realm_watch_subscriptions(storage, realm_id)
         .await
         .map_err(|error| error.to_string())?;
     if subscriptions.is_empty() {
-        return Ok(0);
+        return Ok(InboxWriteOutcome::default());
     }
     let mut records = Vec::new();
     for event in events {
         records.extend(route_watch_event(event, &subscriptions));
     }
-    upsert_inbox_records(storage, &records).await
+    upsert_inbox_records_reporting(storage, &records).await
 }
 
 #[cfg(test)]
@@ -105,16 +106,16 @@ mod tests {
         .expect("create");
 
         let events = vec![upload_event(realm, actor, "bucket/object")];
-        assert_eq!(
-            expand_watch_events(&storage, realm, &events).await,
-            Ok(1),
-            "first delivery writes one record"
-        );
-        assert_eq!(
-            expand_watch_events(&storage, realm, &events).await,
-            Ok(0),
-            "redelivery writes nothing"
-        );
+        let first = expand_watch_events(&storage, realm, &events)
+            .await
+            .expect("first delivery");
+        assert_eq!(first.written, 1, "first delivery writes one record");
+        assert_eq!(first.recipients, vec![owner]);
+        let second = expand_watch_events(&storage, realm, &events)
+            .await
+            .expect("redelivery");
+        assert_eq!(second.written, 0, "redelivery writes nothing");
+        assert!(second.recipients.is_empty());
         assert_eq!(count_inbox(&storage).await, 1);
     }
 
@@ -124,7 +125,12 @@ mod tests {
         let realm = RealmId([1u8; 32]);
         let actor = user(realm, 2);
         let events = vec![upload_event(realm, actor, "bucket/object")];
-        assert_eq!(expand_watch_events(&storage, realm, &events).await, Ok(0));
+        assert_eq!(
+            expand_watch_events(&storage, realm, &events)
+                .await
+                .expect("no subscriptions"),
+            InboxWriteOutcome::default()
+        );
         assert_eq!(count_inbox(&storage).await, 0);
     }
 }

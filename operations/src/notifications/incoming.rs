@@ -16,7 +16,7 @@ use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
@@ -91,10 +91,13 @@ async fn build_response(
             if let Err(reason) = verify_batch_local_holder(&records, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match upsert_inbox_records(&context.storage_handle, &records).await {
-                Ok(written) => NotificationTransportMessage::DeliverAck {
-                    written: written as u32,
-                },
+            match upsert_inbox_records_reporting(&context.storage_handle, &records).await {
+                Ok(outcome) => {
+                    wake_recipients(net_handle, &outcome.recipients);
+                    NotificationTransportMessage::DeliverAck {
+                        written: outcome.written as u32,
+                    }
+                }
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
@@ -165,9 +168,14 @@ async fn build_response(
             )
             .await
             {
-                Ok(output) => NotificationTransportMessage::MarkReadResult {
-                    marked: output.marked as u32,
-                },
+                Ok(output) => {
+                    if output.marked > 0 {
+                        net_handle.notify_inbox_activity(recipient);
+                    }
+                    NotificationTransportMessage::MarkReadResult {
+                        marked: output.marked as u32,
+                    }
+                }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
@@ -207,9 +215,12 @@ async fn build_response(
         }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
             match expand_watch_events(&context.storage_handle, realm_id, &events).await {
-                Ok(written) => NotificationTransportMessage::WatchEventsAck {
-                    written: written as u32,
-                },
+                Ok(outcome) => {
+                    wake_recipients(net_handle, &outcome.recipients);
+                    NotificationTransportMessage::WatchEventsAck {
+                        written: outcome.written as u32,
+                    }
+                }
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
@@ -345,6 +356,14 @@ fn verify_recipient_local_holder(
     }
 }
 
+// Best-effort per-recipient wake so a holder's live streams refetch the unread
+// count after inbox writes. A send with no subscribers is a no-op.
+fn wake_recipients(net_handle: &NetHandle, recipients: &[UserId]) {
+    for recipient in recipients {
+        net_handle.notify_inbox_activity(*recipient);
+    }
+}
+
 // The recipient realm is peer-asserted; an empty DeliverBatch has no record to
 // derive it from and must be rejected before any indexing.
 fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, String> {
@@ -453,6 +472,7 @@ mod tests {
         list_remote, list_watches_remote, mark_read_remote, send_notification_request,
         unread_count_remote,
     };
+    use crate::notifications::inbox::upsert_inbox_records;
     use crate::notifications::watch::subscriptions::create_watch_subscription;
     use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
     use aruna_core::structs::{
@@ -463,7 +483,9 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::time::timeout;
     use ulid::Ulid;
 
     struct Node {
@@ -1361,6 +1383,97 @@ mod tests {
                 .await
                 .expect("list succeeds")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_batch_wakes_recipient_only_on_fresh_write() {
+        let realm_id = RealmId::from_bytes([80u8; 32]);
+        let a = spawn(realm_id, [80u8; 32]).await;
+        let b = spawn(realm_id, [81u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let batch = vec![record(recipient, 1)];
+        let mut wakes = b.net.subscribe_notification_wakes();
+
+        deliver_remote(&a.net, b.net.node_id(), batch.clone())
+            .await
+            .expect("first delivery succeeds");
+        let woken = timeout(Duration::from_secs(1), wakes.recv())
+            .await
+            .expect("wake arrives")
+            .expect("channel open");
+        assert_eq!(woken, recipient);
+
+        deliver_remote(&a.net, b.net.node_id(), batch.clone())
+            .await
+            .expect("redelivery succeeds");
+        assert!(
+            timeout(Duration::from_millis(200), wakes.recv())
+                .await
+                .is_err(),
+            "redelivery must not wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_read_rpc_wakes_recipient_only_when_count_changes() {
+        let realm_id = RealmId::from_bytes([82u8; 32]);
+        let a = spawn(realm_id, [82u8; 32]).await;
+        let b = spawn(realm_id, [83u8; 32]).await;
+        connect(&a, &b).await;
+        install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let records = vec![record(recipient, 1), record(recipient, 2)];
+        seed_inbox(&b, &records).await;
+        let ids: Vec<Ulid> = records
+            .iter()
+            .map(|record| record.notification_id)
+            .collect();
+        let mut wakes = b.net.subscribe_notification_wakes();
+
+        assert_eq!(
+            mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
+                .await
+                .expect("mark read"),
+            2
+        );
+        let woken = timeout(Duration::from_secs(1), wakes.recv())
+            .await
+            .expect("wake arrives")
+            .expect("channel open");
+        assert_eq!(woken, recipient);
+
+        assert_eq!(
+            mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+                .await
+                .expect("mark read again"),
+            0
+        );
+        assert!(
+            timeout(Duration::from_millis(200), wakes.recv())
+                .await
+                .is_err(),
+            "no-op mark-read must not wake"
         );
     }
 }
