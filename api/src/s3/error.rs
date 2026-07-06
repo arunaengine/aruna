@@ -9,6 +9,7 @@ use aruna_operations::s3::create_bucket::CreateBucketError;
 use aruna_operations::s3::create_multipart_upload::CreateMultipartUploadError;
 use aruna_operations::s3::delete_bucket::DeleteBucketError;
 use aruna_operations::s3::delete_object::DeleteObjectError;
+use aruna_operations::s3::get_bucket_info::GetBucketInfoError;
 use aruna_operations::s3::get_object::GetObjectError;
 use aruna_operations::s3::head_object::HeadObjectError;
 use aruna_operations::s3::list_buckets::ListBucketsError;
@@ -242,6 +243,15 @@ impl IntoS3Error for DeleteObjectError {
     fn into_s3_error(self) -> S3Error {
         match self {
             DeleteObjectError::NoSuchVersion => no_such_version_error(),
+            err => internal_error(err),
+        }
+    }
+}
+
+impl IntoS3Error for GetBucketInfoError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            GetBucketInfoError::NotFound => bucket_not_found_error(),
             err => internal_error(err),
         }
     }

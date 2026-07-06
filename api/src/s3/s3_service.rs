@@ -45,6 +45,7 @@ use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
+use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
     GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
@@ -73,11 +74,12 @@ use s3s::dto::{
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
     EncodingType, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
     GetBucketReplicationOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, LastModified,
-    ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, Owner,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
+    GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, Object, Owner, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput, PutObjectOutput,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StreamingBlob,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -653,6 +655,27 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to create bucket"))?;
 
         Ok(S3Response::new(CreateBucketOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        debug!("Received HEAD BUCKET Request: {:#?}", req);
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to head bucket"))?;
+
+        Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
