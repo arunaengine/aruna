@@ -272,6 +272,8 @@ pub struct MetadataSearchHit {
     pub graph_iri: String,
     pub subject_iri: String,
     pub score: f32,
+    pub title: String,
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

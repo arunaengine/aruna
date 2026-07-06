@@ -267,6 +267,12 @@ pub struct MetadataSearchHitResponse {
     pub graph_iri: String,
     pub subject_iri: String,
     pub score: f32,
+    /// Human-readable title for the hit, populated by the answering node from
+    /// the resource's `schema:name` with a path-based fallback.
+    pub title: String,
+    /// Query-relevant text excerpt, populated by the answering node. Absent when
+    /// the resource has no indexed literals to window.
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1578,6 +1584,8 @@ fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
         graph_iri: hit.graph_iri,
         subject_iri: hit.subject_iri,
         score: hit.score,
+        title: hit.title,
+        snippet: hit.snippet,
     }
 }
 
@@ -1847,6 +1855,19 @@ mod tests {
         assert!(!search.hits.is_empty());
         assert_eq!(search.nodes_queried, 1);
         assert_eq!(search.nodes_failed, 0);
+        let dataset_hit = search
+            .hits
+            .iter()
+            .find(|hit| hit.title == "Public Dataset")
+            .expect("root dataset hit is enriched with its schema:name title");
+        assert!(
+            dataset_hit
+                .snippet
+                .as_deref()
+                .is_some_and(|snippet| snippet.to_lowercase().contains("public")),
+            "snippet should window the matched query term: {:?}",
+            dataset_hit.snippet
+        );
     }
 
     #[tokio::test]
@@ -2858,6 +2879,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01A".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.5,
+                    title: "File A".to_string(),
+                    snippet: None,
                 },
                 MetadataSearchHit {
                     document_id: "01A".to_string(),
@@ -2866,6 +2889,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01A".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.8,
+                    title: "File A".to_string(),
+                    snippet: None,
                 },
                 MetadataSearchHit {
                     document_id: "01B".to_string(),
@@ -2874,6 +2899,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01B".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.7,
+                    title: "File B".to_string(),
+                    snippet: None,
                 },
             ],
             2,
@@ -2894,6 +2921,8 @@ mod tests {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
             subject_iri: subject_iri.to_string(),
             score: 0.7,
+            title: subject_iri.to_string(),
+            snippet: None,
         };
 
         let hits = deduplicate_search_hits(

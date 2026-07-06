@@ -6,6 +6,7 @@ mod protocol;
 pub mod prune_queue;
 mod queue_storage;
 pub mod repository;
+mod search_enrichment;
 
 use std::sync::Arc;
 

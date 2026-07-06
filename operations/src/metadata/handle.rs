@@ -48,6 +48,7 @@ use ulid::Ulid;
 
 use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
+use super::search_enrichment::{hit_snippet, hit_title};
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
     validate_aruna_bearer_token,
@@ -3291,7 +3292,11 @@ fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCra
 fn metadata_search_hit_from_craqle(
     hit: craqle::SearchHit,
     record: &MetadataRegistryRecord,
+    properties: &[(String, Term)],
+    query: &str,
 ) -> MetadataSearchHit {
+    let title = hit_title(properties, &record.document_path, &hit.subject_iri);
+    let snippet = hit_snippet(properties, query);
     MetadataSearchHit {
         document_id: record.document_id.to_string(),
         group_id: record.group_id.to_string(),
@@ -3299,7 +3304,24 @@ fn metadata_search_hit_from_craqle(
         graph_iri: hit.graph_id,
         subject_iri: hit.subject_iri,
         score: hit.score,
+        title,
+        snippet,
     }
+}
+
+fn decode_hit_properties(
+    properties: Vec<(craqle::EncodedTerm, craqle::EncodedTerm)>,
+) -> Vec<(String, Term)> {
+    properties
+        .into_iter()
+        .filter_map(|(predicate, object)| {
+            let Some(Term::NamedNode(predicate)) = predicate.to_term() else {
+                return None;
+            };
+            let object = object.to_term()?;
+            Some((predicate.as_str().to_string(), object))
+        })
+        .collect()
 }
 
 #[tracing::instrument(
@@ -3780,12 +3802,28 @@ async fn search_local_graphs(
                 .node
                 .search_graphs(&authorizer, &graph_ids, &query, limit)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            let mut visible = hits
-                .into_iter()
-                .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
-                .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
-                .collect::<Vec<_>>();
-            visible.truncate(limit);
+            let mut visible = Vec::with_capacity(hits.len().min(limit));
+            for hit in hits {
+                let Some(record) = by_graph.get(&hit.graph_id) else {
+                    continue;
+                };
+                // Enrichment is best-effort: a pending or raced projection must
+                // never fail the search, so fall back to an empty property set.
+                let properties = inner
+                    .node
+                    .describe_subject(&authorizer, &GraphId::new(&hit.graph_id), &hit.subject_iri)
+                    .map(decode_hit_properties)
+                    .unwrap_or_default();
+                visible.push(metadata_search_hit_from_craqle(
+                    hit,
+                    record,
+                    &properties,
+                    &query,
+                ));
+                if visible.len() >= limit {
+                    break;
+                }
+            }
             Ok(visible)
         })
     })
