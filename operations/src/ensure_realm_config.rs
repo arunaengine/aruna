@@ -770,6 +770,7 @@ mod tests {
             replica_count: Some(3),
             distinct_locations: false,
             affinity: Vec::new(),
+            bucket_count: 64,
         };
         let binding = StrategyBinding {
             scope: BindingScope::Class(DocumentClass::MetadataRegistry),

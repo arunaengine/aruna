@@ -411,6 +411,20 @@ impl DocumentSyncTarget {
     }
 }
 
+/// Sync topic a bucket's records ride, derived purely from the placement
+/// reference (no config lookup at the net layer). Mirrors the `TopicId::hash`
+/// idiom [`DocumentSyncTarget::sync_topic_id`] uses. Not yet wired into
+/// `sync_topic_id`: stage 2 flips the bucketed targets over to this in a later
+/// commit.
+pub fn bucket_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
+    let mut bytes = b"aruna-bucket-topic-v1".to_vec();
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&placement.bucket.to_be_bytes());
+    irokle::TopicId::hash(bytes)
+}
+
 fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
     let hash = blake3::hash(graph_iri.as_bytes());
     let mut bytes = [0u8; 16];
@@ -500,7 +514,7 @@ mod tests {
     use super::{
         DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
         DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
-        compare_document_sync_revisions, document_sync_apply_decision,
+        bucket_topic_id, compare_document_sync_revisions, document_sync_apply_decision,
     };
     use crate::NodeId;
     use crate::TopicId;
@@ -509,6 +523,7 @@ mod tests {
         METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
         REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
     };
+    use crate::structs::PlacementRef;
     use crate::structs::RealmId;
     use crate::types::UserId;
     use irokle::Event as _;
@@ -754,6 +769,52 @@ mod tests {
     #[test]
     fn document_sync_event_type_id_is_stable() {
         assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+    }
+
+    #[test]
+    fn bucket_topic_id_matches_golden_and_separates_dimensions() {
+        let realm_id = test_realm(2);
+        let placement = PlacementRef {
+            strategy_id: test_ulid(4),
+            epoch: 0,
+            bucket: 5,
+        };
+        // Fixed inputs → fixed topic id: the stage-2 cross-node canary. A change
+        // here means co-holders would derive different bucket topics.
+        assert_eq!(
+            bucket_topic_id(realm_id, &placement).to_string(),
+            "9ea950b394474cd820cfce7d0a840232de8cbd34216aeb19a11eb39f21f99048"
+        );
+
+        // Each hashed dimension moves the topic.
+        let other_bucket = PlacementRef {
+            bucket: 6,
+            ..placement
+        };
+        let other_epoch = PlacementRef {
+            epoch: 1,
+            ..placement
+        };
+        let other_strategy = PlacementRef {
+            strategy_id: test_ulid(5),
+            ..placement
+        };
+        assert_ne!(
+            bucket_topic_id(realm_id, &placement),
+            bucket_topic_id(realm_id, &other_bucket)
+        );
+        assert_ne!(
+            bucket_topic_id(realm_id, &placement),
+            bucket_topic_id(realm_id, &other_epoch)
+        );
+        assert_ne!(
+            bucket_topic_id(realm_id, &placement),
+            bucket_topic_id(realm_id, &other_strategy)
+        );
+        assert_ne!(
+            bucket_topic_id(realm_id, &placement),
+            bucket_topic_id(test_realm(3), &placement)
+        );
     }
 
     #[test]

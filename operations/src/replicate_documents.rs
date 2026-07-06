@@ -441,6 +441,7 @@ mod tests {
             replica_count: replica,
             distinct_locations: false,
             affinity: Vec::new(),
+            bucket_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy];
