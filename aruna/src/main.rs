@@ -322,6 +322,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.realm_id,
         config.node_id,
         cors,
+        state.metrics(),
     )
     .await
     .unwrap();
