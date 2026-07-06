@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentSyncReconcileResult, DocumentSyncTarget};
+use aruna_core::document::{DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
@@ -346,6 +346,14 @@ enum PeerConnectivityEvent {
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
+
+    /// Re-emits the documents recovered from a genesis tie-break eviction: the
+    /// loser's own payloads, decoded from the reset chain, to be replayed onto
+    /// the winning genesis (each carries `allow_genesis: false`, and admin
+    /// events keep their original embedded event id so appliers dedupe). The
+    /// default drops them; the operations layer overrides this to enqueue
+    /// outbox records.
+    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncPublish>) {}
 }
 
 #[derive(Clone)]
@@ -642,6 +650,41 @@ impl NetHandle {
             .await;
         });
 
+        // Drains genesis tie-break evictions (from irokle's own accept/resync
+        // loops and this service's bootstrap/batch-sync paths), decodes them
+        // into re-emittable documents, and hands them to the registered inbound
+        // handler for outbox re-enqueue. Reads the handler per batch, so it
+        // works whether or not the handler is registered yet.
+        let eviction_document_sync = document_sync.clone();
+        let eviction_inbound_handler = inbound_handler.clone();
+        let eviction_shutdown = shutdown.child_token();
+        let eviction_task = tokio::spawn(async move {
+            let Some(mut eviction_rx) = eviction_document_sync.take_eviction_receiver() else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    _ = eviction_shutdown.cancelled() => break,
+                    maybe_eviction = eviction_rx.recv() => {
+                        let Some(eviction) = maybe_eviction else { break };
+                        let documents = eviction_document_sync.decode_eviction(eviction);
+                        if documents.is_empty() {
+                            continue;
+                        }
+                        let handler = eviction_inbound_handler.read().clone();
+                        if let Some(handler) = handler {
+                            handler.handle_evicted_documents(documents).await;
+                        } else {
+                            warn!(
+                                count = documents.len(),
+                                "Dropping re-emitted eviction documents without a registered inbound handler"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
             dht.clone(),
             address_lookup.clone(),
@@ -672,6 +715,7 @@ impl NetHandle {
             dht_task,
             stream_task,
             accept_task,
+            eviction_task,
             peer_connectivity_task,
         ]);
 
