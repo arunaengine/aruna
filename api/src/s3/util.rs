@@ -272,6 +272,29 @@ pub(crate) fn checksum_algorithm_from_s3(
     }
 }
 
+pub(crate) fn s3_checksum_algorithm_from_core(
+    algorithm: ChecksumAlgorithm,
+) -> Option<S3ChecksumAlgorithm> {
+    match algorithm {
+        ChecksumAlgorithm::Crc32 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32))
+        }
+        ChecksumAlgorithm::Crc32c => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC32C,
+        )),
+        ChecksumAlgorithm::Crc64Nvme => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC64NVME,
+        )),
+        ChecksumAlgorithm::Sha1 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::SHA1))
+        }
+        ChecksumAlgorithm::Sha256 => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::SHA256,
+        )),
+        ChecksumAlgorithm::Md5 => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

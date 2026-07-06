@@ -9,7 +9,7 @@ use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_type_from_multipart, validate_object_key,
+    s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -57,6 +57,7 @@ use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOpe
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
+use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
@@ -70,8 +71,8 @@ use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-    CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    ChecksumType, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+    CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
@@ -79,12 +80,12 @@ use s3s::dto::{
     GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, Object, Owner, PutBucketCorsInput,
-    PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
-    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StreamingBlob,
-    UploadPartInput, UploadPartOutput,
+    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
+    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
+    Object, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
+    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
+    ReplicationRuleStatus, StorageClass, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -1383,6 +1384,112 @@ impl S3 for ArunaS3Service {
         }
 
         Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        debug!("Received LIST PARTS Request: {:#?}", req);
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let part_number_marker = match req.input.part_number_marker {
+            None => None,
+            Some(marker) if marker < 0 => {
+                return Err(s3_error!(InvalidArgument, "Invalid part-number-marker"));
+            }
+            Some(marker) => Some(u16::try_from(marker).unwrap_or(u16::MAX)),
+        };
+        let max_parts = match req.input.max_parts {
+            None => ListPartsOperation::DEFAULT_MAX_PARTS,
+            Some(max_parts) => usize::try_from(max_parts)
+                .map_err(|_| s3_error!(InvalidArgument, "max-parts must be non-negative"))?
+                .min(ListPartsOperation::DEFAULT_MAX_PARTS),
+        };
+
+        let result = drive(
+            ListPartsOperation::new(LPI {
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                upload_id,
+                part_number_marker,
+                max_parts,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list parts"))?;
+
+        let checksum_algorithm = result
+            .upload
+            .checksum_hint
+            .as_ref()
+            .and_then(|hint| hint.algorithm)
+            .and_then(s3_checksum_algorithm_from_core);
+        let checksum_type = result
+            .upload
+            .checksum_hint
+            .as_ref()
+            .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type));
+        let initiator = Some(Initiator {
+            display_name: None,
+            id: Some(result.upload.created_by.to_string()),
+        });
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(result.upload.group_id.to_string()),
+        });
+
+        let parts = result
+            .parts
+            .into_iter()
+            .map(|part| {
+                let checksums = encode_checksums(
+                    &part.location.hashes,
+                    ChecksumSelection::AllStored,
+                    ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                );
+                Part {
+                    part_number: Some(i32::from(part.part_number)),
+                    size: Some(part.location.blob_size as i64),
+                    last_modified: Some(part.created_at.into()),
+                    e_tag: part
+                        .location
+                        .hashes
+                        .get(HASH_MD5)
+                        .map(|value| ETag::Strong(hex::encode(value))),
+                    checksum_crc32: checksums.checksum_crc32,
+                    checksum_crc32c: checksums.checksum_crc32c,
+                    checksum_crc64nvme: checksums.checksum_crc64nvme,
+                    checksum_sha1: checksums.checksum_sha1,
+                    checksum_sha256: checksums.checksum_sha256,
+                }
+            })
+            .collect();
+
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            upload_id: Some(req.input.upload_id),
+            part_number_marker: req.input.part_number_marker,
+            max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_part_number_marker: result.next_part_number_marker.map(i32::from),
+            parts: Some(parts),
+            initiator,
+            owner,
+            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+            checksum_algorithm,
+            checksum_type,
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(err)]
