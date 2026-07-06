@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::server_state::ServerState;
-use aruna_core::metrics::{RequestLabels, RouteLabels};
+use aruna_core::metrics::{RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::AuthContext;
 use aruna_core::telemetry::{LatencyAggregator, RequestStages, duration_ms};
 use axum::extract::{MatchedPath, Request, State};
@@ -99,7 +99,7 @@ pub async fn request_tracing_middleware(
         .http_requests
         .get_or_create(&RequestLabels {
             interface: "rest",
-            method: method.to_string(),
+            method: method_label(method.as_str()),
             code: status_code,
         })
         .inc();

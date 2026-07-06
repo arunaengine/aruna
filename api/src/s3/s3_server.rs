@@ -8,7 +8,7 @@ use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
-use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels};
+use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -65,7 +65,7 @@ fn record_s3_request(
         .http_requests
         .get_or_create(&RequestLabels {
             interface: "s3",
-            method: method.to_string(),
+            method: method_label(method.as_str()),
             code,
         })
         .inc();

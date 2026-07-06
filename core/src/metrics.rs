@@ -28,8 +28,25 @@ pub const DURATION_BUCKETS_SECONDS: [f64; 15] = [
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RequestLabels {
     pub interface: &'static str,
-    pub method: String,
+    pub method: &'static str,
     pub code: u16,
+}
+
+/// Collapses nonstandard request methods to `other` so arbitrary extension
+/// tokens cannot mint unbounded label values.
+pub fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "TRACE" => "TRACE",
+        "CONNECT" => "CONNECT",
+        _ => "other",
+    }
 }
 
 /// Labels for the request-duration histogram: interface plus the logical
@@ -177,7 +194,7 @@ mod tests {
             .http_requests
             .get_or_create(&RequestLabels {
                 interface: "rest",
-                method: "GET".to_string(),
+                method: method_label("GET"),
                 code: 200,
             })
             .inc();
@@ -194,6 +211,14 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("aruna_build_info{version=\""), "{body}");
+    }
+
+    #[test]
+    fn method_label_collapses_nonstandard_tokens() {
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("PATCH"), "PATCH");
+        assert_eq!(method_label("BREW"), "other");
+        assert_eq!(method_label("get"), "other");
     }
 
     #[tokio::test]
