@@ -1,4 +1,4 @@
-use aruna_core::structs::NotificationRecord;
+use aruna_core::structs::{NotificationRecord, WatchEventMask, WatchSubscription};
 use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,25 @@ pub enum NotificationTransportMessage {
         marked: u32,
     },
     Reject(String),
+    CreateWatch {
+        owner: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+    },
+    WatchCreated {
+        subscription: WatchSubscription,
+    },
+    DeleteWatch {
+        owner: UserId,
+        watch_id: Ulid,
+    },
+    WatchDeleted,
+    ListWatches {
+        owner: UserId,
+    },
+    WatchList {
+        subscriptions: Vec<WatchSubscription>,
+    },
 }
 
 pub(crate) fn notification_message_kind(message: &NotificationTransportMessage) -> &'static str {
@@ -53,6 +72,12 @@ pub(crate) fn notification_message_kind(message: &NotificationTransportMessage) 
         NotificationTransportMessage::MarkRead { .. } => "mark_read",
         NotificationTransportMessage::MarkReadResult { .. } => "mark_read_result",
         NotificationTransportMessage::Reject(_) => "reject",
+        NotificationTransportMessage::CreateWatch { .. } => "create_watch",
+        NotificationTransportMessage::WatchCreated { .. } => "watch_created",
+        NotificationTransportMessage::DeleteWatch { .. } => "delete_watch",
+        NotificationTransportMessage::WatchDeleted => "watch_deleted",
+        NotificationTransportMessage::ListWatches { .. } => "list_watches",
+        NotificationTransportMessage::WatchList { .. } => "watch_list",
     }
 }
 
