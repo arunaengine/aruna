@@ -1,7 +1,9 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::Actor;
 use crate::structs::structs::{Permission, Role};
+use crate::structs::{
+    Actor, NodePlacementEntry, PlacementOverride, PlacementStrategy, StrategyBinding,
+};
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -149,6 +151,11 @@ pub struct RealmConfigDocument {
     pub nodes: Vec<RealmNode>,
     pub quota: QuotaConfig,
     pub description: String,
+    pub placement_map: Vec<NodePlacementEntry>,
+    pub strategies: Vec<PlacementStrategy>,
+    pub default_strategy_id: Option<Ulid>,
+    pub strategy_bindings: Vec<StrategyBinding>,
+    pub placement_overrides: Vec<PlacementOverride>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -347,6 +354,11 @@ impl RealmConfigDocument {
             nodes: Vec::new(),
             quota: QuotaConfig::default(),
             description: String::new(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         }
     }
 
@@ -398,6 +410,18 @@ impl RealmConfigDocument {
                     .map_err(|error| ConversionError::FromStrError(error.to_string()))
             })
             .collect()
+    }
+
+    pub fn placement_entry(&self, node_id: NodeId) -> Option<&NodePlacementEntry> {
+        self.placement_map
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+    }
+
+    pub fn strategy(&self, strategy_id: &Ulid) -> Option<&PlacementStrategy> {
+        self.strategies
+            .iter()
+            .find(|strategy| strategy.strategy_id == *strategy_id)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -549,6 +573,11 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             description: "Example Realm".to_string(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -652,6 +681,11 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             description: String::new(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         };
 
         assert_eq!(

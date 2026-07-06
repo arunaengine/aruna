@@ -2363,6 +2363,11 @@ fn realm_config_from_reducer_materialization(
             .materialized_realm_config_quota()
             .unwrap_or_default(),
         description: String::new(),
+        placement_map: Vec::new(),
+        strategies: Vec::new(),
+        default_strategy_id: None,
+        strategy_bindings: Vec::new(),
+        placement_overrides: Vec::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)

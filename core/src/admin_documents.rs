@@ -5,8 +5,9 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+    Actor, BindingScope, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+    Permission, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind, Role, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -154,6 +155,33 @@ pub enum AdminDocumentOperation {
     RealmConfigQuotaSet {
         quota: QuotaConfig,
     },
+    RealmConfigNodePlacementSet {
+        entry: NodePlacementEntry,
+    },
+    RealmConfigNodePlacementRemoved {
+        node_id: NodeId,
+    },
+    RealmConfigPlacementStrategyUpserted {
+        strategy: PlacementStrategy,
+    },
+    RealmConfigPlacementStrategyRemoved {
+        strategy_id: Ulid,
+    },
+    RealmConfigDefaultStrategySet {
+        strategy_id: Ulid,
+    },
+    RealmConfigStrategyBindingSet {
+        binding: StrategyBinding,
+    },
+    RealmConfigStrategyBindingRemoved {
+        scope: BindingScope,
+    },
+    RealmConfigPlacementOverrideSet {
+        record: PlacementOverride,
+    },
+    RealmConfigPlacementOverrideRemoved {
+        subject: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -161,8 +189,10 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
     use crate::structs::{
-        MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        AffinityEffect, AffinityRule, BindingScope, DocumentClass, LabelMatch,
+        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
+        PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, StrategyBinding,
     };
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
@@ -283,10 +313,74 @@ mod tests {
             AdminDocumentOperation::RealmConfigQuotaSet {
                 quota: QuotaConfig::default(),
             },
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(node(1)),
+            },
+            AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: node(1) },
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: placement_strategy(Ulid::from_bytes([4; 16])),
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+                strategy_id: Ulid::from_bytes([4; 16]),
+            },
+            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                strategy_id: Ulid::from_bytes([4; 16]),
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: StrategyBinding {
+                    scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                    strategy_id: Ulid::from_bytes([4; 16]),
+                },
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: placement_override(b"document-subject".to_vec()),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
+                subject: b"document-subject".to_vec(),
+            },
         ];
 
         for op in operations {
             assert_eq!(postcard_roundtrip(op.clone()), op);
+        }
+    }
+
+    fn placement_entry(node_id: NodeId) -> NodePlacementEntry {
+        NodePlacementEntry {
+            node_id,
+            location: "eu-west".to_string(),
+            weight: 100,
+            full: false,
+            draining: false,
+            label_overrides: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+        }
+    }
+
+    fn placement_strategy(strategy_id: Ulid) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id,
+            name: "default".to_string(),
+            replica_count: Some(3),
+            distinct_locations: true,
+            affinity: vec![AffinityRule {
+                matcher: LabelMatch {
+                    key: "tier".to_string(),
+                    value: "hot".to_string(),
+                },
+                effect: AffinityEffect::Multiply { permille: 1500 },
+            }],
+        }
+    }
+
+    fn placement_override(subject: Vec<u8>) -> PlacementOverride {
+        PlacementOverride {
+            subject,
+            pinned: vec![node(4)],
+            excluded: vec![node(5)],
+            strategy_id: Some(Ulid::from_bytes([4; 16])),
         }
     }
 
