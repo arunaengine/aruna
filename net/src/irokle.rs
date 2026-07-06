@@ -1722,6 +1722,7 @@ impl DocumentSyncService {
                                         metadata_document_lifecycle_revision_change(
                                             &lifecycle,
                                             self.local_node_id()?,
+                                            aruna_core::structs::PlacementRef::NIL,
                                         ),
                                     ),
                                     record,
@@ -3579,7 +3580,11 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    let revision = metadata_document_lifecycle_revision_change(record, delete_actor);
+    let revision = metadata_document_lifecycle_revision_change(
+        record,
+        delete_actor,
+        aruna_core::structs::PlacementRef::NIL,
+    );
     if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, &revision).await? {
         return Ok(None);
     }

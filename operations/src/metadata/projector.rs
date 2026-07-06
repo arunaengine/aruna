@@ -799,13 +799,14 @@ pub fn create_event_outbox_record(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let mut change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id);
     // The origin knows the governing strategy: stamp the real reference so the
     // metadata create/lifecycle envelope carries it (else the nil fallback).
-    if let Some(config) = realm_config {
-        change.placement =
-            placement_ref_for_target(config, &target, Some(event.record.document_path.as_str()));
-    }
+    let placement = realm_config
+        .map(|config| {
+            placement_ref_for_target(config, &target, Some(event.record.document_path.as_str()))
+        })
+        .unwrap_or(aruna_core::structs::PlacementRef::NIL);
+    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
@@ -1303,6 +1304,33 @@ mod tests {
             aruna_core::document::DocumentSyncChangeKind::Upsert
         );
         assert_eq!(change.current.event_id, event.event_id);
+    }
+
+    #[test]
+    fn create_and_update_stamp_equal_placement_refs() {
+        let create = create_event();
+        let config = realm_config(create.record.realm_id, &[node(1), node(2)]);
+
+        // An update of the same document reuses its id and path; only the event
+        // identity/timestamps advance.
+        let mut update = create.clone();
+        update.event_id = Ulid::new();
+        update.record.last_event_id = update.event_id;
+        update.record.updated_at_ms = create.record.updated_at_ms + 1;
+        update.occurred_at_ms = create.occurred_at_ms + 1;
+
+        let placement_of = |event: &MetadataCreateEventRecord| {
+            let DocumentSyncOutboxEvent::Upsert { change, .. } =
+                create_event_outbox_record(event, Some(&config), true).event
+            else {
+                panic!("expected upsert outbox event");
+            };
+            change.placement
+        };
+
+        let create_ref = placement_of(&create);
+        assert_ne!(create_ref, aruna_core::structs::PlacementRef::NIL);
+        assert_eq!(create_ref, placement_of(&update));
     }
 
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {

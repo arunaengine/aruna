@@ -291,6 +291,7 @@ impl AnnounceTopicOperation {
                 Ok(metadata_document_lifecycle_revision_change(
                     &record,
                     self.local_node_id,
+                    PlacementRef::NIL,
                 ))
             }
             DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {

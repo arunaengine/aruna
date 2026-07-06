@@ -181,12 +181,13 @@ pub fn write_document_lifecycle_effect(
 pub fn write_document_lifecycle_with_revision_effect(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: aruna_core::structs::PlacementRef,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::BatchWrite {
         writes: vec![
             metadata_document_lifecycle_write_entry(record)?,
-            metadata_document_lifecycle_revision_write_entry(record, delete_actor)?,
+            metadata_document_lifecycle_revision_write_entry(record, delete_actor, placement)?,
         ],
         txn_id,
     }))
@@ -304,13 +305,16 @@ fn document_lifecycle_revision_from_outbox(
     ) {
         return Ok(None);
     }
-    let DocumentSyncOutboxEvent::Upsert { bytes, .. } = &outbox.event else {
+    let DocumentSyncOutboxEvent::Upsert { bytes, change } = &outbox.event else {
         return Ok(None);
     };
     let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+    // Mirror the outbox envelope's placement into the revision sidecar so the
+    // same document carries the same reference locally and on the wire.
     Ok(Some(metadata_document_lifecycle_revision_write_entry(
         &lifecycle,
         outbox.node_id,
+        change.placement,
     )?))
 }
 
