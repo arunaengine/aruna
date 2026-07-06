@@ -80,14 +80,6 @@ impl OpsState {
             readiness,
         })
     }
-
-    pub fn readiness(&self) -> Readiness {
-        self.readiness.clone()
-    }
-
-    pub fn metrics(&self) -> Arc<NodeMetrics> {
-        self.metrics.clone()
-    }
 }
 
 pub fn ops_router(state: Arc<OpsState>) -> Router {
