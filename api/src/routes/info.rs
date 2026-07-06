@@ -453,12 +453,7 @@ async fn load_node_info_documents_best_effort(
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
         .collect();
-    match aruna_operations::node_info::read_node_info_documents(
-        &state.get_ctx().storage_handle,
-        &node_ids,
-    )
-    .await
-    {
+    match aruna_operations::node_info::read_node_info_documents(&state.get_ctx(), &node_ids).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(error = %error, "Failed to load node info documents for realm info");
