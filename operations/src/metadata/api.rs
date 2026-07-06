@@ -1533,6 +1533,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01A".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.5,
+                    title: "File A".to_string(),
+                    snippet: None,
                 },
                 MetadataSearchHit {
                     document_id: "01A".to_string(),
@@ -1541,6 +1543,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01A".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.8,
+                    title: "File A".to_string(),
+                    snippet: None,
                 },
                 MetadataSearchHit {
                     document_id: "01B".to_string(),
@@ -1549,6 +1553,8 @@ mod tests {
                     graph_iri: "https://w3id.org/aruna/01B".to_string(),
                     subject_iri: "./file.txt".to_string(),
                     score: 0.7,
+                    title: "File B".to_string(),
+                    snippet: None,
                 },
             ],
             2,
@@ -1569,6 +1575,8 @@ mod tests {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
             subject_iri: subject_iri.to_string(),
             score: 0.7,
+            title: subject_iri.to_string(),
+            snippet: None,
         };
 
         let hits = deduplicate_search_hits(
