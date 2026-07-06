@@ -44,7 +44,7 @@ fn replica_one() -> PlacementStrategy {
         replica_count: Some(1),
         distinct_locations: false,
         affinity: Vec::new(),
-        bucket_count: 64,
+        shard_count: 64,
     }
 }
 

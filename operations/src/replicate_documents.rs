@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingBucketPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingShardPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -56,7 +56,7 @@ enum ReplicateDocumentsState {
 
 #[derive(Debug, Clone, PartialEq)]
 enum PlacementAction {
-    Write(PendingBucketPlacement),
+    Write(PendingShardPlacement),
     Delete(PlacementRef),
 }
 
@@ -238,8 +238,8 @@ impl ReplicateDocumentsOperation {
             PlacementAction::Write(record) => record.placement,
             PlacementAction::Delete(placement) => placement,
         };
-        warn!(placement = ?placement, error = %error, "Document sync failed; queued bucket placement retry");
-        // Re-queue the bucket with no selected co-holders so the placement
+        warn!(placement = ?placement, error = %error, "Document sync failed; queued shard placement retry");
+        // Re-queue the shard with no selected co-holders so the placement
         // reconciler re-resolves and re-ensures topic membership.
         self.placement_action = Some(PlacementAction::Write(new_placement(
             self.config.realm_id,
@@ -391,7 +391,7 @@ mod tests {
             replica_count: replica,
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: 64,
+            shard_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy];
@@ -531,7 +531,7 @@ mod tests {
         operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
             epoch: 0,
-            bucket: 1,
+            shard: 1,
         }));
 
         let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {

@@ -63,7 +63,7 @@ use crate::notifications::watch::outbox::{
     read_watch_forward_outbox_batch, restore_watch_forward_outbox_timer,
 };
 use crate::queue_backoff::timer_retry_after_secs;
-use crate::process_placements::process_bucket_placements;
+use crate::process_placements::process_shard_placements;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -109,7 +109,7 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
-/// Resolves the bucket placement a drained record publishes under. A record
+/// Resolves the shard placement a drained record publishes under. A record
 /// that already carries a real ref keeps it; a NIL ref (admin-operation
 /// emitters leave one) is resolved from the realm config for the target. Shared
 /// realm targets ignore the placement, so resolving them is harmless.
@@ -294,8 +294,8 @@ impl OperationsTaskHandler {
 
         let realm_id = *net_handle.realm_id();
         // Admin-operation records (group/user document ops) are stamped NIL by
-        // their emitters; resolve their bucket placement here from the realm
-        // config so they publish onto the right bucket topic. Records that
+        // their emitters; resolve their shard placement here from the realm
+        // config so they publish onto the right shard topic. Records that
         // already carry a real ref (metadata upserts/deletes) keep it.
         let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
         let mut totals = DrainSyncOutcome::default();
@@ -318,16 +318,16 @@ impl OperationsTaskHandler {
             })
             .collect();
 
-        // Bucket topics are join-only for this node unless it is the bucket's
+        // Shard topics are join-only for this node unless it is the shard's
         // rank-0 holder: a record whose topic has no local genesis yet cannot
         // publish. Try one bootstrap pass against the record's peers (falling
-        // back to the bucket's resolved holders when the record carries none,
+        // back to the shard's resolved holders when the record carries none,
         // as admin operations do), then defer whatever is still missing to a
         // short retry — the genesis arrives via gossip or the next pass.
         let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
             BTreeMap::new();
         for (_, record, topic) in &records {
-            if !record.target.uses_bucket_topic()
+            if !record.target.uses_shard_topic()
                 || net_handle
                     .document_sync_topic_exists(*topic)
                     .unwrap_or(false)
@@ -339,7 +339,7 @@ impl OperationsTaskHandler {
                 && let Some(config) = realm_config.as_ref()
             {
                 bootstrap_peers =
-                    crate::placement::resolve_bucket_holders(config, &record.placement);
+                    crate::placement::resolve_shard_holders(config, &record.placement);
                 bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
                 crate::sync_placement::sort_node_ids(&mut bootstrap_peers);
             }
@@ -370,7 +370,7 @@ impl OperationsTaskHandler {
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record, topic) in records {
-            if record.target.uses_bucket_topic()
+            if record.target.uses_shard_topic()
                 && !net_handle
                     .document_sync_topic_exists(topic)
                     .unwrap_or(false)
@@ -379,7 +379,7 @@ impl OperationsTaskHandler {
                     event = "pipeline.drain.deferred",
                     target = ?record.target,
                     %topic,
-                    "Deferring outbox record: bucket topic genesis not yet known"
+                    "Deferring outbox record: shard topic genesis not yet known"
                 );
                 deferred += 1;
                 continue;
@@ -488,7 +488,7 @@ impl OperationsTaskHandler {
             self.reschedule_with_backoff(retry_key).await;
         } else if deferred > 0 {
             // Deferred records wait only for a genesis to arrive from the
-            // bucket's rank-0 holder; retry quickly rather than on the failure
+            // shard's rank-0 holder; retry quickly rather than on the failure
             // backoff.
             self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
                 .await;
@@ -1323,7 +1323,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
-                process_bucket_placements(&self.context, realm_id, node_id).await;
+                process_shard_placements(&self.context, realm_id, node_id).await;
             }
             TaskKey::DrainDocumentSyncOutbox => {
                 self.drain_document_sync_outbox().await;

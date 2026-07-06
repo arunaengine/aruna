@@ -43,8 +43,8 @@ pub enum AdminDocumentReducerError {
     UnknownPlacementStrategy(Ulid),
     #[error("placement strategy {0} is still referenced")]
     PlacementStrategyInUse(Ulid),
-    #[error("placement strategy bucket count must be a non-zero power of two")]
-    InvalidPlacementBucketCount,
+    #[error("placement strategy shard count must be a non-zero power of two")]
+    InvalidPlacementShardCount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,8 +306,8 @@ impl AdminDocumentReducerState {
                 if strategy.replica_count == Some(0) {
                     return Err(AdminDocumentReducerError::ZeroPlacementReplicaCount);
                 }
-                if strategy.bucket_count == 0 || !strategy.bucket_count.is_power_of_two() {
-                    return Err(AdminDocumentReducerError::InvalidPlacementBucketCount);
+                if strategy.shard_count == 0 || !strategy.shard_count.is_power_of_two() {
+                    return Err(AdminDocumentReducerError::InvalidPlacementShardCount);
                 }
                 self.apply_realm_config_placement_field(
                     event,
@@ -3218,7 +3218,7 @@ mod tests {
                 },
                 effect: AffinityEffect::Filter,
             }],
-            bucket_count: 64,
+            shard_count: 64,
         }
     }
 
@@ -3454,13 +3454,13 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_placement_strategy_rejects_non_power_of_two_bucket_count() {
+    fn realm_config_placement_strategy_rejects_non_power_of_two_shard_count() {
         let mut state = realm_config_state();
         let before = state.clone();
 
         for bad in [0u32, 3, 63] {
             let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
-            strategy.bucket_count = bad;
+            strategy.shard_count = bad;
             assert_eq!(
                 state.apply(&realm_config_event(
                     1,
@@ -3469,8 +3469,8 @@ mod tests {
                     AdminDocumentClock::default(),
                     AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
                 )),
-                Err(AdminDocumentReducerError::InvalidPlacementBucketCount),
-                "bucket_count {bad} must be rejected"
+                Err(AdminDocumentReducerError::InvalidPlacementShardCount),
+                "shard_count {bad} must be rejected"
             );
             assert_eq!(state, before);
         }

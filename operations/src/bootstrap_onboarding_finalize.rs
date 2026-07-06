@@ -27,7 +27,7 @@ use crate::issue_onboarding_sync_ticket::{
 };
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::process_placements::process_bucket_placements;
+use crate::process_placements::process_shard_placements;
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
@@ -127,13 +127,13 @@ pub async fn bootstrap_onboarding_finalize(
         .as_ref()
         .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
     // Shared realm topics may be created here (the issuer is a legitimate
-    // origin for them); bucket topics are join-only — their genesis comes from
-    // the bucket's rank-0 holder, so the joiner is only added as a member.
+    // origin for them); shard topics are join-only — their genesis comes from
+    // the shard's rank-0 holder, so the joiner is only added as a member.
     net_handle
         .ensure_document_sync_topics(&onboarding_topics.shared, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
     let mut all_topics = onboarding_topics.shared;
-    all_topics.extend(onboarding_topics.bucket);
+    all_topics.extend(onboarding_topics.shard);
     net_handle
         .allow_document_sync_peers(&all_topics, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
@@ -284,19 +284,19 @@ async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
     context: &Arc<DriverContext>,
 ) {
-    process_bucket_placements(context, input.realm_id, input.local_node_id).await;
+    process_shard_placements(context, input.realm_id, input.local_node_id).await;
 }
 
 struct OnboardingSyncTopics {
     shared: Vec<::irokle::TopicId>,
-    bucket: Vec<::irokle::TopicId>,
+    shard: Vec<::irokle::TopicId>,
 }
 
 /// Derives the sync topics for a ticket's documents so the issuer can add the
 /// joiner to them: shared realm targets ignore the placement, user documents
-/// ride their bucket topic (resolved from the issuer's realm config). Shared
-/// and bucket topics are returned separately because only shared topics may be
-/// created by the issuer; bucket topics are join-only.
+/// ride their shard topic (resolved from the issuer's realm config). Shared
+/// and shard topics are returned separately because only shared topics may be
+/// created by the issuer; shard topics are join-only.
 async fn onboarding_sync_topics(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -307,10 +307,10 @@ async fn onboarding_sync_topics(
     let config = load_realm_config_document(context, realm_id).await;
     let mut topics = OnboardingSyncTopics {
         shared: Vec::new(),
-        bucket: Vec::new(),
+        shard: Vec::new(),
     };
     for document in &ticket.payload.documents {
-        if document.uses_bucket_topic() {
+        if document.uses_shard_topic() {
             if !matches!(document, DocumentSyncTarget::User { .. }) {
                 continue;
             }
@@ -322,7 +322,7 @@ async fn onboarding_sync_topics(
                 continue;
             }
             topics
-                .bucket
+                .shard
                 .push(document.sync_topic_id(realm_id, &placement));
         } else {
             topics

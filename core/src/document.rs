@@ -68,12 +68,12 @@ pub enum DocumentSyncTarget {
     },
 }
 
-/// A bucket whose sync topic the local node is an authoritative holder of and
+/// A shard whose sync topic the local node is an authoritative holder of and
 /// whose co-holder membership is still being topped up. Keyed by
-/// realm ‖ strategy ‖ epoch(le) ‖ bucket(be); one record per bucket, not per
-/// document (every document in the bucket rides the same topic).
+/// realm ‖ strategy ‖ epoch(le) ‖ shard(be); one record per shard, not per
+/// document (every document in the shard rides the same topic).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingBucketPlacement {
+pub struct PendingShardPlacement {
     pub realm_id: RealmId,
     pub placement: PlacementRef,
     pub selected_peers: Vec<NodeId>,
@@ -363,11 +363,11 @@ impl DocumentSyncTarget {
         }
     }
 
-    /// Whether this target's records ride a bucket topic (group, user,
+    /// Whether this target's records ride a shard topic (group, user,
     /// metadata classes) rather than a shared realm-scoped domain topic.
-    /// Bucket topics are join-only for everyone but the bucket's rank-0
+    /// Shard topics are join-only for everyone but the shard's rank-0
     /// holder, which creates the genesis eagerly.
-    pub fn uses_bucket_topic(&self) -> bool {
+    pub fn uses_shard_topic(&self) -> bool {
         matches!(
             self,
             Self::Group { .. }
@@ -380,25 +380,25 @@ impl DocumentSyncTarget {
         )
     }
 
-    /// Sync topic this target's records ride. Bucket-classed targets (group,
-    /// user, metadata) derive one topic per `(strategy, epoch, bucket)` from the
+    /// Sync topic this target's records ride. Shard-classed targets (group,
+    /// user, metadata) derive one topic per `(strategy, epoch, shard)` from the
     /// placement; shared realm-scoped targets keep their per-domain topic and
-    /// ignore the placement. A NIL placement on a bucket-classed target is a bug
+    /// ignore the placement. A NIL placement on a shard-classed target is a bug
     /// (the emitter failed to stamp a real ref) — it is asserted in debug and
     /// warned in release, never silently accepted.
     pub fn sync_topic_id(&self, realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
-        if self.uses_bucket_topic() {
+        if self.uses_shard_topic() {
             if *placement == PlacementRef::NIL {
                 debug_assert!(
                     false,
-                    "bucket-classed target {self:?} derived a topic from a NIL placement"
+                    "shard-classed target {self:?} derived a topic from a NIL placement"
                 );
                 tracing::warn!(
                     target = ?self,
-                    "bucket-classed target has a NIL placement; deriving a NIL bucket topic"
+                    "shard-classed target has a NIL placement; deriving a NIL shard topic"
                 );
             }
-            bucket_topic_id(realm_id, placement)
+            shard_topic_id(realm_id, placement)
         } else {
             self.shared_sync_topic_id()
         }
@@ -422,26 +422,26 @@ impl DocumentSyncTarget {
             other => {
                 debug_assert!(
                     false,
-                    "shared_sync_topic_id on bucket-classed target {other:?}"
+                    "shared_sync_topic_id on shard-classed target {other:?}"
                 );
-                bytes.extend_from_slice(b"/bucket-misroute");
+                bytes.extend_from_slice(b"/shard-misroute");
             }
         }
         irokle::TopicId::hash(bytes)
     }
 }
 
-/// Sync topic a bucket's records ride, derived purely from the placement
+/// Sync topic a shard's records ride, derived purely from the placement
 /// reference (no config lookup at the net layer). Mirrors the `TopicId::hash`
 /// idiom [`DocumentSyncTarget::sync_topic_id`] uses. Not yet wired into
-/// `sync_topic_id`: stage 2 flips the bucketed targets over to this in a later
+/// `sync_topic_id`: stage 2 flips the sharded targets over to this in a later
 /// commit.
-pub fn bucket_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
-    let mut bytes = b"aruna-bucket-topic-v1".to_vec();
+pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
+    let mut bytes = b"aruna-shard-topic-v1".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
     bytes.extend_from_slice(&placement.epoch.to_le_bytes());
-    bytes.extend_from_slice(&placement.bucket.to_be_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
     irokle::TopicId::hash(bytes)
 }
 
@@ -540,7 +540,7 @@ mod tests {
     use super::{
         DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
         DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
-        bucket_topic_id, compare_document_sync_revisions, document_sync_apply_decision,
+        compare_document_sync_revisions, document_sync_apply_decision, shard_topic_id,
     };
     use crate::NodeId;
     use crate::TopicId;
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_classed_targets_ride_bucket_topics_shared_targets_ride_domain_topics() {
+    fn shard_classed_targets_ride_shard_topics_shared_targets_ride_domain_topics() {
         let group_id = test_ulid(1);
         let realm_id = test_realm(2);
         let document_id = test_ulid(4);
@@ -759,15 +759,15 @@ mod tests {
         let placement_a = PlacementRef {
             strategy_id: test_ulid(9),
             epoch: 0,
-            bucket: 3,
+            shard: 3,
         };
         let placement_b = PlacementRef {
-            bucket: 4,
+            shard: 4,
             ..placement_a
         };
 
         // Group and its authorization are one logical subject: with the same
-        // placement they ride a single bucket topic, derived purely from it.
+        // placement they ride a single shard topic, derived purely from it.
         let group = DocumentSyncTarget::Group { group_id };
         let group_auth = DocumentSyncTarget::GroupAuthorization { group_id };
         assert_eq!(
@@ -776,14 +776,14 @@ mod tests {
         );
         assert_eq!(
             group.sync_topic_id(realm_id, &placement_a),
-            bucket_topic_id(realm_id, &placement_a)
+            shard_topic_id(realm_id, &placement_a)
         );
         assert_ne!(
             group.sync_topic_id(realm_id, &placement_a),
             group.sync_topic_id(realm_id, &placement_b)
         );
 
-        // The three metadata variants of one document collapse onto its bucket.
+        // The three metadata variants of one document collapse onto its shard.
         let registry = DocumentSyncTarget::MetadataRegistry {
             group_id,
             document_id,
@@ -817,7 +817,7 @@ mod tests {
         );
         assert_ne!(
             realm_config.sync_topic_id(realm_id, &placement_a),
-            bucket_topic_id(realm_id, &placement_a)
+            shard_topic_id(realm_id, &placement_a)
         );
     }
 
@@ -827,23 +827,23 @@ mod tests {
     }
 
     #[test]
-    fn bucket_topic_id_matches_golden_and_separates_dimensions() {
+    fn shard_topic_id_matches_golden_and_separates_dimensions() {
         let realm_id = test_realm(2);
         let placement = PlacementRef {
             strategy_id: test_ulid(4),
             epoch: 0,
-            bucket: 5,
+            shard: 5,
         };
         // Fixed inputs → fixed topic id: the stage-2 cross-node canary. A change
-        // here means co-holders would derive different bucket topics.
+        // here means co-holders would derive different shard topics.
         assert_eq!(
-            bucket_topic_id(realm_id, &placement).to_string(),
-            "9ea950b394474cd820cfce7d0a840232de8cbd34216aeb19a11eb39f21f99048"
+            shard_topic_id(realm_id, &placement).to_string(),
+            "b375275475edc34ab568776cea1fdf4053e57458816e8ed35c5925e3caa07cf4"
         );
 
         // Each hashed dimension moves the topic.
-        let other_bucket = PlacementRef {
-            bucket: 6,
+        let other_shard = PlacementRef {
+            shard: 6,
             ..placement
         };
         let other_epoch = PlacementRef {
@@ -855,20 +855,20 @@ mod tests {
             ..placement
         };
         assert_ne!(
-            bucket_topic_id(realm_id, &placement),
-            bucket_topic_id(realm_id, &other_bucket)
+            shard_topic_id(realm_id, &placement),
+            shard_topic_id(realm_id, &other_shard)
         );
         assert_ne!(
-            bucket_topic_id(realm_id, &placement),
-            bucket_topic_id(realm_id, &other_epoch)
+            shard_topic_id(realm_id, &placement),
+            shard_topic_id(realm_id, &other_epoch)
         );
         assert_ne!(
-            bucket_topic_id(realm_id, &placement),
-            bucket_topic_id(realm_id, &other_strategy)
+            shard_topic_id(realm_id, &placement),
+            shard_topic_id(realm_id, &other_strategy)
         );
         assert_ne!(
-            bucket_topic_id(realm_id, &placement),
-            bucket_topic_id(test_realm(3), &placement)
+            shard_topic_id(realm_id, &placement),
+            shard_topic_id(test_realm(3), &placement)
         );
     }
 
@@ -1168,7 +1168,7 @@ mod tests {
         let placement = PlacementRef {
             strategy_id: test_ulid(9),
             epoch: 0,
-            bucket: 2,
+            shard: 2,
         };
         let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };

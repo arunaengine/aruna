@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, bucket_topic_id};
+use aruna_core::document::{DocumentSyncTarget, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -13,24 +13,24 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::resolve_bucket_holders;
+use crate::placement::resolve_shard_holders;
 use crate::sync_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 
-/// Eagerly creates the genesis of every bucket topic whose rank-0 holder is the
-/// local node, so genesis creation has exactly one origin per bucket (race-free
+/// Eagerly creates the genesis of every shard topic whose rank-0 holder is the
+/// local node, so genesis creation has exactly one origin per shard (race-free
 /// by rank uniqueness). Every other node is join-only: it receives the genesis
 /// via gossip from the rank-0 holder or bootstraps it during anti-entropy.
 /// Runs on realm-config apply/change and at startup.
 ///
 /// Join-before-create: a config change can move rank-0 (e.g. a new node ranks
-/// first for a bucket whose genesis the previous rank-0 already created), so a
+/// first for a shard whose genesis the previous rank-0 already created), so a
 /// missing topic is first adopted from a co-holder; only what no co-holder
 /// knows either is created fresh.
-async fn ensure_rank0_bucket_topics(
+async fn ensure_rank0_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     config: &RealmConfigDocument,
@@ -40,13 +40,13 @@ async fn ensure_rank0_bucket_topics(
     let mut rank0_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
-        for bucket in 0..strategy.bucket_count {
+        for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
                 strategy_id: strategy.strategy_id,
                 epoch: 0,
-                bucket,
+                shard,
             };
-            let holders = resolve_bucket_holders(config, &placement);
+            let holders = resolve_shard_holders(config, &placement);
             if !holders.contains(&local_node_id) {
                 continue;
             }
@@ -64,7 +64,7 @@ async fn ensure_rank0_bucket_topics(
             groups
                 .entry(co_holders)
                 .or_default()
-                .push(bucket_topic_id(realm_id, &placement));
+                .push(shard_topic_id(realm_id, &placement));
         }
     }
     for (co_holders, topics) in rank0_groups {
@@ -87,13 +87,13 @@ async fn ensure_rank0_bucket_topics(
             event = "placement.genesis.ensure",
             topics = topics.len(),
             co_holders = co_holders.len(),
-            "Ensuring rank-0 bucket topic geneses"
+            "Ensuring rank-0 shard topic geneses"
         );
         if let Err(error) = net_handle.ensure_document_sync_topics(&topics, co_holders) {
-            warn!(error = %error, "Failed to ensure rank-0 bucket topics");
+            warn!(error = %error, "Failed to ensure rank-0 shard topics");
         }
     }
-    // Non-rank-0 held buckets: a holder that is already a member (e.g. the
+    // Non-rank-0 held shards: a holder that is already a member (e.g. the
     // previous rank-0 after a config change moved the rank) completes the
     // membership of freshly added co-holders — a new holder cannot add itself.
     // Topics not known locally are skipped: their rank-0 creates them with the
@@ -114,38 +114,38 @@ async fn ensure_rank0_bucket_topics(
             continue;
         }
         if let Err(error) = net_handle.allow_document_sync_peers(&known, co_holders) {
-            debug!(error = %error, "Could not complete held bucket topic membership");
+            debug!(error = %error, "Could not complete held shard topic membership");
         }
     }
 }
 
-/// Reconciles the local node's held bucket topics with their co-holders.
+/// Reconciles the local node's held shard topics with their co-holders.
 ///
-/// First creates the genesis of every bucket the local node is rank-0 holder
-/// of (see [`ensure_rank0_bucket_topics`]). Then iterates the
+/// First creates the genesis of every shard the local node is rank-0 holder
+/// of (see [`ensure_rank0_shard_topics`]). Then iterates the
 /// [`SYNC_PLACEMENT_KEYSPACE`] records the write path left behind (one per
-/// bucket that was not fully replicated at write time), re-resolves each
-/// bucket's holder set from the current realm config, and adds every co-holder
-/// as a member of the bucket topic. Membership changes schedule an irokle topic
-/// recheck, so the resync loop then pushes the bucket's events to any freshly
+/// shard that was not fully replicated at write time), re-resolves each
+/// shard's holder set from the current realm config, and adds every co-holder
+/// as a member of the shard topic. Membership changes schedule an irokle topic
+/// recheck, so the resync loop then pushes the shard's events to any freshly
 /// added co-holder. A record whose co-holders are all members is removed; a
-/// record the local node no longer holds is dropped; a record whose bucket
+/// record the local node no longer holds is dropped; a record whose shard
 /// topic has no genesis locally yet (non-rank-0 holder, genesis in flight) is
 /// kept for retry.
-pub async fn process_bucket_placements(
+pub async fn process_shard_placements(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     local_node_id: NodeId,
 ) {
     let Some(config) = load_realm_config(context, realm_id).await else {
-        warn!(%realm_id, "Cannot process bucket placements without a realm config");
+        warn!(%realm_id, "Cannot process shard placements without a realm config");
         return;
     };
     let Some(net_handle) = context.net_handle.as_ref() else {
         return;
     };
 
-    ensure_rank0_bucket_topics(context, net_handle, &config, realm_id, local_node_id).await;
+    ensure_rank0_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
 
     let mut start_after: Option<Key> = None;
     let mut retry_needed = false;
@@ -169,11 +169,11 @@ pub async fn process_bucket_placements(
                 values
             }
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to list pending bucket placements");
+                warn!(error = %error, "Failed to list pending shard placements");
                 return;
             }
             other => {
-                warn!(event = ?other, "Unexpected pending bucket placement iter result");
+                warn!(event = ?other, "Unexpected pending shard placement iter result");
                 return;
             }
         };
@@ -182,7 +182,7 @@ pub async fn process_bucket_placements(
             let record = match decode_placement(value) {
                 Ok(record) => record,
                 Err(error) => {
-                    warn!(error = %error, "Deleting malformed bucket placement record");
+                    warn!(error = %error, "Deleting malformed shard placement record");
                     delete_record(context, key.to_vec()).await;
                     continue;
                 }
@@ -191,9 +191,9 @@ pub async fn process_bucket_placements(
                 continue;
             }
 
-            let holders = resolve_bucket_holders(&config, &record.placement);
+            let holders = resolve_shard_holders(&config, &record.placement);
             if !holders.contains(&local_node_id) {
-                // The local node is no longer a holder of this bucket.
+                // The local node is no longer a holder of this shard.
                 delete_record(context, key.to_vec()).await;
                 continue;
             }
@@ -208,7 +208,7 @@ pub async fn process_bucket_placements(
                 continue;
             }
 
-            let topic = bucket_topic_id(realm_id, &record.placement);
+            let topic = shard_topic_id(realm_id, &record.placement);
             // Rank-0 may create the genesis; every other holder is join-only
             // and can only add members to an already-known topic.
             let membership = if local_is_rank0 {
@@ -219,11 +219,11 @@ pub async fn process_bucket_placements(
             match membership {
                 Ok(()) => {
                     // Every co-holder is now a member; the resync loop delivers
-                    // the bucket's events. Record satisfied.
+                    // the shard's events. Record satisfied.
                     delete_record(context, key.to_vec()).await;
                 }
                 Err(error) => {
-                    debug!(error = %error, "Bucket topic membership incomplete; keeping placement record");
+                    debug!(error = %error, "Shard topic membership incomplete; keeping placement record");
                     let refreshed = new_placement(
                         realm_id,
                         record.placement,
@@ -302,7 +302,7 @@ mod tests {
             replica_count: replica,
             distinct_locations: false,
             affinity: Vec::new(),
-            bucket_count: 64,
+            shard_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy.clone()];
@@ -314,27 +314,27 @@ mod tests {
             PlacementRef {
                 strategy_id: strategy.strategy_id,
                 epoch: 0,
-                bucket: 3,
+                shard: 3,
             },
         )
     }
 
     #[test]
-    fn bucket_holders_are_deterministic_across_node_ordering() {
+    fn shard_holders_are_deterministic_across_node_ordering() {
         let (config, placement) = config_with(&[node(1), node(2), node(3), node(4)], None);
-        let first = resolve_bucket_holders(&config, &placement);
+        let first = resolve_shard_holders(&config, &placement);
 
         let (reversed, _) = config_with(&[node(4), node(3), node(2), node(1)], None);
-        let second = resolve_bucket_holders(&reversed, &placement);
+        let second = resolve_shard_holders(&reversed, &placement);
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 4);
     }
 
     #[test]
-    fn replica_capped_bucket_holder_set_is_bounded() {
+    fn replica_capped_shard_holder_set_is_bounded() {
         let (config, placement) = config_with(&[node(1), node(2), node(3), node(4)], Some(2));
-        let holders = resolve_bucket_holders(&config, &placement);
+        let holders = resolve_shard_holders(&config, &placement);
         assert_eq!(holders.len(), 2);
     }
 }
