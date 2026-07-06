@@ -1,4 +1,5 @@
 use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
+use super::s3_server::S3OpLabel;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
@@ -55,8 +56,14 @@ impl S3Auth for AuthProvider {
 #[async_trait::async_trait]
 impl S3Access for AuthProvider {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // Label request metrics with the resolved operation as early as possible.
+        let operation_name = cx.s3_op().name().to_string();
+        if let Some(label) = cx.extensions_mut().get::<S3OpLabel>() {
+            label.set(&operation_name);
+        }
+
         // Evaluate action from S3 operation name
-        let action = get_s3_operation_permission(cx.s3_op().name())
+        let action = get_s3_operation_permission(&operation_name)
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
         // Unsigned requests are checked as the Everyone principal, but only for

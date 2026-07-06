@@ -15,6 +15,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -584,15 +585,21 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     announce_realm_presence(context.as_ref(), &realm_id, net.node_id()).await?;
 
     let capabilities = NodeCapabilities::management_node(realm_signing_key)?;
-    let (base_url, server_task) = spawn_rest_server(
+    let (base_url, state, server_task) = spawn_rest_server(
         context.clone(),
         realm_id,
         net.node_id(),
         capabilities.clone(),
     )
     .await?;
-    let (s3, s3_task) =
-        spawn_optional_s3_server(mode, context.clone(), realm_id, net.node_id()).await?;
+    let (s3, s3_task) = spawn_optional_s3_server(
+        mode,
+        context.clone(),
+        realm_id,
+        net.node_id(),
+        state.metrics(),
+    )
+    .await?;
 
     Ok(SeedNode {
         _temp_dir: temp_dir,
@@ -688,7 +695,7 @@ async fn spawn_joiner_node_with_mode(
     mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     announce_realm_presence(joiner_context.as_ref(), &config.realm_id, config.node_id).await?;
 
-    let (base_url, server_task) = spawn_rest_server(
+    let (base_url, state, server_task) = spawn_rest_server(
         joiner_context.clone(),
         config.realm_id,
         config.node_id,
@@ -700,6 +707,7 @@ async fn spawn_joiner_node_with_mode(
         joiner_context.clone(),
         config.realm_id,
         config.node_id,
+        state.metrics(),
     )
     .await?;
 
@@ -786,13 +794,13 @@ async fn spawn_rest_server(
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     capabilities: NodeCapabilities,
-) -> TestResult<(String, JoinHandle<()>)> {
+) -> TestResult<(String, Arc<ServerState>, JoinHandle<()>)> {
     let state =
         Arc::new(ServerState::new(context, realm_id, node_id, capabilities, false, None).await);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = Server::new(
-        state,
+        state.clone(),
         ServerConfig {
             http_addr: addr,
             max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
@@ -808,7 +816,7 @@ async fn spawn_rest_server(
         .await
         .unwrap();
     });
-    Ok((format!("http://{}", addr), server_task))
+    Ok((format!("http://{}", addr), state, server_task))
 }
 
 async fn spawn_optional_s3_server(
@@ -816,12 +824,13 @@ async fn spawn_optional_s3_server(
     context: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: iroh::PublicKey,
+    metrics: Arc<NodeMetrics>,
 ) -> TestResult<(Option<S3Endpoint>, Option<JoinHandle<()>>)> {
     if mode != NodeServiceMode::Full {
         return Ok((None, None));
     }
 
-    let (s3, task) = spawn_s3_server(context, realm_id, node_id).await?;
+    let (s3, task) = spawn_s3_server(context, realm_id, node_id, metrics).await?;
     Ok((Some(s3), Some(task)))
 }
 
@@ -829,6 +838,7 @@ async fn spawn_s3_server(
     context: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: iroh::PublicKey,
+    metrics: Arc<NodeMetrics>,
 ) -> TestResult<(S3Endpoint, JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let bind_addr = listener.local_addr()?;
@@ -841,6 +851,7 @@ async fn spawn_s3_server(
         realm_id,
         node_id,
         test_cors_config(),
+        metrics,
     )
     .await?;
     let (_addr, task) = s3_server.run_with_listener(listener)?;

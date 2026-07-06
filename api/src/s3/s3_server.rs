@@ -8,6 +8,7 @@ use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
+use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -25,11 +26,57 @@ use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, trace};
+
+/// Carries the resolved S3 operation name from the access check back to the
+/// wrapper so request metrics can be labelled by operation. The wrapper inserts
+/// it into the request extensions (which survive `s3s` routing) and keeps a
+/// clone; [`crate::s3::auth::AuthProvider::check`] fills it in once the
+/// operation is known.
+#[derive(Clone)]
+pub struct S3OpLabel(Arc<OnceLock<String>>);
+
+impl S3OpLabel {
+    fn new() -> Self {
+        Self(Arc::new(OnceLock::new()))
+    }
+
+    pub fn set(&self, name: &str) {
+        let _ = self.0.set(name.to_string());
+    }
+
+    fn resolved(&self) -> &str {
+        self.0.get().map_or("unknown", String::as_str)
+    }
+}
+
+fn record_s3_request(
+    metrics: &NodeMetrics,
+    method: &Method,
+    code: u16,
+    op: &str,
+    elapsed: Duration,
+) {
+    metrics
+        .http_requests
+        .get_or_create(&RequestLabels {
+            interface: "s3",
+            method: method.to_string(),
+            code,
+        })
+        .inc();
+    metrics
+        .http_request_duration
+        .get_or_create(&RouteLabels {
+            interface: "s3",
+            op: op.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
+}
 
 pub struct S3Server {
     address: String,
@@ -37,6 +84,7 @@ pub struct S3Server {
     cors: CorsConfig,
     domain: String,
     driver_ctx: Arc<DriverContext>,
+    metrics: Arc<NodeMetrics>,
 }
 
 #[derive(Clone)]
@@ -45,10 +93,11 @@ pub struct WrappingService {
     cors: CorsConfig,
     domain: String,
     driver_ctx: Arc<DriverContext>,
+    metrics: Arc<NodeMetrics>,
 }
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx))]
+    #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx, metrics))]
     pub async fn new(
         address: impl Into<String> + Copy,
         hostname: impl Into<String>,
@@ -56,6 +105,7 @@ impl S3Server {
         realm_id: RealmId,
         node_id: NodeId,
         cors: CorsConfig,
+        metrics: Arc<NodeMetrics>,
     ) -> Result<Self, S3ServerError> {
         let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id).await;
         let hostname = hostname.into();
@@ -81,6 +131,7 @@ impl S3Server {
             cors,
             domain: hostname,
             driver_ctx,
+            metrics,
         })
     }
 
@@ -94,6 +145,7 @@ impl S3Server {
             cors: self.cors,
             domain: self.domain,
             driver_ctx: self.driver_ctx,
+            metrics: self.metrics,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -136,9 +188,13 @@ impl Service<Request<Incoming>> for WrappingService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
+        // The access check fills this in with the resolved operation name; it
+        // reaches the check through the request extensions.
+        let op_label = S3OpLabel::new();
+        parts.extensions.insert(op_label.clone());
         let span = make_request_span("s3", &parts.headers, &method, &path);
         let started = Instant::now();
         {
@@ -179,12 +235,14 @@ impl Service<Request<Incoming>> for WrappingService {
         let shared = self.shared.clone();
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();
+        let metrics = self.metrics.clone();
         Box::pin(async move {
             let bucket_cors = if origin_header.is_some() {
                 match load_bucket_cors_config(driver_ctx, bucket).await {
                     Ok(bucket_cors) => bucket_cors,
                     Err(error) => {
                         span.record("status_code", 500);
+                        record_s3_request(&metrics, &method, 500, "unknown", started.elapsed());
                         let _guard = span.enter();
                         error!(
                             event = "request.failed",
@@ -218,7 +276,9 @@ impl Service<Request<Incoming>> for WrappingService {
                             None => build_preflight_forbidden_response(),
                         },
                     );
-                    emit_request_completed(&span, "s3", response.status().as_u16(), started);
+                    let code = response.status().as_u16();
+                    emit_request_completed(&span, "s3", code, started);
+                    record_s3_request(&metrics, &method, code, "cors_preflight", started.elapsed());
                     return Ok(response);
                 }
 
@@ -231,7 +291,9 @@ impl Service<Request<Incoming>> for WrappingService {
                 {
                     response.headers_mut().extend(cors_headers);
                 }
-                emit_request_completed(&span, "s3", response.status().as_u16(), started);
+                let code = response.status().as_u16();
+                emit_request_completed(&span, "s3", code, started);
+                record_s3_request(&metrics, &method, code, "cors_preflight", started.elapsed());
                 return Ok(response);
             }
 
@@ -247,12 +309,16 @@ impl Service<Request<Incoming>> for WrappingService {
                     cors.apply_s3_response_headers(origin_header.as_ref(), response.headers_mut());
                 }
             }
+            let op = op_label.resolved();
             match &result {
                 Ok(response) => {
-                    emit_request_completed(&span, "s3", response.status().as_u16(), started)
+                    let code = response.status().as_u16();
+                    emit_request_completed(&span, "s3", code, started);
+                    record_s3_request(&metrics, &method, code, op, started.elapsed());
                 }
                 Err(error) => {
                     span.record("status_code", 500);
+                    record_s3_request(&metrics, &method, 500, op, started.elapsed());
                     let _guard = span.enter();
                     error!(
                         event = "request.failed",
