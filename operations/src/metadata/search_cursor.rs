@@ -142,16 +142,22 @@ pub struct SearchPage {
     pub next: Option<SearchPageCursor>,
 }
 
-/// Deduplicate hits on `(graph_iri, subject_iri)` keeping the max score, preserving
-/// title/snippet from whichever copy carries them, and order by score descending
-/// with a `(graph_iri, subject_iri)` tie-break for a stable total order.
+/// Deduplicate hits on `(graph_iri, subject_iri)` keeping the highest quantized
+/// score (smallest `document_id` on ties), preserving title/snippet from whichever
+/// copy carries them, and order by score descending with a `(graph_iri,
+/// subject_iri)` tie-break for a stable total order.
 pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
         let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
         match deduped.get_mut(&key) {
             Some(existing) => {
-                if hit.score > existing.score {
+                let replace = match score_key(hit.score).cmp(&score_key(existing.score)) {
+                    Ordering::Greater => true,
+                    Ordering::Less => false,
+                    Ordering::Equal => hit.document_id < existing.document_id,
+                };
+                if replace {
                     let mut winner = hit;
                     if winner.snippet.is_none() {
                         winner.snippet = existing.snippet.take();
@@ -443,6 +449,27 @@ mod tests {
                 ("https://w3id.org/aruna/01B", "./file-b.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn merge_retains_deterministic_copy_on_quantized_ties() {
+        let make = |document_id: &str, score: f32, title: &str| {
+            let mut copy = hit("01A", "./file.txt", score);
+            copy.document_id = document_id.to_string();
+            copy.title = title.to_string();
+            copy
+        };
+        // Same 1e-6 quantization bucket, raw scores differ.
+        let low_id = make("01AAA", 0.100_000_1, "low-id");
+        let high_id = make("01BBB", 0.100_000_4, "high-id");
+        assert_eq!(score_key(low_id.score), score_key(high_id.score));
+
+        let merged_one = merge_search_hits(vec![low_id.clone(), high_id.clone()]);
+        let merged_two = merge_search_hits(vec![high_id, low_id]);
+        assert_eq!(merged_one.len(), 1);
+        assert_eq!(merged_one[0].document_id, "01AAA");
+        assert_eq!(merged_two[0].document_id, "01AAA");
+        assert_eq!(merged_one[0].title, merged_two[0].title);
     }
 
     #[test]
