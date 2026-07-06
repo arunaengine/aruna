@@ -417,13 +417,14 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
-            false,
+            true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
             postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
+        assert!(decoded.allow_genesis);
     }
 
     #[test]

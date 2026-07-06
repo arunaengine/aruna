@@ -81,6 +81,7 @@ fn document_publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentSyncTarget,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
         DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
@@ -88,15 +89,19 @@ fn document_publish_from_outbox(
             target,
             bytes,
             change,
+            allow_genesis,
         },
         DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
             event_id,
             target,
             change,
+            allow_genesis,
         },
-        DocumentSyncOutboxEvent::AdminOperation { event } => {
-            DocumentSyncPublish::AdminOperation { target, event }
-        }
+        DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
+            target,
+            event,
+            allow_genesis,
+        },
     }
 }
 
@@ -218,8 +223,12 @@ impl OperationsTaskHandler {
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record) in batch.records {
-            let document =
-                document_publish_from_outbox(record.outbox_id, record.target.clone(), record.event);
+            let document = document_publish_from_outbox(
+                record.outbox_id,
+                record.target.clone(),
+                record.event,
+                record.allow_genesis,
+            );
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();
             if subbatches
@@ -889,10 +898,12 @@ mod tests {
                 bytes: vec![1, 2, 3],
                 change,
             },
+            true,
         );
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
+        assert!(publish.allow_genesis());
         assert!(matches!(
             publish,
             DocumentSyncPublish::Upsert { bytes, change: actual, .. }
