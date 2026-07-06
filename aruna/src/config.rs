@@ -322,6 +322,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                         onboarding_secret,
                         node_location.clone(),
                         node_weight,
+                        node_labels.clone(),
                     )
                     .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
@@ -358,6 +359,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                 &node_state,
                 node_location.clone(),
                 node_weight,
+                node_labels.clone(),
             )
             .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
@@ -747,6 +749,7 @@ async fn bootstrap_onboarded_node_state(
     onboarding_secret: &str,
     node_location: Option<String>,
     node_weight: Option<u32>,
+    node_labels: BTreeMap<String, String>,
 ) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -807,6 +810,7 @@ async fn bootstrap_onboarded_node_state(
             issuer_proof,
             node_location,
             node_weight,
+            node_labels,
         })
         .send()
         .await?;
@@ -903,6 +907,7 @@ async fn refresh_onboarding_bootstrap(
     node_state: &PersistedNodeState,
     node_location: Option<String>,
     node_weight: Option<u32>,
+    node_labels: BTreeMap<String, String>,
 ) -> Result<BootstrapOnboardingResponse, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
@@ -973,6 +978,7 @@ async fn refresh_onboarding_bootstrap(
             issuer_proof,
             node_location,
             node_weight,
+            node_labels,
         })
         .send()
         .await?;

@@ -8,8 +8,8 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
     AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    KIND_LABEL_KEY, LabelMatch, NodeInfoDocument, PlacementOverride, PlacementStrategy,
-    RealmConfigDocument, RealmNodeKind,
+    KIND_LABEL_KEY, LabelMatch, PlacementOverride, PlacementStrategy, RealmConfigDocument,
+    RealmNodeKind,
 };
 use aruna_core::types::GroupId;
 
@@ -35,9 +35,11 @@ pub struct PlacementView {
 ///
 /// Placement fields come from the matching `placement_map` entry; unmapped
 /// nodes fall back to [`DEFAULT_LOCATION`] / [`DEFAULT_NODE_WEIGHT`] and clear
-/// status flags. Labels are `NodeInfo` labels, overlaid by the entry's
-/// `label_overrides`, overlaid by the derived read-only kind label.
-pub fn build_view(config: &RealmConfigDocument, node_infos: &[NodeInfoDocument]) -> PlacementView {
+/// status flags. Labels are the entry's `labels`, overlaid by the derived
+/// read-only kind label (which always wins). The label input is the replicated
+/// class-1 placement-map entry, never the eventually-consistent `NodeInfo`, so
+/// holder sets stay a pure function of the placement map.
+pub fn build_view(config: &RealmConfigDocument) -> PlacementView {
     let mut nodes = Vec::with_capacity(config.nodes.len());
     for realm_node in &config.nodes {
         let Ok(node_id) = NodeId::from_str(&realm_node.node_id) else {
@@ -53,16 +55,7 @@ pub fn build_view(config: &RealmConfigDocument, node_infos: &[NodeInfoDocument])
         let full = entry.is_some_and(|entry| entry.full);
         let draining = entry.is_some_and(|entry| entry.draining);
 
-        let mut labels = node_infos
-            .iter()
-            .find(|info| info.node_id == node_id)
-            .map(|info| info.labels.clone())
-            .unwrap_or_default();
-        if let Some(entry) = entry {
-            for (key, value) in &entry.label_overrides {
-                labels.insert(key.clone(), value.clone());
-            }
-        }
+        let mut labels = entry.map(|entry| entry.labels.clone()).unwrap_or_default();
         labels.insert(
             KIND_LABEL_KEY.to_string(),
             kind_label(&realm_node.kind).to_string(),
@@ -401,8 +394,7 @@ fn binding_strategy<'a>(
 mod tests {
     use super::*;
     use aruna_core::structs::{
-        AffinityRule, NodePlacementEntry, NodeUrls, NodeUtilization, RealmId, RealmNode,
-        StrategyBinding,
+        AffinityRule, NodePlacementEntry, RealmId, RealmNode, StrategyBinding,
     };
     use proptest::prelude::*;
     use ulid::Ulid;
@@ -503,32 +495,13 @@ mod tests {
             weight: 250,
             full: true,
             draining: false,
-            label_overrides: BTreeMap::from([
+            labels: BTreeMap::from([
                 ("tier".to_string(), "hot".to_string()),
                 (KIND_LABEL_KEY.to_string(), "override-bogus".to_string()),
             ]),
         });
-        let node_infos = vec![NodeInfoDocument {
-            node_id: mapped,
-            labels: BTreeMap::from([
-                ("tier".to_string(), "cold".to_string()),
-                ("region".to_string(), "west".to_string()),
-                (KIND_LABEL_KEY.to_string(), "ni-bogus".to_string()),
-            ]),
-            urls: NodeUrls {
-                api: None,
-                s3: None,
-            },
-            utilization: NodeUtilization {
-                storage_bytes_used: 0,
-                documents_held: 0,
-                load_permille: 0,
-                heartbeat_at_ms: 0,
-            },
-            updated_at_ms: 0,
-        }];
 
-        let view = build_view(&config, &node_infos);
+        let view = build_view(&config);
         assert_eq!(view.nodes.len(), 2);
 
         let a = view.nodes.iter().find(|n| n.node_id == mapped).unwrap();
@@ -536,9 +509,8 @@ mod tests {
         assert_eq!(a.weight, 250);
         assert!(a.full);
         assert!(!a.draining);
-        // node_info < label_overrides < derived kind label.
+        // entry labels < derived kind label (derived wins).
         assert_eq!(a.labels.get("tier"), Some(&"hot".to_string()));
-        assert_eq!(a.labels.get("region"), Some(&"west".to_string()));
         assert_eq!(a.labels.get(KIND_LABEL_KEY), Some(&"server".to_string()));
 
         let b = view.nodes.iter().find(|n| n.node_id == unmapped).unwrap();
@@ -547,6 +519,34 @@ mod tests {
         assert!(!b.full);
         assert!(!b.draining);
         assert_eq!(b.labels.get(KIND_LABEL_KEY), Some(&"local".to_string()));
+    }
+
+    #[test]
+    fn entry_labels_from_config_drive_affinity_filter() {
+        // The chain ARUNA_NODE_LABELS -> onboarding -> placement-map entry ->
+        // build_view -> Filter selects only labeled nodes.
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let labeled = node_id(1);
+        let plain = node_id(2);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(labeled, RealmNodeKind::Server);
+        config.ensure_node(plain, RealmNodeKind::Server);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: labeled,
+            location: "eu".to_string(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+        });
+
+        let view = build_view(&config);
+        let mut strategy = strategy(None, false);
+        strategy.affinity = vec![filter_rule("tier", "hot")];
+
+        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        assert_eq!(holders, vec![labeled]);
     }
 
     #[test]

@@ -410,6 +410,7 @@ mod tests {
                 oidc_providers: Vec::new(),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
             ctx,
         )
@@ -430,7 +431,7 @@ mod tests {
             weight: 250,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::new(),
+            labels: BTreeMap::new(),
         };
         drive(
             SetNodePlacementOperation::new(SetNodePlacementConfig {
@@ -460,7 +461,7 @@ mod tests {
             weight: DEFAULT_NODE_WEIGHT,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::from([(
+            labels: BTreeMap::from([(
                 aruna_core::structs::KIND_LABEL_KEY.to_string(),
                 "Server".to_string(),
             )]),

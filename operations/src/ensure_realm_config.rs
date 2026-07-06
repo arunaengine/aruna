@@ -871,7 +871,7 @@ mod tests {
             weight: 250,
             full: false,
             draining: false,
-            label_overrides: BTreeMap::new(),
+            labels: BTreeMap::new(),
         };
         let strategy = PlacementStrategy {
             strategy_id: Ulid::from_bytes([4; 16]),

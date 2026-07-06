@@ -97,6 +97,7 @@ pub struct BootstrapOnboardingRequestDoc {
     pub issuer_proof: Option<String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -406,6 +407,7 @@ pub async fn bootstrap_onboarding(
             now: now_timestamp(),
             node_location: request.node_location.clone(),
             node_weight: request.node_weight,
+            node_labels: request.node_labels.clone(),
         },
         state.get_ctx(),
     )
@@ -674,6 +676,7 @@ mod tests {
                 oidc_providers: vec![],
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -763,6 +766,7 @@ mod tests {
                 issuer_proof: Some(issuer_signature),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await
@@ -992,6 +996,7 @@ mod tests {
                 issuer_proof: Some("invalid-signature".to_string()),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await;
@@ -1021,6 +1026,7 @@ mod tests {
                 issuer_proof: Some(issuer_signature),
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await;
@@ -1076,6 +1082,7 @@ mod tests {
                 issuer_proof: None,
                 node_location: None,
                 node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await

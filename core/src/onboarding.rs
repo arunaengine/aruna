@@ -72,6 +72,8 @@ pub struct BootstrapOnboardingRequest {
     pub node_location: Option<String>,
     /// Joiner's placement weight (`None` ⇒ default weight).
     pub node_weight: Option<u32>,
+    /// Joiner's placement labels, carried into the seeded placement map entry.
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

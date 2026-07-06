@@ -32,6 +32,9 @@ pub struct CreateRealmConfig {
     pub node_location: Option<String>,
     /// Creating node's placement weight (`None` ⇒ default weight).
     pub node_weight: Option<u32>,
+    /// Creating node's placement labels (config-sourced, reserved key rejected
+    /// at parse time). Flow into the node's placement-map entry.
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(PartialEq)]
@@ -123,7 +126,7 @@ impl CreateRealmOperation {
             weight: self.config.node_weight.unwrap_or(DEFAULT_NODE_WEIGHT),
             full: false,
             draining: false,
-            label_overrides: std::collections::BTreeMap::new(),
+            labels: self.config.node_labels.clone(),
         }
     }
 
@@ -525,6 +528,7 @@ mod test {
             oidc_providers: Vec::new(),
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         }
     }
 
@@ -792,7 +796,7 @@ mod test {
                             weight: DEFAULT_NODE_WEIGHT,
                             full: false,
                             draining: false,
-                            label_overrides: std::collections::BTreeMap::new(),
+                            labels: std::collections::BTreeMap::new(),
                         },
                     },
                 ),
@@ -919,6 +923,7 @@ mod test {
             oidc_providers: Vec::new(),
             node_location: None,
             node_weight: None,
+            node_labels: Default::default(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();
