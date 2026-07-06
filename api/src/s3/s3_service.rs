@@ -15,11 +15,15 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
+    AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
+    WatchEventKind, blob_bucket_permission_path,
 };
+use aruna_core::types::UserId;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -318,6 +322,33 @@ impl ArunaS3Service {
         }
     }
 
+    /// Post-commit, best-effort resource-watch emission for a committed object
+    /// write. Fire-and-forget: a failed emission only warns and never affects the
+    /// already-successful upload response.
+    async fn emit_data_uploaded_watch(
+        &self,
+        actor: UserId,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+    ) {
+        let path = format!("{bucket}/{key}");
+        let event = WatchEvent {
+            event_id: ulid::Ulid::new(),
+            realm_id: self.realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path,
+            actor,
+            occurred_at_ms: unix_timestamp_millis(),
+            detail: WatchEventDetail::DataUploaded {
+                bucket,
+                key,
+                size_bytes,
+            },
+        };
+        emit_resource_watch_event(self.state.as_ref(), event).await;
+    }
+
     async fn complete_multipart_upload_response(
         &self,
         bucket: String,
@@ -346,6 +377,10 @@ impl ArunaS3Service {
             s3_checksum_type_from_multipart(result.checksum_type),
         ));
 
+        let watch_actor = replication_auth.user_id;
+        let watch_bucket = replication_bucket.clone();
+        let watch_key = replication_key.clone();
+        let watch_size = result.location.blob_size;
         self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
@@ -354,6 +389,8 @@ impl ArunaS3Service {
             false,
         )
         .await;
+        self.emit_data_uploaded_watch(watch_actor, watch_bucket, watch_key, watch_size)
+            .await;
 
         Ok(S3Response::new(output))
     }
@@ -382,6 +419,10 @@ impl ArunaS3Service {
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
         ));
+        let watch_actor = replication_auth.user_id;
+        let watch_bucket = replication_bucket.clone();
+        let watch_key = replication_key.clone();
+        let watch_size = result.location.blob_size;
         self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
@@ -390,6 +431,8 @@ impl ArunaS3Service {
             false,
         )
         .await;
+        self.emit_data_uploaded_watch(watch_actor, watch_bucket, watch_key, watch_size)
+            .await;
 
         Ok(S3Response::new(output))
     }
