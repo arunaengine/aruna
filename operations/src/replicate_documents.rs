@@ -133,6 +133,12 @@ impl ReplicateDocumentsOperation {
             return self.finish_success();
         };
 
+        // Admin documents replicate as operations over their shared topic; they never
+        // take placements, so skip them without a placement write or publish attempt.
+        if document.is_admin_document() {
+            return self.emit_next_publish();
+        }
+
         let desired_count = desired_peer_count(&document);
         if desired_count == 0 {
             return self.emit_next_publish();
@@ -337,6 +343,12 @@ mod tests {
         }
     }
 
+    fn metadata_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([seed; 16]),
+        }
+    }
+
     #[test]
     fn task_schedule_error_is_non_blocking_after_placement_write() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -361,7 +373,7 @@ mod tests {
 
     #[test]
     fn two_remote_peers_satisfy_default_document_placement() {
-        let target = group_target(4);
+        let target = metadata_target(4);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
             local_node_id: node(1),
@@ -381,7 +393,7 @@ mod tests {
     #[test]
     fn pending_placement_records_authoritative_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = group_target(5);
+        let target = metadata_target(5);
         let local_node_id = node(1);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -404,7 +416,7 @@ mod tests {
     #[test]
     fn publish_failure_keeps_authoritative_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = group_target(6);
+        let target = metadata_target(6);
         let local_node_id = node(1);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -433,7 +445,7 @@ mod tests {
     #[test]
     fn replicate_documents_selection_uses_rendezvous_not_local_salt() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = group_target(7);
+        let target = metadata_target(7);
         let realm_nodes = vec![node(2)];
 
         let mut first = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -465,5 +477,23 @@ mod tests {
             first_record.authoritative_node_id,
             second_record.authoritative_node_id
         );
+    }
+
+    #[test]
+    fn admin_target_creates_no_placement() {
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![group_target(4)],
+        });
+        operation.realm_nodes = vec![node(2), node(3)];
+
+        let effects = operation.emit_next_publish();
+
+        assert!(effects.is_empty());
+        assert!(operation.placement_action.is_none());
+        assert_eq!(operation.state, ReplicateDocumentsState::Finish);
+        assert_eq!(operation.finalize(), Ok(()));
     }
 }

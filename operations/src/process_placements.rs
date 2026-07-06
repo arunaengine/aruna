@@ -139,6 +139,18 @@ impl ProcessPlacementsOperation {
             );
             return self.emit_next_record();
         }
+        if record.target.is_admin_document() {
+            // Admin documents never take placements; drain any stale row instead of
+            // retrying it forever. The satisfied-delete path continues the sweep once
+            // the delete result arrives.
+            self.current = None;
+            self.retry_needed = false;
+            self.state = PlacementState::StorePlacement;
+            return smallvec![delete_placement_effect(
+                self.config.realm_id,
+                &record.target
+            )];
+        }
 
         let missing_peer_count = missing_peer_count(&record);
         let mut selected_peers = record.selected_peers;
@@ -342,6 +354,12 @@ mod tests {
         }
     }
 
+    fn metadata_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([seed; 16]),
+        }
+    }
+
     #[test]
     fn task_schedule_error_is_non_blocking_after_placement_write() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
@@ -365,7 +383,7 @@ mod tests {
     #[test]
     fn two_remote_peers_complete_existing_default_pending_placement() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let target = group_target(4);
+        let target = metadata_target(4);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
@@ -399,7 +417,7 @@ mod tests {
         operation.realm_nodes = vec![authoritative, node(2), node(3), node(4)];
         operation.records = vec![new_placement(
             realm_id,
-            group_target(5),
+            metadata_target(5),
             authoritative,
             3,
             vec![node(2)],
@@ -418,7 +436,7 @@ mod tests {
     #[test]
     fn process_placement_does_not_replace_existing_holders() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let target = group_target(6);
+        let target = metadata_target(6);
         let authoritative = node(1);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
@@ -453,7 +471,7 @@ mod tests {
         operation.realm_nodes = vec![authoritative, node(2)];
         operation.records = vec![new_placement(
             realm_id,
-            group_target(7),
+            metadata_target(7),
             authoritative,
             2,
             Vec::new(),
@@ -464,5 +482,33 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
         assert_eq!(current.newly_selected, vec![node(2)]);
+    }
+
+    #[test]
+    fn admin_target_placement_is_drained_not_retried() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(1),
+        });
+        operation.realm_nodes = vec![node(1), node(2), node(3)];
+        operation.records = vec![new_placement(
+            realm_id,
+            group_target(4),
+            node(1),
+            3,
+            Vec::new(),
+        )];
+
+        let effects = operation.emit_next_record();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == SYNC_PLACEMENT_KEYSPACE
+        ));
+        assert!(!operation.retry_needed);
+        assert_eq!(operation.state, PlacementState::StorePlacement);
+        assert!(operation.current.is_none());
     }
 }
