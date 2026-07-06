@@ -14,6 +14,9 @@ pub const METADATA_SEARCH_MAX_PAGE_SIZE: usize = 100;
 pub const METADATA_SEARCH_MAX_PAGINATION_DEPTH: usize = 1000;
 
 const SEARCH_CURSOR_VERSION: u8 = 1;
+// Cursors are unsigned, so cap the resume map to bound the fan-out a forged
+// cursor can trigger through the target-node union.
+const SEARCH_CURSOR_MAX_RESUME_NODES: usize = 64;
 
 /// Sort key of the last hit emitted on a page, used as the exact resume point in
 /// the merged, deduplicated ordering.
@@ -70,7 +73,9 @@ impl SearchCursor {
             .map_err(|_| SearchCursorError::Invalid)?;
         let cursor: SearchCursor =
             postcard::from_bytes(&bytes).map_err(|_| SearchCursorError::Invalid)?;
-        if cursor.version != SEARCH_CURSOR_VERSION {
+        if cursor.version != SEARCH_CURSOR_VERSION
+            || cursor.resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES
+        {
             return Err(SearchCursorError::Invalid);
         }
         Ok(cursor)
@@ -346,6 +351,26 @@ mod tests {
         cursor.version = 2;
         assert_eq!(
             SearchCursor::decode(&cursor.encode()),
+            Err(SearchCursorError::Invalid)
+        );
+    }
+
+    #[test]
+    fn cursor_decode_caps_resume_entries() {
+        let cursor_with = |count: usize| SearchCursor {
+            version: SEARCH_CURSOR_VERSION,
+            fingerprint: [0u8; 32],
+            watermark: SearchWatermark {
+                score: 1.0,
+                graph_iri: "g".to_string(),
+                subject_iri: "s".to_string(),
+            },
+            resume: (0..count).map(|index| ([index as u8; 32], 0)).collect(),
+        };
+
+        assert!(SearchCursor::decode(&cursor_with(64).encode()).is_ok());
+        assert_eq!(
+            SearchCursor::decode(&cursor_with(65).encode()),
             Err(SearchCursorError::Invalid)
         );
     }
