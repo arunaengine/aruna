@@ -1,365 +1,249 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+use aruna_core::document::{
+    DocumentSyncNetEvent, DocumentSyncReconcileResult, DocumentSyncTarget, bucket_topic_id,
 };
-use aruna_core::metadata::MetadataGraphLifecycleRecord;
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::RealmId;
-use aruna_core::types::{Key, UserId};
-use smallvec::smallvec;
-use thiserror::Error;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::MetadataCreateEventRecord;
+use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use tracing::warn;
 
-use crate::announce::AnnounceTopicOperation;
-use crate::document_repository::{
-    parse_auth_document, parse_group_document, parse_realm_config_document,
+use crate::driver::DriverContext;
+use crate::metadata::projector::{
+    project_metadata_create_events, project_metadata_create_events_from_log,
 };
-use crate::metadata::repository::parse_registry_iter;
+use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
+use crate::placement::resolve_bucket_holders;
+use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
-const STARTUP_DOCUMENT_PAGE_SIZE: usize = 256;
-
-#[derive(Debug, PartialEq)]
-pub struct RestoreTopicSubscriptionsOperation {
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    state: RestoreTopicSubscriptionsState,
-    scan_state: RestoreTopicSubscriptionsState,
-    documents: Vec<DocumentSyncTarget>,
-    discovered_documents: HashSet<DocumentSyncTarget>,
-    next_start_after: Option<Key>,
-    output: Option<Result<(), RestoreTopicSubscriptionsError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum RestoreTopicSubscriptionsState {
-    Init,
-    ListAuth,
-    ListGroups,
-    ListRealmConfig,
-    ListMetadata,
-    ListMetadataLifecycle,
-    ListUsers,
-    WaitAnnouncement,
-    Finish,
-    Error,
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum RestoreTopicSubscriptionsError {
-    #[error(transparent)]
-    StorageError(#[from] StorageError),
-    #[error(transparent)]
-    ConversionError(#[from] ConversionError),
-    #[error("topic announcement failed: {0}")]
-    TopicAnnouncement(String),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
-}
-
-impl RestoreTopicSubscriptionsOperation {
-    pub fn new(local_node_id: NodeId, realm_id: RealmId) -> Self {
-        Self {
+/// Shared realm-scoped topics every node subscribes to (placement is inert on
+/// these; see [`DocumentSyncTarget::sync_topic_id`]).
+fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5] {
+    [
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentSyncTarget::RealmConfig { realm_id },
+        DocumentSyncTarget::NodeUsage {
             realm_id,
-            local_node_id,
-            state: RestoreTopicSubscriptionsState::Init,
-            scan_state: RestoreTopicSubscriptionsState::ListAuth,
-            documents: Vec::new(),
-            discovered_documents: HashSet::new(),
-            next_start_after: None,
-            output: None,
+            node_id,
+            group_id: None,
+        },
+        DocumentSyncTarget::NodeInfo { realm_id, node_id },
+        DocumentSyncTarget::WatchInterest { realm_id, node_id },
+    ]
+}
+
+/// Restarts the local node's document-sync subscriptions from the buckets it
+/// holds instead of re-announcing every stored document.
+///
+/// Loads the realm config, and for each bound strategy × bucket the local node
+/// resolves into a holder of, ensures the bucket sync topic with its co-holders
+/// and runs one anti-entropy pass against them (digest exchange, not a
+/// per-document re-announce). The fixed shared realm topics are restored the
+/// same way. Topics that share a co-holder set are batched into one ensure and
+/// one sync so a restart costs O(held buckets), not O(stored documents).
+pub async fn restore_bucket_subscriptions(
+    context: &Arc<DriverContext>,
+    node_id: NodeId,
+    realm_id: RealmId,
+) {
+    let Some(net_handle) = context.net_handle.clone() else {
+        return;
+    };
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        // No config yet (fresh/onboarding node): nothing bucketed to restore.
+        return;
+    };
+
+    let realm_nodes: Vec<NodeId> = config
+        .nodes
+        .iter()
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .filter(|candidate| *candidate != node_id)
+        .collect();
+
+    // Group topics by their co-holder peer set so co-located buckets ride one
+    // ensure + one sync instead of one round trip each. Only topics the local
+    // node may create the genesis of (shared realm topics, and buckets it is
+    // rank-0 holder of) are ensured; the rest are join-only — synced if their
+    // genesis is known or bootstrappable from a co-holder, otherwise left for
+    // the rank-0 holder's gossip to deliver.
+    let mut ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+
+    let mut shared_peers = realm_nodes.clone();
+    shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    for target in shared_targets(realm_id, node_id) {
+        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        ensure_groups
+            .entry(shared_peers.clone())
+            .or_default()
+            .push(topic);
+    }
+
+    for strategy in &config.strategies {
+        for bucket in 0..strategy.bucket_count {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                bucket,
+            };
+            let holders = resolve_bucket_holders(&config, &placement);
+            if !holders.contains(&node_id) {
+                continue;
+            }
+            let local_is_rank0 = holders.first() == Some(&node_id);
+            let mut co_holders: Vec<NodeId> = holders
+                .into_iter()
+                .filter(|candidate| *candidate != node_id)
+                .collect();
+            co_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            if co_holders.is_empty() {
+                continue;
+            }
+            let topic = bucket_topic_id(realm_id, &placement);
+            let groups = if local_is_rank0 {
+                &mut ensure_groups
+            } else {
+                &mut join_groups
+            };
+            groups.entry(co_holders).or_default().push(topic);
         }
     }
 
-    fn fail(&mut self, error: RestoreTopicSubscriptionsError) -> aruna_core::types::Effects {
-        self.state = RestoreTopicSubscriptionsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RestoreTopicSubscriptionsError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-
-    fn push_document(&mut self, document: DocumentSyncTarget) {
-        if self.discovered_documents.insert(document.clone()) {
-            self.documents.push(document);
-        }
-    }
-
-    fn next_announcement(&mut self) -> aruna_core::types::Effects {
-        if let Some(document) = self.documents.pop() {
-            self.state = RestoreTopicSubscriptionsState::WaitAnnouncement;
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new_for_document(
-                    document.topic_id(),
-                    self.local_node_id,
-                    Some(document),
-                    // Placement reconciliation is the only path that knows the
-                    // authoritative origin for metadata documents. Startup restore
-                    // must not let a replica-holder mint a rival genesis.
-                    false,
-                ),
-                |result| {
-                    Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                        result: result.map_err(|error| error.to_string()),
+    for (groups, may_create) in [(ensure_groups, true), (join_groups, false)] {
+        for (peers, topics) in groups {
+            if peers.is_empty() || topics.is_empty() {
+                continue;
+            }
+            if may_create {
+                // Join-before-create: rank-0 may have just inherited a bucket
+                // whose genesis a previous rank-0 created — adopt that genesis
+                // from a co-holder rather than forking a second one. Only what
+                // no peer knows either is created fresh.
+                let missing: Vec<::irokle::TopicId> = topics
+                    .iter()
+                    .copied()
+                    .filter(|topic| {
+                        !net_handle
+                            .document_sync_topic_exists(*topic)
+                            .unwrap_or(false)
                     })
-                },
-            ))]
-        } else {
-            self.continue_scan_or_advance(self.scan_state.clone())
+                    .collect();
+                if !missing.is_empty() {
+                    let event = net_handle
+                        .sync_document_topics(missing, peers.clone())
+                        .await;
+                    apply_restored_reconcile(context, node_id, event).await;
+                }
+                if let Err(error) = net_handle.ensure_document_sync_topics(&topics, peers.clone()) {
+                    warn!(error = %error, "Failed to ensure held bucket topics on restart");
+                }
+            }
+            let event = net_handle.sync_document_topics(topics, peers).await;
+            apply_restored_reconcile(context, node_id, event).await;
         }
     }
+}
 
-    fn emit_iter(&mut self, state: RestoreTopicSubscriptionsState) -> aruna_core::types::Effects {
-        let key_space = match state {
-            RestoreTopicSubscriptionsState::ListAuth => AUTH_KEYSPACE,
-            RestoreTopicSubscriptionsState::ListGroups => GROUP_KEYSPACE,
-            RestoreTopicSubscriptionsState::ListRealmConfig => REALM_CONFIG_KEYSPACE,
-            RestoreTopicSubscriptionsState::ListMetadata => METADATA_DOCUMENT_INDEX_KEYSPACE,
-            RestoreTopicSubscriptionsState::ListMetadataLifecycle => {
-                METADATA_GRAPH_LIFECYCLE_KEYSPACE
+pub(crate) async fn apply_restored_reconcile(
+    context: &Arc<DriverContext>,
+    node_id: NodeId,
+    event: DocumentSyncNetEvent,
+) {
+    let result = match event {
+        DocumentSyncNetEvent::DocumentsReconciled {
+            applied,
+            targets,
+            metadata_create_events,
+            metadata_graph_tombstones,
+        } => {
+            if applied == 0 {
+                return;
             }
-            RestoreTopicSubscriptionsState::ListUsers => USER_KEYSPACE,
-            _ => {
-                self.state = RestoreTopicSubscriptionsState::Finish;
-                self.output = Some(Ok(()));
-                return smallvec![];
+            DocumentSyncReconcileResult {
+                targets,
+                metadata_create_events,
+                metadata_graph_tombstones,
             }
-        };
-        self.scan_state = state.clone();
-        self.state = state;
-        let prefix = if matches!(self.state, RestoreTopicSubscriptionsState::ListUsers) {
-            Some(UserId::storage_prefix(self.realm_id))
-        } else {
-            None
-        };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: self.next_start_after.take().map(IterStart::After),
-            limit: STARTUP_DOCUMENT_PAGE_SIZE,
+        }
+        DocumentSyncNetEvent::Error { error, .. } => {
+            warn!(error = %error, "Failed to sync held bucket topics on restart");
+            return;
+        }
+        other => {
+            warn!(event = ?other, "Unexpected restart bucket sync result");
+            return;
+        }
+    };
+
+    let tombstones = result.metadata_graph_tombstones.clone();
+    refresh_realm_usage_summary_for_targets(context, node_id, &result.targets).await;
+    refresh_watch_interest_for_targets(context, &result.targets).await;
+    project_restored_metadata_create_events(
+        context,
+        node_id,
+        result.targets,
+        result.metadata_create_events,
+    )
+    .await;
+    process_metadata_graph_tombstones(context, tombstones).await;
+}
+
+async fn project_restored_metadata_create_events(
+    context: &Arc<DriverContext>,
+    node_id: NodeId,
+    targets: Vec<DocumentSyncTarget>,
+    metadata_create_events: Vec<MetadataCreateEventRecord>,
+) {
+    if !metadata_create_events.is_empty() {
+        if let Err(error) =
+            project_metadata_create_events(context, metadata_create_events, Some(node_id)).await
+        {
+            warn!(error = ?error, "Failed to project restored metadata create events");
+        }
+        return;
+    }
+
+    let mut pairs = Vec::new();
+    for target in targets {
+        if let DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        } = target
+        {
+            pairs.push((document_id, event_id));
+        }
+    }
+    if pairs.is_empty() {
+        return;
+    }
+    if let Err(error) = project_metadata_create_events_from_log(context, pairs).await {
+        warn!(error = ?error, "Failed to project restored metadata create events from log");
+    }
+}
+
+async fn load_realm_config(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> Option<RealmConfigDocument> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
             txn_id: None,
-        })]
-    }
-
-    fn continue_scan_or_advance(
-        &mut self,
-        current: RestoreTopicSubscriptionsState,
-    ) -> aruna_core::types::Effects {
-        if self.next_start_after.is_some() {
-            return self.emit_iter(current);
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
         }
-        self.next_start_after = None;
-        match current {
-            RestoreTopicSubscriptionsState::ListAuth => {
-                self.emit_iter(RestoreTopicSubscriptionsState::ListGroups)
-            }
-            RestoreTopicSubscriptionsState::ListGroups => {
-                self.emit_iter(RestoreTopicSubscriptionsState::ListRealmConfig)
-            }
-            RestoreTopicSubscriptionsState::ListRealmConfig => {
-                self.emit_iter(RestoreTopicSubscriptionsState::ListMetadata)
-            }
-            RestoreTopicSubscriptionsState::ListMetadata => {
-                self.emit_iter(RestoreTopicSubscriptionsState::ListMetadataLifecycle)
-            }
-            RestoreTopicSubscriptionsState::ListMetadataLifecycle => {
-                self.emit_iter(RestoreTopicSubscriptionsState::ListUsers)
-            }
-            RestoreTopicSubscriptionsState::ListUsers => {
-                self.state = RestoreTopicSubscriptionsState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            _ => smallvec![],
-        }
-    }
-}
-
-impl Default for RestoreTopicSubscriptionsOperation {
-    fn default() -> Self {
-        Self::new(
-            iroh::SecretKey::from_bytes(&[0u8; 32]).public(),
-            RealmId::from_bytes([0u8; 32]),
-        )
-    }
-}
-
-impl Operation for RestoreTopicSubscriptionsOperation {
-    type Output = ();
-    type Error = RestoreTopicSubscriptionsError;
-
-    fn start(&mut self) -> aruna_core::types::Effects {
-        self.next_start_after = None;
-        self.emit_iter(RestoreTopicSubscriptionsState::ListAuth)
-    }
-
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-        match self.state {
-            RestoreTopicSubscriptionsState::ListAuth => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, _) in values {
-                        match parse_auth_document(&key) {
-                            Ok(document) => self.push_document(document),
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::ListGroups => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, _) in values {
-                        match parse_group_document(&key) {
-                            Ok(document) => self.push_document(document),
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::ListRealmConfig => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, _) in values {
-                        match parse_realm_config_document(&key) {
-                            Ok(document) => self.push_document(document),
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::ListMetadata => match parse_registry_iter(event) {
-                Ok((records, next_start_after)) => {
-                    for record in records {
-                        self.push_document(DocumentSyncTarget::MetadataRegistry {
-                            group_id: record.group_id,
-                            document_id: record.document_id,
-                        });
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
-                    self.fail(error.into())
-                }
-                Err(crate::metadata::repository::StorageReadError::Conversion(error)) => {
-                    self.fail(error.into())
-                }
-            },
-            RestoreTopicSubscriptionsState::ListMetadataLifecycle => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (_, value) in values {
-                        let record: MetadataGraphLifecycleRecord =
-                            match postcard::from_bytes(&value) {
-                                Ok(record) => record,
-                                Err(error) => {
-                                    return self.fail(ConversionError::from(error).into());
-                                }
-                            };
-                        if record.realm_id == self.realm_id {
-                            self.push_document(DocumentSyncTarget::MetadataGraphLifecycle {
-                                graph_iri: record.graph_iri,
-                            });
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::ListUsers => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, _) in values {
-                        match UserId::from_storage_key(&key) {
-                            Ok(user_id) if user_id.realm_id == self.realm_id => {
-                                self.push_document(DocumentSyncTarget::User { user_id })
-                            }
-                            Ok(_) => {}
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    self.next_announcement()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::WaitAnnouncement => match event {
-                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
-                    match result {
-                        Ok(()) => self.next_announcement(),
-                        Err(error) => {
-                            warn!(error = %error, "Failed to restore topic subscription; continuing best-effort");
-                            self.next_announcement()
-                        }
-                    }
-                }
-                other => self.unexpected_event("document sync result", format!("{other:?}")),
-            },
-            RestoreTopicSubscriptionsState::Finish
-            | RestoreTopicSubscriptionsState::Error
-            | RestoreTopicSubscriptionsState::Init => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RestoreTopicSubscriptionsState::Finish | RestoreTopicSubscriptionsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
-    }
-
-    fn abort(&mut self) -> aruna_core::types::Effects {
-        smallvec![]
+        _ => None,
     }
 }

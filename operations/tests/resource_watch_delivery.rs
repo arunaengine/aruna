@@ -777,6 +777,16 @@ async fn install_config_document(
         }
         node.net.refresh_realm_peers_from_document(config).await?;
     }
+    // Config apply hook: the bucket's rank-0 holder eagerly creates each
+    // bucket topic genesis (mirrors the production realm-config apply path).
+    for node in nodes {
+        aruna_operations::process_placements::process_bucket_placements(
+            &node.context,
+            realm_id,
+            node.net.node_id(),
+        )
+        .await;
+    }
     Ok(())
 }
 

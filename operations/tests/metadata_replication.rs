@@ -71,7 +71,7 @@ struct TestNode {
 async fn metadata_creation_replicates_to_all_three_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::r#gen();
     let document_id = Ulid::r#gen();
 
@@ -106,9 +106,14 @@ async fn metadata_creation_replicates_to_all_three_holders()
     .record;
 
     assert_eq!(created.holder_node_ids, vec![nodes[0].net.node_id()]);
-    assert_eq!(
-        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
-        1
+    // Replay is idempotent: it projects the logged create event unless the
+    // async drain (and the holders' expansion round trip) already did, so the
+    // stable invariant is the logged event itself, not the projection count.
+    assert!(replay_metadata_event_log(nodes[0].context.as_ref()).await? <= 1);
+    assert!(
+        read_metadata_event_log_value(&nodes[0], document_id, created.last_event_id)
+            .await?
+            .is_some()
     );
 
     wait_for_metadata_convergence(&nodes, group_id, document_id, &created.graph_iri).await?;
@@ -263,7 +268,7 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
 async fn metadata_updates_and_deletes_apply_to_local_holder()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::r#gen();
     let document_id = Ulid::r#gen();
 
@@ -289,9 +294,13 @@ async fn metadata_updates_and_deletes_apply_to_local_holder()
     )
     .await?;
 
-    assert_eq!(
-        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
-        1
+    // See metadata_creation_replicates_to_all_three_holders: the projection
+    // count races the async drain, the logged event is the stable invariant.
+    assert!(replay_metadata_event_log(nodes[0].context.as_ref()).await? <= 1);
+    assert!(
+        read_metadata_event_log_value(&nodes[0], document_id, created.record.last_event_id)
+            .await?
+            .is_some()
     );
 
     wait_for_metadata_state(
@@ -458,7 +467,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
 async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([44u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let (nodes, realm_config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::r#gen();
     let document_id = Ulid::r#gen();
     let document_path = "datasets/reordered-delete";
@@ -505,25 +514,53 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
             deleted_after_event_id: event_id,
         },
     };
+    // All records of this document share a subject and so one bucket topic.
+    // The placement comes from the installed realm config, so the bucket
+    // topic's genesis exists (created eagerly by its rank-0 holder during
+    // install); the publisher below only joins it, never creates it.
     let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let placement = aruna_operations::placement::placement_ref_for_target(
+        &realm_config,
+        &lifecycle_target,
+        None,
+    );
+    assert_ne!(placement, aruna_core::structs::PlacementRef::NIL);
+    let bucket_topic = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
+    // Make sure the publisher knows the bucket topic before publishing onto it:
+    // sync_document_topics bootstraps the genesis from the co-holder when
+    // rank-0 was the other node (the singular sync never bootstraps).
+    nodes[0]
+        .net
+        .sync_document_topics(
+            vec![bucket_topic(&lifecycle_target)],
+            vec![nodes[1].net.node_id()],
+        )
+        .await;
+    assert!(
+        nodes[0]
+            .net
+            .document_sync_topic_exists(bucket_topic(&lifecycle_target))?,
+        "bucket topic genesis unavailable on both nodes after install"
+    );
     publish_document_to_peer(
         &nodes[0],
         delete_event_id,
         lifecycle_target.clone(),
         postcard::to_allocvec(&lifecycle)?,
         nodes[1].net.node_id(),
+        placement,
     )
     .await?;
     nodes[1]
         .net
         .sync_document_topic_with_peers(
-            lifecycle_target.sync_topic_id(),
+            bucket_topic(&lifecycle_target),
             vec![nodes[0].net.node_id()],
         )
         .await?;
     let delete_result = nodes[1]
         .net
-        .reconcile_document_sync_topics(vec![lifecycle_target.sync_topic_id()])
+        .reconcile_document_sync_topics(vec![bucket_topic(&lifecycle_target)])
         .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
@@ -537,15 +574,16 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
         stale_target.clone(),
         postcard::to_allocvec(&create_event)?,
         nodes[1].net.node_id(),
+        placement,
     )
     .await?;
     nodes[1]
         .net
-        .sync_document_topic_with_peers(stale_target.sync_topic_id(), vec![nodes[0].net.node_id()])
+        .sync_document_topic_with_peers(bucket_topic(&stale_target), vec![nodes[0].net.node_id()])
         .await?;
     let stale_result = nodes[1]
         .net
-        .reconcile_document_sync_topics(vec![stale_target.sync_topic_id()])
+        .reconcile_document_sync_topics(vec![bucket_topic(&stale_target)])
         .await?;
 
     assert!(stale_result.metadata_create_events.is_empty());
@@ -567,7 +605,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
 async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
-) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
@@ -599,8 +637,8 @@ async fn build_realm_nodes(
     }
 
     wait_for_realm_node_convergence(&nodes, realm_id).await?;
-    install_realm_config(&nodes, realm_id).await?;
-    Ok(nodes)
+    let config = install_realm_config(&nodes, realm_id).await?;
+    Ok((nodes, config))
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
@@ -648,7 +686,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
 async fn install_realm_config(
     nodes: &[TestNode],
     realm_id: &RealmId,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
     config.seed_default_placement();
     for node in nodes {
@@ -678,8 +716,18 @@ async fn install_realm_config(
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
+    // Config apply hook: the bucket's rank-0 holder eagerly creates each
+    // bucket topic genesis (mirrors the production realm-config apply path).
+    for node in nodes {
+        aruna_operations::process_placements::process_bucket_placements(
+            &node.context,
+            *realm_id,
+            node.net.node_id(),
+        )
+        .await;
+    }
 
-    Ok(())
+    Ok(config)
 }
 
 async fn publish_document_to_peer(
@@ -688,6 +736,7 @@ async fn publish_document_to_peer(
     target: DocumentSyncTarget,
     bytes: Vec<u8>,
     peer: aruna_core::NodeId,
+    placement: aruna_core::structs::PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
         .net
@@ -696,7 +745,12 @@ async fn publish_document_to_peer(
                 documents: vec![DocumentSyncPublish::Upsert {
                     event_id,
                     target: target.clone(),
-                    change: document_change_for_publish(node.net.node_id(), &target, &bytes)?,
+                    change: document_change_for_publish(
+                        node.net.node_id(),
+                        &target,
+                        &bytes,
+                        placement,
+                    )?,
                     bytes,
                     allow_genesis: true,
                 }],
@@ -719,6 +773,7 @@ fn document_change_for_publish(
     node_id: aruna_core::NodeId,
     target: &DocumentSyncTarget,
     bytes: &[u8],
+    placement: aruna_core::structs::PlacementRef,
 ) -> Result<DocumentSyncChange, Box<dyn std::error::Error>> {
     match target {
         DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
@@ -727,9 +782,7 @@ fn document_change_for_publish(
                 return Err("metadata document lifecycle target mismatch".into());
             }
             Ok(metadata_document_lifecycle_revision_change(
-                &lifecycle,
-                node_id,
-                aruna_core::structs::PlacementRef::NIL,
+                &lifecycle, node_id, placement,
             ))
         }
         DocumentSyncTarget::MetadataCreateEvent {
@@ -749,7 +802,7 @@ fn document_change_for_publish(
                     updated_at_ms: record.occurred_at_ms,
                 },
                 kind: DocumentSyncChangeKind::Upsert,
-                placement: aruna_core::structs::PlacementRef::NIL,
+                placement,
             })
         }
         _ => Err("unsupported test publish target".into()),

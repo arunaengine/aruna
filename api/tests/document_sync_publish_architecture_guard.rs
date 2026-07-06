@@ -75,6 +75,8 @@ fn allowed_publish_use(publish_use: &PublishUse) -> bool {
                     "DocumentSyncPublish::Upsert {"
                         | "DocumentSyncPublish::Delete { target, change, .. } => {"
                         | "DocumentSyncPublish::AdminOperation { target, event, .. } => {"
+                        | "DocumentSyncPublish::Delete {"
+                        | "DocumentSyncPublish::AdminOperation {"
                 )
         }
         _ => false,
