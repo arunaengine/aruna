@@ -168,6 +168,48 @@ impl WatchEvent {
     }
 }
 
+/// Domain separator for the deterministic per-subscription notification id.
+pub const WATCH_NOTIFICATION_ID_DOMAIN: &[u8] = b"aruna-watch-notification-v1\0";
+
+/// Deterministic notification-record id for the `(event, subscription)` pair.
+/// Because it is a pure function of the origin-minted `event_id` and the
+/// `watch_id`, re-expanding a redelivered event mints the same id, so the
+/// holder-side idempotent upsert collapses duplicate deliveries.
+pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(WATCH_NOTIFICATION_ID_DOMAIN);
+    hasher.update(&event_id.to_bytes());
+    hasher.update(&watch_id.to_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Ulid::from_bytes(bytes)
+}
+
+/// Durable origin-node forward-outbox row (transport plane). Unlike the inbox
+/// outbox, the target holder is minted at emit time (from the interest table) and
+/// stored, since the holder set is per-event fan-out, not per-recipient.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchForwardOutboxRecord {
+    pub outbox_id: Ulid,
+    pub holder_node: NodeId,
+    pub event: WatchEvent,
+}
+
+impl WatchForwardOutboxRecord {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn watch_forward_outbox_key(outbox_id: Ulid) -> Key {
+    ByteView::from(outbox_id.to_bytes())
+}
+
 /// Durable watch subscription row on the owner's inbox-holder node. Placed and
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +652,41 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn watch_notification_id_is_deterministic_per_event_and_watch() {
+        let event_id = Ulid::from_bytes([1u8; 16]);
+        let watch_id = Ulid::from_bytes([2u8; 16]);
+        assert_eq!(
+            watch_notification_id(event_id, watch_id),
+            watch_notification_id(event_id, watch_id)
+        );
+        assert_ne!(
+            watch_notification_id(event_id, watch_id),
+            watch_notification_id(event_id, Ulid::from_bytes([3u8; 16]))
+        );
+        assert_ne!(
+            watch_notification_id(event_id, watch_id),
+            watch_notification_id(Ulid::from_bytes([9u8; 16]), watch_id)
+        );
+    }
+
+    #[test]
+    fn forward_outbox_record_roundtrips_and_keys_are_fifo() {
+        let record = WatchForwardOutboxRecord {
+            outbox_id: Ulid::from_parts(1, 0),
+            holder_node: node(3),
+            event: metadata_event(user(1, 2)),
+        };
+        assert_eq!(
+            WatchForwardOutboxRecord::from_bytes(&record.to_bytes().unwrap()).unwrap(),
+            record
+        );
+        assert!(
+            watch_forward_outbox_key(Ulid::from_parts(1, 0))
+                < watch_forward_outbox_key(Ulid::from_parts(2, 0))
+        );
     }
 
     #[test]

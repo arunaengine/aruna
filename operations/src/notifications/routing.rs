@@ -1,6 +1,7 @@
 use aruna_core::structs::{
     GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-    RealmAuthorizationDocument, ResourceEvent,
+    RealmAuthorizationDocument, ResourceEvent, WatchEvent, WatchSubscription,
+    watch_notification_id,
 };
 use aruna_core::types::UserId;
 
@@ -110,10 +111,43 @@ pub fn route_resource_event(
     records
 }
 
+/// Expands one origin watch event into recipient-addressed records against the
+/// holder's local watch subscriptions. A subscription matches when the event
+/// path starts with its prefix, its mask selects the event kind, and its owner is
+/// not the actor (no self-notify). Each record's id is deterministic in
+/// `(event_id, watch_id)` and its timestamp is the event's, so re-expanding a
+/// redelivered event mints identical records for the holder's idempotent upsert.
+pub fn route_watch_event(
+    event: &WatchEvent,
+    subscriptions: &[WatchSubscription],
+) -> Vec<NotificationRecord> {
+    let mut records = Vec::new();
+    for subscription in subscriptions {
+        if subscription.owner == event.actor {
+            continue;
+        }
+        if !event.path.starts_with(&subscription.path_prefix) {
+            continue;
+        }
+        if !subscription.event_mask.contains(event.kind) {
+            continue;
+        }
+        records.push(NotificationRecord {
+            notification_id: watch_notification_id(event.event_id, subscription.watch_id),
+            recipient: subscription.owner,
+            class: NotificationClass::Transient,
+            kind: event.notification_kind(),
+            created_at_ms: event.occurred_at_ms,
+            read_at_ms: None,
+        });
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, Role};
+    use aruna_core::structs::{RealmId, Role, WatchEventDetail, WatchEventKind, WatchEventMask};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 
@@ -284,5 +318,90 @@ mod tests {
             1_000,
         );
         assert!(self_removal.is_empty());
+    }
+
+    fn watch_subscription(owner: UserId, prefix: &str, mask: WatchEventMask) -> WatchSubscription {
+        WatchSubscription::new(owner, prefix.to_string(), mask, 1_000)
+    }
+
+    fn upload_event(actor: UserId, path: &str) -> WatchEvent {
+        WatchEvent {
+            event_id: Ulid::from_bytes([7u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::DataUploaded,
+            path: path.to_string(),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::DataUploaded {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                size_bytes: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn watch_event_matches_prefix_mask_and_skips_self() {
+        let owner = user(1);
+        let actor = user(2);
+        let subs = vec![
+            // Matches: prefix + mask.
+            watch_subscription(
+                owner,
+                "bucket/",
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+            // Prefix mismatch.
+            watch_subscription(
+                owner,
+                "other/",
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+            // Mask mismatch.
+            watch_subscription(
+                owner,
+                "bucket/",
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            ),
+            // Self-notify: owner is the actor.
+            watch_subscription(
+                actor,
+                "bucket/",
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+        ];
+
+        let records = route_watch_event(&upload_event(actor, "bucket/object"), &subs);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, owner);
+        assert_eq!(records[0].class, NotificationClass::Transient);
+        assert_eq!(records[0].created_at_ms, 5_000);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::DataUploaded { .. }
+        ));
+    }
+
+    #[test]
+    fn watch_event_ids_are_deterministic_across_invocations() {
+        let owner = user(1);
+        let actor = user(2);
+        let subs = vec![watch_subscription(
+            owner,
+            "bucket/",
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )];
+        let event = upload_event(actor, "bucket/object");
+
+        let first = route_watch_event(&event, &subs);
+        let second = route_watch_event(&event, &subs);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].notification_id, second[0].notification_id);
+    }
+
+    #[test]
+    fn watch_event_with_no_matches_is_empty() {
+        let actor = user(2);
+        assert!(route_watch_event(&upload_event(actor, "bucket/object"), &[]).is_empty());
     }
 }
