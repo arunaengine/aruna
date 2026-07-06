@@ -145,5 +145,13 @@ utoipa = { version = "5.5.0", features = [
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
+# Pre-release only: point irokle at the remote genesis-tiebreak branch so the
+# additive eviction APIs are available before they land on main. This patch
+# also covers craqle's transitive irokle edge (same git source), keeping one
+# irokle instance across the graph. Drop this section once upstream main has
+# the tie-break APIs.
+[patch."https://github.com/arunaengine/irokle.git"]
+irokle = { git = "https://github.com/arunaengine/irokle", rev = "8d447a81af827eed9a564533a2d0a27a21e6a177" }
+
 [profile.release]
 panic = "abort"
