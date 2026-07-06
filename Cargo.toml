@@ -142,6 +142,7 @@ tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "time",
     "fmt",
+    "json",
     "registry",
 ] }
 ulid = { version = "2.0.1", features = ["serde"] }
