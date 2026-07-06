@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -11,8 +11,10 @@ use aruna_core::keyspaces::{
     NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use aruna_core::structs::{
-    RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    watch_interest_dirty_key, watch_interest_dirty_realm_id, watch_interest_node_key,
+    RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
+    WatchInterestTable, WatchSubscription, watch_interest_dirty_key, watch_interest_dirty_realm_id,
+    watch_interest_key_node_id, watch_interest_key_realm_id, watch_interest_node_key,
+    watch_interest_node_prefix, watch_interest_realm_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, UserId, Value};
@@ -322,6 +324,100 @@ pub async fn restore_watch_interest_publish_timer(
     }
 }
 
+/// Rebuilds the full in-memory watch-interest table from the replicated digests
+/// in local storage. Digests whose embedded node id disagrees with their key are
+/// skipped defensively, and empty digests contribute nothing.
+pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInterestTable {
+    let mut table = WatchInterestTable::default();
+    let entries = match iter_all(
+        storage,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        Some(Key::from(watch_interest_node_prefix())),
+    )
+    .await
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(error = %error, "Failed to scan watch interest digests");
+            return table;
+        }
+    };
+    for (key, value) in entries {
+        let Some(realm_id) = watch_interest_key_realm_id(key.as_ref()) else {
+            continue;
+        };
+        let key_node_id = watch_interest_key_node_id(key.as_ref());
+        let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
+            Ok(digest) => digest,
+            Err(error) => {
+                warn!(error = %error, "Failed to decode watch interest digest");
+                continue;
+            }
+        };
+        // Never trust a digest whose embedded node id disagrees with its key.
+        if key_node_id != Some(digest.node_id) {
+            continue;
+        }
+        table.insert(realm_id, digest.node_id, digest.entries);
+    }
+    table
+}
+
+/// Refreshes the in-memory watch-interest cache for exactly the realms whose
+/// `WatchInterest` digests a document-sync reconcile touched. Mirrors
+/// `refresh_realm_usage_summary_for_targets`: shared by every reconcile handler
+/// (inbound apply, durable outbox drain, and the `SyncDocument` timer) so a
+/// digest that lands on any of those paths updates the origin-side table.
+pub async fn refresh_watch_interest_for_targets(
+    ctx: &DriverContext,
+    targets: &[DocumentSyncTarget],
+) {
+    let Some(net_handle) = ctx.net_handle.as_ref() else {
+        return;
+    };
+    let mut realms: BTreeSet<RealmId> = BTreeSet::new();
+    for target in targets {
+        if let DocumentSyncTarget::WatchInterest { realm_id, .. } = target {
+            realms.insert(*realm_id);
+        }
+    }
+    if realms.is_empty() {
+        return;
+    }
+    for realm_id in realms {
+        match build_realm_node_map(&ctx.storage_handle, realm_id).await {
+            Ok(nodes) => net_handle.update_watch_interest_realm(realm_id, nodes),
+            Err(error) => {
+                warn!(error = %error, "Failed to refresh watch interest after document sync reconciliation")
+            }
+        }
+    }
+}
+
+/// Builds one realm's node -> entries map from the digests in the realm's scan
+/// range, dropping mismatched and empty digests.
+async fn build_realm_node_map(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+) -> Result<HashMap<NodeId, Vec<WatchInterestEntry>>, String> {
+    let entries = iter_all(
+        storage,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        Some(Key::from(watch_interest_realm_prefix(realm_id))),
+    )
+    .await?;
+    let mut nodes: HashMap<NodeId, Vec<WatchInterestEntry>> = HashMap::new();
+    for (key, value) in entries {
+        let key_node_id = watch_interest_key_node_id(key.as_ref());
+        let digest = WatchInterestDigest::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        if key_node_id != Some(digest.node_id) || digest.entries.is_empty() {
+            continue;
+        }
+        nodes.insert(digest.node_id, digest.entries);
+    }
+    Ok(nodes)
+}
+
 async fn iter_all(
     storage: &StorageHandle,
     key_space: &str,
@@ -360,9 +456,10 @@ async fn iter_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, WatchEventKind};
+    use aruna_core::structs::{RealmId, WatchEventKind, WatchInterestEntry};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use crate::notifications::watch::subscriptions::{
         create_watch_subscription, delete_watch_subscription,
@@ -375,6 +472,51 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+        }
+    }
+
+    async fn ctx_with_net(
+        realm_id: RealmId,
+        secret: [u8; 32],
+    ) -> (TempDir, DriverContext, NetHandle) {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let ctx = DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+        (dir, ctx, net)
+    }
+
+    async fn write_digest(ctx: &DriverContext, realm_id: RealmId, digest: &WatchInterestDigest) {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key: Key::from(watch_interest_node_key(realm_id, digest.node_id)),
+                value: Value::from(digest.to_bytes().unwrap()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected digest write event: {other:?}"),
         }
     }
 
@@ -561,5 +703,77 @@ mod tests {
 
         // The re-dirtied marker survived because its generation moved on.
         assert!(read_marker(&ctx, realm_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rebuild_reads_digests_from_storage() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let realm_id = RealmId([3u8; 32]);
+        let holder = node(11);
+
+        write_digest(
+            &ctx,
+            realm_id,
+            &WatchInterestDigest {
+                node_id: holder,
+                entries: vec![WatchInterestEntry {
+                    path_prefix: "/bucket/".to_string(),
+                    event_mask: mask(),
+                }],
+            },
+        )
+        .await;
+        // An empty digest from another node must not add a matchable holder.
+        write_digest(
+            &ctx,
+            realm_id,
+            &WatchInterestDigest {
+                node_id: node(12),
+                entries: Vec::new(),
+            },
+        )
+        .await;
+
+        let table = rebuild_watch_interest_table(&ctx.storage_handle).await;
+        assert_eq!(
+            table.matching_nodes(realm_id, "/bucket/object", WatchEventKind::MetadataCreated),
+            vec![holder]
+        );
+        assert_eq!(table.nodes(realm_id).map(|nodes| nodes.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn refresh_updates_the_net_handle_table() {
+        let realm_id = RealmId([4u8; 32]);
+        let (_dir, ctx, net) = ctx_with_net(realm_id, [70u8; 32]).await;
+        let holder = node(13);
+
+        assert!(net.watch_interest_snapshot().is_empty());
+
+        write_digest(
+            &ctx,
+            realm_id,
+            &WatchInterestDigest {
+                node_id: holder,
+                entries: vec![WatchInterestEntry {
+                    path_prefix: "/data/".to_string(),
+                    event_mask: mask(),
+                }],
+            },
+        )
+        .await;
+
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: holder,
+        };
+        refresh_watch_interest_for_targets(&ctx, &[target]).await;
+
+        let snapshot = net.watch_interest_snapshot();
+        assert_eq!(
+            snapshot.matching_nodes(realm_id, "/data/x", WatchEventKind::MetadataCreated),
+            vec![holder]
+        );
     }
 }

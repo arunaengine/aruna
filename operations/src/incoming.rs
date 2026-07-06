@@ -12,6 +12,7 @@ use crate::metadata::projector::{
     project_metadata_create_events_from_log, schedule_pending_metadata_projection_drain,
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
+use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
@@ -178,6 +179,7 @@ async fn reconcile_inbound_document_sync_topics(
         }
     }
     refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
+    refresh_watch_interest_for_targets(context, &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_metadata_create_events(context, targets).await;
     let project_elapsed = project_started.elapsed();
