@@ -1663,7 +1663,7 @@ mod tests {
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use tempfile::TempDir;
 
     struct TestState {
@@ -2888,6 +2888,517 @@ mod tests {
         assert_excludes_search_path(&anonymous.paths, "datasets/remote-private");
 
         test.shutdown().await;
+    }
+
+    async fn run_search_route(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+        mode: Option<MetadataQueryMode>,
+    ) -> ServerResult<MetadataSearchResponse> {
+        search_metadata(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: query.to_string(),
+                limit: Some(limit),
+                cursor,
+                mode,
+            }),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+    }
+
+    async fn flush_node_search(node: &DistributedMetadataNode) {
+        let ctx = node.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+    }
+
+    struct SearchPaginationCluster {
+        auth: AuthContext,
+        group_id: Ulid,
+        nodes: Vec<DistributedMetadataNode>,
+    }
+
+    impl SearchPaginationCluster {
+        fn coordinator(&self) -> &DistributedMetadataNode {
+            &self.nodes[0]
+        }
+
+        async fn shutdown(self) {
+            for node in self.nodes {
+                node.net.shutdown().await;
+            }
+        }
+    }
+
+    async fn setup_search_pagination_cluster(node_count: usize) -> SearchPaginationCluster {
+        let realm_signing_key = test_realm_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+
+        let mut nodes = Vec::new();
+        for _ in 0..node_count {
+            nodes.push(spawn_distributed_metadata_node(realm_id).await);
+        }
+        for i in 0..nodes.len() {
+            for j in 0..nodes.len() {
+                if i != j {
+                    let addr = nodes[j].net.endpoint_addr();
+                    nodes[i].net.add_peer_addr(addr).await;
+                }
+            }
+        }
+        let node_refs: Vec<&DistributedMetadataNode> = nodes.iter().collect();
+        install_distributed_realm_config(&node_refs, realm_id).await;
+        for node in &nodes {
+            install_metadata_auth_documents(node, realm_id, user_id, group_id).await;
+        }
+
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        SearchPaginationCluster {
+            auth,
+            group_id,
+            nodes,
+        }
+    }
+
+    async fn seed_public_document(
+        node: &DistributedMetadataNode,
+        auth: &AuthContext,
+        group_id: Ulid,
+        path: &str,
+        name: &str,
+    ) {
+        create_test_metadata_document(node.state.clone(), auth.clone(), group_id, path, name, true)
+            .await;
+        drain_metadata_background(node.state.as_ref()).await;
+        flush_node_search(node).await;
+    }
+
+    // Drives the coordinator against an explicit node set, matching how the other
+    // distributed metadata tests fan out (the REST route never sets target_nodes).
+    async fn search_cluster_page(
+        cluster: &SearchPaginationCluster,
+        query: &str,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> aruna_operations::metadata::api::MetadataSearchExecution {
+        let coordinator = cluster.coordinator();
+        let ctx = coordinator.state.get_ctx();
+        let target_nodes = cluster
+            .nodes
+            .iter()
+            .map(|node| node.net.node_id())
+            .collect();
+        run_search_metadata(
+            ctx.as_ref(),
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                limit: Some(limit),
+                cursor,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_search_paginates_across_nodes_without_duplicates() {
+        let cluster = setup_search_pagination_cluster(3).await;
+        for index in 0..9 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            seed_public_document(
+                node,
+                &cluster.auth,
+                cluster.group_id,
+                &format!("datasets/corpus-{index}"),
+                &format!("Corpus Document {index}"),
+            )
+            .await;
+        }
+
+        let mut seen_keys: Vec<(String, String)> = Vec::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        let mut cursor = None;
+        let mut last_score = f32::INFINITY;
+        let mut pages = 0;
+        loop {
+            let response = search_cluster_page(&cluster, "Corpus", 3, cursor.clone()).await;
+            assert_eq!(response.fanout_stats.nodes_failed, 0);
+            assert!(response.hits.len() <= 3);
+            for hit in &response.hits {
+                assert!(
+                    hit.score <= last_score,
+                    "scores must be non-increasing across pages"
+                );
+                last_score = hit.score;
+                seen_keys.push((hit.graph_iri.clone(), hit.subject_iri.clone()));
+                seen_paths.insert(hit.document_path.clone());
+            }
+            pages += 1;
+            assert!(pages <= 20, "pagination failed to terminate");
+            match response.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let unique: HashSet<_> = seen_keys.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            seen_keys.len(),
+            "pages must not repeat a (graph_iri, subject_iri)"
+        );
+        for index in 0..9 {
+            assert!(
+                seen_paths.contains(&format!("datasets/corpus-{index}")),
+                "every seeded document must appear across the pages"
+            );
+        }
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_search_pagination_survives_node_failure() {
+        let cluster = setup_search_pagination_cluster(3).await;
+        for index in 0..9 {
+            let node = &cluster.nodes[index % cluster.nodes.len()];
+            seed_public_document(
+                node,
+                &cluster.auth,
+                cluster.group_id,
+                &format!("datasets/corpus-{index}"),
+                &format!("Corpus Document {index}"),
+            )
+            .await;
+        }
+
+        let page1 = search_cluster_page(&cluster, "Corpus", 3, None).await;
+        assert_eq!(page1.fanout_stats.nodes_failed, 0);
+        let cursor = page1.next_cursor.clone().expect("more pages remain");
+
+        // Drop a non-coordinator holder mid-session; paging must continue.
+        cluster.nodes[2].net.shutdown().await;
+
+        let page2 = search_cluster_page(&cluster, "Corpus", 3, Some(cursor)).await;
+        assert!(
+            page2.fanout_stats.nodes_failed >= 1,
+            "the downed node must surface as a failed partition"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_search_rejects_cursor_on_query_change_and_malformed_input() {
+        let test = setup_state().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/alpha".to_string(),
+                    name: "Alpha Widget".to_string(),
+                    description: "cursor fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            1,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        let cursor = page.next_cursor.clone();
+
+        let malformed = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            1,
+            Some("!!!not-a-cursor!!!".to_string()),
+            Some(MetadataQueryMode::Local),
+        )
+        .await;
+        assert!(matches!(malformed, Err(ServerError::BadRequestMessage(_))));
+
+        if let Some(cursor) = cursor {
+            let mismatched = run_search_route(
+                &test.state,
+                &test.auth,
+                "Different",
+                1,
+                Some(cursor),
+                Some(MetadataQueryMode::Local),
+            )
+            .await;
+            match mismatched {
+                Err(ServerError::BadRequestMessage(message)) => {
+                    assert!(message.contains("does not match query"), "{message}");
+                }
+                other => panic!("expected a query-mismatch rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_search_cursor_suppresses_churned_hits() {
+        let test = setup_state().await;
+        for index in 0..5 {
+            let _ = create_metadata_document(
+                State(test.state.clone()),
+                Extension(Some(test.auth.clone())),
+                Json(CreateMetadataRequest::Scaffold(
+                    CreateMetadataScaffoldRequest {
+                        group_id: test.group_id.to_string(),
+                        path: format!("datasets/widget-{index}"),
+                        name: format!("Widget {index}"),
+                        description: "churn fixture".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        public: true,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page1 = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            2,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        let page1_keys: HashSet<(String, String)> = page1
+            .hits
+            .iter()
+            .map(|hit| (hit.graph_iri.clone(), hit.subject_iri.clone()))
+            .collect();
+        let cursor = page1.next_cursor.clone().expect("more pages remain");
+
+        // Introduce a matching document between pages (churn).
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/widget-extra".to_string(),
+                    name: "Widget Extra".to_string(),
+                    description: "churn fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let page2 = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            2,
+            Some(cursor),
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        for hit in &page2.hits {
+            let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
+            assert!(
+                !page1_keys.contains(&key),
+                "already emitted hits must not repeat under churn"
+            );
+        }
+
+        let fresh = run_search_route(
+            &test.state,
+            &test.auth,
+            "Widget",
+            10,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fresh
+                .hits
+                .iter()
+                .any(|hit| hit.document_path == "datasets/widget-extra"),
+            "a fresh search must surface the churned document"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_search_clamps_page_size_to_cap() {
+        let test = setup_state().await;
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/capacity".to_string(),
+                    name: "Capacity Dataset".to_string(),
+                    description: "capacity".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        let document_id = created.summary.document_id.clone();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let files: String = (0..105)
+            .map(|index| {
+                format!(
+                    r#"{{"@id":"./data/capacity-{index}.txt","@type":"File","name":"Capacity file {index}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let parts: String = (0..105)
+            .map(|index| format!(r#"{{"@id":"./data/capacity-{index}.txt"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rocrate = format!(
+            r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[{{"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{{"@id":"https://w3id.org/ro/crate/1.2"}},"about":{{"@id":"https://w3id.org/aruna/{document_id}"}}}},{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"Capacity Dataset","description":"capacity","datePublished":"2026-01-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}},"hasPart":[{parts}]}},{files}]}}"#
+        );
+        let _ = replace_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(document_id.clone()),
+            Json(ReplaceMetadataRoCrateRequest {
+                rocrate: serde_json::from_str(&rocrate).unwrap(),
+                public: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let response = run_search_route(
+            &test.state,
+            &test.auth,
+            "Capacity",
+            250,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response.hits.len() <= 100,
+            "page size must be clamped to the cap, got {}",
+            response.hits.len()
+        );
+        assert!(
+            response.next_cursor.is_some(),
+            "a corpus larger than the cap must offer a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_search_tolerates_pending_projection() {
+        let test = setup_state().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/pending".to_string(),
+                    name: "Pending Dataset".to_string(),
+                    description: "pending fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        // Search before draining the projection queue: it must not 5xx, and any
+        // hit that does surface must still carry an enriched, non-empty title.
+        let response = run_search_route(
+            &test.state,
+            &test.auth,
+            "Pending",
+            10,
+            None,
+            Some(MetadataQueryMode::Local),
+        )
+        .await
+        .unwrap();
+        for hit in &response.hits {
+            assert!(!hit.title.is_empty(), "title must always be populated");
+        }
     }
 
     struct DistributedMetadataAccessState {
