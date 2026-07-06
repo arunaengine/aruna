@@ -9,9 +9,9 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
-    NotificationDispatchError, WatchDispatchError, create_watch_for_user, delete_watch_for_user,
-    list_notifications_for_user, list_watches_for_user, mark_read_for_user,
-    resolve_inbox_holder_for_user, unread_count_for_user,
+    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
+    delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
+    resolve_inbox_holder_for_user, subscribe_inbox_wakes, unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
@@ -30,7 +30,6 @@ use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tracing::warn;
 use ulid::Ulid;
@@ -395,7 +394,7 @@ pub async fn unread_count(
 /// per-node wake bus; the remote arm degrades to polling the holder, keeping the
 /// notification RPC surface unchanged.
 enum UnreadStreamMode {
-    Local(broadcast::Receiver<UserId>),
+    Local(InboxWakeReceiver),
     Remote,
 }
 
@@ -423,7 +422,7 @@ enum StreamStep {
     End,
 }
 
-fn drain_pending_wakes(rx: &mut broadcast::Receiver<UserId>) {
+fn drain_pending_wakes(rx: &mut InboxWakeReceiver) {
     // Collapse any wakes buffered during the coalesce window into the single
     // refetch that follows; a closed/lagged channel simply stops the drain.
     while rx.try_recv().is_ok() {}
@@ -474,7 +473,7 @@ fn unread_count_stream(
             let recheck_deadline = state.next_holder_recheck;
             let step = match &mut state.mode {
                 UnreadStreamMode::Local(rx) => {
-                    use broadcast::error::RecvError;
+                    use tokio::sync::broadcast::error::RecvError;
                     tokio::select! {
                         biased;
                         recv = rx.recv() => match recv {
@@ -567,12 +566,12 @@ pub async fn stream_notifications(
     let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
         .await
         .map_err(|error| map_dispatch_error(error, "stream"))?;
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(ServerError::ServiceUnavailable)?;
+    // Subscribe on both arms: the remote arm needs the net handle to poll the
+    // holder, so a node without one answers 503 up front either way.
+    let wake_rx = subscribe_inbox_wakes(context.as_ref())
+        .map_err(|error| map_dispatch_error(error, "stream"))?;
     let mode = if holder == local_node_id {
-        UnreadStreamMode::Local(net_handle.subscribe_notification_wakes())
+        UnreadStreamMode::Local(wake_rx)
     } else {
         UnreadStreamMode::Remote
     };

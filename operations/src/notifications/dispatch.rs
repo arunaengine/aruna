@@ -3,6 +3,7 @@ use aruna_core::structs::{NotificationRecord, WatchEventMask, WatchSubscription}
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use thiserror::Error;
+use tokio::sync::broadcast;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -67,6 +68,22 @@ pub async fn resolve_inbox_holder_for_user(
     recipient: UserId,
 ) -> Result<NodeId, NotificationDispatchError> {
     resolve_holder(context, recipient).await
+}
+
+/// Receiver half of the inbox wake channel; re-exported so the REST layer never
+/// names the net handle's channel type directly.
+pub type InboxWakeReceiver = broadcast::Receiver<UserId>;
+
+/// Subscribes to local inbox-delivery wakes. `Unavailable` when the node runs
+/// without a net handle, matching the other dispatch paths.
+pub fn subscribe_inbox_wakes(
+    context: &DriverContext,
+) -> Result<InboxWakeReceiver, NotificationDispatchError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(NotificationDispatchError::Unavailable)?;
+    Ok(net_handle.subscribe_notification_wakes())
 }
 
 async fn resolve_holder(
