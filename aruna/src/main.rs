@@ -129,8 +129,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
             if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
-                announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id)
-                    .await?;
+                announce_core_documents(
+                    driver_ctx.as_ref(),
+                    config.node_id,
+                    &config.realm_id,
+                    true,
+                )
+                .await?;
             } else {
                 drive(
                     CreateRealmOperation::new(CreateRealmConfig {
@@ -143,6 +148,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         oidc_providers: config.oidc_providers.clone(),
                     }),
                     driver_ctx.as_ref(),
+                )
+                .await?;
+                // CreateRealm mints the realm-auth/realm-config genesis via its admin
+                // operation outbox records, but not the shared node-usage topic. As
+                // the realm-bootstrap node, announce the core documents here so the
+                // node-usage genesis is minted on the fresh-bootstrap path too.
+                announce_core_documents(
+                    driver_ctx.as_ref(),
+                    config.node_id,
+                    &config.realm_id,
+                    true,
                 )
                 .await?;
             }
@@ -190,7 +206,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
                 }
             }
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+            // A joining node is never the realm-bootstrap node: it announces the
+            // shared node-usage topic with allow_genesis=false and waits for the
+            // bootstrap node's genesis to replicate in.
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
+                .await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::Provisioned => {
@@ -224,7 +244,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+            // A provisioned node re-announces core documents on restart as a
+            // holder, but the shared node-usage genesis already exists from the
+            // bootstrap node, so it never needs to mint it.
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
+                .await?;
         }
     }
 
