@@ -51,8 +51,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeInfoDocument, NodeUsageSnapshot,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, WatchInterestDigest,
-    group_owner_index_key, node_usage_key_node_id, watch_interest_key_node_id,
+    PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User,
+    WatchInterestDigest, group_owner_index_key, node_usage_key_node_id, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
@@ -1620,6 +1620,7 @@ impl DocumentSyncService {
                     DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
                         bytes,
+                        change,
                         ..
                     } => {
                         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
@@ -1646,7 +1647,7 @@ impl DocumentSyncService {
                                         metadata_document_lifecycle_revision_change(
                                             &lifecycle,
                                             self.local_node_id()?,
-                                            aruna_core::structs::PlacementRef::NIL,
+                                            change.placement,
                                         ),
                                     ),
                                     record,
@@ -1659,6 +1660,7 @@ impl DocumentSyncService {
                                 let accepted = self
                                     .apply_metadata_document_lifecycle(
                                         MetadataDocumentLifecycleRecord::Delete { event },
+                                        change.placement,
                                     )
                                     .await?;
                                 if accepted && tombstone.is_deleted() {
@@ -1952,7 +1954,7 @@ impl DocumentSyncService {
         &self,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
-        _change: DocumentSyncChange,
+        change: DocumentSyncChange,
     ) -> Result<()> {
         if admin_document_target_for_reduced_document(&target).is_some() {
             return Err(NetError::Bootstrap(
@@ -2003,7 +2005,7 @@ impl DocumentSyncService {
                 )));
             }
             return self
-                .apply_metadata_document_lifecycle(record)
+                .apply_metadata_document_lifecycle(record, change.placement)
                 .await
                 .map(|_| ());
         }
@@ -2075,9 +2077,15 @@ impl DocumentSyncService {
     async fn apply_metadata_document_lifecycle(
         &self,
         record: MetadataDocumentLifecycleRecord,
+        placement: PlacementRef,
     ) -> Result<bool> {
-        apply_metadata_document_lifecycle_to_storage(&self.storage, &record, self.local_node_id()?)
-            .await
+        apply_metadata_document_lifecycle_to_storage(
+            &self.storage,
+            &record,
+            self.local_node_id()?,
+            placement,
+        )
+        .await
     }
 
     async fn apply_metadata_graph_lifecycle(
@@ -2647,9 +2655,15 @@ async fn apply_metadata_document_lifecycle_to_storage(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> Result<bool> {
-    let Some(writes) =
-        metadata_document_lifecycle_write_entries_if_current(storage, record, delete_actor).await?
+    let Some(writes) = metadata_document_lifecycle_write_entries_if_current(
+        storage,
+        record,
+        delete_actor,
+        placement,
+    )
+    .await?
     else {
         return Ok(false);
     };
@@ -3462,15 +3476,12 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     storage: &StorageHandle,
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    let revision = metadata_document_lifecycle_revision_change(
-        record,
-        delete_actor,
-        aruna_core::structs::PlacementRef::NIL,
-    );
+    let revision = metadata_document_lifecycle_revision_change(record, delete_actor, placement);
     if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, &revision).await? {
         return Ok(None);
     }
@@ -7340,9 +7351,14 @@ mod tests {
             stale_event_id,
         );
         assert!(
-            apply_metadata_document_lifecycle_to_storage(&storage, &delete_lifecycle, node(8))
-                .await
-                .expect("document tombstone applies")
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &delete_lifecycle,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("document tombstone applies")
         );
         let stale = registry_record(
             group_id,
@@ -7663,14 +7679,24 @@ mod tests {
         };
 
         assert!(
-            apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, node(9))
-                .await
-                .expect("upsert lifecycle applies")
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &lifecycle,
+                node(9),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("upsert lifecycle applies")
         );
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, node(9))
-                .await
-                .expect("equal upsert lifecycle is idempotent")
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &lifecycle,
+                node(9),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("equal upsert lifecycle is idempotent")
         );
 
         let stored_event = read_storage_value(
@@ -7693,6 +7719,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_lifecycle_sidecar_mirrors_wire_placement_ref() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(30, 1);
+        let document_id = Ulid::from_parts(31, 1);
+        let event_id = Ulid::from_parts(32, 1);
+        let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
+        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(event),
+        };
+        // The wire ref a co-holder receives from the origin's envelope.
+        let wire_ref = aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_parts(33, 1),
+            epoch: 0,
+            bucket: 21,
+        };
+
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, node(9), wire_ref,)
+                .await
+                .expect("upsert lifecycle applies")
+        );
+
+        let revision = read_lifecycle_revision(&storage, document_id).await;
+        assert_eq!(revision.placement, wire_ref);
+    }
+
+    #[tokio::test]
     async fn metadata_lifecycle_upsert_skips_newer_delete_sidecar() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(10, 1);
@@ -7702,9 +7755,14 @@ mod tests {
         let delete_lifecycle =
             metadata_delete_lifecycle(group_id, document_id, 200, delete_event_id, stale_event_id);
         assert!(
-            apply_metadata_document_lifecycle_to_storage(&storage, &delete_lifecycle, node(8))
-                .await
-                .expect("delete lifecycle applies")
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &delete_lifecycle,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("delete lifecycle applies")
         );
 
         let stale_event = metadata_create_event(group_id, document_id, 100, stale_event_id, 7);
@@ -7712,9 +7770,14 @@ mod tests {
             event: Box::new(stale_event),
         };
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(&storage, &stale_lifecycle, node(8))
-                .await
-                .expect("stale upsert lifecycle is fenced")
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &stale_lifecycle,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("stale upsert lifecycle is fenced")
         );
 
         assert_eq!(
@@ -7749,14 +7812,24 @@ mod tests {
             deleted_after_event_id,
         );
         assert!(
-            apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, node(8))
-                .await
-                .expect("delete lifecycle applies")
+            apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &local_delete,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("delete lifecycle applies")
         );
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, node(8))
-                .await
-                .expect("equal delete lifecycle is idempotent")
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &local_delete,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("equal delete lifecycle is idempotent")
         );
 
         let stale_delete = metadata_delete_lifecycle(
@@ -7767,9 +7840,14 @@ mod tests {
             deleted_after_event_id,
         );
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(&storage, &stale_delete, node(8))
-                .await
-                .expect("stale delete lifecycle is fenced")
+            !apply_metadata_document_lifecycle_to_storage(
+                &storage,
+                &stale_delete,
+                node(8),
+                aruna_core::structs::PlacementRef::NIL,
+            )
+            .await
+            .expect("stale delete lifecycle is fenced")
         );
 
         assert_eq!(
