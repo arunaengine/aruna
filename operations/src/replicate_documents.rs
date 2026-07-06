@@ -180,6 +180,10 @@ impl ReplicateDocumentsOperation {
                 self.config.local_node_id,
                 Some(document),
                 selected_peers,
+                // Replication runs on the node that authored the change and stamps
+                // itself as the placement's authoritative origin, so it may mint the
+                // document's topic genesis.
+                true,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
