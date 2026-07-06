@@ -13,6 +13,7 @@ pub mod id;
 pub mod keys;
 pub mod keyspaces;
 pub mod metadata;
+pub mod metrics;
 pub mod onboarding;
 pub mod operation;
 pub mod storage_entries;
