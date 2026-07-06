@@ -247,6 +247,7 @@ dependencies = [
  "opentelemetry",
  "percent-encoding",
  "postcard",
+ "prometheus-client",
  "rand 0.10.2",
  "reqwest",
  "s3s",
