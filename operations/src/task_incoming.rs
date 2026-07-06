@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
@@ -62,8 +62,8 @@ use crate::notifications::watch::outbox::{
     WATCH_FORWARD_OUTBOX_RETENTION_MS, delete_watch_forward_outbox_records,
     read_watch_forward_outbox_batch, restore_watch_forward_outbox_timer,
 };
-use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
+use crate::process_placements::process_bucket_placements;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -71,7 +71,7 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
+use crate::sync_placement::DOCUMENT_SYNC_DEFER_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -97,7 +97,7 @@ struct OperationsTaskHandler {
 struct DrainSubBatch {
     peers: Vec<aruna_core::NodeId>,
     documents: Vec<DocumentSyncPublish>,
-    targets: Vec<DocumentSyncTarget>,
+    topics: Vec<irokle::TopicId>,
     record_keys: Vec<Vec<u8>>,
 }
 
@@ -109,10 +109,49 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
+/// Resolves the bucket placement a drained record publishes under. A record
+/// that already carries a real ref keeps it; a NIL ref (admin-operation
+/// emitters leave one) is resolved from the realm config for the target. Shared
+/// realm targets ignore the placement, so resolving them is harmless.
+fn resolve_publish_placement(
+    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    target: &DocumentSyncTarget,
+    current: aruna_core::structs::PlacementRef,
+) -> aruna_core::structs::PlacementRef {
+    if current != aruna_core::structs::PlacementRef::NIL {
+        return current;
+    }
+    match config {
+        Some(config) => crate::placement::placement_ref_for_target(config, target, None),
+        None => aruna_core::structs::PlacementRef::NIL,
+    }
+}
+
+async fn load_realm_config_for_drain(
+    context: &Arc<DriverContext>,
+    realm_id: aruna_core::structs::RealmId,
+) -> Option<aruna_core::structs::RealmConfigDocument> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match context
+        .storage_handle
+        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+        _ => None,
+    }
+}
+
 fn document_publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentSyncTarget,
     event: DocumentSyncOutboxEvent,
+    placement: aruna_core::structs::PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
@@ -132,6 +171,7 @@ fn document_publish_from_outbox(
         DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
             target,
             event,
+            placement,
             allow_genesis,
         },
     }
@@ -252,13 +292,103 @@ impl OperationsTaskHandler {
             return;
         };
 
+        let realm_id = *net_handle.realm_id();
+        // Admin-operation records (group/user document ops) are stamped NIL by
+        // their emitters; resolve their bucket placement here from the realm
+        // config so they publish onto the right bucket topic. Records that
+        // already carry a real ref (metadata upserts/deletes) keep it.
+        let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
+        let mut totals = DrainSyncOutcome::default();
+
+        let records: Vec<(
+            Vec<u8>,
+            aruna_core::document::DocumentSyncOutboxRecord,
+            irokle::TopicId,
+        )> = batch
+            .records
+            .into_iter()
+            .map(|(record_key, mut record)| {
+                record.placement = resolve_publish_placement(
+                    realm_config.as_ref(),
+                    &record.target,
+                    record.placement,
+                );
+                let topic = record.target.sync_topic_id(realm_id, &record.placement);
+                (record_key, record, topic)
+            })
+            .collect();
+
+        // Bucket topics are join-only for this node unless it is the bucket's
+        // rank-0 holder: a record whose topic has no local genesis yet cannot
+        // publish. Try one bootstrap pass against the record's peers (falling
+        // back to the bucket's resolved holders when the record carries none,
+        // as admin operations do), then defer whatever is still missing to a
+        // short retry — the genesis arrives via gossip or the next pass.
+        let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
+            BTreeMap::new();
+        for (_, record, topic) in &records {
+            if !record.target.uses_bucket_topic()
+                || net_handle
+                    .document_sync_topic_exists(*topic)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let mut bootstrap_peers = record.peers.clone();
+            if bootstrap_peers.is_empty()
+                && let Some(config) = realm_config.as_ref()
+            {
+                bootstrap_peers =
+                    crate::placement::resolve_bucket_holders(config, &record.placement);
+                bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
+                crate::sync_placement::sort_node_ids(&mut bootstrap_peers);
+            }
+            if bootstrap_peers.is_empty() {
+                continue;
+            }
+            missing_topics
+                .entry(bootstrap_peers)
+                .or_default()
+                .insert(*topic);
+        }
+        for (peers, topics) in missing_topics {
+            let event = net_handle
+                .sync_document_topics(topics.into_iter().collect(), peers)
+                .await;
+            let outcome = self
+                .finish_sync_drain_subbatch(
+                    &retry_key,
+                    Vec::new(),
+                    Event::Net(NetEvent::DocumentSync(event)),
+                    Default::default(),
+                )
+                .await;
+            totals.merge(outcome);
+        }
+
+        let mut deferred = 0usize;
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
-        for (record_key, record) in batch.records {
+        for (record_key, record, topic) in records {
+            if record.target.uses_bucket_topic()
+                && !net_handle
+                    .document_sync_topic_exists(topic)
+                    .unwrap_or(false)
+            {
+                debug!(
+                    event = "pipeline.drain.deferred",
+                    target = ?record.target,
+                    %topic,
+                    "Deferring outbox record: bucket topic genesis not yet known"
+                );
+                deferred += 1;
+                continue;
+            }
             let document = document_publish_from_outbox(
                 record.outbox_id,
                 record.target.clone(),
                 record.event,
+                record.placement,
                 record.allow_genesis,
             );
 
@@ -270,13 +400,13 @@ impl OperationsTaskHandler {
                 subbatches.push(DrainSubBatch {
                     peers: record.peers,
                     documents: Vec::new(),
-                    targets: Vec::new(),
+                    topics: Vec::new(),
                     record_keys: Vec::new(),
                 });
             }
             let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
             subbatch.documents.push(document);
-            subbatch.targets.push(record.target);
+            subbatch.topics.push(topic);
             subbatch.record_keys.push(record_key);
         }
 
@@ -287,7 +417,6 @@ impl OperationsTaskHandler {
         // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
         // sub-batches enter the sync stage strictly in submission order.
         let mut publish_elapsed = Duration::ZERO;
-        let mut totals = DrainSyncOutcome::default();
         let mut awaiting_sync: Option<DrainSubBatch> = None;
         for mut subbatch in subbatches {
             let documents = std::mem::take(&mut subbatch.documents);
@@ -340,6 +469,7 @@ impl OperationsTaskHandler {
         info!(
             event = "pipeline.drain.summary",
             records = record_count,
+            deferred,
             groups = group_count,
             subbatches = subbatch_count,
             scan_ms = duration_ms(scan_elapsed),
@@ -356,6 +486,12 @@ impl OperationsTaskHandler {
 
         if totals.retry_needed {
             self.reschedule_with_backoff(retry_key).await;
+        } else if deferred > 0 {
+            // Deferred records wait only for a genesis to arrive from the
+            // bucket's rank-0 holder; retry quickly rather than on the failure
+            // backoff.
+            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
+                .await;
         } else if batch.has_more {
             self.reschedule_timer(retry_key, std::time::Duration::ZERO)
                 .await;
@@ -378,7 +514,7 @@ impl OperationsTaskHandler {
         let event = net_handle
             .send_effect(Effect::Net(NetEffect::DocumentSync(
                 DocumentSyncEffect::SyncDocuments {
-                    targets: subbatch.targets,
+                    topics: subbatch.topics,
                     peers: subbatch.peers,
                 },
             )))
@@ -1187,99 +1323,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
-                let retry_key = TaskKey::SyncPlacements { realm_id, node_id };
-                let op = ProcessPlacementsOperation::new(PlacementConfig {
-                    realm_id,
-                    local_node_id: node_id,
-                    retry_after: self.backoff_after(&retry_key),
-                });
-                match drive(op, self.context.as_ref()).await {
-                    // The sweep re-armed itself for still-pending placements: grow the
-                    // backoff so a persistently unsatisfiable placement stops hot-looping.
-                    Ok(true) => self.note_retry_backoff(&retry_key),
-                    // A clean sweep clears the backoff for the next unrelated re-arm.
-                    Ok(false) => self.reset_backoff(&retry_key),
-                    Err(err) => {
-                        error!(error = ?err, "Failed to process pending sync placements timer event");
-                        self.reschedule_with_backoff(retry_key).await;
-                    }
-                }
-            }
-            TaskKey::SyncDocument {
-                node_id,
-                target,
-                peers,
-            } => {
-                let retry_key = TaskKey::SyncDocument {
-                    node_id,
-                    target: target.clone(),
-                    peers: peers.clone(),
-                };
-                let Some(net_handle) = self.context.net_handle.as_ref() else {
-                    warn!(key = ?retry_key, "Cannot sync document without net handle");
-                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                        .await;
-                    return;
-                };
-                let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::SyncDocument { target, peers },
-                    )))
-                    .await;
-                match event {
-                    Event::Net(NetEvent::DocumentSync(
-                        DocumentSyncNetEvent::DocumentsReconciled {
-                            targets,
-                            metadata_create_events,
-                            metadata_graph_tombstones,
-                            ..
-                        },
-                    )) => {
-                        process_metadata_graph_tombstones(
-                            self.context.as_ref(),
-                            metadata_graph_tombstones,
-                        )
-                        .await;
-                        refresh_realm_usage_summary_for_targets(
-                            self.context.as_ref(),
-                            net_handle.node_id(),
-                            &targets,
-                        )
-                        .await;
-                        refresh_watch_interest_for_targets(self.context.as_ref(), &targets).await;
-                        if self
-                            .project_reconciled_metadata_create_events(
-                                &retry_key,
-                                targets,
-                                metadata_create_events,
-                            )
-                            .await
-                            .is_err()
-                        {
-                            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                                .await;
-                            return;
-                        }
-                    }
-                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                        error,
-                        ..
-                    })) => {
-                        warn!(key = ?retry_key, error = %error, "Failed to process durable document sync timer event");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
-                    }
-                    Event::Net(NetEvent::Error(error)) => {
-                        warn!(key = ?retry_key, error = ?error, "Failed to process durable document sync timer event");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
-                    }
-                    other => {
-                        warn!(key = ?retry_key, event = ?other, "Unexpected durable document sync timer result");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
-                    }
-                }
+                process_bucket_placements(&self.context, realm_id, node_id).await;
             }
             TaskKey::DrainDocumentSyncOutbox => {
                 self.drain_document_sync_outbox().await;
@@ -1434,6 +1478,7 @@ mod tests {
                 bytes: vec![1, 2, 3],
                 change,
             },
+            aruna_core::structs::PlacementRef::NIL,
             true,
         );
 

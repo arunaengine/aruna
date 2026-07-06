@@ -1,10 +1,10 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::{DocumentSyncTarget, PendingBucketPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::placement::{placement_ref_for_target, plan_target_placement};
+use crate::placement::plan_target_placement;
 use crate::sync_placement::{
     delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
     write_placement_effect,
@@ -56,8 +56,8 @@ enum ReplicateDocumentsState {
 
 #[derive(Debug, Clone, PartialEq)]
 enum PlacementAction {
-    Write(PendingDocumentPlacement),
-    Delete(DocumentSyncTarget),
+    Write(PendingBucketPlacement),
+    Delete(PlacementRef),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -171,15 +171,13 @@ impl ReplicateDocumentsOperation {
             .collect();
 
         self.placement_action = if placement_satisfied(selected_peers.len(), desired_count) {
-            Some(PlacementAction::Delete(document.clone()))
+            Some(PlacementAction::Delete(placement))
         } else {
             Some(PlacementAction::Write(new_placement(
                 self.config.realm_id,
-                document.clone(),
-                local_node_id,
-                desired_count,
-                selected_peers.clone(),
                 placement,
+                local_node_id,
+                selected_peers.clone(),
             )))
         };
 
@@ -222,11 +220,11 @@ impl ReplicateDocumentsOperation {
                     |error| ReplicateDocumentsError::Placement(error.to_string())
                 )?])
             }
-            PlacementAction::Delete(target) => {
+            PlacementAction::Delete(placement) => {
                 self.retry_needed = false;
                 Ok(smallvec![delete_placement_effect(
                     self.config.realm_id,
-                    &target
+                    &placement
                 )])
             }
         }
@@ -236,25 +234,18 @@ impl ReplicateDocumentsOperation {
         let Some(action) = self.placement_action.take() else {
             return self.fail(ReplicateDocumentsError::DocumentSync(error));
         };
-        let target = match action {
-            PlacementAction::Write(record) => record.target,
-            PlacementAction::Delete(target) => target,
+        let placement = match action {
+            PlacementAction::Write(record) => record.placement,
+            PlacementAction::Delete(placement) => placement,
         };
-        warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
-        let (desired_count, placement) = match self.realm_config.as_ref() {
-            Some(realm_config) => match plan_target_placement(realm_config, &target, None) {
-                Some(plan) => (plan.desired_count.max(1), plan.placement),
-                None => (1, placement_ref_for_target(realm_config, &target, None)),
-            },
-            None => (1, aruna_core::structs::PlacementRef::NIL),
-        };
+        warn!(placement = ?placement, error = %error, "Document sync failed; queued bucket placement retry");
+        // Re-queue the bucket with no selected co-holders so the placement
+        // reconciler re-resolves and re-ensures topic membership.
         self.placement_action = Some(PlacementAction::Write(new_placement(
             self.config.realm_id,
-            target,
-            self.config.local_node_id,
-            desired_count,
-            Vec::new(),
             placement,
+            self.config.local_node_id,
+            Vec::new(),
         )));
         match self.emit_placement_update() {
             Ok(effects) => effects,
@@ -447,9 +438,10 @@ mod tests {
 
         let effects = operation.emit_next_publish();
 
-        assert!(
-            matches!(operation.placement_action, Some(PlacementAction::Delete(ref delete_target)) if *delete_target == target)
-        );
+        assert!(matches!(
+            operation.placement_action,
+            Some(PlacementAction::Delete(_))
+        ));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 
@@ -536,7 +528,11 @@ mod tests {
         });
         operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
         operation.state = ReplicateDocumentsState::Publish;
-        operation.placement_action = Some(PlacementAction::Delete(target));
+        operation.placement_action = Some(PlacementAction::Delete(PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([9u8; 16]),
+            epoch: 0,
+            bucket: 1,
+        }));
 
         let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
             result: Err("publish failed".to_string()),

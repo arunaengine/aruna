@@ -553,6 +553,7 @@ impl NetHandle {
             app_alpns,
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
+            config.realm_id,
         )?);
 
         let streams = Arc::new(StreamsService::new(
@@ -787,22 +788,41 @@ impl NetHandle {
 
     pub fn allow_document_sync_peers(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .allow_document_sync_peers(targets, peers)
+            .allow_document_sync_peers(topics, peers)
     }
 
     pub fn ensure_document_sync_topics(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .ensure_document_sync_topics(targets, peers)
+            .ensure_document_sync_topics(topics, peers)
+    }
+
+    /// Whether a document sync topic's genesis is known locally.
+    pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.topic_exists(topic)
+    }
+
+    /// Bucket-topic anti-entropy for the startup restore and placement
+    /// reconciler: ensures the topics locally, syncs them with `peers`, and
+    /// reconciles the applied events.
+    pub async fn sync_document_topics(
+        &self,
+        topics: Vec<::irokle::TopicId>,
+        peers: Vec<NodeId>,
+    ) -> aruna_core::document::DocumentSyncNetEvent {
+        self.inner
+            .document_sync
+            .sync_documents_event(topics, peers)
+            .await
     }
 
     pub async fn handle_document_sync_stream(

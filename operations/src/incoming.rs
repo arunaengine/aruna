@@ -13,7 +13,7 @@ use crate::metadata::projector::{
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
-use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
+use crate::process_placements::process_bucket_placements;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
@@ -169,14 +169,7 @@ async fn reconcile_inbound_document_sync_topics(
         .iter()
         .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }));
     if realm_config_changed {
-        let operation = ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id: *net_handle.realm_id(),
-            local_node_id: net_handle.node_id(),
-            retry_after: crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
-        });
-        if let Err(error) = drive(operation, context.as_ref()).await {
-            error!(error = ?error, "Failed to process pending placements after document sync reconciliation");
-        }
+        process_bucket_placements(context, *net_handle.realm_id(), net_handle.node_id()).await;
     }
     refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     refresh_watch_interest_for_targets(context, &targets.targets).await;
@@ -356,7 +349,7 @@ async fn reemit_evicted_documents(
             document.target,
             Vec::new(),
             document.event,
-            aruna_core::structs::PlacementRef::NIL,
+            document.placement,
             document.allow_genesis,
         );
         let effect = match write_outbox_effect(&record) {

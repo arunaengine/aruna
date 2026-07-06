@@ -112,6 +112,9 @@ pub struct DocumentSyncService {
     // receiver once via `take_eviction_receiver` and re-emits the payloads.
     eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
+    // Realm this service serves; bucket-classed targets carry no realm id of
+    // their own, so their topic derivation reads it from here.
+    realm_id: RealmId,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -124,6 +127,7 @@ impl std::fmt::Debug for DocumentSyncService {
 }
 
 impl DocumentSyncService {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         endpoint: iroh::Endpoint,
         storage: StorageHandle,
@@ -131,6 +135,7 @@ impl DocumentSyncService {
         peer_nodes: &[NodeId],
         alpns: Vec<Vec<u8>>,
         runtime: irokle_crate::net::IrohRuntimeConfig,
+        realm_id: RealmId,
     ) -> Result<Self> {
         Self::open_with_persist_policy(
             endpoint,
@@ -140,9 +145,11 @@ impl DocumentSyncService {
             alpns,
             runtime,
             FjallPersistPolicy::default(),
+            realm_id,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_persist_policy(
         endpoint: iroh::Endpoint,
         storage: StorageHandle,
@@ -151,6 +158,7 @@ impl DocumentSyncService {
         alpns: Vec<Vec<u8>>,
         runtime: irokle_crate::net::IrohRuntimeConfig,
         persist_policy: FjallPersistPolicy,
+        realm_id: RealmId,
     ) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_id_to_peer_id).collect();
@@ -189,6 +197,7 @@ impl DocumentSyncService {
             storage_path,
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
+            realm_id,
         })
     }
 
@@ -241,11 +250,16 @@ impl DocumentSyncService {
                 }
             };
             match event {
-                DocumentSyncEvent::AdminOperation { target, event } => {
+                DocumentSyncEvent::AdminOperation {
+                    target,
+                    event,
+                    placement,
+                } => {
                     documents.push(DocumentSyncEvictedDocument {
                         event_id: None,
                         target,
                         event: DocumentSyncOutboxEvent::AdminOperation { event },
+                        placement,
                         allow_genesis: false,
                     });
                 }
@@ -266,6 +280,7 @@ impl DocumentSyncService {
                     documents.push(DocumentSyncEvictedDocument {
                         event_id: Some(event_id),
                         target,
+                        placement: change.placement,
                         event: DocumentSyncOutboxEvent::Upsert { bytes, change },
                         allow_genesis: false,
                     });
@@ -286,6 +301,7 @@ impl DocumentSyncService {
                     documents.push(DocumentSyncEvictedDocument {
                         event_id: Some(event_id),
                         target,
+                        placement: change.placement,
                         event: DocumentSyncOutboxEvent::Delete { change },
                         allow_genesis: false,
                     });
@@ -381,10 +397,10 @@ impl DocumentSyncService {
 
     pub fn allow_document_sync_peers(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[irokle_crate::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        if targets.is_empty() {
+        if topics.is_empty() {
             return Ok(());
         }
 
@@ -395,8 +411,7 @@ impl DocumentSyncService {
         self.allow_sync_peers(&sync_peers)?;
 
         let mut seen_topics = BTreeSet::new();
-        for target in targets {
-            let topic_id = target.sync_topic_id();
+        for topic_id in topics.iter().copied() {
             if !seen_topics.insert(topic_id) {
                 continue;
             }
@@ -407,9 +422,7 @@ impl DocumentSyncService {
                 .topic_state(&topic_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .ok_or_else(|| {
-                    NetError::Bootstrap(format!(
-                        "document sync topic {topic_id} for target {target:?} is missing"
-                    ))
+                    NetError::Bootstrap(format!("document sync topic {topic_id} is missing"))
                 })?;
 
             if state.event_type_id != DocumentSyncEvent::TYPE_ID {
@@ -449,10 +462,10 @@ impl DocumentSyncService {
 
     pub fn ensure_document_sync_topics(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[irokle_crate::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
-        if targets.is_empty() {
+        if topics.is_empty() {
             return Ok(());
         }
 
@@ -460,12 +473,9 @@ impl DocumentSyncService {
         self.allow_sync_peers(&sync_peers)?;
 
         let mut seen_topics = BTreeSet::new();
-        for target in targets {
-            if seen_topics.insert(target.sync_topic_id()) {
-                // Called on the realm node that already holds these documents to
-                // admit an onboarding peer, so it may create any still-missing
-                // topic genesis for documents it originated/holds.
-                self.ensure_topic(target, &sync_peers, true)?;
+        for topic_id in topics.iter().copied() {
+            if seen_topics.insert(topic_id) {
+                self.ensure_topic(topic_id, &sync_peers, true)?;
             }
         }
 
@@ -563,14 +573,13 @@ impl DocumentSyncService {
 
     pub async fn sync_document_event(
         &self,
-        target: DocumentSyncTarget,
+        topic_id: irokle_crate::TopicId,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
-        let topic_id = target.sync_topic_id();
         let sync_peers = self.sync_peers(peers);
         if let Err(error) = self.allow_sync_peers(&sync_peers) {
             return DocumentSyncNetEvent::Error {
-                target: Some(target),
+                target: None,
                 error: error.to_string(),
             };
         }
@@ -578,7 +587,7 @@ impl DocumentSyncService {
             Ok(true) => {
                 if let Err(error) = self.sync_topic(topic_id, sync_peers).await {
                     return DocumentSyncNetEvent::Error {
-                        target: Some(target),
+                        target: None,
                         error: error.to_string(),
                     };
                 }
@@ -586,21 +595,21 @@ impl DocumentSyncService {
             Ok(false) => {
                 if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
                     return DocumentSyncNetEvent::Error {
-                        target: Some(target),
+                        target: None,
                         error: error.to_string(),
                     };
                 }
             }
             Err(error) => {
                 return DocumentSyncNetEvent::Error {
-                    target: Some(target),
+                    target: None,
                     error: error.to_string(),
                 };
             }
         }
         if let Err(error) = self.flush_database() {
             return DocumentSyncNetEvent::Error {
-                target: Some(target),
+                target: None,
                 error: error.to_string(),
             };
         }
@@ -612,7 +621,7 @@ impl DocumentSyncService {
                 metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
             Err(error) => DocumentSyncNetEvent::Error {
-                target: Some(target),
+                target: None,
                 error: error.to_string(),
             },
         }
@@ -620,11 +629,11 @@ impl DocumentSyncService {
 
     pub async fn sync_documents_event(
         &self,
-        targets: Vec<DocumentSyncTarget>,
+        topic_ids: Vec<irokle_crate::TopicId>,
         peers: Vec<NodeId>,
     ) -> DocumentSyncNetEvent {
         let sync_started = Instant::now();
-        let target_count = targets.len();
+        let target_count = topic_ids.len();
         let sync_peers = self.sync_peers(peers);
         if let Err(error) = self.allow_sync_peers(&sync_peers) {
             return DocumentSyncNetEvent::Error {
@@ -634,27 +643,28 @@ impl DocumentSyncService {
         }
 
         let mut seen_topics = BTreeSet::new();
-        let mut topics: Vec<(irokle_crate::TopicId, DocumentSyncTarget)> = Vec::new();
-        for target in targets {
-            let topic_id = target.sync_topic_id();
+        let mut topic_ids_out: Vec<irokle_crate::TopicId> = Vec::new();
+        for topic_id in topic_ids {
             if !seen_topics.insert(topic_id) {
                 continue;
             }
             match self.has_topic(topic_id) {
-                Ok(true) => topics.push((topic_id, target)),
+                Ok(true) => topic_ids_out.push(topic_id),
                 Ok(false) => {
-                    if let Err(error) = self.bootstrap_topic_from_peers(topic_id, &sync_peers).await
-                    {
-                        return DocumentSyncNetEvent::Error {
-                            target: Some(target),
-                            error: error.to_string(),
-                        };
+                    // Join-only: an unknown topic whose genesis is nowhere to be
+                    // found yet (e.g. an empty bucket whose rank-0 holder has not
+                    // created it) is skipped, not fatal — it arrives via gossip
+                    // or a later anti-entropy pass.
+                    match self.bootstrap_topic_from_peers(topic_id, &sync_peers).await {
+                        Ok(()) => topic_ids_out.push(topic_id),
+                        Err(error) => {
+                            debug!(%topic_id, error = %error, "skipping unbootstrappable document sync topic");
+                        }
                     }
-                    topics.push((topic_id, target));
                 }
                 Err(error) => {
                     return DocumentSyncNetEvent::Error {
-                        target: Some(target),
+                        target: None,
                         error: error.to_string(),
                     };
                 }
@@ -662,10 +672,7 @@ impl DocumentSyncService {
         }
 
         let bootstrap_elapsed = sync_started.elapsed();
-        let topic_ids = topics
-            .iter()
-            .map(|(topic_id, _)| *topic_id)
-            .collect::<Vec<_>>();
+        let topic_ids = topic_ids_out;
         let peer_sync_started = Instant::now();
         if let Err(error) = self.sync_topics(topic_ids.clone(), sync_peers).await {
             return DocumentSyncNetEvent::Error {
@@ -768,23 +775,35 @@ impl DocumentSyncService {
                     target,
                     change,
                 },
-                DocumentSyncPublish::AdminOperation { target, event, .. } => {
-                    DocumentSyncEvent::AdminOperation { target, event }
-                }
+                DocumentSyncPublish::AdminOperation {
+                    target,
+                    event,
+                    placement,
+                    ..
+                } => DocumentSyncEvent::AdminOperation {
+                    target,
+                    event,
+                    placement,
+                },
             };
             let target = event.target().clone();
-            let topic_id = target.sync_topic_id();
+            let topic_id = target.sync_topic_id(self.realm_id, &event.placement());
+            // Bucket topics are join-only here: only the bucket's rank-0 holder
+            // creates the genesis (eagerly, via the placement reconciler), so a
+            // publish onto a genesis-less bucket topic fails and the outbox
+            // drain defers the record instead.
+            let may_create_topic = !target.uses_bucket_topic();
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             let op = self.publish_event_op(
                 &oplog,
-                &target,
                 topic_id,
                 actor_id,
                 envelope,
                 sync_peers,
                 allow_genesis,
+                may_create_topic,
                 &mut fast_path,
                 &mut fallback,
             )?;
@@ -792,6 +811,15 @@ impl DocumentSyncService {
                 .entry(topic_id)
                 .or_default()
                 .observe(op.signed.body.actor_id, op.signed.body.actor_seq);
+        }
+        // Member fan-out for publishes without an explicit peer set (admin
+        // operations): the drain's sync stage only pushes to record peers, so
+        // on an already-existing topic these ops would otherwise wait for an
+        // incidental recheck. Peer-addressed publishes keep their drain sync.
+        if sync_peers.is_empty() {
+            for topic_id in published.keys() {
+                self.net.schedule_topic_recheck(*topic_id)?;
+            }
         }
         info!(
             event = "pipeline.publish.summary",
@@ -809,30 +837,35 @@ impl DocumentSyncService {
     fn publish_event_op(
         &self,
         oplog: &Oplog<irokle_crate::FjallStorage>,
-        target: &DocumentSyncTarget,
         topic_id: irokle_crate::TopicId,
         actor_id: irokle_crate::ActorId,
         envelope: EventEnvelope,
         sync_peers: &BTreeSet<PeerId>,
         allow_genesis: bool,
+        may_create_topic: bool,
         fast_path: &mut usize,
         fallback: &mut usize,
     ) -> Result<irokle_crate::Op> {
-        // Fast path for brand-new topics: genesis + first event admitted in a
-        // single storage transaction. Any failure (e.g. a concurrent admission
-        // won the genesis race) falls back to the existing two-step flow.
         let topic_missing = self
             .node
             .storage()
             .topic_state(&topic_id)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .is_none();
+        if topic_missing && !may_create_topic {
+            return Err(NetError::Bootstrap(format!(
+                "bucket topic {topic_id} has no genesis yet; only its rank-0 holder creates it"
+            )));
+        }
         if topic_missing {
             // Only the document's origin may mint its topic genesis. Any other
             // publisher waits (retryable) for that genesis to replicate in.
             if !allow_genesis {
                 return Err(NetError::TopicNotReady(topic_id.to_string()));
             }
+            // Fast path for brand-new topics: genesis + first event admitted in
+            // a single storage transaction. Any failure (e.g. a concurrent
+            // admission won the genesis race) falls back to the two-step flow.
             let genesis = TopicGenesis {
                 event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
                 initial_peers: sync_peers.clone(),
@@ -856,7 +889,9 @@ impl DocumentSyncService {
                 }
             }
         }
-        let topic_id = self.ensure_topic(target, sync_peers, allow_genesis)?;
+        if may_create_topic {
+            self.ensure_topic(topic_id, sync_peers, allow_genesis)?;
+        }
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))
@@ -907,11 +942,10 @@ impl DocumentSyncService {
 
     fn ensure_topic(
         &self,
-        target: &DocumentSyncTarget,
+        topic_id: irokle_crate::TopicId,
         peers: &BTreeSet<PeerId>,
         allow_genesis: bool,
     ) -> Result<irokle_crate::TopicId> {
-        let topic_id = target.sync_topic_id();
         let mut genesis_error = None;
         for _ in 0..2 {
             if let Some(state) = self
@@ -978,6 +1012,12 @@ impl DocumentSyncService {
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| format!("failed to ensure document sync topic {topic_id}")),
         ))
+    }
+
+    /// Whether the topic's genesis is known locally. The outbox drain uses this
+    /// to defer bucket-topic records until the rank-0 holder's genesis arrives.
+    pub fn topic_exists(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
+        self.has_topic(topic_id)
     }
 
     fn has_topic(&self, topic_id: irokle_crate::TopicId) -> Result<bool> {
@@ -1478,7 +1518,9 @@ impl DocumentSyncService {
             cursor.merge(&topic_clock);
             let mut deferred_creates = false;
             for (event, actor_id) in events {
-                let target_topic_id = event.target().sync_topic_id();
+                let target_topic_id = event
+                    .target()
+                    .sync_topic_id(self.realm_id, &event.placement());
                 if target_topic_id != topic_id {
                     warn!(
                         %topic_id,
@@ -1944,7 +1986,7 @@ impl DocumentSyncService {
             DocumentSyncEvent::Delete { target, change, .. } => {
                 self.apply_delete(target, change).await
             }
-            DocumentSyncEvent::AdminOperation { target, event } => {
+            DocumentSyncEvent::AdminOperation { target, event, .. } => {
                 apply_admin_document_operation_to_storage(&self.storage, target, *event).await
             }
         }
@@ -4242,7 +4284,7 @@ mod tests {
         DocumentSyncTarget::RealmConfig {
             realm_id: RealmId::from_bytes([seed; 32]),
         }
-        .sync_topic_id()
+        .sync_topic_id(RealmId::from_bytes([seed; 32]), &PlacementRef::NIL)
     }
 
     fn node(seed: u8) -> NodeId {
@@ -4265,6 +4307,22 @@ mod tests {
         DocumentSyncTarget::MetadataGraphLifecycle {
             graph_iri: "urn:aruna:restart-contract".to_string(),
         }
+    }
+
+    fn restart_realm() -> RealmId {
+        RealmId::from_bytes([99; 32])
+    }
+
+    fn restart_placement() -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_parts(99, 7),
+            epoch: 0,
+            bucket: 11,
+        }
+    }
+
+    fn restart_topic() -> irokle_crate::TopicId {
+        restart_target().sync_topic_id(restart_realm(), &restart_placement())
     }
 
     fn restart_event_id() -> Ulid {
@@ -4292,7 +4350,7 @@ mod tests {
                 updated_at_ms: 1_727_000_000_101,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: aruna_core::structs::PlacementRef::NIL,
+            placement: restart_placement(),
         }
     }
 
@@ -4325,6 +4383,7 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            restart_realm(),
         )
         .expect("document sync service opens")
     }
@@ -7114,6 +7173,11 @@ mod tests {
         runtime.block_on(async {
             let service = open_restart_service(&root, "child-storage").await;
             let target = restart_target();
+            // Bucket topics are join-only at publish time; this node plays the
+            // bucket's rank-0 holder and creates the genesis eagerly first.
+            service
+                .ensure_document_sync_topics(&[restart_topic()], Vec::new())
+                .expect("restart bucket topic genesis");
             let event = service
                 .publish_documents(
                     vec![DocumentSyncPublish::Upsert {
@@ -7166,7 +7230,7 @@ mod tests {
         let service = open_restart_service(root, "parent-storage").await;
         let topic = service
             .node()
-            .open_topic::<DocumentSyncEvent>(target.sync_topic_id())
+            .open_topic::<DocumentSyncEvent>(restart_topic())
             .expect("published topic reopens after restart");
         let history = topic
             .history(HistoryOrder::OldestFirst)
@@ -8038,6 +8102,7 @@ mod tests {
                 vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(admin_a),
+                    placement: PlacementRef::NIL,
                     allow_genesis: true,
                 }],
                 vec![node_b],
@@ -8052,6 +8117,7 @@ mod tests {
                 vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(admin_b),
+                    placement: PlacementRef::NIL,
                     allow_genesis: true,
                 }],
                 vec![node_a],
@@ -8177,6 +8243,7 @@ mod tests {
             reemitted.event_id.is_none(),
             "admin outbox re-emission uses the embedded admin event id"
         );
+        assert_eq!(reemitted.placement, PlacementRef::NIL);
         match &reemitted.event {
             DocumentSyncOutboxEvent::AdminOperation { event } => {
                 assert_eq!(
@@ -8255,6 +8322,7 @@ mod tests {
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(admin_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                 ],
@@ -8784,6 +8852,7 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            RealmId::from_bytes([53u8; 32]),
         )
         .expect("document sync service opens");
 
@@ -8794,7 +8863,7 @@ mod tests {
             node_id: local_node,
             group_id: None,
         };
-        let topic_id = target.sync_topic_id();
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
 
         let change = |kind| DocumentSyncChange {
             base: None,

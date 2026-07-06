@@ -23,11 +23,11 @@ pub async fn handle_net_effect(
             aruna_core::DocumentSyncEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocument { target, peers } => {
-                NetEvent::DocumentSync(document_sync.sync_document_event(target, peers).await)
+            aruna_core::DocumentSyncEffect::SyncDocument { topic, peers } => {
+                NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentSyncEffect::SyncDocuments { targets, peers } => {
-                NetEvent::DocumentSync(document_sync.sync_documents_event(targets, peers).await)
+            aruna_core::DocumentSyncEffect::SyncDocuments { topics, peers } => {
+                NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,

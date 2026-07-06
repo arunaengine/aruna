@@ -2,7 +2,7 @@ use crate::error::CliError;
 use aruna::config::PersistedNodeState;
 use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
-use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::{PendingBucketPlacement, bucket_topic_id};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
@@ -84,11 +84,11 @@ struct TopicsListOutput {
 #[derive(Debug, Serialize, PartialEq)]
 struct TopicListEntry {
     topic_id: String,
-    target: JsonDocumentSyncTarget,
+    strategy_id: String,
+    epoch: u64,
+    bucket: u32,
     status: &'static str,
-    desired_peer_count: usize,
     selected_peer_count: usize,
-    missing_peer_count: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -489,22 +489,23 @@ impl Serialize for JsonPersistedNodeState {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct JsonPendingDocumentPlacement(PendingDocumentPlacement);
+struct JsonPendingDocumentPlacement(PendingBucketPlacement);
 
 impl Serialize for JsonPendingDocumentPlacement {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingDocumentPlacement", 8)?;
+        let mut state = serializer.serialize_struct("PendingBucketPlacement", 8)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
-        state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
+        state.serialize_field("strategy_id", &self.0.placement.strategy_id.to_string())?;
+        state.serialize_field("epoch", &self.0.placement.epoch)?;
+        state.serialize_field("bucket", &self.0.placement.bucket)?;
         state.serialize_field(
             "authoritative_node_id",
             &self.0.authoritative_node_id.to_string(),
         )?;
-        state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
         state.serialize_field(
             "selected_peers",
             &self
@@ -514,138 +515,13 @@ impl Serialize for JsonPendingDocumentPlacement {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
         )?;
-        state.serialize_field("missing_peer_count", &placement_missing_peer_count(&self.0))?;
         state.serialize_field("updated_at", &self.0.updated_at)?;
         state.end()
     }
 }
 
-fn placement_topic_id(placement: &PendingDocumentPlacement) -> String {
-    placement.target.sync_topic_id().to_string()
-}
-
-fn placement_missing_peer_count(placement: &PendingDocumentPlacement) -> usize {
-    let mut selected_peers = placement.selected_peers.clone();
-    selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
-    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    selected_peers.dedup();
-    placement
-        .desired_peer_count
-        .saturating_sub(selected_peers.len().saturating_add(1))
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind")]
-enum JsonDocumentSyncTarget {
-    Group {
-        group_id: String,
-    },
-    GroupAuthorization {
-        group_id: String,
-    },
-    RealmAuthorization {
-        realm_id: String,
-    },
-    RealmConfig {
-        realm_id: String,
-    },
-    User {
-        user_id: String,
-    },
-    MetadataRegistry {
-        group_id: String,
-        document_id: String,
-    },
-    MetadataCreateEvent {
-        document_id: String,
-        event_id: String,
-    },
-    MetadataDocumentLifecycle {
-        document_id: String,
-    },
-    MetadataGraphLifecycle {
-        graph_iri: String,
-    },
-    NodeUsage {
-        realm_id: String,
-        node_id: String,
-        group_id: Option<String>,
-    },
-    WatchInterest {
-        realm_id: String,
-        node_id: String,
-    },
-    NodeInfo {
-        realm_id: String,
-        node_id: String,
-    },
-}
-
-fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
-    match target {
-        DocumentSyncTarget::Group { group_id } => JsonDocumentSyncTarget::Group {
-            group_id: group_id.to_string(),
-        },
-        DocumentSyncTarget::GroupAuthorization { group_id } => {
-            JsonDocumentSyncTarget::GroupAuthorization {
-                group_id: group_id.to_string(),
-            }
-        }
-        DocumentSyncTarget::RealmAuthorization { realm_id } => {
-            JsonDocumentSyncTarget::RealmAuthorization {
-                realm_id: realm_id.to_string(),
-            }
-        }
-        DocumentSyncTarget::RealmConfig { realm_id } => JsonDocumentSyncTarget::RealmConfig {
-            realm_id: realm_id.to_string(),
-        },
-        DocumentSyncTarget::User { user_id } => JsonDocumentSyncTarget::User {
-            user_id: user_id.to_string(),
-        },
-        DocumentSyncTarget::MetadataRegistry {
-            group_id,
-            document_id,
-        } => JsonDocumentSyncTarget::MetadataRegistry {
-            group_id: group_id.to_string(),
-            document_id: document_id.to_string(),
-        },
-        DocumentSyncTarget::MetadataCreateEvent {
-            document_id,
-            event_id,
-        } => JsonDocumentSyncTarget::MetadataCreateEvent {
-            document_id: document_id.to_string(),
-            event_id: event_id.to_string(),
-        },
-        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
-            JsonDocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: document_id.to_string(),
-            }
-        }
-        DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
-            JsonDocumentSyncTarget::MetadataGraphLifecycle {
-                graph_iri: graph_iri.clone(),
-            }
-        }
-        DocumentSyncTarget::NodeUsage {
-            realm_id,
-            node_id,
-            group_id,
-        } => JsonDocumentSyncTarget::NodeUsage {
-            realm_id: realm_id.to_string(),
-            node_id: node_id.to_string(),
-            group_id: group_id.map(|group_id| group_id.to_string()),
-        },
-        DocumentSyncTarget::WatchInterest { realm_id, node_id } => {
-            JsonDocumentSyncTarget::WatchInterest {
-                realm_id: realm_id.to_string(),
-                node_id: node_id.to_string(),
-            }
-        }
-        DocumentSyncTarget::NodeInfo { realm_id, node_id } => JsonDocumentSyncTarget::NodeInfo {
-            realm_id: realm_id.to_string(),
-            node_id: node_id.to_string(),
-        },
-    }
+fn placement_topic_id(placement: &PendingBucketPlacement) -> String {
+    bucket_topic_id(placement.realm_id, &placement.placement).to_string()
 }
 
 #[derive(Debug)]
@@ -1127,11 +1003,11 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
         .into_iter()
         .map(|placement| TopicListEntry {
             topic_id: placement_topic_id(&placement),
-            target: json_document_sync_target(&placement.target),
+            strategy_id: placement.placement.strategy_id.to_string(),
+            epoch: placement.placement.epoch,
+            bucket: placement.placement.bucket,
             status: "under_replicated",
-            desired_peer_count: placement.desired_peer_count,
             selected_peer_count: placement.selected_peers.len(),
-            missing_peer_count: placement_missing_peer_count(&placement),
         })
         .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
@@ -1186,7 +1062,7 @@ fn topic_placements_output(
 
 fn load_pending_placements(
     database_path: &str,
-) -> Result<Vec<PendingDocumentPlacement>, ExplorerError> {
+) -> Result<Vec<PendingBucketPlacement>, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let keyspace_names = db.list_keyspace_names();
     if !keyspace_names
@@ -1495,12 +1371,11 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        placement_missing_peer_count, raw_field,
+        raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
-    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, API_STATE_KEYSPACE,
@@ -1796,22 +1671,22 @@ mod tests {
 
     #[test]
     fn decodes_pending_topic_placement_value() {
-        let target = DocumentSyncTarget::RealmConfig {
-            realm_id: RealmId::from_bytes([4_u8; 32]),
-        };
         let realm_id = RealmId::from_bytes([4_u8; 32]);
+        let placement_ref = aruna_core::structs::PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([9_u8; 16]),
+            epoch: 0,
+            bucket: 5,
+        };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
         let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
         let placement = aruna_operations::sync_placement::new_placement(
             realm_id,
-            target.clone(),
+            placement_ref,
             authoritative_node_id,
-            3,
             vec![selected_peer],
-            aruna_core::structs::PlacementRef::NIL,
         );
         let value = postcard::to_allocvec(&placement).unwrap();
-        let key = aruna_operations::sync_placement::placement_key(realm_id, &target);
+        let key = aruna_operations::sync_placement::placement_key(realm_id, &placement_ref);
 
         let decoded = decode_entry(SYNC_PLACEMENT_KEYSPACE, key.as_ref(), &value);
         assert_eq!(
@@ -1823,11 +1698,9 @@ mod tests {
         match decoded.value {
             DecodedValue::PendingDocumentPlacement { data } => {
                 assert_eq!(data.0.realm_id, realm_id);
-                assert_eq!(data.0.target, target);
+                assert_eq!(data.0.placement, placement_ref);
                 assert_eq!(data.0.authoritative_node_id, authoritative_node_id);
-                assert_eq!(data.0.desired_peer_count, 3);
                 assert_eq!(data.0.selected_peers, vec![selected_peer]);
-                assert_eq!(placement_missing_peer_count(&data.0), 1);
             }
             other => panic!("expected pending topic placement, got {other:?}"),
         }

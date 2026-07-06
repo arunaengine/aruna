@@ -27,7 +27,7 @@ use crate::issue_onboarding_sync_ticket::{
 };
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::process_placements::{PlacementConfig, PlacementError, ProcessPlacementsOperation};
+use crate::process_placements::process_bucket_placements;
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
@@ -72,8 +72,6 @@ pub enum BootstrapOnboardingFinalizeError {
     #[error(transparent)]
     SetNodePlacement(#[from] SetNodePlacementError),
     #[error(transparent)]
-    Placement(#[from] PlacementError),
-    #[error(transparent)]
     IssueTicket(#[from] IssueOnboardingSyncTicketError),
     #[error(transparent)]
     Consume(#[from] ConsumeOnboardingSecretError),
@@ -108,7 +106,7 @@ pub async fn bootstrap_onboarding_finalize(
 
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
     set_joiner_placement_entry(&input, context.as_ref()).await?;
-    process_pending_placements(&input, context.as_ref()).await?;
+    process_pending_placements(&input, &context).await;
 
     let ticket = drive(
         IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
@@ -123,15 +121,21 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
     let encoded_ticket = ticket.encode()?;
 
+    let onboarding_topics = onboarding_sync_topics(&context, input.realm_id, &ticket).await;
     let net_handle = context
         .net_handle
         .as_ref()
         .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
+    // Shared realm topics may be created here (the issuer is a legitimate
+    // origin for them); bucket topics are join-only — their genesis comes from
+    // the bucket's rank-0 holder, so the joiner is only added as a member.
     net_handle
-        .ensure_document_sync_topics(&ticket.payload.documents, vec![input.node_id])
+        .ensure_document_sync_topics(&onboarding_topics.shared, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+    let mut all_topics = onboarding_topics.shared;
+    all_topics.extend(onboarding_topics.bucket);
     net_handle
-        .allow_document_sync_peers(&ticket.payload.documents, vec![input.node_id])
+        .allow_document_sync_peers(&all_topics, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
 
     drive(
@@ -278,23 +282,77 @@ async fn set_joiner_placement_entry(
 
 async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
-    context: &DriverContext,
-) -> Result<(), PlacementError> {
-    match drive(
-        ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id: input.realm_id,
-            local_node_id: input.local_node_id,
-            retry_after: crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            warn!(error = %error, "Failed to process pending document-sync placements during onboarding");
-            Err(error)
+    context: &Arc<DriverContext>,
+) {
+    process_bucket_placements(context, input.realm_id, input.local_node_id).await;
+}
+
+struct OnboardingSyncTopics {
+    shared: Vec<::irokle::TopicId>,
+    bucket: Vec<::irokle::TopicId>,
+}
+
+/// Derives the sync topics for a ticket's documents so the issuer can add the
+/// joiner to them: shared realm targets ignore the placement, user documents
+/// ride their bucket topic (resolved from the issuer's realm config). Shared
+/// and bucket topics are returned separately because only shared topics may be
+/// created by the issuer; bucket topics are join-only.
+async fn onboarding_sync_topics(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    ticket: &aruna_core::onboarding::OnboardingSyncTicket,
+) -> OnboardingSyncTopics {
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::structs::PlacementRef;
+    let config = load_realm_config_document(context, realm_id).await;
+    let mut topics = OnboardingSyncTopics {
+        shared: Vec::new(),
+        bucket: Vec::new(),
+    };
+    for document in &ticket.payload.documents {
+        if document.uses_bucket_topic() {
+            if !matches!(document, DocumentSyncTarget::User { .. }) {
+                continue;
+            }
+            let placement = match config.as_ref() {
+                Some(config) => crate::placement::placement_ref_for_target(config, document, None),
+                None => PlacementRef::NIL,
+            };
+            if placement == PlacementRef::NIL {
+                continue;
+            }
+            topics
+                .bucket
+                .push(document.sync_topic_id(realm_id, &placement));
+        } else {
+            topics
+                .shared
+                .push(document.sync_topic_id(realm_id, &PlacementRef::NIL));
         }
+    }
+    topics
+}
+
+async fn load_realm_config_document(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> Option<aruna_core::structs::RealmConfigDocument> {
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+        _ => None,
     }
 }
 

@@ -13,6 +13,7 @@ use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::placement::placement_ref_for_target;
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -142,7 +143,7 @@ async fn core_document_targets(
 pub async fn fetch_core_onboarding_documents(
     driver_ctx: &DriverContext,
     node_state: &PersistedNodeState,
-    _realm_id: &aruna_core::structs::RealmId,
+    realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
@@ -154,23 +155,69 @@ pub async fn fetch_core_onboarding_documents(
     let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
         return Err("net handle unavailable".into());
     };
+    let realm_id = *realm_id;
 
+    // Fetch the shared realm documents first (they include the realm config), so
+    // the bucket-classed user documents can then be routed onto their bucket
+    // topics via the freshly synced config.
+    let mut user_documents = Vec::new();
     for document in onboarding_sync_ticket.payload.documents.clone() {
-        sync_document_from_peer(net_handle, document, bootstrap_peer).await?;
+        if matches!(document, DocumentSyncTarget::User { .. }) {
+            user_documents.push(document);
+            continue;
+        }
+        let topic = document.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+    }
+
+    if !user_documents.is_empty() {
+        let config = load_realm_config(driver_ctx, realm_id).await;
+        for document in user_documents {
+            let placement = match config.as_ref() {
+                Some(config) => placement_ref_for_target(config, &document, None),
+                None => aruna_core::structs::PlacementRef::NIL,
+            };
+            if placement == aruna_core::structs::PlacementRef::NIL {
+                warn!(document = ?document, "Skipping onboarding user document without a bucket placement");
+                continue;
+            }
+            let topic = document.sync_topic_id(realm_id, &placement);
+            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+        }
     }
 
     Ok(())
 }
 
-async fn sync_document_from_peer(
+async fn load_realm_config(
+    driver_ctx: &DriverContext,
+    realm_id: aruna_core::structs::RealmId,
+) -> Option<aruna_core::structs::RealmConfigDocument> {
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*realm_id.as_bytes()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+        _ => None,
+    }
+}
+
+async fn sync_topic_from_peer(
     net_handle: &aruna_net::NetHandle,
-    document: DocumentSyncTarget,
+    topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
+    document_for_error: &DocumentSyncTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let document_for_error = document.clone();
+    let document_for_error = document_for_error.clone();
     let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
         DocumentSyncEffect::SyncDocument {
-            target: document,
+            topic,
             peers: vec![bootstrap_peer],
         },
     )));

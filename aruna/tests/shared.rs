@@ -557,6 +557,15 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     )
     .await?;
     announce_core_documents(context.as_ref(), net.node_id(), &realm_id, true).await?;
+    // Mirrors the startup path in main.rs: the seed is rank-0 holder of every
+    // bucket in its single-node realm and must create the bucket topic geneses
+    // eagerly, or its first bucket-classed writes defer forever.
+    aruna_operations::process_placements::process_bucket_placements(
+        &context,
+        realm_id,
+        net.node_id(),
+    )
+    .await;
     drive(
         ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: Actor {
@@ -655,6 +664,21 @@ async fn spawn_joiner_node_with_mode(
     )
     .await?;
     mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
+    // Mirrors the startup path in main.rs: join the held bucket topics from
+    // co-holders, then create the geneses of buckets this node is now rank-0
+    // holder of (join-before-create adopts geneses the seed already made).
+    aruna_operations::startup::restore_bucket_subscriptions(
+        &joiner_context,
+        config.node_id,
+        config.realm_id,
+    )
+    .await;
+    aruna_operations::process_placements::process_bucket_placements(
+        &joiner_context,
+        config.realm_id,
+        config.node_id,
+    )
+    .await;
     announce_realm_presence(joiner_context.as_ref(), &config.realm_id, config.node_id).await?;
 
     let (base_url, server_task) = spawn_rest_server(
