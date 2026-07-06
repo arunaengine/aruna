@@ -48,6 +48,19 @@ pub enum NotificationKind {
         realm_id: RealmId,
         node_id: NodeId,
     },
+    MetadataCreated {
+        path: String,
+        group_id: GroupId,
+        document_id: Ulid,
+        actor_user_id: UserId,
+    },
+    DataUploaded {
+        path: String,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -59,6 +72,9 @@ impl NotificationKind {
             | NotificationKind::RemovedFromGroup { .. }
             | NotificationKind::GroupMemberAdded { .. } => "group.membership",
             NotificationKind::NodeOnboarded { .. } => "node.onboarding",
+            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. } => {
+                "resource.watch"
+            }
         }
     }
 
@@ -69,6 +85,8 @@ impl NotificationKind {
             NotificationKind::RemovedFromGroup { .. } => "removed_from_group",
             NotificationKind::GroupMemberAdded { .. } => "group_member_added",
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
+            NotificationKind::MetadataCreated { .. } => "metadata_created",
+            NotificationKind::DataUploaded { .. } => "data_uploaded",
         }
     }
 }
@@ -251,6 +269,19 @@ mod tests {
                 realm_id: RealmId([1; 32]),
                 node_id: make_node_id(7),
             },
+            NotificationKind::MetadataCreated {
+                path: "meta/group/doc".to_string(),
+                group_id: Ulid::new(),
+                document_id: Ulid::new(),
+                actor_user_id: user(1, 5),
+            },
+            NotificationKind::DataUploaded {
+                path: "bucket/key".to_string(),
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+                size_bytes: 4096,
+                actor_user_id: user(1, 6),
+            },
         ] {
             let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
             let bytes = record.to_bytes().unwrap();
@@ -406,13 +437,30 @@ mod tests {
             realm_id: RealmId([1; 32]),
             node_id: make_node_id(1),
         };
+        let metadata_created = NotificationKind::MetadataCreated {
+            path: "meta/group/doc".to_string(),
+            group_id: Ulid::new(),
+            document_id: Ulid::new(),
+            actor_user_id: user(1, 5),
+        };
+        let data_uploaded = NotificationKind::DataUploaded {
+            path: "bucket/key".to_string(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            size_bytes: 1,
+            actor_user_id: user(1, 6),
+        };
         assert_eq!(added.category(), "group.membership");
         assert_eq!(removed.category(), "group.membership");
         assert_eq!(member.category(), "group.membership");
         assert_eq!(onboarded.category(), "node.onboarding");
+        assert_eq!(metadata_created.category(), "resource.watch");
+        assert_eq!(data_uploaded.category(), "resource.watch");
         assert_eq!(added.name(), "added_to_group");
         assert_eq!(removed.name(), "removed_from_group");
         assert_eq!(member.name(), "group_member_added");
         assert_eq!(onboarded.name(), "node_onboarded");
+        assert_eq!(metadata_created.name(), "metadata_created");
+        assert_eq!(data_uploaded.name(), "data_uploaded");
     }
 }
