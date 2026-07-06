@@ -56,7 +56,7 @@ use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    deduplicate_search_hits, load_metadata_realm_nodes, query_select_limit,
+    load_metadata_realm_nodes, query_select_limit,
 };
 #[cfg(test)]
 use std::time::Duration;
@@ -1190,6 +1190,7 @@ pub async fn search_metadata(
             graph_iris: None,
             query: params.q,
             limit: params.limit,
+            cursor: None,
             mode: map_query_mode(params.mode),
             target_nodes: None,
         },
@@ -1350,6 +1351,7 @@ fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::Forbidden => ServerError::Forbidden,
         MetadataApiError::NotFound => ServerError::NotFound,
         MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::InvalidCursor(_) => ServerError::BadRequest,
         MetadataApiError::Internal(message) => ServerError::InternalError(message),
     }
 }
@@ -2868,86 +2870,6 @@ mod tests {
         test.shutdown().await;
     }
 
-    #[test]
-    fn deduplicates_search_hits_across_replicas() {
-        let hits = deduplicate_search_hits(
-            vec![
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.5,
-                    title: "File A".to_string(),
-                    snippet: None,
-                },
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.8,
-                    title: "File A".to_string(),
-                    snippet: None,
-                },
-                MetadataSearchHit {
-                    document_id: "01B".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/b".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01B".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.7,
-                    title: "File B".to_string(),
-                    snippet: None,
-                },
-            ],
-            2,
-        );
-
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
-        assert_eq!(hits[0].score, 0.8);
-        assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
-    }
-
-    #[test]
-    fn search_hit_dedup_orders_equal_scores_stably() {
-        let hit = |document_id: &str, subject_iri: &str| MetadataSearchHit {
-            document_id: document_id.to_string(),
-            group_id: "01G".to_string(),
-            document_path: format!("datasets/{document_id}"),
-            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
-            subject_iri: subject_iri.to_string(),
-            score: 0.7,
-            title: subject_iri.to_string(),
-            snippet: None,
-        };
-
-        let hits = deduplicate_search_hits(
-            vec![
-                hit("01B", "./file-b.txt"),
-                hit("01A", "./file-b.txt"),
-                hit("01A", "./file-a.txt"),
-            ],
-            10,
-        );
-
-        let keys = hits
-            .iter()
-            .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                ("https://w3id.org/aruna/01A", "./file-a.txt"),
-                ("https://w3id.org/aruna/01A", "./file-b.txt"),
-                ("https://w3id.org/aruna/01B", "./file-b.txt"),
-            ]
-        );
-    }
-
     struct DistributedMetadataAccessState {
         auth: AuthContext,
         valid_bearer_token: String,
@@ -3243,6 +3165,7 @@ mod tests {
                 graph_iris: None,
                 query: "Remote".to_string(),
                 limit: Some(10),
+                cursor: None,
                 mode: Some(MetadataApiQueryMode::Distributed),
                 target_nodes: Some(vec![test.remote.net.node_id()]),
             },

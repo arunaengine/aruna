@@ -32,6 +32,11 @@ use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::MetadataAuthToken;
+use super::search_cursor::{
+    METADATA_SEARCH_DEFAULT_PAGE_SIZE, METADATA_SEARCH_MAX_PAGE_SIZE,
+    METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
+    SearchPageCursor, SearchWatermark, paginate, query_fingerprint, resume_fetch_limit,
+};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::{
@@ -61,6 +66,8 @@ pub enum MetadataApiError {
     NotFound,
     #[error("service unavailable")]
     ServiceUnavailable,
+    #[error("{0}")]
+    InvalidCursor(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -160,6 +167,7 @@ pub struct MetadataSearchRequest {
     pub graph_iris: Option<Vec<String>>,
     pub query: String,
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
     pub mode: Option<MetadataApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
 }
@@ -173,6 +181,7 @@ pub struct MetadataQueryExecution {
 #[derive(Debug, Clone)]
 pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
+    pub next_cursor: Option<String>,
     pub fanout_stats: MetadataFanoutStats,
 }
 
@@ -391,8 +400,45 @@ pub async fn search_metadata(
     if request.query.trim().is_empty() {
         return Err(MetadataApiError::BadRequest);
     }
-    let limit = request.limit.unwrap_or(25).clamp(1, 250);
-    let (hits, fanout_stats) = run_search_distributed(
+    let page_size = request
+        .limit
+        .unwrap_or(METADATA_SEARCH_DEFAULT_PAGE_SIZE)
+        .clamp(1, METADATA_SEARCH_MAX_PAGE_SIZE);
+
+    let fingerprint =
+        query_fingerprint(&request.query, request.graph_iris.as_deref(), request.mode);
+    let (watermark, resume) = match request.cursor.as_deref() {
+        Some(raw) => {
+            let cursor = SearchCursor::decode(raw)
+                .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
+            if cursor.fingerprint != fingerprint {
+                return Err(MetadataApiError::InvalidCursor(
+                    SearchCursorError::QueryMismatch.to_string(),
+                ));
+            }
+            (Some(cursor.watermark.clone()), cursor.resume_positions())
+        }
+        None => (None, HashMap::new()),
+    };
+
+    // On a continuation, attempt every node in the resume map even if realm
+    // discovery no longer reports it, so its remaining hits are not skipped.
+    let target_nodes = if request.cursor.is_some() {
+        let mut nodes = match request.target_nodes.clone() {
+            Some(nodes) => nodes,
+            None => load_metadata_realm_nodes(context, realm_id, local_node_id).await,
+        };
+        for node_id in resume.keys() {
+            if !nodes.contains(node_id) {
+                nodes.push(*node_id);
+            }
+        }
+        Some(nodes)
+    } else {
+        request.target_nodes.clone()
+    };
+
+    let (hits, next, fanout_stats) = run_search_distributed(
         context,
         realm_id,
         local_node_id,
@@ -400,11 +446,19 @@ pub async fn search_metadata(
         request.bearer_token,
         request.graph_iris,
         request.query,
-        limit,
-        MetadataFanoutScope::new(request.mode, request.target_nodes),
+        resume,
+        watermark,
+        page_size,
+        MetadataFanoutScope::new(request.mode, target_nodes),
     )
     .await?;
-    Ok(MetadataSearchExecution { hits, fanout_stats })
+    let next_cursor =
+        next.map(|cursor| SearchCursor::new(fingerprint, cursor.watermark, cursor.resume).encode());
+    Ok(MetadataSearchExecution {
+        hits,
+        next_cursor,
+        fanout_stats,
+    })
 }
 
 pub async fn load_realm_config(
@@ -1102,9 +1156,12 @@ fn record_query_node_result(span: &Span, result: &Result<MetadataQueryResults, M
     }
 }
 
-fn record_search_node_result(span: &Span, result: &Result<Vec<MetadataSearchHit>, MetadataError>) {
+fn record_search_node_result(
+    span: &Span,
+    result: &Result<(Vec<MetadataSearchHit>, usize), MetadataError>,
+) {
     match result {
-        Ok(hits) => {
+        Ok((hits, _)) => {
             span.record("result", "ok");
             span.record("hit_count", hits.len() as u64);
         }
@@ -1206,11 +1263,11 @@ async fn run_query_distributed(
 #[tracing::instrument(
     name = "metadata.operation.search_distributed",
     level = "debug",
-    skip(context, auth, query, scope),
+    skip(context, auth, query, resume, watermark, scope),
     fields(
         mode = ?scope.mode,
         query_len = query.len() as u64,
-        limit = limit as u64,
+        page_size = page_size as u64,
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         node_count = field::Empty,
         discovery_ms = field::Empty,
@@ -1227,9 +1284,18 @@ async fn run_search_distributed(
     bearer_token: Option<String>,
     graph_iris: Option<Vec<String>>,
     query: String,
-    limit: usize,
+    resume: HashMap<NodeId, u32>,
+    watermark: Option<SearchWatermark>,
+    page_size: usize,
     scope: MetadataFanoutScope,
-) -> Result<(Vec<MetadataSearchHit>, MetadataFanoutStats), MetadataApiError> {
+) -> Result<
+    (
+        Vec<MetadataSearchHit>,
+        Option<SearchPageCursor>,
+        MetadataFanoutStats,
+    ),
+    MetadataApiError,
+> {
     let span = Span::current();
     let total_started = Instant::now();
     let handle = context
@@ -1237,36 +1303,53 @@ async fn run_search_distributed(
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     let remote_auth_token = metadata_auth_token_from_bearer(bearer_token.as_deref());
+    let resume = Arc::new(resume);
 
-    let local_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
+    let local_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
         (
             handle.clone(),
             auth.clone(),
             graph_iris.clone(),
             query.clone(),
-            limit,
+            resume.clone(),
+            page_size,
         ),
-        |(handle, auth, graph_iris, query, limit), _| async move {
-            handle
+        |(handle, auth, graph_iris, query, resume, page_size), node_id| async move {
+            let limit = resume_fetch_limit(
+                &resume,
+                node_id,
+                page_size,
+                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            );
+            let hits = handle
                 .search_authorized_local(auth, graph_iris, query, limit)
-                .await
+                .await?;
+            Ok((hits, limit))
         },
     );
-    let remote_call: MetadataNodeCall<Vec<MetadataSearchHit>> = metadata_node_call(
+    let remote_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
         (
             handle.clone(),
             remote_auth_token.clone(),
             graph_iris.clone(),
             query.clone(),
-            limit,
+            resume.clone(),
+            page_size,
         ),
-        |(handle, auth_token, graph_iris, query, limit), node_id| async move {
-            handle
+        |(handle, auth_token, graph_iris, query, resume, page_size), node_id| async move {
+            let limit = resume_fetch_limit(
+                &resume,
+                node_id,
+                page_size,
+                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            );
+            let hits = handle
                 .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
-                .await
+                .await?;
+            Ok((hits, limit))
         },
     );
-    let (node_hits, fanout_stats) = run_metadata_fanout(
+    let (node_parts, fanout_stats) = run_metadata_fanout(
         context,
         realm_id,
         local_node_id,
@@ -1279,13 +1362,23 @@ async fn run_search_distributed(
     )
     .await?;
 
-    let hits = deduplicate_search_hits(
-        node_hits.into_iter().flat_map(|(_, hits)| hits).collect(),
-        limit,
+    let node_results = node_parts
+        .into_iter()
+        .map(|(node_id, (hits, requested))| NodeSearchResult {
+            node_id,
+            saturated: hits.len() >= requested,
+            hits,
+        })
+        .collect();
+    let page = paginate(
+        node_results,
+        watermark,
+        page_size,
+        METADATA_SEARCH_MAX_PAGINATION_DEPTH,
     );
-    span.record("hit_count", hits.len() as u64);
+    span.record("hit_count", page.hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok((hits, fanout_stats))
+    Ok((page.hits, page.next, fanout_stats))
 }
 
 pub fn aggregate_query_results(
@@ -1331,35 +1424,6 @@ pub fn query_select_limit(query: &str) -> Option<usize> {
         return None;
     };
     length
-}
-
-pub fn deduplicate_search_hits(
-    hits: Vec<MetadataSearchHit>,
-    limit: usize,
-) -> Vec<MetadataSearchHit> {
-    let mut deduped = HashMap::new();
-    for hit in hits {
-        let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
-        deduped
-            .entry(key)
-            .and_modify(|existing: &mut MetadataSearchHit| {
-                if hit.score > existing.score {
-                    *existing = hit.clone();
-                }
-            })
-            .or_insert(hit);
-    }
-    let mut hits = deduped.into_values().collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.graph_iri.cmp(&right.graph_iri))
-            .then_with(|| left.subject_iri.cmp(&right.subject_iri))
-    });
-    hits.truncate(limit);
-    hits
 }
 
 pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
@@ -1527,85 +1591,5 @@ mod tests {
             Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
         );
         assert_eq!(metadata_auth_token_from_bearer(None), None);
-    }
-
-    #[test]
-    fn deduplicates_search_hits_across_replicas() {
-        let hits = deduplicate_search_hits(
-            vec![
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.5,
-                    title: "File A".to_string(),
-                    snippet: None,
-                },
-                MetadataSearchHit {
-                    document_id: "01A".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/a".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.8,
-                    title: "File A".to_string(),
-                    snippet: None,
-                },
-                MetadataSearchHit {
-                    document_id: "01B".to_string(),
-                    group_id: "01G".to_string(),
-                    document_path: "datasets/b".to_string(),
-                    graph_iri: "https://w3id.org/aruna/01B".to_string(),
-                    subject_iri: "./file.txt".to_string(),
-                    score: 0.7,
-                    title: "File B".to_string(),
-                    snippet: None,
-                },
-            ],
-            2,
-        );
-
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
-        assert_eq!(hits[0].score, 0.8);
-        assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
-    }
-
-    #[test]
-    fn search_hit_dedup_orders_equal_scores_stably() {
-        let hit = |document_id: &str, subject_iri: &str| MetadataSearchHit {
-            document_id: document_id.to_string(),
-            group_id: "01G".to_string(),
-            document_path: format!("datasets/{document_id}"),
-            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
-            subject_iri: subject_iri.to_string(),
-            score: 0.7,
-            title: subject_iri.to_string(),
-            snippet: None,
-        };
-
-        let hits = deduplicate_search_hits(
-            vec![
-                hit("01B", "./file-b.txt"),
-                hit("01A", "./file-b.txt"),
-                hit("01A", "./file-a.txt"),
-            ],
-            10,
-        );
-
-        let keys = hits
-            .iter()
-            .map(|hit| (hit.graph_iri.as_str(), hit.subject_iri.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                ("https://w3id.org/aruna/01A", "./file-a.txt"),
-                ("https://w3id.org/aruna/01A", "./file-b.txt"),
-                ("https://w3id.org/aruna/01B", "./file-b.txt"),
-            ]
-        );
     }
 }
