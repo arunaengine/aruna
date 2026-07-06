@@ -7282,6 +7282,221 @@ mod tests {
         );
     }
 
+    // Two services fork one admin topic (each mints its own genesis carrying a
+    // unique admin event). The genesis tie-break resets exactly the losing side,
+    // whose admin event is evicted and decodes back into a re-emittable outbox
+    // publish that preserves the original embedded event id (the applier dedup
+    // key) and refuses to mint a rival genesis.
+    #[tokio::test]
+    async fn forked_admin_topic_eviction_reemits_with_preserved_event_id() {
+        let (_dir_a, storage_a) = test_storage();
+        let (_dir_b, storage_b) = test_storage();
+        let doc_a = tempfile::tempdir().expect("doc a");
+        let doc_b = tempfile::tempdir().expect("doc b");
+        let service_a = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(71).await,
+            storage_a,
+            doc_a.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("service a opens");
+        let service_b = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(72).await,
+            storage_b,
+            doc_b.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("service b opens");
+
+        let node_a = service_a.local_node_id().expect("node a id");
+        let node_b = service_b.local_node_id().expect("node b id");
+
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let topic_id = target.sync_topic_id();
+
+        let event_a_id = Ulid::from_parts(0xA1, 1);
+        let event_b_id = Ulid::from_parts(0xB2, 2);
+        let admin_a = test_admin_event(
+            event_a_id,
+            admin_target.clone(),
+            &test_actor(1, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "from-a".into(),
+            },
+        );
+        let admin_b = test_admin_event(
+            event_b_id,
+            admin_target.clone(),
+            &test_actor(2, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "from-b".into(),
+            },
+        );
+
+        // Each side lists the other in its genesis peer set, so the loser is a
+        // member of the winner's topic after the reset.
+        let published_a = service_a
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(admin_a),
+                    allow_genesis: true,
+                }],
+                vec![node_b],
+            )
+            .await;
+        assert!(
+            matches!(published_a, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "service a publish: {published_a:?}"
+        );
+        let published_b = service_b
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(admin_b),
+                    allow_genesis: true,
+                }],
+                vec![node_a],
+            )
+            .await;
+        assert!(
+            matches!(published_b, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "service b publish: {published_b:?}"
+        );
+
+        let node_a_handle = service_a.node();
+        let node_b_handle = service_b.node();
+        let genesis_a = node_a_handle
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis;
+        let genesis_b = node_b_handle
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis;
+        assert_ne!(
+            genesis_a, genesis_b,
+            "the two nodes forked distinct genesis"
+        );
+
+        // The smaller genesis wins; the side holding the larger genesis loses.
+        let (
+            loser,
+            loser_node,
+            winner_node,
+            loser_event_id,
+            winner_genesis,
+            winner_peer,
+            loser_peer,
+        ) = if genesis_a > genesis_b {
+            (
+                &service_a,
+                &node_a_handle,
+                &node_b_handle,
+                event_a_id,
+                genesis_b,
+                node_id_to_peer_id(&node_b),
+                node_id_to_peer_id(&node_a),
+            )
+        } else {
+            (
+                &service_b,
+                &node_b_handle,
+                &node_a_handle,
+                event_b_id,
+                genesis_a,
+                node_id_to_peer_id(&node_a),
+                node_id_to_peer_id(&node_b),
+            )
+        };
+
+        let winner_ops =
+            irokle_crate::oplog::topological(winner_node.storage(), &topic_id).unwrap();
+        let loser_ops = irokle_crate::oplog::topological(loser_node.storage(), &topic_id).unwrap();
+
+        // The winner keeps its genesis and produces no eviction.
+        let (_winner_ack, winner_side) = winner_node
+            .receive_sync_data_from_evicting(
+                loser_peer,
+                SyncData {
+                    topic_id,
+                    ops: loser_ops,
+                },
+            )
+            .unwrap();
+        assert!(
+            winner_side.is_empty(),
+            "winner keeps its genesis; no eviction"
+        );
+
+        // The loser resets and evicts its own admin chain.
+        let (_loser_ack, evictions) = loser_node
+            .receive_sync_data_from_evicting(
+                winner_peer,
+                SyncData {
+                    topic_id,
+                    ops: winner_ops,
+                },
+            )
+            .unwrap();
+        assert_eq!(evictions.len(), 1, "exactly the loser side resets");
+
+        // Both sides now agree on the winning genesis.
+        assert_eq!(
+            loser_node
+                .storage()
+                .topic_state(&topic_id)
+                .unwrap()
+                .unwrap()
+                .genesis,
+            winner_genesis
+        );
+        assert_eq!(
+            winner_node
+                .storage()
+                .topic_state(&topic_id)
+                .unwrap()
+                .unwrap()
+                .genesis,
+            winner_genesis
+        );
+
+        // The evicted admin event re-emits with its original event id preserved
+        // and allow_genesis cleared.
+        let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
+        assert_eq!(reemitted.len(), 1);
+        match &reemitted[0] {
+            DocumentSyncPublish::AdminOperation {
+                target: reemit_target,
+                event,
+                allow_genesis,
+            } => {
+                assert_eq!(reemit_target, &target);
+                assert_eq!(
+                    event.event_id, loser_event_id,
+                    "embedded admin event id must survive for applier dedup"
+                );
+                assert!(!allow_genesis, "re-emission must not mint a rival genesis");
+            }
+            other => panic!("expected an AdminOperation re-emission, got {other:?}"),
+        }
+    }
+
     // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
     // `?`-propagated that refusal the applied-ops cursor would never advance, so each
     // reconcile would re-materialize the whole post-cursor history. The upsert/delete
