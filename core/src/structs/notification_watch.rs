@@ -6,8 +6,8 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::RealmId;
-use crate::types::{Key, UserId};
+use crate::structs::{NotificationKind, RealmId};
+use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
@@ -98,6 +98,73 @@ impl WatchEventMask {
             kinds.push(WatchEventKind::DataUploaded);
         }
         kinds
+    }
+}
+
+/// Raw origin-plane watch event that crosses the wire from the node where a
+/// mutation committed to every interested inbox-holder node. `event_id` is minted
+/// exactly once at the origin and is the idempotency root: holder-side expansion
+/// derives a deterministic per-subscription record id from it, so a redelivered
+/// event re-expands to the same records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchEvent {
+    pub event_id: Ulid,
+    pub realm_id: RealmId,
+    pub kind: WatchEventKind,
+    pub path: String,
+    pub actor: UserId,
+    pub occurred_at_ms: u64,
+    pub detail: WatchEventDetail,
+}
+
+/// Kind-specific payload carried by a [`WatchEvent`]. Append-only postcard enum.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatchEventDetail {
+    MetadataCreated {
+        group_id: GroupId,
+        document_id: Ulid,
+    },
+    DataUploaded {
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+    },
+}
+
+impl WatchEvent {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Maps this event to the recipient-facing notification kind. The event's
+    /// `kind` selects matching; the `detail` supplies the deep-link fields.
+    pub fn notification_kind(&self) -> NotificationKind {
+        match &self.detail {
+            WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            } => NotificationKind::MetadataCreated {
+                path: self.path.clone(),
+                group_id: *group_id,
+                document_id: *document_id,
+                actor_user_id: self.actor,
+            },
+            WatchEventDetail::DataUploaded {
+                bucket,
+                key,
+                size_bytes,
+            } => NotificationKind::DataUploaded {
+                path: self.path.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                size_bytes: *size_bytes,
+                actor_user_id: self.actor,
+            },
+        }
     }
 }
 
@@ -451,6 +518,98 @@ mod tests {
             mask.bits(),
             WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED
         );
+    }
+
+    fn metadata_event(actor: UserId) -> WatchEvent {
+        WatchEvent {
+            event_id: Ulid::from_bytes([9u8; 16]),
+            realm_id: RealmId([1u8; 32]),
+            kind: WatchEventKind::MetadataCreated,
+            path: "meta/group/doc".to_string(),
+            actor,
+            occurred_at_ms: 1_700_000_000_000,
+            detail: WatchEventDetail::MetadataCreated {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                document_id: Ulid::from_bytes([4u8; 16]),
+            },
+        }
+    }
+
+    #[test]
+    fn watch_event_roundtrips_through_postcard() {
+        let actor = user(1, 2);
+        let metadata = metadata_event(actor);
+        assert_eq!(
+            WatchEvent::from_bytes(&metadata.to_bytes().unwrap()).unwrap(),
+            metadata
+        );
+
+        let uploaded = WatchEvent {
+            event_id: Ulid::from_bytes([10u8; 16]),
+            realm_id: RealmId([1u8; 32]),
+            kind: WatchEventKind::DataUploaded,
+            path: "bucket/object".to_string(),
+            actor,
+            occurred_at_ms: 42,
+            detail: WatchEventDetail::DataUploaded {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                size_bytes: 8192,
+            },
+        };
+        assert_eq!(
+            WatchEvent::from_bytes(&uploaded.to_bytes().unwrap()).unwrap(),
+            uploaded
+        );
+    }
+
+    #[test]
+    fn watch_event_maps_to_notification_kind() {
+        let actor = user(1, 2);
+        match metadata_event(actor).notification_kind() {
+            NotificationKind::MetadataCreated {
+                path,
+                group_id,
+                document_id,
+                actor_user_id,
+            } => {
+                assert_eq!(path, "meta/group/doc");
+                assert_eq!(group_id, Ulid::from_bytes([3u8; 16]));
+                assert_eq!(document_id, Ulid::from_bytes([4u8; 16]));
+                assert_eq!(actor_user_id, actor);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        let uploaded = WatchEvent {
+            event_id: Ulid::new(),
+            realm_id: RealmId([1u8; 32]),
+            kind: WatchEventKind::DataUploaded,
+            path: "bucket/object".to_string(),
+            actor,
+            occurred_at_ms: 1,
+            detail: WatchEventDetail::DataUploaded {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                size_bytes: 5,
+            },
+        };
+        match uploaded.notification_kind() {
+            NotificationKind::DataUploaded {
+                path,
+                bucket,
+                key,
+                size_bytes,
+                actor_user_id,
+            } => {
+                assert_eq!(path, "bucket/object");
+                assert_eq!(bucket, "bucket");
+                assert_eq!(key, "object");
+                assert_eq!(size_bytes, 5);
+                assert_eq!(actor_user_id, actor);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 
     #[test]

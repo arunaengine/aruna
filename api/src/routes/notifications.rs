@@ -76,6 +76,16 @@ pub struct NotificationResponse {
     pub node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -211,6 +221,11 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         actor_user_id: None,
         node_id: None,
         realm_id: None,
+        path: None,
+        document_id: None,
+        bucket: None,
+        key: None,
+        size_bytes: None,
     };
     match &record.kind {
         NotificationKind::AddedToGroup {
@@ -236,6 +251,30 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         NotificationKind::NodeOnboarded { realm_id, node_id } => {
             response.realm_id = Some(realm_id.to_string());
             response.node_id = Some(node_id.to_string());
+        }
+        NotificationKind::MetadataCreated {
+            path,
+            group_id,
+            document_id,
+            actor_user_id,
+        } => {
+            response.path = Some(path.clone());
+            response.group_id = Some(group_id.to_string());
+            response.document_id = Some(document_id.to_string());
+            response.actor_user_id = Some(actor_user_id.to_string());
+        }
+        NotificationKind::DataUploaded {
+            path,
+            bucket,
+            key,
+            size_bytes,
+            actor_user_id,
+        } => {
+            response.path = Some(path.clone());
+            response.bucket = Some(bucket.clone());
+            response.key = Some(key.clone());
+            response.size_bytes = Some(*size_bytes);
+            response.actor_user_id = Some(actor_user_id.to_string());
         }
     }
     response
@@ -811,6 +850,45 @@ mod tests {
         assert_eq!(onboarded.realm_id, Some(realm_id.to_string()));
         assert_eq!(onboarded.node_id, Some(onboarded_node.to_string()));
         assert_eq!(onboarded.group_id, None);
+
+        let document_id = Ulid::new();
+        let metadata_created = notification_response(&NotificationRecord::new(
+            recipient,
+            NotificationClass::Transient,
+            NotificationKind::MetadataCreated {
+                path: "meta/group/doc".to_string(),
+                group_id,
+                document_id,
+                actor_user_id: actor,
+            },
+            1,
+        ));
+        assert_eq!(metadata_created.kind, "metadata_created");
+        assert_eq!(metadata_created.category, "resource.watch");
+        assert_eq!(metadata_created.path, Some("meta/group/doc".to_string()));
+        assert_eq!(metadata_created.group_id, Some(group_id.to_string()));
+        assert_eq!(metadata_created.document_id, Some(document_id.to_string()));
+        assert_eq!(metadata_created.actor_user_id, Some(actor.to_string()));
+
+        let data_uploaded = notification_response(&NotificationRecord::new(
+            recipient,
+            NotificationClass::Transient,
+            NotificationKind::DataUploaded {
+                path: "bucket/object".to_string(),
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                size_bytes: 4096,
+                actor_user_id: actor,
+            },
+            1,
+        ));
+        assert_eq!(data_uploaded.kind, "data_uploaded");
+        assert_eq!(data_uploaded.category, "resource.watch");
+        assert_eq!(data_uploaded.path, Some("bucket/object".to_string()));
+        assert_eq!(data_uploaded.bucket, Some("bucket".to_string()));
+        assert_eq!(data_uploaded.key, Some("object".to_string()));
+        assert_eq!(data_uploaded.size_bytes, Some(4096));
+        assert_eq!(data_uploaded.actor_user_id, Some(actor.to_string()));
     }
 
     #[tokio::test]
