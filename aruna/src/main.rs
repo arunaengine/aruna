@@ -9,11 +9,13 @@ use aruna::portal;
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
+use aruna_api::ops::{OpsState, Readiness, serve_ops};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
@@ -111,6 +113,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
+
+    // Start the ops listener before realm bootstrap so `/readyz` reports 503
+    // (startup) and `/metrics` is scrapable while the node is still coming up.
+    let metrics = Arc::new(NodeMetrics::new());
+    let readiness = Readiness::new();
+    if let Some(ops_addr) = config.ops_socket_addr {
+        let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
+        let ops_listener = TcpListener::bind(ops_addr).await?;
+        let bound = ops_listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Err(error) = serve_ops(ops_listener, ops_state).await {
+                error!(error = %error, "Ops server stopped");
+            }
+        });
+        info!(ops_address = %bound, "Ops server listening");
+    }
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
@@ -302,7 +320,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
         )
-        .await,
+        .await
+        .with_metrics(metrics.clone()),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -322,7 +341,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.realm_id,
         config.node_id,
         cors,
-        state.metrics(),
+        metrics.clone(),
     )
     .await
     .unwrap();
@@ -338,6 +357,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+
+    // Both request listeners are bound and bootstrap has completed: the node is
+    // ready to serve, so `/readyz` may now return 200.
+    readiness.set_ready();
 
     tokio::select! {
         res = server_handle => {

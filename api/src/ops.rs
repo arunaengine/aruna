@@ -98,6 +98,14 @@ pub fn ops_router(state: Arc<OpsState>) -> Router {
         .with_state(state)
 }
 
+/// Serves the ops router on an already-bound listener until it stops.
+pub async fn serve_ops(
+    listener: tokio::net::TcpListener,
+    state: Arc<OpsState>,
+) -> std::io::Result<()> {
+    axum::serve(listener, ops_router(state).into_make_service()).await
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }

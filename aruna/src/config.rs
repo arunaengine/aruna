@@ -57,6 +57,7 @@ pub struct Config {
     pub blob_control_plane_io_timeout_secs: u64,
     pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
+    pub ops_socket_addr: Option<SocketAddr>,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
@@ -261,6 +262,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .transpose()?
         .unwrap_or(30 * 60);
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
+    let ops_socket_addr = dotenvy::var("OPS_SOCKET_ADDRESS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| SocketAddr::from_str(value.trim()))
+        .transpose()?;
     let max_http_body_size = dotenvy::var("MAX_HTTP_BODY_SIZE")
         .ok()
         .map(|value| value.parse::<usize>())
@@ -376,6 +382,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_control_plane_io_timeout_secs,
             blob_transfer_idle_timeout_secs,
             http_socket_addr,
+            ops_socket_addr,
             max_http_body_size,
             cors_allowed_origins,
             p2p_socket_addr,
