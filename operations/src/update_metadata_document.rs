@@ -214,7 +214,7 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let outbox = create_event_outbox_record(event, false);
+        let outbox = create_event_outbox_record(event, None, false);
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
         let writes =

@@ -203,6 +203,7 @@ mod tests {
 
     async fn seed_realm_config(ctx: &DriverContext, realm_id: RealmId, nodes: &[NodeId]) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
         for node_id in nodes {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }

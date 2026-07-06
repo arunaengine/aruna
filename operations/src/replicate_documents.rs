@@ -4,7 +4,7 @@ use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -13,10 +13,10 @@ use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
+use crate::placement::{placement_ref_for_target, plan_target_placement};
 use crate::sync_placement::{
-    delete_placement_effect, desired_peer_count, desired_remote_peer_count, new_placement,
-    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_effect,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
+    write_placement_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +37,7 @@ pub struct ReplicateDocumentsOperation {
     config: ReplicateDocumentsConfig,
     state: ReplicateDocumentsState,
     pending_documents: Vec<DocumentSyncTarget>,
-    realm_nodes: Vec<NodeId>,
+    realm_config: Option<RealmConfigDocument>,
     placement_action: Option<PlacementAction>,
     retry_needed: bool,
     output: Option<Result<(), ReplicateDocumentsError>>,
@@ -109,7 +109,7 @@ impl ReplicateDocumentsOperation {
             pending_documents: config.documents.clone().into_iter().rev().collect(),
             config,
             state: ReplicateDocumentsState::Init,
-            realm_nodes: Vec::new(),
+            realm_config: None,
             placement_action: None,
             retry_needed: false,
             output: None,
@@ -147,30 +147,39 @@ impl ReplicateDocumentsOperation {
             return self.emit_next_publish();
         }
 
-        let desired_count = desired_peer_count(&document);
-        if desired_count == 0 {
+        let Some(realm_config) = self.realm_config.as_ref() else {
             return self.emit_next_publish();
-        }
-        let desired_remote_count = desired_remote_peer_count(desired_count);
-        let mut excluded_peers = self.config.excluded_peers.clone();
-        excluded_peers.push(self.config.local_node_id);
-        sort_node_ids(&mut excluded_peers);
+        };
+        // Placement plan for the document's bound strategy. `None` means the
+        // realm has no strategy for this target (skip, like the old
+        // desired_peer_count == 0 case).
+        let Some(plan) = plan_target_placement(realm_config, &[], &document, None) else {
+            return self.emit_next_publish();
+        };
+        let desired_count = plan.desired_count;
+        let placement = plan.placement;
 
-        let selected_peers = select_sync_peers(
-            &document,
-            &self.realm_nodes,
-            &excluded_peers,
-            desired_remote_count,
-        );
+        // The origin is the authoritative holder; replicate to the remaining
+        // top-ranked holders (excluding self and any explicit exclusions).
+        let local_node_id = self.config.local_node_id;
+        let excluded_peers = &self.config.excluded_peers;
+        let selected_peers: Vec<NodeId> = plan
+            .holders
+            .into_iter()
+            .filter(|node_id| *node_id != local_node_id && !excluded_peers.contains(node_id))
+            .take(desired_count.saturating_sub(1))
+            .collect();
+
         self.placement_action = if placement_satisfied(selected_peers.len(), desired_count) {
             Some(PlacementAction::Delete(document.clone()))
         } else {
             Some(PlacementAction::Write(new_placement(
                 self.config.realm_id,
                 document.clone(),
-                self.config.local_node_id,
+                local_node_id,
                 desired_count,
                 selected_peers.clone(),
+                placement,
             )))
         };
 
@@ -232,13 +241,20 @@ impl ReplicateDocumentsOperation {
             PlacementAction::Delete(target) => target,
         };
         warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
-        let desired_count = desired_peer_count(&target);
+        let (desired_count, placement) = match self.realm_config.as_ref() {
+            Some(realm_config) => match plan_target_placement(realm_config, &[], &target, None) {
+                Some(plan) => (plan.desired_count.max(1), plan.placement),
+                None => (1, placement_ref_for_target(realm_config, &target, None)),
+            },
+            None => (1, aruna_core::structs::PlacementRef::NIL),
+        };
         self.placement_action = Some(PlacementAction::Write(new_placement(
             self.config.realm_id,
             target,
             self.config.local_node_id,
             desired_count,
             Vec::new(),
+            placement,
         )));
         match self.emit_placement_update() {
             Ok(effects) => effects,
@@ -266,14 +282,14 @@ impl Operation for ReplicateDocumentsOperation {
             ReplicateDocumentsState::LoadRealmConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     let Some(value) = value else {
-                        self.realm_nodes.clear();
+                        self.realm_config = None;
                         return self.emit_next_publish();
                     };
-                    let nodes = match realm_nodes_from_config_bytes(&value) {
-                        Ok(nodes) => nodes,
+                    let config = match RealmConfigDocument::from_bytes(&value) {
+                        Ok(config) => config,
                         Err(error) => return self.fail(error.into()),
                     };
-                    self.realm_nodes = nodes;
+                    self.realm_config = Some(config);
                     self.emit_next_publish()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -344,6 +360,7 @@ impl Operation for ReplicateDocumentsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
     use aruna_core::task::TaskEvent;
     use ulid::Ulid;
 
@@ -373,6 +390,23 @@ mod tests {
 
     fn watch_interest_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
         DocumentSyncTarget::WatchInterest { realm_id, node_id }
+    }
+
+    fn config_with(nodes: &[NodeId], replica: Option<u32>) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            name: "default".to_string(),
+            replica_count: replica,
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for node_id in nodes {
+            config.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        config
     }
 
     #[test]
@@ -408,7 +442,7 @@ mod tests {
             documents: vec![target.clone()],
             allow_genesis: true,
         });
-        operation.realm_nodes = vec![node(2), node(3)];
+        operation.realm_config = Some(config_with(&[node(1), node(2), node(3)], Some(3)));
 
         let effects = operation.emit_next_publish();
 
@@ -430,7 +464,8 @@ mod tests {
             documents: vec![target],
             allow_genesis: true,
         });
-        operation.realm_nodes = vec![local_node_id, node(2)];
+        // Replica target of three but only two eligible nodes ⇒ stays pending.
+        operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
 
         let effects = operation.emit_next_publish();
 
@@ -498,6 +533,7 @@ mod tests {
             documents: vec![target.clone()],
             allow_genesis: true,
         });
+        operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
         operation.state = ReplicateDocumentsState::Publish;
         operation.placement_action = Some(PlacementAction::Delete(target));
 
@@ -520,7 +556,6 @@ mod tests {
     fn replicate_documents_selection_uses_rendezvous_not_local_salt() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let target = metadata_target(7);
-        let realm_nodes = vec![node(2)];
 
         let mut first = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -529,7 +564,7 @@ mod tests {
             documents: vec![target.clone()],
             allow_genesis: true,
         });
-        first.realm_nodes = realm_nodes.clone();
+        first.realm_config = Some(config_with(&[node(1), node(2)], Some(3)));
         let _ = first.emit_next_publish();
 
         let mut second = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -539,7 +574,7 @@ mod tests {
             documents: vec![target],
             allow_genesis: true,
         });
-        second.realm_nodes = realm_nodes;
+        second.realm_config = Some(config_with(&[node(9), node(2)], Some(3)));
         let _ = second.emit_next_publish();
 
         let Some(PlacementAction::Write(first_record)) = first.placement_action else {
@@ -564,7 +599,6 @@ mod tests {
             documents: vec![group_target(4)],
             allow_genesis: true,
         });
-        operation.realm_nodes = vec![node(2), node(3)];
 
         let effects = operation.emit_next_publish();
 

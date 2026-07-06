@@ -5,7 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
+use crate::placement::rank_eligible_holders;
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_after,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    placement_satisfied, schedule_placement_retry_after, sort_node_ids, write_placement_effect,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -36,7 +36,7 @@ pub struct PlacementConfig {
 pub struct ProcessPlacementsOperation {
     config: PlacementConfig,
     state: PlacementState,
-    realm_nodes: Vec<NodeId>,
+    realm_config: Option<RealmConfigDocument>,
     records: Vec<PendingDocumentPlacement>,
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
@@ -64,6 +64,7 @@ struct CurrentPlacement {
     desired_peer_count: usize,
     selected_peers: Vec<NodeId>,
     newly_selected: Vec<NodeId>,
+    placement: PlacementRef,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -93,7 +94,7 @@ impl ProcessPlacementsOperation {
         Self {
             config,
             state: PlacementState::Init,
-            realm_nodes: Vec::new(),
+            realm_config: None,
             records: Vec::new(),
             next_start_after: None,
             current: None,
@@ -165,18 +166,21 @@ impl ProcessPlacementsOperation {
         let mut excluded_peers = selected_peers.clone();
         excluded_peers.push(record.authoritative_node_id);
         sort_node_ids(&mut excluded_peers);
-        let newly_selected = select_sync_peers(
-            &record.target,
-            &self.realm_nodes,
-            &excluded_peers,
-            missing_peer_count,
-        );
+        let newly_selected: Vec<NodeId> = match self.realm_config.as_ref() {
+            Some(config) => rank_eligible_holders(config, &[], &record.target, None)
+                .into_iter()
+                .filter(|node_id| !excluded_peers.contains(node_id))
+                .take(missing_peer_count)
+                .collect(),
+            None => Vec::new(),
+        };
         self.current = Some(CurrentPlacement {
             target: record.target.clone(),
             authoritative_node_id: record.authoritative_node_id,
             desired_peer_count: record.desired_peer_count,
             selected_peers,
             newly_selected: newly_selected.clone(),
+            placement: record.placement,
         });
 
         if newly_selected.is_empty() {
@@ -226,6 +230,7 @@ impl ProcessPlacementsOperation {
             current.authoritative_node_id,
             current.desired_peer_count,
             current.selected_peers,
+            current.placement,
         );
         self.retry_needed = true;
         match write_placement_effect(&record) {
@@ -257,11 +262,11 @@ impl Operation for ProcessPlacementsOperation {
                     let Some(value) = value else {
                         return self.fail(PlacementError::RealmConfigNotFound);
                     };
-                    let nodes = match realm_nodes_from_config_bytes(&value) {
-                        Ok(nodes) => nodes,
+                    let config = match RealmConfigDocument::from_bytes(&value) {
+                        Ok(config) => config,
                         Err(error) => return self.fail(error.into()),
                     };
-                    self.realm_nodes = nodes;
+                    self.realm_config = Some(config);
                     self.emit_list_pending()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -359,6 +364,7 @@ impl Operation for ProcessPlacementsOperation {
 mod tests {
     use super::*;
     use crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER;
+    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -375,6 +381,23 @@ mod tests {
         DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([seed; 16]),
         }
+    }
+
+    fn config_with(nodes: &[NodeId]) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([8u8; 32]), Vec::new(), 3);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            name: "default".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for node_id in nodes {
+            config.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        config
     }
 
     #[test]
@@ -413,6 +436,7 @@ mod tests {
             desired_peer_count: 3,
             selected_peers: vec![node(2), node(3)],
             newly_selected: Vec::new(),
+            placement: PlacementRef::NIL,
         });
 
         let effects = operation.emit_placement_update();
@@ -434,13 +458,14 @@ mod tests {
             local_node_id: node(9),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_nodes = vec![authoritative, node(2), node(3), node(4)];
+        operation.realm_config = Some(config_with(&[authoritative, node(2), node(3), node(4)]));
         operation.records = vec![new_placement(
             realm_id,
             metadata_target(5),
             authoritative,
             3,
             vec![node(2)],
+            PlacementRef::NIL,
         )];
 
         let effects = operation.emit_next_record();
@@ -469,6 +494,7 @@ mod tests {
             desired_peer_count: 5,
             selected_peers: vec![node(2)],
             newly_selected: vec![node(3)],
+            placement: PlacementRef::NIL,
         });
 
         let effects = operation.emit_placement_update();
@@ -490,13 +516,14 @@ mod tests {
             local_node_id: node(9),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_nodes = vec![authoritative, node(2)];
+        operation.realm_config = Some(config_with(&[authoritative, node(2)]));
         operation.records = vec![new_placement(
             realm_id,
             metadata_target(7),
             authoritative,
             2,
             Vec::new(),
+            PlacementRef::NIL,
         )];
 
         let effects = operation.emit_next_record();
@@ -514,13 +541,13 @@ mod tests {
             local_node_id: node(1),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_nodes = vec![node(1), node(2), node(3)];
         operation.records = vec![new_placement(
             realm_id,
             group_target(4),
             node(1),
             3,
             Vec::new(),
+            PlacementRef::NIL,
         )];
 
         let effects = operation.emit_next_record();
@@ -579,13 +606,14 @@ mod tests {
             local_node_id: local,
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_nodes = vec![node(1), node(2), node(3), local];
+        operation.realm_config = Some(config_with(&[node(1), node(2), node(3), local]));
         operation.records = vec![new_placement(
             realm_id,
             target,
             authoritative,
             3,
             Vec::new(),
+            PlacementRef::NIL,
         )];
         announce_outbox_allow_genesis(operation.emit_next_record(), document_bytes)
     }

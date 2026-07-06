@@ -10,9 +10,8 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
-    OidcProviderConfig, PlacementStrategy, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmNodeKind, StrategyBinding,
+    Actor, DEFAULT_NODE_WEIGHT, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -473,32 +472,7 @@ impl Operation for CreateRealmOperation {
 }
 
 fn seed_placement_defaults(config: &mut RealmConfigDocument) {
-    let default_strategy = PlacementStrategy {
-        strategy_id: Ulid::new(),
-        name: "default".to_string(),
-        replica_count: Some(3),
-        distinct_locations: false,
-        affinity: Vec::new(),
-    };
-    let everywhere_strategy = PlacementStrategy {
-        strategy_id: Ulid::new(),
-        name: "everywhere".to_string(),
-        replica_count: None,
-        distinct_locations: false,
-        affinity: Vec::new(),
-    };
-    config.default_strategy_id = Some(default_strategy.strategy_id);
-    config.strategy_bindings = vec![
-        StrategyBinding {
-            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
-            strategy_id: everywhere_strategy.strategy_id,
-        },
-        StrategyBinding {
-            scope: BindingScope::Class(DocumentClass::Admin),
-            strategy_id: everywhere_strategy.strategy_id,
-        },
-    ];
-    config.strategies = vec![default_strategy, everywhere_strategy];
+    config.seed_default_placement();
 }
 
 #[cfg(test)]

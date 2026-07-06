@@ -94,6 +94,16 @@ pub struct PlacementRef {
     pub epoch: u64,
 }
 
+impl PlacementRef {
+    /// Zero-valued reference used when no strategy governs a change yet (early
+    /// bootstrap / generic re-announce). The single named fallback so no
+    /// ad-hoc `PlacementRef` literals scatter across producers.
+    pub const NIL: PlacementRef = PlacementRef {
+        strategy_id: Ulid::nil(),
+        epoch: 0,
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

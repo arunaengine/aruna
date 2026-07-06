@@ -1,9 +1,10 @@
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{RealmConfigDocument, WatchSubscription};
+use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, WatchSubscription};
 use aruna_core::types::UserId;
+use ulid::Ulid;
 
-use crate::sync_placement::select_topic_peers;
+use crate::placement::{build_view, resolve_holders};
 
 pub const NOTIFICATION_INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
 
@@ -14,17 +15,27 @@ pub fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Fixed replica-1 strategy: the inbox lands on the single top-ranked eligible
+/// holder for the user's inbox topic under the realm's weighted placement view.
+fn inbox_strategy() -> PlacementStrategy {
+    PlacementStrategy {
+        strategy_id: Ulid::nil(),
+        name: "notification-inbox".to_string(),
+        replica_count: Some(1),
+        distinct_locations: false,
+        affinity: Vec::new(),
+    }
+}
+
 pub fn resolve_inbox_holder(
     user_id: &UserId,
     realm_config: &RealmConfigDocument,
 ) -> Result<Option<NodeId>, ConversionError> {
-    // Single swap point for the #261/#264 placement map; R stays 1 until then.
-    let candidates = realm_config.sync_eligible_node_ids()?;
-    Ok(
-        select_topic_peers(&inbox_topic_id(user_id), &candidates, &[], 1)
-            .into_iter()
-            .next(),
-    )
+    let view = build_view(realm_config, &[]);
+    let subject = inbox_topic_id(user_id);
+    Ok(resolve_holders(&view, &inbox_strategy(), &subject, 0, None)
+        .into_iter()
+        .next())
 }
 
 pub fn filter_locally_held_watch_subscriptions(

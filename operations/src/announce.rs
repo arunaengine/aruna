@@ -14,6 +14,7 @@ use aruna_core::metadata::{
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::metadata_document_lifecycle_revision_change;
 use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
@@ -251,6 +252,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.updated_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
+                    placement: PlacementRef::NIL,
                 })
             }
             DocumentSyncTarget::MetadataCreateEvent {
@@ -274,6 +276,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.occurred_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
+                    placement: PlacementRef::NIL,
                 })
             }
             DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
@@ -308,6 +311,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.updated_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
+                    placement: PlacementRef::NIL,
                 })
             }
             // Node usage snapshots, watch-interest digests, and node info/heartbeat
@@ -327,6 +331,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: now,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
+                    placement: PlacementRef::NIL,
                 })
             }
         }

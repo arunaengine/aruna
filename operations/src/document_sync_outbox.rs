@@ -323,6 +323,7 @@ mod tests {
                 updated_at_ms: 9,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         }
     }
 

@@ -2,7 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, NodePlacementEntry, PlacementOverride, PlacementStrategy, StrategyBinding,
+    Actor, BindingScope, DocumentClass, NodePlacementEntry, PlacementOverride, PlacementStrategy,
+    StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -368,6 +369,39 @@ impl RealmConfigDocument {
             oidc_providers,
             DEFAULT_METADATA_REPLICATION_FACTOR,
         )
+    }
+
+    /// Seeds the default placement strategies realm creation installs: a
+    /// replica-3 `default` strategy (the realm default) plus an `everywhere`
+    /// strategy bound to the `MetadataRegistry` and `Admin` document classes.
+    /// Replaces any existing strategy configuration.
+    pub fn seed_default_placement(&mut self) {
+        let default_strategy = PlacementStrategy {
+            strategy_id: Ulid::new(),
+            name: "default".to_string(),
+            replica_count: Some(DEFAULT_METADATA_REPLICATION_FACTOR),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let everywhere_strategy = PlacementStrategy {
+            strategy_id: Ulid::new(),
+            name: "everywhere".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        self.default_strategy_id = Some(default_strategy.strategy_id);
+        self.strategy_bindings = vec![
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                strategy_id: everywhere_strategy.strategy_id,
+            },
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::Admin),
+                strategy_id: everywhere_strategy.strategy_id,
+            },
+        ];
+        self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {

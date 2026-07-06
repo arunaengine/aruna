@@ -13,7 +13,7 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, document_sync_revision_write_entry,
 };
-use aruna_core::structs::{Actor, User, oidc_subject_key};
+use aruna_core::structs::{Actor, PlacementRef, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
@@ -451,6 +451,7 @@ fn initial_user_document_sync_change(actor: &Actor) -> DocumentSyncChange {
             updated_at_ms,
         },
         kind: DocumentSyncChangeKind::Upsert,
+        placement: PlacementRef::NIL,
     }
 }
 

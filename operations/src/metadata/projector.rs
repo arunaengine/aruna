@@ -45,6 +45,7 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
+use crate::placement::placement_ref_for_target;
 use crate::sync_placement::{complete_authoritative_holders, sort_node_ids};
 use crate::task_persistence::persist_task_effect;
 
@@ -497,7 +498,13 @@ pub async fn project_metadata_create_events(
         {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
-            Some(create_event_outbox_record(&event, true))
+            Some(create_event_outbox_record(
+                &event,
+                realm_configs
+                    .get(&event.record.realm_id)
+                    .and_then(|config| config.as_ref()),
+                true,
+            ))
         } else {
             None
         };
@@ -744,13 +751,20 @@ fn expand_create_event_holders(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let desired_holder_count = realm_config.metadata_replication_factor_for(
-        event.record.group_id,
-        Some(event.record.document_path.as_str()),
-    );
+    let document_path = event.record.document_path.clone();
+    let desired_holder_count =
+        realm_config.metadata_replication_factor_for(event.record.group_id, Some(&document_path));
 
-    event.record.holder_node_ids =
-        complete_authoritative_holders(&target, &candidates, &holders, desired_holder_count);
+    // Rank via the resolver over the realm config's placement map; labels for
+    // affinity are not needed for the default metadata strategy.
+    event.record.holder_node_ids = complete_authoritative_holders(
+        realm_config,
+        &[],
+        &target,
+        Some(&document_path),
+        &holders,
+        desired_holder_count,
+    );
     Ok(event)
 }
 
@@ -777,18 +791,26 @@ async fn read_realm_config(
 
 pub fn create_event_outbox_record(
     event: &MetadataCreateEventRecord,
+    realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
-    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id);
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: event.record.document_id,
+    };
+    let mut change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id);
+    // The origin knows the governing strategy: stamp the real reference so the
+    // metadata create/lifecycle envelope carries it (else the nil fallback).
+    if let Some(config) = realm_config {
+        change.placement =
+            placement_ref_for_target(config, &target, Some(event.record.document_path.as_str()));
+    }
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
-        target: DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: event.record.document_id,
-        },
+        target,
         peers: event.record.holder_node_ids.clone(),
         event: DocumentSyncOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(&lifecycle)
@@ -1013,6 +1035,7 @@ mod tests {
 
     fn realm_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.seed_default_placement();
         for node in nodes {
             config.ensure_node(*node, RealmNodeKind::Server);
         }
@@ -1211,6 +1234,7 @@ mod tests {
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
         let mut config = RealmConfigDocument::new(event.record.realm_id, Vec::new(), 3);
+        config.seed_default_placement();
         config.ensure_node(node(1), RealmNodeKind::User);
         config.ensure_node(node(2), RealmNodeKind::Server);
         config.ensure_node(node(3), RealmNodeKind::Server);
@@ -1253,7 +1277,7 @@ mod tests {
     #[test]
     fn create_event_outbox_record_uses_document_lifecycle_stream() {
         let event = create_event();
-        let outbox = create_event_outbox_record(&event, true);
+        let outbox = create_event_outbox_record(&event, None, true);
 
         assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
