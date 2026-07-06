@@ -1,16 +1,19 @@
 use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, NotificationClass, NotificationKind, NotificationRecord};
+use aruna_core::structs::{
+    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
+    NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
+};
 use aruna_operations::notifications::dispatch::{
-    NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
-    unread_count_for_user,
+    NotificationDispatchError, WatchDispatchError, create_watch_for_user, delete_watch_for_user,
+    list_notifications_for_user, list_watches_for_user, mark_read_for_user, unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,7 +29,14 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "notifications", description = "User notification inbox")),
-    paths(list_notifications, unread_count, mark_read)
+    paths(
+        list_notifications,
+        unread_count,
+        mark_read,
+        list_watches,
+        create_watch,
+        delete_watch
+    )
 )]
 pub struct NotificationsApiDoc;
 
@@ -35,6 +45,11 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/notifications", get(list_notifications))
         .route("/notifications/unread", get(unread_count))
         .route("/notifications/read", post(mark_read))
+        .route(
+            "/notifications/watches",
+            get(list_watches).post(create_watch),
+        )
+        .route("/notifications/watches/{id}", delete(delete_watch))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -89,6 +104,25 @@ pub struct MarkReadApiResponse {
     pub marked: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WatchResponse {
+    pub id: String,
+    pub path_prefix: String,
+    pub events: Vec<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WatchListResponse {
+    pub watches: Vec<WatchResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateWatchRequest {
+    pub path_prefix: String,
+    pub events: Vec<String>,
+}
+
 fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> ServerError {
     match error {
         NotificationDispatchError::Unavailable => ServerError::ServiceUnavailable,
@@ -97,6 +131,34 @@ fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> Serv
             warn!(operation, reason = %reason, "notification holder proxy failed");
             ServerError::BadGateway
         }
+    }
+}
+
+fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> ServerError {
+    match error {
+        WatchDispatchError::Unavailable => ServerError::ServiceUnavailable,
+        WatchDispatchError::CapExceeded => {
+            ServerError::Conflict("notification watch subscription cap reached".to_string())
+        }
+        WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
+        WatchDispatchError::Remote(reason) => {
+            warn!(operation, reason = %reason, "notification holder proxy failed");
+            ServerError::BadGateway
+        }
+    }
+}
+
+fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
+    WatchResponse {
+        id: subscription.watch_id.to_string(),
+        path_prefix: subscription.path_prefix.clone(),
+        events: subscription
+            .event_mask
+            .kinds()
+            .iter()
+            .map(|kind| kind.name().to_string())
+            .collect(),
+        created_at_ms: subscription.created_at_ms,
     }
 }
 
@@ -300,6 +362,115 @@ pub async fn mark_read(
     .map_err(|error| map_dispatch_error(error, "mark_read"))?;
 
     Ok((StatusCode::OK, Json(MarkReadApiResponse { marked })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/notifications/watches",
+    tag = "notifications",
+    responses(
+        (status = 200, description = "Watch subscriptions", body = WatchListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
+        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_watches(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+
+    let subscriptions = list_watches_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
+        .await
+        .map_err(|error| map_watch_dispatch_error(error, "list_watches"))?;
+
+    let watches = subscriptions.iter().map(watch_response).collect();
+    Ok((StatusCode::OK, Json(WatchListResponse { watches })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/notifications/watches",
+    tag = "notifications",
+    request_body = CreateWatchRequest,
+    responses(
+        (status = 201, description = "Watch subscription created", body = WatchResponse),
+        (status = 400, description = "Invalid path prefix or event name", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "Per-user watch cap reached", body = ErrorResponse),
+        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
+        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_watch(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<CreateWatchRequest>,
+) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    if request.path_prefix.is_empty()
+        || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
+        || request.events.is_empty()
+    {
+        return Err(ServerError::BadRequest);
+    }
+    let mut event_mask = WatchEventMask::empty();
+    for name in &request.events {
+        let kind = WatchEventKind::from_name(name).ok_or(ServerError::BadRequest)?;
+        event_mask.insert(kind);
+    }
+
+    let subscription = create_watch_for_user(
+        &state.get_ctx(),
+        state.get_node_id(),
+        auth.user_id,
+        request.path_prefix,
+        event_mask,
+    )
+    .await
+    .map_err(|error| map_watch_dispatch_error(error, "create_watch"))?;
+
+    Ok((StatusCode::CREATED, Json(watch_response(&subscription))))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/notifications/watches/{id}",
+    tag = "notifications",
+    params(("id" = String, Path, description = "Watch subscription id")),
+    responses(
+        (status = 204, description = "Watch subscription deleted"),
+        (status = 400, description = "Invalid watch id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 502, description = "Holder proxy failed", body = ErrorResponse),
+        (status = 503, description = "No inbox holder available", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_watch(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let watch_id = Ulid::from_str(&id).map_err(|_| ServerError::BadRequest)?;
+
+    delete_watch_for_user(
+        &state.get_ctx(),
+        state.get_node_id(),
+        auth.user_id,
+        watch_id,
+    )
+    .await
+    .map_err(|error| map_watch_dispatch_error(error, "delete_watch"))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -640,5 +811,147 @@ mod tests {
         assert_eq!(onboarded.realm_id, Some(realm_id.to_string()));
         assert_eq!(onboarded.node_id, Some(onboarded_node.to_string()));
         assert_eq!(onboarded.group_id, None);
+    }
+
+    #[tokio::test]
+    async fn watch_local_path_crud() {
+        let realm_id = realm_id(6);
+        let holder = node(6);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let (status, created) = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: "/bucket/prefix".to_string(),
+                events: vec!["metadata_created".to_string(), "data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect("create succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.path_prefix, "/bucket/prefix");
+        assert_eq!(created.events, vec!["metadata_created", "data_uploaded"]);
+
+        let (_, listed) = list_watches(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+        )
+        .await
+        .expect("list succeeds");
+        assert_eq!(listed.watches.len(), 1);
+        assert_eq!(listed.watches[0].id, created.id);
+
+        let status = delete_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Path(created.id.clone()),
+        )
+        .await
+        .expect("delete succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, empty) = list_watches(State(state), Extension(Some(auth_for(user_id, realm_id))))
+            .await
+            .expect("list after delete succeeds");
+        assert!(empty.watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_watch_validates_input() {
+        let realm_id = realm_id(7);
+        let (_dir, state) = build_state(realm_id, node(7)).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+
+        let empty_prefix = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: String::new(),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("empty prefix must be rejected");
+        assert!(matches!(empty_prefix, ServerError::BadRequest));
+
+        let empty_events = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: "/bucket".to_string(),
+                events: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("empty events must be rejected");
+        assert!(matches!(empty_events, ServerError::BadRequest));
+
+        let unknown_event = create_watch(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: "/bucket".to_string(),
+                events: vec!["not_an_event".to_string()],
+            }),
+        )
+        .await
+        .expect_err("unknown event must be rejected");
+        assert!(matches!(unknown_event, ServerError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn delete_watch_rejects_bad_id() {
+        let realm_id = realm_id(8);
+        let (_dir, state) = build_state(realm_id, node(8)).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+        let error = delete_watch(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Path("not-a-ulid".to_string()),
+        )
+        .await
+        .expect_err("bad id must be rejected");
+        assert!(matches!(error, ServerError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn watch_endpoints_reject_path_restricted_token() {
+        let realm_id = realm_id(9);
+        let (_dir, state) = build_state(realm_id, node(9)).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+        let mut auth = auth_for(user_id, realm_id);
+        auth.path_restrictions = Some(vec![PathRestriction {
+            pattern: "/bucket/**".to_string(),
+            permission: Permission::READ,
+        }]);
+
+        let list_err = list_watches(State(state.clone()), Extension(Some(auth.clone())))
+            .await
+            .expect_err("delegated token must be rejected");
+        assert!(matches!(list_err, ServerError::Forbidden));
+
+        let create_err = create_watch(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateWatchRequest {
+                path_prefix: "/bucket".to_string(),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("delegated token must be rejected");
+        assert!(matches!(create_err, ServerError::Forbidden));
+
+        let delete_err = delete_watch(
+            State(state),
+            Extension(Some(auth)),
+            Path(Ulid::new().to_string()),
+        )
+        .await
+        .expect_err("delegated token must be rejected");
+        assert!(matches!(delete_err, ServerError::Forbidden));
     }
 }
