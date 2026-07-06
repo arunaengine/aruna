@@ -177,6 +177,23 @@ struct StorageMetrics {
     last_error: Mutex<Option<String>>,
 }
 
+/// Decrements `in_flight` on drop so cancelled callers (probe timeouts,
+/// client disconnects) stay balanced.
+struct InFlightGuard(Arc<StorageMetrics>);
+
+impl InFlightGuard {
+    fn acquire(metrics: &Arc<StorageMetrics>) -> Self {
+        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(metrics.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StorageMetricsSnapshot {
     pub requests_total: u64,
@@ -288,8 +305,8 @@ impl StorageHandle {
             }
         }
 
-        self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
-        let event = match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+        let _in_flight = InFlightGuard::acquire(&self.metrics);
+        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(event)) => self.observe_storage_event(event),
             Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
                 error: StorageError::ChannelClosed,
@@ -309,9 +326,7 @@ impl StorageHandle {
                     error: StorageError::Timeout,
                 })
             }
-        };
-        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
-        event
+        }
     }
 
     fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
@@ -1969,6 +1984,26 @@ mod tests {
             event,
             Event::Storage(StorageEvent::SyncAllFinished)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_returns_in_flight_to_zero() {
+        let (handle, _receiver) = StorageHandle::new();
+        let mut probe = Box::pin(handle.send_storage_effect(StorageEffect::Read {
+            key_space: "node_state".to_string(),
+            key: b"node_state".to_vec().into(),
+            txn_id: None,
+        }));
+
+        // No worker consumes the effect, so the external timeout fires and the
+        // probe future is dropped mid-await, as in a readiness probe timeout.
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(50), probe.as_mut()).await;
+        assert!(timed_out.is_err());
+        assert_eq!(handle.in_flight(), 1);
+
+        drop(probe);
+        assert_eq!(handle.in_flight(), 0);
     }
 
     #[tokio::test]
