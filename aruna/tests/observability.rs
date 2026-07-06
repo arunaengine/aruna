@@ -92,7 +92,7 @@ async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
             "missing rest interface sample: {body}"
         );
         assert!(
-            body.contains("aruna_storage_requests_total"),
+            body.contains("aruna_storage_requests "),
             "missing storage gauge: {body}"
         );
         assert!(

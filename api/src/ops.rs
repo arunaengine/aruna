@@ -234,7 +234,7 @@ async fn register_storage_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>)
     let requests: Gauge = Gauge::default();
     metrics
         .register(
-            "storage_requests_total",
+            "storage_requests",
             "Total storage effect requests dispatched",
             requests.clone(),
         )
@@ -242,7 +242,7 @@ async fn register_storage_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>)
     let errors: Gauge = Gauge::default();
     metrics
         .register(
-            "storage_errors_total",
+            "storage_errors",
             "Total storage effect errors observed",
             errors.clone(),
         )
@@ -250,7 +250,7 @@ async fn register_storage_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>)
     let conflicts: Gauge = Gauge::default();
     metrics
         .register(
-            "storage_conflicts_total",
+            "storage_conflicts",
             "Total storage transaction conflicts observed",
             conflicts.clone(),
         )
@@ -475,7 +475,7 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("aruna_build_info{version=\""), "{body}");
-        assert!(body.contains("aruna_storage_requests_total"), "{body}");
+        assert!(body.contains("aruna_storage_requests "), "{body}");
         assert!(
             body.contains("aruna_queue_depth{queue=\"document_sync_outbox\"}"),
             "{body}"
