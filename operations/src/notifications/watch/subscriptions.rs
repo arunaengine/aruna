@@ -175,6 +175,38 @@ pub async fn delete_watch_subscription(
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), WatchSubscriptionError> {
+    match delete_once(storage, owner, watch_id).await {
+        Ok(()) => Ok(()),
+        Err(CreateFailure::Conflict) => match delete_once(storage, owner, watch_id).await {
+            Ok(()) => Ok(()),
+            Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
+                "watch subscription delete conflicted twice".to_string(),
+            )),
+            Err(other) => Err(delete_failure(other)),
+        },
+        Err(other) => Err(delete_failure(other)),
+    }
+}
+
+fn delete_failure(failure: CreateFailure) -> WatchSubscriptionError {
+    match failure {
+        CreateFailure::Fatal(error) => WatchSubscriptionError::Storage(error),
+        // A delete never checks the per-user cap, so this is unreachable; map it
+        // defensively rather than panicking.
+        CreateFailure::Cap => {
+            WatchSubscriptionError::Storage("unexpected cap failure on delete".to_string())
+        }
+        CreateFailure::Conflict => WatchSubscriptionError::Storage(
+            "watch subscription delete conflicted twice".to_string(),
+        ),
+    }
+}
+
+async fn delete_once(
+    storage: &StorageHandle,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), CreateFailure> {
     // Row delete and the interest dirty marker share one transaction so the
     // publisher can never miss the change; both are blind writes, so no read set
     // means the commit does not spuriously conflict with concurrent CRUD.
@@ -183,11 +215,9 @@ pub async fn delete_watch_subscription(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
-        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
         other => {
-            return Err(WatchSubscriptionError::Storage(format!(
+            return Err(CreateFailure::Fatal(format!(
                 "unexpected storage event: {other:?}"
             )));
         }
@@ -204,33 +234,25 @@ pub async fn delete_watch_subscription(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => {
-            abort_txn(storage, txn_id).await;
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
+            return Err(abort_and_classify(storage, txn_id, error).await);
         }
         other => {
             abort_txn(storage, txn_id).await;
-            return Err(WatchSubscriptionError::Storage(format!(
+            return Err(CreateFailure::Fatal(format!(
                 "unexpected storage event: {other:?}"
             )));
         }
     }
 
-    if let Err(failure) = write_dirty_marker(storage, owner.realm_id, txn_id).await {
-        return Err(match failure {
-            CreateFailure::Fatal(error) => WatchSubscriptionError::Storage(error),
-            _ => WatchSubscriptionError::Storage("watch interest marker write failed".to_string()),
-        });
-    }
+    write_dirty_marker(storage, owner.realm_id, txn_id).await?;
 
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(WatchSubscriptionError::Storage(error.to_string()))
-        }
-        other => Err(WatchSubscriptionError::Storage(format!(
+        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
+        other => Err(CreateFailure::Fatal(format!(
             "unexpected storage event: {other:?}"
         ))),
     }
