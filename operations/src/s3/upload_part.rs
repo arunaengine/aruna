@@ -390,12 +390,58 @@ impl Operation for UploadPartOperation {
 
     fn abort(&mut self) -> Effects {
         let mut effects = smallvec![];
-        if let Some(location) = self.written_location.clone() {
+        if let Some(location) = self.written_location.take() {
             effects.push(Effect::Blob(BlobEffect::Delete { location }));
         }
-        if let Some(txn_id) = self.txn_id {
+        if let Some(txn_id) = self.txn_id.take() {
             effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
         }
         effects
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::structs::RealmId;
+    use aruna_storage::storage;
+    use tempfile::tempdir;
+
+    fn test_user_id() -> UserId {
+        UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    #[tokio::test]
+    async fn drive_upload_part_missing_upload_returns_no_such_upload() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = drive(
+            UploadPartOperation::new(UploadPartInput {
+                bucket: "mybucket".to_string(),
+                key: "object.txt".to_string(),
+                upload_id: Ulid::new(),
+                part_number: 1,
+                content_length: None,
+                body: None,
+                created_by: test_user_id(),
+                compressed: false,
+                encrypted: false,
+                expected_checksums: Vec::new(),
+            }),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(UploadPartError::NoSuchUpload)));
     }
 }
