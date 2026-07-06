@@ -179,6 +179,13 @@ impl ServerState {
     pub fn metrics(&self) -> Arc<NodeMetrics> {
         self.metrics.clone()
     }
+
+    /// Replaces the metrics registry so the REST interface, the S3 server and
+    /// the ops listener share one per-node instance. Call before serving.
+    pub fn with_metrics(mut self, metrics: Arc<NodeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
     pub fn get_pubkey(&self) -> [u8; 113] {
         match self.node_capabilities {
             NodeCapabilities::Management {
