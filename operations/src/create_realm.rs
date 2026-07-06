@@ -174,6 +174,7 @@ impl CreateRealmOperation {
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(realm_role_event),
             },
+            true,
         );
         let mut writes = vec![
             admin_document_reducer_state_write_entry(&realm_state)?,
@@ -189,6 +190,7 @@ impl CreateRealmOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
+                true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }

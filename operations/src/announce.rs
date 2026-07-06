@@ -193,7 +193,18 @@ impl AnnounceTopicOperation {
     ) -> Effects {
         self.current = Some(document.clone());
         self.state = AnnounceTopicState::WriteOutbox;
-        let record = new_outbox_record(self.local_node_id, document, self.peers.clone(), event);
+        // Whole-document announces (metadata registry/create-event/lifecycle,
+        // graph lifecycle and node-usage snapshots) may originate a topic the
+        // announcing node holds, so they retain the ability to mint genesis.
+        // See fix/admin-doc-sync-309 report: origin-gating this path needs an
+        // origin signal AnnounceTopicOperation does not currently carry.
+        let record = new_outbox_record(
+            self.local_node_id,
+            document,
+            self.peers.clone(),
+            event,
+            true,
+        );
         match write_outbox_effect(&record) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),

@@ -48,8 +48,9 @@ pub fn new_outbox_record(
     target: DocumentSyncTarget,
     peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event)
+    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event, allow_genesis)
 }
 
 pub fn new_outbox_record_with_id(
@@ -58,6 +59,7 @@ pub fn new_outbox_record_with_id(
     target: DocumentSyncTarget,
     mut peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     crate::sync_placement::sort_node_ids(&mut peers);
     DocumentSyncOutboxRecord {
@@ -67,6 +69,7 @@ pub fn new_outbox_record_with_id(
         peers,
         event,
         updated_at: unix_timestamp_secs(),
+        allow_genesis,
     }
 }
 
@@ -345,6 +348,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            false,
         );
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
         match storage
@@ -393,6 +397,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -412,6 +417,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -429,6 +435,7 @@ mod tests {
             DocumentSyncOutboxEvent::Delete {
                 change: delete_change(),
             },
+            false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -443,8 +450,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
-        let right = new_outbox_record(node(1), target(), vec![node(2)], event);
+        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
+        let right = new_outbox_record(node(1), target(), vec![node(2)], event, false);
         let prefix = outbox_prefix(&left.event);
 
         assert_ne!(outbox_key(&left), outbox_key(&right));
@@ -458,7 +465,7 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
+        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(
             node(1),
@@ -467,6 +474,7 @@ mod tests {
             },
             vec![node(2)],
             event,
+            false,
         );
         newer.outbox_id = Ulid::from_parts(2, 0);
 
@@ -482,10 +490,16 @@ mod tests {
             target.clone(),
             Vec::new(),
             user_admin_event(user_id, 1),
+            false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
-        let mut later =
-            new_outbox_record(node(1), target, Vec::new(), user_admin_event(user_id, 2));
+        let mut later = new_outbox_record(
+            node(1),
+            target,
+            Vec::new(),
+            user_admin_event(user_id, 2),
+            false,
+        );
         later.outbox_id = Ulid::from_parts(1, 1);
 
         assert!(outbox_key(&earlier) < outbox_key(&later));

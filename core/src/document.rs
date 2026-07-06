@@ -69,6 +69,10 @@ pub struct DocumentSyncOutboxRecord {
     pub peers: Vec<NodeId>,
     pub event: DocumentSyncOutboxEvent,
     pub updated_at: u64,
+    /// Whether the publisher may mint this document's sync topic genesis when it
+    /// is missing. Only the node that originated the document sets this; every
+    /// other publisher waits (retryable) for the origin's genesis to replicate.
+    pub allow_genesis: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

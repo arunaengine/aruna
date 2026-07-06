@@ -495,7 +495,9 @@ pub async fn project_metadata_create_events(
         let outbox = if local_node_id == Some(event.node_id)
             && (!registry_exists || needs_materialization || holders_changed)
         {
-            Some(create_event_outbox_record(&event))
+            // The local node authored this create event, so it originates the
+            // document's lifecycle sync topic and may mint its genesis.
+            Some(create_event_outbox_record(&event, true))
         } else {
             None
         };
@@ -773,7 +775,10 @@ async fn read_realm_config(
     }
 }
 
-pub fn create_event_outbox_record(event: &MetadataCreateEventRecord) -> DocumentSyncOutboxRecord {
+pub fn create_event_outbox_record(
+    event: &MetadataCreateEventRecord,
+    allow_genesis: bool,
+) -> DocumentSyncOutboxRecord {
     let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
@@ -791,6 +796,7 @@ pub fn create_event_outbox_record(event: &MetadataCreateEventRecord) -> Document
             change,
         },
         updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
     }
 }
 
@@ -1247,8 +1253,9 @@ mod tests {
     #[test]
     fn create_event_outbox_record_uses_document_lifecycle_stream() {
         let event = create_event();
-        let outbox = create_event_outbox_record(&event);
+        let outbox = create_event_outbox_record(&event, true);
 
+        assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
         assert_eq!(outbox.peers, event.record.holder_node_ids);
         assert_eq!(
