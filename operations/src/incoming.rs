@@ -163,6 +163,7 @@ async fn reconcile_inbound_document_sync_topics(
         let operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: *net_handle.realm_id(),
             local_node_id: net_handle.node_id(),
+            retry_after: crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
         });
         if let Err(error) = drive(operation, context.as_ref()).await {
             error!(error = ?error, "Failed to process pending placements after document sync reconciliation");

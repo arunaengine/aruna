@@ -15,9 +15,10 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_effect,
+    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_after,
     select_sync_peers, sort_node_ids, write_placement_effect,
 };
+use std::time::Duration;
 use tracing::warn;
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
@@ -26,6 +27,9 @@ const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 pub struct PlacementConfig {
     pub realm_id: RealmId,
     pub local_node_id: NodeId,
+    /// In-memory backoff duration the driver uses for the retry re-arm; not
+    /// persisted anywhere.
+    pub retry_after: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +41,7 @@ pub struct ProcessPlacementsOperation {
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
     retry_needed: bool,
+    rearmed: bool,
     output: Option<Result<(), PlacementError>>,
 }
 
@@ -93,6 +98,7 @@ impl ProcessPlacementsOperation {
             next_start_after: None,
             current: None,
             retry_needed: false,
+            rearmed: false,
             output: None,
         }
     }
@@ -226,7 +232,8 @@ impl ProcessPlacementsOperation {
 }
 
 impl Operation for ProcessPlacementsOperation {
-    type Output = ();
+    /// `true` when this tick re-armed the placement retry timer.
+    type Output = bool;
     type Error = PlacementError;
 
     fn start(&mut self) -> Effects {
@@ -298,10 +305,12 @@ impl Operation for ProcessPlacementsOperation {
                 Event::Storage(StorageEvent::WriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     if self.retry_needed {
+                        self.rearmed = true;
                         self.state = PlacementState::ScheduleRetry;
-                        smallvec![schedule_placement_retry_effect(
+                        smallvec![schedule_placement_retry_after(
                             self.config.realm_id,
                             self.config.local_node_id,
+                            self.config.retry_after,
                         )]
                     } else {
                         self.emit_next_record()
@@ -331,7 +340,10 @@ impl Operation for ProcessPlacementsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
+        match self.output {
+            Some(Err(error)) => Err(error),
+            _ => Ok(self.rearmed),
+        }
     }
 
     fn abort(&mut self) -> Effects {
@@ -342,6 +354,7 @@ impl Operation for ProcessPlacementsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -366,6 +379,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.state = PlacementState::ScheduleRetry;
         operation.retry_needed = true;
@@ -377,7 +391,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(operation.state, PlacementState::Finish);
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.finalize(), Ok(false));
     }
 
     #[test]
@@ -387,6 +401,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.current = Some(CurrentPlacement {
             target: target.clone(),
@@ -413,6 +428,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_nodes = vec![authoritative, node(2), node(3), node(4)];
         operation.records = vec![new_placement(
@@ -441,6 +457,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.current = Some(CurrentPlacement {
             target,
@@ -467,6 +484,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_nodes = vec![authoritative, node(2)];
         operation.records = vec![new_placement(
@@ -490,6 +508,7 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_nodes = vec![node(1), node(2), node(3)];
         operation.records = vec![new_placement(
