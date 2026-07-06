@@ -148,9 +148,7 @@ async fn create_once(
         }
     }
 
-    if let Err(failure) = write_dirty_marker(storage, subscription.owner.realm_id, txn_id).await {
-        return Err(failure);
-    }
+    write_dirty_marker(storage, subscription.owner.realm_id, txn_id).await?;
 
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })

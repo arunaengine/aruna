@@ -10,6 +10,7 @@ pub mod error;
 pub mod streams;
 mod telemetry;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -29,8 +30,8 @@ use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
-    realm_endpoint_announcement_signing_bytes,
+    RealmConfigDocument, RealmEndpointAnnouncement, RealmId, WatchInterestEntry,
+    WatchInterestTable, realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -371,6 +372,7 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    watch_interest: Arc<RwLock<WatchInterestTable>>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     document_sync: Arc<DocumentSyncService>,
@@ -490,6 +492,7 @@ impl NetHandle {
             .await?
             .unwrap_or_default();
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
         let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
             &realm_peer_nodes,
@@ -729,6 +732,7 @@ impl NetHandle {
             discovery_method,
             relay_method,
             realm_peers,
+            watch_interest,
             dht_signed_authorized_nodes,
             dht,
             document_sync,
@@ -914,6 +918,27 @@ impl NetHandle {
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {
         self.inner.realm_peers.read().clone()
+    }
+
+    /// Cheap clone of the origin-side watch interest cache. Consumers match
+    /// events against this table without any per-event storage read.
+    pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
+        self.inner.watch_interest.read().clone()
+    }
+
+    /// Replaces the whole watch interest cache (startup and full rebuilds).
+    pub fn replace_watch_interest(&self, table: WatchInterestTable) {
+        *self.inner.watch_interest.write() = table;
+    }
+
+    /// Replaces one realm's node map after a reconcile touched its digests,
+    /// leaving every other realm's cached interest untouched.
+    pub fn update_watch_interest_realm(
+        &self,
+        realm_id: RealmId,
+        nodes: HashMap<NodeId, Vec<WatchInterestEntry>>,
+    ) {
+        self.inner.watch_interest.write().set_realm(realm_id, nodes);
     }
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {

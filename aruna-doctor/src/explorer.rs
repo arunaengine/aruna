@@ -571,6 +571,10 @@ enum JsonDocumentSyncTarget {
         node_id: String,
         group_id: Option<String>,
     },
+    WatchInterest {
+        realm_id: String,
+        node_id: String,
+    },
 }
 
 fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
@@ -627,6 +631,12 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
             node_id: node_id.to_string(),
             group_id: group_id.map(|group_id| group_id.to_string()),
         },
+        DocumentSyncTarget::WatchInterest { realm_id, node_id } => {
+            JsonDocumentSyncTarget::WatchInterest {
+                realm_id: realm_id.to_string(),
+                node_id: node_id.to_string(),
+            }
+        }
     }
 }
 

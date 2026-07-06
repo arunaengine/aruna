@@ -53,7 +53,8 @@ use crate::notifications::prune::{
     process_notification_prune_batch, restore_notification_prune_timer,
 };
 use crate::notifications::watch::interest::{
-    WATCH_INTEREST_PUBLISH_DEBOUNCE, restore_watch_interest_publish_timer,
+    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
+    refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
@@ -401,6 +402,7 @@ impl OperationsTaskHandler {
                     )
                     .await;
                 }
+                refresh_watch_interest_for_targets(self.context.as_ref(), &targets).await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -511,16 +513,27 @@ impl OperationsTaskHandler {
             return;
         };
         let node_id = net_handle.node_id();
-        if let Err(error) =
-            crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
-                .await
+        match crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
+            .await
         {
-            warn!(error = %error, "Failed to publish watch interest");
-            self.reschedule_timer(
-                TaskKey::PublishWatchInterest,
-                WATCH_INTEREST_PUBLISH_DEBOUNCE,
-            )
-            .await;
+            // Fold this node's freshly written digest into the origin-side cache;
+            // the local write bypasses the reconcile path that refreshes remotes.
+            Ok(true) => {
+                let table = crate::notifications::watch::interest::rebuild_watch_interest_table(
+                    &self.context.storage_handle,
+                )
+                .await;
+                net_handle.replace_watch_interest(table);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(error = %error, "Failed to publish watch interest");
+                self.reschedule_timer(
+                    TaskKey::PublishWatchInterest,
+                    WATCH_INTEREST_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
         }
     }
 
@@ -947,6 +960,12 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
     crate::queue_lag::spawn_queue_lag_monitor(&context);
+    // Prime the origin-side watch interest cache from any digests already in
+    // local storage so matching works before the first reconcile.
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        let table = rebuild_watch_interest_table(&context.storage_handle).await;
+        net_handle.replace_watch_interest(table);
+    }
     spawn_durable_queue_rearm(&context, &task_handle);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
@@ -1041,6 +1060,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                             &targets,
                         )
                         .await;
+                        refresh_watch_interest_for_targets(self.context.as_ref(), &targets).await;
                         if self
                             .project_reconciled_metadata_create_events(
                                 &retry_key,
