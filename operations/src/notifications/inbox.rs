@@ -4,12 +4,22 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::storage_entries::notification_inbox_write_entries;
 use aruna_core::structs::{NotificationRecord, notification_inbox_key};
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 
 enum UpsertFailure {
     Conflict,
     Fatal(String),
+}
+
+/// Result of a holder-local inbox upsert. `recipients` lists the distinct
+/// recipients whose inbox actually gained a record (in first-seen order), so a
+/// caller with net access can fire one wake per woken user; a pure redelivery
+/// reports zero writes and an empty recipient set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxWriteOutcome {
+    pub written: usize,
+    pub recipients: Vec<UserId>,
 }
 
 /// Idempotent holder-local upsert. Records whose primary key already exists are
@@ -20,14 +30,25 @@ pub async fn upsert_inbox_records(
     storage: &StorageHandle,
     records: &[NotificationRecord],
 ) -> Result<usize, String> {
+    upsert_inbox_records_reporting(storage, records)
+        .await
+        .map(|outcome| outcome.written)
+}
+
+/// Like [`upsert_inbox_records`] but reports the distinct recipients actually
+/// written so a caller with net access can wake their live streams.
+pub async fn upsert_inbox_records_reporting(
+    storage: &StorageHandle,
+    records: &[NotificationRecord],
+) -> Result<InboxWriteOutcome, String> {
     if records.is_empty() {
-        return Ok(0);
+        return Ok(InboxWriteOutcome::default());
     }
     match upsert_once(storage, records).await {
-        Ok(written) => Ok(written),
+        Ok(outcome) => Ok(outcome),
         Err(UpsertFailure::Fatal(error)) => Err(error),
         Err(UpsertFailure::Conflict) => match upsert_once(storage, records).await {
-            Ok(written) => Ok(written),
+            Ok(outcome) => Ok(outcome),
             Err(UpsertFailure::Fatal(error)) => Err(error),
             Err(UpsertFailure::Conflict) => {
                 Err("notification inbox upsert conflicted twice".to_string())
@@ -39,7 +60,7 @@ pub async fn upsert_inbox_records(
 async fn upsert_once(
     storage: &StorageHandle,
     records: &[NotificationRecord],
-) -> Result<usize, UpsertFailure> {
+) -> Result<InboxWriteOutcome, UpsertFailure> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -87,7 +108,7 @@ async fn upsert_once(
     };
 
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
-    let mut new_count = 0usize;
+    let mut outcome = InboxWriteOutcome::default();
     for (record, (_, existing_value)) in records.iter().zip(existing) {
         if existing_value.is_some() {
             continue;
@@ -95,7 +116,10 @@ async fn upsert_once(
         match notification_inbox_write_entries(record) {
             Ok(entries) => {
                 writes.extend(entries);
-                new_count += 1;
+                outcome.written += 1;
+                if !outcome.recipients.contains(&record.recipient) {
+                    outcome.recipients.push(record.recipient);
+                }
             }
             Err(error) => {
                 abort_txn(storage, txn_id).await;
@@ -106,7 +130,7 @@ async fn upsert_once(
 
     if writes.is_empty() {
         abort_txn(storage, txn_id).await;
-        return Ok(0);
+        return Ok(InboxWriteOutcome::default());
     }
 
     match storage
@@ -132,7 +156,7 @@ async fn upsert_once(
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(new_count),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(outcome),
         Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
         other => Err(UpsertFailure::Fatal(format!(
             "unexpected storage event: {other:?}"
@@ -267,6 +291,39 @@ mod tests {
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn reporting_lists_recipients_on_fresh_write_and_none_on_rewrite() {
+        let (_dir, storage) = temp_storage();
+        let record = make_record();
+
+        let fresh = upsert_inbox_records_reporting(&storage, std::slice::from_ref(&record))
+            .await
+            .expect("fresh write");
+        assert_eq!(fresh.written, 1);
+        assert_eq!(fresh.recipients, vec![record.recipient]);
+
+        let rewrite = upsert_inbox_records_reporting(&storage, std::slice::from_ref(&record))
+            .await
+            .expect("rewrite");
+        assert_eq!(rewrite.written, 0);
+        assert!(rewrite.recipients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reporting_dedupes_recipients_across_records() {
+        let (_dir, storage) = temp_storage();
+        let mut second = make_record();
+        second.created_at_ms += 1;
+        let first = make_record();
+        assert_eq!(first.recipient, second.recipient);
+
+        let outcome = upsert_inbox_records_reporting(&storage, &[first.clone(), second])
+            .await
+            .expect("write");
+        assert_eq!(outcome.written, 2);
+        assert_eq!(outcome.recipients, vec![first.recipient]);
     }
 
     #[tokio::test]

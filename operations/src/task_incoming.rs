@@ -41,7 +41,7 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::notifications::client::{deliver_remote, deliver_watch_events_remote};
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
     NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
@@ -937,8 +937,13 @@ impl OperationsTaskHandler {
             }
 
             if !local_records.is_empty() {
-                match upsert_inbox_records(&self.context.storage_handle, &local_records).await {
-                    Ok(_) => {
+                match upsert_inbox_records_reporting(&self.context.storage_handle, &local_records)
+                    .await
+                {
+                    Ok(outcome) => {
+                        for recipient in &outcome.recipients {
+                            net_handle.notify_inbox_activity(*recipient);
+                        }
                         if let Err(error) = delete_notification_outbox_records(
                             &self.context.storage_handle,
                             local_keys,
@@ -1102,7 +1107,10 @@ impl OperationsTaskHandler {
 
             for (realm_id, (events, keys)) in local_by_realm {
                 match expand_watch_events(&self.context.storage_handle, realm_id, &events).await {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        for recipient in &outcome.recipients {
+                            net_handle.notify_inbox_activity(*recipient);
+                        }
                         if let Err(error) =
                             delete_watch_forward_outbox_records(&self.context.storage_handle, keys)
                                 .await

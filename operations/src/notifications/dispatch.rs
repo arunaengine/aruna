@@ -151,6 +151,11 @@ pub async fn mark_read_for_user(
         )
         .await
         .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
+        if output.marked > 0
+            && let Some(net_handle) = context.net_handle.as_ref()
+        {
+            net_handle.notify_inbox_activity(recipient);
+        }
         Ok(output.marked as u32)
     } else {
         let net_handle = context
