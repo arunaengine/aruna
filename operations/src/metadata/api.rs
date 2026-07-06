@@ -974,7 +974,7 @@ async fn run_metadata_fanout<T>(
     remote_call: MetadataNodeCall<T>,
     record_result: fn(&Span, &Result<T, MetadataError>),
     map_local_error: fn(MetadataError) -> MetadataApiError,
-) -> Result<(Vec<T>, MetadataFanoutStats), MetadataApiError>
+) -> Result<(Vec<(NodeId, T)>, MetadataFanoutStats), MetadataApiError>
 where
     T: Send + 'static,
 {
@@ -998,7 +998,7 @@ where
                 nodes_failed: 0,
             };
             match result {
-                Ok(result) => Ok((vec![result], fanout_stats)),
+                Ok(result) => Ok((vec![(local_node_id, result)], fanout_stats)),
                 Err(error) => Err(map_local_error(error)),
             }
         }
@@ -1036,7 +1036,7 @@ where
 
             while let Some((node_index, node_id, result)) = pending.next().await {
                 match result {
-                    Ok(result) => node_parts.push((node_index, result)),
+                    Ok(result) => node_parts.push((node_index, node_id, result)),
                     Err(error) => {
                         fanout_stats.nodes_failed += 1;
                         warn!(
@@ -1049,10 +1049,13 @@ where
                 }
             }
 
-            node_parts.sort_by_key(|(node_index, _)| *node_index);
+            node_parts.sort_by_key(|(node_index, _, _)| *node_index);
             aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
             Ok((
-                node_parts.into_iter().map(|(_, result)| result).collect(),
+                node_parts
+                    .into_iter()
+                    .map(|(_, node_id, result)| (node_id, result))
+                    .collect(),
                 fanout_stats,
             ))
         }
@@ -1157,6 +1160,7 @@ async fn run_query_distributed(
     )
     .await?;
 
+    let parts = parts.into_iter().map(|(_, result)| result).collect();
     let result = aggregate_query_results(parts, query_form, select_limit);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     match &result {
@@ -1246,7 +1250,10 @@ async fn run_search_distributed(
     )
     .await?;
 
-    let hits = deduplicate_search_hits(node_hits.into_iter().flatten().collect(), limit);
+    let hits = deduplicate_search_hits(
+        node_hits.into_iter().flat_map(|(_, hits)| hits).collect(),
+        limit,
+    );
     span.record("hit_count", hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok((hits, fanout_stats))
