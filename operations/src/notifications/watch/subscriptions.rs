@@ -6,13 +6,15 @@ use aruna_core::storage_entries::{
     watch_subscription_delete_entry, watch_subscription_write_entry,
 };
 use aruna_core::structs::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, WatchEventMask,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, RealmId, WatchEventMask,
     WatchSubscription, watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
 /// always covers a subscription set with a wide safety margin.
@@ -146,6 +148,10 @@ async fn create_once(
         }
     }
 
+    if let Err(failure) = write_dirty_marker(storage, subscription.owner.realm_id, txn_id).await {
+        return Err(failure);
+    }
+
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -163,22 +169,95 @@ pub async fn delete_watch_subscription(
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), WatchSubscriptionError> {
+    // Row delete and the interest dirty marker share one transaction so the
+    // publisher can never miss the change; both are blind writes, so no read set
+    // means the commit does not spuriously conflict with concurrent CRUD.
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(WatchSubscriptionError::Storage(error.to_string()));
+        }
+        other => {
+            return Err(WatchSubscriptionError::Storage(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    };
+
     let (key_space, key) = watch_subscription_delete_entry(owner, watch_id);
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space,
             key,
-            txn_id: None,
+            txn_id: Some(txn_id),
         })
         .await
     {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_txn(storage, txn_id).await;
+            return Err(WatchSubscriptionError::Storage(error.to_string()));
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(WatchSubscriptionError::Storage(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    }
+
+    if let Err(failure) = write_dirty_marker(storage, owner.realm_id, txn_id).await {
+        return Err(match failure {
+            CreateFailure::Fatal(error) => WatchSubscriptionError::Storage(error),
+            _ => WatchSubscriptionError::Storage("watch interest marker write failed".to_string()),
+        });
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => {
             Err(WatchSubscriptionError::Storage(error.to_string()))
         }
         other => Err(WatchSubscriptionError::Storage(format!(
             "unexpected storage event: {other:?}"
         ))),
+    }
+}
+
+/// Writes the realm's interest dirty marker inside `txn_id` and aborts the
+/// transaction on failure. A blind write (no prior read of the marker key) so it
+/// never adds a conflict of its own.
+async fn write_dirty_marker(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    txn_id: TxnId,
+) -> Result<(), CreateFailure> {
+    let (key_space, key, value) = watch_interest_dirty_marker_write(realm_id);
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(abort_and_classify(storage, txn_id, error).await)
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            Err(CreateFailure::Fatal(format!(
+                "unexpected storage event: {other:?}"
+            )))
+        }
     }
 }
 

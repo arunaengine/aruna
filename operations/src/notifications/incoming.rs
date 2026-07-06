@@ -23,6 +23,7 @@ use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
     create_watch_subscription, delete_watch_subscription, list_watch_subscriptions,
 };
@@ -188,12 +189,18 @@ async fn build_response(
         )
         .await
         {
-            Ok(subscription) => NotificationTransportMessage::WatchCreated { subscription },
+            Ok(subscription) => {
+                schedule_watch_interest_publish(context).await;
+                NotificationTransportMessage::WatchCreated { subscription }
+            }
             Err(error) => NotificationTransportMessage::Reject(error.to_string()),
         },
         NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
             match delete_watch_subscription(&context.storage_handle, owner, watch_id).await {
-                Ok(()) => NotificationTransportMessage::WatchDeleted,
+                Ok(()) => {
+                    schedule_watch_interest_publish(context).await;
+                    NotificationTransportMessage::WatchDeleted
+                }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
