@@ -188,12 +188,13 @@ async fn process_pending_placements(
         ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: input.realm_id,
             local_node_id: input.local_node_id,
+            retry_after: crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
         }),
         context,
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) => {
             warn!(error = %error, "Failed to process pending document-sync placements during onboarding");
             Err(error)

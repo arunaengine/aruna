@@ -232,6 +232,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: config.realm_id,
             local_node_id: config.node_id,
+            retry_after: aruna_operations::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
         }),
         driver_ctx.as_ref(),
     )

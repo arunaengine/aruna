@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
+use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -45,7 +46,7 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
+use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -56,6 +57,9 @@ const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
+    // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
+    // a restarted node simply retries from the base interval.
+    retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
 }
 
 struct DrainSubBatch {
@@ -107,7 +111,46 @@ impl DrainSyncOutcome {
 
 impl OperationsTaskHandler {
     fn new(context: Arc<DriverContext>) -> Self {
-        Self { context }
+        Self {
+            context,
+            retry_backoff: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Backoff interval for the next re-arm of `key`, derived from the in-memory
+    /// attempt count without mutating it.
+    fn backoff_after(&self, key: &TaskKey) -> Duration {
+        let attempts = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .get(key)
+            .copied()
+            .unwrap_or(0);
+        Duration::from_secs(timer_retry_after_secs(attempts))
+    }
+
+    fn note_retry_backoff(&self, key: &TaskKey) {
+        let mut backoff = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned");
+        let attempts = backoff.entry(key.clone()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+    }
+
+    fn reset_backoff(&self, key: &TaskKey) {
+        self.retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .remove(key);
+    }
+
+    /// Re-arms `key` at its current backoff interval and records the attempt.
+    async fn reschedule_with_backoff(&self, key: TaskKey) -> bool {
+        let after = self.backoff_after(&key);
+        self.note_retry_backoff(&key);
+        self.reschedule_timer(key, after).await
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
@@ -146,14 +189,15 @@ impl OperationsTaskHandler {
                 Ok(batch) if batch.records.is_empty() => {
                     if batch.has_more {
                         self.reschedule_timer(retry_key, Duration::ZERO).await;
+                    } else {
+                        self.reset_backoff(&retry_key);
                     }
                     return;
                 }
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(error = %error, "Failed to read document sync outbox record");
-                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                        .await;
+                    self.reschedule_with_backoff(retry_key).await;
                     return;
                 }
             };
@@ -167,8 +211,7 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                .await;
+            self.reschedule_with_backoff(retry_key).await;
             return;
         };
 
@@ -271,11 +314,12 @@ impl OperationsTaskHandler {
         );
 
         if totals.retry_needed {
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                .await;
+            self.reschedule_with_backoff(retry_key).await;
         } else if batch.has_more {
             self.reschedule_timer(retry_key, std::time::Duration::ZERO)
                 .await;
+        } else {
+            self.reset_backoff(&retry_key);
         }
     }
 
@@ -632,17 +676,22 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
+                let retry_key = TaskKey::SyncPlacements { realm_id, node_id };
                 let op = ProcessPlacementsOperation::new(PlacementConfig {
                     realm_id,
                     local_node_id: node_id,
+                    retry_after: self.backoff_after(&retry_key),
                 });
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process pending sync placements timer event");
-                    self.reschedule_timer(
-                        TaskKey::SyncPlacements { realm_id, node_id },
-                        SYNC_PLACEMENT_RETRY_AFTER,
-                    )
-                    .await;
+                match drive(op, self.context.as_ref()).await {
+                    // The sweep re-armed itself for still-pending placements: grow the
+                    // backoff so a persistently unsatisfiable placement stops hot-looping.
+                    Ok(true) => self.note_retry_backoff(&retry_key),
+                    // A clean sweep clears the backoff for the next unrelated re-arm.
+                    Ok(false) => self.reset_backoff(&retry_key),
+                    Err(err) => {
+                        error!(error = ?err, "Failed to process pending sync placements timer event");
+                        self.reschedule_with_backoff(retry_key).await;
+                    }
                 }
             }
             TaskKey::SyncDocument {
