@@ -2798,6 +2798,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            composite_part_count: None,
         };
 
         service
@@ -2871,6 +2872,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            composite_part_count: None,
         };
 
         service
