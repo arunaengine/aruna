@@ -7,7 +7,7 @@ use crate::s3::checksum::{
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
-    convert_input, multipart_checksum_type_from_s3, parse_completed_part,
+    convert_input, multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart, validate_object_key,
 };
@@ -16,7 +16,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, data_watch_resource_path,
+    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -36,6 +37,9 @@ use aruna_operations::s3::bucket_cors::{
 use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
     CompleteMultipartUploadResult,
+};
+use aruna_operations::s3::copy_object::{
+    CopyObjectInput as CopyObjectData, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
@@ -78,23 +82,24 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
     ChecksumType, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerEntry,
-    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
-    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType,
-    Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LastModified,
-    ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CreateBucketInput, CreateBucketOutput,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketCorsInput,
+    DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput, DeleteBucketReplicationInput,
+    DeleteBucketReplicationOutput, DeleteMarkerEntry, DeleteMarkerReplication,
+    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+    DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType, Error as S3DeleteError,
+    GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
+    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
+    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
     ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    ListPartsInput, ListPartsOutput, MultipartUpload as S3MultipartUpload, Object, ObjectVersion,
-    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
-    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, UploadPartInput,
-    UploadPartOutput,
+    ListPartsInput, ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload,
+    Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput,
+    PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -1035,6 +1040,142 @@ impl S3 for ArunaS3Service {
             result,
         )
         .await
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        debug!("Received COPY OBJECT Request: {:#?}", req);
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let dest_bucket_info = req.extensions.get::<BucketInfo>().cloned();
+
+        let (source_bucket, source_key, source_version_id) =
+            parse_copy_source(&req.input.copy_source)?;
+
+        // The auth layer only authorized the destination path; authorize the source here.
+        let source_bucket_info = drive(
+            GetBucketInfoOperation::new(source_bucket.clone()),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
+
+        let source_allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: AuthContext {
+                    user_id: user_access.user_identity,
+                    realm_id: user_access.user_identity.realm_id,
+                    path_restrictions: user_access.path_restrictions.clone(),
+                },
+                path: blob_object_permission_path(
+                    self.realm_id,
+                    source_bucket_info.group_id,
+                    self.node_id,
+                    &source_bucket,
+                    &source_key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            &self.state,
+        )
+        .await
+        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+        if !source_allowed {
+            return Err(s3_error!(AccessDenied, "Permission denied"));
+        }
+
+        let dest_bucket = req.input.bucket.clone();
+        let dest_key = req.input.key.clone();
+
+        let metadata_replace = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .map(MetadataDirective::as_str)
+            == Some(MetadataDirective::REPLACE);
+        if source_bucket == dest_bucket
+            && source_key == dest_key
+            && source_version_id.is_none()
+            && !metadata_replace
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
+            ));
+        }
+
+        let dest_group_id = dest_bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let quota_ceiling = self.resolve_quota_ceiling(dest_group_id).await?;
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
+
+        let result = copy_object(
+            &self.state,
+            CopyObjectData {
+                source_bucket,
+                source_key,
+                source_version_id,
+                source_group_id: source_bucket_info.group_id,
+                dest_bucket: dest_bucket.clone(),
+                dest_key: dest_key.clone(),
+                user_id: user_access.user_identity,
+                group_id: dest_group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                quota_ceiling,
+                conditions: CopySourceConditions::default(),
+            },
+        )
+        .await
+        .map_err(IntoS3Error::into_s3_error)?;
+
+        self.queue_live_version_replication(
+            replication_auth,
+            dest_bucket,
+            dest_key,
+            result.version_id,
+            false,
+        )
+        .await;
+
+        let mut copy_object_result = CopyObjectResult {
+            e_tag: result
+                .location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(hex::encode(value))),
+            last_modified: Some(result.location.created_at.into()),
+            ..Default::default()
+        };
+        copy_object_result.apply_checksums(encode_checksums(
+            &result.location.hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        ));
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(copy_object_result),
+            version_id: Some(result.version_id.to_string()),
+            copy_source_version_id: result
+                .source_version_id
+                .map(|version_id| version_id.to_string()),
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]

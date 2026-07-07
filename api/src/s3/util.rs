@@ -9,7 +9,7 @@ use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
 use s3s::dto::{
-    ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
+    ChecksumType, CompletedPart, CopySource, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::path::Path;
@@ -232,6 +232,31 @@ pub(crate) fn parse_upload_id(upload_id: &str) -> S3Result<Ulid> {
         .map_err(|_| s3_error!(NoSuchUpload, "The specified upload does not exist."))
 }
 
+pub(crate) fn parse_copy_source(
+    copy_source: &CopySource,
+) -> S3Result<(String, String, Option<Ulid>)> {
+    match copy_source {
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id,
+        } => {
+            let version_id = version_id
+                .as_ref()
+                .map(|version_id| {
+                    Ulid::from_string(version_id)
+                        .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+                })
+                .transpose()?;
+            Ok((bucket.to_string(), key.to_string(), version_id))
+        }
+        _ => Err(s3_error!(
+            InvalidArgument,
+            "Unsupported copy source; only bucket/key sources are supported"
+        )),
+    }
+}
+
 pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ulid>> {
     version_id
         .map(|version_id| {
@@ -299,10 +324,72 @@ pub(crate) fn s3_checksum_algorithm_from_core(
 mod tests {
     use super::{
         get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_multipart_part_number, validate_object_key,
+        parse_copy_source, parse_multipart_part_number, validate_object_key,
     };
     use crate::s3::auth::Action;
     use s3s::S3ErrorCode;
+    use s3s::dto::CopySource;
+    use ulid::Ulid;
+
+    #[test]
+    fn parses_bucket_copy_source_without_version() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "folder/object.txt".into(),
+            version_id: None,
+        };
+
+        let (bucket, key, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(bucket, "src-bucket");
+        assert_eq!(key, "folder/object.txt");
+        assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn parses_bucket_copy_source_with_version() {
+        let version = Ulid::new();
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some(version.to_string().into()),
+        };
+
+        let (_, _, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(version_id, Some(version));
+    }
+
+    #[test]
+    fn rejects_invalid_copy_source_version() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some("not-a-ulid".into()),
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn rejects_non_bucket_copy_source() {
+        let source = CopySource::AccessPoint {
+            partition: "aws".into(),
+            region: "eu-central-1".into(),
+            account_id: "123456789012".into(),
+            access_point_name: "my-access-point".into(),
+            key: "object.txt".into(),
+            version_id: None,
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
 
     #[test]
     fn validate_object_key_accepts_ordinary_keys() {

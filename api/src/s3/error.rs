@@ -5,6 +5,7 @@ use aruna_operations::s3::bucket_cors::{
     DeleteBucketCorsError, GetBucketCorsError, PutBucketCorsError,
 };
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadError;
+use aruna_operations::s3::copy_object::CopyObjectError;
 use aruna_operations::s3::create_bucket::CreateBucketError;
 use aruna_operations::s3::create_multipart_upload::CreateMultipartUploadError;
 use aruna_operations::s3::delete_bucket::DeleteBucketError;
@@ -250,6 +251,15 @@ impl IntoS3Error for GetObjectError {
                 err => s3_error!(ServiceUnavailable, "{}", err),
             },
             err => internal_error(err),
+        }
+    }
+}
+
+impl IntoS3Error for CopyObjectError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            CopyObjectError::Get(err) => err.into_s3_error(),
+            CopyObjectError::Put(err) => err.into_s3_error(),
         }
     }
 }
