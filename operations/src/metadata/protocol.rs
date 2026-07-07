@@ -1,8 +1,9 @@
-use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
+use aruna_core::metadata::{MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit};
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
+use ulid::Ulid;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
@@ -64,6 +65,27 @@ impl fmt::Display for MetadataAuthTokenError {
 
 impl std::error::Error for MetadataAuthTokenError {}
 
+/// Which RO-Crate export view a forwarded request wants, carrying the page window
+/// so the holder reproduces the exact export the local route would have served.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RoCrateExportView {
+    Full,
+    Summary,
+    Page {
+        limit: usize,
+        offset: Option<usize>,
+        after: Option<String>,
+    },
+}
+
+/// The exported RO-Crate a holder returns, shaped to match the requested view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RoCrateExportPayload {
+    Full { jsonld: String },
+    Summary { jsonld: String },
+    Page { page: MetadataRoCratePage },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
     QueryGraphs {
@@ -82,6 +104,17 @@ pub enum MetadataTransportMessage {
     },
     SearchResults {
         hits: Vec<MetadataSearchHit>,
+    },
+    /// Forwarded RO-Crate export for a document whose graph lives only on its
+    /// holders. The holder re-validates the bearer and re-checks record visibility
+    /// before exporting, so a non-holder never strands on a `503`.
+    ExportRoCrate {
+        auth_token: Option<MetadataAuthToken>,
+        document_id: Ulid,
+        view: RoCrateExportView,
+    },
+    RoCrateExport {
+        payload: RoCrateExportPayload,
     },
     Reject(String),
 }

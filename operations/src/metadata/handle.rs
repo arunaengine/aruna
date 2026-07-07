@@ -40,11 +40,15 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
-use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
+use super::protocol::{
+    MetadataAuthToken, MetadataTransportMessage, RoCrateExportPayload, RoCrateExportView,
+    read_message, write_message,
+};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use crate::auth::{ArunaBearerTokenValidationState, validate_aruna_bearer_token};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::list_groups::ListGroupOperation;
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -945,8 +949,33 @@ impl MetadataHandle {
                 },
                 Err(error) => MetadataTransportMessage::Reject(error.to_string()),
             },
+            MetadataTransportMessage::ExportRoCrate {
+                auth_token,
+                document_id,
+                view,
+            } => match authorize_remote_metadata_peer(
+                &self.inner.auth_validation,
+                &self.inner.storage_handle,
+                peer,
+                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                auth_token,
+            )
+            .await
+            {
+                Ok(auth_context) => {
+                    match self
+                        .export_authorized_local(auth_context, document_id, view)
+                        .await
+                    {
+                        Ok(payload) => MetadataTransportMessage::RoCrateExport { payload },
+                        Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                    }
+                }
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
+            | MetadataTransportMessage::RoCrateExport { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1054,6 +1083,50 @@ impl MetadataHandle {
             other => Err(MetadataError::Backend(format!(
                 "unexpected metadata page event: {other:?}"
             ))),
+        }
+    }
+
+    /// Serves a routed RO-Crate export on this holder. The forwarded identity's
+    /// read access is re-checked against the registry record — never trusted from
+    /// the origin — before the local graph is exported. A missing or deleted graph
+    /// surfaces as `GraphNotFound` so the origin can fall through to another holder.
+    async fn export_authorized_local(
+        &self,
+        auth_context: Option<AuthContext>,
+        document_id: Ulid,
+        view: RoCrateExportView,
+    ) -> Result<RoCrateExportPayload, MetadataError> {
+        let record = load_export_record(&self.inner.storage_handle, document_id).await?;
+        if metadata_graph_deleted(self.inner.clone(), &record.graph_iri)
+            .await?
+            .deleted
+        {
+            return Err(MetadataError::GraphNotFound);
+        }
+        if !can_read_record_locally(self.inner.storage_handle.clone(), auth_context, &record)
+            .await?
+        {
+            return Err(MetadataError::InvalidInput(
+                "caller may not read this metadata document".to_string(),
+            ));
+        }
+        let graph_iri = record.graph_iri;
+        match view {
+            RoCrateExportView::Full => Ok(RoCrateExportPayload::Full {
+                jsonld: self.export_rocrate_jsonld(graph_iri).await?,
+            }),
+            RoCrateExportView::Summary => Ok(RoCrateExportPayload::Summary {
+                jsonld: self.export_rocrate_summary_jsonld(graph_iri).await?,
+            }),
+            RoCrateExportView::Page {
+                limit,
+                offset,
+                after,
+            } => Ok(RoCrateExportPayload::Page {
+                page: self
+                    .export_rocrate_page(graph_iri, limit, offset, after)
+                    .await?,
+            }),
         }
     }
 
@@ -1176,6 +1249,57 @@ impl MetadataHandle {
             Err(error) => record_error(&span, &error.to_string()),
         }
         result
+    }
+
+    /// Requests a routed RO-Crate export from a remote graph holder, mirroring the
+    /// remote-query path: the forwarded bearer is re-validated on the holder and
+    /// the record's visibility re-checked before it exports.
+    pub async fn request_remote_export_rocrate(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        document_id: Ulid,
+        view: RoCrateExportView,
+    ) -> Result<RoCrateExportPayload, MetadataError> {
+        let span = Span::current();
+        match send_remote_metadata_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::ExportRoCrate {
+                auth_token,
+                document_id,
+                view,
+            },
+        )
+        .await?
+        {
+            MetadataTransportMessage::RoCrateExport { payload } => Ok(payload),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata export response: {other:?}"
+            ))),
+        }
+    }
+}
+
+async fn load_export_record(
+    storage_handle: &StorageHandle,
+    document_id: Ulid,
+) -> Result<MetadataRegistryRecord, MetadataError> {
+    let context = DriverContext {
+        storage_handle: storage_handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+    };
+    match load_metadata_record_by_document(&context, document_id).await {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(MetadataError::GraphNotFound),
+        Err(error) => Err(MetadataError::Backend(format!(
+            "metadata registry read failed: {error:?}"
+        ))),
     }
 }
 
@@ -3029,6 +3153,8 @@ fn metadata_transport_message_kind(message: &MetadataTransportMessage) -> &'stat
         MetadataTransportMessage::QueryResults { .. } => "query_results",
         MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
         MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::ExportRoCrate { .. } => "export_rocrate",
+        MetadataTransportMessage::RoCrateExport { .. } => "rocrate_export",
         MetadataTransportMessage::Reject(_) => "reject",
     }
 }

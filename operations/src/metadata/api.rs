@@ -30,6 +30,7 @@ use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::MetadataAuthToken;
+use super::protocol::{RoCrateExportPayload, RoCrateExportView};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::{
@@ -102,6 +103,8 @@ pub enum MetadataRoCrateExportView {
 pub struct ExportMetadataRoCrateRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
+    /// Forwarded to a remote graph holder when the local graph is absent.
+    pub bearer_token: Option<String>,
     pub view: MetadataRoCrateExportView,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -293,33 +296,112 @@ pub async fn get_visible_metadata_document(
 pub async fn export_metadata_rocrate(
     context: &DriverContext,
     realm_id: RealmId,
+    local_node_id: NodeId,
     request: ExportMetadataRoCrateRequest,
 ) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
     ensure_record_materialized_for_graph_read(context, &record).await?;
 
-    match request.view {
-        MetadataRoCrateExportView::Full => Ok(ExportMetadataRoCrateResult::Full {
-            jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
-            record,
-        }),
-        MetadataRoCrateExportView::Summary => Ok(ExportMetadataRoCrateResult::Summary {
-            jsonld: export_rocrate_summary_jsonld(context, &record.graph_iri).await?,
-            record,
-        }),
-        MetadataRoCrateExportView::Page => Ok(ExportMetadataRoCrateResult::Page {
-            page: export_rocrate_page(
-                context,
-                &record.graph_iri,
-                request.limit,
-                request.offset,
-                request.after,
-            )
-            .await?,
-            record,
-        }),
+    // Validate page params up front (400) and pin the export window into the view
+    // so a remote holder reproduces the exact export the local route would serve.
+    let view = match request.view {
+        MetadataRoCrateExportView::Full => RoCrateExportView::Full,
+        MetadataRoCrateExportView::Summary => RoCrateExportView::Summary,
+        MetadataRoCrateExportView::Page => {
+            if request.offset.is_some() && request.after.is_some() {
+                return Err(MetadataApiError::BadRequest);
+            }
+            RoCrateExportView::Page {
+                limit: request.limit.unwrap_or(100).clamp(1, 1_000),
+                offset: request.offset,
+                after: request.after,
+            }
+        }
+    };
+
+    let payload = export_rocrate_local_first(
+        context,
+        local_node_id,
+        &record,
+        request.bearer_token.as_deref(),
+        view,
+    )
+    .await?;
+
+    Ok(match payload {
+        RoCrateExportPayload::Full { jsonld } => {
+            ExportMetadataRoCrateResult::Full { jsonld, record }
+        }
+        RoCrateExportPayload::Summary { jsonld } => {
+            ExportMetadataRoCrateResult::Summary { jsonld, record }
+        }
+        RoCrateExportPayload::Page { page } => ExportMetadataRoCrateResult::Page { page, record },
+    })
+}
+
+/// Exports the document's RO-Crate local-first, falling back to the record's graph
+/// holders when the local graph is absent. On `>replica` realms the graph lives
+/// only on `holder_node_ids`, so a non-holder route would otherwise `503` forever.
+/// Holders are tried first-reachable in the same dedup order as the query fan-out;
+/// a genuine local error is a 500, while an absent graph everywhere is a 503.
+async fn export_rocrate_local_first(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    record: &MetadataRegistryRecord,
+    bearer_token: Option<&str>,
+    view: RoCrateExportView,
+) -> Result<RoCrateExportPayload, MetadataApiError> {
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+
+    let local = match &view {
+        RoCrateExportView::Full => handle
+            .export_rocrate_jsonld(record.graph_iri.clone())
+            .await
+            .map(|jsonld| RoCrateExportPayload::Full { jsonld }),
+        RoCrateExportView::Summary => handle
+            .export_rocrate_summary_jsonld(record.graph_iri.clone())
+            .await
+            .map(|jsonld| RoCrateExportPayload::Summary { jsonld }),
+        RoCrateExportView::Page {
+            limit,
+            offset,
+            after,
+        } => handle
+            .export_rocrate_page(record.graph_iri.clone(), *limit, *offset, after.clone())
+            .await
+            .map(|page| RoCrateExportPayload::Page { page }),
+    };
+    match local {
+        Ok(payload) => return Ok(payload),
+        // The local graph is absent: fall back to the record's holders.
+        Err(MetadataError::GraphNotFound) => {}
+        Err(other) => return Err(map_metadata_internal_error(other)),
     }
+
+    let auth_token = metadata_auth_token_from_bearer(bearer_token);
+    for holder in deduplicate_fanout_nodes(record.holder_node_ids.clone()) {
+        if holder == local_node_id {
+            continue;
+        }
+        if let Ok(payload) = handle
+            .request_remote_export_rocrate(
+                holder,
+                auth_token.clone(),
+                record.document_id,
+                view.clone(),
+            )
+            .await
+        {
+            return Ok(payload);
+        }
+    }
+
+    // The graph is absent locally and no holder served it: retryable.
+    Err(MetadataApiError::ServiceUnavailable)
 }
 
 pub async fn query_metadata_document(
@@ -742,20 +824,6 @@ fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool 
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-async fn export_rocrate_jsonld(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<String, MetadataApiError> {
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)
-}
-
 async fn export_rocrate_summary_jsonld(
     context: &DriverContext,
     graph_iri: &str,
@@ -766,27 +834,6 @@ async fn export_rocrate_summary_jsonld(
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     handle
         .export_rocrate_summary_jsonld(graph_iri.to_string())
-        .await
-        .map_err(map_metadata_event_error)
-}
-
-async fn export_rocrate_page(
-    context: &DriverContext,
-    graph_iri: &str,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    after: Option<String>,
-) -> Result<MetadataRoCratePage, MetadataApiError> {
-    if offset.is_some() && after.is_some() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    let limit = limit.unwrap_or(100).clamp(1, 1_000);
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_page(graph_iri.to_string(), limit, offset, after)
         .await
         .map_err(map_metadata_event_error)
 }

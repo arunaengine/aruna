@@ -690,6 +690,7 @@ pub async fn delete_metadata_document(
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Query(params): Query<MetadataRoCrateExportParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataRoCrateResponse>)> {
@@ -699,9 +700,11 @@ pub async fn export_metadata_rocrate(
     let export = run_export_metadata_rocrate(
         ctx.as_ref(),
         state.get_realm_id(),
+        state.get_node_id(),
         ExportMetadataRoCrateRequest {
             document_id,
             auth,
+            bearer_token: bearer_token_to_string(bearer),
             view: map_rocrate_export_view(&view),
             limit: params.limit,
             offset: params.offset,
@@ -1707,6 +1710,7 @@ mod tests {
         let (_, Json(response)) = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(document_id.clone()),
             Query(MetadataRoCrateExportParams::default()),
         )
@@ -1721,6 +1725,7 @@ mod tests {
 
         let (_, Json(summary)) = export_metadata_rocrate(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Path(document_id.clone()),
             Query(MetadataRoCrateExportParams {
@@ -1739,6 +1744,7 @@ mod tests {
 
         let (_, Json(page)) = export_metadata_rocrate(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Path(document_id.clone()),
             Query(MetadataRoCrateExportParams {
@@ -1877,6 +1883,7 @@ mod tests {
 
         let (_, Json(exported)) = export_metadata_rocrate(
             State(test.state),
+            Extension(None),
             Extension(None),
             Path(document_id.clone()),
             Query(MetadataRoCrateExportParams::default()),
@@ -2145,6 +2152,7 @@ mod tests {
         let result = export_metadata_rocrate(
             State(test.state),
             Extension(None),
+            Extension(None),
             Path(created.summary.document_id),
             Query(MetadataRoCrateExportParams::default()),
         )
@@ -2358,6 +2366,7 @@ mod tests {
         let result = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(created.summary.document_id.clone()),
             Query(MetadataRoCrateExportParams::default()),
         )
@@ -2372,6 +2381,7 @@ mod tests {
         let result = export_metadata_rocrate(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(created.summary.document_id.clone()),
             Query(MetadataRoCrateExportParams::default()),
         )
@@ -2384,6 +2394,7 @@ mod tests {
         assert_eq!(materialized.processed, 1);
         let result = export_metadata_rocrate(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Path(created.summary.document_id),
             Query(MetadataRoCrateExportParams::default()),
