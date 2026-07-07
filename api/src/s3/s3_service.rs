@@ -57,6 +57,9 @@ use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOpe
 use aruna_operations::s3::list_multipart_uploads::{
     ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
 };
+use aruna_operations::s3::list_object_versions::{
+    ListObjectVersionsInput as LOVI, ListObjectVersionsItem, ListObjectVersionsOperation,
+};
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
@@ -77,19 +80,21 @@ use s3s::dto::{
     ChecksumType, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
     CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
-    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-    DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType, Error as S3DeleteError,
-    GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
-    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
-    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload as S3MultipartUpload,
-    Object, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StorageClass, StreamingBlob, UploadPartInput, UploadPartOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerEntry,
+    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
+    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType,
+    Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LastModified,
+    ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    ListPartsInput, ListPartsOutput, MultipartUpload as S3MultipartUpload, Object, ObjectVersion,
+    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -1603,6 +1608,150 @@ impl S3 for ArunaS3Service {
                 .next_upload_id_marker
                 .map(|upload_id| upload_id.to_string()),
             uploads: Some(uploads),
+            common_prefixes: Some(common_prefixes),
+            encoding_type: req.input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        debug!("Received LIST OBJECT VERSIONS Request: {:#?}", req);
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let key_marker = req.input.key_marker.clone();
+        let requested_version_id_marker = req.input.version_id_marker.clone();
+        let version_id_marker = match requested_version_id_marker.as_deref() {
+            None => None,
+            Some(marker) => Some(
+                ulid::Ulid::from_string(marker)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid version-id-marker"))?,
+            ),
+        };
+        let max_keys = match req.input.max_keys {
+            None => ListObjectVersionsOperation::DEFAULT_MAX_KEYS,
+            Some(max_keys) => usize::try_from(max_keys)
+                .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
+                .min(ListObjectVersionsOperation::DEFAULT_MAX_KEYS),
+        };
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+
+        let result = drive(
+            ListObjectVersionsOperation::new(LOVI {
+                bucket: bucket.clone(),
+                group_id,
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                key_marker: key_marker.clone(),
+                version_id_marker,
+                max_keys: Some(max_keys),
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list object versions"))?;
+
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(group_id.to_string()),
+        });
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        for item in result.items {
+            match item {
+                ListObjectVersionsItem::Version {
+                    key,
+                    version_id,
+                    is_latest,
+                    location,
+                    source_metadata,
+                    created_at,
+                } => {
+                    let response_fields = self.build_object_response_fields(
+                        location.as_ref(),
+                        source_metadata.as_ref(),
+                        None,
+                    );
+                    versions.push(ObjectVersion {
+                        key: Some(encode_field(key)),
+                        version_id: Some(version_id.to_string()),
+                        is_latest: Some(is_latest),
+                        last_modified: Some(created_at.into()),
+                        e_tag: response_fields.e_tag,
+                        size: response_fields.content_length,
+                        owner: owner.clone(),
+                        storage_class: Some(ObjectVersionStorageClass::from_static(
+                            ObjectVersionStorageClass::STANDARD,
+                        )),
+                        ..Default::default()
+                    });
+                }
+                ListObjectVersionsItem::DeleteMarker {
+                    key,
+                    version_id,
+                    is_latest,
+                    created_at,
+                } => {
+                    delete_markers.push(DeleteMarkerEntry {
+                        key: Some(encode_field(key)),
+                        version_id: Some(version_id.to_string()),
+                        is_latest: Some(is_latest),
+                        last_modified: Some(created_at.into()),
+                        owner: owner.clone(),
+                    });
+                }
+            }
+        }
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(S3Response::new(ListObjectVersionsOutput {
+            name: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            delimiter: delimiter.map(&encode_field),
+            key_marker,
+            version_id_marker: requested_version_id_marker,
+            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_key_marker: result.next_key_marker.map(&encode_field),
+            next_version_id_marker: result
+                .next_version_id_marker
+                .map(|version_id| version_id.to_string()),
+            versions: Some(versions),
+            delete_markers: Some(delete_markers),
             common_prefixes: Some(common_prefixes),
             encoding_type: req.input.encoding_type,
             ..Default::default()
