@@ -1,17 +1,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::structs::{
-    Actor, BucketInfo, NODE_USAGE_DIRTY_GLOBAL_KEY, RealmConfigDocument, RealmId, RealmNodeKind,
-    UsageCounters, node_usage_global_key, usage_global_key_for_group, usage_group_key,
+    Actor, BucketInfo, NODE_USAGE_DIRTY_GLOBAL_KEY, NodeUsageSnapshot, RealmConfigDocument,
+    RealmId, RealmNodeKind, UsageCounters, node_usage_global_key, usage_global_key_for_group,
+    usage_group_key,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::usage_stats::{RealmUsageScope, load_realm_usage, publish_usage_snapshots};
@@ -43,6 +50,7 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
     let node_a = &nodes[0];
     let node_b = &nodes[1];
     let group_id = Ulid::new();
+    bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
 
     drive(
         CreateBucketOperation::new(
@@ -142,6 +150,7 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
     let node_a = &nodes[0];
     let node_b = &nodes[1];
     let group_id = Ulid::new();
+    bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
 
     // Seed node A's live counters with a full, non-trivial usage total, then let
     // the real publisher distribute it as node-usage snapshot documents.
@@ -296,6 +305,63 @@ async fn write_usage_stat(node: &TestNode, key: Vec<u8>, counters: UsageCounters
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => panic!("unexpected usage stat write event: {other:?}"),
+    }
+}
+
+async fn bootstrap_node_usage_genesis(
+    publisher: &TestNode,
+    subscriber: &TestNode,
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let node_id = publisher.net.node_id();
+    let snapshot_key = node_usage_global_key(node_id);
+    let snapshot = NodeUsageSnapshot {
+        node_id,
+        counters: UsageCounters::default(),
+    };
+    match publisher
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key: snapshot_key.clone().into(),
+            value: snapshot.to_bytes()?.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected node usage snapshot write: {other:?}").into()),
+    }
+
+    drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![DocumentSyncTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: None,
+            }],
+            allow_genesis: true,
+        }),
+        publisher.context.as_ref(),
+    )
+    .await?;
+
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        if read_node_stats(subscriber, snapshot_key.clone())
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("bootstrap node-usage genesis did not reach peer".into());
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 

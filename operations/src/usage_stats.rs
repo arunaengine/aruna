@@ -1147,6 +1147,9 @@ pub async fn publish_usage_snapshots(
             local_node_id: node_id,
             excluded_peers: Vec::new(),
             documents: targets,
+            // Steady-state publishers must not mint the shared node-usage
+            // genesis; bootstrap/placement-origin paths do that authoritatively.
+            allow_genesis: false,
         }),
         ctx,
     )
