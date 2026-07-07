@@ -68,8 +68,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "anonymous GET must be denied before a public role exists"
         );
 
-        // Anonymous DRS lookups are equally denied (403, not 401 — the object
-        // exists on this node but nothing grants the Everyone principal READ).
+        // Anonymous DRS lookups hide private existence by matching unknown ids.
         let public_hash = hex::encode(blake3::hash(PUBLIC_BODY).as_bytes());
         let drs_object_id = format!(
             "arn:aruna:{}:{}:ch/{}",
@@ -84,8 +83,23 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let drs_denied = http.get(&drs_object_url).send().await?;
         assert_eq!(
             drs_denied.status(),
-            StatusCode::FORBIDDEN,
-            "anonymous DRS lookup must be denied before a public role exists"
+            StatusCode::NOT_FOUND,
+            "anonymous DRS lookup must not reveal private existence before a public role exists"
+        );
+        let unknown_drs = http
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/arn:aruna:{}:{}:ch/{}",
+                seed.base_url,
+                seed.realm_id,
+                seed.net.node_id(),
+                "ff".repeat(32)
+            ))
+            .send()
+            .await?;
+        assert_eq!(
+            drs_denied.status(),
+            unknown_drs.status(),
+            "anonymous DRS must not distinguish existing private objects from unknown ids"
         );
 
         // Mint a public-read role scoped to the public bucket.
@@ -125,6 +139,24 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         assert_eq!(allowed.status(), StatusCode::OK);
         assert_eq!(allowed.bytes().await?.as_ref(), PUBLIC_BODY);
 
+        // Public anonymous S3 access is only object bytes, not object metadata
+        // or bucket listing/configuration surfaces.
+        let head = http.head(&object_url).send().await?;
+        assert_eq!(
+            head.status(),
+            StatusCode::FORBIDDEN,
+            "anonymous HEAD must stay denied even when GET is public"
+        );
+        let list = http
+            .get(format!("{}/{bucket}?list-type=2", s3_endpoint.endpoint_url))
+            .send()
+            .await?;
+        assert_eq!(
+            list.status(),
+            StatusCode::FORBIDDEN,
+            "anonymous bucket listing must stay denied even when object GET is public"
+        );
+
         // Anonymous writes stay denied — public roles never grant more than
         // the anonymous read path allows.
         let put = http
@@ -138,7 +170,8 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "anonymous writes must be denied even on public buckets"
         );
 
-        // Objects outside the granted path stay private.
+        // Objects outside the granted path stay private, and anonymous S3 does
+        // not distinguish an existing private bucket from an absent bucket.
         let private = http
             .get(format!(
                 "{}/private-bucket/secret.txt",
@@ -146,10 +179,31 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             ))
             .send()
             .await?;
+        let private_status = private.status();
+        let private_body = private.text().await?;
         assert_eq!(
-            private.status(),
+            private_status,
             StatusCode::FORBIDDEN,
             "the public role must not leak other buckets"
+        );
+        assert!(
+            private_body.contains("<Code>AccessDenied</Code>"),
+            "private bucket should be hidden as AccessDenied: {private_body}"
+        );
+
+        let absent = http
+            .get(format!(
+                "{}/absent-bucket/secret.txt",
+                s3_endpoint.endpoint_url
+            ))
+            .send()
+            .await?;
+        let absent_status = absent.status();
+        let absent_body = absent.text().await?;
+        assert_eq!(absent_status, private_status);
+        assert!(
+            absent_body.contains("<Code>AccessDenied</Code>"),
+            "absent bucket should match private anonymous denial: {absent_body}"
         );
 
         // Authenticated requests inherit public grants: signed access is never
@@ -193,8 +247,8 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             .await?;
         assert_eq!(
             private_drs.status(),
-            StatusCode::FORBIDDEN,
-            "anonymous DRS must not resolve private objects"
+            StatusCode::NOT_FOUND,
+            "anonymous DRS must not reveal private object existence"
         );
 
         Ok(())

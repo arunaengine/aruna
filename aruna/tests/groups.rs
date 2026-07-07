@@ -37,6 +37,21 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
     .await?;
     let group = create_group_via_http(&seed.base_url, &admin_token, "membership-flow").await?;
 
+    let everyone = UserId::nil(seed.realm_id);
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/groups/{}/members",
+            seed.base_url, group.group_id
+        ))
+        .bearer_auth(&admin_token)
+        .json(&AddGroupMemberRequest {
+            user_id: everyone.to_string(),
+            role_ids: None,
+        })
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
     let member_id = UserId::local(Ulid::new(), seed.realm_id);
     let member_token = create_bearer_token(
         seed.context.as_ref(),
@@ -133,6 +148,40 @@ async fn role_management_rejects_foreign_paths_and_protects_admin() -> TestResul
             name: "escalation".to_string(),
             permissions: HashMap::from([(format!("/{realm_id}/admin/**"), "write".to_string())]),
             assigned_users: Vec::new(),
+            public: false,
+        })
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    for permission in ["write", "deny"] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+            .bearer_auth(&admin_token)
+            .json(&CreateGroupRoleRequest {
+                name: format!("public-{permission}"),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/data/**"),
+                    permission.to_string(),
+                )]),
+                assigned_users: Vec::new(),
+                public: true,
+            })
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/v1/groups/{group_id}/roles", seed.base_url))
+        .bearer_auth(&admin_token)
+        .json(&CreateGroupRoleRequest {
+            name: "nil-assigned-user".to_string(),
+            permissions: HashMap::from([(
+                format!("/{realm_id}/g/{group_id}/data/**"),
+                "read".to_string(),
+            )]),
+            assigned_users: vec![UserId::nil(realm_id).to_string()],
             public: false,
         })
         .send()

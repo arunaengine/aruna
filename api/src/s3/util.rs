@@ -119,6 +119,10 @@ pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     }
 }
 
+pub(crate) fn is_anonymous_object_read_operation(operation_name: &str) -> bool {
+    matches!(operation_name, "GetObject")
+}
+
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
     match input.body.take() {
         None => Err(s3_error!(InvalidRequest, "Missing body")),
@@ -258,8 +262,48 @@ pub(crate) fn checksum_algorithm_from_s3(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_multipart_part_number;
+    use super::{
+        get_s3_operation_permission, is_anonymous_object_read_operation,
+        parse_multipart_part_number,
+    };
+    use crate::s3::auth::Action;
     use s3s::S3ErrorCode;
+
+    #[test]
+    fn anonymous_public_access_only_allows_get_object() {
+        assert!(is_anonymous_object_read_operation("GetObject"));
+
+        for operation in [
+            "HeadObject",
+            "GetObjectAttributes",
+            "GetObjectTagging",
+            "GetBucketCors",
+            "GetBucketVersioning",
+            "ListBuckets",
+            "ListObjectsV2",
+            "ListObjectVersions",
+            "ListMultipartUploads",
+            "ListParts",
+        ] {
+            assert!(
+                !is_anonymous_object_read_operation(operation),
+                "{operation} must not be allowed anonymously"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_read_classification_still_includes_metadata_operations() {
+        assert_eq!(get_s3_operation_permission("GetObject"), Some(Action::Read));
+        assert_eq!(
+            get_s3_operation_permission("HeadObject"),
+            Some(Action::Read)
+        );
+        assert_eq!(
+            get_s3_operation_permission("ListObjectsV2"),
+            Some(Action::Read)
+        );
+    }
 
     #[test]
     fn rejects_upload_part_number_zero() {
