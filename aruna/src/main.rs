@@ -283,7 +283,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // All startup modes: join the held shard topics (a freshly onboarded node
     // pulls existing shard data from its co-holders here), then create the
     // geneses of the shards this node is rank-0 holder of.
-    restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
+    let restore_summary =
+        restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
+    tracing::info!(
+        held_shards = restore_summary.held_shards,
+        shard_topics = restore_summary.shard_topics,
+        shared_topics = restore_summary.shared_topics,
+        "Restored held shard subscriptions",
+    );
     aruna_operations::process_placements::process_shard_placements(
         &driver_ctx,
         config.realm_id,

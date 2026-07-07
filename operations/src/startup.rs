@@ -37,6 +37,29 @@ fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5]
     ]
 }
 
+/// Fixed realm-scoped topics restored on every start (see [`shared_targets`]).
+pub const SHARED_RESTORE_TOPIC_COUNT: usize = 5;
+
+/// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
+/// invariant is `shard_topics == held_shards`, i.e. one topic per held shard,
+/// never one per stored document — asserted by the restart-traffic gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestoreShardSummary {
+    /// Shards the local node resolves into a holder of.
+    pub held_shards: usize,
+    /// Shard sync topics ensured (rank-0) or joined that this pass touched.
+    pub shard_topics: usize,
+    /// Fixed shared realm topics restored ([`SHARED_RESTORE_TOPIC_COUNT`]).
+    pub shared_topics: usize,
+}
+
+impl RestoreShardSummary {
+    /// Total distinct topics the restore ensured or joined.
+    pub fn total_topics(&self) -> usize {
+        self.shard_topics + self.shared_topics
+    }
+}
+
 /// Restarts the local node's document-sync subscriptions from the shards it
 /// holds instead of re-announcing every stored document.
 ///
@@ -45,18 +68,21 @@ fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5]
 /// and runs one anti-entropy pass against them (digest exchange, not a
 /// per-document re-announce). The fixed shared realm topics are restored the
 /// same way. Topics that share a co-holder set are batched into one ensure and
-/// one sync so a restart costs O(held shards), not O(stored documents).
+/// one sync so a restart costs O(held shards), not O(stored documents). The
+/// returned [`RestoreShardSummary`] reports the (small) topic count for callers
+/// and the restart-traffic gate.
 pub async fn restore_shard_subscriptions(
     context: &Arc<DriverContext>,
     node_id: NodeId,
     realm_id: RealmId,
-) {
+) -> RestoreShardSummary {
+    let mut summary = RestoreShardSummary::default();
     let Some(net_handle) = context.net_handle.clone() else {
-        return;
+        return summary;
     };
     let Some(config) = load_realm_config(context, realm_id).await else {
         // No config yet (fresh/onboarding node): nothing sharded to restore.
-        return;
+        return summary;
     };
 
     let realm_nodes: Vec<NodeId> = config
@@ -83,6 +109,7 @@ pub async fn restore_shard_subscriptions(
             .entry(shared_peers.clone())
             .or_default()
             .push(topic);
+        summary.shared_topics += 1;
     }
 
     for strategy in &config.strategies {
@@ -96,6 +123,7 @@ pub async fn restore_shard_subscriptions(
             if !holders.contains(&node_id) {
                 continue;
             }
+            summary.held_shards += 1;
             let local_is_rank0 = holders.first() == Some(&node_id);
             let mut co_holders: Vec<NodeId> = holders
                 .into_iter()
@@ -112,6 +140,7 @@ pub async fn restore_shard_subscriptions(
                 &mut join_groups
             };
             groups.entry(co_holders).or_default().push(topic);
+            summary.shard_topics += 1;
         }
     }
 
@@ -120,6 +149,8 @@ pub async fn restore_shard_subscriptions(
     // New-holder verification: reconcile each held shard against a co-holder and
     // persist a marker so a restart resumes only unverified shards.
     crate::shard::verify::verify_held_shards(context, node_id, realm_id).await;
+
+    summary
 }
 
 async fn restore_held_shard_topics(
