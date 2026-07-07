@@ -97,6 +97,19 @@ struct PendingMetadataCreateApply {
     lifecycle_revision: Option<DocumentSyncChange>,
 }
 
+/// Outcome of probing a shard's co-holders for an existing genesis before a
+/// rank-0 holder considers creating a fresh one. A genesis may be created only
+/// when every co-holder was reached (`unreachable` empty) and none advertised
+/// the topic (`known_by_co_holder` does not contain it); an unreachable
+/// co-holder might hold a genesis, so creation must be withheld to avoid a fork.
+#[derive(Clone, Debug, Default)]
+pub struct ShardGenesisProbe {
+    /// Probed topics at least one reached co-holder already has a genesis for.
+    pub known_by_co_holder: BTreeSet<irokle_crate::TopicId>,
+    /// Co-holders that could not be reached (empty ⇒ every co-holder answered).
+    pub unreachable: Vec<NodeId>,
+}
+
 #[derive(Clone)]
 pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
@@ -1345,6 +1358,65 @@ impl DocumentSyncService {
                 "no peers available to bootstrap document sync topic {topic_id}"
             ))
         }))
+    }
+
+    /// Probes each co-holder for an existing genesis of `topics` without
+    /// adopting anything: a rank-0 holder uses this to decide whether creating a
+    /// fresh genesis is safe (see [`ShardGenesisProbe`]). A co-holder that could
+    /// not be reached is recorded so the caller withholds creation for it.
+    pub async fn probe_shard_topic_geneses(
+        &self,
+        topics: Vec<irokle_crate::TopicId>,
+        co_holders: Vec<NodeId>,
+    ) -> ShardGenesisProbe {
+        let mut probe = ShardGenesisProbe::default();
+        if topics.is_empty() {
+            return probe;
+        }
+        // Callers pass co-holders with the local node already excluded.
+        for node_id in &co_holders {
+            let peer = node_id_to_peer_id(node_id);
+            match self.probe_topics_on_peer(&topics, peer).await {
+                Ok(advertised) => probe.known_by_co_holder.extend(advertised),
+                Err(error) => {
+                    debug!(%node_id, error = %error, "co-holder unreachable while probing shard genesis");
+                    probe.unreachable.push(*node_id);
+                }
+            }
+        }
+        probe
+    }
+
+    async fn probe_topics_on_peer(
+        &self,
+        topics: &[irokle_crate::TopicId],
+        peer: PeerId,
+    ) -> Result<BTreeSet<irokle_crate::TopicId>> {
+        let peer_addr = peer_id_to_endpoint_addr(peer)?;
+        let wanted: BTreeSet<irokle_crate::TopicId> = topics.iter().copied().collect();
+        let mut advertised = BTreeSet::new();
+        for chunk in topics.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
+            let opens: Vec<SyncMessage> = chunk
+                .iter()
+                .map(|topic| SyncMessage::Open(self.node.sync_open(*topic)))
+                .collect();
+            let responses = timeout(
+                DOCUMENT_SYNC_PEER_SYNC_TIMEOUT,
+                self.net.sync_with(peer_addr.clone(), &opens),
+            )
+            .await
+            .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
+            .map_err(NetError::from)?;
+            for response in responses {
+                if let SyncMessage::Summary(summary) = response
+                    && wanted.contains(&summary.topic_id)
+                    && !remote_summary_is_empty(&summary)
+                {
+                    advertised.insert(summary.topic_id);
+                }
+            }
+        }
+        Ok(advertised)
     }
 
     async fn bootstrap_topic_from_peer(
