@@ -54,6 +54,9 @@ use aruna_operations::s3::get_object::{
 };
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
+use aruna_operations::s3::list_multipart_uploads::{
+    ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
+};
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
@@ -81,7 +84,8 @@ use s3s::dto::{
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
     HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
-    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput,
+    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload as S3MultipartUpload,
     Object, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
     PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
     PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
@@ -1488,6 +1492,119 @@ impl S3 for ArunaS3Service {
             storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
             checksum_algorithm,
             checksum_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        debug!("Received LIST MULTIPART UPLOADS Request: {:#?}", req);
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let key_marker = req.input.key_marker.clone();
+        let requested_upload_id_marker = req.input.upload_id_marker.clone();
+        let upload_id_marker = match requested_upload_id_marker.as_deref() {
+            None => None,
+            Some(marker) => Some(
+                ulid::Ulid::from_string(marker)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid upload-id-marker"))?,
+            ),
+        };
+        let max_uploads = match req.input.max_uploads {
+            None => ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
+            Some(max_uploads) => usize::try_from(max_uploads)
+                .map_err(|_| s3_error!(InvalidArgument, "max-uploads must be non-negative"))?
+                .min(ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS),
+        };
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(LMUI {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                key_marker: key_marker.clone(),
+                upload_id_marker,
+                max_uploads,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list multipart uploads"))?;
+
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let uploads: Vec<S3MultipartUpload> = result
+            .uploads
+            .into_iter()
+            .map(|record| S3MultipartUpload {
+                key: Some(encode_field(record.key)),
+                upload_id: Some(record.upload_id.to_string()),
+                initiated: Some(record.created_at.into()),
+                initiator: Some(Initiator {
+                    display_name: None,
+                    id: Some(record.created_by.to_string()),
+                }),
+                owner: Some(Owner {
+                    display_name: None,
+                    id: Some(record.group_id.to_string()),
+                }),
+                storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                checksum_algorithm: record
+                    .checksum_hint
+                    .as_ref()
+                    .and_then(|hint| hint.algorithm)
+                    .and_then(s3_checksum_algorithm_from_core),
+                checksum_type: record
+                    .checksum_hint
+                    .as_ref()
+                    .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type)),
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(S3Response::new(ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            delimiter: delimiter.map(&encode_field),
+            key_marker,
+            upload_id_marker: requested_upload_id_marker,
+            max_uploads: Some(i32::try_from(max_uploads).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_key_marker: result.next_key_marker.map(&encode_field),
+            next_upload_id_marker: result
+                .next_upload_id_marker
+                .map(|upload_id| upload_id.to_string()),
+            uploads: Some(uploads),
+            common_prefixes: Some(common_prefixes),
+            encoding_type: req.input.encoding_type,
             ..Default::default()
         }))
     }

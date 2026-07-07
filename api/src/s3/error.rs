@@ -13,6 +13,7 @@ use aruna_operations::s3::get_bucket_info::GetBucketInfoError;
 use aruna_operations::s3::get_object::GetObjectError;
 use aruna_operations::s3::head_object::HeadObjectError;
 use aruna_operations::s3::list_buckets::ListBucketsError;
+use aruna_operations::s3::list_multipart_uploads::ListMultipartUploadsError;
 use aruna_operations::s3::list_objects_v2::ListObjectsV2Error;
 use aruna_operations::s3::list_parts::ListPartsError;
 use aruna_operations::s3::put_bucket_replication::{
@@ -128,6 +129,12 @@ impl IntoS3Error for ListPartsError {
             | ListPartsError::UploadNotOpen => no_such_upload_error(),
             err => internal_error(err),
         }
+    }
+}
+
+impl IntoS3Error for ListMultipartUploadsError {
+    fn into_s3_error(self) -> S3Error {
+        internal_error(self)
     }
 }
 

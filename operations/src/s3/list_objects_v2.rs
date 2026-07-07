@@ -327,10 +327,11 @@ impl ListObjectsV2Operation {
     }
 
     fn common_prefix_of(&self, key: &str) -> Option<String> {
-        let delimiter = self.input.delimiter.as_ref().filter(|d| !d.is_empty())?;
-        let prefix_len = self.input.prefix.as_ref().map_or(0, String::len);
-        let relative_match = key.get(prefix_len..)?.find(delimiter.as_str())?;
-        Some(key[..prefix_len + relative_match + delimiter.len()].to_string())
+        crate::s3::listing::common_prefix_of(
+            key,
+            self.input.prefix.as_deref(),
+            self.input.delimiter.as_deref(),
+        )
     }
 
     fn handle_heads_read(&mut self, event: Event) -> Effects {
