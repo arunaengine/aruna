@@ -86,6 +86,13 @@ const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// expand/forward and the outbox keys to delete once they land.
 type WatchDrainGroup = (Vec<WatchEvent>, Vec<Vec<u8>>);
 
+/// One drained outbox record with its resolved publish topic.
+type DrainRecord = (
+    Vec<u8>,
+    aruna_core::document::DocumentSyncOutboxRecord,
+    irokle::TopicId,
+);
+
 #[derive(Debug)]
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
@@ -184,6 +191,44 @@ impl DrainSyncOutcome {
         self.delete_elapsed += other.delete_elapsed;
         self.retry_needed |= other.retry_needed;
     }
+}
+
+/// Splits FIFO-ordered drain records into those to publish now and a count of
+/// those deferred because their shard topic has no local genesis yet. Each
+/// topic's availability is evaluated once per run; once a topic defers, every
+/// later record of that topic defers too. Splitting FIFO-adjacent records of one
+/// topic across a defer/publish boundary would let the newer op publish first,
+/// invert its origin sequence on receivers, and drop the older op forever as
+/// StaleOriginSequence — so a topic never straddles that boundary within a run.
+fn partition_drain_records(
+    records: Vec<DrainRecord>,
+    mut topic_available: impl FnMut(irokle::TopicId) -> bool,
+) -> (Vec<DrainRecord>, usize) {
+    let mut topic_exists: HashMap<irokle::TopicId, bool> = HashMap::new();
+    let mut deferred_topics: HashSet<irokle::TopicId> = HashSet::new();
+    let mut to_publish = Vec::with_capacity(records.len());
+    let mut deferred = 0usize;
+    for (record_key, record, topic) in records {
+        if record.target.uses_shard_topic() {
+            let available = !deferred_topics.contains(&topic)
+                && *topic_exists
+                    .entry(topic)
+                    .or_insert_with(|| topic_available(topic));
+            if !available {
+                deferred_topics.insert(topic);
+                debug!(
+                    event = "pipeline.drain.deferred",
+                    target = ?record.target,
+                    %topic,
+                    "Deferring outbox record: shard topic genesis not yet known"
+                );
+                deferred += 1;
+                continue;
+            }
+        }
+        to_publish.push((record_key, record, topic));
+    }
+    (to_publish, deferred)
 }
 
 impl OperationsTaskHandler {
@@ -366,24 +411,14 @@ impl OperationsTaskHandler {
             totals.merge(outcome);
         }
 
-        let mut deferred = 0usize;
+        let (to_publish, deferred) = partition_drain_records(records, |topic| {
+            net_handle
+                .document_sync_topic_exists(topic)
+                .unwrap_or(false)
+        });
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
-        for (record_key, record, topic) in records {
-            if record.target.uses_shard_topic()
-                && !net_handle
-                    .document_sync_topic_exists(topic)
-                    .unwrap_or(false)
-            {
-                debug!(
-                    event = "pipeline.drain.deferred",
-                    target = ?record.target,
-                    %topic,
-                    "Deferring outbox record: shard topic genesis not yet known"
-                );
-                deferred += 1;
-                continue;
-            }
+        for (record_key, record, topic) in to_publish {
             let document = document_publish_from_outbox(
                 record.outbox_id,
                 record.target.clone(),
@@ -1490,6 +1525,64 @@ mod tests {
             DocumentSyncPublish::Upsert { bytes, change: actual, .. }
                 if bytes == vec![1, 2, 3] && actual == change
         ));
+    }
+
+    fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
+        crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![origin_seq as u8],
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+        )
+    }
+
+    // Two FIFO-adjacent records for one shard topic must never split across a
+    // defer/publish boundary: if the genesis "arrives" (availability flips
+    // false→true) between the two records, the older would defer and the newer
+    // publish first, inverting their origin sequence on receivers. The fix
+    // evaluates availability once per topic, so both defer together.
+    #[test]
+    fn drain_partition_never_splits_a_topic_when_availability_flips() {
+        let topic = irokle::TopicId::hash(b"shard-genesis-race");
+        let older = shard_topic_record(1);
+        let newer = shard_topic_record(2);
+        assert!(older.target.uses_shard_topic());
+        let records = vec![
+            (b"older".to_vec(), older, topic),
+            (b"newer".to_vec(), newer, topic),
+        ];
+
+        let mut calls = 0usize;
+        let (to_publish, deferred) = partition_drain_records(records, |_| {
+            calls += 1;
+            calls > 1
+        });
+
+        assert_eq!(calls, 1, "topic availability is evaluated once per run");
+        assert!(
+            to_publish.is_empty(),
+            "no record of a deferred topic may publish"
+        );
+        assert_eq!(deferred, 2);
+    }
+
+    #[test]
+    fn drain_partition_publishes_all_records_of_an_available_topic_in_fifo_order() {
+        let topic = irokle::TopicId::hash(b"shard-genesis-present");
+        let records = vec![
+            (b"older".to_vec(), shard_topic_record(1), topic),
+            (b"newer".to_vec(), shard_topic_record(2), topic),
+        ];
+
+        let (to_publish, deferred) = partition_drain_records(records, |_| true);
+
+        assert_eq!(deferred, 0);
+        let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
+        assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(
