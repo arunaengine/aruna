@@ -117,16 +117,18 @@ pub enum OidcError {
 }
 
 /// Maps a holder-routing failure onto the REST surface: `NotFound` → 404,
-/// `Unavailable` → 503 (+Retry-After), `Remote` → 502, `Unauthorized` → 403,
-/// `Internal` → 500. A missing bearer is already rejected with 401 by the
-/// handler before it routes, so a routed authorization denial is always 403.
+/// `Unavailable` → 503 (+Retry-After), `Unauthorized` → 403, `Conflict` → 409,
+/// `BadRequest` → 400, `Internal` → 500. A missing bearer is already rejected
+/// with 401 by the handler before it routes, so a routed authorization denial is
+/// always 403.
 impl From<HolderRoutingError> for ServerError {
     fn from(error: HolderRoutingError) -> Self {
         match error {
             HolderRoutingError::NotFound => ServerError::NotFound,
             HolderRoutingError::Unavailable => ServerError::ServiceUnavailable,
-            HolderRoutingError::Remote(_) => ServerError::BadGateway,
             HolderRoutingError::Unauthorized(_) => ServerError::Forbidden,
+            HolderRoutingError::Conflict(reason) => ServerError::Conflict(reason),
+            HolderRoutingError::BadRequest(reason) => ServerError::BadRequestReason(reason),
             HolderRoutingError::Internal(message) => ServerError::InternalError(message),
         }
     }

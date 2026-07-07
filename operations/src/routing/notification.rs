@@ -19,7 +19,7 @@ fn ok(reply: NotificationReply) -> HolderProxyResponse {
 }
 
 fn internal(reason: impl ToString) -> HolderProxyResponse {
-    HolderProxyResponse::Rejected(reason.to_string())
+    HolderProxyResponse::internal(reason.to_string())
 }
 
 /// Serves a user-facing inbox read or watch mutation on this holder. The served
@@ -31,7 +31,7 @@ pub(crate) async fn serve_notification_call(
     auth: Option<AuthContext>,
 ) -> HolderProxyResponse {
     let Some(auth) = auth else {
-        return HolderProxyResponse::Rejected("notification access requires a bearer token".into());
+        return HolderProxyResponse::forbidden("notification access requires a bearer token");
     };
     let recipient = auth.user_id;
 
@@ -112,7 +112,7 @@ pub(crate) async fn serve_notification_call(
                     ok(NotificationReply::Watch(subscription))
                 }
                 Err(WatchSubscriptionError::CapExceeded) => {
-                    HolderProxyResponse::Rejected(WATCH_SUBSCRIPTION_CAP_REACHED.to_string())
+                    HolderProxyResponse::conflict(WATCH_SUBSCRIPTION_CAP_REACHED)
                 }
                 Err(error) => internal(error),
             }

@@ -528,6 +528,104 @@ async fn notification_list_serves_bearer_subject_not_wire_recipient() {
     shutdown(nodes).await;
 }
 
+// A routed membership removal that would strip a group's last admin must reach
+// the holder's operation and come back as a typed Conflict (409), not a flattened
+// authorization rejection — the status the review found regressed.
+#[tokio::test]
+async fn group_remove_last_admin_routes_conflict() {
+    let (realm_key, realm_id, owner) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config_with_geneses(&nodes, &config, realm_id).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (group_id, holders) =
+        sample_group(&config, |h| h.len() == 1 && h[0] == holder.net.node_id());
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let group = Group {
+        display_name: "team".to_string(),
+        group_id,
+        realm_id,
+        roles: HashSet::new(),
+        owner,
+    };
+    let authorization =
+        GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let admin_role_id = *authorization
+        .roles
+        .iter()
+        .find(|(_, role)| role.name == "admin")
+        .map(|(role_id, _)| role_id)
+        .expect("default group has an admin role");
+    write_group(holder, &group, &authorization).await;
+    write_realm_auth(holder, realm_id).await;
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, owner));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::RemoveMember {
+            group_id,
+            user_id: owner,
+            role_ids: Some(HashSet::from([admin_role_id])),
+        }),
+    )
+    .await
+    .expect_err("removing the last admin is a conflict");
+    assert!(
+        matches!(error, HolderRoutingError::Conflict(_)),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+// A routed self user-update with an invalid display name reaches the holder's
+// validation and returns a typed BadRequest (400) rather than a flattened refusal.
+#[tokio::test]
+async fn user_update_invalid_name_routes_bad_request() {
+    let (realm_key, realm_id, _user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (target_user, holders) = sample_user(&config, realm_id, |h| {
+        h.len() == 1 && h[0] == holder.net.node_id()
+    });
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let user = make_user(target_user, "Alice");
+    write_user(holder, &user).await;
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, target_user));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::User(UserCall::Update {
+            user_id: target_user.to_string(),
+            name: Some("   ".to_string()),
+            set_attributes: HashMap::new(),
+            remove_attributes: Vec::new(),
+        }),
+    )
+    .await
+    .expect_err("an empty display name is a bad request");
+    assert!(
+        matches!(error, HolderRoutingError::BadRequest(_)),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
 // A by-id metadata mutation from a non-holder must resolve the SAME strategy the
 // create resolved. Under a `profiles/` MetadataPathPrefix binding (replica-1) the
 // document's shard lives on one holder, while the registry class (everywhere)

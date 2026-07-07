@@ -52,7 +52,7 @@ async fn build_response(
 ) -> HolderProxyResponse {
     let realm_id = request.realm_id;
     if realm_id != *net_handle.realm_id() {
-        return HolderProxyResponse::Rejected(format!(
+        return HolderProxyResponse::forbidden(format!(
             "holder proxy peer `{peer}` addressed foreign realm `{realm_id}`"
         ));
     }
@@ -60,20 +60,22 @@ async fn build_response(
     let config = match drive(GetRealmConfigOperation::new(realm_id), context).await {
         Ok(config) => config,
         Err(GetRealmConfigError::DocumentNotFound) => {
-            return HolderProxyResponse::Rejected(format!("realm `{realm_id}` config unavailable"));
+            return HolderProxyResponse::unavailable(format!(
+                "realm `{realm_id}` config unavailable"
+            ));
         }
-        Err(error) => return HolderProxyResponse::Rejected(error.to_string()),
+        Err(error) => return HolderProxyResponse::internal(error.to_string()),
     };
 
     // Trust gate: only sync-eligible (server-class) realm nodes may proxy.
     match config.sync_eligible_node_ids() {
         Ok(eligible) if eligible.contains(&peer) => {}
         Ok(_) => {
-            return HolderProxyResponse::Rejected(format!(
+            return HolderProxyResponse::forbidden(format!(
                 "holder proxy peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
             ));
         }
-        Err(error) => return HolderProxyResponse::Rejected(error.to_string()),
+        Err(error) => return HolderProxyResponse::internal(error.to_string()),
     }
 
     // Loop guard: a target serves only its own hop and never re-forwards.
@@ -88,14 +90,14 @@ async fn build_response(
         Ok(key) => key,
         Err(MetadataStrategyKeyError::NotFound) => return HolderProxyResponse::NotHolder,
         Err(MetadataStrategyKeyError::Storage(reason)) => {
-            return HolderProxyResponse::Rejected(reason);
+            return HolderProxyResponse::internal(reason);
         }
     };
 
     let Some((placement, holders)) =
         resolve_call_holders(&config, &request.call, metadata_key.as_ref())
     else {
-        return HolderProxyResponse::Rejected("proxied call domain not yet supported".into());
+        return HolderProxyResponse::internal("proxied call domain not yet supported");
     };
     if !holders.contains(&net_handle.node_id()) {
         return HolderProxyResponse::NotHolder;
@@ -105,7 +107,7 @@ async fn build_response(
     let auth =
         match validate_proxy_bearer(context, request.bearer.as_ref().map(|b| b.as_str())).await {
             Ok(auth) => auth,
-            Err(reason) => return HolderProxyResponse::Rejected(reason),
+            Err(reason) => return HolderProxyResponse::forbidden(reason),
         };
 
     let response = serve_local(context, request.call, auth).await;
@@ -128,8 +130,8 @@ mod tests {
     use super::*;
     use crate::incoming::initialize_net_incoming;
     use crate::routing::protocol::{
-        GroupCall, HolderProxyResponse, ProxiedCall, ProxyBearerToken, read_holder_proxy_response,
-        write_holder_proxy_request,
+        GroupCall, HolderProxyResponse, ProxiedCall, ProxyBearerToken, RejectKind,
+        read_holder_proxy_response, write_holder_proxy_request,
     };
     use aruna_core::alpn::Alpn;
     use aruna_core::effects::StorageEffect;
@@ -267,7 +269,7 @@ mod tests {
 
         let response = send(&c, &b, get_group_request(realm_id, Ulid::new(), 0)).await;
         assert!(
-            matches!(&response, HolderProxyResponse::Rejected(reason) if reason.contains("not a sync-eligible node")),
+            matches!(&response, HolderProxyResponse::Rejected { kind, reason } if *kind == RejectKind::Forbidden && reason.contains("not a sync-eligible node")),
             "unexpected response: {response:?}"
         );
     }
@@ -300,7 +302,7 @@ mod tests {
         };
         let response = send(&a, &b, request).await;
         assert!(
-            matches!(&response, HolderProxyResponse::Rejected(reason) if reason.contains("requires a bearer token")),
+            matches!(&response, HolderProxyResponse::Rejected { kind, reason } if *kind == RejectKind::Forbidden && reason.contains("requires a bearer token")),
             "unexpected response: {response:?}"
         );
     }
@@ -324,7 +326,7 @@ mod tests {
         // A syntactically invalid (non-JWT) bearer must be refused by the target.
         let response = send(&a, &b, get_group_request(realm_id, Ulid::new(), 0)).await;
         assert!(
-            matches!(&response, HolderProxyResponse::Rejected(reason) if reason.contains("invalid bearer token")),
+            matches!(&response, HolderProxyResponse::Rejected { kind, reason } if *kind == RejectKind::Forbidden && reason.contains("invalid bearer token")),
             "unexpected response: {response:?}"
         );
     }

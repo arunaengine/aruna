@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use aruna_core::errors::AuthorizationError;
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    create_metadata_document as run_create_metadata_document,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentPayload, create_metadata_document as run_create_metadata_document,
 };
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation,
@@ -36,10 +37,10 @@ pub(crate) async fn serve_metadata_call(
     auth: Option<AuthContext>,
 ) -> HolderProxyResponse {
     let Some(auth) = auth else {
-        return HolderProxyResponse::Rejected("metadata mutation requires a bearer token".into());
+        return HolderProxyResponse::forbidden("metadata mutation requires a bearer token");
     };
     let Some(net_handle) = context.net_handle.as_ref() else {
-        return HolderProxyResponse::Rejected("holder has no net handle".into());
+        return HolderProxyResponse::internal("holder has no net handle");
     };
     let actor = Actor {
         node_id: net_handle.node_id(),
@@ -75,7 +76,13 @@ pub(crate) async fn serve_metadata_call(
             .await
             {
                 Ok(created) => ok(MetadataReply::Record(created.record)),
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(CreateMetadataDocumentError::MetadataError(error)) => {
+                    reject_metadata_error(&error)
+                }
+                Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
+                    HolderProxyResponse::conflict("document already exists")
+                }
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         MetadataCall::Delete { document_id } => {
@@ -95,7 +102,10 @@ pub(crate) async fn serve_metadata_call(
             {
                 Ok(()) => ok(MetadataReply::Ack),
                 Err(DeleteMetadataDocumentError::DocumentNotFound) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(DeleteMetadataDocumentError::MetadataError(error)) => {
+                    reject_metadata_error(&error)
+                }
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         MetadataCall::Update {
@@ -124,7 +134,10 @@ pub(crate) async fn serve_metadata_call(
             {
                 Ok(record) => ok(MetadataReply::Record(record)),
                 Err(UpdateMetadataDocumentError::DocumentNotFound) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(UpdateMetadataDocumentError::MetadataError(error)) => {
+                    reject_metadata_error(&error)
+                }
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
     }
@@ -142,7 +155,7 @@ async fn load_writable_record(
         Ok(Some(record)) => record,
         Ok(None) => return None,
         Err(error) => {
-            return Some(Err(HolderProxyResponse::Rejected(format!(
+            return Some(Err(HolderProxyResponse::internal(format!(
                 "metadata registry read failed: {error:?}"
             ))));
         }
@@ -170,18 +183,30 @@ async fn deny_without_write(
     .await
     {
         Ok(true) => None,
-        Ok(false) => Some(HolderProxyResponse::Rejected(
-            "caller lacks write permission".into(),
+        Ok(false) => Some(HolderProxyResponse::forbidden(
+            "caller lacks write permission",
         )),
         Err(
             AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
             | AuthorizationError::AuthDocNotFound,
-        ) => Some(HolderProxyResponse::Rejected(
-            "caller lacks write permission".into(),
+        ) => Some(HolderProxyResponse::forbidden(
+            "caller lacks write permission",
         )),
-        Err(other) => Some(HolderProxyResponse::Rejected(other.to_string())),
+        Err(other) => Some(HolderProxyResponse::internal(other.to_string())),
+    }
+}
+
+/// Maps a metadata backend error onto a typed rejection: invalid input is a 400,
+/// a missing graph is a retryable 503, and anything else is a holder-side 500.
+fn reject_metadata_error(error: &MetadataError) -> HolderProxyResponse {
+    match error {
+        MetadataError::InvalidInput(reason) => HolderProxyResponse::bad_request(reason.clone()),
+        MetadataError::GraphNotFound => {
+            HolderProxyResponse::unavailable("metadata graph not found")
+        }
+        other => HolderProxyResponse::internal(other.to_string()),
     }
 }
 

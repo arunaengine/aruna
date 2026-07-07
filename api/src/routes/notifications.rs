@@ -164,6 +164,7 @@ pub struct CreateWatchRequest {
 fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> ServerError {
     match error {
         NotificationDispatchError::Unavailable => ServerError::ServiceUnavailable,
+        NotificationDispatchError::Forbidden(_) => ServerError::Forbidden,
         NotificationDispatchError::Internal(reason) => ServerError::InternalError(reason),
         NotificationDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");
@@ -178,6 +179,7 @@ fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> Serve
         WatchDispatchError::CapExceeded => {
             ServerError::Conflict("notification watch subscription cap reached".to_string())
         }
+        WatchDispatchError::Forbidden(_) => ServerError::Forbidden,
         WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
         WatchDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");

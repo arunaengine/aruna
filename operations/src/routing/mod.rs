@@ -14,7 +14,9 @@ use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleO
 use crate::add_user_to_group::{AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation};
 use crate::auth::{NodeBearerValidationState, validate_aruna_bearer_token};
 use crate::driver::{DriverContext, drive};
-use crate::ensure_canonical_user_token_subject::EnsureCanonicalUserTokenSubjectOperation;
+use crate::ensure_canonical_user_token_subject::{
+    EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
+};
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::get_user::{GetUserError, GetUserInput, GetUserOperation};
@@ -268,7 +270,7 @@ async fn serve_group_call(
     auth: Option<AuthContext>,
 ) -> HolderProxyResponse {
     let Some(auth) = auth else {
-        return HolderProxyResponse::Rejected("group operation requires a bearer token".into());
+        return HolderProxyResponse::forbidden("group operation requires a bearer token");
     };
     match call {
         GroupCall::Get { group_id } => {
@@ -280,7 +282,7 @@ async fn serve_group_call(
                 Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {
                     HolderProxyResponse::NotFound
                 }
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         GroupCall::AddMember {
@@ -289,7 +291,7 @@ async fn serve_group_call(
             role_ids,
         } => {
             let Some(actor) = local_actor(context, &auth) else {
-                return HolderProxyResponse::Rejected("holder has no net handle".into());
+                return HolderProxyResponse::internal("holder has no net handle");
             };
             match drive(
                 AddUserToGroupOperation::new(AddUserToGroupInput {
@@ -306,7 +308,11 @@ async fn serve_group_call(
                 Err(AddUserToGroupError::RoleNotFound | AddUserToGroupError::AuthDocNotFound) => {
                     HolderProxyResponse::NotFound
                 }
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(
+                    error @ (AddUserToGroupError::Unauthorized
+                    | AddUserToGroupError::CheckPermissionsError(_)),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         GroupCall::RemoveMember {
@@ -315,7 +321,7 @@ async fn serve_group_call(
             role_ids,
         } => {
             let Some(actor) = local_actor(context, &auth) else {
-                return HolderProxyResponse::Rejected("holder has no net handle".into());
+                return HolderProxyResponse::internal("holder has no net handle");
             };
             match drive(
                 RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
@@ -333,12 +339,19 @@ async fn serve_group_call(
                     RemoveUserFromGroupError::RoleNotFound
                     | RemoveUserFromGroupError::AuthDocNotFound,
                 ) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(RemoveUserFromGroupError::LastAdmin) => {
+                    HolderProxyResponse::conflict("cannot remove the last admin of a group")
+                }
+                Err(
+                    error @ (RemoveUserFromGroupError::Unauthorized
+                    | RemoveUserFromGroupError::CheckPermissionsError(_)),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         GroupCall::AddRole { group_id, role } => {
             let Some(actor) = local_actor(context, &auth) else {
-                return HolderProxyResponse::Rejected("holder has no net handle".into());
+                return HolderProxyResponse::internal("holder has no net handle");
             };
             let realm_id = auth.realm_id;
             match drive(
@@ -360,12 +373,16 @@ async fn serve_group_call(
                         AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
                     ),
                 ) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(
+                    error @ (AddGroupRoleError::Unauthorized
+                    | AddGroupRoleError::CheckPermissionsError(_)),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         GroupCall::RemoveRole { group_id, role_id } => {
             let Some(actor) = local_actor(context, &auth) else {
-                return HolderProxyResponse::Rejected("holder has no net handle".into());
+                return HolderProxyResponse::internal("holder has no net handle");
             };
             let realm_id = auth.realm_id;
             match drive(
@@ -381,10 +398,19 @@ async fn serve_group_call(
             .await
             {
                 Ok(_) => ok_group(GroupReply::Ack),
-                Err(RemoveGroupRoleError::RoleNotFound | RemoveGroupRoleError::AuthDocNotFound) => {
-                    HolderProxyResponse::NotFound
+                Err(
+                    RemoveGroupRoleError::RoleNotFound
+                    | RemoveGroupRoleError::AuthDocNotFound
+                    | RemoveGroupRoleError::GroupNotFound,
+                ) => HolderProxyResponse::NotFound,
+                Err(RemoveGroupRoleError::AdminRoleUndeletable) => {
+                    HolderProxyResponse::conflict("the admin role of a group cannot be deleted")
                 }
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(
+                    error @ (RemoveGroupRoleError::Unauthorized
+                    | RemoveGroupRoleError::CheckPermissionsError(_)),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
     }
@@ -396,7 +422,7 @@ async fn serve_user_call(
     auth: Option<AuthContext>,
 ) -> HolderProxyResponse {
     let Some(auth) = auth else {
-        return HolderProxyResponse::Rejected("user operation requires a bearer token".into());
+        return HolderProxyResponse::forbidden("user operation requires a bearer token");
     };
     match call {
         UserCall::Get { user_id } => {
@@ -413,7 +439,10 @@ async fn serve_user_call(
             {
                 Ok(user) => ok_user(UserReply::User(user)),
                 Err(GetUserError::UserNotFound) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(error @ (GetUserError::Unauthorized | GetUserError::AuthorizationError(_))) => {
+                    HolderProxyResponse::forbidden(error.to_string())
+                }
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         UserCall::Update {
@@ -423,7 +452,7 @@ async fn serve_user_call(
             remove_attributes,
         } => {
             let Some(actor) = local_actor(context, &auth) else {
-                return HolderProxyResponse::Rejected("holder has no net handle".into());
+                return HolderProxyResponse::internal("holder has no net handle");
             };
             let self_realm_id = auth.realm_id;
             match drive(
@@ -442,7 +471,17 @@ async fn serve_user_call(
             {
                 Ok(user) => ok_user(UserReply::User(user)),
                 Err(UpdateUserError::UserNotFound) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(
+                    error @ (UpdateUserError::InvalidUserName
+                    | UpdateUserError::InvalidAttributeKey(_)
+                    | UpdateUserError::InvalidAttributeValue(_)
+                    | UpdateUserError::TooManyAttributes),
+                ) => HolderProxyResponse::bad_request(error.to_string()),
+                Err(
+                    error
+                    @ (UpdateUserError::Unauthorized | UpdateUserError::AuthorizationError(_)),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         // `user_id` is a routing hint only; the served identity is the validated
@@ -451,7 +490,7 @@ async fn serve_user_call(
             match drive(ReadUserDocumentOperation::new(auth.user_id), context).await {
                 Ok(user) => ok_user(UserReply::User(user)),
                 Err(ReadUserDocumentError::NotFound) => HolderProxyResponse::NotFound,
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
         UserCall::EnsureCanonicalTokenSubject { .. } => {
@@ -462,7 +501,11 @@ async fn serve_user_call(
             .await
             {
                 Ok(()) => ok_user(UserReply::TokenSubjectEnsured),
-                Err(other) => HolderProxyResponse::Rejected(other.to_string()),
+                Err(
+                    error @ (EnsureCanonicalUserTokenSubjectError::Unauthorized
+                    | EnsureCanonicalUserTokenSubjectError::Forbidden),
+                ) => HolderProxyResponse::forbidden(error.to_string()),
+                Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
     }

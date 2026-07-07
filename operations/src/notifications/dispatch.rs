@@ -14,8 +14,8 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_watch_subscription,
-    delete_watch_subscription, list_watch_subscriptions,
+    WatchSubscriptionError, create_watch_subscription, delete_watch_subscription,
+    list_watch_subscriptions,
 };
 use crate::routing::dispatch::{HolderRoutingError, dispatch_holder_call};
 use crate::routing::protocol::{NotificationCall, NotificationReply, ProxiedCall, ProxiedReply};
@@ -27,6 +27,8 @@ use crate::routing::protocol::{NotificationCall, NotificationReply, ProxiedCall,
 pub enum NotificationDispatchError {
     #[error("no inbox holder is currently available")]
     Unavailable,
+    #[error("holder rejected the request: {0}")]
+    Forbidden(String),
     #[error("holder proxy failed: {0}")]
     Remote(String),
     #[error("{0}")]
@@ -41,6 +43,8 @@ pub enum WatchDispatchError {
     Unavailable,
     #[error("notification watch subscription cap reached")]
     CapExceeded,
+    #[error("holder rejected the request: {0}")]
+    Forbidden(String),
     #[error("holder proxy failed: {0}")]
     Remote(String),
     #[error("{0}")]
@@ -51,6 +55,7 @@ impl From<NotificationDispatchError> for WatchDispatchError {
     fn from(error: NotificationDispatchError) -> Self {
         match error {
             NotificationDispatchError::Unavailable => WatchDispatchError::Unavailable,
+            NotificationDispatchError::Forbidden(reason) => WatchDispatchError::Forbidden(reason),
             NotificationDispatchError::Remote(reason) => WatchDispatchError::Remote(reason),
             NotificationDispatchError::Internal(reason) => WatchDispatchError::Internal(reason),
         }
@@ -120,17 +125,18 @@ async fn dispatch_notification(
     .await
     .map_err(|error| match error {
         HolderRoutingError::Unavailable => NotificationDispatchError::Unavailable,
-        HolderRoutingError::Remote(reason) | HolderRoutingError::Unauthorized(reason) => {
-            NotificationDispatchError::Remote(reason)
-        }
+        HolderRoutingError::Unauthorized(reason) => NotificationDispatchError::Forbidden(reason),
         HolderRoutingError::NotFound => {
             NotificationDispatchError::Internal("inbox holder reported not found".to_string())
         }
-        HolderRoutingError::Internal(reason) => NotificationDispatchError::Internal(reason),
+        HolderRoutingError::Conflict(reason)
+        | HolderRoutingError::BadRequest(reason)
+        | HolderRoutingError::Internal(reason) => NotificationDispatchError::Internal(reason),
     })?;
     match reply {
         ProxiedReply::Notification(notification_reply) => Ok(*notification_reply),
-        _ => Err(NotificationDispatchError::Internal(
+        // A holder that answers with the wrong domain is a misbehaving upstream.
+        _ => Err(NotificationDispatchError::Remote(
             "holder returned a non-notification reply".to_string(),
         )),
     }
@@ -153,20 +159,20 @@ async fn dispatch_watch(
     .await
     .map_err(|error| match error {
         HolderRoutingError::Unavailable => WatchDispatchError::Unavailable,
-        HolderRoutingError::Unauthorized(reason) if reason == WATCH_SUBSCRIPTION_CAP_REACHED => {
-            WatchDispatchError::CapExceeded
-        }
-        HolderRoutingError::Remote(reason) | HolderRoutingError::Unauthorized(reason) => {
-            WatchDispatchError::Remote(reason)
-        }
+        // The per-user watch cap is the only conflict a watch holder returns.
+        HolderRoutingError::Conflict(_) => WatchDispatchError::CapExceeded,
+        HolderRoutingError::Unauthorized(reason) => WatchDispatchError::Forbidden(reason),
         HolderRoutingError::NotFound => {
             WatchDispatchError::Internal("inbox holder reported not found".to_string())
         }
-        HolderRoutingError::Internal(reason) => WatchDispatchError::Internal(reason),
+        HolderRoutingError::BadRequest(reason) | HolderRoutingError::Internal(reason) => {
+            WatchDispatchError::Internal(reason)
+        }
     })?;
     match reply {
         ProxiedReply::Notification(notification_reply) => Ok(*notification_reply),
-        _ => Err(WatchDispatchError::Internal(
+        // A holder that answers with the wrong domain is a misbehaving upstream.
+        _ => Err(WatchDispatchError::Remote(
             "holder returned a non-notification reply".to_string(),
         )),
     }

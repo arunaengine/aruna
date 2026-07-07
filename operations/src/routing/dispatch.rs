@@ -7,6 +7,7 @@ use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::routing::client::send_holder_proxy_request;
 use crate::routing::protocol::{
     HolderProxyRequest, HolderProxyResponse, ProxiedCall, ProxiedReply, ProxyBearerToken,
+    RejectKind,
 };
 use crate::routing::{
     MetadataStrategyKey, MetadataStrategyKeyError, load_metadata_strategy_key,
@@ -14,20 +15,35 @@ use crate::routing::{
 };
 
 /// Outcome of routing a proxied call. Designed so the api layer maps
-/// `NotFound` → 404, `Unavailable` → 503 (+Retry-After), `Remote` → 502,
-/// `Unauthorized` → 401/403, and `Internal` → 500.
+/// `NotFound` → 404, `Unavailable` → 503 (+Retry-After), `Unauthorized` → 403,
+/// `Conflict` → 409, `BadRequest` → 400, and `Internal` → 500. Holder rejections
+/// carry a typed [`RejectKind`] so a domain error keeps its status across the proxy.
 #[derive(Debug, Error)]
 pub enum HolderRoutingError {
     #[error("resource not found")]
     NotFound,
     #[error("no reachable holder for the requested resource")]
     Unavailable,
-    #[error("holder proxy error: {0}")]
-    Remote(String),
     #[error("holder rejected the request: {0}")]
     Unauthorized(String),
+    #[error("holder rejected the request: {0}")]
+    Conflict(String),
+    #[error("holder rejected the request: {0}")]
+    BadRequest(String),
     #[error("{0}")]
     Internal(String),
+}
+
+/// Maps a holder's typed rejection onto the routing error the api layer maps to a
+/// status. `Unavailable` drops its reason to match the general 503 path.
+fn rejection_to_routing_error(kind: RejectKind, reason: String) -> HolderRoutingError {
+    match kind {
+        RejectKind::Forbidden => HolderRoutingError::Unauthorized(reason),
+        RejectKind::Conflict => HolderRoutingError::Conflict(reason),
+        RejectKind::BadRequest => HolderRoutingError::BadRequest(reason),
+        RejectKind::Unavailable => HolderRoutingError::Unavailable,
+        RejectKind::Internal => HolderRoutingError::Internal(reason),
+    }
 }
 
 /// Routes a user-authorized call to a current holder of its subject shard.
@@ -154,8 +170,8 @@ async fn run_pass(
         match send_holder_proxy_request(net_handle, holder, request).await {
             Ok(HolderProxyResponse::Ok(reply)) => return Ok(PassOutcome::Done(reply)),
             Ok(HolderProxyResponse::NotFound) => return Err(HolderRoutingError::NotFound),
-            Ok(HolderProxyResponse::Rejected(reason)) => {
-                return Err(HolderRoutingError::Unauthorized(reason));
+            Ok(HolderProxyResponse::Rejected { kind, reason }) => {
+                return Err(rejection_to_routing_error(kind, reason));
             }
             Ok(HolderProxyResponse::NotHolder) => saw_not_holder = true,
             Err(_unreachable) => continue,
@@ -173,7 +189,9 @@ fn map_local_response(response: HolderProxyResponse) -> Result<PassOutcome, Hold
     match response {
         HolderProxyResponse::Ok(reply) => Ok(PassOutcome::Done(reply)),
         HolderProxyResponse::NotFound => Err(HolderRoutingError::NotFound),
-        HolderProxyResponse::Rejected(reason) => Err(HolderRoutingError::Unauthorized(reason)),
+        HolderProxyResponse::Rejected { kind, reason } => {
+            Err(rejection_to_routing_error(kind, reason))
+        }
         // The local node was resolved into the holder set, so it cannot answer
         // `NotHolder`; treat any such inconsistency as an internal error.
         HolderProxyResponse::NotHolder => Err(HolderRoutingError::Internal(

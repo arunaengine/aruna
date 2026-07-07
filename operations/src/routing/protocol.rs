@@ -214,15 +214,74 @@ pub enum NotificationCall {
     },
 }
 
+/// Why a holder refused to serve a call. The origin maps each kind onto an HTTP
+/// status, so a domain error keeps its meaning across the proxy instead of
+/// collapsing every refusal into one status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectKind {
+    /// Authenticated but not permitted (→ 403).
+    Forbidden,
+    /// Conflicts with current state, e.g. the last admin or a per-user cap (→ 409).
+    Conflict,
+    /// Malformed or failed validation (→ 400).
+    BadRequest,
+    /// The holder cannot serve right now; the caller may retry (→ 503).
+    Unavailable,
+    /// A holder-side storage or internal failure (→ 500).
+    Internal,
+}
+
 /// Holder response. `NotHolder` tells the origin to retry another holder;
-/// `NotFound` from a reachable holder is authoritative; `Rejected` carries an
-/// authorization or validation failure reason.
+/// `NotFound` from a reachable holder is authoritative; `Rejected` carries a
+/// typed refusal `kind` plus a human-readable `reason`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HolderProxyResponse {
     Ok(ProxiedReply),
     NotFound,
     NotHolder,
-    Rejected(String),
+    Rejected { kind: RejectKind, reason: String },
+}
+
+impl HolderProxyResponse {
+    /// A 403 refusal: the caller is authenticated but not permitted.
+    pub fn forbidden(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            kind: RejectKind::Forbidden,
+            reason: reason.into(),
+        }
+    }
+
+    /// A 409 refusal: the request conflicts with current state.
+    pub fn conflict(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            kind: RejectKind::Conflict,
+            reason: reason.into(),
+        }
+    }
+
+    /// A 400 refusal: the request is malformed or fails validation.
+    pub fn bad_request(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            kind: RejectKind::BadRequest,
+            reason: reason.into(),
+        }
+    }
+
+    /// A 503 refusal: the holder cannot serve right now.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            kind: RejectKind::Unavailable,
+            reason: reason.into(),
+        }
+    }
+
+    /// A 500 refusal: a holder-side storage or internal failure.
+    pub fn internal(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            kind: RejectKind::Internal,
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Typed reply payload, grown one domain per commit.
@@ -401,7 +460,9 @@ mod tests {
         for control in [
             HolderProxyResponse::NotFound,
             HolderProxyResponse::NotHolder,
-            HolderProxyResponse::Rejected("nope".to_string()),
+            HolderProxyResponse::forbidden("nope"),
+            HolderProxyResponse::conflict("last admin"),
+            HolderProxyResponse::bad_request("invalid"),
         ] {
             let bytes = postcard::to_allocvec(&control).unwrap();
             assert_eq!(
