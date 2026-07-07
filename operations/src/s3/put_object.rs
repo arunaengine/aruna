@@ -555,11 +555,14 @@ impl PutObjectOperation {
                     self.start_usage_update(txn_id)
                 }
             }
-            Err(err) => self.emit_error(err.into()),
+            Err(err) => {
+                self.pending_error = Some(err.into());
+                self.reject_over_quota()
+            }
         }
     }
 
-    /// Unwinds the pending write after a quota rejection: aborts the open
+    /// Unwinds the pending write after quota/accounting failure: aborts the open
     /// transaction, then deletes the orphaned blob, before surfacing the error.
     fn reject_over_quota(&mut self) -> Effects {
         self.state = PutObjectState::QuotaRejectAbort;
@@ -598,7 +601,10 @@ impl PutObjectOperation {
                 self.state = PutObjectState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            Err(err) => self.emit_error(err.into()),
+            Err(err) => {
+                self.pending_error = Some(err.into());
+                self.reject_over_quota()
+            }
         }
     }
 
@@ -795,19 +801,24 @@ impl Operation for PutObjectOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
-    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::s3::put_object::{
+        PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectState,
+    };
+    use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
     };
+    use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-        HashPathIndexKey, RealmId, VersionKey,
+        HashPathIndexKey, RealmId, UsageDelta, VersionKey,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -844,6 +855,135 @@ mod test {
         };
 
         value
+    }
+
+    fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
+        BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "path".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: std::time::SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: HashMap::new(),
+        }
+    }
+
+    fn put_config(
+        realm_id: RealmId,
+        group_id: Ulid,
+        node_id: aruna_core::NodeId,
+    ) -> PutObjectConfig {
+        PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: None,
+                body: None,
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            quota_ceiling: Some(1),
+        }
+    }
+
+    #[test]
+    fn quota_gate_error_aborts_transaction_and_deletes_written_blob() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::new();
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
+        let txn_id = Ulid::new();
+        let location = test_location(op.config.user_id);
+
+        op.state = PutObjectState::EnforceQuota;
+        op.txn_id = Some(txn_id);
+        op.written_location = Some(location.clone());
+        op.quota_gate = Some(QuotaGate::new(1, 1, group_id, node_id));
+
+        let effects = op.handle_enforce_quota(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id: observed }) if observed == txn_id
+        ));
+        assert_eq!(op.txn_id, None);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+
+        let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
+            panic!("expected blob cleanup")
+        };
+        assert_eq!(deleted, &location);
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(crate::s3::put_object::PutObjectError::QuotaGateError(_))
+        ));
+    }
+
+    #[test]
+    fn usage_update_error_aborts_transaction_and_deletes_written_blob() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::new();
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
+        let txn_id = Ulid::new();
+        let location = test_location(op.config.user_id);
+
+        op.state = PutObjectState::UpdateUsage;
+        op.txn_id = Some(txn_id);
+        op.written_location = Some(location.clone());
+        op.usage_update = Some(UsageCounterUpdate::with_global(
+            group_id,
+            UsageDelta::default(),
+            UsageDelta::default(),
+        ));
+
+        let effects = op.handle_usage_update(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id: observed }) if observed == txn_id
+        ));
+        assert_eq!(op.txn_id, None);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+
+        let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
+            panic!("expected blob cleanup")
+        };
+        assert_eq!(deleted, &location);
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(crate::s3::put_object::PutObjectError::UsageUpdateError(_))
+        ));
     }
 
     #[tokio::test]
