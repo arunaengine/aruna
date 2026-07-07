@@ -96,20 +96,24 @@ struct DrainSubBatch {
     peers: Vec<aruna_core::NodeId>,
     documents: Vec<DocumentSyncPublish>,
     topics: Vec<irokle::TopicId>,
+    targets: Vec<DocumentSyncTarget>,
     record_keys: Vec<Vec<u8>>,
 }
 
 impl DrainSubBatch {
     fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
+        let mut topics = Vec::with_capacity(indices.len());
         let mut targets = Vec::with_capacity(indices.len());
         let mut record_keys = Vec::with_capacity(indices.len());
         for &index in indices {
+            topics.push(*self.topics.get(index)?);
             targets.push(self.targets.get(index)?.clone());
             record_keys.push(self.record_keys.get(index)?.clone());
         }
         Some(Self {
             peers: self.peers.clone(),
             documents: Vec::new(),
+            topics,
             targets,
             record_keys,
         })
@@ -201,29 +205,39 @@ impl DrainSyncOutcome {
     }
 }
 
+/// Per-run defer state, carried across the drain's pages so a topic deferred on
+/// one page keeps deferring on later pages (preserving FIFO within a topic) and
+/// each topic's genesis presence is probed at most once per run.
+#[derive(Default)]
+struct DrainDeferState {
+    topic_exists: HashMap<irokle::TopicId, bool>,
+    deferred_topics: HashSet<irokle::TopicId>,
+}
+
 /// Splits FIFO-ordered drain records into those to publish now and a count of
 /// those deferred because their shard topic has no local genesis yet. Each
-/// topic's availability is evaluated once per run; once a topic defers, every
-/// later record of that topic defers too. Splitting FIFO-adjacent records of one
-/// topic across a defer/publish boundary would let the newer op publish first,
-/// invert its origin sequence on receivers, and drop the older op forever as
-/// StaleOriginSequence — so a topic never straddles that boundary within a run.
+/// topic's availability is evaluated once per run (state persists in `defer`);
+/// once a topic defers, every later record of that topic defers too. Splitting
+/// FIFO-adjacent records of one topic across a defer/publish boundary would let
+/// the newer op publish first, invert its origin sequence on receivers, and drop
+/// the older op forever as StaleOriginSequence — so a topic never straddles that
+/// boundary within a run, across pages included.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
+    defer: &mut DrainDeferState,
     mut topic_available: impl FnMut(irokle::TopicId) -> bool,
 ) -> (Vec<DrainRecord>, usize) {
-    let mut topic_exists: HashMap<irokle::TopicId, bool> = HashMap::new();
-    let mut deferred_topics: HashSet<irokle::TopicId> = HashSet::new();
     let mut to_publish = Vec::with_capacity(records.len());
     let mut deferred = 0usize;
     for (record_key, record, topic) in records {
         if record.target.uses_shard_topic() {
-            let available = !deferred_topics.contains(&topic)
-                && *topic_exists
+            let available = !defer.deferred_topics.contains(&topic)
+                && *defer
+                    .topic_exists
                     .entry(topic)
                     .or_insert_with(|| topic_available(topic));
             if !available {
-                deferred_topics.insert(topic);
+                defer.deferred_topics.insert(topic);
                 debug!(
                     event = "pipeline.drain.deferred",
                     target = ?record.target,
@@ -312,32 +326,6 @@ impl OperationsTaskHandler {
     async fn drain_document_sync_outbox(&self) {
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
-        let batch =
-            match read_outbox_records(&self.context.storage_handle, &[], OUTBOX_DRAIN_BATCH_SIZE)
-                .await
-            {
-                Ok(batch) if batch.records.is_empty() => {
-                    if batch.has_more {
-                        self.reschedule_timer(retry_key, Duration::ZERO).await;
-                    } else {
-                        self.reset_backoff(&retry_key);
-                    }
-                    return;
-                }
-                Ok(batch) => batch,
-                Err(error) => {
-                    warn!(error = %error, "Failed to read document sync outbox record");
-                    self.reschedule_with_backoff(retry_key).await;
-                    return;
-                }
-            };
-        let scan_elapsed = drain_started.elapsed();
-        let record_count = batch.records.len();
-        let oldest_record_ms = batch
-            .records
-            .iter()
-            .map(|(_, record)| record.outbox_id.timestamp_ms())
-            .min();
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
@@ -351,185 +339,260 @@ impl OperationsTaskHandler {
         // config so they publish onto the right shard topic. Records that
         // already carry a real ref (metadata upserts/deletes) keep it.
         let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
+
         let mut totals = DrainSyncOutcome::default();
-
-        let records: Vec<(
-            Vec<u8>,
-            aruna_core::document::DocumentSyncOutboxRecord,
-            irokle::TopicId,
-        )> = batch
-            .records
-            .into_iter()
-            .map(|(record_key, mut record)| {
-                record.placement = resolve_publish_placement(
-                    realm_config.as_ref(),
-                    &record.target,
-                    record.placement,
-                );
-                let topic = record.target.sync_topic_id(realm_id, &record.placement);
-                (record_key, record, topic)
-            })
-            .collect();
-
-        // Shard topics are join-only for this node unless it is the shard's
-        // rank-0 holder: a record whose topic has no local genesis yet cannot
-        // publish. Try one bootstrap pass against the record's peers (falling
-        // back to the shard's resolved holders when the record carries none,
-        // as admin operations do), then defer whatever is still missing to a
-        // short retry — the genesis arrives via gossip or the next pass.
-        let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
-            BTreeMap::new();
-        for (_, record, topic) in &records {
-            if !record.target.uses_shard_topic()
-                || net_handle
-                    .document_sync_topic_exists(*topic)
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-            let mut bootstrap_peers = record.peers.clone();
-            if bootstrap_peers.is_empty()
-                && let Some(config) = realm_config.as_ref()
-            {
-                bootstrap_peers =
-                    crate::placement::resolve_shard_holders(config, &record.placement);
-                bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
-                crate::sync_placement::sort_node_ids(&mut bootstrap_peers);
-            }
-            if bootstrap_peers.is_empty() {
-                continue;
-            }
-            missing_topics
-                .entry(bootstrap_peers)
-                .or_default()
-                .insert(*topic);
-        }
-        for (peers, topics) in missing_topics {
-            let event = net_handle
-                .sync_document_topics(topics.into_iter().collect(), peers)
-                .await;
-            let outcome = self
-                .finish_sync_drain_subbatch(
-                    &retry_key,
-                    Vec::new(),
-                    Event::Net(NetEvent::DocumentSync(event)),
-                    Default::default(),
-                )
-                .await;
-            totals.merge(outcome);
-        }
-
-        let (to_publish, deferred) = partition_drain_records(records, |topic| {
-            net_handle
-                .document_sync_topic_exists(topic)
-                .unwrap_or(false)
-        });
-        let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
-            BTreeMap::new();
-        for (record_key, record, topic) in to_publish {
-            let document = document_publish_from_outbox(
-                record.outbox_id,
-                record.target.clone(),
-                record.event,
-                record.placement,
-                record.allow_genesis,
-            );
-
-            let subbatches = publish_groups.entry(record.peers.clone()).or_default();
-            if subbatches
-                .last()
-                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
-            {
-                subbatches.push(DrainSubBatch {
-                    peers: record.peers,
-                    documents: Vec::new(),
-                    topics: Vec::new(),
-                    record_keys: Vec::new(),
-                });
-            }
-            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
-            subbatch.documents.push(document);
-            subbatch.topics.push(topic);
-            subbatch.record_keys.push(record_key);
-        }
-
-        let group_count = publish_groups.len();
-        let subbatches: Vec<DrainSubBatch> = publish_groups.into_values().flatten().collect();
-        let subbatch_count = subbatches.len();
-
-        // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
-        // sub-batches enter the sync stage strictly in submission order.
+        let mut defer_state = DrainDeferState::default();
+        let mut start_after: Option<Vec<u8>> = None;
+        let mut scan_elapsed = Duration::ZERO;
         let mut publish_elapsed = Duration::ZERO;
-        let mut awaiting_sync: Option<DrainSubBatch> = None;
-        for mut subbatch in subbatches {
-            let documents = std::mem::take(&mut subbatch.documents);
-            let peers = subbatch.peers.clone();
-            let publish = async {
-                let publish_started = Instant::now();
-                let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::PublishDocuments { documents, peers },
-                    )))
-                    .await;
-                (event, publish_started.elapsed())
-            };
-            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
-                publish,
-                self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-            );
-            publish_elapsed += publish_time;
-            totals.merge(sync_outcome);
-            match publish_event {
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
-                    ..
-                })) => {
-                    awaiting_sync = Some(subbatch);
+        let mut record_count = 0usize;
+        let mut deferred_total = 0usize;
+        let mut group_count = 0usize;
+        let mut subbatch_count = 0usize;
+        let mut pages = 0usize;
+        let mut oldest_record_ms: Option<u64> = None;
+        let mut read_failed = false;
+
+        // Drain the whole outbox in pages every run rather than only the FIFO
+        // head: a page of permanently-deferred records (a missing shard genesis)
+        // at the head must never starve records for other topics sitting behind
+        // it. Deferred records are left in place but paged past; published
+        // records are deleted, so the next run reads from the head again. The
+        // per-topic defer state carries across pages so a topic deferred on one
+        // page keeps deferring on the next (FIFO within a topic).
+        loop {
+            let scan_started = Instant::now();
+            let batch = match read_outbox_records(
+                &self.context.storage_handle,
+                &[],
+                start_after.clone(),
+                OUTBOX_DRAIN_BATCH_SIZE,
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(error = %error, "Failed to read document sync outbox record");
+                    read_failed = true;
+                    break;
                 }
-                Event::Net(NetEvent::DocumentSync(
-                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
-                        published_indices,
-                        retry_indices,
-                        error,
-                    },
-                )) => {
-                    warn!(
-                        key = ?retry_key,
-                        published = published_indices.len(),
-                        retry = retry_indices.len(),
-                        error = %error,
-                        "Partially created local document sync batch"
+            };
+            scan_elapsed += scan_started.elapsed();
+            if batch.records.is_empty() {
+                break;
+            }
+            pages += 1;
+            let has_more = batch.has_more;
+            start_after = batch.records.last().map(|(key, _)| key.clone());
+            record_count += batch.records.len();
+            if let Some(page_oldest) = batch
+                .records
+                .iter()
+                .map(|(_, record)| record.outbox_id.timestamp_ms())
+                .min()
+            {
+                oldest_record_ms =
+                    Some(oldest_record_ms.map_or(page_oldest, |current| current.min(page_oldest)));
+            }
+
+            let records: Vec<DrainRecord> = batch
+                .records
+                .into_iter()
+                .map(|(record_key, mut record)| {
+                    record.placement = resolve_publish_placement(
+                        realm_config.as_ref(),
+                        &record.target,
+                        record.placement,
                     );
-                    totals.retry_needed = true;
-                    match subbatch.sync_subset(&published_indices) {
-                        Some(published_subbatch) if !published_subbatch.record_keys.is_empty() => {
-                            awaiting_sync = Some(published_subbatch);
-                        }
-                        Some(_) => {}
-                        None => {
-                            warn!(key = ?retry_key, "Invalid partial document publish indices");
+                    let topic = record.target.sync_topic_id(realm_id, &record.placement);
+                    (record_key, record, topic)
+                })
+                .collect();
+
+            // Shard topics are join-only for this node unless it is the shard's
+            // rank-0 holder: a record whose topic has no local genesis yet cannot
+            // publish. Try one bootstrap pass against the record's peers (falling
+            // back to the shard's resolved holders when the record carries none,
+            // as admin operations do), then defer whatever is still missing to a
+            // short retry — the genesis arrives via gossip or the next pass. A
+            // topic already deferred earlier this run is skipped: its records
+            // stay deferred regardless, and re-probing would only waste RPCs.
+            let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
+                BTreeMap::new();
+            for (_, record, topic) in &records {
+                if !record.target.uses_shard_topic()
+                    || defer_state.deferred_topics.contains(topic)
+                    || net_handle
+                        .document_sync_topic_exists(*topic)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let mut bootstrap_peers = record.peers.clone();
+                if bootstrap_peers.is_empty()
+                    && let Some(config) = realm_config.as_ref()
+                {
+                    bootstrap_peers =
+                        crate::placement::resolve_shard_holders(config, &record.placement);
+                    bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
+                    crate::sync_placement::sort_node_ids(&mut bootstrap_peers);
+                }
+                if bootstrap_peers.is_empty() {
+                    continue;
+                }
+                missing_topics
+                    .entry(bootstrap_peers)
+                    .or_default()
+                    .insert(*topic);
+            }
+            for (peers, topics) in missing_topics {
+                let event = net_handle
+                    .sync_document_topics(topics.into_iter().collect(), peers)
+                    .await;
+                let outcome = self
+                    .finish_sync_drain_subbatch(
+                        &retry_key,
+                        Vec::new(),
+                        Vec::new(),
+                        Event::Net(NetEvent::DocumentSync(event)),
+                        Default::default(),
+                    )
+                    .await;
+                totals.merge(outcome);
+            }
+
+            let (to_publish, deferred) =
+                partition_drain_records(records, &mut defer_state, |topic| {
+                    net_handle
+                        .document_sync_topic_exists(topic)
+                        .unwrap_or(false)
+                });
+            deferred_total += deferred;
+
+            let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
+                BTreeMap::new();
+            for (record_key, record, topic) in to_publish {
+                let document = document_publish_from_outbox(
+                    record.outbox_id,
+                    record.target.clone(),
+                    record.event,
+                    record.placement,
+                    record.allow_genesis,
+                );
+
+                let subbatches = publish_groups.entry(record.peers.clone()).or_default();
+                if subbatches
+                    .last()
+                    .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+                {
+                    subbatches.push(DrainSubBatch {
+                        peers: record.peers,
+                        documents: Vec::new(),
+                        topics: Vec::new(),
+                        targets: Vec::new(),
+                        record_keys: Vec::new(),
+                    });
+                }
+                let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
+                subbatch.documents.push(document);
+                subbatch.topics.push(topic);
+                subbatch.targets.push(record.target);
+                subbatch.record_keys.push(record_key);
+            }
+
+            group_count += publish_groups.len();
+            let subbatches: Vec<DrainSubBatch> = publish_groups.into_values().flatten().collect();
+            subbatch_count += subbatches.len();
+
+            // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
+            // sub-batches enter the sync stage strictly in submission order.
+            let mut awaiting_sync: Option<DrainSubBatch> = None;
+            for mut subbatch in subbatches {
+                let documents = std::mem::take(&mut subbatch.documents);
+                let peers = subbatch.peers.clone();
+                let publish = async {
+                    let publish_started = Instant::now();
+                    let event = net_handle
+                        .send_effect(Effect::Net(NetEffect::DocumentSync(
+                            DocumentSyncEffect::PublishDocuments { documents, peers },
+                        )))
+                        .await;
+                    (event, publish_started.elapsed())
+                };
+                let ((publish_event, publish_time), sync_outcome) = tokio::join!(
+                    publish,
+                    self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
+                );
+                publish_elapsed += publish_time;
+                totals.merge(sync_outcome);
+                match publish_event {
+                    Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPublished { .. },
+                    )) => {
+                        awaiting_sync = Some(subbatch);
+                    }
+                    Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                            published_indices,
+                            retry_indices,
+                            error,
+                        },
+                    )) => {
+                        warn!(
+                            key = ?retry_key,
+                            published = published_indices.len(),
+                            retry = retry_indices.len(),
+                            error = %error,
+                            "Partially created local document sync batch"
+                        );
+                        totals.retry_needed = true;
+                        match subbatch.sync_subset(&published_indices) {
+                            Some(published_subbatch)
+                                if !published_subbatch.record_keys.is_empty() =>
+                            {
+                                awaiting_sync = Some(published_subbatch);
+                            }
+                            Some(_) => {}
+                            None => {
+                                warn!(key = ?retry_key, "Invalid partial document publish indices");
+                            }
                         }
                     }
-                }
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                    error, ..
-                })) => {
-                    warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
-                    totals.retry_needed = true;
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
-                    totals.retry_needed = true;
-                }
-                other => {
-                    warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
-                    totals.retry_needed = true;
+                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                        error,
+                        ..
+                    })) => {
+                        warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
+                        totals.retry_needed = true;
+                    }
+                    Event::Net(NetEvent::Error(error)) => {
+                        warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                        totals.retry_needed = true;
+                    }
+                    other => {
+                        warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                        totals.retry_needed = true;
+                    }
                 }
             }
+            let sync_outcome = self
+                .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
+                .await;
+            totals.merge(sync_outcome);
+
+            if !has_more {
+                break;
+            }
         }
-        let sync_outcome = self
-            .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-            .await;
-        totals.merge(sync_outcome);
+
+        if record_count == 0 {
+            if read_failed {
+                self.reschedule_with_backoff(retry_key).await;
+            } else {
+                self.reset_backoff(&retry_key);
+            }
+            return;
+        }
 
         let oldest_age_ms = oldest_record_ms
             .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
@@ -537,9 +600,10 @@ impl OperationsTaskHandler {
         info!(
             event = "pipeline.drain.summary",
             records = record_count,
-            deferred,
+            deferred = deferred_total,
             groups = group_count,
             subbatches = subbatch_count,
+            pages,
             scan_ms = duration_ms(scan_elapsed),
             publish_ms = duration_ms(publish_elapsed),
             sync_ms = duration_ms(totals.sync_elapsed),
@@ -548,20 +612,16 @@ impl OperationsTaskHandler {
             total_ms = duration_ms(drain_started.elapsed()),
             oldest_age_ms,
             retry = totals.retry_needed,
-            has_more = batch.has_more,
             "Document sync outbox drain summary"
         );
 
-        if totals.retry_needed {
+        if totals.retry_needed || read_failed {
             self.reschedule_with_backoff(retry_key).await;
-        } else if deferred > 0 {
+        } else if deferred_total > 0 {
             // Deferred records wait only for a genesis to arrive from the
             // shard's rank-0 holder; retry quickly rather than on the failure
             // backoff.
             self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
-                .await;
-        } else if batch.has_more {
-            self.reschedule_timer(retry_key, std::time::Duration::ZERO)
                 .await;
         } else {
             self.reset_backoff(&retry_key);
@@ -1485,6 +1545,11 @@ mod tests {
         let subbatch = DrainSubBatch {
             peers: vec![node(2)],
             documents: Vec::new(),
+            topics: vec![
+                irokle::TopicId::hash(b"first"),
+                irokle::TopicId::hash(b"second"),
+                irokle::TopicId::hash(b"third"),
+            ],
             targets: vec![
                 duplicate_target.clone(),
                 other_target,
@@ -1498,6 +1563,7 @@ mod tests {
             .expect("published index selects a record");
 
         assert_eq!(selected.targets, vec![duplicate_target]);
+        assert_eq!(selected.topics, vec![irokle::TopicId::hash(b"third")]);
         assert_eq!(selected.record_keys, vec![b"third".to_vec()]);
         assert!(selected.documents.is_empty());
         assert!(subbatch.sync_subset(&[3]).is_none());
@@ -1513,6 +1579,7 @@ mod tests {
                 change: change(),
             },
             aruna_core::structs::PlacementRef::NIL,
+            false,
         )
     }
 
@@ -1533,7 +1600,8 @@ mod tests {
         ];
 
         let mut calls = 0usize;
-        let (to_publish, deferred) = partition_drain_records(records, |_| {
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred) = partition_drain_records(records, &mut defer, |_| {
             calls += 1;
             calls > 1
         });
@@ -1554,11 +1622,132 @@ mod tests {
             (b"newer".to_vec(), shard_topic_record(2), topic),
         ];
 
-        let (to_publish, deferred) = partition_drain_records(records, |_| true);
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred) = partition_drain_records(records, &mut defer, |_| true);
 
         assert_eq!(deferred, 0);
         let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
         assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
+    }
+
+    // A full first page of records for a genesis-less shard topic (all deferred)
+    // must not starve records for other topics behind it in the FIFO: the drain
+    // pages the whole outbox per run, so a later-page record still publishes.
+    #[tokio::test]
+    async fn drain_paginates_past_a_deferred_head_page_to_publish_later_records() {
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        });
+
+        // Every head-page record targets one shard topic with no local genesis,
+        // so all of them defer.
+        let deferred_change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(8, 1),
+                actor: node(1),
+                updated_at_ms: 9,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef {
+                strategy_id: Ulid::from_parts(42, 1),
+                epoch: 0,
+                shard: 3,
+            },
+        };
+        let deferred_target = DocumentSyncTarget::MetadataRegistry {
+            group_id: Ulid::from_parts(1, 1),
+            document_id: Ulid::from_parts(2, 2),
+        };
+        let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
+        for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
+            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, index as u128),
+                node(1),
+                deferred_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: Vec::new(),
+                    change: deferred_change,
+                },
+                aruna_core::structs::PlacementRef::NIL,
+                false,
+            );
+            writes.push(
+                crate::document_sync_outbox::outbox_write_entry(&record).expect("outbox entry"),
+            );
+        }
+
+        // One later record for a shared (non-shard) topic, ordered strictly after
+        // the head page, so only pagination reaches it.
+        let publish_record = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(2, 0),
+            node(1),
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"realm-auth".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let publish_key = outbox_key(&publish_record).to_vec();
+        writes
+            .push(crate::document_sync_outbox::outbox_write_entry(&publish_record).expect("entry"));
+
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected batch write event: {other:?}"),
+        }
+
+        let handler = OperationsTaskHandler::new(context);
+        handler.drain_document_sync_outbox().await;
+
+        assert_eq!(
+            read_outbox_record(&storage, &publish_key)
+                .await
+                .expect("read publish record"),
+            None,
+            "the later-page record must publish despite an all-deferred first page"
+        );
+        let remaining = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE + 8)
+            .await
+            .expect("read remaining");
+        assert_eq!(
+            remaining.records.len(),
+            OUTBOX_DRAIN_BATCH_SIZE,
+            "every deferred record is retained for the next run"
+        );
+
+        net.shutdown().await;
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(
