@@ -1431,6 +1431,7 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
         Alpn::DocumentSync => "document_sync".to_string(),
         Alpn::Metadata => "metadata".to_string(),
         Alpn::Notification => "notification".to_string(),
+        Alpn::Shard => "shard".to_string(),
     })
 }
 
