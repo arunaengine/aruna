@@ -8,10 +8,6 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use crate::notifications::client::{
-    create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
-    unread_count_remote,
-};
 use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
@@ -21,6 +17,8 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_watch_subscription,
     delete_watch_subscription, list_watch_subscriptions,
 };
+use crate::routing::dispatch::{HolderRoutingError, dispatch_holder_call};
+use crate::routing::protocol::{NotificationCall, NotificationReply, ProxiedCall, ProxiedReply};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the
@@ -103,9 +101,81 @@ async fn resolve_holder(
     }
 }
 
+/// Routes a user-facing inbox read to the recipient's inbox holder. Serving
+/// locally stays a direct drive; a remote holder is reached over the holder
+/// proxy with the caller's bearer forwarded, so the holder re-derives the
+/// recipient from the validated identity instead of trusting a wire claim.
+async fn dispatch_notification(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    bearer: Option<&str>,
+    call: NotificationCall,
+) -> Result<NotificationReply, NotificationDispatchError> {
+    let reply = dispatch_holder_call(
+        context,
+        local_node_id,
+        bearer,
+        ProxiedCall::Notification(call),
+    )
+    .await
+    .map_err(|error| match error {
+        HolderRoutingError::Unavailable => NotificationDispatchError::Unavailable,
+        HolderRoutingError::Remote(reason) | HolderRoutingError::Unauthorized(reason) => {
+            NotificationDispatchError::Remote(reason)
+        }
+        HolderRoutingError::NotFound => {
+            NotificationDispatchError::Internal("inbox holder reported not found".to_string())
+        }
+        HolderRoutingError::Internal(reason) => NotificationDispatchError::Internal(reason),
+    })?;
+    match reply {
+        ProxiedReply::Notification(notification_reply) => Ok(*notification_reply),
+        _ => Err(NotificationDispatchError::Internal(
+            "holder returned a non-notification reply".to_string(),
+        )),
+    }
+}
+
+/// Watch variant of [`dispatch_notification`] that recovers the per-user cap
+/// signal the holder returns as a rejection reason.
+async fn dispatch_watch(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    bearer: Option<&str>,
+    call: NotificationCall,
+) -> Result<NotificationReply, WatchDispatchError> {
+    let reply = dispatch_holder_call(
+        context,
+        local_node_id,
+        bearer,
+        ProxiedCall::Notification(call),
+    )
+    .await
+    .map_err(|error| match error {
+        HolderRoutingError::Unavailable => WatchDispatchError::Unavailable,
+        HolderRoutingError::Unauthorized(reason) if reason == WATCH_SUBSCRIPTION_CAP_REACHED => {
+            WatchDispatchError::CapExceeded
+        }
+        HolderRoutingError::Remote(reason) | HolderRoutingError::Unauthorized(reason) => {
+            WatchDispatchError::Remote(reason)
+        }
+        HolderRoutingError::NotFound => {
+            WatchDispatchError::Internal("inbox holder reported not found".to_string())
+        }
+        HolderRoutingError::Internal(reason) => WatchDispatchError::Internal(reason),
+    })?;
+    match reply {
+        ProxiedReply::Notification(notification_reply) => Ok(*notification_reply),
+        _ => Err(WatchDispatchError::Internal(
+            "holder returned a non-notification reply".to_string(),
+        )),
+    }
+}
+
 pub async fn list_notifications_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     recipient: UserId,
     cursor: Option<Vec<u8>>,
     limit: usize,
@@ -124,19 +194,31 @@ pub async fn list_notifications_for_user(
         .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
         Ok((output.records, output.next_cursor))
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(NotificationDispatchError::Unavailable)?;
-        list_remote(net_handle, holder, recipient, cursor, limit as u32)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        match dispatch_notification(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::List {
+                recipient,
+                cursor,
+                limit: limit as u32,
+            },
+        )
+        .await?
+        {
+            NotificationReply::List {
+                records,
+                next_cursor,
+            } => Ok((records, next_cursor)),
+            _ => Err(unexpected_notification_reply()),
+        }
     }
 }
 
 pub async fn unread_count_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     recipient: UserId,
 ) -> Result<(u32, bool), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
@@ -149,19 +231,24 @@ pub async fn unread_count_for_user(
         .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
         Ok((output.count as u32, output.capped))
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(NotificationDispatchError::Unavailable)?;
-        unread_count_remote(net_handle, holder, recipient)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        match dispatch_notification(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::UnreadCount { recipient },
+        )
+        .await?
+        {
+            NotificationReply::UnreadCount { count, capped } => Ok((count, capped)),
+            _ => Err(unexpected_notification_reply()),
+        }
     }
 }
 
 pub async fn mark_read_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     recipient: UserId,
     ids: Vec<Ulid>,
     up_to_ms: Option<u64>,
@@ -186,19 +273,28 @@ pub async fn mark_read_for_user(
         }
         Ok(output.marked as u32)
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(NotificationDispatchError::Unavailable)?;
-        mark_read_remote(net_handle, holder, recipient, ids, up_to_ms)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        match dispatch_notification(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::MarkRead {
+                recipient,
+                ids,
+                up_to_ms,
+            },
+        )
+        .await?
+        {
+            NotificationReply::MarkRead { marked } => Ok(marked),
+            _ => Err(unexpected_notification_reply()),
+        }
     }
 }
 
 pub async fn create_watch_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
@@ -220,25 +316,28 @@ pub async fn create_watch_for_user(
         schedule_watch_interest_publish(context).await;
         Ok(subscription)
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(WatchDispatchError::Unavailable)?;
-        create_watch_remote(net_handle, holder, owner, path_prefix, event_mask)
-            .await
-            .map_err(|reason| {
-                if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
-                    WatchDispatchError::CapExceeded
-                } else {
-                    WatchDispatchError::Remote(reason)
-                }
-            })
+        match dispatch_watch(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::CreateWatch {
+                recipient: owner,
+                path_prefix,
+                event_mask,
+            },
+        )
+        .await?
+        {
+            NotificationReply::Watch(subscription) => Ok(subscription),
+            _ => Err(unexpected_watch_reply()),
+        }
     }
 }
 
 pub async fn delete_watch_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), WatchDispatchError> {
@@ -250,19 +349,27 @@ pub async fn delete_watch_for_user(
         schedule_watch_interest_publish(context).await;
         Ok(())
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(WatchDispatchError::Unavailable)?;
-        delete_watch_remote(net_handle, holder, owner, watch_id)
-            .await
-            .map_err(WatchDispatchError::Remote)
+        match dispatch_watch(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::DeleteWatch {
+                recipient: owner,
+                watch_id,
+            },
+        )
+        .await?
+        {
+            NotificationReply::Ack => Ok(()),
+            _ => Err(unexpected_watch_reply()),
+        }
     }
 }
 
 pub async fn list_watches_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: Option<&str>,
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
@@ -271,12 +378,26 @@ pub async fn list_watches_for_user(
             .await
             .map_err(|error| WatchDispatchError::Internal(error.to_string()))
     } else {
-        let net_handle = context
-            .net_handle
-            .as_ref()
-            .ok_or(WatchDispatchError::Unavailable)?;
-        list_watches_remote(net_handle, holder, owner)
-            .await
-            .map_err(WatchDispatchError::Remote)
+        match dispatch_watch(
+            context,
+            local_node_id,
+            bearer,
+            NotificationCall::ListWatches { recipient: owner },
+        )
+        .await?
+        {
+            NotificationReply::Watches(subscriptions) => Ok(subscriptions),
+            _ => Err(unexpected_watch_reply()),
+        }
     }
+}
+
+fn unexpected_notification_reply() -> NotificationDispatchError {
+    NotificationDispatchError::Internal(
+        "holder returned an unexpected notification reply".to_string(),
+    )
+}
+
+fn unexpected_watch_reply() -> WatchDispatchError {
+    WatchDispatchError::Internal("holder returned an unexpected notification reply".to_string())
 }

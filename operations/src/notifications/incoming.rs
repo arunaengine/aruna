@@ -13,23 +13,16 @@ use aruna_net::streams::BiStream;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
 use crate::notifications::inbox::upsert_inbox_records_reporting;
-use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
-use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
-use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::schedule_watch_interest_publish;
-use crate::notifications::watch::subscriptions::{
-    create_watch_subscription, delete_watch_subscription, list_realm_watch_subscriptions,
-    list_watch_subscriptions,
-};
+use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -103,135 +96,6 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
-        NotificationTransportMessage::List {
-            recipient,
-            cursor,
-            limit,
-        } => {
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match drive(
-                ListNotificationsOperation::new(ListNotificationsInput {
-                    recipient,
-                    cursor,
-                    limit: limit as usize,
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::ListResult {
-                    records: output.records,
-                    next_cursor: output.next_cursor,
-                },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::UnreadCount { recipient } => {
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match drive(
-                UnreadCountOperation::new(UnreadCountInput { recipient }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::UnreadCountResult {
-                    count: output.count as u32,
-                    capped: output.capped,
-                },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::MarkRead {
-            recipient,
-            ids,
-            up_to_ms,
-        } => {
-            if let Err(reason) =
-                verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match drive(
-                MarkReadOperation::new(MarkReadInput {
-                    recipient,
-                    ids,
-                    up_to_ms,
-                    now_ms: unix_timestamp_millis(),
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => {
-                    if output.marked > 0 {
-                        net_handle.notify_inbox_activity(recipient);
-                    }
-                    NotificationTransportMessage::MarkReadResult {
-                        marked: output.marked as u32,
-                    }
-                }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::CreateWatch {
-            owner,
-            path_prefix,
-            event_mask,
-        } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match create_watch_subscription(
-                &context.storage_handle,
-                owner,
-                path_prefix,
-                event_mask,
-                unix_timestamp_millis(),
-            )
-            .await
-            {
-                Ok(subscription) => {
-                    schedule_watch_interest_publish(context).await;
-                    NotificationTransportMessage::WatchCreated { subscription }
-                }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match delete_watch_subscription(&context.storage_handle, owner, watch_id).await {
-                Ok(()) => {
-                    schedule_watch_interest_publish(context).await;
-                    NotificationTransportMessage::WatchDeleted
-                }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::ListWatches { owner } => {
-            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
-            {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match list_watch_subscriptions(&context.storage_handle, owner).await {
-                Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
             if let Err(reason) =
                 validate_inbound_watch_events(&events, realm_id, unix_timestamp_millis())
@@ -256,13 +120,7 @@ async fn build_response(
             }
         }
         NotificationTransportMessage::DeliverAck { .. }
-        | NotificationTransportMessage::ListResult { .. }
-        | NotificationTransportMessage::UnreadCountResult { .. }
-        | NotificationTransportMessage::MarkReadResult { .. }
         | NotificationTransportMessage::Reject(_)
-        | NotificationTransportMessage::WatchCreated { .. }
-        | NotificationTransportMessage::WatchDeleted
-        | NotificationTransportMessage::WatchList { .. }
         | NotificationTransportMessage::WatchEventsAck { .. } => {
             NotificationTransportMessage::Reject(
                 "unexpected notification control message".to_string(),
@@ -545,12 +403,6 @@ fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, Stri
             }
             Ok(realm_id)
         }
-        NotificationTransportMessage::List { recipient, .. }
-        | NotificationTransportMessage::UnreadCount { recipient }
-        | NotificationTransportMessage::MarkRead { recipient, .. } => Ok(recipient.realm_id),
-        NotificationTransportMessage::CreateWatch { owner, .. }
-        | NotificationTransportMessage::DeleteWatch { owner, .. }
-        | NotificationTransportMessage::ListWatches { owner } => Ok(owner.realm_id),
         NotificationTransportMessage::DeliverWatchEvents { events } => {
             let Some(first) = events.first() else {
                 return Err("empty batch".to_string());
@@ -562,13 +414,7 @@ fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, Stri
             Ok(realm_id)
         }
         NotificationTransportMessage::DeliverAck { .. }
-        | NotificationTransportMessage::ListResult { .. }
-        | NotificationTransportMessage::UnreadCountResult { .. }
-        | NotificationTransportMessage::MarkReadResult { .. }
         | NotificationTransportMessage::Reject(_)
-        | NotificationTransportMessage::WatchCreated { .. }
-        | NotificationTransportMessage::WatchDeleted
-        | NotificationTransportMessage::WatchList { .. }
         | NotificationTransportMessage::WatchEventsAck { .. } => {
             Err("unexpected notification control message".to_string())
         }
@@ -632,11 +478,8 @@ mod tests {
     use super::*;
     use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
-        create_watch_remote, delete_watch_remote, deliver_remote, deliver_watch_events_remote,
-        list_remote, list_watches_remote, mark_read_remote, send_notification_request,
-        unread_count_remote,
+        deliver_remote, deliver_watch_events_remote, send_notification_request,
     };
-    use crate::notifications::inbox::upsert_inbox_records;
     use crate::notifications::watch::subscriptions::create_watch_subscription;
     use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
     use aruna_core::structs::{
@@ -1092,204 +935,7 @@ mod tests {
             deliver_error.contains("not a sync-eligible node"),
             "unexpected reject reason: {deliver_error}"
         );
-
-        let list = send_notification_request(
-            &c.net,
-            b.net.node_id(),
-            NotificationTransportMessage::UnreadCount { recipient },
-        )
-        .await
-        .expect("request completes");
-        assert!(
-            matches!(&list, NotificationTransportMessage::Reject(reason) if reason.contains("not a sync-eligible node")),
-            "unexpected response: {list:?}"
-        );
         assert!(read_inbox(&b).await.is_empty());
-    }
-
-    async fn seed_inbox(node: &Node, records: &[NotificationRecord]) {
-        assert_eq!(
-            upsert_inbox_records(&node.context.storage_handle, records).await,
-            Ok(records.len())
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_list_roundtrip() {
-        let realm_id = RealmId::from_bytes([55u8; 32]);
-        let a = spawn(realm_id, [55u8; 32]).await;
-        let b = spawn(realm_id, [56u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let records = vec![
-            record(recipient, 1),
-            record(recipient, 2),
-            record(recipient, 3),
-        ];
-        seed_inbox(&b, &records).await;
-
-        let (page1, cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 2)
-            .await
-            .expect("first page");
-        let cursor = cursor.expect("cursor for second page");
-        let (page2, next) = list_remote(&a.net, b.net.node_id(), recipient, Some(cursor), 2)
-            .await
-            .expect("second page");
-        assert_eq!(next, None);
-
-        let seen: Vec<u64> = page1
-            .iter()
-            .chain(page2.iter())
-            .map(|record| record.created_at_ms)
-            .collect();
-        assert_eq!(
-            seen,
-            vec![
-                1_700_000_000_000 + 3,
-                1_700_000_000_000 + 2,
-                1_700_000_000_000 + 1,
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_unread_and_mark_read_roundtrip() {
-        let realm_id = RealmId::from_bytes([59u8; 32]);
-        let a = spawn(realm_id, [59u8; 32]).await;
-        let b = spawn(realm_id, [60u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let records = vec![
-            record(recipient, 1),
-            record(recipient, 2),
-            record(recipient, 3),
-        ];
-        seed_inbox(&b, &records).await;
-
-        assert_eq!(
-            unread_count_remote(&a.net, b.net.node_id(), recipient)
-                .await
-                .expect("unread count"),
-            (3, false)
-        );
-
-        let ids: Vec<Ulid> = records
-            .iter()
-            .map(|record| record.notification_id)
-            .collect();
-        assert_eq!(
-            mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
-                .await
-                .expect("mark read"),
-            3
-        );
-        assert_eq!(
-            mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
-                .await
-                .expect("mark read again"),
-            0
-        );
-        assert_eq!(
-            unread_count_remote(&a.net, b.net.node_id(), recipient)
-                .await
-                .expect("unread count after"),
-            (0, false)
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_read_path_still_gated() {
-        let realm_id = RealmId::from_bytes([61u8; 32]);
-        let a = spawn(realm_id, [61u8; 32]).await;
-        let b = spawn(realm_id, [62u8; 32]).await;
-        let c = spawn(realm_id, [63u8; 32]).await;
-        connect(&c, &b).await;
-        install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let recipient = UserId::new(Ulid::new(), realm_id);
-        let error = list_remote(&c.net, b.net.node_id(), recipient, None, 10)
-            .await
-            .expect_err("unknown peer must be rejected on the read path");
-        assert!(
-            error.contains("not a sync-eligible node"),
-            "unexpected reject reason: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_inbox_ops_reject_non_local_holder() {
-        let realm_id = RealmId::from_bytes([66u8; 32]);
-        let a = spawn(realm_id, [66u8; 32]).await;
-        let b = spawn(realm_id, [67u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let recipient = recipient_for_holder(&config, a.net.node_id(), realm_id);
-        let seeded = record(recipient, 1);
-        seed_inbox(&b, std::slice::from_ref(&seeded)).await;
-
-        for error in [
-            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
-                .await
-                .expect_err("list on non-holder must be rejected"),
-            unread_count_remote(&a.net, b.net.node_id(), recipient)
-                .await
-                .expect_err("unread count on non-holder must be rejected"),
-            mark_read_remote(
-                &a.net,
-                b.net.node_id(),
-                recipient,
-                vec![seeded.notification_id],
-                None,
-            )
-            .await
-            .expect_err("mark read on non-holder must be rejected"),
-        ] {
-            assert!(
-                error.contains("not local node"),
-                "unexpected reject reason: {error}"
-            );
-        }
-
-        let inbox = read_inbox(&b).await;
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].read_at_ms, None);
     }
 
     #[tokio::test]
@@ -1331,110 +977,6 @@ mod tests {
         assert!(
             error.contains("exceeds maximum size"),
             "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_watch_crud_roundtrip() {
-        let realm_id = RealmId::from_bytes([64u8; 32]);
-        let a = spawn(realm_id, [64u8; 32]).await;
-        let b = spawn(realm_id, [65u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let mask = WatchEventMask::from_kinds([
-            WatchEventKind::MetadataCreated,
-            WatchEventKind::DataUploaded,
-        ]);
-        let created = create_watch_remote(
-            &a.net,
-            b.net.node_id(),
-            owner,
-            "bucket/prefix".to_string(),
-            mask,
-        )
-        .await
-        .expect("create succeeds");
-        assert_eq!(created.owner, owner);
-        assert_eq!(created.path_prefix, "bucket/prefix");
-        assert_eq!(created.event_mask, mask);
-
-        let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
-            .await
-            .expect("list succeeds");
-        assert_eq!(listed, vec![created.clone()]);
-
-        delete_watch_remote(&a.net, b.net.node_id(), owner, created.watch_id)
-            .await
-            .expect("delete succeeds");
-        assert!(
-            list_watches_remote(&a.net, b.net.node_id(), owner)
-                .await
-                .expect("list after delete succeeds")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_watch_ops_reject_non_local_holder() {
-        let realm_id = RealmId::from_bytes([68u8; 32]);
-        let a = spawn(realm_id, [68u8; 32]).await;
-        let b = spawn(realm_id, [69u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let owner = recipient_for_holder(&config, a.net.node_id(), realm_id);
-        let create_error = create_watch_remote(
-            &a.net,
-            b.net.node_id(),
-            owner,
-            "bucket/".to_string(),
-            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-        )
-        .await
-        .expect_err("create on non-holder must be rejected");
-        assert!(
-            create_error.contains("not local node"),
-            "unexpected reject reason: {create_error}"
-        );
-
-        let list_error = list_watches_remote(&a.net, b.net.node_id(), owner)
-            .await
-            .expect_err("list on non-holder must be rejected");
-        assert!(
-            list_error.contains("not local node"),
-            "unexpected reject reason: {list_error}"
-        );
-
-        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::new())
-            .await
-            .expect_err("delete on non-holder must be rejected");
-        assert!(
-            delete_error.contains("not local node"),
-            "unexpected reject reason: {delete_error}"
-        );
-        assert!(
-            list_watch_subscriptions(&b.context.storage_handle, owner)
-                .await
-                .expect("list succeeds")
-                .is_empty()
         );
     }
 
@@ -1672,44 +1214,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_path_is_trust_gated() {
-        let realm_id = RealmId::from_bytes([66u8; 32]);
-        let b = spawn(realm_id, [67u8; 32]).await;
-        let c = spawn(realm_id, [68u8; 32]).await;
-        connect(&c, &b).await;
-        install_config(
-            &b,
-            realm_id,
-            &[
-                (b.net.node_id(), RealmNodeKind::Server),
-                (c.net.node_id(), RealmNodeKind::User),
-            ],
-        )
-        .await;
-
-        let owner = UserId::new(Ulid::new(), realm_id);
-        let error = create_watch_remote(
-            &c.net,
-            b.net.node_id(),
-            owner,
-            "bucket".to_string(),
-            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
-        )
-        .await
-        .expect_err("non-eligible peer must be rejected");
-        assert!(
-            error.contains("not a sync-eligible node"),
-            "unexpected reject reason: {error}"
-        );
-        assert!(
-            list_watch_subscriptions(&b.context.storage_handle, owner)
-                .await
-                .expect("list succeeds")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn deliver_batch_wakes_recipient_only_on_fresh_write() {
         let realm_id = RealmId::from_bytes([80u8; 32]);
         let a = spawn(realm_id, [80u8; 32]).await;
@@ -1746,57 +1250,6 @@ mod tests {
                 .await
                 .is_err(),
             "redelivery must not wake"
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_read_rpc_wakes_recipient_only_when_count_changes() {
-        let realm_id = RealmId::from_bytes([82u8; 32]);
-        let a = spawn(realm_id, [82u8; 32]).await;
-        let b = spawn(realm_id, [83u8; 32]).await;
-        connect(&a, &b).await;
-        let config = install_config(
-            &b,
-            realm_id,
-            &[
-                (a.net.node_id(), RealmNodeKind::Server),
-                (b.net.node_id(), RealmNodeKind::Server),
-            ],
-        )
-        .await;
-
-        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let records = vec![record(recipient, 1), record(recipient, 2)];
-        seed_inbox(&b, &records).await;
-        let ids: Vec<Ulid> = records
-            .iter()
-            .map(|record| record.notification_id)
-            .collect();
-        let mut wakes = b.net.subscribe_notification_wakes();
-
-        assert_eq!(
-            mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
-                .await
-                .expect("mark read"),
-            2
-        );
-        let woken = timeout(Duration::from_secs(1), wakes.recv())
-            .await
-            .expect("wake arrives")
-            .expect("channel open");
-        assert_eq!(woken, recipient);
-
-        assert_eq!(
-            mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
-                .await
-                .expect("mark read again"),
-            0
-        );
-        assert!(
-            timeout(Duration::from_millis(200), wakes.recv())
-                .await
-                .is_err(),
-            "no-op mark-read must not wake"
         );
     }
 }

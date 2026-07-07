@@ -1,5 +1,6 @@
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmId, Role, User,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NotificationRecord, RealmId, Role,
+    User, WatchEventMask, WatchSubscription,
 };
 use aruna_core::types::{GroupId, RoleId, UserId};
 use aruna_net::streams::BiStream;
@@ -181,8 +182,37 @@ pub enum MetadataMutation {
     UpsertContextualEntity { jsonld: String },
 }
 
+/// User-facing inbox reads and watch CRUD. The `recipient` steers holder
+/// resolution (the inbox's replica-1 holder) only; the target serves the inbox
+/// of the identity carried by the validated bearer, never this wire claim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum NotificationCall {}
+pub enum NotificationCall {
+    List {
+        recipient: UserId,
+        cursor: Option<Vec<u8>>,
+        limit: u32,
+    },
+    UnreadCount {
+        recipient: UserId,
+    },
+    MarkRead {
+        recipient: UserId,
+        ids: Vec<Ulid>,
+        up_to_ms: Option<u64>,
+    },
+    CreateWatch {
+        recipient: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+    },
+    ListWatches {
+        recipient: UserId,
+    },
+    DeleteWatch {
+        recipient: UserId,
+        watch_id: Ulid,
+    },
+}
 
 /// Holder response. `NotHolder` tells the origin to retry another holder;
 /// `NotFound` from a reachable holder is authoritative; `Rejected` carries an
@@ -201,6 +231,25 @@ pub enum ProxiedReply {
     Group(Box<GroupReply>),
     User(Box<UserReply>),
     Metadata(Box<MetadataReply>),
+    Notification(Box<NotificationReply>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NotificationReply {
+    List {
+        records: Vec<NotificationRecord>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    UnreadCount {
+        count: u32,
+        capped: bool,
+    },
+    MarkRead {
+        marked: u32,
+    },
+    Watch(WatchSubscription),
+    Watches(Vec<WatchSubscription>),
+    Ack,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

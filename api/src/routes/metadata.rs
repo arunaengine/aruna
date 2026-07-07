@@ -1286,9 +1286,9 @@ async fn route_metadata_call(
     .await?;
     match reply {
         ProxiedReply::Metadata(metadata_reply) => Ok(*metadata_reply),
-        ProxiedReply::Group(_) | ProxiedReply::User(_) => Err(ServerError::InternalError(
-            "holder returned a non-metadata reply".to_string(),
-        )),
+        ProxiedReply::Group(_) | ProxiedReply::User(_) | ProxiedReply::Notification(_) => Err(
+            ServerError::InternalError("holder returned a non-metadata reply".to_string()),
+        ),
     }
 }
 

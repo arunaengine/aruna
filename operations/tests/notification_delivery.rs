@@ -1,13 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::structs::{
     Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
-    RealmConfigDocument, RealmId, RealmNodeKind,
+    RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
@@ -15,7 +18,6 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
 use aruna_operations::notifications::dispatch::{
     NotificationDispatchError, list_notifications_for_user, mark_read_for_user,
     unread_count_for_user,
@@ -27,6 +29,11 @@ use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use std::collections::HashSet;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
@@ -43,11 +50,12 @@ struct TestNode {
 
 #[tokio::test]
 async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([12u8; 32]);
+    let (realm_key, realm_id) = test_realm(12);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, recipient);
     let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
@@ -55,8 +63,9 @@ async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std:
 
     wait_for(POLL_TIMEOUT, || {
         let nodes = &nodes;
+        let bearer = bearer.as_str();
         async move {
-            list_via(&nodes[1], recipient)
+            list_via(&nodes[1], Some(bearer), recipient)
                 .await
                 .iter()
                 .any(|record| record.notification_id == target)
@@ -64,7 +73,13 @@ async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std:
     })
     .await?;
 
-    let (count, capped) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, capped) = unread_count_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+    )
+    .await?;
     assert_eq!((count, capped), (1, false));
 
     shutdown_nodes(nodes).await;
@@ -73,7 +88,7 @@ async fn notification_emitted_on_a_is_visible_via_b() -> Result<(), Box<dyn std:
 
 #[tokio::test]
 async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([22u8; 32]);
+    let (realm_key, realm_id) = test_realm(22);
     let secrets: [[u8; 32]; 3] = [[11u8; 32], [22u8; 32], [33u8; 32]];
     // The holder's storage must outlive its node struct so the post-outage
     // restart reopens the same persisted dir instead of an empty one.
@@ -90,6 +105,7 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, recipient);
     let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
@@ -111,8 +127,9 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
 
     wait_for(RESPAWN_POLL_TIMEOUT, || {
         let nodes = &nodes;
+        let bearer = bearer.as_str();
         async move {
-            let delivered = list_via(&nodes[2], recipient)
+            let delivered = list_via(&nodes[2], Some(bearer), recipient)
                 .await
                 .iter()
                 .any(|record| record.notification_id == target);
@@ -127,19 +144,21 @@ async fn delivery_retries_through_holder_outage() -> Result<(), Box<dyn std::err
 
 #[tokio::test]
 async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([33u8; 32]);
+    let (realm_key, realm_id) = test_realm(33);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, recipient);
     let record = added_to_group_record(recipient, realm_id, unix_timestamp_millis());
     let target = record.notification_id;
 
     emit_on(&nodes[0], vec![record.clone()]).await?;
     wait_for(POLL_TIMEOUT, || {
         let nodes = &nodes;
+        let bearer = bearer.as_str();
         async move {
-            list_via(&nodes[2], recipient)
+            list_via(&nodes[2], Some(bearer), recipient)
                 .await
                 .iter()
                 .any(|record| record.notification_id == target)
@@ -147,7 +166,15 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
     })
     .await?;
 
-    let marked = mark_read_remote(&nodes[1].net, holder, recipient, vec![target], None).await?;
+    let marked = mark_read_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+        vec![target],
+        None,
+    )
+    .await?;
     assert_eq!(marked, 1);
 
     emit_on(&nodes[0], vec![record]).await?;
@@ -157,7 +184,7 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
     })
     .await?;
 
-    let inbox = list_via(&nodes[2], recipient).await;
+    let inbox = list_via(&nodes[2], Some(&bearer), recipient).await;
     let matching: Vec<&NotificationRecord> = inbox
         .iter()
         .filter(|record| record.notification_id == target)
@@ -178,11 +205,12 @@ async fn duplicate_delivery_is_idempotent_across_nodes() -> Result<(), Box<dyn s
 
 #[tokio::test]
 async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([44u8; 32]);
+    let (realm_key, realm_id) = test_realm(44);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, recipient);
 
     let now = unix_timestamp_millis();
     let records: Vec<NotificationRecord> = (0..3)
@@ -193,23 +221,58 @@ async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::E
     emit_on(&nodes[0], records).await?;
     wait_for(POLL_TIMEOUT, || {
         let nodes = &nodes;
-        async move { list_via(&nodes[1], recipient).await.len() >= 3 }
+        let bearer = bearer.as_str();
+        async move { list_via(&nodes[1], Some(bearer), recipient).await.len() >= 3 }
     })
     .await?;
 
-    let (count, _) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, _) = unread_count_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+    )
+    .await?;
     assert_eq!(count, 3);
 
-    let marked = mark_read_remote(&nodes[1].net, holder, recipient, ids.clone(), None).await?;
+    let marked = mark_read_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+        ids.clone(),
+        None,
+    )
+    .await?;
     assert_eq!(marked, 2);
 
-    let (count, _) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, _) = unread_count_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+    )
+    .await?;
     assert_eq!(count, 1);
 
-    let (count_from_a, _) = unread_count_remote(&nodes[0].net, holder, recipient).await?;
+    let (count_from_a, _) = unread_count_for_user(
+        nodes[0].context.as_ref(),
+        nodes[0].net.node_id(),
+        Some(&bearer),
+        recipient,
+    )
+    .await?;
     assert_eq!(count_from_a, 1);
 
-    let marked_again = mark_read_remote(&nodes[1].net, holder, recipient, ids, None).await?;
+    let marked_again = mark_read_for_user(
+        nodes[1].context.as_ref(),
+        nodes[1].net.node_id(),
+        Some(&bearer),
+        recipient,
+        ids,
+        None,
+    )
+    .await?;
     assert_eq!(marked_again, 0);
 
     shutdown_nodes(nodes).await;
@@ -218,7 +281,7 @@ async fn unread_and_mark_read_across_nodes() -> Result<(), Box<dyn std::error::E
 
 #[tokio::test]
 async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([55u8; 32]);
+    let (_realm_key, realm_id) = test_realm(55);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
 
     for _ in 0..20 {
@@ -239,11 +302,12 @@ async fn placement_is_uniform_across_nodes() -> Result<(), Box<dyn std::error::E
 
 #[tokio::test]
 async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([66u8; 32]);
+    let (realm_key, realm_id) = test_realm(66);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, recipient);
     // Neither the emitter nor the holder: every op it serves must proxy one hop
     // to the holder through the dispatch remote arms.
     let reader_ctx = nodes[1].context.clone();
@@ -258,10 +322,12 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     emit_on(&nodes[0], records).await?;
     wait_for(POLL_TIMEOUT, || {
         let reader_ctx = reader_ctx.clone();
+        let bearer = bearer.clone();
         async move {
             list_notifications_for_user(
                 reader_ctx.as_ref(),
                 reader_id,
+                Some(bearer.as_str()),
                 recipient,
                 None,
                 LIST_LIMIT as usize,
@@ -273,14 +339,23 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     })
     .await?;
 
-    let (count, capped) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, capped) =
+        unread_count_for_user(reader_ctx.as_ref(), reader_id, Some(&bearer), recipient).await?;
     assert_eq!((count, capped), (3, false));
 
-    let marked =
-        mark_read_for_user(reader_ctx.as_ref(), reader_id, recipient, ids.clone(), None).await?;
+    let marked = mark_read_for_user(
+        reader_ctx.as_ref(),
+        reader_id,
+        Some(&bearer),
+        recipient,
+        ids.clone(),
+        None,
+    )
+    .await?;
     assert_eq!(marked, 2);
 
-    let (count, _) = unread_count_for_user(reader_ctx.as_ref(), reader_id, recipient).await?;
+    let (count, _) =
+        unread_count_for_user(reader_ctx.as_ref(), reader_id, Some(&bearer), recipient).await?;
     assert_eq!(count, 1);
 
     // A resolvable remote holder with no net handle is Unavailable, not a 500.
@@ -294,6 +369,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
     let unavailable = list_notifications_for_user(
         no_net.as_ref(),
         reader_id,
+        Some(&bearer),
         recipient,
         None,
         LIST_LIMIT as usize,
@@ -305,10 +381,15 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
         NotificationDispatchError::Unavailable
     ));
 
-    // An unreachable holder surfaces as a Remote proxy error (mapped to 502).
+    // Every holder of the inbox shard is unreachable, so the holder-proxy walk
+    // exhausts its candidates and reports Unavailable (mapped to 503).
     nodes[2].net.shutdown().await;
-    let remote = wait_for_dispatch_error(reader_ctx.as_ref(), reader_id, recipient).await;
-    assert!(matches!(remote, NotificationDispatchError::Remote(_)));
+    let unreachable =
+        wait_for_dispatch_error(reader_ctx.as_ref(), reader_id, &bearer, recipient).await;
+    assert!(matches!(
+        unreachable,
+        NotificationDispatchError::Unavailable
+    ));
 
     nodes[0].net.shutdown().await;
     nodes[1].net.shutdown().await;
@@ -318,6 +399,7 @@ async fn dispatch_proxies_inbox_ops_from_non_holder() -> Result<(), Box<dyn std:
 async fn wait_for_dispatch_error(
     context: &DriverContext,
     local_node_id: NodeId,
+    bearer: &str,
     recipient: UserId,
 ) -> NotificationDispatchError {
     let deadline = Instant::now() + POLL_TIMEOUT;
@@ -325,6 +407,7 @@ async fn wait_for_dispatch_error(
         match list_notifications_for_user(
             context,
             local_node_id,
+            Some(bearer),
             recipient,
             None,
             LIST_LIMIT as usize,
@@ -354,6 +437,57 @@ fn added_to_group_record(
         },
         created_at_ms,
     )
+}
+
+// A realm whose id is the verifying key of a reconstructable signing key, so a
+// bearer the test mints re-validates on the holder's forwarded-bearer path.
+fn test_realm(seed: u8) -> (SigningKey, RealmId) {
+    let signing_key = SigningKey::from_bytes(&[seed; 32]);
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    (signing_key, realm_id)
+}
+
+fn bearer_for(realm_key: &SigningKey, recipient: UserId) -> String {
+    let now = unix_timestamp_millis() / 1000;
+    let claims = TokenClaims {
+        sub: recipient.to_string(),
+        iss: recipient.realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: Ulid::new().to_string(),
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+    };
+    let key_pem = realm_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+    encode(
+        &Header::new(Algorithm::EdDSA),
+        &claims,
+        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn persist_trusted_realm(
+    node: &TestNode,
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trusted: HashSet<RealmId> = HashSet::from([realm_id]);
+    let bytes = postcard::to_allocvec(&trusted)?;
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: TRUSTED_REALMS_LIST_KEY.to_vec().into(),
+            value: bytes.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected trusted realm write event: {other:?}").into()),
+    }
 }
 
 fn realm_config_for(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
@@ -392,10 +526,15 @@ async fn emit_on(
     Ok(())
 }
 
-async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
+async fn list_via(
+    node: &TestNode,
+    bearer: Option<&str>,
+    recipient: UserId,
+) -> Vec<NotificationRecord> {
     list_notifications_for_user(
         node.context.as_ref(),
         node.net.node_id(),
+        bearer,
         recipient,
         None,
         LIST_LIMIT as usize,
@@ -557,6 +696,7 @@ async fn install_realm_config(
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
+        persist_trusted_realm(node, realm_id).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).

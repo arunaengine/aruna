@@ -300,9 +300,9 @@ async fn route_group_call(
     .await?;
     match reply {
         ProxiedReply::Group(group_reply) => Ok(*group_reply),
-        ProxiedReply::User(_) | ProxiedReply::Metadata(_) => Err(ServerError::InternalError(
-            "holder returned a non-group reply".to_string(),
-        )),
+        ProxiedReply::User(_) | ProxiedReply::Metadata(_) | ProxiedReply::Notification(_) => Err(
+            ServerError::InternalError("holder returned a non-group reply".to_string()),
+        ),
     }
 }
 

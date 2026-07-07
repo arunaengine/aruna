@@ -1,18 +1,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
     Actor, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass, NotificationKind,
-    NotificationRecord, RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail,
-    WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    NotificationRecord, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims, WatchEvent,
+    WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
     watch_interest_node_key, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
@@ -32,6 +34,11 @@ use aruna_operations::replicate_documents::{
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use std::collections::HashSet;
 use tempfile::TempDir;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -58,15 +65,17 @@ struct TestNode {
 #[tokio::test]
 async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
 -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([90u8; 32]);
+    let (realm_key, realm_id) = test_realm(90);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, watcher);
     let uploader = UserId::local(Ulid::new(), realm_id);
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let subscription = create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    let subscription =
+        create_watch_via(&nodes[0], &bearer, watcher, "bucket/reports/", mask).await?;
 
     // Node B must observe the holder's interest before the upload matches.
     wait_for_holder(
@@ -93,8 +102,9 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let expected_id = watch_notification_id(event_id, subscription.watch_id);
     wait_for(POLL_TIMEOUT, || {
         let node_c = &nodes[2];
+        let bearer = bearer.as_str();
         async move {
-            list_via(node_c, watcher)
+            list_via(node_c, bearer, watcher)
                 .await
                 .iter()
                 .any(|record| record.notification_id == expected_id)
@@ -102,7 +112,7 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     })
     .await?;
 
-    let listed = list_via(&nodes[2], watcher).await;
+    let listed = list_via(&nodes[2], &bearer, watcher).await;
     let record = listed
         .iter()
         .find(|record| record.notification_id == expected_id)
@@ -152,15 +162,16 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
 // stages a forward-outbox row and no inbox record materializes anywhere.
 #[tokio::test]
 async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([91u8; 32]);
+    let (realm_key, realm_id) = test_realm(91);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, watcher);
     let uploader = UserId::local(Ulid::new(), realm_id);
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    create_watch_via(&nodes[0], &bearer, watcher, "bucket/reports/", mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
@@ -196,7 +207,7 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
             "an unmatched event must not write any inbox record"
         );
     }
-    assert!(list_via(&nodes[2], watcher).await.is_empty());
+    assert!(list_via(&nodes[2], &bearer, watcher).await.is_empty());
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -207,14 +218,15 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
 // watcher's inbox stays empty.
 #[tokio::test]
 async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([92u8; 32]);
+    let (realm_key, realm_id) = test_realm(92);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, watcher);
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    create_watch_via(&nodes[0], &bearer, watcher, "bucket/reports/", mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
@@ -251,7 +263,7 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
             "a self-authored event must not notify the watcher"
         );
     }
-    assert!(list_via(&nodes[2], watcher).await.is_empty());
+    assert!(list_via(&nodes[2], &bearer, watcher).await.is_empty());
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -262,16 +274,17 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
 // empty digest that retracts the holder from that table.
 #[tokio::test]
 async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([93u8; 32]);
+    let (realm_key, realm_id) = test_realm(93);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, watcher);
 
     // Create through node A while the holder is node C: exercises the remote
     // create arm on the way to publishing the digest.
     let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
-    let subscription = create_watch_via(&nodes[0], watcher, "meta/team/", mask).await?;
+    let subscription = create_watch_via(&nodes[0], &bearer, watcher, "meta/team/", mask).await?;
 
     wait_for_holder(
         &nodes[1],
@@ -284,7 +297,7 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     .await?;
 
     // Deleting the last watch retracts the interest via an empty digest.
-    delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
+    delete_watch_via(&nodes[0], &bearer, watcher, subscription.watch_id).await?;
 
     wait_for_holder(
         &nodes[1],
@@ -315,11 +328,12 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn remote_create_surfaces_cap_conflict_over_the_wire()
 -> Result<(), Box<dyn std::error::Error>> {
-    let realm_id = RealmId([94u8; 32]);
+    let (realm_key, realm_id) = test_realm(94);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let owner = user_with_holder(&config, holder, realm_id);
+    let bearer = bearer_for(&realm_key, owner);
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
 
     // Node B is not the holder, so every create proxies to node A over the wire.
@@ -327,6 +341,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
         create_watch_for_user(
             nodes[1].context.as_ref(),
             nodes[1].net.node_id(),
+            Some(&bearer),
             owner,
             format!("bucket/{index}/"),
             mask,
@@ -338,6 +353,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     let error = create_watch_for_user(
         nodes[1].context.as_ref(),
         nodes[1].net.node_id(),
+        Some(&bearer),
         owner,
         "bucket/overflow/".to_string(),
         mask,
@@ -380,6 +396,7 @@ fn upload_event(
 
 async fn create_watch_via(
     node: &TestNode,
+    bearer: &str,
     owner: UserId,
     path_prefix: &str,
     event_mask: WatchEventMask,
@@ -387,6 +404,7 @@ async fn create_watch_via(
     Ok(create_watch_for_user(
         node.context.as_ref(),
         node.net.node_id(),
+        Some(bearer),
         owner,
         path_prefix.to_string(),
         event_mask,
@@ -396,10 +414,18 @@ async fn create_watch_via(
 
 async fn delete_watch_via(
     node: &TestNode,
+    bearer: &str,
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    delete_watch_for_user(node.context.as_ref(), node.net.node_id(), owner, watch_id).await?;
+    delete_watch_for_user(
+        node.context.as_ref(),
+        node.net.node_id(),
+        Some(bearer),
+        owner,
+        watch_id,
+    )
+    .await?;
     Ok(())
 }
 
@@ -421,10 +447,11 @@ async fn wait_for_holder(
     .await
 }
 
-async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord> {
+async fn list_via(node: &TestNode, bearer: &str, recipient: UserId) -> Vec<NotificationRecord> {
     list_notifications_for_user(
         node.context.as_ref(),
         node.net.node_id(),
+        Some(bearer),
         recipient,
         None,
         LIST_LIMIT,
@@ -549,6 +576,57 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     })
 }
 
+// A realm whose id is the verifying key of a reconstructable signing key, so a
+// bearer the test mints re-validates on the holder's forwarded-bearer path.
+fn test_realm(seed: u8) -> (SigningKey, RealmId) {
+    let signing_key = SigningKey::from_bytes(&[seed; 32]);
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    (signing_key, realm_id)
+}
+
+fn bearer_for(realm_key: &SigningKey, owner: UserId) -> String {
+    let now = unix_timestamp_millis() / 1000;
+    let claims = TokenClaims {
+        sub: owner.to_string(),
+        iss: owner.realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: Ulid::new().to_string(),
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+    };
+    let key_pem = realm_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+    encode(
+        &Header::new(Algorithm::EdDSA),
+        &claims,
+        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn persist_trusted_realm(
+    node: &TestNode,
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trusted: HashSet<RealmId> = HashSet::from([realm_id]);
+    let bytes = postcard::to_allocvec(&trusted)?;
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: TRUSTED_REALMS_LIST_KEY.to_vec().into(),
+            value: bytes.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected trusted realm write event: {other:?}").into()),
+    }
+}
+
 async fn install_realm_config(
     nodes: &[TestNode],
     realm_id: RealmId,
@@ -576,6 +654,7 @@ async fn install_realm_config(
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
+        persist_trusted_realm(node, realm_id).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).

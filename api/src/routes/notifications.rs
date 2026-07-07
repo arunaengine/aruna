@@ -1,4 +1,4 @@
-use crate::auth::require_realm_auth;
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
@@ -213,6 +213,12 @@ fn require_unrestricted_realm_auth(
     Ok(auth)
 }
 
+fn bearer_str(bearer: &Option<ValidatedArunaBearerTokenCarrier>) -> Option<&str> {
+    bearer
+        .as_ref()
+        .map(ValidatedArunaBearerTokenCarrier::as_str)
+}
+
 fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     match cursor {
         Some(cursor) => {
@@ -329,6 +335,7 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
 pub async fn list_notifications(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(query): Query<ListNotificationsQuery>,
 ) -> ServerResult<(StatusCode, Json<NotificationListResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -341,6 +348,7 @@ pub async fn list_notifications(
     let (records, next_cursor) = list_notifications_for_user(
         &state.get_ctx(),
         state.get_node_id(),
+        bearer_str(&bearer),
         auth.user_id,
         cursor,
         limit,
@@ -374,13 +382,18 @@ pub async fn list_notifications(
 pub async fn unread_count(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
 ) -> ServerResult<(StatusCode, Json<UnreadCountApiResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
 
-    let (count, capped) =
-        unread_count_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
-            .await
-            .map_err(|error| map_dispatch_error(error, "unread"))?;
+    let (count, capped) = unread_count_for_user(
+        &state.get_ctx(),
+        state.get_node_id(),
+        bearer_str(&bearer),
+        auth.user_id,
+    )
+    .await
+    .map_err(|error| map_dispatch_error(error, "unread"))?;
 
     Ok((
         StatusCode::OK,
@@ -399,6 +412,7 @@ enum UnreadStreamMode {
 struct UnreadStreamState {
     context: Arc<DriverContext>,
     local_node_id: NodeId,
+    bearer: Option<String>,
     recipient: UserId,
     mode: UnreadStreamMode,
     initial_done: bool,
@@ -427,10 +441,15 @@ fn drain_pending_wakes(rx: &mut InboxWakeReceiver) {
 }
 
 async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
-    unread_count_for_user(state.context.as_ref(), state.local_node_id, state.recipient)
-        .await
-        .ok()
-        .map(|(count, capped)| (count as u64, capped))
+    unread_count_for_user(
+        state.context.as_ref(),
+        state.local_node_id,
+        state.bearer.as_deref(),
+        state.recipient,
+    )
+    .await
+    .ok()
+    .map(|(count, capped)| (count as u64, capped))
 }
 
 /// Yields the recipient's unread count: once initially, then whenever it may have
@@ -440,6 +459,7 @@ async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
 fn unread_count_stream(
     context: Arc<DriverContext>,
     local_node_id: NodeId,
+    bearer: Option<String>,
     recipient: UserId,
     mode: UnreadStreamMode,
     remote_poll: Duration,
@@ -448,6 +468,7 @@ fn unread_count_stream(
     let state = UnreadStreamState {
         context,
         local_node_id,
+        bearer,
         recipient,
         mode,
         initial_done: false,
@@ -555,11 +576,13 @@ fn unread_stream_event(count: u64, capped: bool) -> Event {
 pub async fn stream_notifications(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
 ) -> ServerResult<Sse<impl Stream<Item = Result<Event, Infallible>> + Send>> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
+    let bearer = bearer.map(|carrier| carrier.as_str().to_string());
 
     let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
         .await
@@ -577,6 +600,7 @@ pub async fn stream_notifications(
     let events = unread_count_stream(
         context.clone(),
         local_node_id,
+        bearer,
         recipient,
         mode,
         NOTIFICATION_STREAM_REMOTE_POLL,
@@ -604,6 +628,7 @@ pub async fn stream_notifications(
 pub async fn mark_read(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<MarkReadApiRequest>,
 ) -> ServerResult<(StatusCode, Json<MarkReadApiResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -616,6 +641,7 @@ pub async fn mark_read(
     let marked = mark_read_for_user(
         &state.get_ctx(),
         state.get_node_id(),
+        bearer_str(&bearer),
         auth.user_id,
         ids,
         request.up_to_ms,
@@ -642,12 +668,18 @@ pub async fn mark_read(
 pub async fn list_watches(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
 ) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
 
-    let subscriptions = list_watches_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
-        .await
-        .map_err(|error| map_watch_dispatch_error(error, "list_watches"))?;
+    let subscriptions = list_watches_for_user(
+        &state.get_ctx(),
+        state.get_node_id(),
+        bearer_str(&bearer),
+        auth.user_id,
+    )
+    .await
+    .map_err(|error| map_watch_dispatch_error(error, "list_watches"))?;
 
     let watches = subscriptions.iter().map(watch_response).collect();
     Ok((StatusCode::OK, Json(WatchListResponse { watches })))
@@ -673,6 +705,7 @@ pub async fn list_watches(
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -692,6 +725,7 @@ pub async fn create_watch(
     let subscription = create_watch_for_user(
         &state.get_ctx(),
         state.get_node_id(),
+        bearer_str(&bearer),
         auth.user_id,
         request.path_prefix,
         event_mask,
@@ -720,6 +754,7 @@ pub async fn create_watch(
 pub async fn delete_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
@@ -728,6 +763,7 @@ pub async fn delete_watch(
     delete_watch_for_user(
         &state.get_ctx(),
         state.get_node_id(),
+        bearer_str(&bearer),
         auth.user_id,
         watch_id,
     )
@@ -887,6 +923,7 @@ mod tests {
         let error = list_notifications(
             State(state),
             Extension(None),
+            Extension(None),
             Query(ListNotificationsQuery::default()),
         )
         .await
@@ -908,20 +945,26 @@ mod tests {
         let list_err = list_notifications(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            Extension(None),
             Query(ListNotificationsQuery::default()),
         )
         .await
         .expect_err("delegated token must be rejected");
         assert!(matches!(list_err, ServerError::Forbidden));
 
-        let unread_err = unread_count(State(state.clone()), Extension(Some(auth.clone())))
-            .await
-            .expect_err("delegated token must be rejected");
+        let unread_err = unread_count(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+        )
+        .await
+        .expect_err("delegated token must be rejected");
         assert!(matches!(unread_err, ServerError::Forbidden));
 
         let mark_err = mark_read(
             State(state),
             Extension(Some(auth)),
+            Extension(None),
             Json(MarkReadApiRequest {
                 ids: Vec::new(),
                 up_to_ms: None,
@@ -958,6 +1001,7 @@ mod tests {
         let error = mark_read(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(MarkReadApiRequest {
                 ids: vec!["not-a-ulid".to_string()],
                 up_to_ms: None,
@@ -988,6 +1032,7 @@ mod tests {
         let (_, listed) = list_notifications(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Query(ListNotificationsQuery::default()),
         )
         .await
@@ -999,6 +1044,7 @@ mod tests {
         let (_, unread) = unread_count(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
         )
         .await
         .expect("unread succeeds");
@@ -1013,6 +1059,7 @@ mod tests {
         let (_, marked) = mark_read(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(MarkReadApiRequest {
                 ids,
                 up_to_ms: None,
@@ -1022,10 +1069,13 @@ mod tests {
         .expect("mark read succeeds");
         assert_eq!(marked.marked, 3);
 
-        let (_, unread_after) =
-            unread_count(State(state), Extension(Some(auth_for(user_id, realm_id))))
-                .await
-                .expect("unread after succeeds");
+        let (_, unread_after) = unread_count(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
+        )
+        .await
+        .expect("unread after succeeds");
         assert_eq!(unread_after.count, 0);
     }
 
@@ -1039,6 +1089,7 @@ mod tests {
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
             state.get_node_id(),
+            None,
             user_id,
             UnreadStreamMode::Local(net.subscribe_notification_wakes()),
             Duration::from_secs(5),
@@ -1085,6 +1136,7 @@ mod tests {
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
             state.get_node_id(),
+            None,
             user_id,
             UnreadStreamMode::Local(net.subscribe_notification_wakes()),
             Duration::from_secs(60),
@@ -1126,6 +1178,7 @@ mod tests {
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
             state.get_node_id(),
+            None,
             user_id,
             UnreadStreamMode::Remote,
             Duration::from_millis(100),
@@ -1165,6 +1218,7 @@ mod tests {
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
             state.get_node_id(),
+            None,
             user_id,
             UnreadStreamMode::Remote,
             Duration::from_millis(100),
@@ -1292,6 +1346,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: "bucket/prefix".to_string(),
                 events: vec!["metadata_created".to_string(), "data_uploaded".to_string()],
@@ -1306,6 +1361,7 @@ mod tests {
         let (_, listed) = list_watches(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
         )
         .await
         .expect("list succeeds");
@@ -1315,15 +1371,20 @@ mod tests {
         let status = delete_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Path(created.id.clone()),
         )
         .await
         .expect("delete succeeds");
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (_, empty) = list_watches(State(state), Extension(Some(auth_for(user_id, realm_id))))
-            .await
-            .expect("list after delete succeeds");
+        let (_, empty) = list_watches(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
+        )
+        .await
+        .expect("list after delete succeeds");
         assert!(empty.watches.is_empty());
     }
 
@@ -1336,6 +1397,7 @@ mod tests {
         let empty_prefix = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: String::new(),
                 events: vec!["metadata_created".to_string()],
@@ -1348,6 +1410,7 @@ mod tests {
         let leading_slash = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: "/bucket".to_string(),
                 events: vec!["metadata_created".to_string()],
@@ -1360,6 +1423,7 @@ mod tests {
         let empty_events = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: Vec::new(),
@@ -1372,6 +1436,7 @@ mod tests {
         let unknown_event = create_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: vec!["not_an_event".to_string()],
@@ -1390,6 +1455,7 @@ mod tests {
         let error = delete_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            Extension(None),
             Path("not-a-ulid".to_string()),
         )
         .await
@@ -1408,14 +1474,19 @@ mod tests {
             permission: Permission::READ,
         }]);
 
-        let list_err = list_watches(State(state.clone()), Extension(Some(auth.clone())))
-            .await
-            .expect_err("delegated token must be rejected");
+        let list_err = list_watches(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+        )
+        .await
+        .expect_err("delegated token must be rejected");
         assert!(matches!(list_err, ServerError::Forbidden));
 
         let create_err = create_watch(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            Extension(None),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: vec!["metadata_created".to_string()],
@@ -1428,6 +1499,7 @@ mod tests {
         let delete_err = delete_watch(
             State(state),
             Extension(Some(auth)),
+            Extension(None),
             Path(Ulid::new().to_string()),
         )
         .await

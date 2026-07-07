@@ -2,6 +2,7 @@ pub mod client;
 pub mod dispatch;
 pub mod incoming;
 mod metadata;
+mod notification;
 pub mod protocol;
 
 use aruna_core::NodeId;
@@ -16,6 +17,7 @@ use crate::driver::{DriverContext, drive};
 use crate::ensure_canonical_user_token_subject::EnsureCanonicalUserTokenSubjectOperation;
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::get_user::{GetUserError, GetUserInput, GetUserOperation};
+use crate::notifications::placement::resolve_inbox_holder;
 use crate::placement::{placement_ref_for_target, resolve_shard_holders};
 use crate::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use crate::remove_group_role::{
@@ -25,8 +27,8 @@ use crate::remove_user_from_group::{
     RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
 };
 use crate::routing::protocol::{
-    GroupCall, GroupReply, HolderProxyResponse, MetadataCall, ProxiedCall, ProxiedReply, UserCall,
-    UserReply,
+    GroupCall, GroupReply, HolderProxyResponse, MetadataCall, NotificationCall, ProxiedCall,
+    ProxiedReply, UserCall, UserReply,
 };
 use crate::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
 use aruna_core::errors::AuthorizationError;
@@ -113,10 +115,32 @@ pub(crate) fn resolve_call_holders(
     config: &RealmConfigDocument,
     call: &ProxiedCall,
 ) -> Option<(PlacementRef, Vec<NodeId>)> {
+    // The notification inbox is not a `DocumentSyncTarget`; its holder comes from
+    // the replica-1 inbox resolver rather than shard placement.
+    if let ProxiedCall::Notification(notification_call) = call {
+        let recipient = notification_call_recipient(notification_call);
+        let holders = match resolve_inbox_holder(&recipient, config) {
+            Ok(Some(holder)) => vec![holder],
+            Ok(None) | Err(_) => Vec::new(),
+        };
+        return Some((PlacementRef::NIL, holders));
+    }
     let target = proxied_call_target(call)?;
     let placement = placement_ref_for_target(config, &target, proxied_call_metadata_path(call));
     let holders = resolve_shard_holders(config, &placement);
     Some((placement, holders))
+}
+
+/// The inbox owner a [`NotificationCall`] resolves its holder against.
+fn notification_call_recipient(call: &NotificationCall) -> UserId {
+    match call {
+        NotificationCall::List { recipient, .. }
+        | NotificationCall::UnreadCount { recipient }
+        | NotificationCall::MarkRead { recipient, .. }
+        | NotificationCall::CreateWatch { recipient, .. }
+        | NotificationCall::ListWatches { recipient }
+        | NotificationCall::DeleteWatch { recipient, .. } => *recipient,
+    }
 }
 
 /// Validates a forwarded bearer against this node's trust configuration and
@@ -150,8 +174,8 @@ pub(crate) async fn serve_local(
         ProxiedCall::Metadata(metadata_call) => {
             metadata::serve_metadata_call(context, metadata_call, auth).await
         }
-        ProxiedCall::Notification(_) => {
-            HolderProxyResponse::Rejected("proxied call domain not yet supported".into())
+        ProxiedCall::Notification(notification_call) => {
+            notification::serve_notification_call(context, notification_call, auth).await
         }
     }
 }
