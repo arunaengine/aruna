@@ -123,21 +123,18 @@ mod tests {
         UserId::local(Ulid::from_bytes([seed; 16]), REALM)
     }
 
-    fn admin_role(assigned: HashSet<UserId>) -> Role {
-        Role {
-            role_id: Ulid::new(),
-            name: "admin".to_string(),
-            permissions: HashMap::new(),
-            assigned_users: assigned,
-        }
-    }
-
     fn group_doc_with_admins(assigned: HashSet<UserId>) -> GroupAuthorizationDocument {
-        let role = admin_role(assigned);
-        GroupAuthorizationDocument {
-            group_id: Ulid::from_bytes([9u8; 16]),
-            roles: HashMap::from([(role.role_id, role)]),
-        }
+        let mut doc = GroupAuthorizationDocument::new_default_group_doc(
+            user(200),
+            REALM,
+            Ulid::from_bytes([9u8; 16]),
+        );
+        doc.roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .expect("default group admin role exists")
+            .assigned_users = assigned;
+        doc
     }
 
     #[test]
@@ -147,10 +144,21 @@ mod tests {
         let doc = GroupAuthorizationDocument::new_default_group_doc(creator, REALM, group_id);
         assert_eq!(group_admin_user_ids(&doc), vec![creator]);
 
-        let (u2, u3) = (user(2), user(3));
+        let (u2, u3, ignored) = (user(2), user(3), user(4));
         let mut doc = doc;
-        let second = admin_role(HashSet::from([u2, u3]));
-        doc.roles.insert(second.role_id, second);
+        doc.roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .expect("default group admin role exists")
+            .assigned_users
+            .extend([u2, u3]);
+        let custom_role = Role {
+            role_id: Ulid::new(),
+            name: "custom-admin-label".to_string(),
+            permissions: HashMap::new(),
+            assigned_users: HashSet::from([ignored]),
+        };
+        doc.roles.insert(custom_role.role_id, custom_role);
 
         let mut expected = vec![creator, u2, u3];
         expected.sort();

@@ -581,9 +581,9 @@ fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
 fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
     match error {
         AddGroupRoleError::Unauthorized => ServerError::Forbidden,
-        AddGroupRoleError::InvalidPublicRole | AddGroupRoleError::InvalidAssignedUser => {
-            ServerError::BadRequest
-        }
+        AddGroupRoleError::InvalidPublicRole
+        | AddGroupRoleError::InvalidAssignedUser
+        | AddGroupRoleError::ReservedRoleName => ServerError::BadRequest,
         AddGroupRoleError::GroupNotFound => ServerError::NotFound,
         AddGroupRoleError::CheckPermissionsError(
             AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
