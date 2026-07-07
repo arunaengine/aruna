@@ -198,6 +198,8 @@ async fn reference_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
+    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
+
     let result = stage_reference_blob(
         &state.get_ctx(),
         MaterializeReferenceInput {
@@ -209,6 +211,7 @@ async fn reference_blob(
             source_path: request.source_path,
             bucket: request.bucket.clone(),
             key: request.key.clone(),
+            quota_ceiling,
         },
     )
     .await
@@ -327,8 +330,13 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
         MaterializeReferenceError::Head(error) => map_head_staging_error(error),
+        MaterializeReferenceError::QuotaExceeded { .. } => ServerError::Forbidden,
         MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
         MaterializeReferenceError::Conversion(error) => {
+            ServerError::InternalError(error.to_string())
+        }
+        MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
+        MaterializeReferenceError::QuotaGate(error) => {
             ServerError::InternalError(error.to_string())
         }
     }
@@ -415,6 +423,7 @@ mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
     use aruna_core::UserId;
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -423,7 +432,7 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
-        RealmAuthorizationDocument,
+        RealmAuthorizationDocument, RealmConfigDocument,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::replication::queue::{
@@ -549,6 +558,16 @@ mod tests {
     }
 
     #[test]
+    fn reference_quota_exceeded_maps_to_forbidden() {
+        let error = map_reference_error(MaterializeReferenceError::QuotaExceeded {
+            limit: 100,
+            usage: 200,
+        });
+
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    #[test]
     fn openapi_includes_staging_path() {
         let openapi = ApiDoc::openapi();
 
@@ -613,12 +632,21 @@ mod tests {
             roles: source_auth.roles.keys().copied().collect(),
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
 
         write_doc(
             &driver_ctx,
             AUTH_KEYSPACE,
             (*realm_id.as_bytes()).into(),
             realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            realm_config_target.storage_keyspace(),
+            realm_config_target.storage_key(),
+            realm_config.to_bytes(&actor).unwrap().into(),
         )
         .await;
         write_doc(

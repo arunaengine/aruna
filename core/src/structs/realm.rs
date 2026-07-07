@@ -233,7 +233,8 @@ impl QuotaConfig {
         let grace = over
             .and_then(|over| over.grace_factor_percent)
             .unwrap_or(self.grace_factor_percent);
-        Some(quota.saturating_mul(u64::from(grace)) / 100)
+        let ceiling = u128::from(quota) * u128::from(grace) / 100;
+        Some(ceiling.min(u128::from(u64::MAX)) as u64)
     }
 }
 
@@ -605,6 +606,20 @@ mod test {
             unlimited_override.effective_group_ceiling(&other),
             Some(1_100)
         );
+
+        let huge = super::QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 100,
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(huge.effective_group_ceiling(&other), Some(u64::MAX));
+
+        let over_huge = super::QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 110,
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(over_huge.effective_group_ceiling(&other), Some(u64::MAX));
     }
 
     #[test]

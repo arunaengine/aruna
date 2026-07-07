@@ -509,21 +509,14 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::usage_stats::publish_usage_snapshots(&self.context, node_id, realm_id, false)
-            .await
+        match crate::usage_stats::publish_and_refresh_usage_snapshots(
+            &self.context,
+            node_id,
+            realm_id,
+            false,
+        )
+        .await
         {
-            Ok(published) if !published.is_empty() => {
-                if let Err(error) = crate::usage_stats::recompute_realm_usage_summary(
-                    &self.context,
-                    node_id,
-                    published.global,
-                    published.groups,
-                )
-                .await
-                {
-                    warn!(error = %error, "Failed to refresh realm usage summary after publishing snapshots");
-                }
-            }
             Ok(_) => {}
             Err(error) => {
                 warn!(error = %error, "Failed to publish usage snapshots");

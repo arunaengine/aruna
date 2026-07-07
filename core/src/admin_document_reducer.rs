@@ -914,7 +914,13 @@ fn realm_discovery_value(discovery: &RealmDiscoveryConfig) -> String {
 }
 
 fn quota_value(quota: &QuotaConfig) -> String {
-    serde_json::to_string(quota).expect("admin document quota config serializes")
+    serde_json::to_string(&supported_quota(quota)).expect("admin document quota config serializes")
+}
+
+fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
+    let mut quota = quota.clone();
+    quota.max_devices_per_user = None;
+    quota
 }
 
 fn oidc_provider_value(provider: &OidcProviderConfig) -> String {
@@ -1001,7 +1007,9 @@ fn realm_discovery_from_value(value: &str) -> Option<RealmDiscoveryConfig> {
 }
 
 fn quota_from_value(value: &str) -> Option<QuotaConfig> {
-    serde_json::from_str(value).ok()
+    serde_json::from_str(value)
+        .ok()
+        .map(|quota| supported_quota(&quota))
 }
 
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {
@@ -1019,13 +1027,13 @@ mod tests {
     use super::{
         AdminDocumentApplyStatus, AdminDocumentReducerError, AdminDocumentReducerState,
         GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH,
-        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH,
-        group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-        group_role_user_assignment_path, metadata_replication_value, oidc_provider_value,
-        realm_config_node_id_from_path, realm_config_node_path,
-        realm_config_oidc_provider_id_from_path, realm_config_oidc_provider_path,
-        realm_discovery_value, realm_role_id_from_path, realm_role_path,
-        realm_role_user_assignment_from_path, realm_role_user_assignment_path,
+        REALM_CONFIG_DISCOVERY_PATH, REALM_CONFIG_METADATA_REPLICATION_PATH,
+        REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH, group_role_id_from_path, group_role_path,
+        group_role_user_assignment_from_path, group_role_user_assignment_path,
+        metadata_replication_value, oidc_provider_value, realm_config_node_id_from_path,
+        realm_config_node_path, realm_config_oidc_provider_id_from_path,
+        realm_config_oidc_provider_path, realm_discovery_value, realm_role_id_from_path,
+        realm_role_path, realm_role_user_assignment_from_path, realm_role_user_assignment_path,
         role_definition_value, user_attribute_path, user_subject_id_path,
     };
     use crate::admin_documents::{
@@ -1033,8 +1041,8 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use crate::structs::{
-        Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
-        RealmId, RealmNodeKind,
+        Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
+        RealmDiscoveryConfig, RealmId, RealmNodeKind,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
@@ -2595,6 +2603,53 @@ mod tests {
             Some("Demo Realm")
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_config_quota_materialization_drops_unsupported_max_devices_per_user() {
+        let mut state = realm_config_state();
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            max_devices_per_user: Some(6),
+            ..QuotaConfig::default()
+        };
+        let expected = QuotaConfig {
+            max_devices_per_user: None,
+            ..quota.clone()
+        };
+
+        state
+            .apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigQuotaSet {
+                    quota: quota.clone(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_quota(),
+            Some(expected.clone())
+        );
+
+        let stored_value = state
+            .user_subject_ids
+            .get(REALM_CONFIG_QUOTA_PATH)
+            .and_then(|version| version.value.as_deref())
+            .expect("quota reducer value exists")
+            .to_string();
+        let stored_quota: QuotaConfig = serde_json::from_str(&stored_value).unwrap();
+        assert_eq!(stored_quota, expected);
+
+        state
+            .user_subject_ids
+            .get_mut(REALM_CONFIG_QUOTA_PATH)
+            .expect("quota reducer value exists")
+            .value = Some(serde_json::to_string(&quota).unwrap());
+        assert_eq!(state.materialized_realm_config_quota(), Some(expected));
     }
 
     #[test]
