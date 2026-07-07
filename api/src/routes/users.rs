@@ -1,4 +1,4 @@
-use crate::auth::{OidcIdentity, bearer_token};
+use crate::auth::{OidcIdentity, ValidatedArunaBearerTokenCarrier, bearer_token};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -11,12 +11,8 @@ use aruna_operations::consume_onboarding_secret::{
 };
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::ensure_canonical_user_token_subject::{
-    EnsureCanonicalUserTokenSubjectError, EnsureCanonicalUserTokenSubjectOperation,
-};
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_oidc_user::{GetOidcUserInput, GetOidcUserOperation};
-use aruna_operations::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
@@ -25,12 +21,12 @@ use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::read_realm_authorization::{
     ReadRealmAuthorizationError, ReadRealmAuthorizationOperation,
 };
-use aruna_operations::read_user_document::{ReadUserDocumentError, ReadUserDocumentOperation};
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::routing::dispatch::dispatch_holder_call;
+use aruna_operations::routing::protocol::{ProxiedCall, ProxiedReply, UserCall, UserReply};
 use aruna_operations::search_users::{SearchUsersInput, SearchUsersOperation};
-use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -280,22 +276,69 @@ async fn issue_user_token(
     .map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
-async fn ensure_canonical_user_token_subject(
-    state: &Arc<ServerState>,
-    user_id: UserId,
-) -> ServerResult<()> {
-    drive(
-        EnsureCanonicalUserTokenSubjectOperation::new(user_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_canonical_subject_error)
+fn bearer_str(bearer: &Option<ValidatedArunaBearerTokenCarrier>) -> Option<&str> {
+    bearer
+        .as_ref()
+        .map(ValidatedArunaBearerTokenCarrier::as_str)
 }
 
-async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
-    drive(ReadUserDocumentOperation::new(user_id), &state.get_ctx())
-        .await
-        .map_err(map_read_user_document_error)
+/// Routes a user-scoped call to a current holder of the user's subject shard.
+/// The holder re-derives the acting identity from the forwarded bearer.
+async fn route_user_call(
+    state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
+    call: UserCall,
+) -> ServerResult<UserReply> {
+    let reply = dispatch_holder_call(
+        state.get_ctx().as_ref(),
+        state.get_node_id(),
+        bearer_str(bearer),
+        ProxiedCall::User(call),
+    )
+    .await?;
+    match reply {
+        ProxiedReply::User(user_reply) => Ok(*user_reply),
+        ProxiedReply::Group(_) => Err(ServerError::InternalError(
+            "holder returned a non-user reply".to_string(),
+        )),
+    }
+}
+
+fn expect_user(reply: UserReply) -> ServerResult<User> {
+    match reply {
+        UserReply::User(user) => Ok(user),
+        UserReply::TokenSubjectEnsured => Err(ServerError::InternalError(
+            "holder returned an unexpected user reply".to_string(),
+        )),
+    }
+}
+
+async fn ensure_canonical_user_token_subject(
+    state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
+    user_id: UserId,
+) -> ServerResult<()> {
+    match route_user_call(
+        state,
+        bearer,
+        UserCall::EnsureCanonicalTokenSubject { user_id },
+    )
+    .await?
+    {
+        UserReply::TokenSubjectEnsured => Ok(()),
+        UserReply::User(_) => Err(ServerError::InternalError(
+            "holder returned an unexpected user reply".to_string(),
+        )),
+    }
+}
+
+async fn read_current_user(
+    state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
+    user_id: UserId,
+) -> ServerResult<User> {
+    let reply = route_user_call(state, bearer, UserCall::ReadDocument { user_id }).await?;
+    expect_user(reply)
 }
 
 async fn read_realm_authorization(
@@ -307,21 +350,6 @@ async fn read_realm_authorization(
     )
     .await
     .map_err(map_read_realm_authorization_error)
-}
-
-fn map_canonical_subject_error(error: EnsureCanonicalUserTokenSubjectError) -> ServerError {
-    match error {
-        EnsureCanonicalUserTokenSubjectError::Unauthorized => ServerError::Unauthorized,
-        EnsureCanonicalUserTokenSubjectError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_read_user_document_error(error: ReadUserDocumentError) -> ServerError {
-    match error {
-        ReadUserDocumentError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    }
 }
 
 fn map_read_realm_authorization_error(error: ReadRealmAuthorizationError) -> ServerError {
@@ -382,12 +410,13 @@ async fn collect_user_group_memberships(
 
 async fn build_user_info_response(
     state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
     auth: AuthContext,
 ) -> ServerResult<GetUserInfoResponse> {
     if auth.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
-    let user = read_current_user(state, auth.user_id).await?;
+    let user = read_current_user(state, bearer, auth.user_id).await?;
     let preferences = user_preferences_from_attributes(&user.attributes);
     let realm_roles =
         collect_user_realm_roles(read_realm_authorization(state).await?, auth.user_id);
@@ -569,13 +598,14 @@ async fn get_token(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
     let user_id = match auth {
         Some(aruna_ctx) => {
             if aruna_ctx.path_restrictions.is_some() {
                 return Err(ServerError::Forbidden);
             }
-            ensure_canonical_user_token_subject(&state, aruna_ctx.user_id).await?;
+            ensure_canonical_user_token_subject(&state, &bearer, aruna_ctx.user_id).await?;
             aruna_ctx.user_id
         }
         None => {
@@ -615,11 +645,12 @@ async fn get_token(
 async fn get_user_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
 ) -> ServerResult<(StatusCode, Json<GetUserInfoResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     Ok((
         StatusCode::OK,
-        Json(build_user_info_response(&state, auth).await?),
+        Json(build_user_info_response(&state, &bearer, auth).await?),
     ))
 }
 
@@ -640,6 +671,7 @@ async fn get_user_info(
 async fn patch_user_info(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<PatchUserInfoRequest>,
 ) -> ServerResult<(StatusCode, Json<GetUserInfoResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
@@ -648,42 +680,22 @@ async fn patch_user_info(
         return Err(ServerError::Forbidden);
     }
 
-    drive(
-        UpdateUserOperation::new(UpdateUserInput {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id,
-            },
-            auth_context: auth.clone(),
-            self_realm_id: realm_id,
+    let reply = route_user_call(
+        &state,
+        &bearer,
+        UserCall::Update {
             user_id: auth.user_id.to_string(),
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
-        }),
-        &state.get_ctx(),
+        },
     )
-    .await
-    .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
-            ServerError::BadRequest
-        }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
-            ServerError::Forbidden
-        }
-        other => ServerError::InternalError(other.to_string()),
-    })?;
+    .await?;
+    expect_user(reply)?;
 
     Ok((
         StatusCode::OK,
-        Json(build_user_info_response(&state, auth).await?),
+        Json(build_user_info_response(&state, &bearer, auth).await?),
     ))
 }
 
@@ -829,6 +841,7 @@ async fn search_users(
 async fn get_user(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(user_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
@@ -837,20 +850,8 @@ async fn get_user(
         // TODO: Forwarding for foreign realm users
         return Err(ServerError::Unimplemented);
     }
-    let user = drive(
-        GetUserOperation::new(GetUserInput {
-            auth_context: auth,
-            self_realm_id: realm_id,
-            user_id,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| match err {
-        aruna_operations::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::get_user::GetUserError::UserNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    })?;
+    let reply = route_user_call(&state, &bearer, UserCall::Get { user_id }).await?;
+    let user = expect_user(reply)?;
 
     Ok((StatusCode::OK, Json(user.into())))
 }
@@ -873,6 +874,7 @@ async fn get_user(
 async fn update_user(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(user_id): Path<String>,
     Json(request): Json<UpdateUserRequest>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
@@ -882,38 +884,18 @@ async fn update_user(
         return Err(ServerError::Forbidden);
     }
 
-    let user = drive(
-        UpdateUserOperation::new(UpdateUserInput {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id,
-            },
-            auth_context: auth,
-            self_realm_id: realm_id,
+    let reply = route_user_call(
+        &state,
+        &bearer,
+        UserCall::Update {
             user_id,
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
-        }),
-        &state.get_ctx(),
+        },
     )
-    .await
-    .map_err(|err| match err {
-        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_operations::update_user::UpdateUserError::InvalidUserName
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
-        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
-            ServerError::BadRequest
-        }
-        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
-            ServerError::Forbidden
-        }
-        other => ServerError::InternalError(other.to_string()),
-    })?;
+    .await?;
+    let user = expect_user(reply)?;
 
     Ok((StatusCode::OK, Json(user.into())))
 }
@@ -1142,9 +1124,13 @@ mod tests {
     async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool) -> TestNode {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage_handle = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+        let realm_signing_key =
+            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
+                realm_id,
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
                 ..NetConfig::default()
@@ -1164,9 +1150,6 @@ mod tests {
         initialize_net_incoming(driver_ctx.clone());
         initialize_task_incoming(driver_ctx.clone(), task_handle).await;
 
-        let realm_signing_key =
-            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
-        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = net_handle.node_id();
         let realm_admin_id = UserId::local(Ulid::new(), realm_id);
 

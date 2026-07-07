@@ -7,11 +7,11 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-    TokenClaims,
+    Actor, Group, GroupAuthorizationDocument, Permission, RealmConfigDocument, RealmId,
+    RealmNodeKind, Role, TokenClaims, User,
 };
 use aruna_core::types::UserId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -19,7 +19,9 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::placement::{placement_ref_for_target, resolve_shard_holders};
 use aruna_operations::routing::dispatch::{HolderRoutingError, dispatch_holder_call};
-use aruna_operations::routing::protocol::{GroupCall, GroupReply, ProxiedCall, ProxiedReply};
+use aruna_operations::routing::protocol::{
+    GroupCall, GroupReply, ProxiedCall, ProxiedReply, UserCall, UserReply,
+};
 use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
@@ -64,11 +66,16 @@ async fn non_holder_dispatch_round_trips_group_and_refuses_invalid_bearer() {
     )
     .await
     .expect("valid bearer round-trips the group");
-    let ProxiedReply::Group(reply) = reply;
+    let ProxiedReply::Group(reply) = reply else {
+        panic!("expected a group reply");
+    };
     let GroupReply::Document {
         group: fetched,
         authorization: fetched_auth,
-    } = *reply;
+    } = *reply
+    else {
+        panic!("expected a group document reply");
+    };
     assert_eq!(fetched, group);
     assert_eq!(fetched_auth, authorization);
 
@@ -162,6 +169,143 @@ async fn dispatch_respects_rank_order() {
     );
 
     shutdown(nodes).await;
+}
+
+// A routed group write (a role mutation) is carried, with its role payload, to
+// the shard holder, which validates the forwarded bearer and drives the write
+// operation locally. The holder holds no authorization document for the sampled
+// group, so the driven mutation resolves to an authoritative NotFound — proving
+// the write reached the holder's operation rather than stranding in the origin's
+// outbox.
+#[tokio::test]
+async fn group_add_role_write_routes_to_holder() {
+    let (realm_key, realm_id, user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (group_id, holders) =
+        sample_group(&config, |h| h.len() == 1 && h[0] == holder.net.node_id());
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let role = Role {
+        role_id: Ulid::new(),
+        name: "auditor".to_string(),
+        permissions: HashMap::from([(
+            format!("/{realm_id}/g/{group_id}/meta/**"),
+            Permission::READ,
+        )]),
+        assigned_users: HashSet::new(),
+    };
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, user_id));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::AddRole {
+            group_id,
+            role: Box::new(role),
+        }),
+    )
+    .await
+    .expect_err("a routed write to a group the holder lacks resolves to NotFound");
+    assert!(
+        matches!(error, HolderRoutingError::NotFound),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+// A non-holder origin proxies a self user-document read to the inbox's shard
+// holder; the target serves the identity carried by the forwarded bearer.
+#[tokio::test]
+async fn user_read_document_routes_to_holder() {
+    let (realm_key, realm_id, _user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (target_user, holders) = sample_user(&config, realm_id, |h| {
+        h.len() == 1 && h[0] == holder.net.node_id()
+    });
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let user = make_user(target_user, "Alice");
+    write_user(holder, &user).await;
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, target_user));
+    let reply = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::User(UserCall::ReadDocument {
+            user_id: target_user,
+        }),
+    )
+    .await
+    .expect("valid bearer round-trips the user document");
+    let ProxiedReply::User(reply) = reply else {
+        panic!("expected a user reply");
+    };
+    let UserReply::User(fetched) = *reply else {
+        panic!("expected a user document");
+    };
+    assert_eq!(fetched, user);
+
+    shutdown(nodes).await;
+}
+
+fn make_user(user_id: UserId, name: &str) -> User {
+    User {
+        user_id,
+        name: name.to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    }
+}
+
+async fn write_user(node: &TestNode, user: &User) {
+    let actor = Actor {
+        node_id: node.net.node_id(),
+        user_id: user.user_id,
+        realm_id: user.user_id.realm_id,
+    };
+    write_storage(
+        &node.context.storage_handle,
+        USER_KEYSPACE,
+        user.user_id.to_bytes().to_vec(),
+        user.to_bytes(&actor).expect("user serializes"),
+    )
+    .await;
+}
+
+fn sample_user<F>(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    predicate: F,
+) -> (UserId, Vec<NodeId>)
+where
+    F: Fn(&[NodeId]) -> bool,
+{
+    for _ in 0..100_000 {
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let placement =
+            placement_ref_for_target(config, &DocumentSyncTarget::User { user_id }, None);
+        let holders = resolve_shard_holders(config, &placement);
+        if predicate(&holders) {
+            return (user_id, holders);
+        }
+    }
+    panic!("no user matched the holder predicate within the sampling bound");
 }
 
 fn realm_fixture() -> (SigningKey, RealmId, UserId) {

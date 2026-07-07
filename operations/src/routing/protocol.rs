@@ -1,8 +1,9 @@
-use aruna_core::structs::{Group, GroupAuthorizationDocument, RealmId};
-use aruna_core::types::GroupId;
+use aruna_core::structs::{Group, GroupAuthorizationDocument, RealmId, Role, User};
+use aruna_core::types::{GroupId, RoleId, UserId};
 use aruna_net::streams::BiStream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
 
@@ -72,7 +73,7 @@ pub struct HolderProxyRequest {
 }
 
 /// A user-authorized operation forwarded to a holder. The domain enums other
-/// than [`GroupCall`] are skeletons filled in by later commits.
+/// than [`GroupCall`] and [`UserCall`] are skeletons filled in by later commits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProxiedCall {
     Group(GroupCall),
@@ -83,11 +84,51 @@ pub enum ProxiedCall {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupCall {
-    Get { group_id: GroupId },
+    Get {
+        group_id: GroupId,
+    },
+    AddMember {
+        group_id: GroupId,
+        user_id: UserId,
+        role_ids: HashSet<RoleId>,
+    },
+    RemoveMember {
+        group_id: GroupId,
+        user_id: UserId,
+        role_ids: Option<HashSet<RoleId>>,
+    },
+    AddRole {
+        group_id: GroupId,
+        role: Box<Role>,
+    },
+    RemoveRole {
+        group_id: GroupId,
+        role_id: RoleId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UserCall {}
+pub enum UserCall {
+    Get {
+        user_id: String,
+    },
+    Update {
+        user_id: String,
+        name: Option<String>,
+        set_attributes: HashMap<String, String>,
+        remove_attributes: Vec<String>,
+    },
+    /// Read the caller's own user document; `user_id` steers holder resolution
+    /// only — the target reads the identity from the validated bearer.
+    ReadDocument {
+        user_id: UserId,
+    },
+    /// Ensure the caller's canonical token subject; `user_id` steers holder
+    /// resolution only.
+    EnsureCanonicalTokenSubject {
+        user_id: UserId,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataCall {}
@@ -110,6 +151,7 @@ pub enum HolderProxyResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProxiedReply {
     Group(Box<GroupReply>),
+    User(Box<UserReply>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +160,16 @@ pub enum GroupReply {
         group: Group,
         authorization: GroupAuthorizationDocument,
     },
+    /// The group's authorization document after a membership or role mutation.
+    Authorization(GroupAuthorizationDocument),
+    /// A mutation that returns no body to the caller.
+    Ack,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UserReply {
+    User(User),
+    TokenSubjectEnsured,
 }
 
 pub async fn write_holder_proxy_request(

@@ -1,3 +1,4 @@
+use crate::auth::ValidatedArunaBearerTokenCarrier;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -7,24 +8,14 @@ use aruna_core::structs::{
     usage_group_key,
 };
 use aruna_core::types::RoleId;
-use aruna_operations::add_group_role::{
-    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
-};
-use aruna_operations::add_user_to_group::{
-    AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
-};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::list_groups::ListGroupOperation;
-use aruna_operations::remove_group_role::{
-    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
-};
-use aruna_operations::remove_user_from_group::{
-    RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
-};
+use aruna_operations::routing::dispatch::dispatch_holder_call;
+use aruna_operations::routing::protocol::{GroupCall, GroupReply, ProxiedCall, ProxiedReply};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -286,30 +277,65 @@ fn require_unrestricted(auth: Option<AuthContext>) -> ServerResult<AuthContext> 
     Ok(auth)
 }
 
-fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: auth.realm_id,
+fn bearer_str(bearer: &Option<ValidatedArunaBearerTokenCarrier>) -> Option<&str> {
+    bearer
+        .as_ref()
+        .map(ValidatedArunaBearerTokenCarrier::as_str)
+}
+
+/// Routes a group-scoped call to a current holder of the group's subject shard
+/// and returns its typed reply. The holder re-checks authorization from the
+/// forwarded bearer, so no new authorization semantics live in the REST layer.
+async fn route_group_call(
+    state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
+    call: GroupCall,
+) -> ServerResult<GroupReply> {
+    let reply = dispatch_holder_call(
+        state.get_ctx().as_ref(),
+        state.get_node_id(),
+        bearer_str(bearer),
+        ProxiedCall::Group(call),
+    )
+    .await?;
+    match reply {
+        ProxiedReply::Group(group_reply) => Ok(*group_reply),
+        ProxiedReply::User(_) => Err(ServerError::InternalError(
+            "holder returned a non-group reply".to_string(),
+        )),
     }
 }
 
+/// Loads a group document from a current holder of its shard.
 async fn load_group(
     state: &ServerState,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
     group_id: Ulid,
 ) -> ServerResult<(Group, GroupAuthorizationDocument)> {
-    drive(
-        GetGroupOperation::new(GetGroupConfig { group_id }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_get_group_error)
+    match route_group_call(state, bearer, GroupCall::Get { group_id }).await? {
+        GroupReply::Document {
+            group,
+            authorization,
+        } => Ok((group, authorization)),
+        GroupReply::Authorization(_) | GroupReply::Ack => Err(unexpected_group_reply()),
+    }
 }
 
-fn map_get_group_error(error: GetGroupError) -> ServerError {
-    match error {
-        GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+fn unexpected_group_reply() -> ServerError {
+    ServerError::InternalError("holder returned an unexpected group reply".to_string())
+}
+
+fn expect_group_authorization(reply: GroupReply) -> ServerResult<GroupAuthorizationDocument> {
+    match reply {
+        GroupReply::Authorization(authorization) => Ok(authorization),
+        GroupReply::Document { .. } | GroupReply::Ack => Err(unexpected_group_reply()),
+    }
+}
+
+fn expect_group_ack(reply: GroupReply) -> ServerResult<()> {
+    match reply {
+        GroupReply::Ack => Ok(()),
+        GroupReply::Document { .. } | GroupReply::Authorization(_) => Err(unexpected_group_reply()),
     }
 }
 
@@ -550,11 +576,12 @@ async fn build_api_groups(
 pub async fn get_group(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     let group_id = parse_group_id(&group_id)?;
-    let (group, auth_doc) = load_group(&state, group_id).await?;
+    let (group, auth_doc) = load_group(&state, &bearer, group_id).await?;
     let is_member = is_group_member(&auth_doc, auth.user_id);
     Ok((
         StatusCode::OK,
@@ -565,45 +592,6 @@ pub async fn get_group(
             roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
         }),
     ))
-}
-
-fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
-    match error {
-        AddUserToGroupError::Unauthorized => ServerError::Forbidden,
-        AddUserToGroupError::InvalidUserId => ServerError::BadRequest,
-        AddUserToGroupError::RoleNotFound | AddUserToGroupError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
-    match error {
-        AddGroupRoleError::Unauthorized => ServerError::Forbidden,
-        AddGroupRoleError::InvalidPublicRole
-        | AddGroupRoleError::InvalidAssignedUser
-        | AddGroupRoleError::ReservedRoleName => ServerError::BadRequest,
-        AddGroupRoleError::GroupNotFound => ServerError::NotFound,
-        AddGroupRoleError::CheckPermissionsError(
-            AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
-        ) => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
-    match error {
-        RemoveUserFromGroupError::Unauthorized => ServerError::Forbidden,
-        RemoveUserFromGroupError::InvalidUserId => ServerError::BadRequest,
-        RemoveUserFromGroupError::RoleNotFound | RemoveUserFromGroupError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
-        RemoveUserFromGroupError::LastAdmin => {
-            ServerError::Conflict("the last admin of a group cannot be removed".to_string())
-        }
-        other => ServerError::InternalError(other.to_string()),
-    }
 }
 
 #[utoipa::path(
@@ -623,11 +611,12 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
 pub async fn get_group_usage(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    let (_, auth_doc) = load_group(&state, &bearer, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
@@ -675,11 +664,12 @@ pub async fn get_group_usage(
 pub async fn list_group_members(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupMembersResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     let group_id = parse_group_id(&group_id)?;
-    let (_, auth_doc) = load_group(&state, group_id).await?;
+    let (_, auth_doc) = load_group(&state, &bearer, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
         return Err(ServerError::Forbidden);
     }
@@ -729,10 +719,11 @@ pub async fn list_group_members(
 pub async fn add_group_member(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
     Json(request): Json<AddGroupMemberRequest>,
 ) -> ServerResult<(StatusCode, Json<GroupRolesResponse>)> {
-    let auth = require_unrestricted(auth)?;
+    require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_user_id(&request.user_id)?;
 
@@ -742,7 +733,7 @@ pub async fn add_group_member(
             .map(|role_id| parse_role_id(role_id))
             .collect::<ServerResult<_>>()?,
         _ => {
-            let (_, auth_doc) = load_group(&state, group_id).await?;
+            let (_, auth_doc) = load_group(&state, &bearer, group_id).await?;
             let role_ids = auth_doc
                 .roles
                 .iter()
@@ -758,17 +749,17 @@ pub async fn add_group_member(
         return Err(ServerError::BadRequest);
     }
 
-    let auth_doc = drive(
-        AddUserToGroupOperation::new(AddUserToGroupInput {
-            actor: actor_for(&state, &auth),
+    let reply = route_group_call(
+        &state,
+        &bearer,
+        GroupCall::AddMember {
             group_id,
             user_id,
             role_ids,
-        }),
-        &state.get_ctx(),
+        },
     )
-    .await
-    .map_err(map_add_member_error)?;
+    .await?;
+    let auth_doc = expect_group_authorization(reply)?;
 
     Ok((
         StatusCode::CREATED,
@@ -799,10 +790,11 @@ pub async fn add_group_member(
 pub async fn remove_group_member(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path((group_id, user_id)): Path<(String, String)>,
     Query(query): Query<RemoveGroupMemberQuery>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted(auth)?;
+    require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_user_id(&user_id)?;
     let role_ids = query
@@ -811,17 +803,17 @@ pub async fn remove_group_member(
         .map(|role_id| parse_role_id(role_id).map(|role_id| HashSet::from([role_id])))
         .transpose()?;
 
-    drive(
-        RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
-            actor: actor_for(&state, &auth),
+    let reply = route_group_call(
+        &state,
+        &bearer,
+        GroupCall::RemoveMember {
             group_id,
             user_id,
             role_ids,
-        }),
-        &state.get_ctx(),
+        },
     )
-    .await
-    .map_err(map_remove_member_error)?;
+    .await?;
+    expect_group_ack(reply)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -841,22 +833,23 @@ pub async fn remove_group_member(
 pub async fn leave_group(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
 
-    drive(
-        RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
-            actor: actor_for(&state, &auth),
+    let reply = route_group_call(
+        &state,
+        &bearer,
+        GroupCall::RemoveMember {
             group_id,
             user_id: auth.user_id,
             role_ids: None,
-        }),
-        &state.get_ctx(),
+        },
     )
-    .await
-    .map_err(map_remove_member_error)?;
+    .await?;
+    expect_group_ack(reply)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -879,10 +872,11 @@ pub async fn leave_group(
 pub async fn create_group_role(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(group_id): Path<String>,
     Json(request): Json<CreateGroupRoleRequest>,
 ) -> ServerResult<(StatusCode, Json<RoleResponse>)> {
-    let auth = require_unrestricted(auth)?;
+    require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let realm_id = state.get_realm_id();
 
@@ -925,23 +919,21 @@ pub async fn create_group_role(
     }
 
     let role_id = Ulid::new();
-    let (_, auth_doc) = drive(
-        AddGroupRoleOperation::new(AddGroupRoleConfig {
-            auth_context: auth.clone(),
-            actor: actor_for(&state, &auth),
-            realm_id,
+    let reply = route_group_call(
+        &state,
+        &bearer,
+        GroupCall::AddRole {
             group_id,
-            role: Role {
+            role: Box::new(Role {
                 role_id,
                 name,
                 permissions,
                 assigned_users,
-            },
-        }),
-        &state.get_ctx(),
+            }),
+        },
     )
-    .await
-    .map_err(map_add_role_error)?;
+    .await?;
+    let auth_doc = expect_group_authorization(reply)?;
 
     let role = map_roles(auth_doc, realm_id)
         .into_iter()
@@ -972,33 +964,16 @@ pub async fn create_group_role(
 pub async fn delete_group_role(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path((group_id, role_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted(auth)?;
+    require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
 
-    drive(
-        RemoveGroupRoleOperation::new(RemoveGroupRoleConfig {
-            auth_context: auth.clone(),
-            actor: actor_for(&state, &auth),
-            realm_id: state.get_realm_id(),
-            group_id,
-            role_id,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| match error {
-        RemoveGroupRoleError::Unauthorized => ServerError::Forbidden,
-        RemoveGroupRoleError::RoleNotFound | RemoveGroupRoleError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
-        RemoveGroupRoleError::AdminRoleUndeletable => {
-            ServerError::Conflict("the admin role cannot be deleted".to_string())
-        }
-        other => ServerError::InternalError(other.to_string()),
-    })?;
+    let reply =
+        route_group_call(&state, &bearer, GroupCall::RemoveRole { group_id, role_id }).await?;
+    expect_group_ack(reply)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

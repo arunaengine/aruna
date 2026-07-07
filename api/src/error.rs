@@ -2,6 +2,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
 use aruna_operations::auth::ArunaBearerTokenError;
+use aruna_operations::routing::dispatch::HolderRoutingError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -113,6 +114,22 @@ pub enum OidcError {
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+}
+
+/// Maps a holder-routing failure onto the REST surface: `NotFound` → 404,
+/// `Unavailable` → 503 (+Retry-After), `Remote` → 502, `Unauthorized` → 403,
+/// `Internal` → 500. A missing bearer is already rejected with 401 by the
+/// handler before it routes, so a routed authorization denial is always 403.
+impl From<HolderRoutingError> for ServerError {
+    fn from(error: HolderRoutingError) -> Self {
+        match error {
+            HolderRoutingError::NotFound => ServerError::NotFound,
+            HolderRoutingError::Unavailable => ServerError::ServiceUnavailable,
+            HolderRoutingError::Remote(_) => ServerError::BadGateway,
+            HolderRoutingError::Unauthorized(_) => ServerError::Forbidden,
+            HolderRoutingError::Internal(message) => ServerError::InternalError(message),
+        }
+    }
 }
 
 /// Standard error response for API endpoints.
