@@ -57,6 +57,9 @@ use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
     GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
+use aruna_operations::s3::get_object_attributes::{
+    GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
+};
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::list_multipart_uploads::{
@@ -85,26 +88,27 @@ use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-    ChecksumType, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerEntry,
-    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
-    DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag, ETagCondition,
-    EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
+    Checksum, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
+    CopyPartResult, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
+    DeleteMarkerEntry, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag,
+    ETagCondition, EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
     GetBucketReplicationInput, GetBucketReplicationOutput, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput,
-    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
-    ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
-    MultipartUpload as S3MultipartUpload, Object, ObjectVersion, ObjectVersionStorageClass, Owner,
-    Part, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StorageClass, StreamingBlob, Timestamp, TimestampFormat,
-    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    GetBucketVersioningOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
+    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
+    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    ListPartsInput, ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload,
+    Object, ObjectAttributes, ObjectPart, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
+    Timestamp, TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -1624,16 +1628,161 @@ impl S3 for ArunaS3Service {
         })
     }
 
-    #[tracing::instrument(err, skip(self, _req))]
+    #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn get_object_attributes(
         &self,
-        _req: S3Request<GetObjectAttributesInput>,
+        req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        Err(s3_error!(
-            NotImplemented,
-            "GetObjectAttributes is not implemented"
-        ))
+        debug!("Received GET OBJECT ATTRIBUTES Request: {:#?}", req);
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        let mut want_etag = false;
+        let mut want_checksum = false;
+        let mut want_object_parts = false;
+        let mut want_object_size = false;
+        let mut want_storage_class = false;
+        for attribute in req.input.object_attributes.iter() {
+            match attribute.as_str() {
+                ObjectAttributes::ETAG => want_etag = true,
+                ObjectAttributes::CHECKSUM => want_checksum = true,
+                ObjectAttributes::OBJECT_PARTS => want_object_parts = true,
+                ObjectAttributes::OBJECT_SIZE => want_object_size = true,
+                ObjectAttributes::STORAGE_CLASS => want_storage_class = true,
+                _ => {}
+            }
+        }
+        if !(want_etag
+            || want_checksum
+            || want_object_parts
+            || want_object_size
+            || want_storage_class)
+        {
+            return Err(s3_error!(
+                InvalidArgument,
+                "At least one object attribute must be specified"
+            ));
+        }
+
+        let requested_part_number_marker = req.input.part_number_marker;
+        let part_number_marker = match requested_part_number_marker {
+            None => None,
+            Some(marker) if marker < 0 => {
+                return Err(s3_error!(InvalidArgument, "Invalid part-number-marker"));
+            }
+            Some(marker) => Some(u16::try_from(marker).unwrap_or(u16::MAX)),
+        };
+        let max_parts = match req.input.max_parts {
+            None => ListPartsOperation::DEFAULT_MAX_PARTS,
+            Some(max_parts) => usize::try_from(max_parts)
+                .map_err(|_| s3_error!(InvalidArgument, "max-parts must be non-negative"))?
+                .min(ListPartsOperation::DEFAULT_MAX_PARTS),
+        };
+        let version_id = parse_version_id(req.input.version_id)?;
+
+        let result = drive(
+            GetObjectAttributesOperation::new(GOAI {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                version_id,
+                include_parts: want_object_parts,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to get object attributes"))?;
+
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            None,
+        );
+
+        let checksum = if want_checksum {
+            result.location.as_ref().map(|location| {
+                let encoded = encode_checksums(
+                    &location.hashes,
+                    ChecksumSelection::AllStored,
+                    s3_checksum_type_from_multipart(result.checksum_type),
+                );
+                Checksum {
+                    checksum_crc32: encoded.checksum_crc32,
+                    checksum_crc32c: encoded.checksum_crc32c,
+                    checksum_crc64nvme: encoded.checksum_crc64nvme,
+                    checksum_sha1: encoded.checksum_sha1,
+                    checksum_sha256: encoded.checksum_sha256,
+                    checksum_type: encoded.checksum_type,
+                }
+            })
+        } else {
+            None
+        };
+
+        let object_parts = if want_object_parts {
+            result.summary.as_ref().map(|summary| {
+                let mut parts: Vec<&aruna_core::structs::MultipartObjectPart> =
+                    result.parts.iter().collect();
+                if let Some(marker) = part_number_marker {
+                    parts.retain(|part| part.part_number > marker);
+                }
+                let is_truncated = parts.len() > max_parts;
+                parts.truncate(max_parts);
+                let next_part_number_marker = is_truncated
+                    .then(|| parts.last().map(|part| part.part_number))
+                    .flatten();
+                let object_part_list: Vec<ObjectPart> = parts
+                    .into_iter()
+                    .map(|part| {
+                        let checksums = encode_checksums(
+                            &part.hashes,
+                            ChecksumSelection::AllStored,
+                            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                        );
+                        ObjectPart {
+                            part_number: Some(i32::from(part.part_number)),
+                            size: Some(part.size as i64),
+                            checksum_crc32: checksums.checksum_crc32,
+                            checksum_crc32c: checksums.checksum_crc32c,
+                            checksum_crc64nvme: checksums.checksum_crc64nvme,
+                            checksum_sha1: checksums.checksum_sha1,
+                            checksum_sha256: checksums.checksum_sha256,
+                        }
+                    })
+                    .collect();
+                GetObjectAttributesParts {
+                    total_parts_count: Some(i32::try_from(summary.part_count).unwrap_or(i32::MAX)),
+                    is_truncated: Some(is_truncated),
+                    max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
+                    part_number_marker: requested_part_number_marker,
+                    next_part_number_marker: next_part_number_marker.map(i32::from),
+                    parts: Some(object_part_list),
+                }
+            })
+        } else {
+            None
+        };
+
+        let output = GetObjectAttributesOutput {
+            e_tag: want_etag.then(|| response_fields.e_tag.clone()).flatten(),
+            last_modified: response_fields.last_modified,
+            object_size: want_object_size
+                .then_some(response_fields.content_length)
+                .flatten(),
+            storage_class: want_storage_class
+                .then(|| StorageClass::from_static(StorageClass::STANDARD)),
+            version_id: result.version_id.map(|version_id| version_id.to_string()),
+            checksum,
+            object_parts,
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(err, skip(self, req))]
