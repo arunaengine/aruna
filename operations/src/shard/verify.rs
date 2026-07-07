@@ -26,7 +26,9 @@ pub const SHARD_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 
 /// Persisted proof that the local node reconciled a shard against a co-holder.
 /// Presence of the row (keyed like a pending placement) means verified; a
-/// restart resumes only shards without one.
+/// restart resumes only shards without one. The marker is a one-shot join-time
+/// signal, not a continuous consistency guarantee: it is written once on the
+/// first successful reconcile and deleted when the node leaves the holder set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardVerificationRecord {
     pub placement: PlacementRef,
@@ -111,13 +113,31 @@ async fn verify_one_shard(
     placement: PlacementRef,
     co_holders: &[NodeId],
 ) -> bool {
-    // A sole holder has no co-holder to reconcile against; it is trivially
-    // consistent with itself, so mark it verified immediately.
+    let topic = shard_topic_id(realm_id, &placement);
+
+    // A sole holder is trivially consistent with itself, but only once its
+    // genesis exists. A genesis-less topic still reports the (non-zero) empty
+    // fingerprint, so gate on the local topic actually existing — never on the
+    // digest value — or a rank-0 create still pending would be marked verified.
     if co_holders.is_empty() {
-        let digest = assemble_shard_manifest(context, realm_id, placement)
-            .await
-            .map(|manifest| manifest.digest)
-            .unwrap_or([0u8; 32]);
+        if !net_handle
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false)
+        {
+            debug!(
+                strategy = %placement.strategy_id,
+                shard = placement.shard,
+                "Sole-holder shard has no local genesis yet; deferring verification"
+            );
+            return false;
+        }
+        let digest = match assemble_shard_manifest(context, realm_id, placement).await {
+            Ok(manifest) => manifest.digest,
+            Err(error) => {
+                warn!(error = %error, "Failed to assemble sole-holder shard manifest for verification");
+                return false;
+            }
+        };
         mark_verified(context, realm_id, placement, None, digest).await;
         info!(
             strategy = %placement.strategy_id,
@@ -127,7 +147,6 @@ async fn verify_one_shard(
         return true;
     }
 
-    let topic = shard_topic_id(realm_id, &placement);
     for co_holder in co_holders {
         let mut remote =
             match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
@@ -152,7 +171,14 @@ async fn verify_one_shard(
                     return false;
                 }
             };
-            if local.digest == remote.digest {
+            // Never certify convergence without a local genesis: two genesis-less
+            // holders share the (non-zero) empty fingerprint and would otherwise
+            // match, so require the local topic to exist before comparing.
+            if net_handle
+                .document_sync_topic_exists(topic)
+                .unwrap_or(false)
+                && local.digest == remote.digest
+            {
                 mark_verified(context, realm_id, placement, Some(*co_holder), local.digest).await;
                 info!(
                     strategy = %placement.strategy_id,
@@ -181,6 +207,26 @@ async fn verify_one_shard(
         return false;
     }
     false
+}
+
+/// Deletes a shard's verification marker (e.g. when the local node leaves the
+/// shard's holder set), so a later re-entry re-verifies from scratch.
+pub async fn delete_shard_verification(
+    context: &DriverContext,
+    realm_id: RealmId,
+    placement: &PlacementRef,
+) {
+    if let Event::Storage(StorageEvent::Error { error }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
+            key: verification_key(realm_id, placement),
+            txn_id: None,
+        })
+        .await
+    {
+        warn!(error = %error, "Failed to delete shard verification marker");
+    }
 }
 
 /// Whether the local node has a persisted verification marker for a shard.
