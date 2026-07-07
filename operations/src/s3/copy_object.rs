@@ -62,7 +62,7 @@ fn etag_matches(expected: &str, actual: Option<&str>) -> bool {
     actual.is_some_and(|actual| normalize_etag(actual) == normalize_etag(expected))
 }
 
-fn evaluate_source_conditions(
+pub(crate) fn evaluate_source_conditions(
     conditions: &CopySourceConditions,
     etag: Option<&str>,
     last_modified: Option<SystemTime>,

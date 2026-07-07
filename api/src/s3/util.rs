@@ -5,6 +5,7 @@ use aruna_core::structs::{
     MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
 };
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
+use aruna_operations::s3::get_object::ObjectRangeRequest;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
@@ -257,6 +258,21 @@ pub(crate) fn parse_copy_source(
     }
 }
 
+pub(crate) fn parse_copy_source_range(range: Option<&str>) -> S3Result<Option<ObjectRangeRequest>> {
+    let Some(range) = range else {
+        return Ok(None);
+    };
+    let invalid = || s3_error!(InvalidArgument, "Invalid copy source range");
+    let spec = range.strip_prefix("bytes=").ok_or_else(invalid)?;
+    let (start, end) = spec.split_once('-').ok_or_else(invalid)?;
+    let start: u64 = start.parse().map_err(|_| invalid())?;
+    let end: u64 = end.parse().map_err(|_| invalid())?;
+    if start > end {
+        return Err(invalid());
+    }
+    Ok(Some(ObjectRangeRequest::StartEnd { start, end }))
+}
+
 pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ulid>> {
     version_id
         .map(|version_id| {
@@ -324,12 +340,38 @@ pub(crate) fn s3_checksum_algorithm_from_core(
 mod tests {
     use super::{
         get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_copy_source, parse_multipart_part_number, validate_object_key,
+        parse_copy_source, parse_copy_source_range, parse_multipart_part_number,
+        validate_object_key,
     };
     use crate::s3::auth::Action;
+    use aruna_operations::s3::get_object::ObjectRangeRequest;
     use s3s::S3ErrorCode;
     use s3s::dto::CopySource;
     use ulid::Ulid;
+
+    #[test]
+    fn parses_bounded_copy_source_range() {
+        assert_eq!(
+            parse_copy_source_range(Some("bytes=0-99")).unwrap(),
+            Some(ObjectRangeRequest::StartEnd { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn parses_absent_copy_source_range() {
+        assert_eq!(parse_copy_source_range(None).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_copy_source_ranges() {
+        for value in ["0-99", "bytes=2-", "bytes=-5", "bytes=abc-def", "bytes=5-2"] {
+            assert_eq!(
+                *parse_copy_source_range(Some(value)).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "expected InvalidArgument for {value}"
+            );
+        }
+    }
 
     #[test]
     fn parses_bucket_copy_source_without_version() {

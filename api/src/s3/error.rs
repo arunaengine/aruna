@@ -23,6 +23,7 @@ use aruna_operations::s3::put_bucket_replication::{
 };
 use aruna_operations::s3::put_object::PutObjectError;
 use aruna_operations::s3::upload_part::UploadPartError;
+use aruna_operations::s3::upload_part_copy::UploadPartCopyError;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;
@@ -177,6 +178,19 @@ impl IntoS3Error for UploadPartError {
                 checksum_mismatch_s3_error(algorithm, "UploadPart")
             }
             err => internal_error(err),
+        }
+    }
+}
+
+impl IntoS3Error for UploadPartCopyError {
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            UploadPartCopyError::Get(err) => err.into_s3_error(),
+            UploadPartCopyError::UploadPart(err) => err.into_s3_error(),
+            UploadPartCopyError::PreconditionFailed => s3_error!(
+                PreconditionFailed,
+                "At least one of the preconditions you specified did not hold."
+            ),
         }
     }
 }

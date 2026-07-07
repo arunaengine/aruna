@@ -3,8 +3,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use http::HeaderMap;
 use s3s::dto::{
-    ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, CopyObjectResult, GetObjectOutput,
-    HeadObjectOutput, PutObjectOutput, UploadPartOutput,
+    ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, CopyObjectResult, CopyPartResult,
+    GetObjectOutput, HeadObjectOutput, PutObjectOutput, UploadPartOutput,
 };
 use s3s::{S3Error, S3Result, s3_error};
 use std::collections::HashMap;
@@ -103,6 +103,16 @@ impl ApplyChecksums for CopyObjectResult {
         self.checksum_sha1 = checksums.checksum_sha1;
         self.checksum_sha256 = checksums.checksum_sha256;
         self.checksum_type = checksums.checksum_type;
+    }
+}
+
+impl ApplyChecksums for CopyPartResult {
+    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
+        self.checksum_crc32 = checksums.checksum_crc32;
+        self.checksum_crc32c = checksums.checksum_crc32c;
+        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
+        self.checksum_sha1 = checksums.checksum_sha1;
+        self.checksum_sha256 = checksums.checksum_sha256;
     }
 }
 
