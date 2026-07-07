@@ -715,6 +715,7 @@ impl CompleteMultipartUploadOperation {
         let summary = MultipartObjectSummary {
             checksum_type: self.input.checksum_type,
             part_count: self.resolved_parts.len(),
+            composite_hashes: self.composite_hashes.clone(),
         };
         let summary_key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
             Ok(key) => key,

@@ -7,10 +7,10 @@ use crate::s3::checksum::{
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
-    convert_input, multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
-    parse_copy_source_range, parse_multipart_checksum_hint, parse_multipart_part_number,
-    parse_upload_id, parse_version_id, s3_checksum_algorithm_from_core,
-    s3_checksum_type_from_multipart, validate_object_key,
+    checksum_response_hashes, convert_input, multipart_checksum_type_from_s3, parse_completed_part,
+    parse_copy_source, parse_copy_source_range, parse_multipart_checksum_hint,
+    parse_multipart_part_number, parse_upload_id, parse_version_id,
+    s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -1615,7 +1615,11 @@ impl S3 for ArunaS3Service {
             && let Some(location) = result.location.as_ref()
         {
             output.apply_checksums(encode_checksums(
-                &location.hashes,
+                checksum_response_hashes(
+                    result.checksum_type,
+                    &location.hashes,
+                    &result.composite_hashes,
+                ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));
@@ -1704,10 +1708,19 @@ impl S3 for ArunaS3Service {
             None,
         );
 
+        let composite_hashes = result
+            .summary
+            .as_ref()
+            .map(|summary| summary.composite_hashes.clone())
+            .unwrap_or_default();
         let checksum = if want_checksum {
             result.location.as_ref().map(|location| {
                 let encoded = encode_checksums(
-                    &location.hashes,
+                    checksum_response_hashes(
+                        result.checksum_type,
+                        &location.hashes,
+                        &composite_hashes,
+                    ),
                     ChecksumSelection::AllStored,
                     s3_checksum_type_from_multipart(result.checksum_type),
                 );
@@ -1828,7 +1841,11 @@ impl S3 for ArunaS3Service {
             && let Some(location) = result.location.as_ref()
         {
             output.apply_checksums(encode_checksums(
-                &location.hashes,
+                checksum_response_hashes(
+                    result.checksum_type,
+                    &location.hashes,
+                    &result.composite_hashes,
+                ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));

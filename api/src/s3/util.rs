@@ -300,6 +300,17 @@ pub(crate) fn s3_checksum_type_from_multipart(
     }
 }
 
+pub(crate) fn checksum_response_hashes<'a>(
+    checksum_type: MultipartChecksumType,
+    location_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+    composite_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+) -> &'a std::collections::HashMap<String, Vec<u8>> {
+    match checksum_type {
+        MultipartChecksumType::Composite if !composite_hashes.is_empty() => composite_hashes,
+        _ => location_hashes,
+    }
+}
+
 pub(crate) fn checksum_algorithm_from_s3(
     algorithm: &S3ChecksumAlgorithm,
 ) -> S3Result<ChecksumAlgorithm> {
@@ -339,15 +350,51 @@ pub(crate) fn s3_checksum_algorithm_from_core(
 #[cfg(test)]
 mod tests {
     use super::{
+        checksum_response_hashes,
         get_s3_operation_permission, is_anonymous_object_read_operation,
         parse_copy_source, parse_copy_source_range, parse_multipart_part_number,
         validate_object_key,
     };
     use crate::s3::auth::Action;
+    use aruna_core::structs::MultipartChecksumType;
     use aruna_operations::s3::get_object::ObjectRangeRequest;
     use s3s::S3ErrorCode;
     use s3s::dto::CopySource;
+    use std::collections::HashMap;
     use ulid::Ulid;
+
+    #[test]
+    fn composite_uploads_surface_composite_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &composite
+        );
+    }
+
+    #[test]
+    fn full_object_uploads_surface_location_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::FullObject, &location, &composite),
+            &location
+        );
+    }
+
+    #[test]
+    fn empty_composite_hashes_fall_back_to_location() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::new();
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &location
+        );
+    }
 
     #[test]
     fn parses_bounded_copy_source_range() {

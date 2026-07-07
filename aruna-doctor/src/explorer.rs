@@ -1815,6 +1815,7 @@ mod tests {
         let summary = MultipartObjectSummary {
             checksum_type: MultipartChecksumType::Composite,
             part_count: 3,
+            composite_hashes: Default::default(),
         };
 
         let decoded = decode_entry(

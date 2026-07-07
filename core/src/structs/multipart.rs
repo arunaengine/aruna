@@ -146,6 +146,7 @@ impl MultipartObjectMetadataKey {
 pub struct MultipartObjectSummary {
     pub checksum_type: MultipartChecksumType,
     pub part_count: usize,
+    pub composite_hashes: HashMap<String, Vec<u8>>,
 }
 
 impl MultipartObjectSummary {

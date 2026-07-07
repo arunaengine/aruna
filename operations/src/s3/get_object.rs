@@ -21,6 +21,7 @@ use aruna_core::structs::{
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -149,6 +150,7 @@ pub struct GetObjectResult {
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
+    pub composite_hashes: HashMap<String, Vec<u8>>,
     pub resolved_range: Option<ResolvedObjectRange>,
 }
 
@@ -165,6 +167,7 @@ pub struct GetObjectOperation {
     last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
+    composite_hashes: HashMap<String, Vec<u8>>,
     resolved_range: Option<ResolvedObjectRange>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
 }
@@ -183,6 +186,7 @@ impl GetObjectOperation {
             last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
             resolved_range: None,
             output: None,
         }
@@ -429,10 +433,12 @@ impl GetObjectOperation {
             });
         };
 
-        self.checksum_type = value
-            .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
-            .map(|summary| summary.checksum_type)
-            .unwrap_or(MultipartChecksumType::FullObject);
+        if let Some(summary) =
+            value.and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
+        {
+            self.checksum_type = summary.checksum_type;
+            self.composite_hashes = summary.composite_hashes;
+        }
 
         self.commit_and_read_blob()
     }
@@ -564,6 +570,7 @@ impl GetObjectOperation {
                 version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
                 checksum_type: self.checksum_type,
+                composite_hashes: self.composite_hashes.clone(),
                 resolved_range: self.resolved_range.clone(),
             }));
             smallvec![]
@@ -620,6 +627,7 @@ impl GetObjectOperation {
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,
+            composite_hashes: self.composite_hashes.clone(),
             resolved_range: self.resolved_range.clone(),
         }));
         smallvec![]

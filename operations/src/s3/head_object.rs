@@ -13,6 +13,7 @@ use aruna_core::structs::{
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
+use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -74,6 +75,7 @@ pub struct HeadObjectResult {
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
+    pub composite_hashes: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -86,6 +88,7 @@ pub struct HeadObjectOperation {
     last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
+    composite_hashes: HashMap<String, Vec<u8>>,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -100,6 +103,7 @@ impl HeadObjectOperation {
             last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
             output: None,
         }
     }
@@ -324,10 +328,12 @@ impl HeadObjectOperation {
             });
         };
 
-        self.checksum_type = value
-            .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
-            .map(|summary| summary.checksum_type)
-            .unwrap_or(MultipartChecksumType::FullObject);
+        if let Some(summary) =
+            value.and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
+        {
+            self.checksum_type = summary.checksum_type;
+            self.composite_hashes = summary.composite_hashes;
+        }
 
         self.finish_lookup()
     }
@@ -348,6 +354,7 @@ impl HeadObjectOperation {
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,
+            composite_hashes: self.composite_hashes.clone(),
         }));
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]

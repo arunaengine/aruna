@@ -566,6 +566,7 @@ mod tests {
             MultipartObjectSummary {
                 checksum_type,
                 part_count: part_numbers.len(),
+                composite_hashes: HashMap::from([(HASH_SHA256.to_string(), vec![9u8; 32])]),
             }
             .to_bytes()
             .unwrap(),
@@ -627,7 +628,12 @@ mod tests {
 
         assert_eq!(result.location, Some(location));
         assert_eq!(result.checksum_type, MultipartChecksumType::Composite);
-        assert_eq!(result.summary.map(|summary| summary.part_count), Some(2));
+        let summary = result.summary.expect("multipart summary");
+        assert_eq!(summary.part_count, 2);
+        assert_eq!(
+            summary.composite_hashes.get(HASH_SHA256),
+            Some(&vec![9u8; 32])
+        );
         let numbers: Vec<u16> = result.parts.iter().map(|part| part.part_number).collect();
         assert_eq!(numbers, vec![1, 2]);
         assert_eq!(result.version_id, Some(version_id));
