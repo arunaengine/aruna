@@ -298,7 +298,7 @@ async fn route_user_call(
     .await?;
     match reply {
         ProxiedReply::User(user_reply) => Ok(*user_reply),
-        ProxiedReply::Group(_) => Err(ServerError::InternalError(
+        ProxiedReply::Group(_) | ProxiedReply::Metadata(_) => Err(ServerError::InternalError(
             "holder returned a non-user reply".to_string(),
         )),
     }

@@ -1,24 +1,18 @@
 use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::AuthorizationError;
-use aruna_core::metadata::{
-    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
-};
+use aruna_core::metadata::{MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit};
 use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
-    WatchEventKind,
+    AuthContext, MetadataRegistryRecord, WatchEvent, WatchEventDetail, WatchEventKind,
 };
 use aruna_core::util::unix_timestamp_millis;
+#[cfg(test)]
+use aruna_core::{errors::AuthorizationError, structs::Permission};
+#[cfg(test)]
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, create_metadata_document as run_create_metadata_document,
-};
-use aruna_operations::delete_metadata_document::{
-    DeleteMetadataDocumentOperation, delete_metadata_document as run_delete_metadata_document,
-};
+#[cfg(test)]
 use aruna_operations::driver::drive;
+#[cfg(test)]
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::api::{
     ExportMetadataRoCrateRequest, ExportMetadataRoCrateResult, GetVisibleMetadataDocumentRequest,
@@ -32,9 +26,9 @@ use aruna_operations::metadata::api::{
     search_metadata as run_search_metadata,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
-use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
+use aruna_operations::routing::dispatch::dispatch_holder_call;
+use aruna_operations::routing::protocol::{
+    MetadataCall, MetadataCreatePayload, MetadataMutation, MetadataReply, ProxiedCall, ProxiedReply,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -445,6 +439,7 @@ impl MetadataDocumentListItem {
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -453,7 +448,7 @@ pub async fn create_metadata_document(
             parse_group_id(&request.group_id)?,
             request.path,
             request.public,
-            CreateMetadataDocumentPayload::Scaffold {
+            MetadataCreatePayload::Scaffold {
                 name: request.name,
                 description: request.description,
                 date_published: request.date_published,
@@ -464,7 +459,7 @@ pub async fn create_metadata_document(
             parse_group_id(&request.group_id)?,
             request.path,
             request.public,
-            CreateMetadataDocumentPayload::RoCrate {
+            MetadataCreatePayload::RoCrate {
                 jsonld: serialize_jsonld_object(&request.rocrate)?,
             },
         ),
@@ -472,29 +467,21 @@ pub async fn create_metadata_document(
     if MetadataRegistryRecord::normalize_document_path(&path).is_empty() {
         return Err(ServerError::BadRequest);
     }
-    ensure_metadata_write_scope(&state, &auth, group_id).await?;
 
     let ctx = state.get_ctx();
-    let created = run_create_metadata_document(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: state.get_node_id(),
-                    user_id: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                },
-                group_id,
-                document_id: Ulid::new(),
-                document_path: path,
-                public,
-                payload,
-            },
-        ),
-        ctx.clone(),
+    let reply = route_metadata_call(
+        &state,
+        &bearer,
+        MetadataCall::Create {
+            group_id,
+            document_id: Ulid::new(),
+            document_path: path,
+            public,
+            payload,
+        },
     )
-    .await
-    .map_err(map_create_metadata_error)?;
-    let result = created.record;
+    .await?;
+    let result = expect_metadata_record(reply)?;
 
     // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
     // emission only warns and never affects the already-successful create.
@@ -627,29 +614,14 @@ pub async fn get_metadata_document(
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
 
-    let ctx = state.get_ctx();
-    run_delete_metadata_document(
-        DeleteMetadataDocumentOperation::new(
-            Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            record.group_id,
-            document_id,
-        ),
-        ctx.as_ref(),
-        document_id,
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let reply = route_metadata_call(&state, &bearer, MetadataCall::Delete { document_id }).await?;
+    expect_metadata_ack(reply)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -813,33 +785,25 @@ pub async fn export_metadata_rocrate(
 pub async fn replace_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(request): Json<ReplaceMetadataRoCrateRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
+    let jsonld = serialize_jsonld_object(&request.rocrate)?;
 
-    let ctx = state.get_ctx();
-    let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
+    let reply = route_metadata_call(
+        &state,
+        &bearer,
+        MetadataCall::Update {
             document_id,
-            public: request.public.unwrap_or(record.public),
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
-                jsonld: serialize_jsonld_object(&request.rocrate)?,
-            },
-        }),
-        ctx.as_ref(),
+            public: request.public,
+            mutation: MetadataMutation::ReplaceRoCrate { jsonld },
+        },
     )
-    .await
-    .map_err(map_update_metadata_error)?;
+    .await?;
+    let updated = expect_metadata_record(reply)?;
 
     Ok((
         StatusCode::OK,
@@ -906,33 +870,25 @@ pub async fn replace_metadata_rocrate(
 pub async fn add_metadata_data_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
+    let jsonld = serialize_jsonld_entity(&entity)?;
 
-    let ctx = state.get_ctx();
-    let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
+    let reply = route_metadata_call(
+        &state,
+        &bearer,
+        MetadataCall::Update {
             document_id,
-            public: record.public,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
-                jsonld: serialize_jsonld_entity(&entity)?,
-            },
-        }),
-        ctx.as_ref(),
+            public: None,
+            mutation: MetadataMutation::UpsertDataEntity { jsonld },
+        },
     )
-    .await
-    .map_err(map_update_metadata_error)?;
+    .await?;
+    let updated = expect_metadata_record(reply)?;
 
     Ok((
         StatusCode::OK,
@@ -995,33 +951,25 @@ pub async fn add_metadata_data_entity(
 pub async fn add_metadata_contextual_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_writable(&state, &auth, &record).await?;
+    let jsonld = serialize_jsonld_entity(&entity)?;
 
-    let ctx = state.get_ctx();
-    let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
+    let reply = route_metadata_call(
+        &state,
+        &bearer,
+        MetadataCall::Update {
             document_id,
-            public: record.public,
-            mutation: UpdateMetadataDocumentMutation::UpsertContextualEntity {
-                jsonld: serialize_jsonld_entity(&entity)?,
-            },
-        }),
-        ctx.as_ref(),
+            public: None,
+            mutation: MetadataMutation::UpsertContextualEntity { jsonld },
+        },
     )
-    .await
-    .map_err(map_update_metadata_error)?;
+    .await?;
+    let updated = expect_metadata_record(reply)?;
 
     Ok((
         StatusCode::OK,
@@ -1291,33 +1239,6 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
     serde_json::to_string(value).map_err(|_| ServerError::BadRequest)
 }
 
-fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError {
-    match error {
-        CreateMetadataDocumentError::MetadataError(metadata_error) => {
-            map_metadata_error(metadata_error)
-        }
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
-    match error {
-        UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
-        UpdateMetadataDocumentError::MetadataError(metadata_error) => {
-            map_metadata_error(metadata_error)
-        }
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_metadata_error(error: MetadataError) -> ServerError {
-    match error {
-        MetadataError::InvalidInput(_) => ServerError::BadRequest,
-        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
 fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
     match error {
         MetadataApiError::BadRequest => ServerError::BadRequest,
@@ -1342,29 +1263,54 @@ fn bearer_token_to_string(
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
-async fn ensure_metadata_write_scope(
-    state: &ServerState,
-    auth: &AuthContext,
-    group_id: Ulid,
-) -> ServerResult<()> {
-    let path = format!("/{}/g/{group_id}/meta/**", state.get_realm_id());
-    ensure_permission(state, auth.clone(), path, Permission::WRITE).await
+fn bearer_str(bearer: &Option<ValidatedArunaBearerTokenCarrier>) -> Option<&str> {
+    bearer
+        .as_ref()
+        .map(ValidatedArunaBearerTokenCarrier::as_str)
 }
 
-async fn ensure_record_writable(
+/// Routes a metadata mutation to a current holder of the document shard. The
+/// holder loads the registry record, re-checks the caller's write permission
+/// from the forwarded bearer, and only then applies the mutation.
+async fn route_metadata_call(
     state: &ServerState,
-    auth: &AuthContext,
-    record: &MetadataRegistryRecord,
-) -> ServerResult<()> {
-    ensure_permission(
-        state,
-        auth.clone(),
-        record.permission_path.clone(),
-        Permission::WRITE,
+    bearer: &Option<ValidatedArunaBearerTokenCarrier>,
+    call: MetadataCall,
+) -> ServerResult<MetadataReply> {
+    let reply = dispatch_holder_call(
+        state.get_ctx().as_ref(),
+        state.get_node_id(),
+        bearer_str(bearer),
+        ProxiedCall::Metadata(call),
     )
-    .await
+    .await?;
+    match reply {
+        ProxiedReply::Metadata(metadata_reply) => Ok(*metadata_reply),
+        ProxiedReply::Group(_) | ProxiedReply::User(_) => Err(ServerError::InternalError(
+            "holder returned a non-metadata reply".to_string(),
+        )),
+    }
 }
 
+fn expect_metadata_record(reply: MetadataReply) -> ServerResult<MetadataRegistryRecord> {
+    match reply {
+        MetadataReply::Record(record) => Ok(record),
+        MetadataReply::Ack => Err(ServerError::InternalError(
+            "holder returned an unexpected metadata reply".to_string(),
+        )),
+    }
+}
+
+fn expect_metadata_ack(reply: MetadataReply) -> ServerResult<()> {
+    match reply {
+        MetadataReply::Ack => Ok(()),
+        MetadataReply::Record(_) => Err(ServerError::InternalError(
+            "holder returned an unexpected metadata reply".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
 async fn ensure_permission(
     state: &ServerState,
     auth: AuthContext,
@@ -1400,6 +1346,7 @@ async fn ensure_permission(
     }
 }
 
+#[cfg(test)]
 async fn load_metadata_record_by_document(
     state: &ServerState,
     document_id: Ulid,
@@ -1417,6 +1364,7 @@ async fn load_metadata_record_by_document(
     }
 }
 
+#[cfg(test)]
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
 
 fn map_rocrate_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCrateExportView {
@@ -1596,7 +1544,7 @@ mod tests {
     };
     use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
@@ -1631,7 +1579,9 @@ mod tests {
     struct TestState {
         _storage_dir: TempDir,
         _metadata_dir: TempDir,
+        _net: NetHandle,
         auth: AuthContext,
+        bearer: ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         state: Arc<ServerState>,
     }
@@ -1650,6 +1600,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -1742,6 +1693,7 @@ mod tests {
         let _ = replace_metadata_rocrate(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
                 rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
@@ -1856,6 +1808,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::RoCrate(
                 CreateMetadataRoCrateRequest {
                     group_id: test.group_id.to_string(),
@@ -1895,6 +1848,7 @@ mod tests {
         let _ = add_metadata_contextual_entity(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Path(document_id.clone()),
             Json(json!({
                 "@id": "#person-ada",
@@ -1908,6 +1862,7 @@ mod tests {
         let _ = add_metadata_data_entity(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Path(document_id.clone()),
             Json(json!({
                 "@id": "./data/run-42.raw",
@@ -1945,6 +1900,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -1977,6 +1933,7 @@ mod tests {
         let status = delete_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Path(created.summary.document_id.clone()),
         )
         .await
@@ -1994,6 +1951,47 @@ mod tests {
         assert!(listed.documents.is_empty());
     }
 
+    // A profile is just a metadata document under the `profiles/` path prefix; it
+    // uses no dedicated call. Its create routes through the holder proxy like any
+    // other document (the path steers holder resolution via the MetadataPathPrefix
+    // binding), and a subsequent get resolves it by document id.
+    #[tokio::test]
+    async fn profile_document_create_and_get_round_trip() {
+        let test = setup_state().await;
+
+        let (status, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "profiles/team-profile".to_string(),
+                    name: "Team Profile".to_string(),
+                    description: "A profile document".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.summary.document_path, "profiles/team-profile");
+
+        drain_metadata_background(test.state.as_ref()).await;
+        let (_, Json(fetched)) = get_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(created.summary.document_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.document_id, created.summary.document_id);
+        assert_eq!(fetched.document_path, "profiles/team-profile");
+    }
+
     #[tokio::test]
     async fn inbound_document_lifecycle_tombstone_hides_stale_registry_listing() {
         let test = setup_state().await;
@@ -2003,6 +2001,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2116,6 +2115,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2339,6 +2339,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2398,6 +2399,7 @@ mod tests {
         let (_, Json(_created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2651,6 +2653,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2705,6 +2708,7 @@ mod tests {
             let _ = create_metadata_document(
                 State(test.state.clone()),
                 Extension(Some(test.auth.clone())),
+                Extension(Some(test.bearer.clone())),
                 Json(CreateMetadataRequest::Scaffold(
                     CreateMetadataScaffoldRequest {
                         group_id: test.group_id.to_string(),
@@ -2978,9 +2982,13 @@ mod tests {
             realm_id,
             path_restrictions: None,
         };
+        let valid_bearer_token =
+            sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+        let bearer = ValidatedArunaBearerTokenCarrier::new_for_test(valid_bearer_token.clone());
         create_test_metadata_document(
             remote.state.clone(),
             auth.clone(),
+            bearer.clone(),
             group_id,
             "datasets/remote-public",
             "Remote Public Dataset",
@@ -2990,6 +2998,7 @@ mod tests {
         create_test_metadata_document(
             remote.state.clone(),
             auth.clone(),
+            bearer,
             group_id,
             "datasets/remote-private",
             "Remote Private Dataset",
@@ -2997,9 +3006,6 @@ mod tests {
         )
         .await;
         drain_metadata_background(remote.state.as_ref()).await;
-
-        let valid_bearer_token =
-            sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
 
         DistributedMetadataAccessState {
             auth,
@@ -3140,6 +3146,7 @@ mod tests {
     async fn create_test_metadata_document(
         state: Arc<ServerState>,
         auth: AuthContext,
+        bearer: ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         path: &str,
         name: &str,
@@ -3148,6 +3155,7 @@ mod tests {
         let _ = create_metadata_document(
             State(state),
             Extension(Some(auth)),
+            Extension(Some(bearer)),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: group_id.to_string(),
@@ -3298,8 +3306,21 @@ mod tests {
         let metadata_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
-        let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let realm_id = test_realm_id(3);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[11u8; 32])),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let node_id = net.node_id();
         let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
         let actor = Actor {
             node_id,
@@ -3318,11 +3339,30 @@ mod tests {
         let task_handle = TaskHandle::new();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: Some(task_handle),
         });
+        // A single-node realm config so the holder proxy resolves this node as the
+        // holder of every metadata shard and mutations serve locally.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            config
+                .to_bytes(&Actor {
+                    node_id,
+                    user_id: aruna_core::UserId::nil(realm_id),
+                    realm_id,
+                })
+                .unwrap()
+                .into(),
+        )
+        .await;
         let group_id = Ulid::new();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
@@ -3369,14 +3409,23 @@ mod tests {
             .await,
         );
 
+        // The realm's signing key is derived from the fixed seed, so a token it
+        // signs re-validates on this node's holder-proxy serve path.
+        let token = sign_test_token(
+            &SigningKey::from_bytes(&[3u8; 32]),
+            &test_token_claims(realm_id, user_id),
+        );
+
         TestState {
             _storage_dir: storage_dir,
             _metadata_dir: metadata_dir,
+            _net: net,
             auth: AuthContext {
                 user_id,
                 realm_id,
                 path_restrictions: None,
             },
+            bearer: ValidatedArunaBearerTokenCarrier::new_for_test(token),
             group_id,
             state,
         }

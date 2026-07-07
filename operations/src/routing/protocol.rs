@@ -1,4 +1,6 @@
-use aruna_core::structs::{Group, GroupAuthorizationDocument, RealmId, Role, User};
+use aruna_core::structs::{
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmId, Role, User,
+};
 use aruna_core::types::{GroupId, RoleId, UserId};
 use aruna_net::streams::BiStream;
 use serde::de::DeserializeOwned;
@@ -6,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
+use ulid::Ulid;
 
 /// A proxied reply carries at most one document; 16 MiB bounds a large document
 /// while still refusing a hostile oversized frame.
@@ -130,8 +133,53 @@ pub enum UserCall {
     },
 }
 
+/// Mutating metadata calls route to the document shard holder so a non-holder's
+/// write never strands in the outbox. Visibility-checked reads (`GET`, RO-Crate
+/// export) and SPARQL fan-out stay on their existing local/`Alpn::Metadata`
+/// paths — under the default everywhere placement every node already holds the
+/// registry record, so routing a read would be a no-op that only flattened its
+/// error classification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum MetadataCall {}
+pub enum MetadataCall {
+    /// Create-with-path: holders resolve from `(group_id, document_path)`, then
+    /// the new document lands at `document_id`.
+    Create {
+        group_id: GroupId,
+        document_id: Ulid,
+        document_path: String,
+        public: bool,
+        payload: MetadataCreatePayload,
+    },
+    Delete {
+        document_id: Ulid,
+    },
+    Update {
+        document_id: Ulid,
+        /// `None` keeps the record's current visibility.
+        public: Option<bool>,
+        mutation: MetadataMutation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetadataCreatePayload {
+    Scaffold {
+        name: String,
+        description: String,
+        date_published: String,
+        license: String,
+    },
+    RoCrate {
+        jsonld: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetadataMutation {
+    ReplaceRoCrate { jsonld: String },
+    UpsertDataEntity { jsonld: String },
+    UpsertContextualEntity { jsonld: String },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotificationCall {}
@@ -152,6 +200,13 @@ pub enum HolderProxyResponse {
 pub enum ProxiedReply {
     Group(Box<GroupReply>),
     User(Box<UserReply>),
+    Metadata(Box<MetadataReply>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetadataReply {
+    Record(MetadataRegistryRecord),
+    Ack,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

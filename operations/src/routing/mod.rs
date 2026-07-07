@@ -1,6 +1,7 @@
 pub mod client;
 pub mod dispatch;
 pub mod incoming;
+mod metadata;
 pub mod protocol;
 
 use aruna_core::NodeId;
@@ -24,10 +25,12 @@ use crate::remove_user_from_group::{
     RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
 };
 use crate::routing::protocol::{
-    GroupCall, GroupReply, HolderProxyResponse, ProxiedCall, ProxiedReply, UserCall, UserReply,
+    GroupCall, GroupReply, HolderProxyResponse, MetadataCall, ProxiedCall, ProxiedReply, UserCall,
+    UserReply,
 };
 use crate::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
 use aruna_core::errors::AuthorizationError;
+use ulid::Ulid;
 
 /// Canonical [`DocumentSyncTarget`] a proxied call resolves holders against.
 /// `None` for call domains not yet routed through the holder proxy.
@@ -39,7 +42,42 @@ pub(crate) fn proxied_call_target(call: &ProxiedCall) -> Option<DocumentSyncTarg
         ProxiedCall::User(user_call) => {
             user_call_user_id(user_call).map(|user_id| DocumentSyncTarget::User { user_id })
         }
-        ProxiedCall::Metadata(_) | ProxiedCall::Notification(_) => None,
+        ProxiedCall::Metadata(metadata_call) => Some(DocumentSyncTarget::MetadataRegistry {
+            group_id: metadata_call_group_id(metadata_call),
+            document_id: metadata_call_document_id(metadata_call),
+        }),
+        ProxiedCall::Notification(_) => None,
+    }
+}
+
+/// The metadata document a [`MetadataCall`] resolves holders against.
+fn metadata_call_document_id(call: &MetadataCall) -> Ulid {
+    match call {
+        MetadataCall::Create { document_id, .. }
+        | MetadataCall::Delete { document_id }
+        | MetadataCall::Update { document_id, .. } => *document_id,
+    }
+}
+
+/// The owning group, when the call carries it. Only `Create` knows the group up
+/// front; by-id mutations resolve on the document shard alone (`group_id` steers
+/// only group-scoped strategy bindings and is nil when unknown).
+fn metadata_call_group_id(call: &MetadataCall) -> GroupId {
+    match call {
+        MetadataCall::Create { group_id, .. } => *group_id,
+        MetadataCall::Delete { .. } | MetadataCall::Update { .. } => Ulid::nil(),
+    }
+}
+
+/// The metadata path a call resolves strategy selection with. Only create knows
+/// it up front, so path-prefix bindings (e.g. `profiles/`) steer create's holder
+/// resolution; by-id mutations resolve on document class alone.
+fn proxied_call_metadata_path(call: &ProxiedCall) -> Option<&str> {
+    match call {
+        ProxiedCall::Metadata(MetadataCall::Create { document_path, .. }) => {
+            Some(document_path.as_str())
+        }
+        _ => None,
     }
 }
 
@@ -76,7 +114,7 @@ pub(crate) fn resolve_call_holders(
     call: &ProxiedCall,
 ) -> Option<(PlacementRef, Vec<NodeId>)> {
     let target = proxied_call_target(call)?;
-    let placement = placement_ref_for_target(config, &target, None);
+    let placement = placement_ref_for_target(config, &target, proxied_call_metadata_path(call));
     let holders = resolve_shard_holders(config, &placement);
     Some((placement, holders))
 }
@@ -109,7 +147,10 @@ pub(crate) async fn serve_local(
     match call {
         ProxiedCall::Group(group_call) => serve_group_call(context, group_call, auth).await,
         ProxiedCall::User(user_call) => serve_user_call(context, user_call, auth).await,
-        ProxiedCall::Metadata(_) | ProxiedCall::Notification(_) => {
+        ProxiedCall::Metadata(metadata_call) => {
+            metadata::serve_metadata_call(context, metadata_call, auth).await
+        }
+        ProxiedCall::Notification(_) => {
             HolderProxyResponse::Rejected("proxied call domain not yet supported".into())
         }
     }
@@ -338,5 +379,85 @@ async fn serve_user_call(
                 Err(other) => HolderProxyResponse::Rejected(other.to_string()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::protocol::{MetadataCall, MetadataCreatePayload};
+    use aruna_core::structs::{
+        BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, PlacementStrategy, RealmId,
+        RealmNodeKind, StrategyBinding,
+    };
+    use ulid::Ulid;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn strategy(name: &str, replica_count: Option<u32>) -> PlacementStrategy {
+        PlacementStrategy {
+            strategy_id: Ulid::new(),
+            name: name.to_string(),
+            replica_count,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: DEFAULT_SHARD_COUNT,
+        }
+    }
+
+    fn create_call(path: &str) -> ProxiedCall {
+        ProxiedCall::Metadata(MetadataCall::Create {
+            group_id: Ulid::nil(),
+            document_id: Ulid::new(),
+            document_path: path.to_string(),
+            public: true,
+            payload: MetadataCreatePayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+        })
+    }
+
+    // A `profiles/` MetadataPathPrefix binding steers a profile create onto its
+    // bound (replica-1) strategy's holder, while any other path falls to the
+    // everywhere class binding — proving the routing layer threads the create
+    // path into holder resolution.
+    #[test]
+    fn metadata_path_prefix_binding_steers_create_holders() {
+        let everywhere = strategy("everywhere", None);
+        let profiles = strategy("profiles", Some(1));
+        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
+        config.default_strategy_id = Some(everywhere.strategy_id);
+        config.strategy_bindings = vec![
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                strategy_id: everywhere.strategy_id,
+            },
+            StrategyBinding {
+                scope: BindingScope::MetadataPathPrefix("profiles/".to_string()),
+                strategy_id: profiles.strategy_id,
+            },
+        ];
+        config.strategies = vec![everywhere, profiles];
+        for seed in 1..=4u8 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+
+        let (_, profile_holders) = resolve_call_holders(&config, &create_call("profiles/team"))
+            .expect("profile create resolves holders");
+        let (_, dataset_holders) = resolve_call_holders(&config, &create_call("datasets/run"))
+            .expect("dataset create resolves holders");
+
+        assert_eq!(
+            profile_holders.len(),
+            1,
+            "profiles pin to the replica-1 strategy"
+        );
+        assert_eq!(
+            dataset_holders.len(),
+            4,
+            "other paths ride the everywhere strategy"
+        );
     }
 }
