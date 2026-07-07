@@ -425,6 +425,7 @@ impl NetHandle {
             Alpn::Metadata.as_bytes().to_vec(),
             Alpn::Notification.as_bytes().to_vec(),
             Alpn::Shard.as_bytes().to_vec(),
+            Alpn::HolderProxy.as_bytes().to_vec(),
         ];
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)

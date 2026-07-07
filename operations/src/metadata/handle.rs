@@ -7,13 +7,10 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-};
+use aruna_core::keyspaces::{METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
@@ -37,21 +34,15 @@ use craqle::{
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
     CreateEntityRequest, GraphId, GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
 };
-use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
-use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
-use crate::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
-    validate_aruna_bearer_token,
-};
+use crate::auth::{ArunaBearerTokenValidationState, validate_aruna_bearer_token};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
@@ -128,72 +119,9 @@ struct MetadataInner {
     deferred_persist_running: AtomicBool,
 }
 
-#[derive(Clone)]
-struct MetadataAuthValidationState {
-    storage_handle: StorageHandle,
-    issuer_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
-}
-
-impl MetadataAuthValidationState {
-    fn new(storage_handle: StorageHandle) -> Self {
-        Self {
-            storage_handle,
-            issuer_keys: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-#[async_trait]
-impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
-    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
-        match load_metadata_auth_state::<HashSet<String>>(
-            &self.storage_handle,
-            TOKEN_REVOCATION_LIST_KEY,
-        )
-        .await
-        {
-            Ok(revoked) => revoked.contains(token_hash),
-            Err(error) => {
-                warn!(error = %error, "Failed to read metadata token revocation state");
-                true
-            }
-        }
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        match load_metadata_auth_state::<HashSet<RealmId>>(
-            &self.storage_handle,
-            TRUSTED_REALMS_LIST_KEY,
-        )
-        .await
-        {
-            Ok(trusted) => trusted.contains(realm_id),
-            Err(error) => {
-                warn!(error = %error, "Failed to read metadata trusted realms state");
-                false
-            }
-        }
-    }
-
-    async fn decoding_key_for_issuer(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        let read_lock = self.issuer_keys.read().await;
-        let key = read_lock.get(issuer_pubkey).cloned();
-        drop(read_lock);
-        if let Some(key) = key {
-            return Ok(key);
-        }
-
-        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
-        self.issuer_keys
-            .write()
-            .await
-            .insert(issuer_pubkey.to_string(), decoding_key.clone());
-        Ok(decoding_key)
-    }
-}
+// The forwarded-bearer validation state is shared with the holder-routing proxy;
+// both re-validate against this node's trust config out of the API state keyspace.
+type MetadataAuthValidationState = crate::auth::NodeBearerValidationState;
 
 struct MetadataVisibilityCache {
     registry: Mutex<Option<RegistryCacheEntry>>,
@@ -1347,36 +1275,6 @@ async fn send_remote_metadata_request(
     };
 
     send_request(&net_handle, node_id, message).await
-}
-
-async fn load_metadata_auth_state<T>(
-    storage_handle: &StorageHandle,
-    key: &[u8],
-) -> Result<T, MetadataError>
-where
-    T: DeserializeOwned + Default,
-{
-    match storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => {
-            postcard::from_bytes(&bytes).map_err(|error| MetadataError::Backend(error.to_string()))
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataError::Backend(error.to_string()))
-        }
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata auth state read result: {other:?}"
-        ))),
-    }
 }
 
 async fn graph_lifecycle_record(

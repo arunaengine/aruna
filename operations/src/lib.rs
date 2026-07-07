@@ -54,6 +54,7 @@ pub mod remove_user_from_group;
 pub mod replicate_documents;
 pub mod replication;
 pub mod reserve_onboarding_secret;
+pub mod routing;
 pub mod s3;
 pub mod search_users;
 pub mod set_node_placement;

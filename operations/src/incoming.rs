@@ -315,6 +315,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                     )
                     .await;
                 }
+                Alpn::HolderProxy => {
+                    crate::routing::incoming::handle_holder_proxy_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    )
+                    .await;
+                }
                 Alpn::Dht => {
                     warn!(
                         node_id = %node_id,

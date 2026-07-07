@@ -13,6 +13,8 @@ pub enum Alpn {
     Notification,
     /// Shard holder-manifest exchange protocol
     Shard,
+    /// One-hop holder-routing proxy protocol
+    HolderProxy,
 }
 
 impl Alpn {
@@ -24,6 +26,7 @@ impl Alpn {
             Alpn::Metadata => b"aruna/metadata/1",
             Alpn::Notification => b"aruna/notification/1",
             Alpn::Shard => b"aruna/shard/1",
+            Alpn::HolderProxy => b"aruna/holder-proxy/1",
         }
     }
 
@@ -35,6 +38,7 @@ impl Alpn {
             b"aruna/metadata/1" => Some(Alpn::Metadata),
             b"aruna/notification/1" => Some(Alpn::Notification),
             b"aruna/shard/1" => Some(Alpn::Shard),
+            b"aruna/holder-proxy/1" => Some(Alpn::HolderProxy),
             _ => None,
         }
     }
@@ -52,6 +56,7 @@ impl std::fmt::Display for Alpn {
             Alpn::Metadata => write!(f, "aruna/metadata/1"),
             Alpn::Notification => write!(f, "aruna/notification/1"),
             Alpn::Shard => write!(f, "aruna/shard/1"),
+            Alpn::HolderProxy => write!(f, "aruna/holder-proxy/1"),
         }
     }
 }
@@ -77,6 +82,10 @@ mod tests {
             Some(Alpn::Notification)
         );
         assert_eq!(Alpn::from_bytes(Alpn::Shard.as_bytes()), Some(Alpn::Shard));
+        assert_eq!(
+            Alpn::from_bytes(Alpn::HolderProxy.as_bytes()),
+            Some(Alpn::HolderProxy)
+        );
     }
 
     #[test]
