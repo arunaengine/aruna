@@ -87,19 +87,19 @@ use s3s::dto::{
     DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput, DeleteBucketReplicationInput,
     DeleteBucketReplicationOutput, DeleteMarkerEntry, DeleteMarkerReplication,
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-    DeleteObjectsOutput, DeletedObject, Destination, ETag, EncodingType, Error as S3DeleteError,
-    GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectAttributesInput,
-    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
-    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+    DeleteObjectsOutput, DeletedObject, Destination, ETag, ETagCondition, EncodingType,
+    Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator, LastModified,
+    ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
     ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
     ListPartsInput, ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload,
     Object, ObjectVersion, ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput,
     PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
     ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
-    UploadPartInput, UploadPartOutput,
+    Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -131,6 +131,43 @@ fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
         },
         s3s::dto::Range::Suffix { length } => ObjectRangeRequest::Suffix { length },
     }
+}
+
+fn etag_condition_value(condition: &ETagCondition) -> String {
+    match condition {
+        ETagCondition::Any => "*".to_string(),
+        ETagCondition::ETag(etag) => etag.value().to_string(),
+    }
+}
+
+fn timestamp_to_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
+    let mut rendered = Vec::new();
+    timestamp
+        .format(TimestampFormat::DateTime, &mut rendered)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    let rendered =
+        String::from_utf8(rendered).map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(&rendered)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    Ok(parsed.with_timezone(&chrono::Utc).into())
+}
+
+fn copy_source_conditions(
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+    if_unmodified_since: Option<&Timestamp>,
+) -> S3Result<CopySourceConditions> {
+    Ok(CopySourceConditions {
+        if_match: if_match.map(etag_condition_value),
+        if_none_match: if_none_match.map(etag_condition_value),
+        if_modified_since: if_modified_since
+            .map(timestamp_to_system_time)
+            .transpose()?,
+        if_unmodified_since: if_unmodified_since
+            .map(timestamp_to_system_time)
+            .transpose()?,
+    })
 }
 
 #[derive(Clone)]
@@ -1123,6 +1160,12 @@ impl S3 for ArunaS3Service {
             realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
         };
+        let conditions = copy_source_conditions(
+            req.input.copy_source_if_match.as_ref(),
+            req.input.copy_source_if_none_match.as_ref(),
+            req.input.copy_source_if_modified_since.as_ref(),
+            req.input.copy_source_if_unmodified_since.as_ref(),
+        )?;
 
         let result = copy_object(
             &self.state,
@@ -1138,7 +1181,7 @@ impl S3 for ArunaS3Service {
                 realm_id: self.realm_id,
                 node_id: self.node_id,
                 quota_ceiling,
-                conditions: CopySourceConditions::default(),
+                conditions,
             },
         )
         .await

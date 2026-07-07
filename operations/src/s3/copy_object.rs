@@ -2,6 +2,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::UserId;
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{BackendLocation, RealmId, StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{GroupId, NodeId};
 use std::time::SystemTime;
@@ -46,6 +47,59 @@ pub enum CopyObjectError {
     Get(#[from] GetObjectError),
     #[error(transparent)]
     Put(#[from] PutObjectError),
+    #[error("At least one of the preconditions you specified did not hold.")]
+    PreconditionFailed,
+}
+
+fn normalize_etag(etag: &str) -> &str {
+    etag.trim_matches('"')
+}
+
+fn etag_matches(expected: &str, actual: Option<&str>) -> bool {
+    if expected == "*" {
+        return actual.is_some();
+    }
+    actual.is_some_and(|actual| normalize_etag(actual) == normalize_etag(expected))
+}
+
+fn evaluate_source_conditions(
+    conditions: &CopySourceConditions,
+    etag: Option<&str>,
+    last_modified: Option<SystemTime>,
+) -> Result<(), CopyObjectError> {
+    // AWS precedence: x-amz-copy-source-if-match overrides if-unmodified-since.
+    match conditions.if_match.as_deref() {
+        Some(expected) => {
+            if !etag_matches(expected, etag) {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+        None => {
+            if let Some(threshold) = conditions.if_unmodified_since
+                && last_modified.is_some_and(|last_modified| last_modified > threshold)
+            {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+    }
+
+    // AWS precedence: x-amz-copy-source-if-none-match overrides if-modified-since.
+    match conditions.if_none_match.as_deref() {
+        Some(expected) => {
+            if etag_matches(expected, etag) {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+        None => {
+            if let Some(threshold) = conditions.if_modified_since
+                && last_modified.is_some_and(|last_modified| last_modified <= threshold)
+            {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn copy_object(
@@ -78,6 +132,26 @@ pub async fn copy_object(
                 .as_ref()
                 .and_then(|metadata| metadata.last_modified)
         });
+
+    // Evaluate preconditions before consuming the (lazy) source stream so that a
+    // failed check drops the stream without pulling any bytes.
+    let source_etag = source
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            source
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    evaluate_source_conditions(
+        &input.conditions,
+        source_etag.as_deref(),
+        source_last_modified,
+    )?;
+
     let materialized = source.location.is_some();
     let content_length = source.location.as_ref().map(|location| location.blob_size);
     let version_source = if materialized {
@@ -142,6 +216,7 @@ mod test {
     use axum::{Router, routing::get};
     use futures_util::StreamExt;
     use std::collections::HashMap;
+    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::net::TcpListener;
 
@@ -493,5 +568,131 @@ mod test {
         .unwrap_err();
 
         assert_eq!(error, CopyObjectError::Get(GetObjectError::DeleteMarker));
+    }
+
+    #[test]
+    fn if_match_requires_matching_etag() {
+        let conditions = CopySourceConditions {
+            if_match: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_source_conditions(&conditions, Some("abc"), None).is_ok());
+        assert!(evaluate_source_conditions(&conditions, Some("\"abc\""), None).is_ok());
+        assert_eq!(
+            evaluate_source_conditions(&conditions, Some("def"), None),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert_eq!(
+            evaluate_source_conditions(&conditions, None, None),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn if_none_match_rejects_matching_etag() {
+        let conditions = CopySourceConditions {
+            if_none_match: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&conditions, Some("abc"), None),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&conditions, Some("def"), None).is_ok());
+    }
+
+    #[test]
+    fn if_unmodified_since_rejects_newer_source() {
+        let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let conditions = CopySourceConditions {
+            if_unmodified_since: Some(threshold),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&conditions, None, Some(threshold + Duration::from_secs(1))),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&conditions, None, Some(threshold)).is_ok());
+    }
+
+    #[test]
+    fn if_modified_since_rejects_unchanged_source() {
+        let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let conditions = CopySourceConditions {
+            if_modified_since: Some(threshold),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&conditions, None, Some(threshold)),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(
+            evaluate_source_conditions(&conditions, None, Some(threshold + Duration::from_secs(1)))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn precondition_failure_leaves_no_new_version() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::new();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+
+        drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "bucket",
+                "source.txt",
+                b"payload",
+            )),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "source.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                group_id,
+                realm_id,
+                node_id,
+                conditions: CopySourceConditions {
+                    if_none_match: Some("*".to_string()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, CopyObjectError::PreconditionFailed);
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("bucket", "dest.txt")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        assert!(value.is_none());
     }
 }

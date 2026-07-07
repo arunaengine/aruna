@@ -260,6 +260,10 @@ impl IntoS3Error for CopyObjectError {
         match self {
             CopyObjectError::Get(err) => err.into_s3_error(),
             CopyObjectError::Put(err) => err.into_s3_error(),
+            CopyObjectError::PreconditionFailed => s3_error!(
+                PreconditionFailed,
+                "At least one of the preconditions you specified did not hold."
+            ),
         }
     }
 }
