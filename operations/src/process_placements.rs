@@ -68,30 +68,13 @@ async fn ensure_rank0_shard_topics(
         }
     }
     for (co_holders, topics) in rank0_groups {
-        let missing: Vec<::irokle::TopicId> = topics
-            .iter()
-            .copied()
-            .filter(|topic| {
-                !net_handle
-                    .document_sync_topic_exists(*topic)
-                    .unwrap_or(false)
-            })
-            .collect();
-        if !missing.is_empty() && !co_holders.is_empty() {
-            let event = net_handle
-                .sync_document_topics(missing, co_holders.clone())
-                .await;
-            crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
-        }
         debug!(
             event = "placement.genesis.ensure",
             topics = topics.len(),
             co_holders = co_holders.len(),
             "Ensuring rank-0 shard topic geneses"
         );
-        if let Err(error) = net_handle.ensure_document_sync_topics(&topics, co_holders) {
-            warn!(error = %error, "Failed to ensure rank-0 shard topics");
-        }
+        ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
     }
     // Non-rank-0 held shards: a holder that is already a member (e.g. the
     // previous rank-0 after a config change moved the rank) completes the
@@ -116,6 +99,85 @@ async fn ensure_rank0_shard_topics(
         if let Err(error) = net_handle.allow_document_sync_peers(&known, co_holders) {
             debug!(error = %error, "Could not complete held shard topic membership");
         }
+    }
+}
+
+/// Ensures the shard topics of one rank-0 co-holder group, creating a fresh
+/// genesis only with positive confirmation that none exists.
+///
+/// Topics already known locally are ensured (membership top-up only, never a
+/// create). For a missing topic the co-holders are probed: one that a co-holder
+/// already holds is adopted via anti-entropy; one that every reached co-holder
+/// lacks is created fresh; but if any co-holder was unreachable, creation is
+/// withheld and left for the next placement pass — a down co-holder might hold a
+/// genesis, and forking a second one is a permanent split-brain. A sole holder
+/// (no co-holders) creates immediately: no peer can hold a divergent genesis.
+pub(crate) async fn ensure_rank0_shard_group(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    local_node_id: NodeId,
+    co_holders: Vec<NodeId>,
+    topics: Vec<::irokle::TopicId>,
+) {
+    let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
+    let mut missing: Vec<::irokle::TopicId> = Vec::new();
+    for topic in topics {
+        if net_handle
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false)
+        {
+            to_ensure.push(topic);
+        } else {
+            missing.push(topic);
+        }
+    }
+
+    if !missing.is_empty() {
+        if co_holders.is_empty() {
+            to_ensure.extend(missing);
+        } else {
+            let probe = net_handle
+                .probe_shard_topic_geneses(missing.clone(), co_holders.clone())
+                .await;
+            let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
+            for topic in missing {
+                if probe.known_by_co_holder.contains(&topic) {
+                    to_adopt.push(topic);
+                } else if probe.unreachable.is_empty() {
+                    to_ensure.push(topic);
+                }
+                // Otherwise a co-holder was unreachable: withhold this genesis.
+            }
+            if !to_adopt.is_empty() {
+                let event = net_handle
+                    .sync_document_topics(to_adopt.clone(), co_holders.clone())
+                    .await;
+                crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+                // Only ensure membership on topics whose genesis actually landed;
+                // an adopt that failed (co-holder now unreachable) must not fall
+                // through to a fresh create.
+                for topic in to_adopt {
+                    if net_handle
+                        .document_sync_topic_exists(topic)
+                        .unwrap_or(false)
+                    {
+                        to_ensure.push(topic);
+                    }
+                }
+            }
+            if !probe.unreachable.is_empty() {
+                warn!(
+                    unreachable = ?probe.unreachable,
+                    "Withholding shard genesis creation: co-holder(s) unreachable"
+                );
+            }
+        }
+    }
+
+    if !to_ensure.is_empty()
+        && let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, co_holders)
+    {
+        warn!(error = %error, "Failed to ensure rank-0 shard topics");
     }
 }
 
@@ -209,8 +271,34 @@ pub async fn process_shard_placements(
             }
 
             let topic = shard_topic_id(realm_id, &record.placement);
-            // Rank-0 may create the genesis; every other holder is join-only
-            // and can only add members to an already-known topic.
+            // Genesis creation is owned by `ensure_rank0_shard_topics` (gated on
+            // positive co-holder confirmation); this loop only tops up membership
+            // on a topic already known locally. A topic whose genesis is not yet
+            // local — a rank-0 create withheld for a down co-holder, or a
+            // non-rank-0 holder still awaiting gossip — is kept for the next pass
+            // rather than force-created into a fork.
+            if !net_handle
+                .document_sync_topic_exists(topic)
+                .unwrap_or(false)
+            {
+                debug!(
+                    ?topic,
+                    "Shard topic genesis not local yet; keeping placement record"
+                );
+                let refreshed = new_placement(
+                    realm_id,
+                    record.placement,
+                    local_node_id,
+                    record.selected_peers.clone(),
+                );
+                if let Ok(effect) = write_placement_effect(&refreshed) {
+                    let _ = context.storage_handle.send_effect(effect).await;
+                }
+                retry_needed = true;
+                continue;
+            }
+            // The topic exists locally, so ensure only adds members (never
+            // creates); a non-rank-0 holder likewise only adds members.
             let membership = if local_is_rank0 {
                 net_handle.ensure_document_sync_topics(&[topic], co_holders.clone())
             } else {

@@ -52,7 +52,7 @@ use tracing::{Instrument, Span, debug, warn};
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
-pub use document_sync::DocumentSyncService;
+pub use document_sync::{DocumentSyncService, ShardGenesisProbe};
 pub use error::{NetError, Result};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -863,6 +863,20 @@ impl NetHandle {
     /// Whether a document sync topic's genesis is known locally.
     pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
         self.inner.document_sync.topic_exists(topic)
+    }
+
+    /// Probes a shard's co-holders for an existing genesis of `topics` (see
+    /// [`ShardGenesisProbe`]). A rank-0 holder uses the result to create a fresh
+    /// genesis only when every co-holder was reached and none had the topic.
+    pub async fn probe_shard_topic_geneses(
+        &self,
+        topics: Vec<::irokle::TopicId>,
+        co_holders: Vec<NodeId>,
+    ) -> ShardGenesisProbe {
+        self.inner
+            .document_sync
+            .probe_shard_topic_geneses(topics, co_holders)
+            .await
     }
 
     /// Shard-topic anti-entropy for the startup restore and placement

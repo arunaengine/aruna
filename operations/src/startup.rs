@@ -93,19 +93,21 @@ pub async fn restore_shard_subscriptions(
         .collect();
 
     // Group topics by their co-holder peer set so co-located shards ride one
-    // ensure + one sync instead of one round trip each. Only topics the local
-    // node may create the genesis of (shared realm topics, and shards it is
-    // rank-0 holder of) are ensured; the rest are join-only — synced if their
-    // genesis is known or bootstrappable from a co-holder, otherwise left for
-    // the rank-0 holder's gossip to deliver.
-    let mut ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+    // ensure + one sync instead of one round trip each. Shared realm topics are
+    // ensured directly. Shards the local node is rank-0 holder of go through the
+    // join-before-create gate (a fresh genesis only with positive co-holder
+    // confirmation); the rest are join-only — synced if their genesis is known
+    // or bootstrappable from a co-holder, otherwise left for the rank-0 holder's
+    // gossip to deliver.
+    let mut shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
 
     let mut shared_peers = realm_nodes.clone();
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        ensure_groups
+        shared_ensure_groups
             .entry(shared_peers.clone())
             .or_default()
             .push(topic);
@@ -135,7 +137,7 @@ pub async fn restore_shard_subscriptions(
             }
             let topic = shard_topic_id(realm_id, &placement);
             let groups = if local_is_rank0 {
-                &mut ensure_groups
+                &mut rank0_shard_groups
             } else {
                 &mut join_groups
             };
@@ -144,7 +146,15 @@ pub async fn restore_shard_subscriptions(
         }
     }
 
-    restore_held_shard_topics(context, &net_handle, node_id, ensure_groups, join_groups).await;
+    restore_held_shard_topics(
+        context,
+        &net_handle,
+        node_id,
+        shared_ensure_groups,
+        rank0_shard_groups,
+        join_groups,
+    )
+    .await;
 
     // New-holder verification: reconcile each held shard against a co-holder and
     // persist a marker so a restart resumes only unverified shards.
@@ -157,41 +167,77 @@ async fn restore_held_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
-    ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
 ) {
-    for (groups, may_create) in [(ensure_groups, true), (join_groups, false)] {
-        for (peers, topics) in groups {
-            if peers.is_empty() || topics.is_empty() {
-                continue;
-            }
-            if may_create {
-                // Join-before-create: rank-0 may have just inherited a shard
-                // whose genesis a previous rank-0 created — adopt that genesis
-                // from a co-holder rather than forking a second one. Only what
-                // no peer knows either is created fresh.
-                let missing: Vec<::irokle::TopicId> = topics
-                    .iter()
-                    .copied()
-                    .filter(|topic| {
-                        !net_handle
-                            .document_sync_topic_exists(*topic)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                if !missing.is_empty() {
-                    let event = net_handle
-                        .sync_document_topics(missing, peers.clone())
-                        .await;
-                    apply_restored_reconcile(context, node_id, event).await;
-                }
-                if let Err(error) = net_handle.ensure_document_sync_topics(&topics, peers.clone()) {
-                    warn!(error = %error, "Failed to ensure held shard topics on restart");
-                }
-            }
-            let event = net_handle.sync_document_topics(topics, peers).await;
+    // Shared realm topics: ensured directly (every node's genesis of a shared
+    // topic is deterministic, not a shard-holder decision).
+    for (peers, topics) in shared_ensure_groups {
+        if peers.is_empty() || topics.is_empty() {
+            continue;
+        }
+        let missing: Vec<::irokle::TopicId> = topics
+            .iter()
+            .copied()
+            .filter(|topic| {
+                !net_handle
+                    .document_sync_topic_exists(*topic)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !missing.is_empty() {
+            let event = net_handle
+                .sync_document_topics(missing, peers.clone())
+                .await;
             apply_restored_reconcile(context, node_id, event).await;
         }
+        if let Err(error) = net_handle.ensure_document_sync_topics(&topics, peers.clone()) {
+            warn!(error = %error, "Failed to ensure shared realm topics on restart");
+        }
+        let event = net_handle.sync_document_topics(topics, peers).await;
+        apply_restored_reconcile(context, node_id, event).await;
+    }
+
+    // Rank-0 shard topics: create a fresh genesis only with positive co-holder
+    // confirmation (see [`ensure_rank0_shard_group`]); a config change may have
+    // just moved rank-0 onto this node, so an unreachable co-holder that might
+    // still hold the genesis withholds creation rather than forking one.
+    for (co_holders, topics) in rank0_shard_groups {
+        if co_holders.is_empty() || topics.is_empty() {
+            continue;
+        }
+        crate::process_placements::ensure_rank0_shard_group(
+            context,
+            net_handle,
+            node_id,
+            co_holders.clone(),
+            topics.clone(),
+        )
+        .await;
+        // Fetch events for the topics whose genesis is now local (created,
+        // adopted, or already present); withheld ones retry on the next pass.
+        let present: Vec<::irokle::TopicId> = topics
+            .into_iter()
+            .filter(|topic| {
+                net_handle
+                    .document_sync_topic_exists(*topic)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !present.is_empty() {
+            let event = net_handle.sync_document_topics(present, co_holders).await;
+            apply_restored_reconcile(context, node_id, event).await;
+        }
+    }
+
+    // Non-rank-0 held shards: join-only, synced if bootstrappable.
+    for (peers, topics) in join_groups {
+        if peers.is_empty() || topics.is_empty() {
+            continue;
+        }
+        let event = net_handle.sync_document_topics(topics, peers).await;
+        apply_restored_reconcile(context, node_id, event).await;
     }
 }
 
