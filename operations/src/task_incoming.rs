@@ -323,6 +323,23 @@ impl OperationsTaskHandler {
         }
     }
 
+    // Kicks the placement reconciler immediately (not persisted; it is re-derived
+    // from the realm config at startup by `restore_shard_subscriptions`).
+    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
+        let Some(task_handle) = self.context.task_handle.as_ref() else {
+            warn!("Cannot schedule shard placement sync without task handle");
+            return;
+        };
+        let effect = Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::SyncPlacements { realm_id, node_id },
+            after: Duration::ZERO,
+        });
+        if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
+        {
+            warn!(message = %message, "Failed to schedule shard placement sync after local realm config change");
+        }
+    }
+
     async fn drain_document_sync_outbox(&self) {
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
@@ -342,6 +359,7 @@ impl OperationsTaskHandler {
 
         let mut totals = DrainSyncOutcome::default();
         let mut defer_state = DrainDeferState::default();
+        let mut realm_config_drained = false;
         let mut start_after: Option<Vec<u8>> = None;
         let mut scan_elapsed = Duration::ZERO;
         let mut publish_elapsed = Duration::ZERO;
@@ -399,6 +417,8 @@ impl OperationsTaskHandler {
                 .records
                 .into_iter()
                 .map(|(record_key, mut record)| {
+                    realm_config_drained |=
+                        matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
                     record.placement = resolve_publish_placement(
                         realm_config.as_ref(),
                         &record.target,
@@ -583,6 +603,15 @@ impl OperationsTaskHandler {
             if !has_more {
                 break;
             }
+        }
+
+        // A locally-originated realm-config change (strategy upsert, node
+        // placement, quota) must re-run the placement reconciler on this origin
+        // so its rank-0 shard topic geneses are created without a restart; the
+        // inbound reconcile path does the same for remote changes.
+        if realm_config_drained {
+            self.schedule_sync_placements(realm_id, net_handle.node_id())
+                .await;
         }
 
         if record_count == 0 {
@@ -1746,6 +1775,108 @@ mod tests {
             OUTBOX_DRAIN_BATCH_SIZE,
             "every deferred record is retained for the next run"
         );
+
+        net.shutdown().await;
+    }
+
+    // A realm-config change originated locally lands only in the outbox; draining
+    // it must kick the placement reconciler so this rank-0 node creates its shard
+    // topic geneses without waiting for a restart.
+    #[tokio::test]
+    async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+        });
+
+        // Install the config so this sole node is rank-0 of every shard, but do
+        // not run the placement reconciler yet.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(net.node_id(), RealmNodeKind::Management);
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: config.to_bytes(&actor).expect("config bytes").into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+        net.refresh_realm_peers_from_document(&config)
+            .await
+            .expect("refresh peers");
+
+        initialize_task_incoming(context.clone(), task_handle.clone()).await;
+
+        let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
+        let topic = aruna_core::document::shard_topic_id(
+            realm_id,
+            &aruna_core::structs::PlacementRef {
+                strategy_id,
+                epoch: 0,
+                shard: 0,
+            },
+        );
+        assert!(
+            !net.document_sync_topic_exists(topic).unwrap_or(false),
+            "the rank-0 shard topic must not exist before the config change is drained"
+        );
+
+        let record = crate::document_sync_outbox::new_outbox_record(
+            net.node_id(),
+            DocumentSyncTarget::RealmConfig { realm_id },
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"config".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+        );
+        write_outbox_record(&storage, &record).await;
+        task_handle
+            .send_effect(crate::document_sync_outbox::schedule_outbox_drain_effect())
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if net.document_sync_topic_exists(topic).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rank-0 shard topic was not created after the local config change drained"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         net.shutdown().await;
     }
