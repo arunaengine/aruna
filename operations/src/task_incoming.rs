@@ -951,6 +951,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"restore durable work".to_vec(),
+                change: change(),
+            },
+            false,
+        );
+        write_outbox_record(&storage, &record).await;
+
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+        match task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::from_secs(3600),
+            }))
+            .await
+        {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            other => panic!("unexpected timer schedule event: {other:?}"),
+        }
+
+        restore_document_sync_outbox_timers(&storage, &task_handle).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+                .await
+                .is_err(),
+            "durable rearm must not replace an active backoff timer"
+        );
+    }
+
+    #[tokio::test]
     async fn outbox_sync_error_retains_record_for_retry() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))

@@ -114,10 +114,10 @@ impl RestoreTopicSubscriptionsOperation {
                     document.topic_id(),
                     self.local_node_id,
                     Some(document),
-                    // Startup restore re-announces documents this node already holds
-                    // locally; as the holder of record it may mint any genesis that
-                    // did not survive a restart.
-                    true,
+                    // Placement reconciliation is the only path that knows the
+                    // authoritative origin for metadata documents. Startup restore
+                    // must not let a replica-holder mint a rival genesis.
+                    false,
                 ),
                 |result| {
                     Event::SubOperation(SubOperationEvent::DocumentSyncResult {
