@@ -115,6 +115,20 @@ pub async fn restore_shard_subscriptions(
         }
     }
 
+    restore_held_shard_topics(context, &net_handle, node_id, ensure_groups, join_groups).await;
+
+    // New-holder verification: reconcile each held shard against a co-holder and
+    // persist a marker so a restart resumes only unverified shards.
+    crate::shard::verify::verify_held_shards(context, node_id, realm_id).await;
+}
+
+async fn restore_held_shard_topics(
+    context: &Arc<DriverContext>,
+    net_handle: &aruna_net::NetHandle,
+    node_id: NodeId,
+    ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+) {
     for (groups, may_create) in [(ensure_groups, true), (join_groups, false)] {
         for (peers, topics) in groups {
             if peers.is_empty() || topics.is_empty() {

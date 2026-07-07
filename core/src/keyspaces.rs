@@ -23,6 +23,7 @@ pub const DOCUMENT_SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const DOCUMENT_SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const SHARD_MANIFEST_KEYSPACE: &str = "shard_manifest";
+pub const SHARD_VERIFICATION_KEYSPACE: &str = "shard_verification";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";

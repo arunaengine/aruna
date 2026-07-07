@@ -11,6 +11,8 @@ pub enum Alpn {
     Metadata,
     /// Notification delivery protocol
     Notification,
+    /// Shard holder-manifest exchange protocol
+    Shard,
 }
 
 impl Alpn {
@@ -21,6 +23,7 @@ impl Alpn {
             Alpn::DocumentSync => irokle::net::IROKLE_SYNC_ALPN,
             Alpn::Metadata => b"aruna/metadata/1",
             Alpn::Notification => b"aruna/notification/1",
+            Alpn::Shard => b"aruna/shard/1",
         }
     }
 
@@ -31,6 +34,7 @@ impl Alpn {
             irokle::net::IROKLE_SYNC_ALPN => Some(Alpn::DocumentSync),
             b"aruna/metadata/1" => Some(Alpn::Metadata),
             b"aruna/notification/1" => Some(Alpn::Notification),
+            b"aruna/shard/1" => Some(Alpn::Shard),
             _ => None,
         }
     }
@@ -47,6 +51,7 @@ impl std::fmt::Display for Alpn {
             },
             Alpn::Metadata => write!(f, "aruna/metadata/1"),
             Alpn::Notification => write!(f, "aruna/notification/1"),
+            Alpn::Shard => write!(f, "aruna/shard/1"),
         }
     }
 }
@@ -71,6 +76,7 @@ mod tests {
             Alpn::from_bytes(Alpn::Notification.as_bytes()),
             Some(Alpn::Notification)
         );
+        assert_eq!(Alpn::from_bytes(Alpn::Shard.as_bytes()), Some(Alpn::Shard));
     }
 
     #[test]

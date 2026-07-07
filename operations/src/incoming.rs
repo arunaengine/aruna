@@ -307,6 +307,14 @@ impl InboundEventHandler for OperationsInboundHandler {
                     )
                     .await;
                 }
+                Alpn::Shard => {
+                    crate::shard::incoming::handle_shard_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    )
+                    .await;
+                }
                 Alpn::Dht => {
                     warn!(
                         node_id = %node_id,
