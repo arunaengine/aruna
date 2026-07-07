@@ -55,15 +55,11 @@ pub struct Role {
 }
 
 impl Role {
-    /// A role assigned to the Everyone principal (the nil user id) applies to
-    /// every request in the realm — including anonymous, unauthenticated ones
-    /// (see `AuthContext::anonymous`). Encoding publicness as a member instead
-    /// of a struct field keeps stored auth documents (postcard, positional)
-    /// readable without a migration.
-    pub fn is_public(&self) -> bool {
-        self.assigned_users
-            .iter()
-            .any(|user| user.user_ulid.is_nil())
+    /// A role assigned to the realm's Everyone principal applies to every
+    /// request in that realm, including anonymous ones. Encoding publicness as
+    /// a member keeps stored auth documents readable without a migration.
+    pub fn is_public(&self, realm_id: RealmId) -> bool {
+        self.assigned_users.contains(&UserId::nil(realm_id))
     }
 }
 
@@ -179,8 +175,8 @@ pub struct AuthContext {
 
 impl AuthContext {
     /// The Everyone principal: unauthenticated requests are permission-checked
-    /// as the nil user, so exactly the roles that assign `UserId::nil` (public
-    /// roles, `Role::is_public`) grant them access.
+    /// as the nil user, so exactly the roles that assign the realm-scoped
+    /// `UserId::nil` (public roles, `Role::is_public`) grant them access.
     pub fn anonymous(realm_id: RealmId) -> Self {
         Self {
             user_id: UserId::nil(realm_id),
@@ -335,6 +331,27 @@ mod test {
         let hydrated_role: Role = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(role, hydrated_role);
+    }
+
+    #[test]
+    pub fn public_role_requires_nil_user_from_same_realm() {
+        let realm_id = RealmId([1u8; 32]);
+        let other_realm_id = RealmId([2u8; 32]);
+        let role = Role {
+            role_id: Ulid::new(),
+            name: "public".to_string(),
+            permissions: HashMap::from([("/test".to_string(), Permission::READ)]),
+            assigned_users: HashSet::from([UserId::nil(realm_id)]),
+        };
+
+        assert!(role.is_public(realm_id));
+        assert!(!role.is_public(other_realm_id));
+
+        let foreign_nil_role = Role {
+            assigned_users: HashSet::from([UserId::nil(other_realm_id)]),
+            ..role
+        };
+        assert!(!foreign_nil_role.is_public(realm_id));
     }
 
     #[test]

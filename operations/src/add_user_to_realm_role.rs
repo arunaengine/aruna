@@ -103,6 +103,8 @@ pub enum AddUserToRealmRolesError {
     Unauthorized,
     #[error("Role not found")]
     RoleNotFound,
+    #[error("Invalid user id")]
+    InvalidUserId,
     #[error("Authorization document not found")]
     AuthDocNotFound,
     #[error(transparent)]
@@ -512,6 +514,10 @@ impl Operation for AddUserToRealmRolesOperation {
     type Error = AddUserToRealmRolesError;
 
     fn start(&mut self) -> Effects {
+        if self.input.user_id.is_nil() {
+            return self.fail(AddUserToRealmRolesError::InvalidUserId);
+        }
+
         self.state = AddUserToRealmRolesState::Auth;
 
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -673,7 +679,9 @@ fn apply_admin_reducer_operation(
 pub mod test {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
+    use crate::add_user_to_realm_role::{
+        AddUserToRealmRolesError, AddUserToRealmRolesInput, AddUserToRealmRolesOperation,
+    };
     use crate::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -782,6 +790,30 @@ pub mod test {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn rejects_nil_user_id_as_realm_role_assignee() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let role_id = Ulid::from_bytes([3u8; 16]);
+        let actor = Actor {
+            node_id: node(4),
+            user_id: owner_id,
+            realm_id,
+        };
+        let mut operation = AddUserToRealmRolesOperation::new(AddUserToRealmRolesInput {
+            actor,
+            realm_id,
+            user_id: UserId::nil(realm_id),
+            role_ids: HashSet::from([role_id]),
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(AddUserToRealmRolesError::InvalidUserId)
+        );
     }
 
     #[test]

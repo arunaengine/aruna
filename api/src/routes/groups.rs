@@ -3,7 +3,8 @@ use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, Role, usage_group_key,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
+    usage_group_key,
 };
 use aruna_core::types::RoleId;
 use aruna_operations::add_group_role::{
@@ -210,14 +211,15 @@ pub struct GroupInfoResponse {
     pub roles: Vec<RoleResponse>,
 }
 
-fn map_roles(auth: GroupAuthorizationDocument) -> Vec<RoleResponse> {
-    map_roles_with_visibility(auth, true)
+fn map_roles(auth: GroupAuthorizationDocument, realm_id: RealmId) -> Vec<RoleResponse> {
+    map_roles_with_visibility(auth, realm_id, true)
 }
 
 /// Member lists are only visible to group members; open endpoints get the
 /// roles without `assigned_users`.
 fn map_roles_with_visibility(
     auth: GroupAuthorizationDocument,
+    realm_id: RealmId,
     include_members: bool,
 ) -> Vec<RoleResponse> {
     auth.roles
@@ -230,12 +232,12 @@ fn map_roles_with_visibility(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.to_string()))
                 .collect(),
-            public: role.is_public(),
+            public: role.is_public(realm_id),
             // The Everyone principal is surfaced via `public`, not as a member.
             assigned_users: include_members.then(|| {
                 role.assigned_users
                     .iter()
-                    .filter(|u| !u.user_ulid.is_nil())
+                    .filter(|u| !u.is_nil())
                     .map(|u| u.to_string())
                     .collect()
             }),
@@ -244,6 +246,10 @@ fn map_roles_with_visibility(
 }
 
 fn is_group_member(auth_doc: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+    if user_id.is_nil() {
+        return false;
+    }
+
     auth_doc
         .roles
         .values()
@@ -260,6 +266,14 @@ fn parse_role_id(role_id: &str) -> ServerResult<RoleId> {
 
 fn parse_user_id(user_id: &str) -> ServerResult<UserId> {
     UserId::from_string(user_id).map_err(|_| ServerError::BadRequest)
+}
+
+fn parse_member_user_id(user_id: &str) -> ServerResult<UserId> {
+    let user_id = parse_user_id(user_id)?;
+    if user_id.is_nil() {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(user_id)
 }
 
 /// Write endpoints mint their permission checks from the caller identity, so
@@ -305,7 +319,7 @@ impl From<(Group, GroupAuthorizationDocument)> for CreateGroupResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
-            roles: map_roles(auth),
+            roles: map_roles(auth, group.realm_id),
         }
     }
 }
@@ -316,7 +330,7 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
-            roles: map_roles(auth),
+            roles: map_roles(auth, group.realm_id),
         }
     }
 }
@@ -502,7 +516,11 @@ async fn build_api_groups(
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
             let is_member = is_group_member(&auth_doc, caller);
-            Some(map_roles_with_visibility(auth_doc, is_member))
+            Some(map_roles_with_visibility(
+                auth_doc,
+                group.realm_id,
+                is_member,
+            ))
         } else {
             None
         };
@@ -544,7 +562,7 @@ pub async fn get_group(
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
-            roles: map_roles_with_visibility(auth_doc, is_member),
+            roles: map_roles_with_visibility(auth_doc, group.realm_id, is_member),
         }),
     ))
 }
@@ -552,6 +570,7 @@ pub async fn get_group(
 fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
     match error {
         AddUserToGroupError::Unauthorized => ServerError::Forbidden,
+        AddUserToGroupError::InvalidUserId => ServerError::BadRequest,
         AddUserToGroupError::RoleNotFound | AddUserToGroupError::AuthDocNotFound => {
             ServerError::NotFound
         }
@@ -562,6 +581,9 @@ fn map_add_member_error(error: AddUserToGroupError) -> ServerError {
 fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
     match error {
         AddGroupRoleError::Unauthorized => ServerError::Forbidden,
+        AddGroupRoleError::InvalidPublicRole | AddGroupRoleError::InvalidAssignedUser => {
+            ServerError::BadRequest
+        }
         AddGroupRoleError::GroupNotFound => ServerError::NotFound,
         AddGroupRoleError::CheckPermissionsError(
             AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
@@ -573,6 +595,7 @@ fn map_add_role_error(error: AddGroupRoleError) -> ServerError {
 fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
     match error {
         RemoveUserFromGroupError::Unauthorized => ServerError::Forbidden,
+        RemoveUserFromGroupError::InvalidUserId => ServerError::BadRequest,
         RemoveUserFromGroupError::RoleNotFound | RemoveUserFromGroupError::AuthDocNotFound => {
             ServerError::NotFound
         }
@@ -664,6 +687,9 @@ pub async fn list_group_members(
     let mut members: HashMap<String, Vec<GroupMemberRoleResponse>> = HashMap::new();
     for (role_id, role) in &auth_doc.roles {
         for user in &role.assigned_users {
+            if user.is_nil() {
+                continue;
+            }
             members
                 .entry(user.to_string())
                 .or_default()
@@ -708,7 +734,7 @@ pub async fn add_group_member(
 ) -> ServerResult<(StatusCode, Json<GroupRolesResponse>)> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
-    let user_id = parse_user_id(&request.user_id)?;
+    let user_id = parse_member_user_id(&request.user_id)?;
 
     let role_ids: HashSet<Ulid> = match &request.role_ids {
         Some(role_ids) if !role_ids.is_empty() => role_ids
@@ -747,7 +773,7 @@ pub async fn add_group_member(
     Ok((
         StatusCode::CREATED,
         Json(GroupRolesResponse {
-            roles: map_roles(auth_doc),
+            roles: map_roles(auth_doc, state.get_realm_id()),
         }),
     ))
 }
@@ -778,7 +804,7 @@ pub async fn remove_group_member(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
-    let user_id = parse_user_id(&user_id)?;
+    let user_id = parse_member_user_id(&user_id)?;
     let role_ids = query
         .role_id
         .as_deref()
@@ -881,11 +907,18 @@ pub async fn create_group_role(
         };
         permissions.insert(path.clone(), permission);
     }
+    if request.public
+        && permissions
+            .values()
+            .any(|permission| permission != &Permission::READ)
+    {
+        return Err(ServerError::BadRequest);
+    }
 
     let mut assigned_users = request
         .assigned_users
         .iter()
-        .map(|user_id| parse_user_id(user_id))
+        .map(|user_id| parse_member_user_id(user_id))
         .collect::<ServerResult<HashSet<UserId>>>()?;
     if request.public {
         assigned_users.insert(UserId::nil(realm_id));
@@ -910,7 +943,7 @@ pub async fn create_group_role(
     .await
     .map_err(map_add_role_error)?;
 
-    let role = map_roles(auth_doc)
+    let role = map_roles(auth_doc, realm_id)
         .into_iter()
         .find(|role| role.role_id == role_id.to_string())
         .ok_or_else(|| ServerError::InternalError("created role missing".to_string()))?;

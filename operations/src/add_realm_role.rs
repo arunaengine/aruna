@@ -102,6 +102,10 @@ pub enum AddRealmRoleError {
     Unauthorized,
     #[error("No realm authorization document found")]
     RealmAuthDocNotFound,
+    #[error("Invalid public role")]
+    InvalidPublicRole,
+    #[error("Invalid assigned user")]
+    InvalidAssignedUser,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding role to realm did not finish")]
@@ -144,6 +148,31 @@ impl AddRealmRoleOperation {
             realm_id: self.input.actor.realm_id,
             path_restrictions: None,
         }
+    }
+
+    fn validate_role(&self) -> Result<(), AddRealmRoleError> {
+        if self
+            .input
+            .role
+            .assigned_users
+            .iter()
+            .any(|user| user.is_nil() && !user.is_nil_in(self.input.realm_id))
+        {
+            return Err(AddRealmRoleError::InvalidAssignedUser);
+        }
+
+        if self.input.role.is_public(self.input.realm_id)
+            && self
+                .input
+                .role
+                .permissions
+                .values()
+                .any(|permission| permission != &Permission::READ)
+        {
+            return Err(AddRealmRoleError::InvalidPublicRole);
+        }
+
+        Ok(())
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
@@ -490,6 +519,10 @@ impl Operation for AddRealmRoleOperation {
     type Error = AddRealmRoleError;
 
     fn start(&mut self) -> Effects {
+        if let Err(error) = self.validate_role() {
+            return self.fail(error);
+        }
+
         self.state = AddRealmRoleState::Auth;
 
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -650,7 +683,9 @@ fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation, AddRealmRoleState};
+    use crate::add_realm_role::{
+        AddRealmRoleConfig, AddRealmRoleError, AddRealmRoleOperation, AddRealmRoleState,
+    };
     use crate::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -684,6 +719,64 @@ pub mod test {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[test]
+    fn rejects_public_roles_with_write_or_deny_permissions() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        for permission in [Permission::WRITE, Permission::DENY] {
+            let mut operation = AddRealmRoleOperation::new(AddRealmRoleConfig {
+                actor: actor.clone(),
+                realm_id,
+                role: Role {
+                    role_id: Ulid::new(),
+                    name: "public".to_string(),
+                    permissions: HashMap::from([(format!("/{realm_id}/data/**"), permission)]),
+                    assigned_users: HashSet::from([UserId::nil(realm_id)]),
+                },
+            });
+
+            assert!(operation.start().is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(AddRealmRoleError::InvalidPublicRole)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_foreign_nil_assigned_users() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let other_realm_id = aruna_core::structs::RealmId([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+        let mut operation = AddRealmRoleOperation::new(AddRealmRoleConfig {
+            actor,
+            realm_id,
+            role: Role {
+                role_id: Ulid::new(),
+                name: "foreign-nil".to_string(),
+                permissions: HashMap::from([(format!("/{realm_id}/data/**"), Permission::READ)]),
+                assigned_users: HashSet::from([UserId::nil(other_realm_id)]),
+            },
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(AddRealmRoleError::InvalidAssignedUser)
+        );
+    }
 
     #[test]
     pub fn writes_realm_auth_doc_reducer_state_and_conflicts_in_one_transaction() {

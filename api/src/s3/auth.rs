@@ -1,4 +1,4 @@
-use super::util::get_s3_operation_permission;
+use super::util::{get_s3_operation_permission, is_anonymous_object_read_operation};
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
@@ -59,8 +59,8 @@ impl S3Access for AuthProvider {
         let action = get_s3_operation_permission(cx.s3_op().name())
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
-        // Unsigned requests are checked as the Everyone principal: read-only,
-        // and only where a public role grants READ.
+        // Unsigned requests are checked as the Everyone principal, but only for
+        // the public object-byte read surface.
         let access_key_id = match cx.credentials() {
             Some(credentials) => credentials.access_key.clone(),
             None => return self.check_anonymous(cx, action).await,
@@ -113,36 +113,36 @@ impl S3Access for AuthProvider {
 }
 
 impl AuthProvider {
-    /// Anonymous access: read-only, addressed to a concrete bucket (never the
-    /// account-level ops like ListBuckets), and allowed only when a public
-    /// role — one assigned to the Everyone principal — grants READ on the
-    /// bucket/object permission path. The bucket's own group scopes that path,
-    /// so the authenticated flow's group-ownership check has no analogue here.
+    /// Anonymous access: object bytes only, addressed to a concrete object, and
+    /// allowed only when a public role — one assigned to the Everyone principal
+    /// — grants READ on the object permission path. The bucket's own group
+    /// scopes that path, so the authenticated flow's group-ownership check has
+    /// no analogue here.
     async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
-        if !matches!(action, Action::Read) {
-            return Err(s3_error!(AccessDenied, "Anonymous requests are read-only"));
-        }
-        let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
+        if !matches!(action, Action::Read) || !is_anonymous_object_read_operation(cx.s3_op().name())
+        {
             return Err(s3_error!(
                 AccessDenied,
-                "Anonymous requests must address a bucket"
+                "Anonymous access is limited to object reads"
+            ));
+        }
+        let Some((bucket, key)) = cx
+            .s3_path()
+            .as_object()
+            .map(|(bucket, key)| (bucket.to_owned(), key.to_owned()))
+        else {
+            return Err(s3_error!(
+                AccessDenied,
+                "Anonymous requests must address an object"
             ));
         };
-        let key = cx.s3_path().get_object_key().map(str::to_owned);
         let Some(bucket_info) = self.find_bucket_info(&bucket).await? else {
-            return Err(s3_error!(
-                NoSuchBucket,
-                "The specified bucket does not exist."
-            ));
+            return Err(s3_error!(AccessDenied, "Permission denied"));
         };
         let group_id = bucket_info.group_id;
 
-        let path = match &key {
-            Some(key) => {
-                blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, key)
-            }
-            None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
-        };
+        let path =
+            blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
         let allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {

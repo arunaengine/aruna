@@ -117,6 +117,10 @@ pub enum AddGroupRoleError {
     Unauthorized,
     #[error("No group found")]
     GroupNotFound,
+    #[error("Invalid public role")]
+    InvalidPublicRole,
+    #[error("Invalid assigned user")]
+    InvalidAssignedUser,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding role to group did not finish")]
@@ -136,6 +140,31 @@ impl AddGroupRoleOperation {
             state: AddGroupRoleState::Init,
             output: None,
         }
+    }
+
+    fn validate_role(&self) -> Result<(), AddGroupRoleError> {
+        if self
+            .input
+            .role
+            .assigned_users
+            .iter()
+            .any(|user| user.is_nil() && !user.is_nil_in(self.input.realm_id))
+        {
+            return Err(AddGroupRoleError::InvalidAssignedUser);
+        }
+
+        if self.input.role.is_public(self.input.realm_id)
+            && self
+                .input
+                .role
+                .permissions
+                .values()
+                .any(|permission| permission != &Permission::READ)
+        {
+            return Err(AddGroupRoleError::InvalidPublicRole);
+        }
+
+        Ok(())
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
@@ -586,6 +615,10 @@ impl Operation for AddGroupRoleOperation {
     type Error = AddGroupRoleError;
 
     fn start(&mut self) -> Effects {
+        if let Err(error) = self.validate_role() {
+            return self.fail(error);
+        }
+
         self.state = AddGroupRoleState::Auth;
 
         let auth_config = CheckPermissionsConfig {
@@ -762,7 +795,9 @@ fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation, AddGroupRoleState};
+    use crate::add_group_role::{
+        AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation, AddGroupRoleState,
+    };
     use aruna_core::UserId;
     use aruna_core::admin_document_reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
@@ -788,6 +823,84 @@ pub mod test {
         DOCUMENT_SYNC_OUTBOX_KEYSPACE,
     };
     use ulid::Ulid;
+
+    #[test]
+    fn rejects_public_roles_with_write_or_deny_permissions() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        for permission in [Permission::WRITE, Permission::DENY] {
+            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+                auth_context: aruna_core::structs::AuthContext {
+                    user_id,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                actor: actor.clone(),
+                realm_id,
+                group_id,
+                role: Role {
+                    role_id: Ulid::new(),
+                    name: "public".to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/g/{group_id}/data/**"),
+                        permission,
+                    )]),
+                    assigned_users: HashSet::from([UserId::nil(realm_id)]),
+                },
+            });
+
+            assert!(operation.start().is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(AddGroupRoleError::InvalidPublicRole)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_foreign_nil_assigned_users() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let other_realm_id = aruna_core::structs::RealmId([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+        let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+            auth_context: aruna_core::structs::AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            actor,
+            realm_id,
+            group_id,
+            role: Role {
+                role_id: Ulid::new(),
+                name: "foreign-nil".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/data/**"),
+                    Permission::READ,
+                )]),
+                assigned_users: HashSet::from([UserId::nil(other_realm_id)]),
+            },
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(AddGroupRoleError::InvalidAssignedUser)
+        );
+    }
 
     #[tokio::test]
     pub async fn test_add_role() {

@@ -53,11 +53,27 @@ fn allowed_publish_use(publish_use: &PublishUse) -> bool {
             publish_use.function.as_deref() == Some("document_publish_from_outbox")
         }
         "net/src/irokle.rs" => {
-            publish_use.function.as_deref() == Some("publish_events_blocking")
+            matches!(
+                (publish_use.function.as_deref(), publish_use.text.as_str()),
+                (
+                    Some("publish_events_blocking"),
+                    "DocumentSyncPublish::Upsert {"
+                        | "DocumentSyncPublish::Delete {"
+                        | "DocumentSyncPublish::AdminOperation { target, event, .. } => {",
+                ) | (
+                    Some("decode_eviction"),
+                    "documents.push(DocumentSyncPublish::Upsert {"
+                        | "documents.push(DocumentSyncPublish::Delete {"
+                        | "documents.push(DocumentSyncPublish::AdminOperation {",
+                )
+            )
+        }
+        "operations/src/incoming.rs" => {
+            publish_use.function.as_deref() == Some("reemit_evicted_documents")
                 && matches!(
                     publish_use.text.as_str(),
                     "DocumentSyncPublish::Upsert {"
-                        | "DocumentSyncPublish::Delete {"
+                        | "DocumentSyncPublish::Delete { target, change, .. } => {"
                         | "DocumentSyncPublish::AdminOperation { target, event, .. } => {"
                 )
         }
