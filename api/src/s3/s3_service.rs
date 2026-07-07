@@ -1753,9 +1753,14 @@ impl S3 for ArunaS3Service {
                 }
                 let is_truncated = parts.len() > max_parts;
                 parts.truncate(max_parts);
-                let next_part_number_marker = is_truncated
-                    .then(|| parts.last().map(|part| part.part_number))
-                    .flatten();
+                // With max_parts=0 the truncation empties `parts`, so fall back to
+                // the marker preceding the first unreturned part (request marker/0).
+                let next_part_number_marker = is_truncated.then(|| {
+                    parts
+                        .last()
+                        .map(|part| part.part_number)
+                        .unwrap_or(part_number_marker.unwrap_or(0))
+                });
                 let object_part_list: Vec<ObjectPart> = parts
                     .into_iter()
                     .map(|part| {

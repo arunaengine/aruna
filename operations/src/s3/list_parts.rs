@@ -189,9 +189,14 @@ impl ListPartsOperation {
 
         let is_truncated = parts.len() > self.input.max_parts;
         parts.truncate(self.input.max_parts);
-        let next_part_number_marker = is_truncated
-            .then(|| parts.last().map(|part| part.part_number))
-            .flatten();
+        // With max_parts=0 the truncation empties `parts`, so fall back to the
+        // marker preceding the first unreturned part (the request marker, or 0).
+        let next_part_number_marker = is_truncated.then(|| {
+            parts
+                .last()
+                .map(|part| part.part_number)
+                .unwrap_or(self.input.part_number_marker.unwrap_or(0))
+        });
 
         let Some(upload) = self.upload.take() else {
             return self.emit_error(ListPartsError::ListPartsFailed);
@@ -438,6 +443,61 @@ mod test {
         }
 
         assert_eq!(collected, vec![1, 100, 128, 130, 256, 300]);
+    }
+
+    #[tokio::test]
+    async fn list_parts_zero_max_returns_resume_marker() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        let upload_id = Ulid::new();
+        seed_upload(
+            &storage_handle,
+            &upload_record(upload_id, "bucket", "object"),
+        )
+        .await;
+        for part_number in [1u16, 2, 3] {
+            seed_part(&storage_handle, upload_id, part_number).await;
+        }
+
+        // No marker: resume marker is 0 so the client can restart from the top.
+        let result = drive(
+            ListPartsOperation::new(ListPartsInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                upload_id,
+                part_number_marker: None,
+                max_parts: 0,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(result.parts.is_empty());
+        assert!(result.is_truncated);
+        assert_eq!(result.next_part_number_marker, Some(0));
+
+        // With a marker the resume marker is preserved.
+        let result = drive(
+            ListPartsOperation::new(ListPartsInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                upload_id,
+                part_number_marker: Some(2),
+                max_parts: 0,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(result.is_truncated);
+        assert_eq!(result.next_part_number_marker, Some(2));
     }
 
     #[tokio::test]

@@ -94,6 +94,21 @@ impl ListMultipartUploadsOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        // Mirror the key-listing operations: max_uploads=0 short-circuits to an
+        // empty, non-truncated result instead of reporting truncation with no
+        // usable resume marker.
+        if self.input.max_uploads == 0 {
+            self.state = ListMultipartUploadsState::Finish;
+            self.output = Some(Ok(ListMultipartUploadsResult {
+                uploads: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_upload_id_marker: None,
+            }));
+            return smallvec![];
+        }
+
         self.state = ListMultipartUploadsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
@@ -392,6 +407,30 @@ mod test {
             .collect();
         assert_eq!(keys, vec!["a", "c"]);
         assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_zero_max_returns_empty_not_truncated() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", "a")).await;
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(input("bucket", 0)),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(result.uploads.is_empty());
+        assert!(!result.is_truncated);
+        assert_eq!(result.next_key_marker, None);
+        assert_eq!(result.next_upload_id_marker, None);
     }
 
     #[tokio::test]
