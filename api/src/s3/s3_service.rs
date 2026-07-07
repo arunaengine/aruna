@@ -2118,7 +2118,6 @@ impl S3 for ArunaS3Service {
         let result = drive(
             ListObjectVersionsOperation::new(LOVI {
                 bucket: bucket.clone(),
-                group_id,
                 prefix: prefix.clone(),
                 delimiter: delimiter.clone(),
                 key_marker: key_marker.clone(),

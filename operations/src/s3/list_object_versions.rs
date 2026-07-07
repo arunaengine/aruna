@@ -7,7 +7,7 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
     SourceMetadata, VersionKey,
 };
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{Effects, Key, Value};
 use aruna_core::util::prefix_upper_bound;
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -56,7 +56,6 @@ pub enum ListObjectVersionsError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListObjectVersionsInput {
     pub bucket: String,
-    pub group_id: GroupId,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
     pub key_marker: Option<String>,
@@ -809,7 +808,6 @@ mod test {
     fn input(max_keys: usize) -> ListObjectVersionsInput {
         ListObjectVersionsInput {
             bucket: "bucket".to_string(),
-            group_id: Ulid::new(),
             prefix: None,
             delimiter: None,
             key_marker: None,
@@ -938,7 +936,6 @@ mod test {
             let result = drive(
                 ListObjectVersionsOperation::new(ListObjectVersionsInput {
                     bucket: "bucket".to_string(),
-                    group_id: Ulid::new(),
                     prefix: None,
                     delimiter: None,
                     key_marker: key_marker.clone(),
@@ -996,7 +993,6 @@ mod test {
         let result = drive(
             ListObjectVersionsOperation::new(ListObjectVersionsInput {
                 bucket: "bucket".to_string(),
-                group_id: Ulid::new(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: None,
@@ -1143,7 +1139,6 @@ mod test {
         let first = drive(
             ListObjectVersionsOperation::new(ListObjectVersionsInput {
                 bucket: "bucket".to_string(),
-                group_id: Ulid::new(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: None,
@@ -1165,7 +1160,6 @@ mod test {
         let second = drive(
             ListObjectVersionsOperation::new(ListObjectVersionsInput {
                 bucket: "bucket".to_string(),
-                group_id: Ulid::new(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: first.next_key_marker.clone(),
