@@ -686,6 +686,7 @@ mod test {
                 group_id,
                 realm_id,
                 node_id,
+                quota_ceiling: None,
                 conditions: CopySourceConditions {
                     if_none_match: Some("*".to_string()),
                     ..Default::default()
