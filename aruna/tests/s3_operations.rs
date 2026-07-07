@@ -1,5 +1,7 @@
 mod shared;
 
+use aruna_api::routes::credentials::CreateS3PathRestriction;
+use aruna_core::structs::{Permission, blob_group_permission_path};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -9,7 +11,8 @@ use aws_sdk_s3::types::{
 };
 use shared::{
     SeedNode, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_seed_node,
+    create_s3_credentials_via_http, create_s3_credentials_with_restrictions_via_http, s3_client,
+    spawn_full_seed_node,
 };
 use ulid::Ulid;
 
@@ -201,6 +204,98 @@ async fn delete_objects_quiet_mode_omits_deleted_entries() -> TestResult<()> {
 
         assert!(output.deleted().is_empty(), "quiet mode must omit deleted");
         assert!(output.errors().is_empty());
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn delete_objects_authorizes_each_entry_for_prefix_scoped_token() -> TestResult<()> {
+    let seed = spawn_full_seed_node().await?;
+    let admin_token = create_bearer_token(
+        seed.context.as_ref(),
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_via_http(&seed.base_url, &admin_token, "s3-ops-delete-scoped").await?;
+    let full_credentials =
+        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+    let endpoint = seed
+        .s3
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+    let full_client = s3_client(endpoint, &full_credentials);
+
+    let result = async {
+        let bucket = "s3-ops-delete-scoped";
+        full_client.create_bucket().bucket(bucket).send().await?;
+        for key in ["scoped/in.txt", "other/out.txt"] {
+            full_client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"scoped delete body"))
+                .send()
+                .await?;
+        }
+
+        // Mint a credential scoped to the "scoped/" prefix only.
+        let group_root =
+            blob_group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
+        let scoped_credentials = create_s3_credentials_with_restrictions_via_http(
+            &seed.base_url,
+            &admin_token,
+            &group.group_id,
+            Some(vec![CreateS3PathRestriction {
+                pattern: format!("{group_root}/{bucket}/scoped/**"),
+                permission: Permission::WRITE.to_string(),
+            }]),
+        )
+        .await?;
+        let scoped_client = s3_client(endpoint, &scoped_credentials);
+
+        let delete = Delete::builder()
+            .objects(ObjectIdentifier::builder().key("scoped/in.txt").build()?)
+            .objects(ObjectIdentifier::builder().key("other/out.txt").build()?)
+            .quiet(false)
+            .build()?;
+        let output = scoped_client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await?;
+
+        // In-scope key deleted; out-of-scope key rejected per entry, not whole request.
+        let deleted_keys: Vec<&str> = output.deleted().iter().filter_map(|d| d.key()).collect();
+        assert_eq!(deleted_keys, vec!["scoped/in.txt"]);
+
+        assert_eq!(output.errors().len(), 1);
+        let error = &output.errors()[0];
+        assert_eq!(error.key(), Some("other/out.txt"));
+        assert_eq!(error.code(), Some("AccessDenied"));
+
+        // The out-of-scope object survives; the in-scope object is now shadowed.
+        full_client
+            .head_object()
+            .bucket(bucket)
+            .key("other/out.txt")
+            .send()
+            .await?;
+        assert!(
+            full_client
+                .head_object()
+                .bucket(bucket)
+                .key("scoped/in.txt")
+                .send()
+                .await
+                .is_err()
+        );
         Ok(())
     }
     .await;

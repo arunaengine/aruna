@@ -2301,18 +2301,51 @@ impl S3 for ArunaS3Service {
         let mut entries = Vec::with_capacity(req.input.delete.objects.len());
         let mut errors: Vec<S3DeleteError> = Vec::new();
         for object in req.input.delete.objects {
-            match parse_version_id(object.version_id.clone()) {
-                Ok(version_id) => entries.push(DeleteObjectsEntry {
-                    key: object.key,
-                    version_id,
+            let version_id = match parse_version_id(object.version_id.clone()) {
+                Ok(version_id) => version_id,
+                Err(_) => {
+                    errors.push(S3DeleteError {
+                        code: Some("NoSuchVersion".to_string()),
+                        key: Some(object.key),
+                        version_id: object.version_id,
+                        message: Some("The specified version does not exist.".to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            // DeleteObjects carries no object key in the request path, so the auth
+            // layer defers object authorization to here; check every entry.
+            let allowed = drive(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: replication_auth.clone(),
+                    path: blob_object_permission_path(
+                        self.realm_id,
+                        user_access.group_id,
+                        self.node_id,
+                        &bucket,
+                        &object.key,
+                    ),
+                    required_permission: Permission::WRITE,
                 }),
-                Err(_) => errors.push(S3DeleteError {
-                    code: Some("NoSuchVersion".to_string()),
+                &self.state,
+            )
+            .await
+            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+            if !allowed {
+                errors.push(S3DeleteError {
+                    code: Some("AccessDenied".to_string()),
                     key: Some(object.key),
                     version_id: object.version_id,
-                    message: Some("The specified version does not exist.".to_string()),
-                }),
+                    message: Some("Access Denied".to_string()),
+                });
+                continue;
             }
+
+            entries.push(DeleteObjectsEntry {
+                key: object.key,
+                version_id,
+            });
         }
 
         let outcomes = delete_objects(
