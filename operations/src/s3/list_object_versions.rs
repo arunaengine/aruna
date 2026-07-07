@@ -110,6 +110,7 @@ pub struct ListObjectVersionsOperation {
     head_round_limit: usize,
     head_exhausted: bool,
     scan_rounds: usize,
+    max_scan_rounds: usize,
     resume_common_prefix: Option<String>,
     last_emitted_group: Option<String>,
     pending_heads: VecDeque<(String, Ulid)>,
@@ -126,7 +127,7 @@ pub struct ListObjectVersionsOperation {
 
 impl ListObjectVersionsOperation {
     pub const DEFAULT_MAX_KEYS: usize = 1_000;
-    const MAX_SCAN_ROUNDS: usize = 1_000;
+    const MAX_SCAN_ROUNDS: usize = 100;
 
     pub fn new(input: ListObjectVersionsInput) -> Self {
         Self {
@@ -140,6 +141,7 @@ impl ListObjectVersionsOperation {
             head_round_limit: 0,
             head_exhausted: false,
             scan_rounds: 0,
+            max_scan_rounds: Self::MAX_SCAN_ROUNDS,
             resume_common_prefix: None,
             last_emitted_group: None,
             pending_heads: VecDeque::new(),
@@ -153,6 +155,12 @@ impl ListObjectVersionsOperation {
             next_version_id_marker: None,
             output: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_scan_rounds(mut self, max_scan_rounds: usize) -> Self {
+        self.max_scan_rounds = max_scan_rounds;
+        self
     }
 
     fn emit_error(&mut self, error: ListObjectVersionsError) -> Effects {
@@ -324,7 +332,11 @@ impl ListObjectVersionsOperation {
             }
 
             let Some((key, head_version_id)) = self.pending_heads.pop_front() else {
-                if self.head_exhausted || self.scan_rounds >= Self::MAX_SCAN_ROUNDS {
+                if self.head_exhausted {
+                    return self.commit();
+                }
+                if self.scan_rounds >= self.max_scan_rounds {
+                    self.truncate();
                     return self.commit();
                 }
                 return self.issue_head_round();
@@ -1073,5 +1085,67 @@ mod test {
             })
             .collect();
         assert_eq!(keys, vec!["a/1", "aa", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_truncates_at_scan_round_cap() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        // Three delimiter groups; each head round makes bounded progress so the
+        // low scan-round cap trips before the "c/" group is reached.
+        for (group, count) in [("a/", 4usize), ("b/", 3), ("c/", 1)] {
+            for index in 0..count {
+                let key = format!("{group}{index}");
+                let version_id = Ulid::new();
+                seed_materialized(&storage_handle, &key, version_id, [index as u8 + 60; 32]).await;
+                seed_head(&storage_handle, &key, version_id).await;
+            }
+        }
+
+        let first = drive(
+            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+                bucket: "bucket".to_string(),
+                group_id: Ulid::new(),
+                prefix: None,
+                delimiter: Some("/".to_string()),
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: Some(3),
+            })
+            .with_max_scan_rounds(2),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(first.is_truncated);
+        assert_eq!(first.common_prefixes, vec!["a/", "b/"]);
+        assert_eq!(first.next_key_marker.as_deref(), Some("b/"));
+
+        let second = drive(
+            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+                bucket: "bucket".to_string(),
+                group_id: Ulid::new(),
+                prefix: None,
+                delimiter: Some("/".to_string()),
+                key_marker: first.next_key_marker.clone(),
+                version_id_marker: first.next_version_id_marker,
+                max_keys: Some(3),
+            })
+            .with_max_scan_rounds(2),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(!second.is_truncated);
+        assert_eq!(second.common_prefixes, vec!["c/"]);
     }
 }
