@@ -121,6 +121,8 @@ pub enum AddGroupRoleError {
     InvalidPublicRole,
     #[error("Invalid assigned user")]
     InvalidAssignedUser,
+    #[error("Reserved role name")]
+    ReservedRoleName,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding role to group did not finish")]
@@ -133,6 +135,12 @@ pub enum AddGroupRoleError {
     },
 }
 
+const RESERVED_GROUP_ROLE_NAMES: &[&str] = &["admin", "user"];
+
+fn is_reserved_group_role_name(name: &str) -> bool {
+    RESERVED_GROUP_ROLE_NAMES.contains(&name.trim())
+}
+
 impl AddGroupRoleOperation {
     pub fn new(input: AddGroupRoleConfig) -> Self {
         AddGroupRoleOperation {
@@ -143,6 +151,10 @@ impl AddGroupRoleOperation {
     }
 
     fn validate_role(&self) -> Result<(), AddGroupRoleError> {
+        if is_reserved_group_role_name(&self.input.role.name) {
+            return Err(AddGroupRoleError::ReservedRoleName);
+        }
+
         if self
             .input
             .role
@@ -823,6 +835,46 @@ pub mod test {
         DOCUMENT_SYNC_OUTBOX_KEYSPACE,
     };
     use ulid::Ulid;
+
+    #[test]
+    fn rejects_reserved_role_names() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        for name in ["admin", "user", " admin "] {
+            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
+                auth_context: aruna_core::structs::AuthContext {
+                    user_id,
+                    realm_id,
+                    path_restrictions: None,
+                },
+                actor: actor.clone(),
+                realm_id,
+                group_id,
+                role: Role {
+                    role_id: Ulid::new(),
+                    name: name.to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/g/{group_id}/data/**"),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::new(),
+                },
+            });
+
+            assert!(operation.start().is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(AddGroupRoleError::ReservedRoleName)
+            );
+        }
+    }
 
     #[test]
     fn rejects_public_roles_with_write_or_deny_permissions() {

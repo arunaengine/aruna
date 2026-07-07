@@ -106,6 +106,8 @@ pub enum AddRealmRoleError {
     InvalidPublicRole,
     #[error("Invalid assigned user")]
     InvalidAssignedUser,
+    #[error("Reserved role name")]
+    ReservedRoleName,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding role to realm did not finish")]
@@ -116,6 +118,12 @@ pub enum AddRealmRoleError {
         expected: &'static str,
         got: String,
     },
+}
+
+const RESERVED_REALM_ROLE_NAMES: &[&str] = &["realm_admin"];
+
+fn is_reserved_realm_role_name(name: &str) -> bool {
+    RESERVED_REALM_ROLE_NAMES.contains(&name.trim())
 }
 
 impl AddRealmRoleOperation {
@@ -151,6 +159,10 @@ impl AddRealmRoleOperation {
     }
 
     fn validate_role(&self) -> Result<(), AddRealmRoleError> {
+        if is_reserved_realm_role_name(&self.input.role.name) {
+            return Err(AddRealmRoleError::ReservedRoleName);
+        }
+
         if self
             .input
             .role
@@ -719,6 +731,39 @@ pub mod test {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[test]
+    fn rejects_reserved_role_names() {
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        for name in ["realm_admin", " realm_admin "] {
+            let mut operation = AddRealmRoleOperation::new(AddRealmRoleConfig {
+                actor: actor.clone(),
+                realm_id,
+                role: Role {
+                    role_id: Ulid::new(),
+                    name: name.to_string(),
+                    permissions: HashMap::from([(
+                        format!("/{realm_id}/data/**"),
+                        Permission::READ,
+                    )]),
+                    assigned_users: HashSet::new(),
+                },
+            });
+
+            assert!(operation.start().is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(AddRealmRoleError::ReservedRoleName)
+            );
+        }
+    }
 
     #[test]
     fn rejects_public_roles_with_write_or_deny_permissions() {
