@@ -74,6 +74,7 @@ pub struct Config {
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
     pub s3_host: String,
+    pub s3_public_url: Option<String>,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -278,6 +279,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .unwrap_or(3)
         .max(1);
     let s3_host = dotenvy::var("S3_HOST")?;
+    let s3_public_url = optional_nonempty_env("S3_PUBLIC_URL")?;
+    if let Some(url) = &s3_public_url {
+        reqwest::Url::parse(url)
+            .map_err(|error| invalid_config_value("S3_PUBLIC_URL", url, error))?;
+    }
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
     let realm_description = dotenvy::var("REALM_DESCRIPTION")
@@ -388,6 +394,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             relay_method,
             default_metadata_replication_factor,
             s3_host,
+            s3_public_url,
             s3_address,
             onboarding_secret,
             oidc_providers,

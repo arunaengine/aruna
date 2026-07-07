@@ -585,6 +585,10 @@ pub fn client_base_url_from_advertised_host(
     let host = match advertised_host.trim() {
         "" => return client_base_url_from_bind_address(bind_address),
         host => {
+            if host.contains("://") {
+                return host.trim_end_matches('/').to_string();
+            }
+
             if let Ok(addr) = host.parse::<SocketAddr>() {
                 return format!("http://{}:{}", client_host_from_ip(addr.ip()), addr.port());
             }
@@ -649,6 +653,24 @@ mod tests {
                 "0.0.0.0:1337".parse().unwrap()
             ),
             "http://s3.node-1.v3.aruna-engine.org"
+        );
+    }
+
+    #[test]
+    fn s3_base_url_preserves_explicit_scheme() {
+        assert_eq!(
+            client_base_url_from_advertised_host(
+                "https://s3.node-1.v3.aruna-engine.org",
+                "0.0.0.0:1337".parse().unwrap()
+            ),
+            "https://s3.node-1.v3.aruna-engine.org"
+        );
+        assert_eq!(
+            client_base_url_from_advertised_host(
+                "https://s3.node-1.v3.aruna-engine.org/",
+                "0.0.0.0:1337".parse().unwrap()
+            ),
+            "https://s3.node-1.v3.aruna-engine.org"
         );
     }
 }
