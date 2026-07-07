@@ -109,6 +109,12 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
         let part_one = vec![7u8; 6 * 1024];
         let part_two = vec![9u8; 4 * 1024];
         let total_size = (part_one.len() + part_two.len()) as i64;
+        // AWS composite form: base64(sha256(part digests concatenated)) + "-<partCount>".
+        let composite_sha256 = {
+            let mut combined = Sha256::digest(&part_one).to_vec();
+            combined.extend_from_slice(&Sha256::digest(&part_two));
+            format!("{}-2", sha256_base64(&combined))
+        };
 
         s3.create_bucket().bucket(bucket).send().await?;
         let create = s3
@@ -152,7 +158,9 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
             );
         }
 
-        s3.complete_multipart_upload()
+        // The SDK-computed object-level checksum arrives in the suffixed form.
+        let complete = s3
+            .complete_multipart_upload()
             .bucket(bucket)
             .key(key)
             .upload_id(&upload_id)
@@ -162,8 +170,10 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
                     .build(),
             )
             .checksum_type(ChecksumType::Composite)
+            .checksum_sha256(&composite_sha256)
             .send()
             .await?;
+        assert_eq!(complete.checksum_sha256(), Some(composite_sha256.as_str()));
 
         let attrs = s3
             .get_object_attributes()
@@ -193,7 +203,7 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
         let checksum = attrs
             .checksum()
             .ok_or_else(|| std::io::Error::other("get_object_attributes returned no checksum"))?;
-        assert!(checksum.checksum_sha256().is_some());
+        assert_eq!(checksum.checksum_sha256(), Some(composite_sha256.as_str()));
         assert_eq!(checksum.checksum_type(), Some(&ChecksumType::Composite));
 
         let head = s3
@@ -203,7 +213,7 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await?;
-        assert!(head.checksum_sha256().is_some());
+        assert_eq!(head.checksum_sha256(), Some(composite_sha256.as_str()));
         assert_eq!(head.checksum_type(), Some(&ChecksumType::Composite));
         assert_eq!(head.content_length(), Some(total_size));
 

@@ -341,6 +341,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         "hello world"
     );
     assert_eq!(complete.checksum_type, MultipartChecksumType::Composite);
+    assert_eq!(complete.part_count, 2);
 
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec())

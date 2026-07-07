@@ -151,6 +151,7 @@ pub struct GetObjectResult {
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
     pub composite_hashes: HashMap<String, Vec<u8>>,
+    pub part_count: Option<usize>,
     pub resolved_range: Option<ResolvedObjectRange>,
 }
 
@@ -168,6 +169,7 @@ pub struct GetObjectOperation {
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
     composite_hashes: HashMap<String, Vec<u8>>,
+    part_count: Option<usize>,
     resolved_range: Option<ResolvedObjectRange>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
 }
@@ -187,6 +189,7 @@ impl GetObjectOperation {
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
             composite_hashes: HashMap::new(),
+            part_count: None,
             resolved_range: None,
             output: None,
         }
@@ -438,6 +441,7 @@ impl GetObjectOperation {
         {
             self.checksum_type = summary.checksum_type;
             self.composite_hashes = summary.composite_hashes;
+            self.part_count = Some(summary.part_count);
         }
 
         self.commit_and_read_blob()
@@ -571,6 +575,7 @@ impl GetObjectOperation {
                 resolved_version_id: self.resolved_version_id,
                 checksum_type: self.checksum_type,
                 composite_hashes: self.composite_hashes.clone(),
+                part_count: self.part_count,
                 resolved_range: self.resolved_range.clone(),
             }));
             smallvec![]
@@ -628,6 +633,7 @@ impl GetObjectOperation {
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,
             composite_hashes: self.composite_hashes.clone(),
+            part_count: self.part_count,
             resolved_range: self.resolved_range.clone(),
         }));
         smallvec![]

@@ -140,6 +140,7 @@ pub struct CompleteMultipartUploadResult {
     pub version_id: Ulid,
     pub checksum_type: MultipartChecksumType,
     pub response_hashes: HashMap<String, Vec<u8>>,
+    pub part_count: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1033,6 +1034,7 @@ impl CompleteMultipartUploadOperation {
                 version_id,
                 checksum_type: self.input.checksum_type,
                 response_hashes,
+                part_count: self.resolved_parts.len(),
             }));
             return smallvec![schedule_usage_snapshot_publish_effect()];
         };

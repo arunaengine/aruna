@@ -2,7 +2,7 @@
 
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
-    encode_checksums, parse_upload_checksum_request,
+    encode_checksums, parse_upload_checksum_request, validate_composite_part_count,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
@@ -454,6 +454,7 @@ impl ArunaS3Service {
             &result.response_hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             s3_checksum_type_from_multipart(result.checksum_type),
+            Some(result.part_count),
         ));
 
         let watch_actor = replication_auth.user_id;
@@ -498,6 +499,7 @@ impl ArunaS3Service {
             &result.location.hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
+            None,
         ));
         let watch_actor = replication_auth.user_id;
         let watch_bucket = replication_bucket.clone();
@@ -1225,6 +1227,7 @@ impl S3 for ArunaS3Service {
             &result.location.hashes,
             ChecksumSelection::AllStored,
             ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            None,
         ));
 
         Ok(S3Response::new(CopyObjectOutput {
@@ -1338,6 +1341,7 @@ impl S3 for ArunaS3Service {
             &result.location.hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type,
+            None,
         ));
 
         Ok(S3Response::new(output))
@@ -1436,6 +1440,7 @@ impl S3 for ArunaS3Service {
             &result.part_location.hashes,
             ChecksumSelection::AllStored,
             ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            None,
         ));
 
         Ok(S3Response::new(UploadPartCopyOutput {
@@ -1486,6 +1491,7 @@ impl S3 for ArunaS3Service {
             })
             .transpose()?
             .unwrap_or_default();
+        validate_composite_part_count(&checksum_request, completed_parts.len())?;
 
         let operation = CompleteMultipartUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
@@ -1629,6 +1635,7 @@ impl S3 for ArunaS3Service {
                 ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
+                result.part_count,
             ));
         }
 
@@ -1730,6 +1737,7 @@ impl S3 for ArunaS3Service {
                     ),
                     ChecksumSelection::AllStored,
                     s3_checksum_type_from_multipart(result.checksum_type),
+                    result.summary.as_ref().map(|summary| summary.part_count),
                 );
                 Checksum {
                     checksum_crc32: encoded.checksum_crc32,
@@ -1768,6 +1776,7 @@ impl S3 for ArunaS3Service {
                             &part.hashes,
                             ChecksumSelection::AllStored,
                             ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                            None,
                         );
                         ObjectPart {
                             part_number: Some(i32::from(part.part_number)),
@@ -1860,6 +1869,7 @@ impl S3 for ArunaS3Service {
                 ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
+                result.part_count,
             ));
         }
 
@@ -1935,6 +1945,7 @@ impl S3 for ArunaS3Service {
                     &part.location.hashes,
                     ChecksumSelection::AllStored,
                     ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                    None,
                 );
                 Part {
                     part_number: Some(i32::from(part.part_number)),
@@ -2610,6 +2621,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            composite_part_count: None,
         };
         let response = service
             .put_object_response(
