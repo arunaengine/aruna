@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
 use aruna_core::structs::PlacementRef;
@@ -154,6 +154,7 @@ pub struct OutboxReadBatch {
 pub async fn read_outbox_records(
     storage: &StorageHandle,
     prefix: &[u8],
+    start_after: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<OutboxReadBatch, String> {
     let read_limit = limit.saturating_add(1);
@@ -161,7 +162,7 @@ pub async fn read_outbox_records(
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(prefix.to_vec())),
-            start: None,
+            start: start_after.map(|key| IterStart::After(ByteView::from(key))),
             limit: read_limit,
             txn_id: None,
         })
@@ -349,7 +350,7 @@ mod tests {
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
             .expect("outbox read succeeds");
 
@@ -389,7 +390,7 @@ mod tests {
             other => panic!("unexpected valid outbox write event: {other:?}"),
         }
 
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
             .expect("outbox read succeeds");
 
