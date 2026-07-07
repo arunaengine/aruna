@@ -420,6 +420,13 @@ impl ArunaS3Service {
         emit_resource_watch_event(self.state.as_ref(), event).await;
     }
 
+    /// Deviates from AWS S3 by returning the true full-object MD5 hex as the
+    /// multipart ETag, without the AWS `-<partCount>` suffix. AWS derives its
+    /// multipart ETag from the concatenated part digests, so its value is opaque
+    /// and cannot be recomputed from the object bytes. Aruna composes the parts
+    /// into a single blob and hashes it, so the ETag is a real content MD5 that
+    /// clients such as rclone can verify end-to-end; aws-cli and boto3 treat
+    /// ETags as opaque tokens and are unaffected by the missing suffix.
     async fn complete_multipart_upload_response(
         &self,
         group_id: ulid::Ulid,
