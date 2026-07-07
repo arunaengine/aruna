@@ -91,9 +91,11 @@ async fn scan_shard_manifest_entries(
     Ok(entries)
 }
 
-// Digest and cursor come straight from irokle: a topic with no local genesis
-// yields the zero digest and an empty cursor, which a non-holder compares as
-// "not converged" rather than erroring.
+// Digest and cursor come straight from irokle. A topic with no local genesis is
+// not special-cased here: it reports the (non-zero) empty fingerprint and an
+// empty cursor, and only a storage error falls back to the zero digest.
+// Verification therefore gates on the topic actually existing (see
+// `shard::verify`), never on the digest value.
 fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([u8; 32], Vec<u8>) {
     let node = net_handle.document_sync_node();
     let digest = node

@@ -458,9 +458,8 @@ impl DocumentSyncTarget {
 
 /// Sync topic a shard's records ride, derived purely from the placement
 /// reference (no config lookup at the net layer). Mirrors the `TopicId::hash`
-/// idiom [`DocumentSyncTarget::sync_topic_id`] uses. Not yet wired into
-/// `sync_topic_id`: stage 2 flips the sharded targets over to this in a later
-/// commit.
+/// idiom [`DocumentSyncTarget::sync_topic_id`] uses, which routes every
+/// shard-classed target here.
 pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
     let mut bytes = b"aruna-shard-topic-v1".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());

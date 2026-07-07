@@ -6,7 +6,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
+};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -149,6 +151,116 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
 
     shutdown_nodes(nodes).await;
     Ok(())
+}
+
+// Two genesis-less holders compute the SAME (non-zero) empty fingerprint, so
+// their digests match — exactly the condition that would falsely certify
+// convergence. Verification must still refuse to mark the shard verified,
+// because neither has a local genesis.
+#[tokio::test]
+async fn co_holders_with_no_genesis_do_not_verify_on_matching_empty_digest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([126u8; 32]);
+    let nodes = build_meshed_nodes(realm_id, 2).await?;
+    let config = install_config_without_placements(&nodes, realm_id, 2).await?;
+
+    let placement = any_held_placement(&config, nodes[1].net.node_id());
+    let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
+    let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+    assert_eq!(
+        left.digest, right.digest,
+        "genesis-less holders share the empty fingerprint"
+    );
+    assert!(
+        !nodes[1]
+            .net
+            .document_sync_topic_exists(aruna_core::document::shard_topic_id(realm_id, &placement))
+            .unwrap_or(false),
+        "no local genesis exists for the shard"
+    );
+
+    let summary = verify_held_shards(&nodes[1].context, nodes[1].net.node_id(), realm_id).await;
+    assert_eq!(
+        summary.newly_verified, 0,
+        "a matching empty digest must not verify a genesis-less shard: {summary:?}"
+    );
+    assert!(
+        !is_shard_verified(nodes[1].context.as_ref(), realm_id, &placement).await,
+        "a genesis-less shard must stay unverified"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+async fn build_meshed_nodes(
+    realm_id: RealmId,
+    count: usize,
+) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        nodes.push(spawn_node(realm_id).await?);
+    }
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            nodes[i]
+                .net
+                .add_peer_addr(nodes[j].net.endpoint_addr())
+                .await;
+            nodes[j]
+                .net
+                .add_peer_addr(nodes[i].net.endpoint_addr())
+                .await;
+        }
+    }
+    Ok(nodes)
+}
+
+// Installs a small-shard realm config (every node holds every shard) but does
+// not run the placement reconciler, so no shard topic genesis exists.
+async fn install_config_without_placements(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    shard_count: u32,
+) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let strategy = PlacementStrategy {
+        strategy_id: Ulid::new(),
+        name: "default".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count,
+    };
+    config.default_strategy_id = Some(strategy.strategy_id);
+    config.strategies = vec![strategy];
+    for node in nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+    for node in nodes {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let bytes = config.to_bytes(&actor)?;
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: bytes.into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
+        }
+        node.net.refresh_realm_peers_from_document(&config).await?;
+    }
+    Ok(config)
 }
 
 fn any_held_placement(config: &RealmConfigDocument, node_id: NodeId) -> PlacementRef {

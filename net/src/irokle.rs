@@ -1774,6 +1774,7 @@ impl DocumentSyncService {
                                 let accepted = self
                                     .apply_metadata_document_lifecycle(
                                         MetadataDocumentLifecycleRecord::Delete { event },
+                                        change.current.actor,
                                         change.placement,
                                     )
                                     .await?;
@@ -2124,7 +2125,7 @@ impl DocumentSyncService {
                 )));
             }
             return self
-                .apply_metadata_document_lifecycle(record, change.placement)
+                .apply_metadata_document_lifecycle(record, change.current.actor, change.placement)
                 .await
                 .map(|_| ());
         }
@@ -2196,12 +2197,16 @@ impl DocumentSyncService {
     async fn apply_metadata_document_lifecycle(
         &self,
         record: MetadataDocumentLifecycleRecord,
+        delete_actor: NodeId,
         placement: PlacementRef,
     ) -> Result<bool> {
+        // Stamp the origin's actor (carried on the wire change), not the local
+        // node id: a delete tombstone's manifest row and revision sidecar must be
+        // byte-identical on every holder so shard digests converge across them.
         apply_metadata_document_lifecycle_to_storage(
             &self.storage,
             &record,
-            self.local_node_id()?,
+            delete_actor,
             placement,
         )
         .await

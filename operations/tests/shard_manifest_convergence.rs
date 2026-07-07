@@ -15,6 +15,7 @@ use aruna_operations::announce_realm_presence::{
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
+use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
@@ -75,6 +76,63 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     assert_eq!(left.entries.len(), document_ids.len());
     assert_eq!(sorted_entries(&left), sorted_entries(&right));
     assert_eq!(left.digest, right.digest);
+
+    // Delete one document and assert the tombstone converges byte-identically.
+    // Receivers must stamp the ORIGIN's actor into the delete tombstone's
+    // manifest row (not their own local node id), or the entry sets diverge
+    // across holders even though the topic digests agree.
+    let deleted_id = document_ids[0];
+    let deleted_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: deleted_id,
+    };
+    drive(
+        DeleteMetadataDocumentOperation::new(
+            Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
+            },
+            group_id,
+            deleted_id,
+        ),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
+        let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+        let left_tomb = left
+            .entries
+            .iter()
+            .find(|entry| entry.target == deleted_target)
+            .map(|entry| entry.revision);
+        let right_tomb = right
+            .entries
+            .iter()
+            .find(|entry| entry.target == deleted_target)
+            .map(|entry| entry.revision);
+        if left_tomb.is_some() && left_tomb == right_tomb {
+            // Both holders now carry the same tombstone row: the whole entry set
+            // (tombstone included) and the digest must be identical.
+            assert_eq!(
+                left.entries.len(),
+                document_ids.len(),
+                "the delete keeps a tombstone row"
+            );
+            assert_eq!(sorted_entries(&left), sorted_entries(&right));
+            assert_eq!(left.digest, right.digest);
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "delete tombstone did not converge across holders: left={left_tomb:?} right={right_tomb:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
 
     shutdown_nodes(nodes).await;
     Ok(())

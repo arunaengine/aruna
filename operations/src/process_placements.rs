@@ -255,8 +255,15 @@ pub async fn process_shard_placements(
 
             let holders = resolve_shard_holders(&config, &record.placement);
             if !holders.contains(&local_node_id) {
-                // The local node is no longer a holder of this shard.
+                // The local node is no longer a holder of this shard. Drop the
+                // verification marker too so a later re-entry re-verifies.
                 delete_record(context, key.to_vec()).await;
+                crate::shard::verify::delete_shard_verification(
+                    context,
+                    realm_id,
+                    &record.placement,
+                )
+                .await;
                 continue;
             }
             let local_is_rank0 = holders.first() == Some(&local_node_id);
