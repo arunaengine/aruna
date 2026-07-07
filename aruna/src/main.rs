@@ -120,7 +120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Republish a full set of node usage snapshots at startup so realm peers see
     // this node's totals again after a restart, dirty-marker loss, or a counter
     // rebuild. Best-effort: failures are retried by the debounced publisher.
-    if let Err(error) = aruna_operations::usage_stats::publish_usage_snapshots(
+    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
         driver_ctx.as_ref(),
         config.node_id,
         config.realm_id,
