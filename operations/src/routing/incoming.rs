@@ -1,10 +1,12 @@
 use aruna_core::NodeId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
+use crate::routing::client::HOLDER_PROXY_IO_TIMEOUT;
 use crate::routing::protocol::{
     HolderProxyRequest, HolderProxyResponse, read_holder_proxy_request, write_holder_proxy_response,
 };
@@ -29,7 +31,15 @@ pub async fn handle_holder_proxy_stream(
         return;
     };
 
-    let request = match read_holder_proxy_request(&mut stream).await {
+    // Server-side I/O timeouts mirror the client's, so a peer that stalls
+    // mid-frame or never reads the response cannot pin this task open.
+    let request = match timeout(
+        HOLDER_PROXY_IO_TIMEOUT,
+        read_holder_proxy_request(&mut stream),
+    )
+    .await
+    .unwrap_or_else(|_| Err("timed out reading holder proxy request".to_string()))
+    {
         Ok(request) => request,
         Err(error) => {
             warn!(peer = %peer, error = %error, "Failed to read holder proxy request");
@@ -38,7 +48,13 @@ pub async fn handle_holder_proxy_stream(
     };
 
     let response = build_response(context, net_handle, peer, request).await;
-    if let Err(error) = write_holder_proxy_response(&mut stream, &response).await {
+    if let Err(error) = timeout(
+        HOLDER_PROXY_IO_TIMEOUT,
+        write_holder_proxy_response(&mut stream, &response),
+    )
+    .await
+    .unwrap_or_else(|_| Err("timed out writing holder proxy response".to_string()))
+    {
         warn!(peer = %peer, error = %error, "Failed to write holder proxy response");
     }
     close_stream(&mut stream).await;

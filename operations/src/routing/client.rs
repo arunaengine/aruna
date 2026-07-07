@@ -13,21 +13,38 @@ use crate::routing::protocol::{
 
 pub const HOLDER_PROXY_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Sends one holder-proxy request to `holder` and returns its response. A
-/// connect or I/O failure surfaces as `Err` so the dispatch loop can fall
-/// through to the next holder in rank order.
+/// A send failure split at the retry-safety boundary. `Connect` means the
+/// request provably never reached the holder, so any call may retry the next
+/// one. `Io` means request bytes may already have been delivered — a mutation
+/// retried elsewhere after this could be applied twice.
+#[derive(Debug)]
+pub enum HolderProxySendError {
+    Connect(String),
+    Io(String),
+}
+
+/// Sends one holder-proxy request to `holder` and returns its response. The
+/// error kind tells the dispatch loop whether falling through to the next
+/// holder is safe for a mutation.
 pub async fn send_holder_proxy_request(
     net_handle: &NetHandle,
     holder: NodeId,
     request: HolderProxyRequest,
-) -> Result<HolderProxyResponse, String> {
+) -> Result<HolderProxyResponse, HolderProxySendError> {
     let mut stream = net_handle
         .open_stream(holder, Alpn::HolderProxy)
         .await
-        .map_err(|error| error.to_string())?;
-    write_message(&mut stream, &request).await?;
-    stream.0.finish().map_err(|error| error.to_string())?;
-    let response = read_response(&mut stream).await?;
+        .map_err(|error| HolderProxySendError::Connect(error.to_string()))?;
+    write_message(&mut stream, &request)
+        .await
+        .map_err(HolderProxySendError::Io)?;
+    stream
+        .0
+        .finish()
+        .map_err(|error| HolderProxySendError::Io(error.to_string()))?;
+    let response = read_response(&mut stream)
+        .await
+        .map_err(HolderProxySendError::Io)?;
     close_stream(&mut stream).await;
     Ok(response)
 }

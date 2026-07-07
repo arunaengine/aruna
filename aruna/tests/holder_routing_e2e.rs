@@ -377,8 +377,9 @@ async fn notification_phase(
         listed.notifications
     );
 
-    // The inbox holder derives the recipient from the bearer, never a wire claim:
-    // an inbox record for a different user seeded on the holder never leaks here.
+    // The inbox holder serves the validated bearer subject and rejects any wire
+    // recipient claiming someone else, so an inbox record for a different user
+    // seeded on the same holder never leaks into the member's routed list.
     let intruder = NotificationRecord {
         notification_id: Ulid::new(),
         recipient: UserId::new(Ulid::new(), seed.realm_id),

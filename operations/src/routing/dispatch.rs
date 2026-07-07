@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
-use crate::routing::client::send_holder_proxy_request;
+use crate::routing::client::{HolderProxySendError, send_holder_proxy_request};
 use crate::routing::protocol::{
     HolderProxyRequest, HolderProxyResponse, ProxiedCall, ProxiedReply, ProxyBearerToken,
     RejectKind,
@@ -46,13 +46,33 @@ fn rejection_to_routing_error(kind: RejectKind, reason: String) -> HolderRouting
     }
 }
 
+/// What the origin does after a send failure, keyed on the call's write-vs-read
+/// class. Reads retry the next holder on any failure. Mutations retry only on a
+/// connect failure — the request provably never reached the holder; once bytes
+/// may have been delivered, retrying elsewhere risks a double apply, so the
+/// caller gets a retryable `Unavailable` instead.
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailureAction {
+    NextHolder,
+    Unavailable,
+}
+
+fn send_failure_action(error: &HolderProxySendError, is_mutation: bool) -> SendFailureAction {
+    match error {
+        HolderProxySendError::Connect(_) => SendFailureAction::NextHolder,
+        HolderProxySendError::Io(_) if is_mutation => SendFailureAction::Unavailable,
+        HolderProxySendError::Io(_) => SendFailureAction::NextHolder,
+    }
+}
+
 /// Routes a user-authorized call to a current holder of its subject shard.
 ///
 /// Serves locally when this node holds the shard; otherwise forwards to remote
 /// holders in resolver rank order over [`Alpn::HolderProxy`](aruna_core::alpn::Alpn::HolderProxy)
-/// with `hop = 0`. Connect/I/O failures fall through to the next holder; a
-/// `NotHolder` from every reachable holder refreshes the realm config once and
-/// retries; a `NotFound` or `Rejected` from a reachable holder is definitive.
+/// with `hop = 0`. Send failures fall through to the next holder under the
+/// [`send_failure_action`] policy; a `NotHolder` from every reachable holder
+/// refreshes the realm config once and retries; a `NotFound` or `Rejected` from
+/// a reachable holder is definitive.
 pub async fn dispatch_holder_call(
     context: &DriverContext,
     local_node_id: NodeId,
@@ -156,6 +176,7 @@ async fn run_pass(
         .as_ref()
         .ok_or(HolderRoutingError::Unavailable)?;
 
+    let is_mutation = call.is_mutation();
     let mut saw_not_holder = false;
     for holder in holders {
         if holder == local_node_id {
@@ -174,7 +195,10 @@ async fn run_pass(
                 return Err(rejection_to_routing_error(kind, reason));
             }
             Ok(HolderProxyResponse::NotHolder) => saw_not_holder = true,
-            Err(_unreachable) => continue,
+            Err(error) => match send_failure_action(&error, is_mutation) {
+                SendFailureAction::NextHolder => continue,
+                SendFailureAction::Unavailable => return Err(HolderRoutingError::Unavailable),
+            },
         }
     }
 
@@ -210,4 +234,39 @@ async fn get_realm_config(
             GetRealmConfigError::DocumentNotFound => HolderRoutingError::Unavailable,
             other => HolderRoutingError::Internal(other.to_string()),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect() -> HolderProxySendError {
+        HolderProxySendError::Connect("dial failed".to_string())
+    }
+
+    fn io() -> HolderProxySendError {
+        HolderProxySendError::Io("timed out waiting for holder proxy response".to_string())
+    }
+
+    // Reads retry the next holder on every failure; mutations retry only when
+    // the request provably never reached the holder.
+    #[test]
+    fn send_failure_action_guards_mutations_after_delivery() {
+        assert_eq!(
+            send_failure_action(&connect(), false),
+            SendFailureAction::NextHolder
+        );
+        assert_eq!(
+            send_failure_action(&io(), false),
+            SendFailureAction::NextHolder
+        );
+        assert_eq!(
+            send_failure_action(&connect(), true),
+            SendFailureAction::NextHolder
+        );
+        assert_eq!(
+            send_failure_action(&io(), true),
+            SendFailureAction::Unavailable
+        );
+    }
 }

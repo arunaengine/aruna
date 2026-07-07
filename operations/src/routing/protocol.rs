@@ -86,6 +86,31 @@ pub enum ProxiedCall {
     Notification(NotificationCall),
 }
 
+impl ProxiedCall {
+    /// Whether this call mutates holder state. The single write-vs-read
+    /// classification the dispatch loop keys its failover policy on: a mutation
+    /// must not be retried on another holder once the request may have reached
+    /// the first, or two holders could apply the same write.
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            ProxiedCall::Group(call) => !matches!(call, GroupCall::Get { .. }),
+            ProxiedCall::User(call) => match call {
+                UserCall::Get { .. } | UserCall::ReadDocument { .. } => false,
+                UserCall::Update { .. } | UserCall::EnsureCanonicalTokenSubject { .. } => true,
+            },
+            ProxiedCall::Metadata(_) => true,
+            ProxiedCall::Notification(call) => match call {
+                NotificationCall::List { .. }
+                | NotificationCall::UnreadCount { .. }
+                | NotificationCall::ListWatches { .. } => false,
+                NotificationCall::MarkRead { .. }
+                | NotificationCall::CreateWatch { .. }
+                | NotificationCall::DeleteWatch { .. } => true,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupCall {
     Get {
@@ -183,8 +208,9 @@ pub enum MetadataMutation {
 }
 
 /// User-facing inbox reads and watch CRUD. The `recipient` steers holder
-/// resolution (the inbox's replica-1 holder) only; the target serves the inbox
-/// of the identity carried by the validated bearer, never this wire claim.
+/// resolution (the inbox's replica-1 holder); the target serves the identity
+/// carried by the validated bearer and rejects a wire recipient claiming
+/// anyone else as a bad request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotificationCall {
     List {
@@ -469,6 +495,99 @@ mod tests {
                 postcard::from_bytes::<HolderProxyResponse>(&bytes).unwrap(),
                 control
             );
+        }
+    }
+
+    // The one write-vs-read classification the dispatch failover policy keys on:
+    // every wire variant is pinned here so a new call cannot silently default.
+    #[test]
+    fn proxied_call_mutation_classification() {
+        let group_id = Ulid::nil();
+        let user_id = UserId::local(Ulid::nil(), RealmId::from_bytes([1u8; 32]));
+        let reads = [
+            ProxiedCall::Group(GroupCall::Get { group_id }),
+            ProxiedCall::User(UserCall::Get {
+                user_id: user_id.to_string(),
+            }),
+            ProxiedCall::User(UserCall::ReadDocument { user_id }),
+            ProxiedCall::Notification(NotificationCall::List {
+                recipient: user_id,
+                cursor: None,
+                limit: 10,
+            }),
+            ProxiedCall::Notification(NotificationCall::UnreadCount { recipient: user_id }),
+            ProxiedCall::Notification(NotificationCall::ListWatches { recipient: user_id }),
+        ];
+        let mutations = [
+            ProxiedCall::Group(GroupCall::AddMember {
+                group_id,
+                user_id,
+                role_ids: HashSet::new(),
+            }),
+            ProxiedCall::Group(GroupCall::RemoveMember {
+                group_id,
+                user_id,
+                role_ids: None,
+            }),
+            ProxiedCall::Group(GroupCall::AddRole {
+                group_id,
+                role: Box::new(Role {
+                    role_id: Ulid::nil(),
+                    name: "role".to_string(),
+                    permissions: HashMap::new(),
+                    assigned_users: HashSet::new(),
+                }),
+            }),
+            ProxiedCall::Group(GroupCall::RemoveRole {
+                group_id,
+                role_id: Ulid::nil(),
+            }),
+            ProxiedCall::User(UserCall::Update {
+                user_id: user_id.to_string(),
+                name: None,
+                set_attributes: HashMap::new(),
+                remove_attributes: Vec::new(),
+            }),
+            ProxiedCall::User(UserCall::EnsureCanonicalTokenSubject { user_id }),
+            ProxiedCall::Metadata(MetadataCall::Delete {
+                document_id: Ulid::nil(),
+            }),
+            ProxiedCall::Metadata(MetadataCall::Update {
+                document_id: Ulid::nil(),
+                public: None,
+                mutation: MetadataMutation::ReplaceRoCrate {
+                    jsonld: String::new(),
+                },
+            }),
+            ProxiedCall::Metadata(MetadataCall::Create {
+                group_id,
+                document_id: Ulid::nil(),
+                document_path: String::new(),
+                public: false,
+                payload: MetadataCreatePayload::RoCrate {
+                    jsonld: String::new(),
+                },
+            }),
+            ProxiedCall::Notification(NotificationCall::MarkRead {
+                recipient: user_id,
+                ids: Vec::new(),
+                up_to_ms: None,
+            }),
+            ProxiedCall::Notification(NotificationCall::CreateWatch {
+                recipient: user_id,
+                path_prefix: String::new(),
+                event_mask: WatchEventMask::default(),
+            }),
+            ProxiedCall::Notification(NotificationCall::DeleteWatch {
+                recipient: user_id,
+                watch_id: Ulid::nil(),
+            }),
+        ];
+        for call in &reads {
+            assert!(!call.is_mutation(), "misclassified as mutation: {call:?}");
+        }
+        for call in &mutations {
+            assert!(call.is_mutation(), "misclassified as read: {call:?}");
         }
     }
 

@@ -196,7 +196,7 @@ pub(crate) fn resolve_call_holders(
 }
 
 /// The inbox owner a [`NotificationCall`] resolves its holder against.
-fn notification_call_recipient(call: &NotificationCall) -> UserId {
+pub(crate) fn notification_call_recipient(call: &NotificationCall) -> UserId {
     match call {
         NotificationCall::List { recipient, .. }
         | NotificationCall::UnreadCount { recipient }
@@ -222,6 +222,18 @@ pub(crate) async fn validate_proxy_bearer(
         .await
         .map(Some)
         .map_err(|error| format!("invalid bearer token: {error}"))
+}
+
+/// Refusal for serve arms whose REST routes require unrestricted tokens: the
+/// holder re-enforces the gate so a path-restricted (delegated) token cannot
+/// reach those operations by arriving over the proxy instead of REST.
+pub(crate) fn reject_path_restricted(auth: &AuthContext) -> Option<HolderProxyResponse> {
+    if auth.path_restrictions.is_some() {
+        return Some(HolderProxyResponse::forbidden(
+            "operation requires an unrestricted token",
+        ));
+    }
+    None
 }
 
 /// Drives the local operation backing a proxied call. Shared by the inbound
@@ -272,6 +284,13 @@ async fn serve_group_call(
     let Some(auth) = auth else {
         return HolderProxyResponse::forbidden("group operation requires a bearer token");
     };
+    // Membership and role mutations mint their permission checks from the caller
+    // identity (REST gates them with `require_unrestricted`); reads stay open.
+    if !matches!(call, GroupCall::Get { .. })
+        && let Some(rejection) = reject_path_restricted(&auth)
+    {
+        return rejection;
+    }
     match call {
         GroupCall::Get { group_id } => {
             match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {

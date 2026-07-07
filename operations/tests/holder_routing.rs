@@ -458,11 +458,11 @@ async fn group_add_member_write_routes_and_is_readable() {
     shutdown(nodes).await;
 }
 
-// The inbox arm derives the served recipient from the validated bearer, never
-// the wire claim: a List whose wire recipient is another user returns only the
-// bearer subject's inbox, so the other user's seeded record is never disclosed.
+// The inbox arm rejects a List whose wire recipient is not the validated bearer
+// subject as a typed BadRequest, so another user's inbox can never be selected
+// by the wire claim; the same call with the matching recipient serves the inbox.
 #[tokio::test]
-async fn notification_list_serves_bearer_subject_not_wire_recipient() {
+async fn notification_wire_recipient_mismatch_is_bad_request() {
     let (realm_key, realm_id, _user) = realm_fixture();
     let nodes = meshed_nodes(realm_id, 2).await;
     let (origin, holder) = (&nodes[0], &nodes[1]);
@@ -494,20 +494,36 @@ async fn notification_list_serves_bearer_subject_not_wire_recipient() {
     .expect("seed victim inbox on the holder");
 
     // The wire recipient steers routing to the victim's inbox holder, but the
-    // bearer subject is `caller`; the holder serves `caller`'s (empty) inbox.
+    // bearer subject is `caller`: the holder refuses the mismatch outright.
+    let list_victim_inbox = NotificationCall::List {
+        recipient: victim,
+        cursor: None,
+        limit: 50,
+    };
     let token = sign_token(&realm_key, &token_claims(realm_id, caller));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Notification(list_victim_inbox.clone()),
+    )
+    .await
+    .expect_err("a wire recipient claiming another user is refused");
+    assert!(
+        matches!(error, HolderRoutingError::BadRequest(_)),
+        "unexpected error: {error:?}"
+    );
+
+    // The same call with the victim's own bearer serves the seeded inbox.
+    let token = sign_token(&realm_key, &token_claims(realm_id, victim));
     let reply = dispatch_holder_call(
         origin.context.as_ref(),
         origin.net.node_id(),
         Some(&token),
-        ProxiedCall::Notification(NotificationCall::List {
-            recipient: victim,
-            cursor: None,
-            limit: 50,
-        }),
+        ProxiedCall::Notification(list_victim_inbox),
     )
     .await
-    .expect("routed notification list");
+    .expect("routed notification list for the matching recipient");
     let ProxiedReply::Notification(reply) = reply else {
         panic!("expected a notification reply");
     };
@@ -517,12 +533,8 @@ async fn notification_list_serves_bearer_subject_not_wire_recipient() {
     assert!(
         records
             .iter()
-            .all(|record| record.notification_id != seeded.notification_id),
-        "the victim's record must not leak to a bearer for another user"
-    );
-    assert!(
-        records.is_empty(),
-        "the bearer subject has an empty inbox: {records:?}"
+            .any(|record| record.notification_id == seeded.notification_id),
+        "the matching recipient's routed list carries the seeded record: {records:?}"
     );
 
     shutdown(nodes).await;

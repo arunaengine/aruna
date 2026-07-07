@@ -13,6 +13,7 @@ use crate::notifications::watch::subscriptions::{
 use crate::routing::protocol::{
     HolderProxyResponse, NotificationCall, NotificationReply, ProxiedReply,
 };
+use crate::routing::{notification_call_recipient, reject_path_restricted};
 
 fn ok(reply: NotificationReply) -> HolderProxyResponse {
     HolderProxyResponse::Ok(ProxiedReply::Notification(Box::new(reply)))
@@ -23,8 +24,9 @@ fn internal(reason: impl ToString) -> HolderProxyResponse {
 }
 
 /// Serves a user-facing inbox read or watch mutation on this holder. The served
-/// recipient is derived from the validated bearer, never the wire claim — this
-/// is the flaw the forwarded-bearer path closes.
+/// recipient is the validated bearer subject; a wire recipient claiming anyone
+/// else is a malformed request and is rejected outright. Every notification REST
+/// route requires an unrestricted token, so the holder re-enforces that too.
 pub(crate) async fn serve_notification_call(
     context: &DriverContext,
     call: NotificationCall,
@@ -33,7 +35,15 @@ pub(crate) async fn serve_notification_call(
     let Some(auth) = auth else {
         return HolderProxyResponse::forbidden("notification access requires a bearer token");
     };
+    if let Some(rejection) = reject_path_restricted(&auth) {
+        return rejection;
+    }
     let recipient = auth.user_id;
+    if notification_call_recipient(&call) != recipient {
+        return HolderProxyResponse::bad_request(
+            "notification recipient does not match the bearer subject",
+        );
+    }
 
     match call {
         NotificationCall::List { cursor, limit, .. } => {
