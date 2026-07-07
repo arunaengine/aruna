@@ -42,6 +42,11 @@ enum TaskCommand {
         after: Duration,
         response: oneshot::Sender<TaskEvent>,
     },
+    ScheduleTimerIfIdle {
+        key: TaskKey,
+        after: Duration,
+        response: oneshot::Sender<TaskEvent>,
+    },
     CancelTimer {
         key: TaskKey,
         response: oneshot::Sender<TaskEvent>,
@@ -323,6 +328,22 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
+    fn schedule_timer_if_idle(&mut self, key: TaskKey, after: Duration) -> TaskEvent {
+        let now = Instant::now();
+        if let Some(existing) = self.timers_by_key.get(&key) {
+            return TaskEvent::TimerScheduled {
+                key,
+                after: existing.deadline.saturating_duration_since(now),
+            };
+        }
+
+        if self.in_flight_keys.contains_key(&key) {
+            return TaskEvent::TimerScheduled { key, after };
+        }
+
+        self.reset_timer(key, after)
+    }
+
     fn cancel_timer(&mut self, key: TaskKey) -> TaskEvent {
         self.remove_timer(&key);
         TaskEvent::TimerCancelled { key }
@@ -402,6 +423,13 @@ impl SchedulerState {
                 response,
             } => {
                 let _ = response.send(self.shorten_timer(key, after));
+            }
+            TaskCommand::ScheduleTimerIfIdle {
+                key,
+                after,
+                response,
+            } => {
+                let _ = response.send(self.schedule_timer_if_idle(key, after));
             }
             TaskCommand::CancelTimer { key, response } => {
                 let _ = response.send(self.cancel_timer(key));
@@ -553,6 +581,27 @@ impl TaskHandle {
         if self
             .command_tx
             .send(TaskCommand::ShortenTimer {
+                key,
+                after,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return scheduler_unavailable(command_key);
+        }
+
+        result
+            .await
+            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    }
+
+    pub async fn schedule_timer_if_idle(&self, key: TaskKey, after: Duration) -> TaskEvent {
+        let command_key = key.clone();
+        let (response, result) = oneshot::channel();
+        if self
+            .command_tx
+            .send(TaskCommand::ScheduleTimerIfIdle {
                 key,
                 after,
                 response,
@@ -987,5 +1036,61 @@ mod tests {
             panic!("expected timer scheduled event");
         };
         assert!(after <= Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn schedule_timer_if_idle_keeps_existing_timer() {
+        let handle = TaskHandle::new();
+        let key = test_key();
+
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: Duration::from_secs(3600),
+            }))
+            .await
+        else {
+            panic!("expected timer scheduled event");
+        };
+        assert_eq!(after, Duration::from_secs(3600));
+
+        let TaskEvent::TimerScheduled { after, .. } =
+            handle.schedule_timer_if_idle(key, Duration::ZERO).await
+        else {
+            panic!("expected timer scheduled event");
+        };
+        assert!(after > Duration::from_secs(3000));
+    }
+
+    #[tokio::test]
+    async fn schedule_timer_if_idle_ignores_running_handler() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(CountingGatedHandler {
+                runs: runs.clone(),
+                started: started.clone(),
+                gate: gate.clone(),
+            }))
+            .await;
+
+        fire_timer(&handle, key.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("first handler run should start");
+
+        let TaskEvent::TimerScheduled { .. } =
+            handle.schedule_timer_if_idle(key, Duration::ZERO).await
+        else {
+            panic!("expected timer scheduled event");
+        };
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }

@@ -4,9 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
-use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
@@ -225,9 +224,9 @@ pub async fn restore_document_sync_outbox_timers(
 
     if has_records {
         let event = task_handle
-            .send_effect(schedule_outbox_drain_effect())
+            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
             .await;
-        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
+        if let TaskEvent::Error { message, .. } = event {
             warn!(message = %message, "Failed to restore document sync outbox timer");
         }
     }
@@ -240,6 +239,7 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
+    use aruna_core::handle::Handle;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
