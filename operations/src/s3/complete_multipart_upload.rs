@@ -3,7 +3,10 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -145,6 +148,7 @@ pub struct CompleteMultipartUploadOperation {
     input: CompleteMultipartUploadInput,
     txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
+    upload_parts: Vec<MultipartUploadPart>,
     resolved_parts: Vec<MultipartUploadPart>,
     composed_location: Option<BackendLocation>,
     final_location: Option<BackendLocation>,
@@ -168,6 +172,7 @@ impl CompleteMultipartUploadOperation {
             input,
             txn_id: None,
             upload_record: None,
+            upload_parts: Vec::new(),
             resolved_parts: Vec::new(),
             composed_location: None,
             final_location: None,
@@ -349,15 +354,18 @@ impl CompleteMultipartUploadOperation {
     fn extract_requested_parts(
         &self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
-    ) -> Result<Vec<MultipartUploadPart>, CompleteMultipartUploadError> {
+    ) -> Result<(Vec<MultipartUploadPart>, Vec<MultipartUploadPart>), CompleteMultipartUploadError>
+    {
         if self.input.completed_parts.is_empty() {
             return Err(CompleteMultipartUploadError::MissingParts);
         }
 
         let mut all_parts = HashMap::new();
+        let mut upload_parts = Vec::new();
         for (key, value) in values {
             let part_key = MultipartUploadPartKey::from_bytes(key.as_ref())?;
             let part_record = MultipartUploadPart::from_bytes(value.as_ref())?;
+            upload_parts.push(part_record.clone());
             all_parts.insert(part_key.part_number, part_record);
         }
 
@@ -385,7 +393,7 @@ impl CompleteMultipartUploadOperation {
             return Err(CompleteMultipartUploadError::InvalidObjectSize);
         }
 
-        Ok(resolved)
+        Ok((resolved, upload_parts))
     }
 
     fn handle_upload_parts_read(&mut self, event: Event) -> Effects {
@@ -393,14 +401,15 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
 
-        let resolved = match self.extract_requested_parts(values) {
-            Ok(resolved) => resolved,
+        let (resolved, upload_parts) = match self.extract_requested_parts(values) {
+            Ok(parts) => parts,
             Err(err) => return self.schedule_error(err),
         };
         self.composite_hashes = match compute_composite_hashes(&resolved) {
             Ok(hashes) => hashes,
             Err(err) => return self.schedule_error(err),
         };
+        self.upload_parts = upload_parts;
         self.resolved_parts = resolved.clone();
 
         self.state = CompleteMultipartUploadState::ComposeBlob;
@@ -758,8 +767,8 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
-        let mut deletes = Vec::with_capacity(self.resolved_parts.len() + 1);
-        for record in &self.resolved_parts {
+        let mut deletes = Vec::with_capacity(self.upload_parts.len() + 1);
+        for record in &self.upload_parts {
             let key = match MultipartUploadPartKey::new(self.input.upload_id, record.part_number)
                 .to_bytes()
             {
@@ -826,7 +835,7 @@ impl CompleteMultipartUploadOperation {
         let Some(size) = self
             .final_location
             .as_ref()
-            .map(|location| i64::try_from(location.blob_size).unwrap_or(i64::MAX))
+            .map(|location| i128::from(location.blob_size))
         else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -858,7 +867,13 @@ impl CompleteMultipartUploadOperation {
         if let Some(ceiling) = self.input.quota_ceiling
             && object_size > 0
         {
-            let mut gate = QuotaGate::new(ceiling, object_size, group_id, self.input.node_id);
+            let mut gate = QuotaGate::new_for_realm(
+                ceiling,
+                object_size,
+                group_id,
+                self.input.node_id,
+                self.input.realm_id,
+            );
             self.state = CompleteMultipartUploadState::EnforceQuota;
             let effects = gate.start(txn_id);
             self.quota_gate = Some(gate);
@@ -997,7 +1012,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn cleanup_next_part_blob(&mut self) -> Effects {
-        let Some(record) = self.resolved_parts.get(self.cleanup_part_index) else {
+        let Some(record) = self.upload_parts.get(self.cleanup_part_index) else {
             self.state = CompleteMultipartUploadState::Finish;
             self.composed_location = None;
             let Some(location) = self.final_location.clone() else {
@@ -1018,7 +1033,7 @@ impl CompleteMultipartUploadOperation {
                 checksum_type: self.input.checksum_type,
                 response_hashes,
             }));
-            return smallvec![];
+            return smallvec![schedule_usage_snapshot_publish_effect()];
         };
 
         self.state = CompleteMultipartUploadState::CleanupPartBlobs;
@@ -1329,6 +1344,84 @@ mod tests {
             status: MultipartUploadStatus::Completing,
             checksum_hint: None,
         }
+    }
+
+    fn part_record(part_number: u16, blob_size: u64) -> MultipartUploadPart {
+        MultipartUploadPart {
+            part_number,
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "multipart".to_string(),
+                backend_path: format!("part-{part_number}"),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+                created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+                created_at: SystemTime::now(),
+                staging: false,
+                partial: true,
+                blob_size,
+                hashes: HashMap::new(),
+            },
+            created_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn delete_upload_records_includes_omitted_parts() {
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.upload_parts = vec![part_record(1, 10), part_record(2, 20)];
+        op.resolved_parts = vec![op.upload_parts[0].clone()];
+
+        let effects = op.delete_upload_records();
+
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected batch delete effect");
+        };
+        assert_eq!(deletes.len(), 3);
+        let omitted_key = MultipartUploadPartKey::new(op.input.upload_id, 2)
+            .to_bytes()
+            .unwrap();
+        assert!(deletes.iter().any(|(_, key)| key.as_ref() == omitted_key));
+    }
+
+    #[test]
+    fn cleanup_part_blobs_includes_omitted_parts() {
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let requested = part_record(1, 10);
+        let omitted = part_record(2, 20);
+        op.final_location = Some(BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "objects".to_string(),
+            backend_path: "object".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        });
+        op.version_id = Some(Ulid::new());
+        op.upload_parts = vec![requested.clone(), omitted.clone()];
+        op.resolved_parts = vec![requested.clone()];
+
+        let effects = op.begin_cleanup_part_blobs();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { location })] if location == &requested.location
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { location })] if location == &omitted.location
+        ));
     }
 
     // A quota rejection at EnforceQuota leaves the finalize transaction open. It

@@ -3,7 +3,10 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
@@ -483,7 +486,7 @@ impl PutObjectOperation {
                 let Some(location) = self.get_output().cloned() else {
                     return self.emit_error(PutObjectError::MissingOutput);
                 };
-                let size = i64::try_from(location.blob_size).unwrap_or(i64::MAX);
+                let size = i128::from(location.blob_size);
                 let group_delta = UsageDelta {
                     objects: if self.was_live { 0 } else { 1 },
                     logical_bytes: size,
@@ -506,11 +509,12 @@ impl PutObjectOperation {
                 if let Some(ceiling) = self.config.quota_ceiling
                     && location.blob_size > 0
                 {
-                    let mut gate = QuotaGate::new(
+                    let mut gate = QuotaGate::new_for_realm(
                         ceiling,
                         location.blob_size,
                         self.config.group_id,
                         self.config.node_id,
+                        self.config.realm_id,
                     );
                     self.state = PutObjectState::EnforceQuota;
                     let effects = gate.start(txn_id);
@@ -653,7 +657,7 @@ impl PutObjectOperation {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.state = PutObjectState::Finish;
-            smallvec![]
+            smallvec![schedule_usage_snapshot_publish_effect()]
         }
     }
 
@@ -661,7 +665,7 @@ impl PutObjectOperation {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.state = PutObjectState::Finish;
-                smallvec![]
+                smallvec![schedule_usage_snapshot_publish_effect()]
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }

@@ -1,4 +1,6 @@
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -281,7 +283,7 @@ impl DeleteBucketOperation {
         self.txn_id = None;
         self.state = DeleteBucketState::Finish;
         self.output = Some(Ok(()));
-        smallvec![]
+        smallvec![schedule_usage_snapshot_publish_effect()]
     }
 }
 

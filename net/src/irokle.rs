@@ -4707,6 +4707,10 @@ mod tests {
             }],
             max_devices_per_user: Some(6),
         };
+        let expected_quota = QuotaConfig {
+            max_devices_per_user: None,
+            ..quota.clone()
+        };
 
         // Quota lands before any config doc exists; it must be recorded in the
         // reducer and later carried through realm_config_from_reducer_materialization.
@@ -4746,7 +4750,7 @@ mod tests {
         .expect("realm config settings op bootstraps config doc");
 
         let config = read_realm_config_doc(&storage, realm_id).await;
-        assert_eq!(config.quota, quota);
+        assert_eq!(config.quota, expected_quota);
         assert_eq!(config.metadata_replication, metadata_replication);
     }
 
@@ -7930,12 +7934,14 @@ mod tests {
                         event_id: Ulid::new(),
                         target: target.clone(),
                         change: change(DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {
                         event_id: Ulid::new(),
                         target: target.clone(),
                         bytes: snapshot_bytes.clone(),
                         change: change(DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
                     },
                 ],
                 Vec::new(),

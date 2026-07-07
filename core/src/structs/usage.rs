@@ -129,7 +129,8 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
 
 /// Maintained usage aggregates. `stored_*` fields track physical,
 /// content-addressed blobs and are only meaningful on the global counter;
-/// `logical_bytes` sums materialized version sizes and is the per-group quota basis.
+/// `logical_bytes` sums materialized and reference version sizes and is the
+/// per-group quota basis.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub buckets: u64,
@@ -181,11 +182,11 @@ impl UsageCounters {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageDelta {
-    pub buckets: i64,
-    pub objects: i64,
-    pub stored_blobs: i64,
-    pub stored_bytes: i64,
-    pub logical_bytes: i64,
+    pub buckets: i128,
+    pub objects: i128,
+    pub stored_blobs: i128,
+    pub stored_bytes: i128,
+    pub logical_bytes: i128,
 }
 
 impl UsageDelta {
@@ -200,21 +201,31 @@ pub enum UsageCounterError {
     Underflow {
         field: &'static str,
         value: u64,
-        delta: i64,
+        delta: i128,
     },
     #[error("usage counter {field} would overflow: {value} + {delta}")]
     Overflow {
         field: &'static str,
         value: u64,
-        delta: u64,
+        delta: u128,
     },
 }
 
-fn apply_delta(field: &'static str, value: u64, delta: i64) -> Result<u64, UsageCounterError> {
+fn apply_delta(field: &'static str, value: u64, delta: i128) -> Result<u64, UsageCounterError> {
     if delta >= 0 {
-        add_counter(field, value, delta as u64)
+        let amount = u64::try_from(delta).map_err(|_| UsageCounterError::Overflow {
+            field,
+            value,
+            delta: delta as u128,
+        })?;
+        add_counter(field, value, amount)
     } else {
-        let amount = delta.unsigned_abs();
+        let amount =
+            u64::try_from(delta.unsigned_abs()).map_err(|_| UsageCounterError::Underflow {
+                field,
+                value,
+                delta,
+            })?;
         value
             .checked_sub(amount)
             .ok_or(UsageCounterError::Underflow {
@@ -229,7 +240,7 @@ fn add_counter(field: &'static str, value: u64, delta: u64) -> Result<u64, Usage
     value.checked_add(delta).ok_or(UsageCounterError::Overflow {
         field,
         value,
-        delta,
+        delta: u128::from(delta),
     })
 }
 
@@ -278,6 +289,21 @@ mod tests {
         assert_eq!(counters.stored_blobs, 3);
         assert_eq!(counters.stored_bytes, 4);
         assert_eq!(counters.logical_bytes, 5);
+    }
+
+    #[test]
+    fn apply_accepts_delta_larger_than_i64_max() {
+        let mut counters = UsageCounters::default();
+        let large = i128::from(i64::MAX) + 1;
+
+        counters
+            .apply(&UsageDelta {
+                logical_bytes: large,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(counters.logical_bytes, i64::MAX as u64 + 1);
     }
 
     #[test]

@@ -1336,7 +1336,6 @@ mod tests {
         };
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
-        body.max_devices_per_user = Some(2);
 
         let (status, Json(stored)) =
             set_realm_quota(State(state.clone()), Extension(Some(auth)), Json(body))
@@ -1344,12 +1343,12 @@ mod tests {
                 .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored.default_group_quota_bytes, Some(4096));
-        assert_eq!(stored.max_devices_per_user, Some(2));
+        assert_eq!(stored.max_devices_per_user, None);
 
         let (status, Json(info)) = get_realm_info(State(state)).await.unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(info.quota.default_group_quota_bytes, Some(4096));
-        assert_eq!(info.quota.max_devices_per_user, Some(2));
+        assert_eq!(info.quota.max_devices_per_user, None);
     }
 
     #[tokio::test]
@@ -1386,5 +1385,26 @@ mod tests {
             "body must carry the validation reason, got: {}",
             parsed.error
         );
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_rejects_unsupported_device_cap() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.max_devices_per_user = Some(2);
+
+        let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
+        ));
     }
 }

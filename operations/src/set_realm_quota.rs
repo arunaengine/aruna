@@ -387,6 +387,13 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
             ),
         });
     }
+    if quota.max_devices_per_user.is_some() {
+        return Err(SetRealmQuotaError::InvalidQuota {
+            reason:
+                "max_devices_per_user is not supported until device ownership enforcement exists"
+                    .to_string(),
+        });
+    }
     let mut seen_groups = BTreeSet::new();
     for over in &quota.group_overrides {
         if !seen_groups.insert(over.group_id) {
@@ -489,7 +496,7 @@ mod tests {
                 user_id: UserId::local(Ulid::from_bytes([8; 16]), RealmId::from_bytes([1; 32])),
                 max_groups: Some(10),
             }],
-            max_devices_per_user: Some(4),
+            max_devices_per_user: None,
         }
     }
 
@@ -518,7 +525,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reread.quota, quota);
-        assert_eq!(reread.quota.max_devices_per_user, Some(4));
+        assert_eq!(reread.quota.max_devices_per_user, None);
+    }
+
+    #[tokio::test]
+    async fn set_quota_rejects_unsupported_device_cap() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        seed_config(&ctx, &actor, &document).await;
+
+        let mut quota = QuotaConfig::default();
+        quota.max_devices_per_user = Some(4);
+
+        let error = drive(
+            SetRealmQuotaOperation::new(SetRealmQuotaConfig { actor, quota }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SetRealmQuotaError::InvalidQuota { reason }
+                if reason.contains("max_devices_per_user")
+        ));
     }
 
     #[tokio::test]
