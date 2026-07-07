@@ -45,7 +45,7 @@ use aruna_core::storage_entries::{
     metadata_document_lifecycle_key, metadata_document_lifecycle_revision_change,
     metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
     metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
-    metadata_registry_delete_entries, metadata_registry_write_entries,
+    metadata_registry_delete_entries, metadata_registry_write_entries, shard_manifest_write_entry,
     stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
     subject_index_writes,
 };
@@ -1956,6 +1956,11 @@ impl DocumentSyncService {
                     document_sync_revision_write_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
+                if let Some(manifest) = shard_manifest_write_entry(&apply.target, revision)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                {
+                    writes.push(manifest);
+                }
             }
             writes.push((
                 target.storage_keyspace().to_string(),
@@ -3546,6 +3551,11 @@ async fn metadata_document_lifecycle_write_entries_if_current(
         document_sync_revision_write_entry(&target, &revision)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
+    if let Some(manifest) = shard_manifest_write_entry(&target, &revision)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    {
+        entries.push(manifest);
+    }
     Ok(Some(entries))
 }
 

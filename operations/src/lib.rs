@@ -58,6 +58,7 @@ pub mod s3;
 pub mod search_users;
 pub mod set_node_placement;
 pub mod set_realm_quota;
+pub mod shard;
 pub mod staging;
 pub mod startup;
 pub mod status;

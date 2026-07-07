@@ -6,7 +6,7 @@ use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerS
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentSyncTarget, ShardManifestEntry,
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
@@ -19,7 +19,8 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_OUTBOX_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -290,6 +291,64 @@ pub fn document_sync_revision_write_entry(
         document_sync_revision_key(target),
         postcard::to_allocvec(change)?.into(),
     ))
+}
+
+/// Manifest-row key: `strategy(16) ‖ epoch(8, le) ‖ shard(4, be) ‖ per-target
+/// sidecar key`. The 28-byte shard prefix isolates one shard's rows on a scan;
+/// the sidecar tail (keyspace-discriminated, see
+/// [`document_sync_revision_key`]) keeps two targets sharing a storage key from
+/// colliding.
+pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentSyncTarget) -> Key {
+    let tail = document_sync_target_sidecar_key(target);
+    let mut bytes = Vec::with_capacity(28 + tail.as_ref().len());
+    bytes.extend_from_slice(&shard_manifest_prefix(placement));
+    bytes.extend_from_slice(tail.as_ref());
+    ByteView::from(bytes)
+}
+
+/// The 28-byte shard prefix (`strategy ‖ epoch ‖ shard`) a manifest assembly
+/// scan iterates.
+pub fn shard_manifest_prefix(placement: &PlacementRef) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(28);
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
+    bytes
+}
+
+/// Manifest row for a shard-classed change: upsert or delete both write the row
+/// at `change.current` (a delete leaves a tombstone). `Ok(None)` for shared
+/// realm-scoped targets or a NIL placement (no shard governs the change yet).
+pub fn shard_manifest_write_entry(
+    target: &DocumentSyncTarget,
+    change: &DocumentSyncChange,
+) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+    if !target.uses_shard_topic() || change.placement == PlacementRef::NIL {
+        return Ok(None);
+    }
+    let entry = ShardManifestEntry {
+        target: target.clone(),
+        revision: change.current,
+    };
+    Ok(Some((
+        SHARD_MANIFEST_KEYSPACE.to_string(),
+        shard_manifest_key(&change.placement, target),
+        postcard::to_allocvec(&entry)?.into(),
+    )))
+}
+
+/// Manifest row for a metadata document lifecycle record, built from the same
+/// revision change its sidecar carries so the manifest and the sidecar agree.
+pub fn metadata_document_lifecycle_manifest_write_entry(
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+    placement: PlacementRef,
+) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: record.document_id(),
+    };
+    let change = metadata_document_lifecycle_revision_change(record, delete_actor, placement);
+    shard_manifest_write_entry(&target, &change)
 }
 
 pub fn document_sync_conflict_write_entry(
@@ -599,20 +658,22 @@ mod tests {
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
         admin_document_reducer_state_write_entry, document_sync_conflict_key,
         document_sync_conflict_write_entry, document_sync_revision_key,
-        document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
+        document_sync_revision_write_entry, shard_manifest_key, shard_manifest_prefix,
+        shard_manifest_write_entry, stale_admin_document_conflict_delete_entries,
     };
     use crate::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
         AdminDocumentReducerState,
     };
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
+    use crate::document::ShardManifestEntry;
     use crate::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
         DocumentSyncTarget,
     };
     use crate::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
     use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
@@ -759,6 +820,139 @@ mod tests {
         assert_eq!(keyspace, DOCUMENT_SYNC_REVISION_KEYSPACE);
         assert_eq!(key, document_sync_revision_key(&target));
         assert_eq!(decoded, change);
+    }
+
+    fn shard_placement(shard: u32) -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            epoch: 0,
+            shard,
+        }
+    }
+
+    #[test]
+    fn shard_manifest_write_entry_records_upsert_revision() {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let placement = shard_placement(3);
+        let change = DocumentSyncChange {
+            base: None,
+            current: revision(2, 5),
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+
+        let (keyspace, key, value) = shard_manifest_write_entry(&target, &change)
+            .unwrap()
+            .unwrap();
+        assert_eq!(keyspace, SHARD_MANIFEST_KEYSPACE);
+        assert_eq!(key, shard_manifest_key(&placement, &target));
+        let decoded: ShardManifestEntry = postcard::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.revision, change.current);
+    }
+
+    #[test]
+    fn shard_manifest_delete_keeps_tombstone_revision_at_same_key() {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let placement = shard_placement(3);
+        let upsert = DocumentSyncChange {
+            base: None,
+            current: revision(2, 5),
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+        let delete = DocumentSyncChange {
+            base: Some(upsert.current),
+            current: revision(3, 6),
+            kind: DocumentSyncChangeKind::Delete,
+            placement,
+        };
+
+        let (_, upsert_key, _) = shard_manifest_write_entry(&target, &upsert)
+            .unwrap()
+            .unwrap();
+        let (_, delete_key, delete_value) = shard_manifest_write_entry(&target, &delete)
+            .unwrap()
+            .unwrap();
+
+        // A delete overwrites the same row with the delete revision (a tombstone),
+        // it never removes it.
+        assert_eq!(upsert_key, delete_key);
+        let decoded: ShardManifestEntry = postcard::from_bytes(delete_value.as_ref()).unwrap();
+        assert_eq!(decoded.revision, delete.current);
+    }
+
+    #[test]
+    fn shard_manifest_write_entry_skips_shared_and_nil_placements() {
+        let shared = DocumentSyncTarget::RealmConfig {
+            realm_id: realm_id(2),
+        };
+        let change = DocumentSyncChange {
+            base: None,
+            current: revision(1, 1),
+            kind: DocumentSyncChangeKind::Upsert,
+            placement: shard_placement(3),
+        };
+        // Shared realm-scoped targets never ride a shard, so they get no row.
+        assert!(
+            shard_manifest_write_entry(&shared, &change)
+                .unwrap()
+                .is_none()
+        );
+
+        // A shard-classed target with a NIL placement has no governing shard yet.
+        let shard_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let nil_change = DocumentSyncChange {
+            placement: PlacementRef::NIL,
+            ..change
+        };
+        assert!(
+            shard_manifest_write_entry(&shard_target, &nil_change)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shard_manifest_keys_isolate_shards_and_targets() {
+        let a = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let b = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([8; 16]),
+        };
+        let shard3 = shard_placement(3);
+        let shard4 = shard_placement(4);
+
+        // Every row for one shard shares the 28-byte shard prefix; a different
+        // shard does not.
+        let prefix3 = shard_manifest_prefix(&shard3);
+        assert!(
+            shard_manifest_key(&shard3, &a)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        assert!(
+            shard_manifest_key(&shard3, &b)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        assert!(
+            !shard_manifest_key(&shard4, &a)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        // Distinct documents in one shard get distinct rows.
+        assert_ne!(
+            shard_manifest_key(&shard3, &a),
+            shard_manifest_key(&shard3, &b)
+        );
     }
 
     #[test]
