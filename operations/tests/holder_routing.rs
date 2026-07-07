@@ -10,19 +10,29 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, Permission, RealmConfigDocument, RealmId,
-    RealmNodeKind, Role, TokenClaims, User,
+    Actor, Group, GroupAuthorizationDocument, NotificationClass, NotificationKind,
+    NotificationRecord, Permission, PlacementOverride, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, Role, TokenClaims, User,
 };
 use aruna_core::types::UserId;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::placement::{placement_ref_for_target, resolve_shard_holders};
+use aruna_operations::notifications::inbox::upsert_inbox_records;
+use aruna_operations::notifications::placement::resolve_inbox_holder;
+use aruna_operations::placement::{
+    placement_ref_for_target, resolve_shard_holders, shard_subject_bytes,
+};
+use aruna_operations::process_placements::process_shard_placements;
 use aruna_operations::routing::dispatch::{HolderRoutingError, dispatch_holder_call};
 use aruna_operations::routing::protocol::{
-    GroupCall, GroupReply, ProxiedCall, ProxiedReply, UserCall, UserReply,
+    GroupCall, GroupReply, NotificationCall, NotificationReply, ProxiedCall, ProxiedReply,
+    UserCall, UserReply,
 };
+use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -263,6 +273,319 @@ async fn user_read_document_routes_to_holder() {
     shutdown(nodes).await;
 }
 
+// A stale holder view: the origin's config pins the shard at a node that no
+// longer holds it. That target answers NotHolder from its own view and never
+// re-forwards, so the true holder (which alone has the document) is never
+// contacted. The origin refreshes its config once, sees the same stale view,
+// and ends Unavailable rather than serving the document.
+#[tokio::test]
+async fn stale_holder_view_never_reforwards_and_ends_unavailable() {
+    let (realm_key, realm_id, user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 3).await;
+    let (origin, target, truth) = (&nodes[0], &nodes[1], &nodes[2]);
+
+    // One base config so both views share the strategy id and shard identity;
+    // only the pinned holder differs between them.
+    let base = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    let group_id = Ulid::new();
+    let placement = placement_ref_for_target(&base, &DocumentSyncTarget::Group { group_id }, None);
+    let subject = shard_subject_bytes(&placement);
+
+    let mut origin_config = base.clone();
+    origin_config.placement_overrides = vec![pin_shard(&subject, target.net.node_id())];
+    let mut target_config = base.clone();
+    target_config.placement_overrides = vec![pin_shard(&subject, truth.net.node_id())];
+
+    install_config_for(origin, &origin_config).await;
+    install_config_for(target, &target_config).await;
+    persist_trusted_realm(target, realm_id).await;
+
+    // The document lives ONLY on the true holder. Were the target to re-forward,
+    // the origin would receive it; it never does.
+    let (group, authorization) = make_group(group_id, realm_id, user_id);
+    write_group(truth, &group, &authorization).await;
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, user_id));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::Get { group_id }),
+    )
+    .await
+    .expect_err("a stale holder view exhausts the refresh-once retry");
+    assert!(
+        matches!(error, HolderRoutingError::Unavailable),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+// A reachable rank-0 holder that lacks the document answers an authoritative
+// NotFound and the walk stops there. The rank-1 holder is an unreachable
+// phantom, so a fall-through past the NotFound would surface Unavailable
+// instead — asserting NotFound proves the 404 is definitive.
+#[tokio::test]
+async fn reachable_holder_missing_document_is_definitive_not_found() {
+    let (realm_key, realm_id, user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, rank_zero) = (&nodes[0], &nodes[1]);
+    let phantom = iroh::SecretKey::from_bytes(&[202u8; 32]).public();
+
+    let config = config_with_replica(
+        realm_id,
+        &[origin.net.node_id(), rank_zero.net.node_id(), phantom],
+        2,
+    );
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(rank_zero, realm_id).await;
+
+    // Holders are exactly the reachable rank-0 node then the unreachable phantom.
+    let (group_id, holders) = sample_group(&config, |h| {
+        h.len() == 2 && h[0] == rank_zero.net.node_id() && h[1] == phantom
+    });
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    // No document is seeded, so the reachable holder answers NotFound.
+    let token = sign_token(&realm_key, &token_claims(realm_id, user_id));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::Get { group_id }),
+    )
+    .await
+    .expect_err("a reachable holder without the document is a definitive 404");
+    assert!(
+        matches!(error, HolderRoutingError::NotFound),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+// A routed group membership write from a non-holder lands on the holder's
+// operation, is authorized against the forwarded bearer, and mutates the
+// authorization document; a subsequent routed read observes the new member.
+#[tokio::test]
+async fn group_add_member_write_routes_and_is_readable() {
+    let (realm_key, realm_id, owner) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config_with_geneses(&nodes, &config, realm_id).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (group_id, holders) =
+        sample_group(&config, |h| h.len() == 1 && h[0] == holder.net.node_id());
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    // The owner holds the default admin role granting group-wide WRITE.
+    let group = Group {
+        display_name: "team".to_string(),
+        group_id,
+        realm_id,
+        roles: HashSet::new(),
+        owner,
+    };
+    let authorization =
+        GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let user_role_id = *authorization
+        .roles
+        .iter()
+        .find(|(_, role)| role.name == "user")
+        .map(|(role_id, _)| role_id)
+        .expect("default group has a user role");
+    write_group(holder, &group, &authorization).await;
+    // The holder's permission check reads the realm authorization document first;
+    // the group admin role (assigned to the owner) supplies the actual grant.
+    write_realm_auth(holder, realm_id).await;
+
+    let member = UserId::local(Ulid::new(), realm_id);
+    let token = sign_token(&realm_key, &token_claims(realm_id, owner));
+
+    let reply = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::AddMember {
+            group_id,
+            user_id: member,
+            role_ids: HashSet::from([user_role_id]),
+        }),
+    )
+    .await
+    .expect("routed add-member converges on the holder");
+    let ProxiedReply::Group(reply) = reply else {
+        panic!("expected a group reply");
+    };
+    assert!(
+        matches!(*reply, GroupReply::Authorization(_)),
+        "expected an authorization reply"
+    );
+
+    let read = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Group(GroupCall::Get { group_id }),
+    )
+    .await
+    .expect("routed read of the mutated group");
+    let ProxiedReply::Group(read) = read else {
+        panic!("expected a group reply");
+    };
+    let GroupReply::Document {
+        authorization: doc, ..
+    } = *read
+    else {
+        panic!("expected a group document reply");
+    };
+    assert!(
+        doc.roles
+            .get(&user_role_id)
+            .expect("user role present")
+            .assigned_users
+            .contains(&member),
+        "the routed write must be readable back through the holder"
+    );
+
+    shutdown(nodes).await;
+}
+
+// The inbox arm derives the served recipient from the validated bearer, never
+// the wire claim: a List whose wire recipient is another user returns only the
+// bearer subject's inbox, so the other user's seeded record is never disclosed.
+#[tokio::test]
+async fn notification_list_serves_bearer_subject_not_wire_recipient() {
+    let (realm_key, realm_id, _user) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    // `victim`'s inbox lives on the holder; `caller` is the bearer subject.
+    let victim = sample_inbox_user(&config, holder.net.node_id(), realm_id);
+    let caller = UserId::local(Ulid::new(), realm_id);
+
+    let seeded = NotificationRecord {
+        notification_id: Ulid::new(),
+        recipient: victim,
+        class: NotificationClass::Transient,
+        kind: NotificationKind::AddedToGroup {
+            group_id: Ulid::new(),
+            actor_user_id: caller,
+        },
+        created_at_ms: unix_timestamp_millis(),
+        read_at_ms: None,
+    };
+    upsert_inbox_records(
+        &holder.context.storage_handle,
+        std::slice::from_ref(&seeded),
+    )
+    .await
+    .expect("seed victim inbox on the holder");
+
+    // The wire recipient steers routing to the victim's inbox holder, but the
+    // bearer subject is `caller`; the holder serves `caller`'s (empty) inbox.
+    let token = sign_token(&realm_key, &token_claims(realm_id, caller));
+    let reply = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Notification(NotificationCall::List {
+            recipient: victim,
+            cursor: None,
+            limit: 50,
+        }),
+    )
+    .await
+    .expect("routed notification list");
+    let ProxiedReply::Notification(reply) = reply else {
+        panic!("expected a notification reply");
+    };
+    let NotificationReply::List { records, .. } = *reply else {
+        panic!("expected a notification list reply");
+    };
+    assert!(
+        records
+            .iter()
+            .all(|record| record.notification_id != seeded.notification_id),
+        "the victim's record must not leak to a bearer for another user"
+    );
+    assert!(
+        records.is_empty(),
+        "the bearer subject has an empty inbox: {records:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+async fn write_realm_auth(node: &TestNode, realm_id: RealmId) {
+    let doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    write_storage(
+        &node.context.storage_handle,
+        AUTH_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        postcard::to_allocvec(&doc).expect("realm auth doc serializes"),
+    )
+    .await;
+}
+
+fn pin_shard(subject: &[u8], node_id: NodeId) -> PlacementOverride {
+    PlacementOverride {
+        subject: subject.to_vec(),
+        pinned: vec![node_id],
+        excluded: Vec::new(),
+        strategy_id: None,
+    }
+}
+
+async fn install_config_for(node: &TestNode, config: &RealmConfigDocument) {
+    let actor = Actor {
+        node_id: node.net.node_id(),
+        user_id: UserId::nil(config.realm_id),
+        realm_id: config.realm_id,
+    };
+    let bytes = config.to_bytes(&actor).expect("config serializes");
+    write_storage(
+        &node.context.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        config.realm_id.as_bytes().to_vec(),
+        bytes,
+    )
+    .await;
+    node.net
+        .refresh_realm_peers_from_document(config)
+        .await
+        .expect("refresh realm peers");
+}
+
+async fn install_config_with_geneses(
+    nodes: &[TestNode],
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+) {
+    install_config(nodes, config).await;
+    for node in nodes {
+        process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
+    }
+}
+
+fn sample_inbox_user(config: &RealmConfigDocument, holder: NodeId, realm_id: RealmId) -> UserId {
+    for _ in 0..100_000 {
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        if matches!(resolve_inbox_holder(&user_id, config), Ok(Some(node)) if node == holder) {
+            return user_id;
+        }
+    }
+    panic!("no user hashed to the inbox holder within the sampling bound");
+}
+
 fn make_user(user_id: UserId, name: &str) -> User {
     User {
         user_id,
@@ -443,14 +766,16 @@ async fn spawn_node(realm_id: RealmId) -> TestNode {
     )
     .await
     .expect("net handle");
+    let task_handle = TaskHandle::new();
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
-        task_handle: None,
+        task_handle: Some(task_handle.clone()),
     });
     initialize_net_incoming(context.clone());
+    initialize_task_incoming(context.clone(), task_handle).await;
     TestNode {
         _temp_dir: temp_dir,
         net,
