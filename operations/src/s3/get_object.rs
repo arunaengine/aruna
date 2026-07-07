@@ -16,7 +16,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary,
-    ResolvedSourceAccess, SourceMetadata, VersionKey,
+    ResolvedSourceAccess, SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -144,6 +144,7 @@ pub struct GetObjectResult {
     pub blob: BackendStream<Result<Bytes, StreamError>>,
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
+    pub source_binding: Option<VersionSourceBinding>,
     pub last_refresh: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
@@ -160,6 +161,7 @@ pub struct GetObjectOperation {
     reference_access: Option<ResolvedSourceAccess>,
     reference_stream: Option<BackendStream<Result<Bytes, StreamError>>>,
     source_metadata: Option<SourceMetadata>,
+    source_binding: Option<VersionSourceBinding>,
     last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
@@ -177,6 +179,7 @@ impl GetObjectOperation {
             reference_access: None,
             reference_stream: None,
             source_metadata: None,
+            source_binding: None,
             last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
@@ -315,13 +318,17 @@ impl GetObjectOperation {
         self.resolved_version_id = Some(version_id);
 
         match version.state {
-            BlobVersionState::Materialized { blob_hash, .. } => self.read_blob_location(blob_hash),
+            BlobVersionState::Materialized { blob_hash, source } => {
+                self.source_binding = source;
+                self.read_blob_location(blob_hash)
+            }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectError::DeleteMarker
             } else {
                 GetObjectError::NoSuchKey
             }),
             BlobVersionState::Reference { source, .. } => {
+                self.source_binding = Some(source.clone());
                 self.location = None;
                 self.reference_access = None;
                 self.reference_stream = None;
@@ -552,6 +559,7 @@ impl GetObjectOperation {
                 blob,
                 location: Some(location),
                 source_metadata: None,
+                source_binding: self.source_binding.clone(),
                 last_refresh: None,
                 version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
@@ -607,6 +615,7 @@ impl GetObjectOperation {
             blob,
             location: None,
             source_metadata: Some(source_metadata),
+            source_binding: self.source_binding.clone(),
             last_refresh: self.last_refresh,
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
@@ -1051,6 +1060,7 @@ mod test {
             location.hashes
         );
         assert!(blob_result.source_metadata.is_none());
+        assert!(blob_result.source_binding.is_none());
         assert!(blob_result.last_refresh.is_none());
         assert_eq!(blob_result.checksum_type, MultipartChecksumType::FullObject);
         let mut blob_stream = blob_result.blob;
@@ -1332,6 +1342,13 @@ mod test {
                 .as_ref()
                 .and_then(|m| m.content_type.clone()),
             Some("text/plain".to_string())
+        );
+        assert_eq!(
+            result
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.strategy.clone()),
+            Some(StagingStrategy::Reference)
         );
         assert!(result.last_refresh.is_some());
         let mut stream = result.blob;
