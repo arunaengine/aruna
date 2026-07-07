@@ -7,7 +7,7 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
     SourceMetadata, VersionKey,
 };
-use aruna_core::types::{Effects, GroupId, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::util::prefix_upper_bound;
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -17,6 +17,10 @@ use ulid::Ulid;
 
 use crate::s3::listing::common_prefix_of;
 
+// A single key may accumulate more versions than one scan page holds. The
+// storage layer only iterates forward (oldest -> newest), so the version prefix
+// is scanned in full and a rolling window retains the newest VERSION_SCAN_LIMIT
+// entries, discarding older ones as the scan advances.
 const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +119,9 @@ pub struct ListObjectVersionsOperation {
     last_emitted_group: Option<String>,
     pending_heads: VecDeque<(String, Ulid)>,
     current_key: Option<(String, Ulid)>,
+    version_scan_limit: usize,
+    version_scan_cursor: Option<Key>,
+    version_window: VecDeque<(Ulid, BlobVersion)>,
     current_pending: Vec<PendingItem>,
     items: Vec<ListObjectVersionsItem>,
     common_prefixes: Vec<String>,
@@ -146,6 +153,9 @@ impl ListObjectVersionsOperation {
             last_emitted_group: None,
             pending_heads: VecDeque::new(),
             current_key: None,
+            version_scan_limit: VERSION_SCAN_LIMIT,
+            version_scan_cursor: None,
+            version_window: VecDeque::new(),
             current_pending: Vec::new(),
             items: Vec::new(),
             common_prefixes: Vec::new(),
@@ -160,6 +170,12 @@ impl ListObjectVersionsOperation {
     #[cfg(test)]
     fn with_max_scan_rounds(mut self, max_scan_rounds: usize) -> Self {
         self.max_scan_rounds = max_scan_rounds;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_version_scan_limit(mut self, version_scan_limit: usize) -> Self {
+        self.version_scan_limit = version_scan_limit;
         self
     }
 
@@ -371,6 +387,8 @@ impl ListObjectVersionsOperation {
                     self.resume_common_prefix = None;
                     self.cursor_group_prefix = None;
                     self.current_key = Some((key.clone(), head_version_id));
+                    self.version_window.clear();
+                    self.version_scan_cursor = None;
                     return self.issue_version_iter(&key);
                 }
             }
@@ -382,18 +400,23 @@ impl ListObjectVersionsOperation {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
+        let start = self.version_scan_cursor.take().map(IterStart::After);
         self.state = ListObjectVersionsState::ReadVersionsForKey;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start: None,
-            limit: VERSION_SCAN_LIMIT,
+            start,
+            limit: self.version_scan_limit,
             txn_id: self.txn_id,
         })]
     }
 
     fn handle_versions_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
             return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
@@ -405,8 +428,6 @@ impl ListObjectVersionsOperation {
             return self.emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
         };
 
-        // Iteration yields oldest -> newest; reverse for newest-first output.
-        let mut versions = Vec::with_capacity(values.len());
         for (version_key, value) in values {
             let version_key = match VersionKey::from_bytes(version_key.as_ref()) {
                 Ok(version_key) => version_key,
@@ -416,8 +437,22 @@ impl ListObjectVersionsOperation {
                 Ok(version) => version,
                 Err(err) => return self.emit_error(err.into()),
             };
-            versions.push((version_key.version_id, version));
+            self.version_window
+                .push_back((version_key.version_id, version));
         }
+        while self.version_window.len() > self.version_scan_limit {
+            self.version_window.pop_front();
+        }
+
+        // Iteration yields oldest -> newest; keep scanning the prefix until it
+        // is exhausted so the rolling window settles on the newest versions.
+        if let Some(cursor) = next_start_after {
+            self.version_scan_cursor = Some(cursor);
+            return self.issue_version_iter(&key);
+        }
+
+        // Window holds oldest -> newest; reverse for newest-first output.
+        let mut versions: Vec<(Ulid, BlobVersion)> = self.version_window.drain(..).collect();
         versions.reverse();
 
         let apply_marker = self.input.key_marker.as_deref() == Some(key.as_str());
@@ -1147,5 +1182,56 @@ mod test {
 
         assert!(!second.is_truncated);
         assert_eq!(second.common_prefixes, vec!["c/"]);
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_keeps_newest_versions_past_scan_limit() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        // Seed more versions than the scan limit; the rolling window must keep
+        // the newest ones (including the is_latest head), not the oldest page.
+        let versions = ordered_ulids(5);
+        for (index, version_id) in versions.iter().enumerate() {
+            seed_materialized(&storage_handle, "obj", *version_id, [index as u8 + 80; 32]).await;
+        }
+        seed_head(&storage_handle, "obj", versions[4]).await;
+
+        let result = drive(
+            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS))
+                .with_version_scan_limit(3),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let observed: Vec<(Ulid, bool)> = result
+            .items
+            .iter()
+            .map(|item| match item {
+                ListObjectVersionsItem::Version {
+                    version_id,
+                    is_latest,
+                    ..
+                }
+                | ListObjectVersionsItem::DeleteMarker {
+                    version_id,
+                    is_latest,
+                    ..
+                } => (*version_id, *is_latest),
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (versions[4], true),
+                (versions[3], false),
+                (versions[2], false),
+            ]
+        );
     }
 }
