@@ -30,13 +30,15 @@ const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 /// first for a shard whose genesis the previous rank-0 already created), so a
 /// missing topic is first adopted from a co-holder; only what no co-holder
 /// knows either is created fresh.
+/// Returns whether any rank-0 genesis was withheld (a co-holder was unreachable
+/// or refused a probe), so the caller can schedule a placement retry.
 async fn ensure_rank0_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     config: &RealmConfigDocument,
     realm_id: RealmId,
     local_node_id: NodeId,
-) {
+) -> bool {
     let mut rank0_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
@@ -67,6 +69,7 @@ async fn ensure_rank0_shard_topics(
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
+    let mut withheld = false;
     for (co_holders, topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
@@ -74,7 +77,8 @@ async fn ensure_rank0_shard_topics(
             co_holders = co_holders.len(),
             "Ensuring rank-0 shard topic geneses"
         );
-        ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
+        withheld |=
+            ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
     }
     // Non-rank-0 held shards: a holder that is already a member (e.g. the
     // previous rank-0 after a config change moved the rank) completes the
@@ -100,6 +104,7 @@ async fn ensure_rank0_shard_topics(
             debug!(error = %error, "Could not complete held shard topic membership");
         }
     }
+    withheld
 }
 
 /// Ensures the shard topics of one rank-0 co-holder group, creating a fresh
@@ -114,13 +119,16 @@ async fn ensure_rank0_shard_topics(
 /// is withheld and left for the next placement pass — either might hold a
 /// genesis, and forking a second one is a permanent split-brain. A sole holder
 /// (no co-holders) creates immediately: no peer can hold a divergent genesis.
+///
+/// Returns whether any genesis was withheld (or an adopt failed to land), so the
+/// caller schedules a placement retry instead of deferring writes forever.
 pub(crate) async fn ensure_rank0_shard_group(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     local_node_id: NodeId,
     co_holders: Vec<NodeId>,
     topics: Vec<::irokle::TopicId>,
-) {
+) -> bool {
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
     for topic in topics {
@@ -134,6 +142,7 @@ pub(crate) async fn ensure_rank0_shard_group(
         }
     }
 
+    let mut withheld = false;
     if !missing.is_empty() {
         if co_holders.is_empty() {
             to_ensure.extend(missing);
@@ -147,10 +156,12 @@ pub(crate) async fn ensure_rank0_shard_group(
                     to_adopt.push(topic);
                 } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
                     to_ensure.push(topic);
+                } else {
+                    // A co-holder was unreachable, or a reached one refused the
+                    // topic (holds it but the prober may not open it yet):
+                    // withhold this genesis rather than fork a second one.
+                    withheld = true;
                 }
-                // Otherwise a co-holder was unreachable, or a reached one refused
-                // the topic (holds it but the prober may not open it yet):
-                // withhold this genesis rather than fork a second one.
             }
             if !to_adopt.is_empty() {
                 let event = net_handle
@@ -159,13 +170,15 @@ pub(crate) async fn ensure_rank0_shard_group(
                 crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
                 // Only ensure membership on topics whose genesis actually landed;
                 // an adopt that failed (co-holder now unreachable) must not fall
-                // through to a fresh create.
+                // through to a fresh create — retry it on the next pass instead.
                 for topic in to_adopt {
                     if net_handle
                         .document_sync_topic_exists(topic)
                         .unwrap_or(false)
                     {
                         to_ensure.push(topic);
+                    } else {
+                        withheld = true;
                     }
                 }
             }
@@ -184,6 +197,15 @@ pub(crate) async fn ensure_rank0_shard_group(
     {
         warn!(error = %error, "Failed to ensure rank-0 shard topics");
     }
+    withheld
+}
+
+/// What a [`process_shard_placements`] pass decided about follow-up work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlacementReconcileOutcome {
+    /// A genesis was withheld or a record left incomplete, so a
+    /// [`TaskKey::SyncPlacements`] retry timer was scheduled.
+    pub retry_scheduled: bool,
 }
 
 /// Reconciles the local node's held shard topics with their co-holders.
@@ -199,23 +221,30 @@ pub(crate) async fn ensure_rank0_shard_group(
 /// record the local node no longer holds is dropped; a record whose shard
 /// topic has no genesis locally yet (non-rank-0 holder, genesis in flight) is
 /// kept for retry.
+///
+/// A withheld genesis or an incomplete record schedules a [`TaskKey::SyncPlacements`]
+/// retry so a down/refusing co-holder returning re-runs the reconciler; the
+/// returned [`PlacementReconcileOutcome`] reports whether that retry was armed.
 pub async fn process_shard_placements(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     local_node_id: NodeId,
-) {
+) -> PlacementReconcileOutcome {
+    let mut outcome = PlacementReconcileOutcome::default();
     let Some(config) = load_realm_config(context, realm_id).await else {
         warn!(%realm_id, "Cannot process shard placements without a realm config");
-        return;
+        return outcome;
     };
     let Some(net_handle) = context.net_handle.as_ref() else {
-        return;
+        return outcome;
     };
 
-    ensure_rank0_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
+    // A withheld rank-0 genesis leaves no placement record, so it alone must
+    // still arm the retry below (otherwise writes defer at 1s forever).
+    let mut retry_needed =
+        ensure_rank0_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
 
     let mut start_after: Option<Key> = None;
-    let mut retry_needed = false;
     loop {
         let batch = match context
             .storage_handle
@@ -237,11 +266,11 @@ pub async fn process_shard_placements(
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 warn!(error = %error, "Failed to list pending shard placements");
-                return;
+                return outcome;
             }
             other => {
                 warn!(event = ?other, "Unexpected pending shard placement iter result");
-                return;
+                return outcome;
             }
         };
 
@@ -347,7 +376,9 @@ pub async fn process_shard_placements(
         let effect =
             crate::sync_placement::schedule_placement_retry_effect(realm_id, local_node_id);
         let _ = task_handle.send_effect(effect).await;
+        outcome.retry_scheduled = true;
     }
+    outcome
 }
 
 async fn load_realm_config(

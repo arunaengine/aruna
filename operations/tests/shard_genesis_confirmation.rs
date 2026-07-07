@@ -7,6 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -54,8 +55,11 @@ async fn reachable_topicless_co_holder_lets_rank0_create_the_genesis()
     Ok(())
 }
 
-// An unreachable co-holder might hold a genesis, so creation is withheld; once
-// the co-holder is reachable again, the retry creates it.
+// An unreachable co-holder might hold a genesis, so creation is withheld — and,
+// crucially, withholding schedules a SyncPlacements retry so a returning
+// co-holder re-runs the reconciler on its own (no placement record exists to
+// drive it). The retry is driven here through the real task handler rather than
+// by re-running the reconciler by hand, which is what masked the liveness gap.
 #[tokio::test]
 async fn unreachable_co_holder_withholds_then_creates_on_retry()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -68,17 +72,24 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
     let topic = shard_topic_id(realm_id, &placement);
 
-    process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
     assert!(
         !rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
         "an unreachable co-holder must withhold genesis creation (a fork would be permanent)"
     );
+    assert!(
+        outcome.retry_scheduled,
+        "withholding must schedule a SyncPlacements retry so a returning co-holder re-runs the reconciler"
+    );
 
-    // The co-holder returns.
+    // The co-holder returns; the scheduled retry is fired immediately (instead of
+    // after the 30s production delay) through the task handler. The test never
+    // calls process_shard_placements itself past this point — convergence proves
+    // the armed retry, not a hand-driven loop, re-creates the genesis.
     mesh_nodes(&nodes).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+        fire_sync_placements_retry(rank0, realm_id).await;
         if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
             break;
         }
@@ -91,6 +102,23 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
 
     shutdown_nodes(nodes).await;
     Ok(())
+}
+
+// Fires the SyncPlacements timer now (compressing the 30s production retry), so
+// the task handler re-runs the reconciler through its real dispatch path.
+async fn fire_sync_placements_retry(node: &TestNode, realm_id: RealmId) {
+    let Some(task_handle) = node.context.task_handle.as_ref() else {
+        return;
+    };
+    let _ = task_handle
+        .send_effect(Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::SyncPlacements {
+                realm_id,
+                node_id: node.net.node_id(),
+            },
+            after: Duration::ZERO,
+        }))
+        .await;
 }
 
 // A co-holder that HAS the topic but has not yet admitted the prober silently

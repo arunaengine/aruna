@@ -8,6 +8,7 @@ use aruna_core::document::{
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use tracing::warn;
@@ -146,7 +147,7 @@ pub async fn restore_shard_subscriptions(
         }
     }
 
-    restore_held_shard_topics(
+    let withheld = restore_held_shard_topics(
         context,
         &net_handle,
         node_id,
@@ -156,6 +157,14 @@ pub async fn restore_shard_subscriptions(
     )
     .await;
 
+    // A withheld genesis (co-holder down or refusing) has no placement record to
+    // drive a re-run, so arm the retry timer here — the reconciler re-probes when
+    // the co-holder returns instead of deferring writes at 1s until restart.
+    if withheld && let Some(task_handle) = context.task_handle.as_ref() {
+        let effect = crate::sync_placement::schedule_placement_retry_effect(realm_id, node_id);
+        let _ = task_handle.send_effect(effect).await;
+    }
+
     // New-holder verification: reconcile each held shard against a co-holder and
     // persist a marker so a restart resumes only unverified shards.
     crate::shard::verify::verify_held_shards(context, node_id, realm_id).await;
@@ -163,6 +172,7 @@ pub async fn restore_shard_subscriptions(
     summary
 }
 
+/// Returns whether any rank-0 genesis was withheld, so the caller arms a retry.
 async fn restore_held_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
@@ -170,7 +180,7 @@ async fn restore_held_shard_topics(
     shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-) {
+) -> bool {
     // Shared realm topics: ensured directly (every node's genesis of a shared
     // topic is deterministic, not a shard-holder decision).
     for (peers, topics) in shared_ensure_groups {
@@ -203,11 +213,12 @@ async fn restore_held_shard_topics(
     // confirmation (see [`ensure_rank0_shard_group`]); a config change may have
     // just moved rank-0 onto this node, so an unreachable co-holder that might
     // still hold the genesis withholds creation rather than forking one.
+    let mut withheld = false;
     for (co_holders, topics) in rank0_shard_groups {
         if co_holders.is_empty() || topics.is_empty() {
             continue;
         }
-        crate::process_placements::ensure_rank0_shard_group(
+        withheld |= crate::process_placements::ensure_rank0_shard_group(
             context,
             net_handle,
             node_id,
@@ -239,6 +250,7 @@ async fn restore_held_shard_topics(
         let event = net_handle.sync_document_topics(topics, peers).await;
         apply_restored_reconcile(context, node_id, event).await;
     }
+    withheld
 }
 
 pub(crate) async fn apply_restored_reconcile(
