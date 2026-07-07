@@ -14,12 +14,13 @@ use aruna_core::metadata::{
 };
 pub use aruna_core::storage_entries::{
     metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
-    metadata_document_key, metadata_document_lifecycle_revision_write_entry,
-    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
-    metadata_graph_lifecycle_write_entry, metadata_materialization_document_job_write_entry,
-    metadata_materialization_job_key, metadata_materialization_job_write_entry,
-    metadata_materialization_status_key, metadata_materialization_status_write_entry,
-    metadata_registry_key, metadata_registry_prefix,
+    metadata_document_key, metadata_document_lifecycle_manifest_write_entry,
+    metadata_document_lifecycle_revision_write_entry, metadata_document_lifecycle_write_entry,
+    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
+    metadata_materialization_job_write_entry, metadata_materialization_status_key,
+    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
+    shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -184,11 +185,17 @@ pub fn write_document_lifecycle_with_revision_effect(
     placement: aruna_core::structs::PlacementRef,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
+    let mut writes = vec![
+        metadata_document_lifecycle_write_entry(record)?,
+        metadata_document_lifecycle_revision_write_entry(record, delete_actor, placement)?,
+    ];
+    if let Some(manifest) =
+        metadata_document_lifecycle_manifest_write_entry(record, delete_actor, placement)?
+    {
+        writes.push(manifest);
+    }
     Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes: vec![
-            metadata_document_lifecycle_write_entry(record)?,
-            metadata_document_lifecycle_revision_write_entry(record, delete_actor, placement)?,
-        ],
+        writes,
         txn_id,
     }))
 }
@@ -291,6 +298,9 @@ pub fn create_records_and_outbox_write_entries(
         if let Some(revision) = document_lifecycle_revision_from_outbox(outbox)? {
             writes.push(revision);
         }
+        if let Some(manifest) = document_lifecycle_manifest_from_outbox(outbox)? {
+            writes.push(manifest);
+        }
     }
 
     Ok(writes)
@@ -299,6 +309,36 @@ pub fn create_records_and_outbox_write_entries(
 fn document_lifecycle_revision_from_outbox(
     outbox: &DocumentSyncOutboxRecord,
 ) -> Result<Option<(String, ByteView, ByteView)>, ConversionError> {
+    let Some((lifecycle, change)) = outbox_document_lifecycle_upsert(outbox)? else {
+        return Ok(None);
+    };
+    // Mirror the outbox envelope's placement into the revision sidecar so the
+    // same document carries the same reference locally and on the wire.
+    Ok(Some(metadata_document_lifecycle_revision_write_entry(
+        &lifecycle,
+        outbox.node_id,
+        change.placement,
+    )?))
+}
+
+fn document_lifecycle_manifest_from_outbox(
+    outbox: &DocumentSyncOutboxRecord,
+) -> Result<Option<(String, ByteView, ByteView)>, ConversionError> {
+    let Some((_, change)) = outbox_document_lifecycle_upsert(outbox)? else {
+        return Ok(None);
+    };
+    shard_manifest_write_entry(&outbox.target, &change)
+}
+
+fn outbox_document_lifecycle_upsert(
+    outbox: &DocumentSyncOutboxRecord,
+) -> Result<
+    Option<(
+        MetadataDocumentLifecycleRecord,
+        aruna_core::document::DocumentSyncChange,
+    )>,
+    ConversionError,
+> {
     if !matches!(
         &outbox.target,
         DocumentSyncTarget::MetadataDocumentLifecycle { .. }
@@ -309,13 +349,7 @@ fn document_lifecycle_revision_from_outbox(
         return Ok(None);
     };
     let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
-    // Mirror the outbox envelope's placement into the revision sidecar so the
-    // same document carries the same reference locally and on the wire.
-    Ok(Some(metadata_document_lifecycle_revision_write_entry(
-        &lifecycle,
-        outbox.node_id,
-        change.placement,
-    )?))
+    Ok(Some((lifecycle, *change)))
 }
 
 pub fn write_create_records_outbox_and_materialization_effect(

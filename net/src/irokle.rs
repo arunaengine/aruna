@@ -39,12 +39,12 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, document_placement_delete_entry,
-    document_sync_revision_key, document_sync_revision_write_entry,
+    admin_document_reducer_state_write_entry, document_sync_revision_key,
+    document_sync_revision_write_entry,
     metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
     metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
     metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
-    metadata_registry_delete_entries, metadata_registry_write_entries,
+    metadata_registry_delete_entries, metadata_registry_write_entries, shard_manifest_write_entry,
     stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
@@ -2262,6 +2262,11 @@ impl DocumentSyncService {
                     document_sync_revision_write_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
+                if let Some(manifest) = shard_manifest_write_entry(&apply.target, revision)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                {
+                    writes.push(manifest);
+                }
             }
             writes.push((
                 target.storage_keyspace().to_string(),
@@ -2930,12 +2935,11 @@ async fn apply_metadata_registry_delete_to_storage(
     if metadata_document_delete_matches_registry(&delete, group_id, document_id)
         && !metadata_registry_live_after_delete(storage, group_id, document_id, &delete).await?
     {
-        let mut deletes = metadata_registry_delete_entries(group_id, document_id);
-        deletes.push(document_placement_delete_entry(
-            delete.tombstone.realm_id,
-            &DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-        ));
-        storage_batch_delete_to(storage, deletes).await?;
+        storage_batch_delete_to(
+            storage,
+            metadata_registry_delete_entries(group_id, document_id),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3857,6 +3861,11 @@ async fn metadata_document_lifecycle_write_entries_if_current(
         document_sync_revision_write_entry(&target, change)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
+    if let Some(manifest) = shard_manifest_write_entry(&target, &revision)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    {
+        entries.push(manifest);
+    }
     Ok(Some(entries))
 }
 

@@ -86,6 +86,31 @@ pub struct PendingShardPlacement {
     pub authoritative_node_id: NodeId,
 }
 
+/// One holder-manifest row: a shard-classed document the local node holds and
+/// the revision it holds it at. A delete keeps the row with the delete
+/// revision (a tombstone), mirroring the lifecycle sidecar. Keyed per entry in
+/// [`SHARD_MANIFEST_KEYSPACE`](crate::keyspaces::SHARD_MANIFEST_KEYSPACE) so the
+/// hot write path never reads-modifies-writes a blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardManifestEntry {
+    pub target: DocumentSyncTarget,
+    pub revision: DocumentSyncRevision,
+}
+
+/// A node's authoritative statement of what it holds for one shard: the entry
+/// set (from a prefix scan of the manifest keyspace), the irokle topic digest
+/// and persisted cursor, and provenance. Assembled on demand, never doc-synced
+/// (a new holder fetches a co-holder's over the shard ALPN and compares).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardManifest {
+    pub placement: PlacementRef,
+    pub holder: NodeId,
+    pub entries: Vec<ShardManifestEntry>,
+    pub cursor: Vec<u8>,
+    pub digest: [u8; 32],
+    pub updated_at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentSyncOutboxRecord {
     pub outbox_id: Ulid,
