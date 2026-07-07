@@ -93,6 +93,62 @@ async fn unreachable_co_holder_withholds_then_creates_on_retry()
     Ok(())
 }
 
+// A co-holder that HAS the topic but has not yet admitted the prober silently
+// omits its summary (irokle refuses the Open). A never-member rank-0 holder must
+// read that as possibly-existing and withhold, not mint a forking genesis; once
+// the co-holder's member top-up admits it, it adopts the existing genesis.
+#[tokio::test]
+async fn never_member_rank0_adopts_existing_genesis_after_top_up()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([152u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let config = install_realm_config(&nodes, realm_id).await?;
+    mesh_nodes(&nodes).await;
+
+    let (rank0, co_holder) = (&nodes[0], &nodes[1]);
+    let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
+    let topic = shard_topic_id(realm_id, &placement);
+
+    // The co-holder holds the genesis with only itself as a member (passing its
+    // own id leaves an empty sync-peer set), so it refuses the rank-0 holder's
+    // probe and its summary is silently omitted.
+    co_holder
+        .net
+        .ensure_document_sync_topics(&[topic], vec![co_holder.net.node_id()])?;
+    assert!(
+        co_holder
+            .net
+            .document_sync_topic_exists(topic)
+            .unwrap_or(false),
+        "the co-holder must hold the genesis before the probe"
+    );
+
+    process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    assert!(
+        !rank0.net.document_sync_topic_exists(topic).unwrap_or(false),
+        "a refused (held-but-not-a-member) probe must withhold creation, not fork a genesis"
+    );
+
+    // The co-holder's member top-up admits the rank-0 holder.
+    process_shard_placements(&co_holder.context, realm_id, co_holder.net.node_id()).await;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+        if rank0.net.document_sync_topic_exists(topic).unwrap_or(false) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rank-0 holder never adopted the existing genesis after the top-up"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
 fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId) -> PlacementRef {
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {

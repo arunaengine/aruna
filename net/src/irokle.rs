@@ -111,13 +111,19 @@ struct PublishEventsOutcome {
 
 /// Outcome of probing a shard's co-holders for an existing genesis before a
 /// rank-0 holder considers creating a fresh one. A genesis may be created only
-/// when every co-holder was reached (`unreachable` empty) and none advertised
-/// the topic (`known_by_co_holder` does not contain it); an unreachable
-/// co-holder might hold a genesis, so creation must be withheld to avoid a fork.
+/// when every co-holder was reached (`unreachable` empty), none advertised the
+/// topic (`known_by_co_holder`), and every reached co-holder positively
+/// confirmed it unknown (not in `unconfirmed`). An unreachable co-holder — or a
+/// reached one that refused the topic (holds it but the prober may not open it
+/// yet) — might hold a genesis, so creation must be withheld to avoid a fork.
 #[derive(Clone, Debug, Default)]
 pub struct ShardGenesisProbe {
     /// Probed topics at least one reached co-holder already has a genesis for.
     pub known_by_co_holder: BTreeSet<irokle_crate::TopicId>,
+    /// Probed topics a reached co-holder neither advertised nor positively
+    /// confirmed unknown: it holds the topic but the prober may not open it yet,
+    /// so a fresh genesis would fork. Possibly-existing ⇒ creation withheld.
+    pub unconfirmed: BTreeSet<irokle_crate::TopicId>,
     /// Co-holders that could not be reached (empty ⇒ every co-holder answered).
     pub unreachable: Vec<NodeId>,
 }
@@ -1422,11 +1428,27 @@ impl DocumentSyncService {
         if topics.is_empty() {
             return probe;
         }
+        let wanted: BTreeSet<irokle_crate::TopicId> = topics.iter().copied().collect();
         // Callers pass co-holders with the local node already excluded.
         for node_id in &co_holders {
             let peer = node_id_to_peer_id(node_id);
             match self.probe_topics_on_peer(&topics, peer).await {
-                Ok(advertised) => probe.known_by_co_holder.extend(advertised),
+                Ok(peer_probe) => {
+                    probe
+                        .known_by_co_holder
+                        .extend(peer_probe.known.iter().copied());
+                    // A reached co-holder that neither advertised a topic nor
+                    // positively confirmed it unknown refused it: it holds the
+                    // genesis but the prober may not open it yet. Withhold, never
+                    // treat as topic-unknown — a fresh genesis would fork.
+                    for topic in &wanted {
+                        if !peer_probe.known.contains(topic)
+                            && !peer_probe.confirmed_unknown.contains(topic)
+                        {
+                            probe.unconfirmed.insert(*topic);
+                        }
+                    }
+                }
                 Err(error) => {
                     debug!(%node_id, error = %error, "co-holder unreachable while probing shard genesis");
                     probe.unreachable.push(*node_id);
@@ -1440,10 +1462,10 @@ impl DocumentSyncService {
         &self,
         topics: &[irokle_crate::TopicId],
         peer: PeerId,
-    ) -> Result<BTreeSet<irokle_crate::TopicId>> {
+    ) -> Result<PeerTopicProbe> {
         let peer_addr = peer_id_to_endpoint_addr(peer)?;
         let wanted: BTreeSet<irokle_crate::TopicId> = topics.iter().copied().collect();
-        let mut advertised = BTreeSet::new();
+        let mut probe = PeerTopicProbe::default();
         for chunk in topics.chunks(DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT) {
             let opens: Vec<SyncMessage> = chunk
                 .iter()
@@ -1456,16 +1478,9 @@ impl DocumentSyncService {
             .await
             .map_err(|_| NetError::Timeout(DOCUMENT_SYNC_PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
-            for response in responses {
-                if let SyncMessage::Summary(summary) = response
-                    && wanted.contains(&summary.topic_id)
-                    && !remote_summary_is_empty(&summary)
-                {
-                    advertised.insert(summary.topic_id);
-                }
-            }
+            probe.merge(classify_probe_responses(&wanted, responses));
         }
-        Ok(advertised)
+        Ok(probe)
     }
 
     async fn bootstrap_topic_from_peer(
@@ -5499,6 +5514,46 @@ fn remote_summary_is_empty(summary: &irokle_crate::sync::SyncSummary) -> bool {
     summary.event_type_id.is_none() && summary.heads.is_empty()
 }
 
+/// Per-peer outcome of probing shard topics: which topics the peer holds a
+/// genesis for (`known`) and which it positively confirmed it has none of
+/// (`confirmed_unknown`). A probed topic in neither was refused — the peer holds
+/// it but the prober may not open it yet, so it must not be treated as unknown.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PeerTopicProbe {
+    known: BTreeSet<irokle_crate::TopicId>,
+    confirmed_unknown: BTreeSet<irokle_crate::TopicId>,
+}
+
+impl PeerTopicProbe {
+    fn merge(&mut self, other: PeerTopicProbe) {
+        self.known.extend(other.known);
+        self.confirmed_unknown.extend(other.confirmed_unknown);
+    }
+}
+
+/// Buckets a peer's Open responses for the `wanted` topics: a non-empty summary
+/// ⇒ the peer holds a genesis; an empty summary (untyped, headless) ⇒ positive
+/// confirmation the peer has none; a topic with no summary is left out of both,
+/// meaning the peer refused it (holds it but the prober may not open it yet).
+fn classify_probe_responses(
+    wanted: &BTreeSet<irokle_crate::TopicId>,
+    responses: Vec<SyncMessage>,
+) -> PeerTopicProbe {
+    let mut probe = PeerTopicProbe::default();
+    for response in responses {
+        if let SyncMessage::Summary(summary) = response
+            && wanted.contains(&summary.topic_id)
+        {
+            if remote_summary_is_empty(&summary) {
+                probe.confirmed_unknown.insert(summary.topic_id);
+            } else {
+                probe.known.insert(summary.topic_id);
+            }
+        }
+    }
+    probe
+}
+
 fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
     let endpoint_id = iroh::EndpointId::from_bytes(peer_id.as_bytes())
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -8784,14 +8839,57 @@ mod tests {
         event_type_id: Option<String>,
         heads: BTreeSet<irokle_crate::OpId>,
     ) -> irokle_crate::sync::SyncSummary {
+        summary_for(topic(9), event_type_id, heads)
+    }
+
+    fn summary_for(
+        topic_id: irokle_crate::TopicId,
+        event_type_id: Option<String>,
+        heads: BTreeSet<irokle_crate::OpId>,
+    ) -> irokle_crate::sync::SyncSummary {
         irokle_crate::sync::SyncSummary {
-            topic_id: topic(9),
+            topic_id,
             event_type_id,
             fingerprint: [0; 32],
             heads,
             actor_clock: irokle_crate::ActorClock::default(),
             actor_tips: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn classify_probe_buckets_empty_summary_as_confirmed_unknown() {
+        let wanted = BTreeSet::from([topic(1), topic(2), topic(3)]);
+        let responses = vec![
+            // Empty summary: positive confirmation the peer has no genesis.
+            SyncMessage::Summary(summary_for(topic(1), None, BTreeSet::new())),
+            // Typed summary: the peer holds a genesis.
+            SyncMessage::Summary(summary_for(
+                topic(2),
+                Some(DocumentSyncEvent::TYPE_ID.to_string()),
+                BTreeSet::new(),
+            )),
+            // topic(3) omitted entirely: refused (held, prober not a member).
+        ];
+        let probe = classify_probe_responses(&wanted, responses);
+        assert_eq!(probe.confirmed_unknown, BTreeSet::from([topic(1)]));
+        assert_eq!(probe.known, BTreeSet::from([topic(2)]));
+        assert!(!probe.confirmed_unknown.contains(&topic(3)));
+        assert!(!probe.known.contains(&topic(3)));
+    }
+
+    #[test]
+    fn classify_probe_ignores_summaries_for_unwanted_topics() {
+        let wanted = BTreeSet::from([topic(1)]);
+        let responses = vec![SyncMessage::Summary(summary_for(
+            topic(5),
+            None,
+            BTreeSet::new(),
+        ))];
+        assert_eq!(
+            classify_probe_responses(&wanted, responses),
+            PeerTopicProbe::default()
+        );
     }
 
     #[test]

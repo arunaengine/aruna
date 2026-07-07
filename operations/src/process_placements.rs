@@ -108,8 +108,10 @@ async fn ensure_rank0_shard_topics(
 /// Topics already known locally are ensured (membership top-up only, never a
 /// create). For a missing topic the co-holders are probed: one that a co-holder
 /// already holds is adopted via anti-entropy; one that every reached co-holder
-/// lacks is created fresh; but if any co-holder was unreachable, creation is
-/// withheld and left for the next placement pass — a down co-holder might hold a
+/// positively confirmed unknown (an empty summary) is created fresh; but if any
+/// co-holder was unreachable, or a reached one refused the topic (holds it but
+/// the prober may not open it yet — its summary is silently omitted), creation
+/// is withheld and left for the next placement pass — either might hold a
 /// genesis, and forking a second one is a permanent split-brain. A sole holder
 /// (no co-holders) creates immediately: no peer can hold a divergent genesis.
 pub(crate) async fn ensure_rank0_shard_group(
@@ -143,10 +145,12 @@ pub(crate) async fn ensure_rank0_shard_group(
             for topic in missing {
                 if probe.known_by_co_holder.contains(&topic) {
                     to_adopt.push(topic);
-                } else if probe.unreachable.is_empty() {
+                } else if probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
                     to_ensure.push(topic);
                 }
-                // Otherwise a co-holder was unreachable: withhold this genesis.
+                // Otherwise a co-holder was unreachable, or a reached one refused
+                // the topic (holds it but the prober may not open it yet):
+                // withhold this genesis rather than fork a second one.
             }
             if !to_adopt.is_empty() {
                 let event = net_handle
@@ -165,10 +169,11 @@ pub(crate) async fn ensure_rank0_shard_group(
                     }
                 }
             }
-            if !probe.unreachable.is_empty() {
+            if !probe.unreachable.is_empty() || !probe.unconfirmed.is_empty() {
                 warn!(
                     unreachable = ?probe.unreachable,
-                    "Withholding shard genesis creation: co-holder(s) unreachable"
+                    unconfirmed = ?probe.unconfirmed,
+                    "Withholding shard genesis creation: co-holder unreachable or topic possibly-existing"
                 );
             }
         }
