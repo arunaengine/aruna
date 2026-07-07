@@ -5,7 +5,7 @@ use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{BackendLocation, RealmId, StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{GroupId, NodeId};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -37,6 +37,7 @@ pub struct CopyObjectInput {
 pub struct CopyObjectResultData {
     pub location: BackendLocation,
     pub version_id: Ulid,
+    pub created_at: SystemTime,
     pub source_version_id: Option<Ulid>,
     pub source_last_modified: Option<SystemTime>,
 }
@@ -190,9 +191,15 @@ pub async fn copy_object(
     .and_then(|result| result.transpose())?;
     let put_result = put_result.ok_or(PutObjectError::PutObjectFailed)?;
 
+    // Dedup can point the copy at the source's BackendLocation, so its
+    // created_at is the source's, not the copy's. The freshly minted destination
+    // version ULID encodes when this copy was written.
+    let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
+
     Ok(CopyObjectResultData {
         location: put_result.location,
         version_id: put_result.version_id,
+        created_at,
         source_version_id,
         source_last_modified,
     })
@@ -381,6 +388,10 @@ mod test {
         .unwrap()
         .unwrap();
 
+        let copy_started_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let result = copy_object(
             &context,
             CopyObjectInput {
@@ -407,6 +418,13 @@ mod test {
             result.source_last_modified,
             Some(source.location.created_at)
         );
+        // The copy dedups onto the source location, but its last-modified must
+        // come from the fresh destination version, not the source's timestamp.
+        assert_eq!(
+            result.created_at,
+            UNIX_EPOCH + Duration::from_millis(result.version_id.timestamp_ms())
+        );
+        assert!(result.version_id.timestamp_ms() >= copy_started_ms);
 
         let dest_version =
             read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;

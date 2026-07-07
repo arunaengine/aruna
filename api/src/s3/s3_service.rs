@@ -1218,7 +1218,7 @@ impl S3 for ArunaS3Service {
                 .hashes
                 .get(HASH_MD5)
                 .map(|value| ETag::Strong(hex::encode(value))),
-            last_modified: Some(result.location.created_at.into()),
+            last_modified: Some(result.created_at.into()),
             ..Default::default()
         };
         copy_object_result.apply_checksums(encode_checksums(
