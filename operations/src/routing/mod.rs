@@ -1,3 +1,5 @@
+pub mod client;
+pub mod dispatch;
 pub mod incoming;
 pub mod protocol;
 
