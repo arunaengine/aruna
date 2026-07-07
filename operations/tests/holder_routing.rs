@@ -7,12 +7,15 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
+use aruna_core::storage_entries::metadata_document_key;
 use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, NotificationClass, NotificationKind,
-    NotificationRecord, Permission, PlacementOverride, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, Role, TokenClaims, User,
+    Actor, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, Group, GroupAuthorizationDocument,
+    MetadataRegistryRecord, NotificationClass, NotificationKind, NotificationRecord, Permission,
+    PlacementOverride, PlacementStrategy, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, Role, StrategyBinding, TokenClaims, User,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -27,8 +30,8 @@ use aruna_operations::placement::{
 use aruna_operations::process_placements::process_shard_placements;
 use aruna_operations::routing::dispatch::{HolderRoutingError, dispatch_holder_call};
 use aruna_operations::routing::protocol::{
-    GroupCall, GroupReply, NotificationCall, NotificationReply, ProxiedCall, ProxiedReply,
-    UserCall, UserReply,
+    GroupCall, GroupReply, MetadataCall, MetadataMutation, NotificationCall, NotificationReply,
+    ProxiedCall, ProxiedReply, UserCall, UserReply,
 };
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -523,6 +526,180 @@ async fn notification_list_serves_bearer_subject_not_wire_recipient() {
     );
 
     shutdown(nodes).await;
+}
+
+// A by-id metadata mutation from a non-holder must resolve the SAME strategy the
+// create resolved. Under a `profiles/` MetadataPathPrefix binding (replica-1) the
+// document's shard lives on one holder, while the registry class (everywhere)
+// ranks a different node first. The record is seeded only on the origin and the
+// profile-strategy holder — never on the registry-class front-runner — so a route
+// that used the registry class would land on a node lacking the record (NotFound),
+// while the correct profile-strategy route lands on the holder that has it and
+// denies the write (Unauthorized). Asserting Unauthorized proves it routed by the
+// record's path, not the registry class.
+#[tokio::test]
+async fn metadata_by_id_mutation_routes_to_path_prefix_holder() {
+    let (realm_key, realm_id, user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 3).await;
+    let origin = &nodes[0];
+    let profile_holder = nodes[1].net.node_id();
+    let registry_front_runner = nodes[2].net.node_id();
+
+    let config = config_with_profiles_binding(realm_id, &node_ids(&nodes));
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(&nodes[1], realm_id).await;
+
+    let group_id = Ulid::new();
+    let document_id = sample_profile_document(
+        &config,
+        group_id,
+        origin.net.node_id(),
+        profile_holder,
+        registry_front_runner,
+    );
+
+    let record = MetadataRegistryRecord {
+        realm_id,
+        group_id,
+        document_id,
+        document_path: "profiles/x".to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: false,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm_id,
+            group_id,
+            "profiles/x",
+            document_id,
+        ),
+        holder_node_ids: vec![profile_holder],
+        created_at_ms: unix_timestamp_millis(),
+        updated_at_ms: unix_timestamp_millis(),
+        last_event_id: Ulid::new(),
+    };
+    // Everywhere-placed record: present on the origin (so it loads the strategy
+    // key) and on the profile holder — but deliberately NOT on the registry-class
+    // front-runner, which the buggy route would reach first.
+    write_document_record(origin, &record).await;
+    write_document_record(&nodes[1], &record).await;
+
+    let token = sign_token(&realm_key, &token_claims(realm_id, user_id));
+
+    let update_error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Metadata(MetadataCall::Update {
+            document_id,
+            public: None,
+            mutation: MetadataMutation::ReplaceRoCrate {
+                jsonld: "{}".to_string(),
+            },
+        }),
+    )
+    .await
+    .expect_err("the routed update reaches the profile holder and is denied write");
+    assert!(
+        matches!(update_error, HolderRoutingError::Unauthorized(_)),
+        "update routed to the wrong holder: {update_error:?}"
+    );
+
+    let delete_error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&token),
+        ProxiedCall::Metadata(MetadataCall::Delete { document_id }),
+    )
+    .await
+    .expect_err("the routed delete reaches the profile holder and is denied write");
+    assert!(
+        matches!(delete_error, HolderRoutingError::Unauthorized(_)),
+        "delete routed to the wrong holder: {delete_error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
+fn config_with_profiles_binding(realm_id: RealmId, node_ids: &[NodeId]) -> RealmConfigDocument {
+    let everywhere = PlacementStrategy {
+        strategy_id: Ulid::new(),
+        name: "everywhere".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: DEFAULT_SHARD_COUNT,
+    };
+    let profiles = PlacementStrategy {
+        strategy_id: Ulid::new(),
+        name: "profiles".to_string(),
+        replica_count: Some(1),
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: DEFAULT_SHARD_COUNT,
+    };
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.default_strategy_id = Some(everywhere.strategy_id);
+    config.strategy_bindings = vec![
+        StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: everywhere.strategy_id,
+        },
+        StrategyBinding {
+            scope: BindingScope::MetadataPathPrefix("profiles/".to_string()),
+            strategy_id: profiles.strategy_id,
+        },
+    ];
+    config.strategies = vec![everywhere, profiles];
+    for node_id in node_ids {
+        config.ensure_node(*node_id, RealmNodeKind::Server);
+    }
+    config
+}
+
+// Samples a metadata document whose profile-strategy holder is exactly
+// `profile_holder` (with the origin forwarding) while the registry class ranks
+// `registry_front_runner` first among remotes — the divergence that makes the
+// regression observable.
+fn sample_profile_document(
+    config: &RealmConfigDocument,
+    group_id: Ulid,
+    origin: NodeId,
+    profile_holder: NodeId,
+    registry_front_runner: NodeId,
+) -> Ulid {
+    for _ in 0..200_000 {
+        let document_id = Ulid::new();
+        let target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        };
+        let profile_holders = resolve_shard_holders(
+            config,
+            &placement_ref_for_target(config, &target, Some("profiles/x")),
+        );
+        if profile_holders != vec![profile_holder] {
+            continue;
+        }
+        let registry_holders =
+            resolve_shard_holders(config, &placement_ref_for_target(config, &target, None));
+        let first_remote = registry_holders
+            .iter()
+            .copied()
+            .find(|node| *node != origin);
+        if first_remote == Some(registry_front_runner) && registry_front_runner != profile_holder {
+            return document_id;
+        }
+    }
+    panic!("no profile document matched the routing divergence within the sampling bound");
+}
+
+async fn write_document_record(node: &TestNode, record: &MetadataRegistryRecord) {
+    write_storage(
+        &node.context.storage_handle,
+        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        metadata_document_key(record.document_id).to_vec(),
+        postcard::to_allocvec(record).expect("registry record serializes"),
+    )
+    .await;
 }
 
 async fn write_realm_auth(node: &TestNode, realm_id: RealmId) {

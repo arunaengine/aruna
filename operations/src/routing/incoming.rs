@@ -8,7 +8,10 @@ use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::routing::protocol::{
     HolderProxyRequest, HolderProxyResponse, read_holder_proxy_request, write_holder_proxy_response,
 };
-use crate::routing::{resolve_call_holders, serve_local, validate_proxy_bearer};
+use crate::routing::{
+    MetadataStrategyKeyError, load_metadata_strategy_key, resolve_call_holders, serve_local,
+    validate_proxy_bearer,
+};
 
 #[tracing::instrument(
     name = "routing.incoming.stream",
@@ -78,7 +81,20 @@ async fn build_response(
         return HolderProxyResponse::NotHolder;
     }
 
-    let Some((placement, holders)) = resolve_call_holders(&config, &request.call) else {
+    // Resolve holders against the same strategy key the origin used: a by-id
+    // metadata mutation loads `(group, path)` from the local registry record. An
+    // absent record means this node cannot confirm it holds the shard → NotHolder.
+    let metadata_key = match load_metadata_strategy_key(context, &request.call).await {
+        Ok(key) => key,
+        Err(MetadataStrategyKeyError::NotFound) => return HolderProxyResponse::NotHolder,
+        Err(MetadataStrategyKeyError::Storage(reason)) => {
+            return HolderProxyResponse::Rejected(reason);
+        }
+    };
+
+    let Some((placement, holders)) =
+        resolve_call_holders(&config, &request.call, metadata_key.as_ref())
+    else {
         return HolderProxyResponse::Rejected("proxied call domain not yet supported".into());
     };
     if !holders.contains(&net_handle.node_id()) {

@@ -16,6 +16,7 @@ use crate::auth::{NodeBearerValidationState, validate_aruna_bearer_token};
 use crate::driver::{DriverContext, drive};
 use crate::ensure_canonical_user_token_subject::EnsureCanonicalUserTokenSubjectOperation;
 use crate::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::get_user::{GetUserError, GetUserInput, GetUserOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::placement::{placement_ref_for_target, resolve_shard_holders};
@@ -34,9 +35,57 @@ use crate::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
 use aruna_core::errors::AuthorizationError;
 use ulid::Ulid;
 
+/// Strategy-selection key for a metadata by-id mutation, loaded from the local
+/// registry record. `Create` carries `(group_id, document_path)` on the wire, but
+/// `Update`/`Delete` do not — loading them from the everywhere-placed registry
+/// record makes by-id mutations resolve the same strategy the create resolved.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataStrategyKey {
+    pub group_id: GroupId,
+    pub document_path: String,
+}
+
+/// Outcome of loading a metadata strategy key: `NotFound` when the record is
+/// absent (mapped to `NotFound`/`NotHolder` by the caller), `Storage` on a read
+/// failure.
+pub(crate) enum MetadataStrategyKeyError {
+    NotFound,
+    Storage(String),
+}
+
+/// Loads the `(group_id, document_path)` strategy key for a by-id metadata
+/// mutation from the local registry record; every other call yields `None`.
+/// Registry records are everywhere-placed, so the origin and the target both load
+/// this locally and resolve the identical holder set.
+pub(crate) async fn load_metadata_strategy_key(
+    context: &DriverContext,
+    call: &ProxiedCall,
+) -> Result<Option<MetadataStrategyKey>, MetadataStrategyKeyError> {
+    let document_id = match call {
+        ProxiedCall::Metadata(
+            MetadataCall::Update { document_id, .. } | MetadataCall::Delete { document_id },
+        ) => *document_id,
+        _ => return Ok(None),
+    };
+    match load_metadata_record_by_document(context, document_id).await {
+        Ok(Some(record)) => Ok(Some(MetadataStrategyKey {
+            group_id: record.group_id,
+            document_path: record.document_path,
+        })),
+        Ok(None) => Err(MetadataStrategyKeyError::NotFound),
+        Err(error) => Err(MetadataStrategyKeyError::Storage(format!(
+            "metadata registry read failed: {error:?}"
+        ))),
+    }
+}
+
 /// Canonical [`DocumentSyncTarget`] a proxied call resolves holders against.
-/// `None` for call domains not yet routed through the holder proxy.
-pub(crate) fn proxied_call_target(call: &ProxiedCall) -> Option<DocumentSyncTarget> {
+/// `None` for call domains not yet routed through the holder proxy. For a by-id
+/// metadata mutation the group comes from `metadata_key`, loaded from the record.
+pub(crate) fn proxied_call_target(
+    call: &ProxiedCall,
+    metadata_key: Option<&MetadataStrategyKey>,
+) -> Option<DocumentSyncTarget> {
     match call {
         ProxiedCall::Group(group_call) => Some(DocumentSyncTarget::Group {
             group_id: group_call_group_id(group_call),
@@ -45,7 +94,9 @@ pub(crate) fn proxied_call_target(call: &ProxiedCall) -> Option<DocumentSyncTarg
             user_call_user_id(user_call).map(|user_id| DocumentSyncTarget::User { user_id })
         }
         ProxiedCall::Metadata(metadata_call) => Some(DocumentSyncTarget::MetadataRegistry {
-            group_id: metadata_call_group_id(metadata_call),
+            group_id: metadata_key
+                .map(|key| key.group_id)
+                .unwrap_or_else(|| metadata_call_group_id(metadata_call)),
             document_id: metadata_call_document_id(metadata_call),
         }),
         ProxiedCall::Notification(_) => None,
@@ -61,9 +112,9 @@ fn metadata_call_document_id(call: &MetadataCall) -> Ulid {
     }
 }
 
-/// The owning group, when the call carries it. Only `Create` knows the group up
-/// front; by-id mutations resolve on the document shard alone (`group_id` steers
-/// only group-scoped strategy bindings and is nil when unknown).
+/// The owning group when the call carries it on the wire. Only `Create` knows
+/// the group up front; by-id mutations supply it through the loaded
+/// [`MetadataStrategyKey`] instead, so this nil fallback is unreachable for them.
 fn metadata_call_group_id(call: &MetadataCall) -> GroupId {
     match call {
         MetadataCall::Create { group_id, .. } => *group_id,
@@ -71,10 +122,16 @@ fn metadata_call_group_id(call: &MetadataCall) -> GroupId {
     }
 }
 
-/// The metadata path a call resolves strategy selection with. Only create knows
-/// it up front, so path-prefix bindings (e.g. `profiles/`) steer create's holder
-/// resolution; by-id mutations resolve on document class alone.
-fn proxied_call_metadata_path(call: &ProxiedCall) -> Option<&str> {
+/// The metadata path a call resolves strategy selection with. `Create` carries it
+/// on the wire; by-id mutations supply it through the loaded strategy key so
+/// path-prefix bindings (e.g. `profiles/`) steer them onto the create's strategy.
+fn proxied_call_metadata_path<'a>(
+    call: &'a ProxiedCall,
+    metadata_key: Option<&'a MetadataStrategyKey>,
+) -> Option<&'a str> {
+    if let Some(key) = metadata_key {
+        return Some(key.document_path.as_str());
+    }
     match call {
         ProxiedCall::Metadata(MetadataCall::Create { document_path, .. }) => {
             Some(document_path.as_str())
@@ -114,6 +171,7 @@ fn user_call_user_id(call: &UserCall) -> Option<UserId> {
 pub(crate) fn resolve_call_holders(
     config: &RealmConfigDocument,
     call: &ProxiedCall,
+    metadata_key: Option<&MetadataStrategyKey>,
 ) -> Option<(PlacementRef, Vec<NodeId>)> {
     // The notification inbox is not a `DocumentSyncTarget`; its holder comes from
     // the replica-1 inbox resolver rather than shard placement.
@@ -125,8 +183,12 @@ pub(crate) fn resolve_call_holders(
         };
         return Some((PlacementRef::NIL, holders));
     }
-    let target = proxied_call_target(call)?;
-    let placement = placement_ref_for_target(config, &target, proxied_call_metadata_path(call));
+    let target = proxied_call_target(call, metadata_key)?;
+    let placement = placement_ref_for_target(
+        config,
+        &target,
+        proxied_call_metadata_path(call, metadata_key),
+    );
     let holders = resolve_shard_holders(config, &placement);
     Some((placement, holders))
 }
@@ -468,10 +530,12 @@ mod tests {
             config.ensure_node(node(seed), RealmNodeKind::Server);
         }
 
-        let (_, profile_holders) = resolve_call_holders(&config, &create_call("profiles/team"))
-            .expect("profile create resolves holders");
-        let (_, dataset_holders) = resolve_call_holders(&config, &create_call("datasets/run"))
-            .expect("dataset create resolves holders");
+        let (_, profile_holders) =
+            resolve_call_holders(&config, &create_call("profiles/team"), None)
+                .expect("profile create resolves holders");
+        let (_, dataset_holders) =
+            resolve_call_holders(&config, &create_call("datasets/run"), None)
+                .expect("dataset create resolves holders");
 
         assert_eq!(
             profile_holders.len(),

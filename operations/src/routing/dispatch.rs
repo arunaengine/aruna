@@ -8,7 +8,10 @@ use crate::routing::client::send_holder_proxy_request;
 use crate::routing::protocol::{
     HolderProxyRequest, HolderProxyResponse, ProxiedCall, ProxiedReply, ProxyBearerToken,
 };
-use crate::routing::{resolve_call_holders, serve_local, validate_proxy_bearer};
+use crate::routing::{
+    MetadataStrategyKey, MetadataStrategyKeyError, load_metadata_strategy_key,
+    resolve_call_holders, serve_local, validate_proxy_bearer,
+};
 
 /// Outcome of routing a proxied call. Designed so the api layer maps
 /// `NotFound` → 404, `Unavailable` → 503 (+Retry-After), `Remote` → 502,
@@ -52,6 +55,17 @@ pub async fn dispatch_holder_call(
         .transpose()
         .map_err(|error| HolderRoutingError::Internal(error.to_string()))?;
 
+    // A by-id metadata mutation resolves its strategy from the local registry
+    // record, so update/delete route to the same holder the create resolved. The
+    // record is everywhere-placed; an absent one is an authoritative NotFound.
+    let metadata_key = match load_metadata_strategy_key(context, &call).await {
+        Ok(key) => key,
+        Err(MetadataStrategyKeyError::NotFound) => return Err(HolderRoutingError::NotFound),
+        Err(MetadataStrategyKeyError::Storage(reason)) => {
+            return Err(HolderRoutingError::Internal(reason));
+        }
+    };
+
     let config = get_realm_config(context, realm_id).await?;
     match run_pass(
         context,
@@ -60,6 +74,7 @@ pub async fn dispatch_holder_call(
         bearer,
         forwarded_bearer.as_ref(),
         &call,
+        metadata_key.as_ref(),
         &config,
     )
     .await?
@@ -77,6 +92,7 @@ pub async fn dispatch_holder_call(
         bearer,
         forwarded_bearer.as_ref(),
         &call,
+        metadata_key.as_ref(),
         &config,
     )
     .await?
@@ -91,6 +107,7 @@ enum PassOutcome {
     StaleView,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_pass(
     context: &DriverContext,
     local_node_id: NodeId,
@@ -98,9 +115,10 @@ async fn run_pass(
     bearer: Option<&str>,
     forwarded_bearer: Option<&ProxyBearerToken>,
     call: &ProxiedCall,
+    metadata_key: Option<&MetadataStrategyKey>,
     config: &RealmConfigDocument,
 ) -> Result<PassOutcome, HolderRoutingError> {
-    let Some((_placement, holders)) = resolve_call_holders(config, call) else {
+    let Some((_placement, holders)) = resolve_call_holders(config, call, metadata_key) else {
         return Err(HolderRoutingError::Internal(
             "proxied call domain not yet supported".to_string(),
         ));
