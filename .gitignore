@@ -5,3 +5,4 @@ docker/
 .env
 **/.env
 !.env.example
+docker/*
