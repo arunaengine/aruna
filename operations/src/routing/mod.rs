@@ -7,7 +7,7 @@ pub mod protocol;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmConfigDocument};
+use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, UserId};
 
 use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation};
@@ -222,6 +222,23 @@ pub(crate) async fn validate_proxy_bearer(
         .await
         .map(Some)
         .map_err(|error| format!("invalid bearer token: {error}"))
+}
+
+pub(crate) async fn validate_proxy_bearer_for_realm(
+    context: &DriverContext,
+    token: Option<&str>,
+    realm_id: RealmId,
+) -> Result<Option<AuthContext>, String> {
+    let auth = validate_proxy_bearer(context, token).await?;
+    if let Some(auth) = auth.as_ref()
+        && auth.realm_id != realm_id
+    {
+        return Err(format!(
+            "bearer realm `{}` does not match holder proxy realm `{realm_id}`",
+            auth.realm_id
+        ));
+    }
+    Ok(auth)
 }
 
 /// Refusal for serve arms whose REST routes require unrestricted tokens: the
@@ -503,16 +520,24 @@ async fn serve_user_call(
                 Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
-        // `user_id` is a routing hint only; the served identity is the validated
-        // bearer subject, never the wire claim.
-        UserCall::ReadDocument { .. } => {
+        UserCall::ReadDocument { user_id } => {
+            if user_id != auth.user_id {
+                return HolderProxyResponse::bad_request(
+                    "user_id does not match the bearer subject",
+                );
+            }
             match drive(ReadUserDocumentOperation::new(auth.user_id), context).await {
                 Ok(user) => ok_user(UserReply::User(user)),
                 Err(ReadUserDocumentError::NotFound) => HolderProxyResponse::NotFound,
                 Err(other) => HolderProxyResponse::internal(other.to_string()),
             }
         }
-        UserCall::EnsureCanonicalTokenSubject { .. } => {
+        UserCall::EnsureCanonicalTokenSubject { user_id } => {
+            if user_id != auth.user_id {
+                return HolderProxyResponse::bad_request(
+                    "user_id does not match the bearer subject",
+                );
+            }
             match drive(
                 EnsureCanonicalUserTokenSubjectOperation::new(auth.user_id),
                 context,

@@ -108,6 +108,41 @@ async fn non_holder_dispatch_round_trips_group_and_refuses_invalid_bearer() {
     shutdown(nodes).await;
 }
 
+#[tokio::test]
+async fn holder_proxy_rejects_foreign_realm_bearer() {
+    let (_realm_key, realm_id, user_id) = realm_fixture();
+    let (foreign_key, foreign_realm, foreign_user) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realms(holder, [realm_id, foreign_realm]).await;
+
+    let (group_id, holders) =
+        sample_group(&config, |h| h.len() == 1 && h[0] == holder.net.node_id());
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let (group, authorization) = make_group(group_id, realm_id, user_id);
+    write_group(holder, &group, &authorization).await;
+
+    let foreign_token = sign_token(&foreign_key, &token_claims(foreign_realm, foreign_user));
+    let error = dispatch_holder_call(
+        origin.context.as_ref(),
+        origin.net.node_id(),
+        Some(&foreign_token),
+        ProxiedCall::Group(GroupCall::Get { group_id }),
+    )
+    .await
+    .expect_err("foreign trusted-realm bearer must not serve a local holder call");
+    assert!(
+        matches!(&error, HolderRoutingError::Unauthorized(reason) if reason.contains("bearer realm")),
+        "unexpected error: {error:?}"
+    );
+
+    shutdown(nodes).await;
+}
+
 // Every holder of the shard is unreachable: dispatch reports Unavailable.
 #[tokio::test]
 async fn all_holders_unreachable_is_unavailable() {
@@ -272,6 +307,48 @@ async fn user_read_document_routes_to_holder() {
         panic!("expected a user document");
     };
     assert_eq!(fetched, user);
+
+    shutdown(nodes).await;
+}
+
+#[tokio::test]
+async fn identity_derived_user_calls_reject_wire_user_mismatch() {
+    let (realm_key, realm_id, _user_id) = realm_fixture();
+    let nodes = meshed_nodes(realm_id, 2).await;
+    let (origin, holder) = (&nodes[0], &nodes[1]);
+
+    let config = config_with_replica(realm_id, &node_ids(&nodes), 1);
+    install_config(&nodes, &config).await;
+    persist_trusted_realm(holder, realm_id).await;
+
+    let (wire_user, holders) = sample_user(&config, realm_id, |h| {
+        h.len() == 1 && h[0] == holder.net.node_id()
+    });
+    assert!(!holders.contains(&origin.net.node_id()));
+
+    let mut caller = UserId::local(Ulid::new(), realm_id);
+    while caller == wire_user {
+        caller = UserId::local(Ulid::new(), realm_id);
+    }
+    let token = sign_token(&realm_key, &token_claims(realm_id, caller));
+
+    for call in [
+        ProxiedCall::User(UserCall::ReadDocument { user_id: wire_user }),
+        ProxiedCall::User(UserCall::EnsureCanonicalTokenSubject { user_id: wire_user }),
+    ] {
+        let error = dispatch_holder_call(
+            origin.context.as_ref(),
+            origin.net.node_id(),
+            Some(&token),
+            call,
+        )
+        .await
+        .expect_err("wire user_id mismatch must be rejected");
+        assert!(
+            matches!(&error, HolderRoutingError::BadRequest(reason) if reason.contains("user_id does not match")),
+            "unexpected error: {error:?}"
+        );
+    }
 
     shutdown(nodes).await;
 }
@@ -1093,7 +1170,11 @@ async fn install_config(nodes: &[TestNode], config: &RealmConfigDocument) {
 }
 
 async fn persist_trusted_realm(node: &TestNode, realm_id: RealmId) {
-    let trusted: HashSet<RealmId> = HashSet::from([realm_id]);
+    persist_trusted_realms(node, [realm_id]).await;
+}
+
+async fn persist_trusted_realms(node: &TestNode, realm_ids: impl IntoIterator<Item = RealmId>) {
+    let trusted: HashSet<RealmId> = realm_ids.into_iter().collect();
     let bytes = postcard::to_allocvec(&trusted).expect("trusted realms serialize");
     write_storage(
         &node.context.storage_handle,

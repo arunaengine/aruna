@@ -11,7 +11,7 @@ use crate::routing::protocol::{
 };
 use crate::routing::{
     MetadataStrategyKey, MetadataStrategyKeyError, load_metadata_strategy_key,
-    resolve_call_holders, serve_local, validate_proxy_bearer,
+    resolve_call_holders, serve_local, validate_proxy_bearer_for_realm,
 };
 
 /// Outcome of routing a proxied call. Designed so the api layer maps
@@ -165,7 +165,7 @@ async fn run_pass(
 
     // Local node holds the shard: serve directly, same path as the inbound handler.
     if holders.contains(&local_node_id) {
-        let auth = validate_proxy_bearer(context, bearer)
+        let auth = validate_proxy_bearer_for_realm(context, bearer, realm_id)
             .await
             .map_err(HolderRoutingError::Unauthorized)?;
         return map_local_response(serve_local(context, call.clone(), auth).await);

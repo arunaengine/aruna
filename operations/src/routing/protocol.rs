@@ -148,12 +148,12 @@ pub enum UserCall {
         remove_attributes: Vec<String>,
     },
     /// Read the caller's own user document; `user_id` steers holder resolution
-    /// only — the target reads the identity from the validated bearer.
+    /// and must match the validated bearer subject.
     ReadDocument {
         user_id: UserId,
     },
     /// Ensure the caller's canonical token subject; `user_id` steers holder
-    /// resolution only.
+    /// resolution and must match the validated bearer subject.
     EnsureCanonicalTokenSubject {
         user_id: UserId,
     },

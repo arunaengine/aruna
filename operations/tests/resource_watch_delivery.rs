@@ -7,8 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE,
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    API_STATE_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{

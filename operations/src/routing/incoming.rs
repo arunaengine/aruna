@@ -12,7 +12,7 @@ use crate::routing::protocol::{
 };
 use crate::routing::{
     MetadataStrategyKeyError, load_metadata_strategy_key, resolve_call_holders, serve_local,
-    validate_proxy_bearer,
+    validate_proxy_bearer_for_realm,
 };
 
 #[tracing::instrument(
@@ -120,11 +120,16 @@ async fn build_response(
     }
 
     // Target validates the forwarded bearer itself and rebuilds the auth context.
-    let auth =
-        match validate_proxy_bearer(context, request.bearer.as_ref().map(|b| b.as_str())).await {
-            Ok(auth) => auth,
-            Err(reason) => return HolderProxyResponse::forbidden(reason),
-        };
+    let auth = match validate_proxy_bearer_for_realm(
+        context,
+        request.bearer.as_ref().map(|b| b.as_str()),
+        realm_id,
+    )
+    .await
+    {
+        Ok(auth) => auth,
+        Err(reason) => return HolderProxyResponse::forbidden(reason),
+    };
 
     let response = serve_local(context, request.call, auth).await;
     debug!(
