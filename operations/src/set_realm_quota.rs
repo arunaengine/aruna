@@ -537,8 +537,10 @@ mod tests {
         let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         seed_config(&ctx, &actor, &document).await;
 
-        let mut quota = QuotaConfig::default();
-        quota.max_devices_per_user = Some(4);
+        let quota = QuotaConfig {
+            max_devices_per_user: Some(4),
+            ..Default::default()
+        };
 
         let error = drive(
             SetRealmQuotaOperation::new(SetRealmQuotaConfig { actor, quota }),
