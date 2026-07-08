@@ -290,6 +290,9 @@ pub struct MetadataSearchResponse {
     /// Number of node partitions that failed or timed out; a non-zero value
     /// means the result is partial.
     pub nodes_failed: usize,
+    /// True when pagination stopped at the server-side depth cap before the
+    /// result set was exhausted.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1212,6 +1215,7 @@ pub async fn search_metadata(
             next_cursor: result.next_cursor,
             nodes_queried: result.fanout_stats.nodes_queried,
             nodes_failed: result.fanout_stats.nodes_failed,
+            truncated: result.truncated,
         }),
     ))
 }
@@ -2923,6 +2927,7 @@ mod tests {
 
     struct SearchPaginationCluster {
         auth: AuthContext,
+        bearer: ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         nodes: Vec<DistributedMetadataNode>,
     }
@@ -2969,6 +2974,10 @@ mod tests {
             path_restrictions: None,
         };
         SearchPaginationCluster {
+            bearer: ValidatedArunaBearerTokenCarrier::new_for_test(sign_test_token(
+                &realm_signing_key,
+                &test_token_claims(realm_id, user_id),
+            )),
             auth,
             group_id,
             nodes,
@@ -2978,12 +2987,21 @@ mod tests {
     async fn seed_public_document(
         node: &DistributedMetadataNode,
         auth: &AuthContext,
+        bearer: &ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         path: &str,
         name: &str,
     ) {
-        create_test_metadata_document(node.state.clone(), auth.clone(), group_id, path, name, true)
-            .await;
+        create_test_metadata_document(
+            node.state.clone(),
+            auth.clone(),
+            bearer.clone(),
+            group_id,
+            path,
+            name,
+            true,
+        )
+        .await;
         drain_metadata_background(node.state.as_ref()).await;
         flush_node_search(node).await;
     }
@@ -3030,6 +3048,7 @@ mod tests {
             seed_public_document(
                 node,
                 &cluster.auth,
+                &cluster.bearer,
                 cluster.group_id,
                 &format!("datasets/corpus-{index}"),
                 &format!("Corpus Document {index}"),
@@ -3087,6 +3106,7 @@ mod tests {
             seed_public_document(
                 node,
                 &cluster.auth,
+                &cluster.bearer,
                 cluster.group_id,
                 &format!("datasets/corpus-{index}"),
                 &format!("Corpus Document {index}"),
@@ -3111,11 +3131,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_search_marks_realm_discovery_failure_partial() {
+        let test = setup_state().await;
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/discovery-partial".to_string(),
+                    name: "Discovery Partial Dataset".to_string(),
+                    description: "discovery failure fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+        let ctx = test.state.get_ctx();
+        installed_metadata_handle(ctx.as_ref())
+            .flush_search_updates()
+            .await
+            .unwrap();
+
+        let no_net_ctx = DriverContext {
+            net_handle: None,
+            ..ctx.as_ref().clone()
+        };
+
+        let result = run_search_metadata(
+            &no_net_ctx,
+            test.state.get_realm_id(),
+            test.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(test.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: "Discovery".to_string(),
+                limit: Some(10),
+                cursor: None,
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.fanout_stats.nodes_queried, 1);
+        assert_eq!(result.fanout_stats.nodes_failed, 1);
+        assert!(!result.truncated);
+    }
+
+    #[tokio::test]
     async fn metadata_search_rejects_cursor_on_query_change_and_malformed_input() {
         let test = setup_state().await;
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3161,6 +3238,28 @@ mod tests {
         assert!(matches!(malformed, Err(ServerError::BadRequestMessage(_))));
 
         if let Some(cursor) = cursor {
+            let mut tampered = cursor.as_bytes().to_vec();
+            let tamper_index = tampered.len() / 2;
+            tampered[tamper_index] = if tampered[tamper_index] == b'A' {
+                b'B'
+            } else {
+                b'A'
+            };
+            let tampered = String::from_utf8(tampered).unwrap();
+            let tampered_result = run_search_route(
+                &test.state,
+                &test.auth,
+                "Widget",
+                1,
+                Some(tampered),
+                Some(MetadataQueryMode::Local),
+            )
+            .await;
+            assert!(matches!(
+                tampered_result,
+                Err(ServerError::BadRequestMessage(_))
+            ));
+
             let mismatched = run_search_route(
                 &test.state,
                 &test.auth,
@@ -3186,6 +3285,7 @@ mod tests {
             let _ = create_metadata_document(
                 State(test.state.clone()),
                 Extension(Some(test.auth.clone())),
+                Extension(Some(test.bearer.clone())),
                 Json(CreateMetadataRequest::Scaffold(
                     CreateMetadataScaffoldRequest {
                         group_id: test.group_id.to_string(),
@@ -3229,6 +3329,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3292,6 +3393,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3327,6 +3429,7 @@ mod tests {
         let _ = replace_metadata_rocrate(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
                 rocrate: serde_json::from_str(&rocrate).unwrap(),
@@ -3369,6 +3472,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
