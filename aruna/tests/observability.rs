@@ -101,6 +101,18 @@ async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
             "outbox depth gauge missing or negative: {body}"
         );
         assert!(
+            gauge_value(
+                &body,
+                "aruna_queue_probe_up{queue=\"document_sync_outbox\"}"
+            )
+            .is_some(),
+            "outbox probe health gauge missing: {body}"
+        );
+        assert!(
+            gauge_value(&body, "aruna_node_started").is_some(),
+            "node_started gauge missing: {body}"
+        );
+        assert!(
             body.contains("aruna_build_info{version=\""),
             "missing build info: {body}"
         );

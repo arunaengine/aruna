@@ -75,7 +75,7 @@ pub struct NodeMetrics {
     sources: RwLock<Vec<Arc<dyn MetricsSource>>>,
     pub http_requests: Family<RequestLabels, Counter>,
     pub http_request_duration: Family<RouteLabels, Histogram>,
-    node_ready: Gauge,
+    node_started: Gauge,
 }
 
 impl NodeMetrics {
@@ -99,11 +99,11 @@ impl NodeMetrics {
             http_request_duration.clone(),
         );
 
-        let node_ready = Gauge::default();
+        let node_started = Gauge::default();
         registry.register(
-            "node_ready",
+            "node_started",
             "1 once the node finished startup and is serving traffic",
-            node_ready.clone(),
+            node_started.clone(),
         );
 
         registry.register(
@@ -119,12 +119,12 @@ impl NodeMetrics {
             sources: RwLock::new(Vec::new()),
             http_requests,
             http_request_duration,
-            node_ready,
+            node_started,
         }
     }
 
-    pub fn set_node_ready(&self, ready: bool) {
-        self.node_ready.set(i64::from(ready));
+    pub fn set_node_started(&self, started: bool) {
+        self.node_started.set(i64::from(started));
     }
 
     /// Late-register a metric into the node registry (used by feature branches).
@@ -222,11 +222,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_ready_gauge_tracks_flag() {
+    async fn node_started_gauge_tracks_flag() {
         let metrics = NodeMetrics::new();
-        assert!(metrics.render().await.contains("aruna_node_ready 0"));
-        metrics.set_node_ready(true);
-        assert!(metrics.render().await.contains("aruna_node_ready 1"));
+        assert!(metrics.render().await.contains("aruna_node_started 0"));
+        metrics.set_node_started(true);
+        assert!(metrics.render().await.contains("aruna_node_started 1"));
     }
 
     #[tokio::test]
