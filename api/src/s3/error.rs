@@ -216,6 +216,10 @@ impl IntoS3Error for CompleteMultipartUploadError {
             CompleteMultipartUploadError::ChecksumMismatch(algorithm) => {
                 checksum_mismatch_s3_error(algorithm, "CompleteMultipartUpload")
             }
+            CompleteMultipartUploadError::ChecksumContractMismatch => s3_error!(
+                InvalidRequest,
+                "CompleteMultipartUpload checksum headers do not match the multipart upload initiation."
+            ),
             CompleteMultipartUploadError::PartEtagMismatch => {
                 s3_error!(
                     InvalidPart,

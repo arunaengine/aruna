@@ -25,6 +25,7 @@ pub struct UploadChecksumRequest {
     pub expected: Vec<ExpectedChecksum>,
     pub response_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: ChecksumType,
+    pub checksum_type_declared: bool,
     pub composite_part_count: Option<usize>,
 }
 
@@ -123,9 +124,23 @@ pub enum ChecksumSelection {
 }
 
 pub fn parse_upload_checksum_request(headers: &HeaderMap) -> S3Result<UploadChecksumRequest> {
-    let checksum_type = parse_checksum_type(headers)?;
+    parse_checksum_request(headers, true)
+}
+
+pub fn parse_complete_multipart_checksum_request(
+    headers: &HeaderMap,
+) -> S3Result<UploadChecksumRequest> {
+    parse_checksum_request(headers, false)
+}
+
+fn parse_checksum_request(
+    headers: &HeaderMap,
+    include_content_md5: bool,
+) -> S3Result<UploadChecksumRequest> {
+    let (checksum_type, checksum_type_declared) = parse_checksum_type(headers)?;
     let composite = checksum_type.as_str() == ChecksumType::COMPOSITE;
-    let (expected, composite_part_count) = parse_expected_checksums(headers, composite)?;
+    let (expected, composite_part_count) =
+        parse_expected_checksums(headers, composite, include_content_md5)?;
     let declared = parse_declared_algorithm(headers)?;
 
     if declared.is_some() && expected.is_empty() {
@@ -151,6 +166,7 @@ pub fn parse_upload_checksum_request(headers: &HeaderMap) -> S3Result<UploadChec
             .or_else(|| expected.first().map(|checksum| checksum.algorithm)),
         expected,
         checksum_type,
+        checksum_type_declared,
         composite_part_count,
     })
 }
@@ -227,6 +243,7 @@ pub fn encode_checksums(
 fn parse_expected_checksums(
     headers: &HeaderMap,
     composite: bool,
+    include_content_md5: bool,
 ) -> S3Result<(Vec<ExpectedChecksum>, Option<usize>)> {
     let mut expected = Vec::new();
     let mut part_count = None;
@@ -239,6 +256,9 @@ fn parse_expected_checksums(
         (X_AMZ_CHECKSUM_SHA1, ChecksumAlgorithm::Sha1),
         (X_AMZ_CHECKSUM_SHA256, ChecksumAlgorithm::Sha256),
     ] {
+        if algorithm == ChecksumAlgorithm::Md5 && !include_content_md5 {
+            continue;
+        }
         if let Some(value) = header_str(headers, name)? {
             let (value, parsed_count) = if composite && algorithm != ChecksumAlgorithm::Md5 {
                 split_composite_part_count(algorithm, value)?
@@ -307,14 +327,16 @@ fn parse_declared_algorithm(headers: &HeaderMap) -> S3Result<Option<ChecksumAlgo
     Ok(Some(parsed))
 }
 
-fn parse_checksum_type(headers: &HeaderMap) -> S3Result<ChecksumType> {
+fn parse_checksum_type(headers: &HeaderMap) -> S3Result<(ChecksumType, bool)> {
     let Some(value) = header_str(headers, X_AMZ_CHECKSUM_TYPE)? else {
-        return Ok(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
+        return Ok((ChecksumType::from_static(ChecksumType::FULL_OBJECT), false));
     };
 
     match value {
-        ChecksumType::FULL_OBJECT => Ok(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
-        ChecksumType::COMPOSITE => Ok(ChecksumType::from_static(ChecksumType::COMPOSITE)),
+        ChecksumType::FULL_OBJECT => {
+            Ok((ChecksumType::from_static(ChecksumType::FULL_OBJECT), true))
+        }
+        ChecksumType::COMPOSITE => Ok((ChecksumType::from_static(ChecksumType::COMPOSITE), true)),
         _ => Err(s3_error!(InvalidRequest, "Unsupported checksum type")),
     }
 }
@@ -384,7 +406,8 @@ mod tests {
     use super::{
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
         X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
-        parse_upload_checksum_request, validate_composite_part_count,
+        parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+        validate_composite_part_count,
     };
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
     use http::HeaderMap;
@@ -403,6 +426,7 @@ mod tests {
         assert_eq!(request.expected.len(), 2);
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
+        assert!(!request.checksum_type_declared);
     }
 
     #[test]
@@ -410,6 +434,7 @@ mod tests {
         let request = parse_upload_checksum_request(&HeaderMap::new()).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
+        assert!(!request.checksum_type_declared);
     }
 
     #[test]
@@ -420,6 +445,19 @@ mod tests {
         let request = parse_upload_checksum_request(&headers).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::COMPOSITE);
+        assert!(request.checksum_type_declared);
+    }
+
+    #[test]
+    fn complete_multipart_does_not_treat_content_md5_as_object_checksum() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_MD5, "XrY7u+Ae7tCTyyK7j1rNww==".parse().unwrap());
+
+        let request = parse_complete_multipart_checksum_request(&headers).unwrap();
+
+        assert!(request.expected.is_empty());
+        assert_eq!(request.response_algorithm, None);
+        assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
     }
 
     #[test]

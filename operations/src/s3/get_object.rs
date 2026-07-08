@@ -147,6 +147,7 @@ pub struct GetObjectResult {
     pub source_metadata: Option<SourceMetadata>,
     pub source_binding: Option<VersionSourceBinding>,
     pub last_refresh: Option<SystemTime>,
+    pub version_created_at: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
@@ -166,6 +167,7 @@ pub struct GetObjectOperation {
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
     last_refresh: Option<SystemTime>,
+    version_created_at: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -186,6 +188,7 @@ impl GetObjectOperation {
             source_metadata: None,
             source_binding: None,
             last_refresh: None,
+            version_created_at: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
             composite_hashes: HashMap::new(),
@@ -327,6 +330,7 @@ impl GetObjectOperation {
         match version.state {
             BlobVersionState::Materialized { blob_hash, source } => {
                 self.source_binding = source;
+                self.version_created_at = Some(version.created_at);
                 self.read_blob_location(blob_hash)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
@@ -341,6 +345,7 @@ impl GetObjectOperation {
                 self.reference_stream = None;
                 self.source_metadata = None;
                 self.last_refresh = None;
+                self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
                 smallvec![resolve_version_source_binding_suboperation(
                     ResolveVersionSourceBindingInput { source },
@@ -571,6 +576,7 @@ impl GetObjectOperation {
                 source_metadata: None,
                 source_binding: self.source_binding.clone(),
                 last_refresh: None,
+                version_created_at: self.version_created_at,
                 version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
                 checksum_type: self.checksum_type,
@@ -629,6 +635,7 @@ impl GetObjectOperation {
             source_metadata: Some(source_metadata),
             source_binding: self.source_binding.clone(),
             last_refresh: self.last_refresh,
+            version_created_at: self.version_created_at,
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,

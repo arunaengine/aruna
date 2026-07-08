@@ -22,7 +22,8 @@ use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
 use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartPart, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
+    CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOperation,
 };
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
@@ -206,7 +207,9 @@ async fn complete_upload(
                 })
                 .collect(),
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type,
+            checksum_type_explicit: false,
             object_size,
             created_by,
             quota_ceiling: None,
@@ -323,7 +326,9 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
                 algorithm: ChecksumAlgorithm::Sha256,
                 digest: composite_sha256(&[part1, part2]),
             }],
+            checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
             checksum_type: MultipartChecksumType::Composite,
+            checksum_type_explicit: true,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
@@ -508,6 +513,71 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 }
 
 #[tokio::test]
+async fn complete_multipart_upload_rejects_missing_initiated_checksum_contract() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let created_by = UserId::local(Ulid::new(), realm_id);
+    let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
+    let created = drive(
+        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "contract.bin".to_string(),
+            group_id: Ulid::new(),
+            created_by,
+            checksum_hint: Some(MultipartUploadChecksumHint {
+                algorithm: Some(ChecksumAlgorithm::Sha256),
+                checksum_type: MultipartChecksumType::Composite,
+            }),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let upload_id = created.record.upload_id;
+    let uploaded_part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "contract.bin",
+        upload_id,
+        1,
+        b"part-one",
+        created_by,
+    )
+    .await;
+
+    let err = drive(
+        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "contract.bin".to_string(),
+            upload_id,
+            realm_id,
+            node_id,
+            completed_parts: vec![CompleteMultipartPart {
+                part_number: 1,
+                etag: Some(hex::encode(
+                    uploaded_part.location.hashes.get("md5").unwrap(),
+                )),
+                expected_checksums: vec![],
+            }],
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
+            object_size: Some(8),
+            created_by,
+            quota_ceiling: None,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err, CompleteMultipartUploadError::ChecksumContractMismatch);
+}
+
+#[tokio::test]
 async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::r#gen(), RealmId::from_bytes([7u8; 32]));
@@ -689,7 +759,9 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
                 },
             ],
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
@@ -1306,7 +1378,9 @@ async fn delete_object_removes_completed_multipart_metadata() {
                 },
             ],
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,

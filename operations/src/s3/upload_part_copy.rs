@@ -5,8 +5,11 @@ use crate::s3::get_object::{
 };
 use crate::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
 use aruna_core::UserId;
-use aruna_core::structs::BackendLocation;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::{BackendLocation, MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::GroupId;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -48,6 +51,8 @@ pub async fn upload_part_copy(
     context: &DriverContext,
     input: UploadPartCopyInput,
 ) -> Result<UploadPartCopyResultData, UploadPartCopyError> {
+    validate_destination_upload(context, &input).await?;
+
     let source = drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: input.source_bucket,
@@ -65,9 +70,8 @@ pub async fn upload_part_copy(
 
     let source_version_id = source.version_id;
     let source_last_modified = source
-        .location
-        .as_ref()
-        .map(|location| location.created_at)
+        .version_created_at
+        .or_else(|| source.location.as_ref().map(|location| location.created_at))
         .or_else(|| {
             source
                 .source_metadata
@@ -91,6 +95,7 @@ pub async fn upload_part_copy(
         &input.conditions,
         source_etag.as_deref(),
         source_last_modified,
+        true,
     )
     .is_err()
     {
@@ -127,6 +132,50 @@ pub async fn upload_part_copy(
         source_version_id,
         source_last_modified,
     })
+}
+
+async fn validate_destination_upload(
+    context: &DriverContext,
+    input: &UploadPartCopyInput,
+) -> Result<(), UploadPartCopyError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key: input.upload_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    let value = match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(UploadPartCopyError::UploadPart(
+                UploadPartError::StorageError(error),
+            ));
+        }
+        _ => {
+            return Err(UploadPartCopyError::UploadPart(
+                UploadPartError::InvalidOperationState,
+            ));
+        }
+    };
+    let Some(value) = value else {
+        return Err(UploadPartCopyError::UploadPart(
+            UploadPartError::NoSuchUpload,
+        ));
+    };
+    let record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
+    if record.bucket != input.dest_bucket || record.key != input.dest_key {
+        return Err(UploadPartCopyError::UploadPart(
+            UploadPartError::UploadTargetMismatch,
+        ));
+    }
+    if record.status != MultipartUploadStatus::Open {
+        return Err(UploadPartCopyError::UploadPart(
+            UploadPartError::UploadNotOpen,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,6 +364,38 @@ mod test {
             MultipartUploadPart::from_bytes(value.expect("missing part record").as_ref()).unwrap();
         assert_eq!(part.part_number, 1);
         assert_eq!(part.location.blob_size, 4);
+    }
+
+    #[tokio::test]
+    async fn missing_destination_upload_fails_before_source_lookup() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
+
+        let error = upload_part_copy(
+            &context,
+            UploadPartCopyInput {
+                source_bucket: "missing-source".to_string(),
+                source_key: "missing.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                dest_bucket: "dest".to_string(),
+                dest_key: "object.txt".to_string(),
+                upload_id: Ulid::new(),
+                part_number: 1,
+                range: None,
+                user_id,
+                conditions: CopySourceConditions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            UploadPartCopyError::UploadPart(UploadPartError::NoSuchUpload)
+        );
     }
 
     #[tokio::test]

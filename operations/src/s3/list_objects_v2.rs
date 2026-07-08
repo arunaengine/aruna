@@ -77,6 +77,7 @@ pub struct ListObjectsV2Object {
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
     pub last_refresh: Option<std::time::SystemTime>,
+    pub version_created_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,7 +90,10 @@ pub struct ListObjectsV2Result {
 #[derive(Debug, PartialEq)]
 enum ResolvedEntry {
     Object(ListObjectsV2Object),
-    AwaitingLocation(BlobHeadKey),
+    AwaitingLocation {
+        head: BlobHeadKey,
+        version_created_at: std::time::SystemTime,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -446,6 +450,7 @@ impl ListObjectsV2Operation {
                             location: None,
                             source_metadata: Some(cached_metadata),
                             last_refresh: Some(last_refresh),
+                            version_created_at: None,
                         }));
                 }
                 BlobVersionState::Materialized { blob_hash, .. } => {
@@ -453,7 +458,10 @@ impl ListObjectsV2Operation {
                         BLOB_LOCATIONS_KEYSPACE.to_string(),
                         blob_hash.to_vec().into(),
                     ));
-                    self.resolved.push(ResolvedEntry::AwaitingLocation(head));
+                    self.resolved.push(ResolvedEntry::AwaitingLocation {
+                        head,
+                        version_created_at: version.created_at,
+                    });
                 }
             }
         }
@@ -481,7 +489,7 @@ impl ListObjectsV2Operation {
         let awaiting = self
             .resolved
             .iter()
-            .filter(|entry| matches!(entry, ResolvedEntry::AwaitingLocation(_)))
+            .filter(|entry| matches!(entry, ResolvedEntry::AwaitingLocation { .. }))
             .count();
         if values.len() != awaiting {
             return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
@@ -495,7 +503,10 @@ impl ListObjectsV2Operation {
         for entry in std::mem::take(&mut self.resolved) {
             match entry {
                 ResolvedEntry::Object(object) => self.objects.push(object),
-                ResolvedEntry::AwaitingLocation(head) => {
+                ResolvedEntry::AwaitingLocation {
+                    head,
+                    version_created_at,
+                } => {
                     let Some((_key, value)) = locations.next() else {
                         return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
                     };
@@ -512,6 +523,7 @@ impl ListObjectsV2Operation {
                         location: Some(location),
                         source_metadata: None,
                         last_refresh: None,
+                        version_created_at: Some(version_created_at),
                     });
                 }
             }

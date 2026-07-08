@@ -350,8 +350,7 @@ pub(crate) fn s3_checksum_algorithm_from_core(
 #[cfg(test)]
 mod tests {
     use super::{
-        checksum_response_hashes,
-        get_s3_operation_permission, is_anonymous_object_read_operation,
+        checksum_response_hashes, get_s3_operation_permission, is_anonymous_object_read_operation,
         parse_copy_source, parse_copy_source_range, parse_multipart_part_number,
         validate_object_key,
     };

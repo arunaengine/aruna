@@ -95,6 +95,8 @@ pub enum CompleteMultipartUploadError {
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
     ChecksumMismatch(&'static str),
+    #[error("multipart completion checksum contract does not match the initiation request")]
+    ChecksumContractMismatch,
     #[error("missing MD5 hash for part etag validation")]
     MissingPartEtag,
     #[error("part etag mismatch")]
@@ -125,7 +127,9 @@ pub struct CompleteMultipartUploadInput {
     pub node_id: NodeId,
     pub completed_parts: Vec<CompleteMultipartPart>,
     pub expected_checksums: Vec<ExpectedChecksum>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: MultipartChecksumType,
+    pub checksum_type_explicit: bool,
     pub object_size: Option<u64>,
     pub created_by: UserId,
     /// Hard ceiling (bytes) the group's realm-wide `logical_bytes` may reach,
@@ -257,6 +261,37 @@ impl CompleteMultipartUploadOperation {
         Ok(())
     }
 
+    fn validate_checksum_contract(
+        &self,
+        record: &MultipartUpload,
+    ) -> Result<(), CompleteMultipartUploadError> {
+        let Some(hint) = record.checksum_hint.as_ref() else {
+            return Ok(());
+        };
+
+        if hint.checksum_type != self.input.checksum_type {
+            return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+        }
+        if hint.checksum_type == MultipartChecksumType::Composite
+            && !self.input.checksum_type_explicit
+        {
+            return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+        }
+
+        if let Some(algorithm) = hint.algorithm {
+            let matching_expected = self
+                .input
+                .expected_checksums
+                .iter()
+                .any(|checksum| checksum.algorithm == algorithm);
+            if self.input.checksum_algorithm != Some(algorithm) || !matching_expected {
+                return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+            }
+        }
+
+        Ok(())
+    }
+
     fn alias_context(&self) -> Result<HeadAliasContext, CompleteMultipartUploadError> {
         let Some(upload_record) = self.upload_record.as_ref() else {
             return Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -303,6 +338,9 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         if let Err(err) = self.validate_upload_target(&record) {
+            return self.emit_error(err);
+        }
+        if let Err(err) = self.validate_checksum_contract(&record) {
             return self.emit_error(err);
         }
 
@@ -1329,7 +1367,9 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             completed_parts: vec![],
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some(10),
             created_by: UserId::local(Ulid::r#gen(), realm_id),
             quota_ceiling: Some(30),

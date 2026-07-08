@@ -72,6 +72,7 @@ pub struct HeadObjectResult {
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
     pub last_refresh: Option<SystemTime>,
+    pub version_created_at: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
@@ -87,6 +88,7 @@ pub struct HeadObjectOperation {
     location: Option<BackendLocation>,
     source_metadata: Option<SourceMetadata>,
     last_refresh: Option<SystemTime>,
+    version_created_at: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -103,6 +105,7 @@ impl HeadObjectOperation {
             location: None,
             source_metadata: None,
             last_refresh: None,
+            version_created_at: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
             composite_hashes: HashMap::new(),
@@ -243,6 +246,7 @@ impl HeadObjectOperation {
             BlobVersionState::Materialized { blob_hash, .. } => {
                 self.source_metadata = None;
                 self.last_refresh = None;
+                self.version_created_at = Some(version.created_at);
                 self.read_blob_location(blob_hash)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
@@ -258,6 +262,7 @@ impl HeadObjectOperation {
                 self.location = None;
                 self.source_metadata = Some(cached_metadata);
                 self.last_refresh = Some(last_refresh);
+                self.version_created_at = None;
                 self.finish_lookup()
             }
         }
@@ -355,6 +360,7 @@ impl HeadObjectOperation {
             location: self.location.clone(),
             source_metadata: self.source_metadata.clone(),
             last_refresh: self.last_refresh,
+            version_created_at: self.version_created_at,
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,

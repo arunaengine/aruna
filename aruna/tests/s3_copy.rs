@@ -3,7 +3,7 @@ mod shared;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use shared::{
     SeedNode, TestResult, create_bearer_token, create_group_via_http,
     create_s3_credentials_via_http, s3_client, spawn_full_seed_node,
@@ -137,6 +137,39 @@ async fn copy_object_with_version_id_source_copies_old_version() -> TestResult<(
             .await?;
         let dest_bytes = dest.body.collect().await?.into_bytes().to_vec();
         assert_eq!(dest_bytes, old_body);
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn copy_object_metadata_replace_is_rejected_until_metadata_is_persisted() -> TestResult<()> {
+    let (seed, client) = s3_setup("s3-copy-metadata-replace").await?;
+
+    let result = async {
+        let bucket = "s3-copy-metadata-replace";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("source.txt")
+            .body(ByteStream::from_static(b"metadata replacement source"))
+            .send()
+            .await?;
+
+        let copy = client
+            .copy_object()
+            .bucket(bucket)
+            .key("dest.txt")
+            .copy_source(format!("{bucket}/source.txt"))
+            .metadata_directive(MetadataDirective::Replace)
+            .send()
+            .await;
+        assert_eq!(service_error_code(&copy).as_deref(), Some("NotImplemented"));
+
         Ok(())
     }
     .await;

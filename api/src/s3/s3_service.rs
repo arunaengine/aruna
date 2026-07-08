@@ -2,7 +2,8 @@
 
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
-    encode_checksums, parse_upload_checksum_request, validate_composite_part_count,
+    encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+    validate_composite_part_count,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
@@ -177,6 +178,21 @@ fn copy_source_conditions(
             .map(timestamp_to_system_time)
             .transpose()?,
     })
+}
+
+fn parse_upload_id_marker(
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> S3Result<Option<ulid::Ulid>> {
+    let Some(_) = key_marker.filter(|marker| !marker.is_empty()) else {
+        return Ok(None);
+    };
+    upload_id_marker
+        .map(|marker| {
+            ulid::Ulid::from_string(marker)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid upload-id-marker"))
+        })
+        .transpose()
 }
 
 #[derive(Clone)]
@@ -582,6 +598,7 @@ impl ArunaS3Service {
         location: Option<&aruna_core::structs::BackendLocation>,
         source_metadata: Option<&aruna_core::structs::SourceMetadata>,
         last_refresh: Option<SystemTime>,
+        version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
         ObjectResponseFields {
             content_length: location
@@ -603,8 +620,9 @@ impl ArunaS3Service {
                             .and_then(|etag| ETag::from_str(etag).ok())
                     })
                 }),
-            last_modified: location
-                .map(|location| location.created_at.into())
+            last_modified: version_created_at
+                .map(Into::into)
+                .or_else(|| location.map(|location| location.created_at.into()))
                 .or_else(|| {
                     source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
                 }),
@@ -996,6 +1014,7 @@ impl S3 for ArunaS3Service {
                     object.location.as_ref(),
                     object.source_metadata.as_ref(),
                     object.last_refresh,
+                    object.version_created_at,
                 );
                 Object {
                     e_tag: response_fields.e_tag,
@@ -1157,11 +1176,13 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(MetadataDirective::as_str)
             == Some(MetadataDirective::REPLACE);
-        if source_bucket == dest_bucket
-            && source_key == dest_key
-            && source_version_id.is_none()
-            && !metadata_replace
-        {
+        if metadata_replace {
+            return Err(s3_error!(
+                NotImplemented,
+                "MetadataDirective=REPLACE is not supported until object metadata is persisted."
+            ));
+        }
+        if source_bucket == dest_bucket && source_key == dest_key && source_version_id.is_none() {
             return Err(s3_error!(
                 InvalidRequest,
                 "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
@@ -1360,6 +1381,17 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
+        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let part_number =
+            parse_multipart_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?;
+        let range = parse_copy_source_range(req.input.copy_source_range.as_deref())?;
+        let conditions = copy_source_conditions(
+            req.input.copy_source_if_match.as_ref(),
+            req.input.copy_source_if_none_match.as_ref(),
+            req.input.copy_source_if_modified_since.as_ref(),
+            req.input.copy_source_if_unmodified_since.as_ref(),
+        )?;
+
         let (source_bucket, source_key, source_version_id) =
             parse_copy_source(&req.input.copy_source)?;
 
@@ -1396,17 +1428,6 @@ impl S3 for ArunaS3Service {
         if !source_allowed {
             return Err(s3_error!(AccessDenied, "Permission denied"));
         }
-
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
-        let part_number =
-            parse_multipart_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?;
-        let range = parse_copy_source_range(req.input.copy_source_range.as_deref())?;
-        let conditions = copy_source_conditions(
-            req.input.copy_source_if_match.as_ref(),
-            req.input.copy_source_if_none_match.as_ref(),
-            req.input.copy_source_if_modified_since.as_ref(),
-            req.input.copy_source_if_unmodified_since.as_ref(),
-        )?;
 
         let result = upload_part_copy(
             &self.state,
@@ -1471,7 +1492,7 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let checksum_request = parse_complete_multipart_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
@@ -1501,7 +1522,9 @@ impl S3 for ArunaS3Service {
             node_id: self.node_id,
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),
+            checksum_algorithm: checksum_request.response_algorithm,
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
+            checksum_type_explicit: checksum_request.checksum_type_declared,
             object_size: req.input.mpu_object_size.map(|size| size as u64),
             created_by: user_access.user_identity,
             quota_ceiling,
@@ -1600,6 +1623,7 @@ impl S3 for ArunaS3Service {
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             result.last_refresh,
+            result.version_created_at,
         );
         let blob = if let Some(refresh) = reference_refresh {
             attach_reference_metadata_refresh(result.blob, self.state.clone(), refresh)
@@ -1720,6 +1744,7 @@ impl S3 for ArunaS3Service {
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             None,
+            result.version_created_at,
         );
 
         let composite_hashes = result
@@ -1847,6 +1872,7 @@ impl S3 for ArunaS3Service {
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             result.last_refresh,
+            result.version_created_at,
         );
         let mut output = HeadObjectOutput {
             content_length: response_fields.content_length,
@@ -1999,13 +2025,8 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
         let requested_upload_id_marker = req.input.upload_id_marker.clone();
-        let upload_id_marker = match requested_upload_id_marker.as_deref() {
-            None => None,
-            Some(marker) => Some(
-                ulid::Ulid::from_string(marker)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid upload-id-marker"))?,
-            ),
-        };
+        let upload_id_marker =
+            parse_upload_id_marker(key_marker.as_deref(), requested_upload_id_marker.as_deref())?;
         let max_uploads = match req.input.max_uploads {
             None => ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
             Some(max_uploads) => usize::try_from(max_uploads)
@@ -2180,6 +2201,7 @@ impl S3 for ArunaS3Service {
                         location.as_ref(),
                         source_metadata.as_ref(),
                         None,
+                        Some(created_at),
                     );
                     versions.push(ObjectVersion {
                         key: Some(encode_field(key)),
@@ -2568,6 +2590,25 @@ mod tests {
         created_by: UserId,
     }
 
+    #[test]
+    fn upload_id_marker_is_ignored_without_key_marker() {
+        assert_eq!(
+            parse_upload_id_marker(None, Some("not-a-ulid")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_upload_id_marker(Some(""), Some("not-a-ulid")).unwrap(),
+            None
+        );
+
+        let marker = Ulid::new();
+        assert_eq!(
+            parse_upload_id_marker(Some("key"), Some(&marker.to_string())).unwrap(),
+            Some(marker)
+        );
+        assert!(parse_upload_id_marker(Some("key"), Some("not-a-ulid")).is_err());
+    }
+
     #[tokio::test]
     async fn put_response_ignores_post_commit_live_replication_queue_failure() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -2621,6 +2662,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
             composite_part_count: None,
         };
         let response = service
@@ -2798,6 +2840,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
             composite_part_count: None,
         };
 
@@ -2872,6 +2915,7 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
             composite_part_count: None,
         };
 

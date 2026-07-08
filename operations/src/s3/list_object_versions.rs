@@ -450,20 +450,29 @@ impl ListObjectVersionsOperation {
             return self.issue_version_iter(&key);
         }
 
-        // Window holds oldest -> newest; reverse for newest-first output.
+        // Window holds oldest -> newest; sort by the stored version timestamp
+        // so same-millisecond ULID randomness cannot put the current head behind
+        // an older sibling.
         let mut versions: Vec<(Ulid, BlobVersion)> = self.version_window.drain(..).collect();
-        versions.reverse();
+        versions.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| (*right_id == head_version_id).cmp(&(*left_id == head_version_id)))
+                .then_with(|| right_id.cmp(left_id))
+        });
 
         let apply_marker = self.input.key_marker.as_deref() == Some(key.as_str());
         let version_marker = self.input.version_id_marker;
+        let mut marker_seen = !apply_marker || version_marker.is_none();
 
         let mut location_reads = Vec::new();
         let mut pending = Vec::new();
         for (version_id, version) in versions {
-            if apply_marker
-                && let Some(marker) = version_marker
-                && version_id >= marker
-            {
+            if !marker_seen {
+                if Some(version_id) == version_marker {
+                    marker_seen = true;
+                }
                 continue;
             }
             let is_latest = version_id == head_version_id;
@@ -864,6 +873,47 @@ mod test {
             other => panic!("expected version, got {other:?}"),
         }
         assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_puts_same_timestamp_head_first() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        let versions = ordered_ulids(2);
+        let (newer_head, older_with_larger_ulid) = (versions[0], versions[1]);
+        seed_materialized(&storage_handle, "obj", older_with_larger_ulid, [1u8; 32]).await;
+        seed_materialized(&storage_handle, "obj", newer_head, [2u8; 32]).await;
+        seed_head(&storage_handle, "obj", newer_head).await;
+
+        let result = drive(
+            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.items.len(), 2);
+        assert!(matches!(
+            &result.items[0],
+            ListObjectVersionsItem::Version {
+                version_id,
+                is_latest: true,
+                ..
+            } if *version_id == newer_head
+        ));
+        assert!(matches!(
+            &result.items[1],
+            ListObjectVersionsItem::Version {
+                version_id,
+                is_latest: false,
+                ..
+            } if *version_id == older_with_larger_ulid
+        ));
     }
 
     #[tokio::test]

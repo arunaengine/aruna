@@ -56,9 +56,9 @@ fn normalize_etag(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
-fn etag_matches(expected: &str, actual: Option<&str>) -> bool {
+fn etag_matches(expected: &str, actual: Option<&str>, source_exists: bool) -> bool {
     if expected == "*" {
-        return actual.is_some();
+        return source_exists;
     }
     actual.is_some_and(|actual| normalize_etag(actual) == normalize_etag(expected))
 }
@@ -67,11 +67,12 @@ pub(crate) fn evaluate_source_conditions(
     conditions: &CopySourceConditions,
     etag: Option<&str>,
     last_modified: Option<SystemTime>,
+    source_exists: bool,
 ) -> Result<(), CopyObjectError> {
     // AWS precedence: x-amz-copy-source-if-match overrides if-unmodified-since.
     match conditions.if_match.as_deref() {
         Some(expected) => {
-            if !etag_matches(expected, etag) {
+            if !etag_matches(expected, etag, source_exists) {
                 return Err(CopyObjectError::PreconditionFailed);
             }
         }
@@ -87,7 +88,7 @@ pub(crate) fn evaluate_source_conditions(
     // AWS precedence: x-amz-copy-source-if-none-match overrides if-modified-since.
     match conditions.if_none_match.as_deref() {
         Some(expected) => {
-            if etag_matches(expected, etag) {
+            if etag_matches(expected, etag, source_exists) {
                 return Err(CopyObjectError::PreconditionFailed);
             }
         }
@@ -124,9 +125,8 @@ pub async fn copy_object(
 
     let source_version_id = source.version_id;
     let source_last_modified = source
-        .location
-        .as_ref()
-        .map(|location| location.created_at)
+        .version_created_at
+        .or_else(|| source.location.as_ref().map(|location| location.created_at))
         .or_else(|| {
             source
                 .source_metadata
@@ -151,6 +151,7 @@ pub async fn copy_object(
         &input.conditions,
         source_etag.as_deref(),
         source_last_modified,
+        true,
     )?;
 
     let materialized = source.location.is_some();
@@ -412,12 +413,11 @@ mod test {
         .await
         .unwrap();
 
+        let source_version =
+            read_dest_version(&context, "bucket", "source.txt", source.version_id).await;
         assert_eq!(result.location, source.location);
         assert_eq!(result.source_version_id, Some(source.version_id));
-        assert_eq!(
-            result.source_last_modified,
-            Some(source.location.created_at)
-        );
+        assert_eq!(result.source_last_modified, Some(source_version.created_at));
         // The copy dedups onto the source location, but its last-modified must
         // come from the fresh destination version, not the source's timestamp.
         assert_eq!(
@@ -429,6 +429,7 @@ mod test {
         let dest_version =
             read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
         assert!(dest_version.is_materialized());
+        assert_eq!(dest_version.created_at, result.created_at);
     }
 
     #[tokio::test]
@@ -594,16 +595,39 @@ mod test {
             if_match: Some("abc".to_string()),
             ..Default::default()
         };
-        assert!(evaluate_source_conditions(&conditions, Some("abc"), None).is_ok());
-        assert!(evaluate_source_conditions(&conditions, Some("\"abc\""), None).is_ok());
+        assert!(evaluate_source_conditions(&conditions, Some("abc"), None, true).is_ok());
+        assert!(evaluate_source_conditions(&conditions, Some("\"abc\""), None, true).is_ok());
         assert_eq!(
-            evaluate_source_conditions(&conditions, Some("def"), None),
+            evaluate_source_conditions(&conditions, Some("def"), None, true),
             Err(CopyObjectError::PreconditionFailed)
         );
         assert_eq!(
-            evaluate_source_conditions(&conditions, None, None),
+            evaluate_source_conditions(&conditions, None, None, true),
             Err(CopyObjectError::PreconditionFailed)
         );
+    }
+
+    #[test]
+    fn wildcard_etag_conditions_use_source_existence() {
+        let if_match = CopySourceConditions {
+            if_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_source_conditions(&if_match, None, None, true).is_ok());
+        assert_eq!(
+            evaluate_source_conditions(&if_match, None, None, false),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+
+        let if_none_match = CopySourceConditions {
+            if_none_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&if_none_match, None, None, true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&if_none_match, None, None, false).is_ok());
     }
 
     #[test]
@@ -613,10 +637,10 @@ mod test {
             ..Default::default()
         };
         assert_eq!(
-            evaluate_source_conditions(&conditions, Some("abc"), None),
+            evaluate_source_conditions(&conditions, Some("abc"), None, true),
             Err(CopyObjectError::PreconditionFailed)
         );
-        assert!(evaluate_source_conditions(&conditions, Some("def"), None).is_ok());
+        assert!(evaluate_source_conditions(&conditions, Some("def"), None, true).is_ok());
     }
 
     #[test]
@@ -627,10 +651,15 @@ mod test {
             ..Default::default()
         };
         assert_eq!(
-            evaluate_source_conditions(&conditions, None, Some(threshold + Duration::from_secs(1))),
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_secs(1)),
+                true,
+            ),
             Err(CopyObjectError::PreconditionFailed)
         );
-        assert!(evaluate_source_conditions(&conditions, None, Some(threshold)).is_ok());
+        assert!(evaluate_source_conditions(&conditions, None, Some(threshold), true).is_ok());
     }
 
     #[test]
@@ -641,12 +670,17 @@ mod test {
             ..Default::default()
         };
         assert_eq!(
-            evaluate_source_conditions(&conditions, None, Some(threshold)),
+            evaluate_source_conditions(&conditions, None, Some(threshold), true),
             Err(CopyObjectError::PreconditionFailed)
         );
         assert!(
-            evaluate_source_conditions(&conditions, None, Some(threshold + Duration::from_secs(1)))
-                .is_ok()
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_secs(1)),
+                true,
+            )
+            .is_ok()
         );
     }
 

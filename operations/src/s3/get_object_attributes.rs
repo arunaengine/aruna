@@ -68,6 +68,7 @@ pub struct GetObjectAttributesInput {
 pub struct GetObjectAttributesResult {
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
+    pub version_created_at: Option<std::time::SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
@@ -82,6 +83,7 @@ pub struct GetObjectAttributesOperation {
     txn_id: Option<Ulid>,
     location: Option<BackendLocation>,
     source_metadata: Option<SourceMetadata>,
+    version_created_at: Option<std::time::SystemTime>,
     resolved_version_id: Option<Ulid>,
     summary: Option<MultipartObjectSummary>,
     parts: Vec<MultipartObjectPart>,
@@ -96,6 +98,7 @@ impl GetObjectAttributesOperation {
             txn_id: None,
             location: None,
             source_metadata: None,
+            version_created_at: None,
             resolved_version_id: None,
             summary: None,
             parts: Vec::new(),
@@ -226,6 +229,7 @@ impl GetObjectAttributesOperation {
         match version.state {
             BlobVersionState::Materialized { blob_hash, .. } => {
                 self.source_metadata = None;
+                self.version_created_at = Some(version.created_at);
                 self.read_blob_location(blob_hash)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
@@ -238,6 +242,7 @@ impl GetObjectAttributesOperation {
             } => {
                 self.location = None;
                 self.source_metadata = Some(cached_metadata);
+                self.version_created_at = None;
                 self.finish_lookup()
             }
         }
@@ -373,6 +378,7 @@ impl GetObjectAttributesOperation {
         self.output = Some(Ok(GetObjectAttributesResult {
             location: self.location.clone(),
             source_metadata: self.source_metadata.clone(),
+            version_created_at: self.version_created_at,
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type,
