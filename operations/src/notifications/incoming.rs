@@ -315,6 +315,41 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
                 );
             }
         }
+        NotificationKind::MetadataCreated {
+            path,
+            group_id,
+            document_id,
+            actor_user_id,
+        } => {
+            if path.is_empty() {
+                return Err("notification record has empty path".to_string());
+            }
+            if group_id.is_nil() {
+                return Err("notification record has empty group_id".to_string());
+            }
+            if document_id.is_nil() {
+                return Err("notification record has empty document_id".to_string());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
+        NotificationKind::DataUploaded {
+            path,
+            bucket,
+            key,
+            actor_user_id,
+            ..
+        } => {
+            if path.is_empty() {
+                return Err("notification record has empty path".to_string());
+            }
+            if bucket.is_empty() {
+                return Err("notification record has empty bucket".to_string());
+            }
+            if key.is_empty() {
+                return Err("notification record has empty key".to_string());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
     }
     Ok(())
 }
@@ -833,6 +868,29 @@ mod tests {
         let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
             .await
             .expect_err("batch containing invalid kind user must be rejected");
+        assert!(
+            error.contains("empty actor_user_id"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_with_invalid_watch_actor_is_rejected_without_partial_write() {
+        let (a, b, recipient) = delivery_pair(83).await;
+        let valid = record(recipient, 1);
+        let mut invalid = record(recipient, 2);
+        invalid.kind = NotificationKind::DataUploaded {
+            path: "bucket/object".to_string(),
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            size_bytes: 0,
+            actor_user_id: UserId::nil(recipient.realm_id),
+        };
+
+        let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
+            .await
+            .expect_err("batch containing invalid watch actor must be rejected");
         assert!(
             error.contains("empty actor_user_id"),
             "unexpected reject reason: {error}"
@@ -1412,7 +1470,7 @@ mod tests {
         let a = spawn(realm_id, [80u8; 32]).await;
         let b = spawn(realm_id, [81u8; 32]).await;
         connect(&a, &b).await;
-        install_config(
+        let config = install_config(
             &b,
             realm_id,
             &[
@@ -1422,7 +1480,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
         let batch = vec![record(recipient, 1)];
         let mut wakes = b.net.subscribe_notification_wakes();
 
@@ -1452,7 +1510,7 @@ mod tests {
         let a = spawn(realm_id, [82u8; 32]).await;
         let b = spawn(realm_id, [83u8; 32]).await;
         connect(&a, &b).await;
-        install_config(
+        let config = install_config(
             &b,
             realm_id,
             &[
@@ -1462,7 +1520,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
         let records = vec![record(recipient, 1), record(recipient, 2)];
         seed_inbox(&b, &records).await;
         let ids: Vec<Ulid> = records

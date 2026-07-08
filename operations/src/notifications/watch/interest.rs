@@ -135,6 +135,9 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
                 local_node_id: node_id,
                 excluded_peers: Vec::new(),
                 documents: vec![target],
+                // Watch-interest digests ride one shared realm topic; steady-state
+                // digest publishers must not fork genesis.
+                allow_genesis: false,
             }),
             ctx,
         )

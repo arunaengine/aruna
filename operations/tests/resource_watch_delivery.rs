@@ -1,21 +1,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
     Actor, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass, NotificationKind,
     NotificationRecord, RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail,
-    WatchEventKind, WatchEventMask, WatchSubscription, watch_notification_id,
+    WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    watch_interest_node_key, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::dispatch::{
     WatchDispatchError, create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
@@ -23,6 +26,9 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -484,6 +490,9 @@ async fn build_realm_nodes(
     }
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, *realm_id).await?;
+    // Mirror production core-document announcement: the shared watch-interest
+    // topic is bootstrapped once, then dirty digest publishes use false.
+    bootstrap_watch_interest_topic(&nodes, *realm_id).await?;
     Ok(nodes)
 }
 
@@ -565,6 +574,77 @@ async fn install_realm_config(
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
     Ok(())
+}
+
+async fn bootstrap_watch_interest_topic(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(publisher) = nodes.first() else {
+        return Ok(());
+    };
+    let node_id = publisher.net.node_id();
+    let digest = WatchInterestDigest {
+        node_id,
+        entries: Vec::new(),
+    };
+    let key = watch_interest_node_key(realm_id, node_id);
+
+    match publisher
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key: key.clone().into(),
+            value: digest.to_bytes()?.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected watch-interest digest write: {other:?}").into()),
+    }
+
+    drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![DocumentSyncTarget::WatchInterest { realm_id, node_id }],
+            allow_genesis: true,
+        }),
+        publisher.context.as_ref(),
+    )
+    .await?;
+
+    for node in nodes {
+        wait_for(POLL_TIMEOUT, || async {
+            read_watch_interest_digest(node, key.clone())
+                .await
+                .is_some()
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+async fn read_watch_interest_digest(node: &TestNode, key: Vec<u8>) -> Option<WatchInterestDigest> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => WatchInterestDigest::from_bytes(bytes.as_ref()).ok(),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
+        other => panic!("unexpected watch-interest digest read: {other:?}"),
+    }
 }
 
 async fn wait_for<F, Fut>(
