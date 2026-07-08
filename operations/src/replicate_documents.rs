@@ -174,7 +174,7 @@ impl ReplicateDocumentsOperation {
             )))
         };
 
-        if selected_peers.is_empty() {
+        if selected_peers.is_empty() && !matches!(document, DocumentSyncTarget::NodeUsage { .. }) {
             return match self.emit_placement_update() {
                 Ok(effects) => effects,
                 Err(error) => self.fail(error),
@@ -358,6 +358,14 @@ mod tests {
         }
     }
 
+    fn node_usage_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        }
+    }
+
     #[test]
     fn task_schedule_error_is_non_blocking_after_placement_write() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -423,6 +431,28 @@ mod tests {
         };
         assert_eq!(record.authoritative_node_id, local_node_id);
         assert_eq!(record.selected_peers, vec![node(2)]);
+    }
+
+    #[test]
+    fn shared_node_usage_publishes_without_remote_peers() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = node_usage_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_nodes = vec![local_node_id];
+
+        let effects = operation.emit_next_publish();
+
+        assert!(
+            matches!(operation.placement_action, Some(PlacementAction::Write(ref record)) if record.target == target)
+        );
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 
     #[test]
