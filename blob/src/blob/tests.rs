@@ -440,7 +440,7 @@ fn parse_replication_init_uses_message_id_when_unknown() {
 #[tokio::test]
 async fn control_plane_timeout_reports_read_timeout() {
     let event = with_control_plane_timeout(
-        tokio::time::sleep(Duration::from_millis(10)),
+        std::future::pending::<()>(),
         Duration::from_millis(1),
         ControlPlaneTimeoutKind::Read,
         "reading replication control message",

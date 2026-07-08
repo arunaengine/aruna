@@ -688,6 +688,8 @@ async fn seed_realm_config_sync_topic(
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let placement = aruna_operations::placement::placement_ref_for_target(config, &target, None);
+    let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),
         user_id: aruna_core::UserId::nil(realm_id),
@@ -713,6 +715,7 @@ async fn seed_realm_config_sync_topic(
                 documents: vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(event),
+                    placement,
                     allow_genesis: true,
                 }],
                 peers: Vec::new(),
@@ -730,7 +733,7 @@ async fn seed_realm_config_sync_topic(
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::SyncDocuments {
-                targets: vec![target],
+                topics: vec![topic],
                 peers: Vec::new(),
             },
         )))

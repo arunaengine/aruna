@@ -1728,8 +1728,8 @@ mod tests {
             );
         }
 
-        // One later record for a shared (non-shard) topic, ordered strictly after
-        // the head page, so only pagination reaches it.
+        // One later origin record for a shared (non-shard) topic, ordered
+        // strictly after the head page, so only pagination reaches it.
         let publish_record = crate::document_sync_outbox::new_outbox_record_with_id(
             Ulid::from_parts(2, 0),
             node(1),
@@ -1740,7 +1740,7 @@ mod tests {
                 change: change(),
             },
             aruna_core::structs::PlacementRef::NIL,
-            false,
+            true,
         );
         let publish_key = outbox_key(&publish_record).to_vec();
         writes
