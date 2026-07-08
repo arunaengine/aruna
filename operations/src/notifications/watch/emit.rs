@@ -11,12 +11,14 @@ use crate::driver::DriverContext;
 use crate::notifications::watch::outbox::{
     new_watch_forward_outbox_record, schedule_watch_forward_outbox_drain_effect,
 };
+use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the event
-/// against the in-memory realm interest table, writes one durable forward-outbox
-/// row per interested holder node, and schedules the drain. Every failure warns;
-/// nothing propagates and nothing panics, so a lost watch event never affects the
-/// host operation. An unmatched event writes nothing.
+/// against the in-memory realm interest table plus local durable subscriptions
+/// that may not have published their digest yet, writes one durable
+/// forward-outbox row per interested holder node, and schedules the drain. Every
+/// failure warns; nothing propagates and nothing panics, so a lost watch event
+/// never affects the host operation. An unmatched event writes nothing.
 pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEvent) {
     // Watches are a user-plane feature; system/anonymous writes carry a nil actor
     // and are deliberately not emitted.
@@ -27,14 +29,22 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
     let Some(net_handle) = context.net_handle.as_ref() else {
         return;
     };
-    let holders = net_handle.watch_interest_snapshot().matching_nodes(
+    let mut holders = net_handle.watch_interest_snapshot().matching_nodes(
         event.realm_id,
         &event.path,
         event.kind,
     );
+    if let Err(error) =
+        include_local_holder_from_subscriptions(context, &event, net_handle.node_id(), &mut holders)
+            .await
+    {
+        warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+    }
     if holders.is_empty() {
         return;
     }
+    holders.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    holders.dedup();
 
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(holders.len());
     for holder in holders {
@@ -70,6 +80,28 @@ pub async fn emit_resource_watch_event(context: &DriverContext, event: WatchEven
     schedule_watch_forward_outbox_drain(context).await;
 }
 
+async fn include_local_holder_from_subscriptions(
+    context: &DriverContext,
+    event: &WatchEvent,
+    local_node_id: aruna_core::NodeId,
+    holders: &mut Vec<aruna_core::NodeId>,
+) -> Result<(), String> {
+    if holders.contains(&local_node_id) {
+        return Ok(());
+    }
+
+    let subscriptions = list_realm_watch_subscriptions(&context.storage_handle, event.realm_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if subscriptions.iter().any(|subscription| {
+        subscription.event_mask.contains(event.kind)
+            && event.path.starts_with(subscription.path_prefix.as_str())
+    }) {
+        holders.push(local_node_id);
+    }
+    Ok(())
+}
+
 async fn schedule_watch_forward_outbox_drain(context: &DriverContext) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
@@ -95,6 +127,8 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
+
+    use crate::notifications::watch::subscriptions::create_watch_subscription;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -182,6 +216,29 @@ mod tests {
         let actor = UserId::new(Ulid::new(), realm);
         emit_resource_watch_event(&ctx, upload_event(realm, actor, "bucket/object")).await;
         assert!(read_outbox_rows(&ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_subscription_matches_before_interest_publish() {
+        let realm = RealmId([1u8; 32]);
+        let (_dir, ctx, net) = ctx_with_net(realm, [84u8; 32]).await;
+        let owner = UserId::new(Ulid::new(), realm);
+        create_watch_subscription(
+            &ctx.storage_handle,
+            owner,
+            "bucket/".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("subscription creates");
+
+        let actor = UserId::new(Ulid::new(), realm);
+        emit_resource_watch_event(&ctx, upload_event(realm, actor, "bucket/object")).await;
+
+        let rows = read_outbox_rows(&ctx).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].holder_node, net.node_id());
     }
 
     #[tokio::test]
