@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::document_sync_outbox::{
-    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+    new_outbox_record_with_id, schedule_outbox_drain_effect, write_outbox_effect,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataHandle;
@@ -17,7 +17,7 @@ use crate::replication::incoming_version_replication::IncomingVersionReplication
 use crate::replication::protocol::VersionReplicationMessage;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
-    DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
+    DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -314,7 +314,7 @@ impl InboundEventHandler for OperationsInboundHandler {
         .await;
     }
 
-    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncPublish>) {
+    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) {
         reemit_evicted_documents(self.context.as_ref(), documents).await;
     }
 }
@@ -327,30 +327,25 @@ impl InboundEventHandler for OperationsInboundHandler {
 /// `allow_genesis: false` (the loser must not mint a rival genesis) and empty
 /// peers (resolved to the realm default set at the net layer, exactly like the
 /// mutation operations that originate admin events).
-async fn reemit_evicted_documents(context: &DriverContext, documents: Vec<DocumentSyncPublish>) {
+async fn reemit_evicted_documents(
+    context: &DriverContext,
+    documents: Vec<DocumentSyncEvictedDocument>,
+) {
     let Some(net_handle) = context.net_handle.as_ref() else {
         warn!("Cannot re-emit evicted documents without net handle");
         return;
     };
     let node_id = net_handle.node_id();
     let mut written = 0usize;
-    for publish in documents {
-        let allow_genesis = publish.allow_genesis();
-        let (target, event) = match publish {
-            DocumentSyncPublish::Upsert {
-                target,
-                bytes,
-                change,
-                ..
-            } => (target, DocumentSyncOutboxEvent::Upsert { bytes, change }),
-            DocumentSyncPublish::AdminOperation { target, event, .. } => {
-                (target, DocumentSyncOutboxEvent::AdminOperation { event })
-            }
-            DocumentSyncPublish::Delete { target, change, .. } => {
-                (target, DocumentSyncOutboxEvent::Delete { change })
-            }
-        };
-        let record = new_outbox_record(node_id, target, Vec::new(), event, allow_genesis);
+    for document in documents {
+        let record = new_outbox_record_with_id(
+            document.event_id.unwrap_or_else(ulid::Ulid::new),
+            node_id,
+            document.target,
+            Vec::new(),
+            document.event,
+            document.allow_genesis,
+        );
         let effect = match write_outbox_effect(&record) {
             Ok(effect) => effect,
             Err(error) => {
