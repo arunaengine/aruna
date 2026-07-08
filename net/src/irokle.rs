@@ -17,8 +17,9 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncNetEvent,
-    DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
+    DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
+    DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -196,15 +197,15 @@ impl DocumentSyncService {
         self.eviction_rx.lock().take()
     }
 
-    /// Decodes a genesis tie-break eviction into the document publishes that
-    /// must be re-emitted onto the winning chain. Every publish sets
+    /// Decodes a genesis tie-break eviction into the document outbox events that
+    /// must be re-emitted onto the winning chain. Every item sets
     /// `allow_genesis: false` so the loser replays through the normal outbox
-    /// drain instead of minting a rival genesis, and admin events keep their
-    /// embedded event id (appliers dedupe on it). Control ops are skipped,
+    /// drain instead of minting a rival genesis, and original ids are preserved
+    /// where the outbox format can carry them. Control ops are skipped,
     /// whole-document admin poison is dropped with a warning (mirroring the
     /// reconcile skip arm), and ops not authored by the local node are rejected
     /// since an eviction is by construction the local node's own chain.
-    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncPublish> {
+    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
         let local_peer = self.node.peer_id();
         let mut documents = Vec::new();
         for evicted in eviction.evicted {
@@ -234,9 +235,10 @@ impl DocumentSyncService {
             };
             match event {
                 DocumentSyncEvent::AdminOperation { target, event } => {
-                    documents.push(DocumentSyncPublish::AdminOperation {
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: None,
                         target,
-                        event,
+                        event: DocumentSyncOutboxEvent::AdminOperation { event },
                         allow_genesis: false,
                     });
                 }
@@ -254,11 +256,10 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    documents.push(DocumentSyncPublish::Upsert {
-                        event_id,
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: Some(event_id),
                         target,
-                        bytes,
-                        change,
+                        event: DocumentSyncOutboxEvent::Upsert { bytes, change },
                         allow_genesis: false,
                     });
                 }
@@ -275,10 +276,10 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    documents.push(DocumentSyncPublish::Delete {
-                        event_id,
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: Some(event_id),
                         target,
-                        change,
+                        event: DocumentSyncOutboxEvent::Delete { change },
                         allow_genesis: false,
                     });
                 }
@@ -7480,18 +7481,22 @@ mod tests {
         // and allow_genesis cleared.
         let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
         assert_eq!(reemitted.len(), 1);
-        match &reemitted[0] {
-            DocumentSyncPublish::AdminOperation {
-                target: reemit_target,
-                event,
-                allow_genesis,
-            } => {
-                assert_eq!(reemit_target, &target);
+        let reemitted = &reemitted[0];
+        assert_eq!(&reemitted.target, &target);
+        assert!(
+            !reemitted.allow_genesis,
+            "re-emission must not mint a rival genesis"
+        );
+        assert!(
+            reemitted.event_id.is_none(),
+            "admin outbox re-emission uses the embedded admin event id"
+        );
+        match &reemitted.event {
+            DocumentSyncOutboxEvent::AdminOperation { event } => {
                 assert_eq!(
                     event.event_id, loser_event_id,
                     "embedded admin event id must survive for applier dedup"
                 );
-                assert!(!allow_genesis, "re-emission must not mint a rival genesis");
             }
             other => panic!("expected an AdminOperation re-emission, got {other:?}"),
         }

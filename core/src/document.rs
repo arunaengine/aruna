@@ -89,6 +89,14 @@ pub enum DocumentSyncOutboxEvent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentSyncEvictedDocument {
+    pub event_id: Option<Ulid>,
+    pub target: DocumentSyncTarget,
+    pub event: DocumentSyncOutboxEvent,
+    pub allow_genesis: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DocumentSyncRevision {
     pub generation: u64,

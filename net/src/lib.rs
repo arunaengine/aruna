@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
+};
 use aruna_core::effects::StorageEffect;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
@@ -349,11 +351,8 @@ pub trait InboundEventHandler: Send + Sync {
 
     /// Re-emits the documents recovered from a genesis tie-break eviction: the
     /// loser's own payloads, decoded from the reset chain, to be replayed onto
-    /// the winning genesis (each carries `allow_genesis: false`, and admin
-    /// events keep their original embedded event id so appliers dedupe). The
-    /// default drops them; the operations layer overrides this to enqueue
-    /// outbox records.
-    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncPublish>) {}
+    /// the winning genesis via durable operations outbox records.
+    async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) {}
 }
 
 #[derive(Clone)]
