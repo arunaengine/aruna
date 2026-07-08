@@ -4,16 +4,20 @@
 //! is never reachable through the public REST/portal port and so Kubernetes
 //! probes hit a container port that is not exposed via Service/Ingress.
 
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_REPLICATION_JOB_KEYSPACE, NODE_STATE_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+    BLOB_REPLICATION_JOB_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE,
+    REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
 };
 use aruna_core::metrics::{MetricsSource, NodeMetrics};
+use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::queue_lag::{
     QueueLagSnapshot, probe_materialization_lag, probe_outbox_lag, probe_queue_depth,
@@ -31,11 +35,25 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Unit;
 use serde::Serialize;
+use tokio::time::MissedTickBehavior;
 
 /// Upper bound on the readiness storage probe so a wedged effect worker fails
 /// readiness quickly instead of blocking on the much longer request timeout.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const SYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const QUEUE_METRICS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_STATE_PROBE_KEY: &[u8] = b"node_state";
+
+const DOCUMENT_SYNC_OUTBOX_QUEUE: &str = "document_sync_outbox";
+const METADATA_MATERIALIZATION_QUEUE: &str = "metadata_materialization";
+const BLOB_REPLICATION_QUEUE: &str = "blob_replication";
+const REFERENCE_METADATA_REFRESH_QUEUE: &str = "reference_metadata_refresh";
+const QUEUE_NAMES: [&str; 4] = [
+    DOCUMENT_SYNC_OUTBOX_QUEUE,
+    METADATA_MATERIALIZATION_QUEUE,
+    BLOB_REPLICATION_QUEUE,
+    REFERENCE_METADATA_REFRESH_QUEUE,
+];
 
 /// Startup gate for readiness. Flipped once the node has finished bootstrap and
 /// its request listeners are bound.
@@ -73,7 +91,7 @@ impl OpsState {
         readiness: Readiness,
     ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
-        register_queue_source(&metrics, ctx.clone()).await;
+        register_queue_metrics(&metrics, ctx.clone()).await;
         Arc::new(Self {
             ctx,
             metrics,
@@ -129,7 +147,7 @@ async fn readyz(State(state): State<Arc<OpsState>>) -> Response {
 }
 
 async fn metrics_handler(State(state): State<Arc<OpsState>>) -> Response {
-    state.metrics.set_node_ready(state.readiness.is_started());
+    state.metrics.set_node_started(state.readiness.is_started());
     let body = state.metrics.render().await;
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
@@ -154,9 +172,13 @@ struct CheckOutcome {
 
 impl CheckOutcome {
     fn ok() -> Self {
+        Self::ok_with("ok")
+    }
+
+    fn ok_with(status: impl Into<String>) -> Self {
         Self {
             ok: true,
-            status: "ok".to_string(),
+            status: status.into(),
         }
     }
 
@@ -191,9 +213,22 @@ async fn check_sync(ctx: &DriverContext) -> CheckOutcome {
     if ctx.net_handle.is_none() {
         return CheckOutcome::failed("document sync node not attached");
     }
-    match probe_outbox_lag(&ctx.storage_handle, false).await {
-        Ok(_) => CheckOutcome::ok(),
-        Err(error) => CheckOutcome::failed(format!("document sync outbox probe failed: {error}")),
+    let probe = ctx.storage_handle.send_storage_effect(StorageEffect::Iter {
+        key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    });
+    match tokio::time::timeout(SYNC_PROBE_TIMEOUT, probe).await {
+        Ok(Event::Storage(StorageEvent::IterResult { .. })) => {
+            CheckOutcome::ok_with("ok: document sync attached; outbox readable")
+        }
+        Ok(Event::Storage(StorageEvent::Error { error })) => {
+            CheckOutcome::failed(format!("document sync outbox probe failed: {error}"))
+        }
+        Ok(other) => CheckOutcome::failed(format!("unexpected document sync event: {other:?}")),
+        Err(_) => CheckOutcome::failed("document sync outbox probe timed out"),
     }
 }
 
@@ -281,22 +316,36 @@ struct QueueLabels {
     queue: &'static str,
 }
 
-/// Scrape-time source reporting the depth and oldest-record age of the durable
-/// work queues, reusing the same probes as the periodic `queue.lag` monitor.
-struct QueueSource {
-    ctx: Arc<DriverContext>,
+/// Background-updated depth and oldest-record age gauges for durable work
+/// queues, reusing the same probes as the periodic `queue.lag` monitor.
+struct QueueMetrics {
     depth: Family<QueueLabels, Gauge>,
     oldest_age_seconds: Family<QueueLabels, Gauge<f64, AtomicU64>>,
     depth_capped: Family<QueueLabels, Gauge>,
+    probe_up: Family<QueueLabels, Gauge>,
+    probe_last_success_timestamp_seconds: Family<QueueLabels, Gauge>,
 }
 
-impl QueueSource {
+impl QueueMetrics {
+    fn seed(&self) {
+        for queue in QUEUE_NAMES {
+            let labels = QueueLabels { queue };
+            self.depth.get_or_create(&labels).set(0);
+            self.oldest_age_seconds.get_or_create(&labels).set(0.0);
+            self.depth_capped.get_or_create(&labels).set(0);
+            self.probe_up.get_or_create(&labels).set(0);
+            self.probe_last_success_timestamp_seconds
+                .get_or_create(&labels)
+                .set(0);
+        }
+    }
+
     fn apply(&self, queue: &'static str, probe: Result<QueueLagSnapshot, String>) {
-        // On probe failure the gauges keep their previous scrape value.
+        let labels = QueueLabels { queue };
         let Ok(snapshot) = probe else {
+            self.probe_up.get_or_create(&labels).set(0);
             return;
         };
-        let labels = QueueLabels { queue };
         self.depth.get_or_create(&labels).set(snapshot.depth as i64);
         self.oldest_age_seconds
             .get_or_create(&labels)
@@ -304,34 +353,68 @@ impl QueueSource {
         self.depth_capped
             .get_or_create(&labels)
             .set(i64::from(snapshot.depth_capped));
+        self.probe_up.get_or_create(&labels).set(1);
+        self.probe_last_success_timestamp_seconds
+            .get_or_create(&labels)
+            .set((unix_timestamp_millis() / 1_000) as i64);
+    }
+
+    async fn refresh(&self, ctx: &DriverContext) {
+        let storage = &ctx.storage_handle;
+        self.apply(
+            DOCUMENT_SYNC_OUTBOX_QUEUE,
+            probe_queue_with_timeout(probe_outbox_lag(storage, false)).await,
+        );
+        self.apply(
+            METADATA_MATERIALIZATION_QUEUE,
+            probe_queue_with_timeout(probe_materialization_lag(storage, false)).await,
+        );
+        self.apply(
+            BLOB_REPLICATION_QUEUE,
+            probe_queue_with_timeout(probe_queue_depth(
+                storage,
+                BLOB_REPLICATION_JOB_KEYSPACE,
+                false,
+            ))
+            .await,
+        );
+        self.apply(
+            REFERENCE_METADATA_REFRESH_QUEUE,
+            probe_queue_with_timeout(probe_queue_depth(
+                storage,
+                REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+                false,
+            ))
+            .await,
+        );
     }
 }
 
-impl MetricsSource for QueueSource {
-    fn refresh(&self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let storage = &self.ctx.storage_handle;
-            self.apply(
-                "document_sync_outbox",
-                probe_outbox_lag(storage, false).await,
-            );
-            self.apply(
-                "metadata_materialization",
-                probe_materialization_lag(storage, false).await,
-            );
-            self.apply(
-                "blob_replication",
-                probe_queue_depth(storage, BLOB_REPLICATION_JOB_KEYSPACE, false).await,
-            );
-            self.apply(
-                "reference_metadata_refresh",
-                probe_queue_depth(storage, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE, false).await,
-            );
-        })
+async fn probe_queue_with_timeout<F>(probe: F) -> Result<QueueLagSnapshot, String>
+where
+    F: Future<Output = Result<QueueLagSnapshot, String>>,
+{
+    match tokio::time::timeout(QUEUE_METRICS_PROBE_TIMEOUT, probe).await {
+        Ok(result) => result,
+        Err(_) => Err("queue probe timed out".to_string()),
     }
 }
 
-async fn register_queue_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
+fn spawn_queue_metrics_refresher(ctx: Weak<DriverContext>, queue_metrics: Arc<QueueMetrics>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(QUEUE_LAG_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let Some(ctx) = ctx.upgrade() else {
+                return;
+            };
+            queue_metrics.refresh(ctx.as_ref()).await;
+        }
+    });
+}
+
+async fn register_queue_metrics(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
     let depth = Family::<QueueLabels, Gauge>::default();
     metrics
         .register("queue_depth", "Durable work queue depth", depth.clone())
@@ -353,15 +436,32 @@ async fn register_queue_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
             depth_capped.clone(),
         )
         .await;
-
+    let probe_up = Family::<QueueLabels, Gauge>::default();
     metrics
-        .register_source(Arc::new(QueueSource {
-            ctx,
-            depth,
-            oldest_age_seconds,
-            depth_capped,
-        }))
+        .register(
+            "queue_probe_up",
+            "1 when the latest durable queue probe succeeded",
+            probe_up.clone(),
+        )
         .await;
+    let probe_last_success_timestamp_seconds = Family::<QueueLabels, Gauge>::default();
+    metrics
+        .register(
+            "queue_probe_last_success_timestamp_seconds",
+            "Unix timestamp of the latest successful durable queue probe",
+            probe_last_success_timestamp_seconds.clone(),
+        )
+        .await;
+
+    let queue_metrics = Arc::new(QueueMetrics {
+        depth,
+        oldest_age_seconds,
+        depth_capped,
+        probe_up,
+        probe_last_success_timestamp_seconds,
+    });
+    queue_metrics.seed();
+    spawn_queue_metrics_refresher(Arc::downgrade(&ctx), queue_metrics);
 }
 
 #[cfg(test)]
@@ -443,6 +543,56 @@ mod tests {
         assert!(body.contains("\"storage\":\"failed"), "{body}");
     }
 
+    #[test]
+    fn queue_metrics_probe_failure_sets_up_zero_without_clearing_depth() {
+        let queue_metrics = QueueMetrics {
+            depth: Family::<QueueLabels, Gauge>::default(),
+            oldest_age_seconds: Family::<QueueLabels, Gauge<f64, AtomicU64>>::default(),
+            depth_capped: Family::<QueueLabels, Gauge>::default(),
+            probe_up: Family::<QueueLabels, Gauge>::default(),
+            probe_last_success_timestamp_seconds: Family::<QueueLabels, Gauge>::default(),
+        };
+        queue_metrics.seed();
+
+        let labels = QueueLabels {
+            queue: DOCUMENT_SYNC_OUTBOX_QUEUE,
+        };
+        assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 0);
+
+        queue_metrics.apply(
+            DOCUMENT_SYNC_OUTBOX_QUEUE,
+            Ok(QueueLagSnapshot {
+                depth: 7,
+                depth_capped: true,
+                oldest_age_ms: 2_500,
+                due: 0,
+            }),
+        );
+        assert_eq!(queue_metrics.depth.get_or_create(&labels).get(), 7);
+        assert_eq!(queue_metrics.depth_capped.get_or_create(&labels).get(), 1);
+        assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 1);
+        let last_success = queue_metrics
+            .probe_last_success_timestamp_seconds
+            .get_or_create(&labels)
+            .get();
+        assert!(last_success > 0);
+
+        queue_metrics.apply(
+            DOCUMENT_SYNC_OUTBOX_QUEUE,
+            Err("storage closed".to_string()),
+        );
+        assert_eq!(queue_metrics.depth.get_or_create(&labels).get(), 7);
+        assert_eq!(queue_metrics.depth_capped.get_or_create(&labels).get(), 1);
+        assert_eq!(queue_metrics.probe_up.get_or_create(&labels).get(), 0);
+        assert_eq!(
+            queue_metrics
+                .probe_last_success_timestamp_seconds
+                .get_or_create(&labels)
+                .get(),
+            last_success
+        );
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_exposes_build_info_and_storage() {
         let (_temp, ctx) = fjall_ctx();
@@ -467,11 +617,16 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("aruna_build_info{version=\""), "{body}");
+        assert!(body.contains("aruna_node_started 0"), "{body}");
         assert!(body.contains("aruna_storage_requests "), "{body}");
         assert!(
             body.contains("aruna_queue_depth{queue=\"document_sync_outbox\"}"),
             "{body}"
         );
         assert!(body.contains("aruna_queue_oldest_age_seconds"), "{body}");
+        assert!(
+            body.contains("aruna_queue_probe_up{queue=\"document_sync_outbox\"}"),
+            "{body}"
+        );
     }
 }
