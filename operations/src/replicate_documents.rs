@@ -489,7 +489,7 @@ mod tests {
             documents: vec![target.clone()],
             allow_genesis: true,
         });
-        operation.realm_nodes = vec![local_node_id];
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
 
         let effects = operation.emit_next_publish();
 
@@ -511,7 +511,7 @@ mod tests {
             documents: vec![target.clone()],
             allow_genesis: true,
         });
-        operation.realm_nodes = vec![local_node_id];
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
 
         let effects = operation.emit_next_publish();
 

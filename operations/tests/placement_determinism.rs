@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::admin_document_reducer::AdminDocumentReducerState;
+use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -64,15 +68,19 @@ async fn weight_change_propagates_and_all_nodes_resolve_identically()
 
     // Wait until every node's materialized placement map reflects the new weight.
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut last_states = Vec::new();
     loop {
         let mut converged = true;
+        last_states.clear();
         for node in &nodes {
             let config = drive(
                 GetRealmConfigOperation::new(realm_id),
                 node.context.as_ref(),
             )
             .await?;
-            if config.placement_entry(bumped).map(|entry| entry.weight) != Some(500) {
+            let weight = config.placement_entry(bumped).map(|entry| entry.weight);
+            last_states.push(format!("node={} weight={weight:?}", node.net.node_id()));
+            if weight != Some(500) {
                 converged = false;
                 break;
             }
@@ -82,7 +90,11 @@ async fn weight_change_propagates_and_all_nodes_resolve_identically()
         }
         if Instant::now() >= deadline {
             shutdown_nodes(nodes).await;
-            return Err("weight change did not propagate to all nodes".into());
+            return Err(format!(
+                "weight change did not propagate to all nodes: {}",
+                last_states.join(", ")
+            )
+            .into());
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -275,7 +287,69 @@ async fn install_realm_config(
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
+    seed_realm_config_sync_topic(nodes, realm_id, &config).await?;
     Ok(())
+}
+
+async fn seed_realm_config_sync_topic(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let actor = Actor {
+        node_id: nodes[1].net.node_id(),
+        user_id: aruna_core::UserId::nil(realm_id),
+        realm_id,
+    };
+    let mut reducer_state =
+        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let event = reducer_state.apply_operation(
+        &actor,
+        AdminDocumentOperation::RealmConfigNodePlacementSet {
+            entry: config
+                .placement_map
+                .first()
+                .ok_or("realm config has no placement entry")?
+                .clone(),
+        },
+    )?;
+
+    match nodes[0]
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(event),
+                    allow_genesis: true,
+                }],
+                peers: Vec::new(),
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished { .. })) => {}
+        other => {
+            return Err(format!("unexpected realm config seed publish event: {other:?}").into());
+        }
+    }
+
+    match nodes[0]
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::SyncDocuments {
+                targets: vec![target],
+                peers: Vec::new(),
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            ..
+        })) => Ok(()),
+        other => Err(format!("unexpected realm config seed sync event: {other:?}").into()),
+    }
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
