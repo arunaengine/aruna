@@ -8147,6 +8147,7 @@ mod tests {
     async fn missing_topic_publish_requires_allow_genesis() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([61u8; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(61).await,
             storage.clone(),
@@ -8155,14 +8156,16 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
         let local_node = service.local_node_id().expect("local node id");
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::new(),
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: local_node,
         };
-        let topic_id = target.sync_topic_id();
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let change = DocumentSyncChange {
             base: None,
             current: DocumentSyncRevision {
@@ -8229,6 +8232,7 @@ mod tests {
         let (_dir_b, storage_b) = test_storage();
         let doc_a = tempfile::tempdir().expect("doc a");
         let doc_b = tempfile::tempdir().expect("doc b");
+        let realm_id = RealmId::from_bytes([71; 32]);
         let service_a = DocumentSyncService::open_with_persist_policy(
             test_endpoint(71).await,
             storage_a,
@@ -8237,6 +8241,7 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("service a opens");
         let service_b = DocumentSyncService::open_with_persist_policy(
@@ -8247,17 +8252,22 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("service b opens");
 
         let node_a = service_a.local_node_id().expect("node a id");
         let node_b = service_b.local_node_id().expect("node b id");
 
-        let realm_id = RealmId::from_bytes([71; 32]);
         let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
         let target = DocumentSyncTarget::User { user_id };
         let admin_target = AdminDocumentTarget::User { user_id };
-        let topic_id = target.sync_topic_id();
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(71, 7),
+            epoch: 0,
+            shard: 1,
+        };
+        let topic_id = target.sync_topic_id(realm_id, &placement);
 
         let event_a_id = Ulid::from_parts(0xA1, 1);
         let event_b_id = Ulid::from_parts(0xB2, 2);
@@ -8280,14 +8290,21 @@ mod tests {
             },
         );
 
-        // Each side lists the other in its genesis peer set, so the loser is a
-        // member of the winner's topic after the reset.
+        // Shard-classed admin topics are created eagerly; each side lists the
+        // other in its genesis peer set so the loser is a member after reset.
+        service_a
+            .ensure_document_sync_topics(&[topic_id], vec![node_b])
+            .expect("service a topic genesis");
+        service_b
+            .ensure_document_sync_topics(&[topic_id], vec![node_a])
+            .expect("service b topic genesis");
+
         let published_a = service_a
             .publish_documents(
                 vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(admin_a),
-                    placement: PlacementRef::NIL,
+                    placement,
                     allow_genesis: true,
                 }],
                 vec![node_b],
@@ -8302,7 +8319,7 @@ mod tests {
                 vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(admin_b),
-                    placement: PlacementRef::NIL,
+                    placement,
                     allow_genesis: true,
                 }],
                 vec![node_a],
@@ -8448,6 +8465,7 @@ mod tests {
     async fn reconcile_skips_whole_document_admin_sync_events() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([54u8; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(54).await,
             storage.clone(),
@@ -8456,13 +8474,21 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
-        let realm_id = RealmId::from_bytes([54u8; 32]);
         let user_id = UserId::local(Ulid::from_parts(1_400, 1), realm_id);
         let target = DocumentSyncTarget::User { user_id };
-        let topic_id = target.sync_topic_id();
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(54, 7),
+            epoch: 0,
+            shard: 1,
+        };
+        let topic_id = target.sync_topic_id(realm_id, &placement);
+        service
+            .ensure_document_sync_topics(&[topic_id], Vec::new())
+            .expect("admin shard topic genesis");
 
         let change = |kind| DocumentSyncChange {
             base: None,
@@ -8473,7 +8499,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind,
-            placement: aruna_core::structs::PlacementRef::NIL,
+            placement,
         };
         let actor = test_actor(8, user_id, realm_id);
         let admin_event = test_admin_event(
@@ -8507,7 +8533,7 @@ mod tests {
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(admin_event),
-                        placement: PlacementRef::NIL,
+                        placement,
                         allow_genesis: true,
                     },
                 ],
@@ -8723,6 +8749,7 @@ mod tests {
 
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([55u8; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(55).await,
             storage.clone(),
@@ -8731,13 +8758,13 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
         let local_node = service.local_node_id().expect("local node id");
         let forged_node = node(88);
         assert_ne!(local_node, forged_node);
-        let realm_id = RealmId::from_bytes([55u8; 32]);
         let target = DocumentSyncTarget::WatchInterest {
             realm_id,
             node_id: local_node,
@@ -8746,8 +8773,11 @@ mod tests {
             realm_id,
             node_id: forged_node,
         };
-        let topic_id = target.sync_topic_id();
-        assert_eq!(topic_id, forged_target.sync_topic_id());
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert_eq!(
+            topic_id,
+            forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
+        );
 
         let change = || DocumentSyncChange {
             base: None,
@@ -8869,6 +8899,7 @@ mod tests {
 
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([56u8; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(56).await,
             storage.clone(),
@@ -8877,13 +8908,13 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
         let local_node = service.local_node_id().expect("local node id");
         let forged_node = node(89);
         assert_ne!(local_node, forged_node);
-        let realm_id = RealmId::from_bytes([56u8; 32]);
         let target = DocumentSyncTarget::WatchInterest {
             realm_id,
             node_id: local_node,
@@ -8892,8 +8923,11 @@ mod tests {
             realm_id,
             node_id: forged_node,
         };
-        let topic_id = target.sync_topic_id();
-        assert_eq!(topic_id, forged_target.sync_topic_id());
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        assert_eq!(
+            topic_id,
+            forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
+        );
 
         let change = |kind| DocumentSyncChange {
             base: None,
@@ -8944,6 +8978,7 @@ mod tests {
                     DocumentSyncPublish::AdminOperation {
                         target: forged_target.clone(),
                         event: Box::new(admin_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::Upsert {

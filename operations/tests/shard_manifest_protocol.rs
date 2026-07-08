@@ -92,6 +92,38 @@ async fn manifest_request_rejected_for_non_held_shard() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn manifest_request_rejected_from_sync_eligible_non_holder()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([127u8; 32]);
+    let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
+    let responder = nodes[0].net.node_id();
+    let (placement, non_holder, holder) = placement_with_non_holder_requester(&config, &nodes);
+
+    let non_holder_node = nodes
+        .iter()
+        .find(|node| node.net.node_id() == non_holder)
+        .expect("non-holder node exists");
+    let error = fetch_shard_manifest(&non_holder_node.net, responder, realm_id, placement)
+        .await
+        .expect_err("sync-eligible non-holder peer must be rejected");
+    assert!(
+        error.contains("is not a holder"),
+        "unexpected reject: {error}"
+    );
+
+    let holder_node = nodes
+        .iter()
+        .find(|node| node.net.node_id() == holder)
+        .expect("holder node exists");
+    let manifest = fetch_shard_manifest(&holder_node.net, responder, realm_id, placement).await?;
+    assert_eq!(manifest.holder, responder);
+    assert_eq!(manifest.placement, placement);
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([124u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
@@ -277,6 +309,39 @@ fn any_held_placement(config: &RealmConfigDocument, node_id: NodeId) -> Placemen
         }
     }
     panic!("node holds no shard");
+}
+
+fn placement_with_non_holder_requester(
+    config: &RealmConfigDocument,
+    nodes: &[TestNode],
+) -> (PlacementRef, NodeId, NodeId) {
+    let responder = nodes[0].net.node_id();
+    let strategy = config.strategies.first().expect("a strategy");
+    for shard in 0..strategy.shard_count {
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard,
+        };
+        let holders = aruna_operations::placement::resolve_shard_holders(config, &placement);
+        if !holders.contains(&responder) {
+            continue;
+        }
+        let Some(non_holder) = nodes
+            .iter()
+            .map(|node| node.net.node_id())
+            .find(|node_id| *node_id != responder && !holders.contains(node_id))
+        else {
+            continue;
+        };
+        let holder = holders
+            .iter()
+            .copied()
+            .find(|node_id| *node_id != responder)
+            .expect("responder has a co-holder");
+        return (placement, non_holder, holder);
+    }
+    panic!("no shard found with a holder responder and sync-eligible non-holder requester");
 }
 
 async fn wait_for_manifest_entry(

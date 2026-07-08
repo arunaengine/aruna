@@ -62,8 +62,8 @@ use crate::notifications::watch::outbox::{
     WATCH_FORWARD_OUTBOX_RETENTION_MS, delete_watch_forward_outbox_records,
     read_watch_forward_outbox_batch, restore_watch_forward_outbox_timer,
 };
-use crate::queue_backoff::timer_retry_after_secs;
 use crate::process_placements::process_shard_placements;
+use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -1869,6 +1869,7 @@ mod tests {
                 change: change(),
             },
             aruna_core::structs::PlacementRef::NIL,
+            true,
         );
         write_outbox_record(&storage, &record).await;
         task_handle
@@ -1943,6 +1944,7 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_outbox_record(&storage, &record).await;

@@ -10,6 +10,8 @@ pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 /// Default per-strategy shard fan-out. Power of two so `shard_for_subject`
 /// can mask with `shard_count - 1`.
 pub const DEFAULT_SHARD_COUNT: u32 = 64;
+/// Maximum per-strategy shard fan-out accepted from placement config.
+pub const MAX_PLACEMENT_SHARD_COUNT: u32 = 4096;
 /// Upper bound for a configurable node weight; onboarding/config inputs clamp
 /// present values into `1..=MAX_NODE_WEIGHT`.
 pub const MAX_NODE_WEIGHT: u32 = 10_000;
