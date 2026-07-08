@@ -8431,8 +8431,8 @@ mod tests {
             winner_genesis
         );
 
-        // The evicted admin event re-emits with its original event id preserved
-        // and allow_genesis cleared.
+        // The evicted admin event re-emits with its original event id and
+        // placement preserved, and allow_genesis cleared.
         let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
         assert_eq!(reemitted.len(), 1);
         let reemitted = &reemitted[0];
@@ -8445,7 +8445,7 @@ mod tests {
             reemitted.event_id.is_none(),
             "admin outbox re-emission uses the embedded admin event id"
         );
-        assert_eq!(reemitted.placement, PlacementRef::NIL);
+        assert_eq!(reemitted.placement, placement);
         match &reemitted.event {
             DocumentSyncOutboxEvent::AdminOperation { event } => {
                 assert_eq!(

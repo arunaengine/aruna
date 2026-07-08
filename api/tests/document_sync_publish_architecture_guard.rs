@@ -59,7 +59,8 @@ fn allowed_publish_use(publish_use: &PublishUse) -> bool {
                     Some("publish_events_blocking"),
                     "DocumentSyncPublish::Upsert {"
                         | "DocumentSyncPublish::Delete {"
-                        | "DocumentSyncPublish::AdminOperation { target, event, .. } => {",
+                        | "DocumentSyncPublish::AdminOperation { target, event, .. } => {"
+                        | "DocumentSyncPublish::AdminOperation {",
                 ) | (
                     Some("decode_eviction"),
                     "documents.push(DocumentSyncPublish::Upsert {"

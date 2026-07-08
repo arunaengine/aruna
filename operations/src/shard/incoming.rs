@@ -141,24 +141,6 @@ async fn build_response(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn shard_io_timeout_reports_timed_out_operation() {
-        let error = with_shard_io_timeout_after(
-            Duration::from_millis(1),
-            "reading shard manifest request",
-            std::future::pending::<Result<(), String>>(),
-        )
-        .await
-        .expect_err("pending shard IO must time out");
-
-        assert_eq!(error, "timed out reading shard manifest request");
-    }
-}
-
 async fn read_realm_config(
     context: &DriverContext,
     realm_id: RealmId,
@@ -180,5 +162,23 @@ async fn read_realm_config(
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shard_io_timeout_reports_timed_out_operation() {
+        let error = with_shard_io_timeout_after(
+            Duration::from_millis(1),
+            "reading shard manifest request",
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect_err("pending shard IO must time out");
+
+        assert_eq!(error, "timed out reading shard manifest request");
     }
 }
