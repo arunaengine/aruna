@@ -7,7 +7,7 @@ use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
-use aruna_core::storage_entries::shard_manifest_prefix;
+use aruna_core::storage_entries::{document_sync_revision_key, shard_manifest_prefix};
 use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
@@ -44,6 +44,32 @@ pub async fn assemble_shard_manifest(
         digest,
         updated_at_ms: unix_timestamp_millis(),
     })
+}
+
+pub(crate) fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
+    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
+    encoded_entries.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
+    for encoded in encoded_entries {
+        hasher.update(&(encoded.len() as u64).to_be_bytes());
+        hasher.update(&encoded);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
+    let target_key = document_sync_revision_key(&entry.target);
+    let target_key = target_key.as_ref();
+    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
+    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(target_key);
+    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
+    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
+    bytes.extend_from_slice(entry.revision.actor.as_bytes());
+    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
+    bytes
 }
 
 async fn scan_shard_manifest_entries(
@@ -243,5 +269,36 @@ mod tests {
             .fingerprint;
         assert_eq!(manifest.digest, expected_digest);
         assert!(postcard::from_bytes::<irokle::ActorClock>(&manifest.cursor).is_ok());
+    }
+
+    #[test]
+    fn manifest_entry_digest_is_order_independent_and_revision_sensitive() {
+        let actor = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let first = ShardManifestEntry {
+            target: aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: Ulid::from_bytes([1; 16]),
+            },
+            revision: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_bytes([2; 16]),
+                actor,
+                updated_at_ms: 3,
+            },
+        };
+        let mut second = first.clone();
+        second.target = aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([4; 16]),
+        };
+        let mut changed = second.clone();
+        changed.revision.generation += 1;
+
+        assert_eq!(
+            manifest_entry_digest(&[first.clone(), second.clone()]),
+            manifest_entry_digest(&[second.clone(), first.clone()])
+        );
+        assert_ne!(
+            manifest_entry_digest(&[first, second]),
+            manifest_entry_digest(&[changed])
+        );
     }
 }

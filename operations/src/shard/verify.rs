@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::driver::DriverContext;
 use crate::placement::resolve_shard_holders;
-use crate::shard::assemble_shard_manifest;
 use crate::shard::client::fetch_shard_manifest;
+use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
 use crate::startup::apply_restored_reconcile;
 use crate::sync_placement::placement_key;
 
@@ -46,11 +46,12 @@ pub struct ShardVerificationSummary {
 }
 
 /// Reconciles every shard the local node newly holds against a co-holder: fetch
-/// the first reachable co-holder's manifest in rank order and compare digests.
-/// Equal ⇒ mark verified; differing ⇒ one anti-entropy pass against that
-/// co-holder and retry, bounded by [`SHARD_VERIFICATION_MAX_ATTEMPTS`]. Already
-/// verified shards (a persisted marker) are skipped, so this is idempotent and
-/// cheap in steady state and resumes unverified shards after a restart.
+/// the first reachable co-holder's manifest in rank order and compare the topic
+/// digest plus manifest entry digest. Equal ⇒ mark verified; differing ⇒ one
+/// anti-entropy pass against that co-holder and retry, bounded by
+/// [`SHARD_VERIFICATION_MAX_ATTEMPTS`]. Already verified shards (a persisted
+/// marker) are skipped, so this is idempotent and cheap in steady state and
+/// resumes unverified shards after a restart.
 pub async fn verify_held_shards(
     context: &Arc<DriverContext>,
     node_id: NodeId,
@@ -177,7 +178,7 @@ async fn verify_one_shard(
             if net_handle
                 .document_sync_topic_exists(topic)
                 .unwrap_or(false)
-                && local.digest == remote.digest
+                && manifests_converged(&local, &remote)
             {
                 mark_verified(context, realm_id, placement, Some(*co_holder), local.digest).await;
                 info!(
@@ -189,7 +190,7 @@ async fn verify_one_shard(
                 );
                 return true;
             }
-            // Digests differ: pull the co-holder's events and re-compare.
+            // Topic or entry digests differ: pull the co-holder's events and re-compare.
             let event = net_handle
                 .sync_document_topics(vec![topic], vec![*co_holder])
                 .await;
@@ -207,6 +208,14 @@ async fn verify_one_shard(
         return false;
     }
     false
+}
+
+fn manifests_converged(
+    local: &aruna_core::document::ShardManifest,
+    remote: &aruna_core::document::ShardManifest,
+) -> bool {
+    local.digest == remote.digest
+        && manifest_entry_digest(&local.entries) == manifest_entry_digest(&remote.entries)
 }
 
 /// Deletes a shard's verification marker (e.g. when the local node leaves the
@@ -303,5 +312,60 @@ async fn load_realm_config(
             value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::document::{
+        DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,
+    };
+    use ulid::Ulid;
+
+    fn node_id(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn placement() -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            epoch: 0,
+            shard: 7,
+        }
+    }
+
+    fn entry(document: u8, generation: u64) -> ShardManifestEntry {
+        ShardManifestEntry {
+            target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: Ulid::from_bytes([document; 16]),
+            },
+            revision: DocumentSyncRevision {
+                generation,
+                event_id: Ulid::from_bytes([generation as u8; 16]),
+                actor: node_id(3),
+                updated_at_ms: generation,
+            },
+        }
+    }
+
+    fn manifest(entries: Vec<ShardManifestEntry>) -> ShardManifest {
+        ShardManifest {
+            placement: placement(),
+            holder: node_id(1),
+            entries,
+            cursor: Vec::new(),
+            digest: [7; 32],
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn equal_topic_digest_with_different_entries_does_not_converge() {
+        let local = manifest(vec![entry(1, 1)]);
+        let remote = manifest(vec![entry(2, 1)]);
+
+        assert_eq!(local.digest, remote.digest);
+        assert!(!manifests_converged(&local, &remote));
     }
 }

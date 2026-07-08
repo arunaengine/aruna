@@ -81,10 +81,17 @@ async fn build_response(
         Err(error) => return ShardTransportResponse::Reject(error.to_string()),
     }
 
+    let holders = resolve_shard_holders(&config, &placement);
     // Only a current holder can answer authoritatively for a shard.
-    if !resolve_shard_holders(&config, &placement).contains(&net_handle.node_id()) {
+    if !holders.contains(&net_handle.node_id()) {
         return ShardTransportResponse::Reject(format!(
             "node does not hold shard {}/{} in realm `{realm_id}`",
+            placement.strategy_id, placement.shard
+        ));
+    }
+    if !holders.contains(&peer) {
+        return ShardTransportResponse::Reject(format!(
+            "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
             placement.strategy_id, placement.shard
         ));
     }

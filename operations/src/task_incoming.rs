@@ -1860,6 +1860,7 @@ mod tests {
                 change: change(),
             },
             aruna_core::structs::PlacementRef::NIL,
+            true,
         );
         write_outbox_record(&storage, &record).await;
         task_handle
@@ -1934,6 +1935,7 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_outbox_record(&storage, &record).await;
