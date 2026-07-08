@@ -127,8 +127,8 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
             actor_user_id,
         } => {
             assert_eq!(path, "bucket/reports/q3/summary.csv");
-            assert_eq!(bucket, "reports");
-            assert_eq!(key, "q3/summary.csv");
+            assert_eq!(bucket, "bucket");
+            assert_eq!(key, "reports/q3/summary.csv");
             assert_eq!(*size_bytes, 2048);
             assert_eq!(*actor_user_id, uploader);
         }
@@ -360,6 +360,9 @@ fn upload_event(
     path: &str,
     occurred_at_ms: u64,
 ) -> WatchEvent {
+    let (bucket, key) = path
+        .split_once('/')
+        .expect("data watch path contains bucket and key");
     WatchEvent {
         event_id,
         realm_id,
@@ -368,8 +371,8 @@ fn upload_event(
         actor,
         occurred_at_ms,
         detail: WatchEventDetail::DataUploaded {
-            bucket: "reports".to_string(),
-            key: "q3/summary.csv".to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             size_bytes: 2048,
         },
     }
