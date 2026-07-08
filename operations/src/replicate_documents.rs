@@ -486,9 +486,11 @@ mod tests {
 
         let effects = operation.emit_next_publish();
 
-        assert!(
-            matches!(operation.placement_action, Some(PlacementAction::Write(ref record)) if record.target == target)
-        );
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 
@@ -508,9 +510,11 @@ mod tests {
 
         let effects = operation.emit_next_publish();
 
-        assert!(
-            matches!(operation.placement_action, Some(PlacementAction::Write(ref record)) if record.target == target)
-        );
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 

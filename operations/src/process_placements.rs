@@ -196,6 +196,7 @@ pub(crate) async fn ensure_rank0_shard_group(
         && let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, co_holders)
     {
         warn!(error = %error, "Failed to ensure rank-0 shard topics");
+        withheld = true;
     }
     withheld
 }
