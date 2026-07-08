@@ -980,7 +980,7 @@ mod tests {
 
         let recipient = recipient_for_holder(&config, a.net.node_id(), realm_id);
         let seeded = record(recipient, 1);
-        seed_inbox(&b, &[seeded.clone()]).await;
+        seed_inbox(&b, std::slice::from_ref(&seeded)).await;
 
         for error in [
             list_remote(&a.net, b.net.node_id(), recipient, None, 10)
