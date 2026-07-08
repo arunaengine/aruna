@@ -4,6 +4,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, RealmConfigDocument, RealmId,
+    WatchEvent, WatchEventDetail, WatchEventKind, WatchSubscription,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -26,7 +27,8 @@ use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    create_watch_subscription, delete_watch_subscription, list_watch_subscriptions,
+    create_watch_subscription, delete_watch_subscription, list_realm_watch_subscriptions,
+    list_watch_subscriptions,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -189,22 +191,34 @@ async fn build_response(
             owner,
             path_prefix,
             event_mask,
-        } => match create_watch_subscription(
-            &context.storage_handle,
-            owner,
-            path_prefix,
-            event_mask,
-            unix_timestamp_millis(),
-        )
-        .await
-        {
-            Ok(subscription) => {
-                schedule_watch_interest_publish(context).await;
-                NotificationTransportMessage::WatchCreated { subscription }
+        } => {
+            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
+            {
+                return NotificationTransportMessage::Reject(reason);
             }
-            Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-        },
+
+            match create_watch_subscription(
+                &context.storage_handle,
+                owner,
+                path_prefix,
+                event_mask,
+                unix_timestamp_millis(),
+            )
+            .await
+            {
+                Ok(subscription) => {
+                    schedule_watch_interest_publish(context).await;
+                    NotificationTransportMessage::WatchCreated { subscription }
+                }
+                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+            }
+        }
         NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
+            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
+            {
+                return NotificationTransportMessage::Reject(reason);
+            }
+
             match delete_watch_subscription(&context.storage_handle, owner, watch_id).await {
                 Ok(()) => {
                     schedule_watch_interest_publish(context).await;
@@ -214,12 +228,29 @@ async fn build_response(
             }
         }
         NotificationTransportMessage::ListWatches { owner } => {
+            if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
+            {
+                return NotificationTransportMessage::Reject(reason);
+            }
+
             match list_watch_subscriptions(&context.storage_handle, owner).await {
                 Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
+            if let Err(reason) =
+                validate_inbound_watch_events(&events, realm_id, unix_timestamp_millis())
+            {
+                return NotificationTransportMessage::Reject(reason);
+            }
+            if let Err(reason) =
+                verify_local_watch_subscriptions(context, realm_id, &realm_config, local_node_id)
+                    .await
+            {
+                return NotificationTransportMessage::Reject(reason);
+            }
+
             match expand_watch_events(&context.storage_handle, realm_id, &events).await {
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
@@ -259,6 +290,81 @@ fn validate_inbound_batch(records: &[NotificationRecord], now_ms: u64) -> Result
             }
         }
     }
+    Ok(())
+}
+
+fn validate_inbound_watch_events(
+    events: &[WatchEvent],
+    realm_id: RealmId,
+    now_ms: u64,
+) -> Result<(), String> {
+    for event in events {
+        validate_inbound_watch_event(event, realm_id, now_ms)?;
+    }
+    Ok(())
+}
+
+fn validate_inbound_watch_event(
+    event: &WatchEvent,
+    realm_id: RealmId,
+    now_ms: u64,
+) -> Result<(), String> {
+    if event.realm_id != realm_id {
+        return Err("watch event realm mismatch".to_string());
+    }
+    if event.event_id.is_nil() {
+        return Err("watch event has empty event_id".to_string());
+    }
+    if event.occurred_at_ms > now_ms.saturating_add(NOTIFICATION_MAX_FUTURE_SKEW_MS) {
+        return Err(format!(
+            "watch event occurred_at_ms {} is too far in the future",
+            event.occurred_at_ms
+        ));
+    }
+    if event.actor.is_nil() {
+        return Err("watch event has empty actor".to_string());
+    }
+    if event.actor.realm_id != realm_id {
+        return Err("watch event actor realm must match event realm".to_string());
+    }
+    if event.path.is_empty() {
+        return Err("watch event has empty path".to_string());
+    }
+
+    match (&event.kind, &event.detail) {
+        (
+            WatchEventKind::MetadataCreated,
+            WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        ) => {
+            if group_id.is_nil() {
+                return Err("watch event has empty group_id".to_string());
+            }
+            if document_id.is_nil() {
+                return Err("watch event has empty document_id".to_string());
+            }
+            let expected_path = format!("meta/{group_id}/{document_id}");
+            if event.path != expected_path {
+                return Err("watch event metadata path does not match detail".to_string());
+            }
+        }
+        (WatchEventKind::DataUploaded, WatchEventDetail::DataUploaded { bucket, key, .. }) => {
+            if bucket.is_empty() {
+                return Err("watch event has empty bucket".to_string());
+            }
+            if key.is_empty() {
+                return Err("watch event has empty key".to_string());
+            }
+            let expected_path = format!("{bucket}/{key}");
+            if event.path != expected_path {
+                return Err("watch event data path does not match detail".to_string());
+            }
+        }
+        _ => return Err("watch event kind does not match detail".to_string()),
+    }
+
     Ok(())
 }
 
@@ -377,6 +483,29 @@ fn verify_batch_local_holder(
 ) -> Result<(), String> {
     for record in records {
         verify_recipient_local_holder(&record.recipient, realm_config, local_node_id)?;
+    }
+    Ok(())
+}
+
+async fn verify_local_watch_subscriptions(
+    context: &DriverContext,
+    realm_id: RealmId,
+    realm_config: &RealmConfigDocument,
+    local_node_id: NodeId,
+) -> Result<(), String> {
+    let subscriptions = list_realm_watch_subscriptions(&context.storage_handle, realm_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    verify_watch_subscriptions_local_holder(&subscriptions, realm_config, local_node_id)
+}
+
+fn verify_watch_subscriptions_local_holder(
+    subscriptions: &[WatchSubscription],
+    realm_config: &RealmConfigDocument,
+    local_node_id: NodeId,
+) -> Result<(), String> {
+    for subscription in subscriptions {
+        verify_recipient_local_holder(&subscription.owner, realm_config, local_node_id)?;
     }
     Ok(())
 }
@@ -1231,7 +1360,7 @@ mod tests {
         let a = spawn(realm_id, [64u8; 32]).await;
         let b = spawn(realm_id, [65u8; 32]).await;
         connect(&a, &b).await;
-        install_config(
+        let config = install_config(
             &b,
             realm_id,
             &[
@@ -1241,7 +1370,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::new(), realm_id);
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         let mask = WatchEventMask::from_kinds([
             WatchEventKind::MetadataCreated,
             WatchEventKind::DataUploaded,
@@ -1275,6 +1404,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rpc_watch_ops_reject_non_local_holder() {
+        let realm_id = RealmId::from_bytes([68u8; 32]);
+        let a = spawn(realm_id, [68u8; 32]).await;
+        let b = spawn(realm_id, [69u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, a.net.node_id(), realm_id);
+        let create_error = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            "bucket/".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )
+        .await
+        .expect_err("create on non-holder must be rejected");
+        assert!(
+            create_error.contains("not local node"),
+            "unexpected reject reason: {create_error}"
+        );
+
+        let list_error = list_watches_remote(&a.net, b.net.node_id(), owner)
+            .await
+            .expect_err("list on non-holder must be rejected");
+        assert!(
+            list_error.contains("not local node"),
+            "unexpected reject reason: {list_error}"
+        );
+
+        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::new())
+            .await
+            .expect_err("delete on non-holder must be rejected");
+        assert!(
+            delete_error.contains("not local node"),
+            "unexpected reject reason: {delete_error}"
+        );
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty()
+        );
+    }
+
     fn upload_event(realm_id: RealmId, actor: UserId, path: &str) -> WatchEvent {
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
@@ -1297,7 +1480,7 @@ mod tests {
         let a = spawn(realm_id, [70u8; 32]).await;
         let b = spawn(realm_id, [71u8; 32]).await;
         connect(&a, &b).await;
-        install_config(
+        let config = install_config(
             &b,
             realm_id,
             &[
@@ -1307,7 +1490,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::new(), realm_id);
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
         let actor = UserId::new(Ulid::new(), realm_id);
         create_watch_subscription(
             &b.context.storage_handle,
@@ -1336,6 +1519,88 @@ mod tests {
             inbox[0].kind,
             NotificationKind::DataUploaded { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn deliver_watch_events_rejects_non_local_watch_subscriptions() {
+        let realm_id = RealmId::from_bytes([71u8; 32]);
+        let a = spawn(realm_id, [72u8; 32]).await;
+        let b = spawn(realm_id, [73u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let stale_owner = recipient_for_holder(&config, a.net.node_id(), realm_id);
+        create_watch_subscription(
+            &b.context.storage_handle,
+            stale_owner,
+            "bucket/".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("stale subscription fixture");
+
+        let actor = UserId::new(Ulid::new(), realm_id);
+        let error = deliver_watch_events_remote(
+            &a.net,
+            b.net.node_id(),
+            vec![upload_event(realm_id, actor, "bucket/object")],
+        )
+        .await
+        .expect_err("delivery to stale non-holder must be rejected");
+        assert!(
+            error.contains("not local node"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deliver_watch_events_rejects_kind_detail_mismatch() {
+        let realm_id = RealmId::from_bytes([73u8; 32]);
+        let a = spawn(realm_id, [74u8; 32]).await;
+        let b = spawn(realm_id, [75u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        create_watch_subscription(
+            &b.context.storage_handle,
+            owner,
+            "bucket/".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("holder subscription");
+
+        let actor = UserId::new(Ulid::new(), realm_id);
+        let mut event = upload_event(realm_id, actor, "bucket/object");
+        event.kind = WatchEventKind::MetadataCreated;
+        let error = deliver_watch_events_remote(&a.net, b.net.node_id(), vec![event])
+            .await
+            .expect_err("kind/detail mismatch must be rejected");
+        assert!(
+            error.contains("kind does not match detail"),
+            "unexpected reject reason: {error}"
+        );
+        assert!(read_inbox(&b).await.is_empty());
     }
 
     #[tokio::test]
