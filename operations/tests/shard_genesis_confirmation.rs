@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use aruna_operations::process_placements::process_shard_placements;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use irokle::oplog::Oplog;
+use irokle::{ReplicationPolicy, TopicGenesis};
 use tempfile::TempDir;
 use tokio::time::sleep;
 
@@ -24,6 +27,32 @@ struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+}
+
+// If the final ensure/create step fails after the topic was selected for
+// ensuring, no pending placement record exists yet. The reconciler must still
+// report retry-worthy work so the missing/invalid genesis path is retried.
+#[tokio::test]
+async fn rank0_topic_ensure_failure_schedules_retry() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([153u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let config = install_realm_config(&nodes, realm_id).await?;
+    mesh_nodes(&nodes).await;
+
+    let (rank0, co_holder) = (&nodes[0], &nodes[1]);
+    let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
+    let topic = shard_topic_id(realm_id, &placement);
+    seed_wrong_event_type_topic(&rank0.net, topic)?;
+
+    let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+
+    assert!(
+        outcome.retry_scheduled,
+        "failed topic ensure must schedule a placement retry"
+    );
+
+    shutdown_nodes(nodes).await;
+    Ok(())
 }
 
 // A reachable, topic-less co-holder is positive confirmation that no genesis
@@ -192,6 +221,22 @@ fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId
         }
     }
     panic!("no shard has {rank0} as rank-0 with {co_holder} as a co-holder");
+}
+
+fn seed_wrong_event_type_topic(
+    net: &NetHandle,
+    topic: ::irokle::TopicId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let node = net.document_sync_node();
+    let actor_id = irokle::actor_id_for(topic, node.peer_id());
+    let genesis = TopicGenesis {
+        event_type_id: "aruna.test.wrong".to_string(),
+        initial_peers: BTreeSet::new(),
+        replication_policy: ReplicationPolicy::all(),
+    };
+    let oplog = Oplog::with_storage(node.storage().clone());
+    oplog.create_topic_genesis(topic, actor_id, genesis, node.signer())?;
+    Ok(())
 }
 
 async fn build_realm_nodes(

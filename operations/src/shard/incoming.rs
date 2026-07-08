@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Duration;
+
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -6,12 +9,13 @@ use aruna_core::structs::{RealmConfigDocument, RealmId};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use byteview::ByteView;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
 use crate::placement::resolve_shard_holders;
 use crate::shard::assemble_shard_manifest;
-use crate::shard::client::close_stream;
+use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
     ShardTransportMessage, ShardTransportResponse, read_shard_request, write_shard_response,
 };
@@ -28,7 +32,12 @@ pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, 
         return;
     };
 
-    let message = match read_shard_request(&mut stream).await {
+    let message = match with_shard_io_timeout(
+        "reading shard manifest request",
+        read_shard_request(&mut stream),
+    )
+    .await
+    {
         Ok(message) => message,
         Err(error) => {
             warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
@@ -37,10 +46,32 @@ pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, 
     };
 
     let response = build_response(context, net_handle, peer, message).await;
-    if let Err(error) = write_shard_response(&mut stream, &response).await {
+    if let Err(error) = with_shard_io_timeout(
+        "writing shard manifest response",
+        write_shard_response(&mut stream, &response),
+    )
+    .await
+    {
         warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
     }
     close_stream(&mut stream).await;
+}
+
+async fn with_shard_io_timeout<T>(
+    operation: &'static str,
+    future: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    with_shard_io_timeout_after(SHARD_IO_TIMEOUT, operation, future).await
+}
+
+async fn with_shard_io_timeout_after<T>(
+    duration: Duration,
+    operation: &'static str,
+    future: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    timeout(duration, future)
+        .await
+        .unwrap_or_else(|_| Err(format!("timed out {operation}")))
 }
 
 async fn build_response(
@@ -107,6 +138,24 @@ async fn build_response(
             ShardTransportResponse::Manifest(Box::new(manifest))
         }
         Err(error) => ShardTransportResponse::Reject(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shard_io_timeout_reports_timed_out_operation() {
+        let error = with_shard_io_timeout_after(
+            Duration::from_millis(1),
+            "reading shard manifest request",
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect_err("pending shard IO must time out");
+
+        assert_eq!(error, "timed out reading shard manifest request");
     }
 }
 
