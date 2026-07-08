@@ -13,9 +13,10 @@ pub const METADATA_SEARCH_DEFAULT_PAGE_SIZE: usize = 25;
 pub const METADATA_SEARCH_MAX_PAGE_SIZE: usize = 100;
 pub const METADATA_SEARCH_MAX_PAGINATION_DEPTH: usize = 1000;
 
-const SEARCH_CURSOR_VERSION: u8 = 1;
-// Cursors are unsigned, so cap the resume map to bound the fan-out a forged
-// cursor can trigger through the target-node union.
+const SEARCH_CURSOR_VERSION: u8 = 2;
+const SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
+// Cursors are signed, but keep a resume cap to bound fan-out if a trusted signer
+// issues an unexpectedly large continuation.
 const SEARCH_CURSOR_MAX_RESUME_NODES: usize = 64;
 
 /// Sort key of the last hit emitted on a page, used as the exact resume point in
@@ -32,9 +33,20 @@ pub struct SearchWatermark {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchCursor {
     pub version: u8,
+    pub signer: [u8; 32],
     pub fingerprint: [u8; 32],
     pub watermark: SearchWatermark,
     pub resume: Vec<([u8; 32], u32)>,
+    pub signature: iroh::Signature,
+}
+
+#[derive(Serialize)]
+struct SearchCursorSignaturePayload<'a> {
+    version: u8,
+    signer: [u8; 32],
+    fingerprint: [u8; 32],
+    watermark: &'a SearchWatermark,
+    resume: &'a [([u8; 32], u32)],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -46,19 +58,33 @@ pub enum SearchCursorError {
 }
 
 impl SearchCursor {
-    pub fn new(
+    pub fn new_signed(
         fingerprint: [u8; 32],
         watermark: SearchWatermark,
         resume: Vec<(NodeId, u32)>,
+        signer: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Self {
+        let signer = *signer.as_bytes();
+        let resume: Vec<_> = resume
+            .into_iter()
+            .map(|(node_id, position)| (*node_id.as_bytes(), position))
+            .collect();
+        let signing_bytes = cursor_signing_bytes(
+            SEARCH_CURSOR_VERSION,
+            signer,
+            fingerprint,
+            &watermark,
+            &resume,
+        );
+        let signature = sign(&signing_bytes);
         Self {
             version: SEARCH_CURSOR_VERSION,
+            signer,
             fingerprint,
             watermark,
-            resume: resume
-                .into_iter()
-                .map(|(node_id, position)| (*node_id.as_bytes(), position))
-                .collect(),
+            resume,
+            signature,
         }
     }
 
@@ -67,7 +93,7 @@ impl SearchCursor {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    pub fn decode(raw: &str) -> Result<Self, SearchCursorError> {
+    pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(raw)
             .map_err(|_| SearchCursorError::Invalid)?;
@@ -78,7 +104,24 @@ impl SearchCursor {
         {
             return Err(SearchCursorError::Invalid);
         }
+        let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| SearchCursorError::Invalid)?;
+        if !authorized_signers.contains(&signer) {
+            return Err(SearchCursorError::Invalid);
+        }
+        signer
+            .verify(&cursor.signing_bytes(), &cursor.signature)
+            .map_err(|_| SearchCursorError::Invalid)?;
         Ok(cursor)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        cursor_signing_bytes(
+            self.version,
+            self.signer,
+            self.fingerprint,
+            &self.watermark,
+            &self.resume,
+        )
     }
 
     pub fn resume_positions(&self) -> HashMap<NodeId, u32> {
@@ -91,6 +134,28 @@ impl SearchCursor {
             })
             .collect()
     }
+}
+
+fn cursor_signing_bytes(
+    version: u8,
+    signer: [u8; 32],
+    fingerprint: [u8; 32],
+    watermark: &SearchWatermark,
+    resume: &[([u8; 32], u32)],
+) -> Vec<u8> {
+    let payload = SearchCursorSignaturePayload {
+        version,
+        signer,
+        fingerprint,
+        watermark,
+        resume,
+    };
+    let payload = postcard::to_allocvec(&payload).expect("search cursor payload serializes");
+    let mut bytes = Vec::with_capacity(SEARCH_CURSOR_SIGNATURE_CONTEXT.len() + 1 + payload.len());
+    bytes.extend_from_slice(SEARCH_CURSOR_SIGNATURE_CONTEXT);
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    bytes
 }
 
 /// Binds a cursor to the query that produced it. Recomputed on every continuation
@@ -140,6 +205,7 @@ pub struct SearchPageCursor {
 pub struct SearchPage {
     pub hits: Vec<MetadataSearchHit>,
     pub next: Option<SearchPageCursor>,
+    pub truncated: bool,
 }
 
 /// Deduplicate hits on `(graph_iri, subject_iri)` keeping the highest quantized
@@ -230,37 +296,47 @@ pub fn paginate(
     let next_watermark = page.last().map(watermark_of).or(watermark);
     let has_more = leftover || saturated;
 
+    let mut truncated = false;
     let next = if has_more {
-        next_watermark.and_then(|mark| {
-            let resume: Vec<(NodeId, u32)> = node_results
-                .iter()
-                .map(|node| {
-                    let position = node
-                        .hits
-                        .iter()
-                        .filter(|hit| !hit_after_watermark(hit, &mark))
-                        .count() as u32;
-                    (node.node_id, position)
-                })
-                .collect();
-            let deepest = resume
-                .iter()
-                .map(|(_, position)| *position as usize)
-                .max()
-                .unwrap_or(0);
-            if deepest >= max_depth {
-                return None;
+        match next_watermark {
+            Some(mark) => {
+                let resume: Vec<(NodeId, u32)> = node_results
+                    .iter()
+                    .map(|node| {
+                        let position = node
+                            .hits
+                            .iter()
+                            .filter(|hit| !hit_after_watermark(hit, &mark))
+                            .count() as u32;
+                        (node.node_id, position)
+                    })
+                    .collect();
+                let deepest = resume
+                    .iter()
+                    .map(|(_, position)| *position as usize)
+                    .max()
+                    .unwrap_or(0);
+                if deepest >= max_depth {
+                    truncated = true;
+                    None
+                } else {
+                    Some(SearchPageCursor {
+                        watermark: mark,
+                        resume,
+                    })
+                }
             }
-            Some(SearchPageCursor {
-                watermark: mark,
-                resume,
-            })
-        })
+            None => None,
+        }
     } else {
         None
     };
 
-    SearchPage { hits: page, next }
+    SearchPage {
+        hits: page,
+        next,
+        truncated,
+    }
 }
 
 /// Per-node fetch depth: resume position plus one page, defaulting unknown nodes to
@@ -298,8 +374,24 @@ fn watermark_of(hit: &MetadataSearchHit) -> SearchWatermark {
 mod tests {
     use super::*;
 
+    fn secret_key(seed: u8) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[seed; 32])
+    }
+
     fn node_id(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+        secret_key(seed).public()
+    }
+
+    fn signed_cursor(
+        fingerprint: [u8; 32],
+        watermark: SearchWatermark,
+        resume: Vec<(NodeId, u32)>,
+        seed: u8,
+    ) -> SearchCursor {
+        let secret = secret_key(seed);
+        SearchCursor::new_signed(fingerprint, watermark, resume, secret.public(), |bytes| {
+            secret.sign(bytes)
+        })
     }
 
     fn hit(graph: &str, subject: &str, score: f32) -> MetadataSearchHit {
@@ -317,7 +409,8 @@ mod tests {
 
     #[test]
     fn cursor_roundtrips_with_node_keys_and_exact_scores() {
-        let cursor = SearchCursor::new(
+        let signer = node_id(9);
+        let cursor = signed_cursor(
             [7u8; 32],
             SearchWatermark {
                 score: 0.8,
@@ -325,8 +418,9 @@ mod tests {
                 subject_iri: "./file.txt".to_string(),
             },
             vec![(node_id(1), 3), (node_id(2), 0)],
+            9,
         );
-        let decoded = SearchCursor::decode(&cursor.encode()).unwrap();
+        let decoded = SearchCursor::decode(&cursor.encode(), &[signer]).unwrap();
         assert_eq!(decoded, cursor);
         assert_eq!(decoded.watermark.score.to_bits(), 0.8f32.to_bits());
         let positions = decoded.resume_positions();
@@ -337,15 +431,15 @@ mod tests {
     #[test]
     fn cursor_decode_rejects_garbage_and_wrong_version() {
         assert_eq!(
-            SearchCursor::decode("not*base64"),
+            SearchCursor::decode("not*base64", &[node_id(1)]),
             Err(SearchCursorError::Invalid)
         );
         assert_eq!(
-            SearchCursor::decode("QUJD"),
+            SearchCursor::decode("QUJD", &[node_id(1)]),
             Err(SearchCursorError::Invalid)
         );
 
-        let mut cursor = SearchCursor::new(
+        let mut cursor = signed_cursor(
             [0u8; 32],
             SearchWatermark {
                 score: 1.0,
@@ -353,30 +447,60 @@ mod tests {
                 subject_iri: "s".to_string(),
             },
             Vec::new(),
+            1,
         );
-        cursor.version = 2;
+        cursor.version = 1;
         assert_eq!(
-            SearchCursor::decode(&cursor.encode()),
+            SearchCursor::decode(&cursor.encode(), &[node_id(1)]),
+            Err(SearchCursorError::Invalid)
+        );
+    }
+
+    #[test]
+    fn cursor_decode_rejects_tampering_and_untrusted_signers() {
+        let signer = node_id(1);
+        let cursor = signed_cursor(
+            [0u8; 32],
+            SearchWatermark {
+                score: 1.0,
+                graph_iri: "g".to_string(),
+                subject_iri: "s".to_string(),
+            },
+            vec![(node_id(2), 1)],
+            1,
+        );
+
+        assert_eq!(
+            SearchCursor::decode(&cursor.encode(), &[node_id(9)]),
+            Err(SearchCursorError::Invalid)
+        );
+
+        let mut forged = cursor;
+        forged.resume[0].1 = 99;
+        assert_eq!(
+            SearchCursor::decode(&forged.encode(), &[signer]),
             Err(SearchCursorError::Invalid)
         );
     }
 
     #[test]
     fn cursor_decode_caps_resume_entries() {
-        let cursor_with = |count: usize| SearchCursor {
-            version: SEARCH_CURSOR_VERSION,
-            fingerprint: [0u8; 32],
-            watermark: SearchWatermark {
-                score: 1.0,
-                graph_iri: "g".to_string(),
-                subject_iri: "s".to_string(),
-            },
-            resume: (0..count).map(|index| ([index as u8; 32], 0)).collect(),
+        let cursor_with = |count: usize| {
+            signed_cursor(
+                [0u8; 32],
+                SearchWatermark {
+                    score: 1.0,
+                    graph_iri: "g".to_string(),
+                    subject_iri: "s".to_string(),
+                },
+                (0..count).map(|index| (node_id(index as u8), 0)).collect(),
+                1,
+            )
         };
 
-        assert!(SearchCursor::decode(&cursor_with(64).encode()).is_ok());
+        assert!(SearchCursor::decode(&cursor_with(64).encode(), &[node_id(1)]).is_ok());
         assert_eq!(
-            SearchCursor::decode(&cursor_with(65).encode()),
+            SearchCursor::decode(&cursor_with(65).encode(), &[node_id(1)]),
             Err(SearchCursorError::Invalid)
         );
     }
@@ -656,8 +780,10 @@ mod tests {
         };
         let page = paginate(vec![node], None, 1, 1);
         assert_eq!(page.hits.len(), 1);
-        // Deepest resume (1) has reached the cap, so no continuation is offered.
+        // Deepest resume (1) has reached the cap, so no continuation is offered,
+        // but the response still marks the page as truncated rather than exhausted.
         assert!(page.next.is_none());
+        assert!(page.truncated);
     }
 
     #[test]

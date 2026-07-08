@@ -811,6 +811,10 @@ impl NetHandle {
         self.inner.node_id
     }
 
+    pub fn sign(&self, message: &[u8]) -> iroh::Signature {
+        self.inner.endpoint.secret_key().sign(message)
+    }
+
     pub fn realm_id(&self) -> &RealmId {
         &self.inner.realm_id
     }

@@ -48,6 +48,7 @@ use ulid::Ulid;
 
 use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
+use super::search_cursor::METADATA_SEARCH_MAX_PAGINATION_DEPTH;
 use super::search_enrichment::{hit_snippet, hit_title};
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
@@ -1009,7 +1010,7 @@ impl MetadataHandle {
                     auth_context,
                     graph_iris,
                     query,
-                    limit,
+                    clamp_remote_search_graph_limit(limit),
                 )
                 .await
                 {
@@ -3852,6 +3853,10 @@ async fn search_local_graphs(
     result
 }
 
+fn clamp_remote_search_graph_limit(limit: usize) -> usize {
+    limit.clamp(1, METADATA_SEARCH_MAX_PAGINATION_DEPTH)
+}
+
 struct AllowedGraphAuthorizer {
     graph_iris: HashSet<String>,
 }
@@ -4305,6 +4310,16 @@ mod tests {
         assert_eq!(
             options.document_sync_persist_policy,
             FjallPersistPolicy::SyncAll
+        );
+    }
+
+    #[test]
+    fn remote_search_graph_limit_clamps_at_protocol_ingress() {
+        assert_eq!(clamp_remote_search_graph_limit(0), 1);
+        assert_eq!(clamp_remote_search_graph_limit(25), 25);
+        assert_eq!(
+            clamp_remote_search_graph_limit(METADATA_SEARCH_MAX_PAGINATION_DEPTH + 1),
+            METADATA_SEARCH_MAX_PAGINATION_DEPTH
         );
     }
 

@@ -178,6 +178,7 @@ pub struct MetadataQueryExecution {
 pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
     pub next_cursor: Option<String>,
+    pub truncated: bool,
     pub fanout_stats: MetadataFanoutStats,
 }
 
@@ -187,15 +188,31 @@ pub struct MetadataFanoutStats {
     pub nodes_failed: usize,
 }
 
+#[derive(Debug, Clone)]
+struct MetadataRealmNodeDiscovery {
+    nodes: Vec<NodeId>,
+    failed: bool,
+}
+
 #[derive(Debug)]
 struct MetadataFanoutScope {
     mode: Option<MetadataApiQueryMode>,
     target_nodes: Option<Vec<NodeId>>,
+    discovery_failed: bool,
 }
 
 impl MetadataFanoutScope {
     fn new(mode: Option<MetadataApiQueryMode>, target_nodes: Option<Vec<NodeId>>) -> Self {
-        Self { mode, target_nodes }
+        Self {
+            mode,
+            target_nodes,
+            discovery_failed: false,
+        }
+    }
+
+    fn with_discovery_failed(mut self, discovery_failed: bool) -> Self {
+        self.discovery_failed = discovery_failed;
+        self
     }
 }
 
@@ -398,9 +415,24 @@ pub async fn search_metadata(
 
     let fingerprint =
         query_fingerprint(&request.query, request.graph_iris.as_deref(), request.mode);
+    let mut cursor_discovery = None;
     let (watermark, resume) = match request.cursor.as_deref() {
         Some(raw) => {
-            let cursor = SearchCursor::decode(raw)
+            let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+                MetadataApiQueryMode::Local => vec![local_node_id],
+                MetadataApiQueryMode::Distributed => match request.target_nodes.clone() {
+                    Some(nodes) => fanout_nodes_with_local(nodes, local_node_id),
+                    None => {
+                        let discovery =
+                            load_metadata_realm_nodes_with_status(context, realm_id, local_node_id)
+                                .await;
+                        let nodes = discovery.nodes.clone();
+                        cursor_discovery = Some(discovery);
+                        nodes
+                    }
+                },
+            };
+            let cursor = SearchCursor::decode(raw, &signer_nodes)
                 .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
             if cursor.fingerprint != fingerprint {
                 return Err(MetadataApiError::InvalidCursor(
@@ -414,22 +446,33 @@ pub async fn search_metadata(
 
     // On a continuation, attempt every node in the resume map even if realm
     // discovery no longer reports it, so its remaining hits are not skipped.
-    let target_nodes = if request.cursor.is_some() {
+    let (target_nodes, discovery_failed) = if request.cursor.is_some() {
         let mut nodes = match request.target_nodes.clone() {
             Some(nodes) => nodes,
-            None => load_metadata_realm_nodes(context, realm_id, local_node_id).await,
+            None => match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
+                MetadataApiQueryMode::Local => vec![local_node_id],
+                MetadataApiQueryMode::Distributed => cursor_discovery
+                    .as_ref()
+                    .map(|discovery| discovery.nodes.clone())
+                    .unwrap_or_else(|| vec![local_node_id]),
+            },
         };
         for node_id in resume.keys() {
             if !nodes.contains(node_id) {
                 nodes.push(*node_id);
             }
         }
-        Some(nodes)
+        (
+            Some(deduplicate_fanout_nodes(nodes)),
+            cursor_discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.failed),
+        )
     } else {
-        request.target_nodes.clone()
+        (request.target_nodes.clone(), false)
     };
 
-    let (hits, next, fanout_stats) = run_search_distributed(
+    let (hits, next, truncated, fanout_stats) = run_search_distributed(
         context,
         realm_id,
         local_node_id,
@@ -440,14 +483,34 @@ pub async fn search_metadata(
         resume,
         watermark,
         page_size,
-        MetadataFanoutScope::new(request.mode, target_nodes),
+        MetadataFanoutScope::new(request.mode, target_nodes)
+            .with_discovery_failed(discovery_failed),
     )
     .await?;
-    let next_cursor =
-        next.map(|cursor| SearchCursor::new(fingerprint, cursor.watermark, cursor.resume).encode());
+    let next_cursor = match next {
+        Some(cursor) => {
+            let net = context.net_handle.as_ref().ok_or_else(|| {
+                MetadataApiError::Internal(
+                    "net handle unavailable for search cursor signing".to_string(),
+                )
+            })?;
+            Some(
+                SearchCursor::new_signed(
+                    fingerprint,
+                    cursor.watermark,
+                    cursor.resume,
+                    net.node_id(),
+                    |bytes| net.sign(bytes),
+                )
+                .encode(),
+            )
+        }
+        None => None,
+    };
     Ok(MetadataSearchExecution {
         hits,
         next_cursor,
+        truncated,
         fanout_stats,
     })
 }
@@ -457,8 +520,28 @@ pub async fn load_metadata_realm_nodes(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> Vec<NodeId> {
+    load_metadata_realm_nodes_with_status(context, realm_id, local_node_id)
+        .await
+        .nodes
+}
+
+async fn load_metadata_realm_nodes_with_status(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+) -> MetadataRealmNodeDiscovery {
     let nodes = match drive(GetRealmNodesOperation::new(realm_id), context).await {
-        Ok(nodes) => nodes,
+        Ok(nodes) => {
+            let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+            if !nodes.contains(&local_node_id) {
+                nodes.push(local_node_id);
+            }
+            nodes.sort_by_key(|node_id| node_id.to_string());
+            return MetadataRealmNodeDiscovery {
+                nodes,
+                failed: false,
+            };
+        }
         Err(error) => {
             warn!(
                 error = %error,
@@ -472,7 +555,10 @@ pub async fn load_metadata_realm_nodes(
         nodes.push(local_node_id);
     }
     nodes.sort_by_key(|node_id| node_id.to_string());
-    nodes
+    MetadataRealmNodeDiscovery {
+        nodes,
+        failed: true,
+    }
 }
 
 async fn load_group_metadata_records(
@@ -889,6 +975,13 @@ pub fn deduplicate_fanout_nodes(nodes: Vec<NodeId>) -> Vec<NodeId> {
         .collect()
 }
 
+fn fanout_nodes_with_local(mut nodes: Vec<NodeId>, local_node_id: NodeId) -> Vec<NodeId> {
+    if !nodes.contains(&local_node_id) {
+        nodes.push(local_node_id);
+    }
+    deduplicate_fanout_nodes(nodes)
+}
+
 pub fn metadata_auth_token_from_bearer(token: Option<&str>) -> Option<MetadataAuthToken> {
     token.and_then(|token| MetadataAuthToken::bearer(token).ok())
 }
@@ -998,21 +1091,24 @@ async fn metadata_fanout_nodes(
     local_node_id: NodeId,
     span: &Span,
     target_nodes: Option<Vec<NodeId>>,
-) -> Vec<NodeId> {
+) -> MetadataRealmNodeDiscovery {
     match target_nodes {
         Some(nodes) => {
             span.record("discovery_ms", 0u64);
-            deduplicate_fanout_nodes(nodes)
+            MetadataRealmNodeDiscovery {
+                nodes: deduplicate_fanout_nodes(nodes),
+                failed: false,
+            }
         }
         None => {
             let discovery_started = Instant::now();
-            let nodes = aruna_core::telemetry::time_stage(
+            let discovery = aruna_core::telemetry::time_stage(
                 "discovery",
-                load_metadata_realm_nodes(context, realm_id, local_node_id),
+                load_metadata_realm_nodes_with_status(context, realm_id, local_node_id),
             )
             .await;
             record_elapsed_ms(span, "discovery_ms", discovery_started);
-            nodes
+            discovery
         }
     }
 }
@@ -1033,7 +1129,11 @@ where
     T: Send + 'static,
 {
     let span = Span::current();
-    let MetadataFanoutScope { mode, target_nodes } = scope;
+    let MetadataFanoutScope {
+        mode,
+        target_nodes,
+        discovery_failed,
+    } = scope;
     ensure_supported_query_mode(&mode);
     match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
         MetadataApiQueryMode::Local => {
@@ -1057,12 +1157,14 @@ where
             }
         }
         MetadataApiQueryMode::Distributed => {
-            let nodes =
+            let discovery =
                 metadata_fanout_nodes(context, realm_id, local_node_id, &span, target_nodes).await;
+            let discovery_failed = discovery_failed || discovery.failed;
+            let nodes = discovery.nodes;
             span.record("node_count", nodes.len() as u64);
             let mut fanout_stats = MetadataFanoutStats {
                 nodes_queried: nodes.len(),
-                nodes_failed: 0,
+                nodes_failed: usize::from(discovery_failed),
             };
             let fanout_started = Instant::now();
             let mut node_parts = Vec::new();
@@ -1263,6 +1365,7 @@ async fn run_search_distributed(
     (
         Vec<MetadataSearchHit>,
         Option<SearchPageCursor>,
+        bool,
         MetadataFanoutStats,
     ),
     MetadataApiError,
@@ -1349,7 +1452,7 @@ async fn run_search_distributed(
     );
     span.record("hit_count", page.hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok((page.hits, page.next, fanout_stats))
+    Ok((page.hits, page.next, page.truncated, fanout_stats))
 }
 
 pub fn aggregate_query_results(
