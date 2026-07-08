@@ -46,8 +46,9 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeUsageSnapshot,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
-    node_usage_key_node_id,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, WatchInterestDigest,
+    group_owner_index_key, node_usage_key_node_id, watch_interest_key_node_id,
+    watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -1523,6 +1524,49 @@ impl DocumentSyncService {
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
+                    DocumentSyncEvent::Upsert {
+                        target:
+                            target @ DocumentSyncTarget::WatchInterest {
+                                realm_id,
+                                node_id: interest_node,
+                            },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        // Watch-interest digests ride a single shared realm topic
+                        // that every realm publisher can write, so validate that
+                        // the signed publisher owns the claimed node and that the
+                        // payload's own node id matches its target before applying.
+                        // A rejected event is skipped (never `?`) so the cursor
+                        // still advances past it and a forgery cannot wedge the
+                        // topic's reconcile loop.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&interest_node),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                realm_id = %realm_id,
+                                node_id = %interest_node,
+                                "Rejecting watch interest digest: publisher is not the owning node"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_watch_interest_upsert(&target, &bytes) {
+                            warn!(
+                                %topic_id,
+                                realm_id = %realm_id,
+                                node_id = %interest_node,
+                                %reason,
+                                "Rejecting invalid watch interest digest"
+                            );
+                            continue;
+                        }
+                        self.apply_upsert(target.clone(), bytes, change).await?;
+                        applied_targets.push(target);
+                    }
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
@@ -1610,14 +1654,18 @@ impl DocumentSyncService {
                         }
                     }
                     DocumentSyncEvent::Delete {
-                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        target:
+                            target @ (DocumentSyncTarget::NodeUsage { .. }
+                            | DocumentSyncTarget::WatchInterest { .. }),
                         ..
                     }
                     | DocumentSyncEvent::AdminOperation {
-                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        target:
+                            target @ (DocumentSyncTarget::NodeUsage { .. }
+                            | DocumentSyncTarget::WatchInterest { .. }),
                         ..
                     } => {
-                        // Node-usage snapshots only ever sync as owner-validated
+                        // Shared realm snapshots only ever sync as owner-validated
                         // upserts. A signed Delete or AdminOperation on the shared
                         // realm topic would otherwise `?`-propagate through the
                         // generic arm and wedge every peer's reconcile forever, so
@@ -1625,7 +1673,7 @@ impl DocumentSyncService {
                         warn!(
                             %topic_id,
                             ?target,
-                            "Skipping unsupported non-upsert node usage document event"
+                            "Skipping unsupported non-upsert shared document event"
                         );
                         continue;
                     }
@@ -1933,6 +1981,13 @@ impl DocumentSyncService {
             // re-check the snapshot's self-consistency here so the generic
             // storage write below can never persist an unvalidated snapshot.
             validate_node_usage_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
+        }
+        if let DocumentSyncTarget::WatchInterest { .. } = target {
+            // Structural guard for the shared watch-interest keyspace. The
+            // reconcile loop already validated the signed publisher and this
+            // payload, but re-check the digest's self-consistency here so the
+            // generic storage write below can never persist an unvalidated digest.
+            validate_watch_interest_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -3529,6 +3584,39 @@ fn validate_node_usage_upsert(
     if node_usage_key_node_id(key.as_ref()) != Some(*node_id) {
         return Err(format!(
             "node usage storage key does not attribute to target node id {node_id}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the self-consistency of a replicated watch-interest digest against
+/// its sync target. Does not check the publisher's identity (the caller enforces
+/// that against the signed actor). Empty digests are valid: they clear a node's
+/// interest for the realm while preserving single-writer ownership.
+fn validate_watch_interest_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::WatchInterest { realm_id, node_id } = target else {
+        return Err("target is not a watch interest digest".to_string());
+    };
+    let digest = WatchInterestDigest::from_bytes(bytes)
+        .map_err(|error| format!("undecodable watch interest digest: {error}"))?;
+    if digest.node_id != *node_id {
+        return Err(format!(
+            "digest node id {} does not match target node id {node_id}",
+            digest.node_id
+        ));
+    }
+    let key = target.storage_key();
+    if watch_interest_key_node_id(key.as_ref()) != Some(*node_id) {
+        return Err(format!(
+            "watch interest storage key does not attribute to target node id {node_id}"
+        ));
+    }
+    if watch_interest_key_realm_id(key.as_ref()) != Some(*realm_id) {
+        return Err(format!(
+            "watch interest storage key does not attribute to target realm id {realm_id}"
         ));
     }
     Ok(())
@@ -7874,6 +7962,356 @@ mod tests {
             validate_node_usage_upsert(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn validate_watch_interest_upsert_accepts_owner_and_rejects_forgeries() {
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let node_id = node(7);
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+
+        // The owning node's own digest validates.
+        let owned = WatchInterestDigest::from_subscriptions(
+            node_id,
+            [(
+                "/owned/**".to_string(),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            )],
+        );
+        let owned_bytes = owned.to_bytes().unwrap();
+        assert!(validate_watch_interest_upsert(&target, &owned_bytes).is_ok());
+
+        // Empty digests are legitimate upserts that clear a node's interest.
+        let empty = WatchInterestDigest {
+            node_id,
+            entries: Vec::new(),
+        };
+        assert!(validate_watch_interest_upsert(&target, &empty.to_bytes().unwrap()).is_ok());
+
+        // A digest whose embedded node id is a different node is rejected.
+        let misattributed = WatchInterestDigest::from_subscriptions(
+            node(9),
+            [(
+                "/forged/**".to_string(),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            )],
+        );
+        assert!(
+            validate_watch_interest_upsert(&target, &misattributed.to_bytes().unwrap()).is_err()
+        );
+
+        // Undecodable payloads and non watch-interest targets are rejected.
+        assert!(validate_watch_interest_upsert(&target, b"not-a-digest").is_err());
+        assert!(
+            validate_watch_interest_upsert(
+                &DocumentSyncTarget::RealmConfig { realm_id },
+                &owned_bytes,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_forged_non_owner_watch_interest_upsert() {
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(55).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let forged_node = node(88);
+        assert_ne!(local_node, forged_node);
+        let realm_id = RealmId::from_bytes([55u8; 32]);
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: local_node,
+        };
+        let forged_target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: forged_node,
+        };
+        let topic_id = target.sync_topic_id();
+        assert_eq!(topic_id, forged_target.sync_topic_id());
+
+        let change = || DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+        let forged_digest = WatchInterestDigest::from_subscriptions(
+            forged_node,
+            [(
+                "/forged/**".to_string(),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            )],
+        );
+        let owned_digest = WatchInterestDigest::from_subscriptions(
+            local_node,
+            [(
+                "/owned/**".to_string(),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            )],
+        );
+        let owned_bytes = owned_digest.to_bytes().expect("digest serializes");
+
+        // The forged upsert claims another node's key but is signed by this
+        // service's local node. The legitimate upsert is signed by its owner on
+        // the same shared realm topic.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: forged_target.clone(),
+                        bytes: forged_digest.to_bytes().expect("digest serializes"),
+                        change: change(),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: owned_bytes.clone(),
+                        change: change(),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips forged watch-interest upsert");
+
+        assert!(result.targets.contains(&target));
+        assert!(!result.targets.contains(&forged_target));
+        let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .expect("watch interest digest applied");
+        assert_eq!(
+            WatchInterestDigest::from_bytes(&stored).expect("digest decodes"),
+            owned_digest
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                forged_target.storage_keyspace(),
+                forged_target.storage_key(),
+            )
+            .await
+            .is_none()
+        );
+
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the forged upsert"
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_forged_non_upsert_watch_interest_events() {
+        use aruna_core::structs::{WatchEventKind, WatchEventMask};
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(56).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let forged_node = node(89);
+        assert_ne!(local_node, forged_node);
+        let realm_id = RealmId::from_bytes([56u8; 32]);
+        let target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: local_node,
+        };
+        let forged_target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: forged_node,
+        };
+        let topic_id = target.sync_topic_id();
+        assert_eq!(topic_id, forged_target.sync_topic_id());
+
+        let change = |kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind,
+        };
+        let digest = WatchInterestDigest::from_subscriptions(
+            local_node,
+            [(
+                "/owned/**".to_string(),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            )],
+        );
+        let digest_bytes = digest.to_bytes().expect("digest serializes");
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_560, 1), realm_id),
+            realm_id,
+        );
+        let admin_event = test_admin_event(
+            Ulid::from_parts(1_561, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &actor,
+            1,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "forged watch-interest admin op".to_string(),
+            },
+        );
+
+        // Hostile non-upserts precede a legitimate owner-signed digest on the
+        // same shared realm topic. Reconcile must skip both non-upserts and
+        // continue to the valid upsert.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Delete {
+                        event_id: Ulid::new(),
+                        target: forged_target.clone(),
+                        change: change(DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: forged_target.clone(),
+                        event: Box::new(admin_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: digest_bytes.clone(),
+                        change: change(DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips forged watch-interest non-upserts");
+
+        assert!(result.targets.contains(&target));
+        assert!(!result.targets.contains(&forged_target));
+        let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .expect("watch interest digest applied");
+        assert_eq!(
+            WatchInterestDigest::from_bytes(&stored).expect("digest decodes"),
+            digest
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                forged_target.storage_keyspace(),
+                forged_target.storage_key(),
+            )
+            .await
+            .is_none()
+        );
+
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the forged non-upserts"
+        );
+
+        service.shutdown().await;
     }
 
     // A forged non-upsert node-usage event (here a signed Delete) on the shared
