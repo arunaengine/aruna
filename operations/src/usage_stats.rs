@@ -1238,20 +1238,19 @@ pub async fn publish_and_refresh_usage_snapshots(
 ) -> Result<PublishedUsage, String> {
     let (published, observed_markers) =
         publish_usage_snapshots_retaining_markers(ctx, node_id, realm_id, full).await?;
-    if !published.is_empty() {
-        if let Err(error) =
+    if !published.is_empty()
+        && let Err(error) =
             recompute_realm_usage_summary(ctx, node_id, published.global, published.groups.clone())
                 .await
+    {
+        if let Err(retry_error) =
+            signal_usage_snapshot_retry(ctx, &published, &observed_markers).await
         {
-            if let Err(retry_error) =
-                signal_usage_snapshot_retry(ctx, &published, &observed_markers).await
-            {
-                return Err(format!(
-                    "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
-                ));
-            }
-            return Err(error);
+            return Err(format!(
+                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
+            ));
         }
+        return Err(error);
     }
     // Replication and summary refresh both succeeded; only now consume the
     // markers, and only those a concurrent write did not re-dirty meanwhile.
