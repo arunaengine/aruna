@@ -8147,6 +8147,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
 
         let blocked = service
@@ -8525,6 +8526,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
         let actor = test_actor(8, user_id, realm_id);
         let admin_event = test_admin_event(
@@ -8808,6 +8810,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
         let forged_digest = WatchInterestDigest::from_subscriptions(
             forged_node,
@@ -8953,6 +8956,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
         let digest = WatchInterestDigest::from_subscriptions(
             local_node,

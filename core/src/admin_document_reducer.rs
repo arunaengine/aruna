@@ -11,9 +11,9 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, KIND_LABEL_KEY, MetadataReplicationConfig, NodePlacementEntry,
-    OidcProviderConfig, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind, StrategyBinding,
+    Actor, BindingScope, KIND_LABEL_KEY, MetadataRegistryRecord, MetadataReplicationConfig,
+    NodePlacementEntry, OidcProviderConfig, PlacementOverride, PlacementStrategy, QuotaConfig,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -39,6 +39,10 @@ pub enum AdminDocumentReducerError {
     ReservedPlacementLabel,
     #[error("placement strategy replica count must not be zero")]
     ZeroPlacementReplicaCount,
+    #[error("placement strategy {0} is not configured")]
+    UnknownPlacementStrategy(Ulid),
+    #[error("placement strategy {0} is still referenced")]
+    PlacementStrategyInUse(Ulid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +314,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
             ) => {
+                self.ensure_placement_strategy_not_referenced(strategy_id)?;
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_placement_strategy_path(strategy_id),
@@ -320,6 +325,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
             ) => {
+                self.ensure_placement_strategy_exists(strategy_id)?;
                 self.apply_realm_config_setting(
                     event,
                     REALM_CONFIG_DEFAULT_STRATEGY_PATH,
@@ -330,6 +336,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigStrategyBindingSet { binding },
             ) => {
+                self.ensure_placement_strategy_exists(&binding.strategy_id)?;
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_strategy_binding_path(&binding.scope),
@@ -350,6 +357,9 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementOverrideSet { record },
             ) => {
+                if let Some(strategy_id) = record.strategy_id.as_ref() {
+                    self.ensure_placement_strategy_exists(strategy_id)?;
+                }
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_placement_override_path(&record.subject),
@@ -670,10 +680,11 @@ impl AdminDocumentReducerState {
                 let binding = version
                     .value
                     .as_deref()
-                    .and_then(strategy_binding_from_value)?;
+                    .and_then(strategy_binding_from_value)
+                    .map(|binding| normalized_strategy_binding(&binding))?;
 
-                (binding_scope_key(&binding.scope) == scope_key)
-                    .then(|| (scope_key.to_string(), binding))
+                let canonical_scope_key = binding_scope_key(&binding.scope);
+                (canonical_scope_key == scope_key).then_some((canonical_scope_key, binding))
             })
             .collect()
     }
@@ -698,6 +709,46 @@ impl AdminDocumentReducerState {
                     .then(|| (subject_key.to_string(), record))
             })
             .collect()
+    }
+
+    fn ensure_placement_strategy_exists(
+        &self,
+        strategy_id: &Ulid,
+    ) -> Result<(), AdminDocumentReducerError> {
+        if self
+            .materialized_realm_config_placement_strategies()
+            .contains_key(strategy_id)
+        {
+            Ok(())
+        } else {
+            Err(AdminDocumentReducerError::UnknownPlacementStrategy(
+                *strategy_id,
+            ))
+        }
+    }
+
+    fn ensure_placement_strategy_not_referenced(
+        &self,
+        strategy_id: &Ulid,
+    ) -> Result<(), AdminDocumentReducerError> {
+        let default_references =
+            self.materialized_realm_config_default_strategy().as_ref() == Some(strategy_id);
+        let binding_references = self
+            .materialized_realm_config_strategy_bindings()
+            .values()
+            .any(|binding| &binding.strategy_id == strategy_id);
+        let override_references = self
+            .materialized_realm_config_placement_overrides()
+            .values()
+            .any(|record| record.strategy_id.as_ref() == Some(strategy_id));
+
+        if default_references || binding_references || override_references {
+            Err(AdminDocumentReducerError::PlacementStrategyInUse(
+                *strategy_id,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -1137,7 +1188,26 @@ pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
-    hex::encode(postcard::to_allocvec(scope).expect("binding scope serializes"))
+    let scope = normalized_binding_scope(scope);
+    hex::encode(postcard::to_allocvec(&scope).expect("binding scope serializes"))
+}
+
+fn normalized_binding_scope(scope: &BindingScope) -> BindingScope {
+    match scope {
+        BindingScope::MetadataPathPrefix(prefix) => BindingScope::MetadataPathPrefix(
+            MetadataRegistryRecord::normalize_document_path(prefix),
+        ),
+        BindingScope::Realm => BindingScope::Realm,
+        BindingScope::Group(group_id) => BindingScope::Group(*group_id),
+        BindingScope::Class(class) => BindingScope::Class(*class),
+    }
+}
+
+fn normalized_strategy_binding(binding: &StrategyBinding) -> StrategyBinding {
+    StrategyBinding {
+        scope: normalized_binding_scope(&binding.scope),
+        strategy_id: binding.strategy_id,
+    }
 }
 
 fn metadata_replication_value(metadata_replication: &MetadataReplicationConfig) -> String {
@@ -1172,7 +1242,8 @@ fn placement_strategy_value(strategy: &PlacementStrategy) -> String {
 }
 
 fn strategy_binding_value(binding: &StrategyBinding) -> String {
-    serde_json::to_string(binding).expect("admin document strategy binding serializes")
+    serde_json::to_string(&normalized_strategy_binding(binding))
+        .expect("admin document strategy binding serializes")
 }
 
 fn placement_override_value(record: &PlacementOverride) -> String {
@@ -3246,6 +3317,25 @@ mod tests {
         )
     }
 
+    fn upsert_placement_strategy(
+        state: &mut AdminDocumentReducerState,
+        event_seed: u8,
+        origin_seed: u8,
+        strategy_id: Ulid,
+    ) {
+        state
+            .apply(&realm_config_event(
+                event_seed,
+                node(origin_seed),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: placement_strategy(strategy_id, Some(3)),
+                },
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn admin_document_placement_paths_preserve_strings_and_round_trip() {
         let node_id = node(6);
@@ -3448,6 +3538,7 @@ mod tests {
     fn realm_config_default_strategy_materializes() {
         let mut state = realm_config_state();
         let strategy_id = Ulid::from_bytes([4; 16]);
+        upsert_placement_strategy(&mut state, 9, 9, strategy_id);
 
         state
             .apply(&realm_config_event(
@@ -3467,6 +3558,100 @@ mod tests {
     }
 
     #[test]
+    fn realm_config_strategy_refs_reject_unknown_strategy() {
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        let subject = b"document-subject".to_vec();
+        let ops = vec![
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: StrategyBinding {
+                    scope: BindingScope::MetadataPathPrefix("datasets".to_string()),
+                    strategy_id,
+                },
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: PlacementOverride {
+                    subject,
+                    pinned: vec![node(4)],
+                    excluded: Vec::new(),
+                    strategy_id: Some(strategy_id),
+                },
+            },
+        ];
+
+        for (index, op) in ops.into_iter().enumerate() {
+            let mut state = realm_config_state();
+            let before = state.clone();
+
+            assert_eq!(
+                state.apply(&realm_config_event(
+                    20 + index as u8,
+                    node(20 + index as u8),
+                    1,
+                    AdminDocumentClock::default(),
+                    op,
+                )),
+                Err(AdminDocumentReducerError::UnknownPlacementStrategy(
+                    strategy_id
+                ))
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn realm_config_placement_strategy_remove_rejects_dependents() {
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        let ops = vec![
+            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: StrategyBinding {
+                    scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                    strategy_id,
+                },
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: PlacementOverride {
+                    subject: b"document-subject".to_vec(),
+                    pinned: vec![node(4)],
+                    excluded: Vec::new(),
+                    strategy_id: Some(strategy_id),
+                },
+            },
+        ];
+
+        for (index, op) in ops.into_iter().enumerate() {
+            let mut state = realm_config_state();
+            let seed = 30 + (index as u8 * 3);
+            upsert_placement_strategy(&mut state, seed, seed, strategy_id);
+            state
+                .apply(&realm_config_event(
+                    seed + 1,
+                    node(seed + 1),
+                    1,
+                    AdminDocumentClock::default(),
+                    op,
+                ))
+                .unwrap();
+            let before = state.clone();
+
+            assert_eq!(
+                state.apply(&realm_config_event(
+                    seed + 2,
+                    node(seed + 2),
+                    1,
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
+                )),
+                Err(AdminDocumentReducerError::PlacementStrategyInUse(
+                    strategy_id
+                ))
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
     fn realm_config_strategy_binding_materializes_and_removes() {
         let mut state = realm_config_state();
         let scope = BindingScope::Class(DocumentClass::MetadataRegistry);
@@ -3474,6 +3659,7 @@ mod tests {
             scope: scope.clone(),
             strategy_id: Ulid::from_bytes([4; 16]),
         };
+        upsert_placement_strategy(&mut state, 9, 9, binding.strategy_id);
         let scope_key = super::binding_scope_key(&scope);
         let set_origin = node(1);
         let set = realm_config_event(
@@ -3514,14 +3700,76 @@ mod tests {
     }
 
     #[test]
+    fn realm_config_metadata_path_prefix_binding_remove_uses_normalized_key() {
+        let mut state = realm_config_state();
+        let raw_scope = BindingScope::MetadataPathPrefix("/datasets/".to_string());
+        let canonical_scope = BindingScope::MetadataPathPrefix("datasets".to_string());
+        let binding = StrategyBinding {
+            scope: raw_scope.clone(),
+            strategy_id: Ulid::from_bytes([4; 16]),
+        };
+        upsert_placement_strategy(&mut state, 9, 9, binding.strategy_id);
+        let canonical_binding = StrategyBinding {
+            scope: canonical_scope.clone(),
+            strategy_id: binding.strategy_id,
+        };
+        let canonical_scope_key = super::binding_scope_key(&canonical_scope);
+        let raw_scope_key = hex::encode(postcard::to_allocvec(&raw_scope).unwrap());
+        let set_origin = node(1);
+        let set = realm_config_event(
+            1,
+            set_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigStrategyBindingSet { binding },
+        );
+
+        state.apply(&set).unwrap();
+        assert_eq!(
+            state.materialized_realm_config_strategy_bindings(),
+            BTreeMap::from([(canonical_scope_key, canonical_binding)])
+        );
+        assert!(
+            state
+                .user_subject_ids
+                .contains_key(&realm_config_strategy_binding_path(&canonical_scope))
+        );
+        assert!(
+            !state
+                .user_subject_ids
+                .contains_key(&format!("realm_config.placement.bindings.{raw_scope_key}"))
+        );
+
+        let removal = realm_config_event(
+            2,
+            node(2),
+            1,
+            AdminDocumentClock::default().with_observed(set_origin, 1),
+            AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+                scope: BindingScope::MetadataPathPrefix(" datasets/ ".to_string()),
+            },
+        );
+
+        state.apply(&removal).unwrap();
+        assert!(
+            state
+                .materialized_realm_config_strategy_bindings()
+                .is_empty()
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
     fn realm_config_placement_override_materializes() {
         let mut state = realm_config_state();
         let subject = b"document-subject".to_vec();
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        upsert_placement_strategy(&mut state, 9, 9, strategy_id);
         let record = PlacementOverride {
             subject: subject.clone(),
             pinned: vec![node(4)],
             excluded: vec![node(5)],
-            strategy_id: Some(Ulid::from_bytes([4; 16])),
+            strategy_id: Some(strategy_id),
         };
         let subject_key = hex::encode(&subject);
 

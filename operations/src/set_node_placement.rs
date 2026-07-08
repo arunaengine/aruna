@@ -185,6 +185,7 @@ impl SetNodePlacementOperation {
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(admin_event),
             },
+            false,
         );
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);

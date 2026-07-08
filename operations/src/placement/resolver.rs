@@ -8,8 +8,8 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
     AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
-    KIND_LABEL_KEY, LabelMatch, PlacementOverride, PlacementStrategy, RealmConfigDocument,
-    RealmNodeKind,
+    KIND_LABEL_KEY, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
+    RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::types::GroupId;
 
@@ -158,8 +158,8 @@ pub fn resolve_holders(
 ///
 /// Precedence: override strategy id > longest matching metadata path prefix >
 /// group binding > class binding > realm binding > `default_strategy_id`,
-/// falling back to the first configured strategy. Returns `None` only when the
-/// realm has no strategies at all (config is seeded with defaults at creation).
+/// falling back to the first configured strategy only when no configured ref
+/// applies. Returns `None` when a configured ref points at no strategy.
 pub fn strategy_for_target<'a>(
     config: &'a RealmConfigDocument,
     target: &DocumentSyncTarget,
@@ -171,8 +171,11 @@ pub fn strategy_for_target<'a>(
         .iter()
         .find(|over| over.subject == subject);
 
-    let strategy = resolve_strategy(config, target, metadata_path, override_)
-        .or_else(|| config.strategies.first())?;
+    let strategy = match resolve_strategy(config, target, metadata_path, override_) {
+        Ok(Some(strategy)) => strategy,
+        Ok(None) => config.strategies.first()?,
+        Err(()) => return None,
+    };
     Some((strategy, override_))
 }
 
@@ -337,11 +340,9 @@ fn resolve_strategy<'a>(
     target: &DocumentSyncTarget,
     metadata_path: Option<&str>,
     override_: Option<&PlacementOverride>,
-) -> Option<&'a PlacementStrategy> {
-    if let Some(id) = override_.and_then(|over| over.strategy_id)
-        && let Some(strategy) = config.strategy(&id)
-    {
-        return Some(strategy);
+) -> Result<Option<&'a PlacementStrategy>, ()> {
+    if let Some(id) = override_.and_then(|over| over.strategy_id) {
+        return config.strategy(&id).map(Some).ok_or(());
     }
 
     let class = document_class(target);
@@ -350,52 +351,64 @@ fn resolve_strategy<'a>(
         DocumentClass::Metadata | DocumentClass::MetadataRegistry
     ) && let Some(path) = metadata_path
     {
+        let path = MetadataRegistryRecord::normalize_document_path(path);
         let best = config
             .strategy_bindings
             .iter()
             .filter_map(|binding| match &binding.scope {
-                BindingScope::MetadataPathPrefix(prefix) if path.starts_with(prefix.as_str()) => {
-                    Some((prefix.len(), binding))
+                BindingScope::MetadataPathPrefix(prefix) => {
+                    metadata_path_prefix_match_len(&path, prefix).map(|len| (len, binding))
                 }
                 _ => None,
             })
             .max_by_key(|(len, _)| *len)
             .map(|(_, binding)| binding);
-        if let Some(binding) = best
-            && let Some(strategy) = config.strategy(&binding.strategy_id)
-        {
-            return Some(strategy);
+        if let Some(binding) = best {
+            return config.strategy(&binding.strategy_id).map(Some).ok_or(());
         }
     }
 
     if let Some(group_id) = group_id_of(target)
-        && let Some(strategy) = binding_strategy(config, &BindingScope::Group(group_id))
+        && let Some(strategy) = binding_strategy(config, &BindingScope::Group(group_id))?
     {
-        return Some(strategy);
+        return Ok(Some(strategy));
     }
-    if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class)) {
-        return Some(strategy);
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class))? {
+        return Ok(Some(strategy));
     }
-    if let Some(strategy) = binding_strategy(config, &BindingScope::Realm) {
-        return Some(strategy);
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Realm)? {
+        return Ok(Some(strategy));
     }
-    if let Some(id) = config.default_strategy_id
-        && let Some(strategy) = config.strategy(&id)
+    if let Some(id) = config.default_strategy_id {
+        return config.strategy(&id).map(Some).ok_or(());
+    }
+    Ok(None)
+}
+
+fn metadata_path_prefix_match_len(normalized_path: &str, prefix: &str) -> Option<usize> {
+    let prefix = MetadataRegistryRecord::normalize_document_path(prefix);
+    if prefix.is_empty()
+        || normalized_path == prefix
+        || normalized_path
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
     {
-        return Some(strategy);
+        Some(prefix.len())
+    } else {
+        None
     }
-    None
 }
 
 fn binding_strategy<'a>(
     config: &'a RealmConfigDocument,
     scope: &BindingScope,
-) -> Option<&'a PlacementStrategy> {
+) -> Result<Option<&'a PlacementStrategy>, ()> {
     config
         .strategy_bindings
         .iter()
         .find(|binding| &binding.scope == scope)
-        .and_then(|binding| config.strategy(&binding.strategy_id))
+        .map(|binding| config.strategy(&binding.strategy_id).ok_or(()))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -842,6 +855,93 @@ mod tests {
         assert_eq!(winner(&config), sid(16)); // default
         config.default_strategy_id = None;
         assert_eq!(winner(&config), sid(10)); // first strategy fallback
+    }
+
+    #[test]
+    fn strategy_for_target_dangling_configured_refs_do_not_fallback() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = sid(2);
+        let target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id: sid(3),
+        };
+        let missing = sid(99);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.strategies = vec![strat(10), strat(11)];
+
+        config.default_strategy_id = Some(missing);
+        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+
+        config.default_strategy_id = Some(sid(11));
+        config.strategy_bindings = vec![binding(
+            BindingScope::MetadataPathPrefix("datasets".to_string()),
+            99,
+        )];
+        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+
+        config.strategy_bindings = vec![binding(BindingScope::Group(group_id), 99)];
+        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+
+        config.strategy_bindings = vec![binding(
+            BindingScope::Class(DocumentClass::MetadataRegistry),
+            99,
+        )];
+        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+
+        config.strategy_bindings = vec![binding(BindingScope::Realm, 99)];
+        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+
+        config.strategy_bindings.clear();
+        config.placement_overrides = vec![PlacementOverride {
+            subject: subject_bytes(&target),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(missing),
+        }];
+        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+
+        config.placement_overrides.clear();
+        config.default_strategy_id = None;
+        assert_eq!(
+            strategy_for_target(&config, &target, Some("datasets/x"))
+                .unwrap()
+                .0
+                .strategy_id,
+            sid(10)
+        );
+    }
+
+    #[test]
+    fn metadata_path_prefix_binding_requires_path_boundary() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = sid(2);
+        let target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id: sid(3),
+        };
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.strategies = vec![strat(10), strat(11), strat(12)];
+        config.strategy_bindings = vec![
+            binding(
+                BindingScope::MetadataPathPrefix(" /datasets/ ".to_string()),
+                10,
+            ),
+            binding(BindingScope::Class(DocumentClass::MetadataRegistry), 11),
+        ];
+        config.default_strategy_id = Some(sid(12));
+
+        let strategy_id = |path: &str| {
+            strategy_for_target(&config, &target, Some(path))
+                .unwrap()
+                .0
+                .strategy_id
+        };
+
+        assert_eq!(strategy_id("datasets"), sid(10));
+        assert_eq!(strategy_id("/datasets/x"), sid(10));
+        assert_eq!(strategy_id("datasets-private/x"), sid(11));
     }
 
     #[test]

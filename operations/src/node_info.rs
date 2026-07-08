@@ -97,6 +97,7 @@ async fn replicate_node_info(
             local_node_id: node_id,
             excluded_peers: Vec::new(),
             documents: vec![DocumentSyncTarget::NodeInfo { realm_id, node_id }],
+            allow_genesis: true,
         }),
         ctx,
     )
