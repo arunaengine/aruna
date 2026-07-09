@@ -613,11 +613,24 @@ impl PutObjectOperation {
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
-            self.txn_id = None;
-            self.register_blob_in_dht_or_continue()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                self.register_blob_in_dht_or_continue()
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => {
+                self.txn_id = None;
+                self.cleanup_failed_write(PutObjectError::StorageError(
+                    StorageError::TransactionConflict,
+                ))
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.txn_id = None;
+                self.emit_error(error.into())
+            }
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
     }
 
@@ -987,6 +1000,40 @@ mod test {
         assert!(matches!(
             op.finalize(),
             Err(crate::s3::put_object::PutObjectError::UsageUpdateError(_))
+        ));
+    }
+
+    #[test]
+    fn commit_transaction_conflict_deletes_written_blob_and_returns_conflict() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::new();
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
+        let txn_id = Ulid::new();
+        let location = test_location(op.config.user_id);
+
+        op.state = PutObjectState::CommitTransaction;
+        op.txn_id = Some(txn_id);
+        op.written_location = Some(location.clone());
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+
+        let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
+            panic!("expected blob cleanup")
+        };
+        assert_eq!(deleted, &location);
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(crate::s3::put_object::PutObjectError::StorageError(
+                StorageError::TransactionConflict
+            ))
         ));
     }
 
