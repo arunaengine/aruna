@@ -98,6 +98,8 @@ pub enum RemoveUserFromGroupError {
     Unauthorized,
     #[error("Role not found")]
     RoleNotFound,
+    #[error("Invalid user id")]
+    InvalidUserId,
     #[error("Authorization document not found")]
     AuthDocNotFound,
     #[error("cannot remove the last admin of a group")]
@@ -529,6 +531,10 @@ impl Operation for RemoveUserFromGroupOperation {
     type Error = RemoveUserFromGroupError;
 
     fn start(&mut self) -> Effects {
+        if self.input.user_id.is_nil() {
+            return self.fail(RemoveUserFromGroupError::InvalidUserId);
+        }
+
         // Self-leave needs no admin permission; the last-admin guard still applies.
         if self.input.actor.user_id == self.input.user_id {
             self.state = RemoveUserFromGroupState::StartTransaction;
@@ -676,6 +682,7 @@ pub mod test {
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
     use aruna_core::types::{RoleId, TxnId};
     use aruna_core::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, structs::Permission, structs::Role};
@@ -753,6 +760,31 @@ pub mod test {
             .iter()
             .filter_map(|(k, v)| (v.name == name).then_some(*k))
             .collect()
+    }
+
+    #[test]
+    fn rejects_nil_user_id_as_removal_target() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let role_id = Ulid::from_bytes([4u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            user_id: owner_id,
+            realm_id,
+        };
+        let mut operation = RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
+            actor,
+            group_id,
+            user_id: UserId::nil(realm_id),
+            role_ids: Some(HashSet::from([role_id])),
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(RemoveUserFromGroupError::InvalidUserId)
+        );
     }
 
     #[test]

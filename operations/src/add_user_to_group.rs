@@ -102,6 +102,8 @@ pub enum AddUserToGroupError {
     Unauthorized,
     #[error("Role not found")]
     RoleNotFound,
+    #[error("Invalid user id")]
+    InvalidUserId,
     #[error("Authorization document not found")]
     AuthDocNotFound,
     #[error(transparent)]
@@ -509,6 +511,10 @@ impl Operation for AddUserToGroupOperation {
     type Error = AddUserToGroupError;
 
     fn start(&mut self) -> Effects {
+        if self.input.user_id.is_nil() {
+            return self.fail(AddUserToGroupError::InvalidUserId);
+        }
+
         self.state = AddUserToGroupState::Auth;
 
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -701,7 +707,9 @@ pub mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::add_user_to_group::{
+        AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
+    };
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
@@ -779,6 +787,31 @@ pub mod test {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn rejects_nil_user_id_as_group_member() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let role_id = Ulid::from_bytes([4u8; 16]);
+        let actor = Actor {
+            node_id: node(5),
+            user_id: owner_id,
+            realm_id,
+        };
+        let mut operation = AddUserToGroupOperation::new(AddUserToGroupInput {
+            actor,
+            group_id,
+            user_id: UserId::nil(realm_id),
+            role_ids: HashSet::from([role_id]),
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(AddUserToGroupError::InvalidUserId)
+        );
     }
 
     #[test]

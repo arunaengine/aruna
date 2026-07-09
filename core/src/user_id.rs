@@ -33,6 +33,16 @@ impl UserId {
     }
 
     #[inline]
+    pub fn is_nil(&self) -> bool {
+        self.user_ulid.is_nil()
+    }
+
+    #[inline]
+    pub fn is_nil_in(&self, realm_id: RealmId) -> bool {
+        self.is_nil() && self.realm_id == realm_id
+    }
+
+    #[inline]
     pub fn to_storage_key(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(48);
         bytes.extend_from_slice(self.realm_id.as_bytes());
@@ -126,5 +136,17 @@ mod tests {
             UserId::from_storage_key(&user_id.to_storage_key()).unwrap(),
             user_id
         );
+    }
+
+    #[test]
+    fn nil_user_id_is_realm_scoped() {
+        let realm_id = RealmId([1u8; 32]);
+        let other_realm_id = RealmId([2u8; 32]);
+        let user_id = UserId::nil(realm_id);
+
+        assert!(user_id.is_nil());
+        assert!(user_id.is_nil_in(realm_id));
+        assert!(!user_id.is_nil_in(other_realm_id));
+        assert!(!UserId::local(Ulid::new(), realm_id).is_nil());
     }
 }

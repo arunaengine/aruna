@@ -263,7 +263,8 @@ pub async fn get_object(
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Response {
-    let auth = match require_drs_auth(state.as_ref(), auth) {
+    let anonymous = auth.is_none();
+    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -272,7 +273,7 @@ pub async fn get_object(
         Ok(ResolveOutcome::Found(resolved)) => {
             drs_json_response(StatusCode::OK, build_object_response(&headers, &resolved))
         }
-        Ok(ResolveOutcome::Denied) => DrsError::forbidden("Forbidden").into_response(),
+        Ok(ResolveOutcome::Denied) => drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
         Err(error) => error.into_response(),
     }
@@ -294,7 +295,8 @@ pub async fn post_objects(
     headers: HeaderMap,
     Json(body): Json<DrsBulkObjectsRequestBody>,
 ) -> Response {
-    let auth = match require_drs_auth(state.as_ref(), auth) {
+    let anonymous = auth.is_none();
+    let auth = match drs_auth_or_anonymous(state.as_ref(), auth) {
         Ok(auth) => auth,
         Err(error) => return error.into_response(),
     };
@@ -306,7 +308,10 @@ pub async fn post_objects(
                 &headers, &resolved,
             ))
             .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
-            Ok(ResolveOutcome::Denied) => json!({ "status_code": 403, "msg": "Forbidden" }),
+            Ok(ResolveOutcome::Denied) => {
+                let error = drs_denied_error(anonymous);
+                json!({ "status_code": error.status.as_u16(), "msg": error.message })
+            }
             Ok(ResolveOutcome::NotFound) => {
                 json!({ "status_code": 404, "msg": "DRS object not found" })
             }
@@ -333,12 +338,13 @@ pub async fn download_object(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let Ok(auth) = require_realm_auth(state.as_ref(), auth) else {
+    let anonymous = auth.is_none();
+    let Ok(auth) = drs_auth_or_anonymous(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
     let resolved = match resolve_object(state.as_ref(), &auth, &query.object_id).await {
         Ok(ResolveOutcome::Found(resolved)) => resolved,
-        Ok(ResolveOutcome::Denied) => return DrsError::forbidden("Forbidden").into_response(),
+        Ok(ResolveOutcome::Denied) => return drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => {
             return DrsError::not_found("DRS object not found").into_response();
         }
@@ -450,6 +456,27 @@ fn require_drs_auth(
     auth: Option<AuthContext>,
 ) -> Result<AuthContext, DrsError> {
     require_realm_auth(state, auth).map_err(|_| DrsError::forbidden("Forbidden"))
+}
+
+/// Requests without a bearer token resolve as the Everyone principal. Public
+/// roles are then the only grants that can make an object readable; denied
+/// anonymous lookups are mapped to 404 at the route layer.
+fn drs_auth_or_anonymous(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> Result<AuthContext, DrsError> {
+    match auth {
+        Some(_) => require_drs_auth(state, auth),
+        None => Ok(AuthContext::anonymous(state.get_realm_id())),
+    }
+}
+
+fn drs_denied_error(anonymous: bool) -> DrsError {
+    if anonymous {
+        DrsError::not_found("DRS object not found")
+    } else {
+        DrsError::forbidden("Forbidden")
+    }
 }
 
 async fn resolve_object(
@@ -693,7 +720,7 @@ impl IntoResponse for DrsError {
 mod tests {
     use super::{
         RequestedObjectId, ResolvedObject, W3ID_DATA_PREFIX, build_object_response,
-        encode_component, parse_requested_object_id,
+        drs_denied_error, encode_component, parse_requested_object_id,
     };
     use crate::openapi::ApiDoc;
     use aruna_core::structs::{BackendLocation, RealmId, SourceMetadata};
@@ -741,6 +768,17 @@ mod tests {
     fn test_node_id() -> NodeId {
         NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
             .unwrap()
+    }
+
+    #[test]
+    fn anonymous_drs_denied_error_matches_unknown_object() {
+        let anonymous = drs_denied_error(true);
+        assert_eq!(anonymous.status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(anonymous.message, "DRS object not found");
+
+        let authenticated = drs_denied_error(false);
+        assert_eq!(authenticated.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(authenticated.message, "Forbidden");
     }
 
     #[test]
