@@ -418,6 +418,11 @@ pub enum DocumentSyncNetEvent {
     DocumentsPublished {
         targets: Vec<DocumentSyncTarget>,
     },
+    DocumentsPartiallyPublished {
+        published_indices: Vec<usize>,
+        retry_indices: Vec<usize>,
+        error: String,
+    },
     DocumentsReconciled {
         applied: usize,
         targets: Vec<DocumentSyncTarget>,

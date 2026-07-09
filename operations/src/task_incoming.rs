@@ -69,6 +69,23 @@ struct DrainSubBatch {
     record_keys: Vec<Vec<u8>>,
 }
 
+impl DrainSubBatch {
+    fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
+        let mut targets = Vec::with_capacity(indices.len());
+        let mut record_keys = Vec::with_capacity(indices.len());
+        for &index in indices {
+            targets.push(self.targets.get(index)?.clone());
+            record_keys.push(self.record_keys.get(index)?.clone());
+        }
+        Some(Self {
+            peers: self.peers.clone(),
+            documents: Vec::new(),
+            targets,
+            record_keys,
+        })
+    }
+}
+
 #[derive(Default)]
 struct DrainSyncOutcome {
     sync_elapsed: Duration,
@@ -280,6 +297,31 @@ impl OperationsTaskHandler {
                     ..
                 })) => {
                     awaiting_sync = Some(subbatch);
+                }
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                        published_indices,
+                        retry_indices,
+                        error,
+                    },
+                )) => {
+                    warn!(
+                        key = ?retry_key,
+                        published = published_indices.len(),
+                        retry = retry_indices.len(),
+                        error = %error,
+                        "Partially created local document sync batch"
+                    );
+                    totals.retry_needed = true;
+                    match subbatch.sync_subset(&published_indices) {
+                        Some(published_subbatch) if !published_subbatch.record_keys.is_empty() => {
+                            awaiting_sync = Some(published_subbatch);
+                        }
+                        Some(_) => {}
+                        None => {
+                            warn!(key = ?retry_key, "Invalid partial document publish indices");
+                        }
+                    }
                 }
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     error, ..
@@ -909,6 +951,33 @@ mod tests {
             DocumentSyncPublish::Upsert { bytes, change: actual, .. }
                 if bytes == vec![1, 2, 3] && actual == change
         ));
+    }
+
+    #[test]
+    fn partial_publish_indices_select_exact_outbox_records() {
+        let duplicate_target = target();
+        let other_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(7, 2),
+        };
+        let subbatch = DrainSubBatch {
+            peers: vec![node(2)],
+            documents: Vec::new(),
+            targets: vec![
+                duplicate_target.clone(),
+                other_target,
+                duplicate_target.clone(),
+            ],
+            record_keys: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+        };
+
+        let selected = subbatch
+            .sync_subset(&[2])
+            .expect("published index selects a record");
+
+        assert_eq!(selected.targets, vec![duplicate_target]);
+        assert_eq!(selected.record_keys, vec![b"third".to_vec()]);
+        assert!(selected.documents.is_empty());
+        assert!(subbatch.sync_subset(&[3]).is_none());
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(

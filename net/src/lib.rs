@@ -10,6 +10,7 @@ pub mod error;
 pub mod streams;
 mod telemetry;
 
+use std::mem;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -41,7 +42,7 @@ use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
@@ -355,6 +356,24 @@ pub trait InboundEventHandler: Send + Sync {
     async fn handle_evicted_documents(&self, _documents: Vec<DocumentSyncEvictedDocument>) {}
 }
 
+async fn flush_pending_evicted_documents(
+    inbound_handler: &Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
+    pending_documents: &mut Vec<DocumentSyncEvictedDocument>,
+) -> bool {
+    if pending_documents.is_empty() {
+        return true;
+    }
+
+    let handler = inbound_handler.read().clone();
+    let Some(handler) = handler else {
+        return false;
+    };
+
+    let documents = mem::take(pending_documents);
+    handler.handle_evicted_documents(documents).await;
+    true
+}
+
 #[derive(Clone)]
 pub struct NetHandle {
     inner: Arc<NetInner>,
@@ -380,6 +399,8 @@ struct NetInner {
     network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
+    inbound_handler_registered: Arc<Notify>,
+    eviction_shutdown: CancellationToken,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -510,6 +531,7 @@ impl NetHandle {
 
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
+        let inbound_handler_registered = Arc::new(Notify::new());
 
         let connection_pool =
             ConnectionPool::new(endpoint.clone(), ConnectionPoolOptions::default());
@@ -652,31 +674,60 @@ impl NetHandle {
         // Drains genesis tie-break evictions (from irokle's own accept/resync
         // loops and this service's bootstrap/batch-sync paths), decodes them
         // into re-emittable documents, and hands them to the registered inbound
-        // handler for outbox re-enqueue. Reads the handler per batch, so it
-        // works whether or not the handler is registered yet.
+        // handler for outbox re-enqueue. Decoded documents are buffered until
+        // the inbound handler is registered and drained before shutdown exits.
         let eviction_document_sync = document_sync.clone();
         let eviction_inbound_handler = inbound_handler.clone();
-        let eviction_shutdown = shutdown.child_token();
+        let eviction_inbound_handler_registered = inbound_handler_registered.clone();
+        let eviction_shutdown = CancellationToken::new();
+        let eviction_shutdown_for_task = eviction_shutdown.clone();
         let eviction_task = tokio::spawn(async move {
             let Some(mut eviction_rx) = eviction_document_sync.take_eviction_receiver() else {
                 return;
             };
+            let mut pending_documents = Vec::new();
             loop {
                 tokio::select! {
-                    _ = eviction_shutdown.cancelled() => break,
+                    _ = eviction_shutdown_for_task.cancelled() => {
+                        while let Ok(eviction) = eviction_rx.try_recv() {
+                            pending_documents.extend(eviction_document_sync.decode_eviction(eviction));
+                        }
+                        if !flush_pending_evicted_documents(
+                            &eviction_inbound_handler,
+                            &mut pending_documents,
+                        )
+                        .await
+                        {
+                            warn!(
+                                count = pending_documents.len(),
+                                "Dropping re-emitted eviction documents during shutdown without a registered inbound handler"
+                            );
+                        }
+                        break;
+                    },
+                    _ = eviction_inbound_handler_registered.notified(), if !pending_documents.is_empty() => {
+                        let _ = flush_pending_evicted_documents(
+                            &eviction_inbound_handler,
+                            &mut pending_documents,
+                        )
+                        .await;
+                    },
                     maybe_eviction = eviction_rx.recv() => {
                         let Some(eviction) = maybe_eviction else { break };
                         let documents = eviction_document_sync.decode_eviction(eviction);
                         if documents.is_empty() {
                             continue;
                         }
-                        let handler = eviction_inbound_handler.read().clone();
-                        if let Some(handler) = handler {
-                            handler.handle_evicted_documents(documents).await;
-                        } else {
+                        pending_documents.extend(documents);
+                        if !flush_pending_evicted_documents(
+                            &eviction_inbound_handler,
+                            &mut pending_documents,
+                        )
+                        .await
+                        {
                             warn!(
-                                count = documents.len(),
-                                "Dropping re-emitted eviction documents without a registered inbound handler"
+                                count = pending_documents.len(),
+                                "Buffering re-emitted eviction documents until an inbound handler is registered"
                             );
                         }
                     }
@@ -737,6 +788,8 @@ impl NetHandle {
             network_diagnostics,
             peer_connectivity_tx,
             inbound_handler,
+            inbound_handler_registered,
+            eviction_shutdown,
             shutdown,
             tasks: Mutex::new(tasks),
         });
@@ -1092,6 +1145,7 @@ impl NetHandle {
 
     pub fn set_inbound_handler(&self, handler: Arc<dyn InboundEventHandler>) {
         *self.inner.inbound_handler.write() = Some(handler);
+        self.inner.inbound_handler_registered.notify_one();
     }
 
     pub fn clear_inbound_handler(&self) {
@@ -1108,6 +1162,7 @@ impl NetHandle {
             warn!(error = %err, "DHT shutdown returned error");
         }
         self.inner.document_sync.shutdown().await;
+        self.inner.eviction_shutdown.cancel();
         if let Err(err) = self.inner.connection_pool.shutdown().await {
             warn!(error = %err, "Connection pool shutdown returned error");
         }
@@ -2184,6 +2239,71 @@ mod tests {
             sequence,
             signature,
         }
+    }
+
+    fn test_evicted_document(seed: u8) -> DocumentSyncEvictedDocument {
+        let event_id = ulid::Ulid::from_parts(seed as u64, seed as u128);
+        let change = aruna_core::document::DocumentSyncChange {
+            base: None,
+            current: aruna_core::document::DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: make_secret(seed).public(),
+                updated_at_ms: seed as u64,
+            },
+            kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+        };
+
+        DocumentSyncEvictedDocument {
+            event_id: Some(event_id),
+            target: DocumentSyncTarget::RealmConfig {
+                realm_id: RealmId::from_bytes([seed; 32]),
+            },
+            event: aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+            allow_genesis: false,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingEvictedHandler {
+        documents: tokio::sync::Mutex<Vec<DocumentSyncEvictedDocument>>,
+    }
+
+    #[async_trait]
+    impl InboundEventHandler for RecordingEvictedHandler {
+        async fn handle_incoming_stream(
+            &self,
+            _alpn: Alpn,
+            _stream: streams::BiStream,
+            _node_id: NodeId,
+        ) {
+        }
+
+        async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) {
+            self.documents.lock().await.extend(documents);
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_documents_wait_for_registered_inbound_handler() {
+        let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
+            Arc::new(RwLock::new(None));
+        let expected = vec![test_evicted_document(11), test_evicted_document(12)];
+        let mut pending_documents = expected.clone();
+
+        assert!(
+            !flush_pending_evicted_documents(&inbound_handler, &mut pending_documents).await,
+            "documents must stay buffered without a handler"
+        );
+        assert_eq!(pending_documents, expected);
+
+        let handler = Arc::new(RecordingEvictedHandler::default());
+        let registered_handler: Arc<dyn InboundEventHandler> = handler.clone();
+        *inbound_handler.write() = Some(registered_handler);
+
+        assert!(flush_pending_evicted_documents(&inbound_handler, &mut pending_documents).await);
+        assert!(pending_documents.is_empty());
+        assert_eq!(*handler.documents.lock().await, expected);
     }
 
     #[test]

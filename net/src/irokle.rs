@@ -90,6 +90,14 @@ struct PendingMetadataCreateApply {
     lifecycle_revision: Option<DocumentSyncChange>,
 }
 
+#[derive(Default)]
+struct PublishEventsOutcome {
+    published: BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock>,
+    published_indices: Vec<usize>,
+    retry_indices: Vec<usize>,
+    retry_error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
@@ -531,7 +539,25 @@ impl DocumentSyncService {
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
         match self.publish_events(documents, peers).await {
-            Ok(()) => DocumentSyncNetEvent::DocumentsPublished { targets },
+            Ok(outcome) if outcome.retry_indices.is_empty() => {
+                DocumentSyncNetEvent::DocumentsPublished { targets }
+            }
+            Ok(outcome) if outcome.published_indices.is_empty() => DocumentSyncNetEvent::Error {
+                target: outcome
+                    .retry_indices
+                    .first()
+                    .and_then(|index| targets.get(*index).cloned()),
+                error: outcome
+                    .retry_error
+                    .unwrap_or_else(|| "Document sync topic not ready".to_string()),
+            },
+            Ok(outcome) => DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                published_indices: outcome.published_indices,
+                retry_indices: outcome.retry_indices,
+                error: outcome
+                    .retry_error
+                    .unwrap_or_else(|| "Document sync topic not ready".to_string()),
+            },
             Err(error) => DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -708,35 +734,36 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
-    ) -> Result<()> {
+    ) -> Result<PublishEventsOutcome> {
         if documents.is_empty() {
-            return Ok(());
+            return Ok(PublishEventsOutcome::default());
         }
         let sync_peers = self.sync_peers(peers);
         self.allow_sync_peers(&sync_peers)?;
         let service = self.clone();
-        let published = tokio::task::spawn_blocking(move || {
+        let mut outcome = tokio::task::spawn_blocking(move || {
             service.publish_events_blocking(documents, &sync_peers)
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
+        let published = std::mem::take(&mut outcome.published);
         self.advance_topic_cursors(published).await?;
-        self.flush_database()
+        self.flush_database()?;
+        Ok(outcome)
     }
 
     fn publish_events_blocking(
         &self,
         documents: Vec<DocumentSyncPublish>,
         sync_peers: &BTreeSet<PeerId>,
-    ) -> Result<BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock>> {
+    ) -> Result<PublishEventsOutcome> {
         let publish_started = Instant::now();
         let document_count = documents.len();
         let mut fast_path = 0usize;
         let mut fallback = 0usize;
         let oplog = Oplog::with_storage(self.node.storage().clone());
-        let mut published: BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock> =
-            BTreeMap::new();
-        for document in documents {
+        let mut outcome = PublishEventsOutcome::default();
+        for (index, document) in documents.into_iter().enumerate() {
             let allow_genesis = document.allow_genesis();
             let event = match document {
                 DocumentSyncPublish::Upsert {
@@ -770,7 +797,7 @@ impl DocumentSyncService {
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let op = self.publish_event_op(
+            let op = match self.publish_event_op(
                 &oplog,
                 &target,
                 topic_id,
@@ -780,22 +807,37 @@ impl DocumentSyncService {
                 allow_genesis,
                 &mut fast_path,
                 &mut fallback,
-            )?;
-            published
+            ) {
+                Ok(op) => op,
+                Err(NetError::TopicNotReady(topic)) => {
+                    outcome.retry_indices.push(index);
+                    outcome
+                        .retry_error
+                        .get_or_insert_with(|| NetError::TopicNotReady(topic).to_string());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            outcome.published_indices.push(index);
+            outcome
+                .published
                 .entry(topic_id)
                 .or_default()
                 .observe(op.signed.body.actor_id, op.signed.body.actor_seq);
         }
+        let published_count = outcome.published_indices.len();
         info!(
             event = "pipeline.publish.summary",
             documents = document_count,
+            published = published_count,
+            retry = outcome.retry_indices.len(),
             fast_path,
             fallback,
-            existing = document_count - fast_path - fallback,
+            existing = published_count.saturating_sub(fast_path + fallback),
             total_ms = duration_ms(publish_started.elapsed()),
             "Document sync publish batch breakdown"
         );
-        Ok(published)
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7280,6 +7322,87 @@ mod tests {
         assert!(
             service.has_topic(topic_id).expect("topic lookup"),
             "origin publish must create the topic genesis"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_not_ready_publish_does_not_block_ready_batch_record() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(62).await,
+            storage,
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let blocked_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_parts(62, 1),
+        };
+        let ready_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_parts(62, 2),
+        };
+        let blocked_topic = blocked_target.sync_topic_id();
+        let ready_topic = ready_target.sync_topic_id();
+        let change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(62, 3),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(62, 4),
+                        target: blocked_target.clone(),
+                        bytes: b"blocked".to_vec(),
+                        change,
+                        allow_genesis: false,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(62, 5),
+                        target: ready_target.clone(),
+                        bytes: b"ready".to_vec(),
+                        change,
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+
+        match published {
+            DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                published_indices,
+                retry_indices,
+                error,
+            } => {
+                assert_eq!(published_indices, vec![1]);
+                assert_eq!(retry_indices, vec![0]);
+                assert!(error.contains(&blocked_topic.to_string()));
+            }
+            other => panic!("expected partial publish, got {other:?}"),
+        }
+        assert!(
+            !service
+                .has_topic(blocked_topic)
+                .expect("blocked topic lookup"),
+            "not-ready record must not mint genesis"
+        );
+        assert!(
+            service.has_topic(ready_topic).expect("ready topic lookup"),
+            "ready record behind not-ready record must publish"
         );
     }
 
