@@ -117,20 +117,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
 
-    // Republish a full set of node usage snapshots at startup so realm peers see
-    // this node's totals again after a restart, dirty-marker loss, or a counter
-    // rebuild. Best-effort: failures are retried by the debounced publisher.
-    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        true,
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node usage snapshots");
-    }
-
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -264,6 +250,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
                 .await?;
         }
+    }
+
+    // Republish a full set of node usage snapshots after startup-mode core
+    // document announcement has had a chance to queue the shared node-usage topic
+    // genesis. Best-effort: failures are retried by the debounced publisher.
+    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        true,
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to publish initial node usage snapshots");
     }
 
     drive(

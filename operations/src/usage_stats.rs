@@ -1212,7 +1212,7 @@ async fn publish_usage_snapshots_retaining_markers(
         groups: group_list,
     };
     let targets = published.targets(realm_id, node_id);
-    drive(
+    if let Err(error) = drive(
         ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
             local_node_id: node_id,
@@ -1225,7 +1225,17 @@ async fn publish_usage_snapshots_retaining_markers(
         ctx,
     )
     .await
-    .map_err(|error| format!("node usage snapshot replication failed: {error}"))?;
+    .map_err(|error| format!("node usage snapshot replication failed: {error}"))
+    {
+        if let Err(retry_error) =
+            signal_usage_snapshot_retry(ctx, &published, &observed_markers).await
+        {
+            return Err(format!(
+                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
+            ));
+        }
+        return Err(error);
+    }
 
     Ok((published, observed_markers))
 }
@@ -1274,7 +1284,7 @@ async fn signal_usage_snapshot_retry(
     {
         Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
         Event::Task(TaskEvent::Error { message, .. }) => {
-            warn!(message = %message, "Failed to schedule usage snapshot retry after summary refresh failure");
+            warn!(message = %message, "Failed to schedule usage snapshot retry");
             Ok(())
         }
         other => {
@@ -2540,6 +2550,74 @@ mod tests {
         );
 
         // Markers survive so the debounced publisher retries the run.
+        assert!(
+            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
+        assert!(
+            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_publish_replication_failure_marks_published_scopes_dirty() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let node_id = node(1);
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let group_id = Ulid::new();
+
+        let counters = UsageCounters {
+            buckets: 1,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_global_key_for_group(group_id), counters).await;
+        write_counters(&ctx, usage_group_key(group_id), counters).await;
+        assert!(
+            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_none()
+        );
+        assert!(
+            read_node_stat(&ctx, node_usage_dirty_group_key(group_id))
+                .await
+                .is_none()
+        );
+
+        let config_key = DocumentSyncTarget::RealmConfig { realm_id }.storage_key();
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                key: config_key,
+                value: Value::from(b"corrupt".to_vec()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+
+        let result = publish_and_refresh_usage_snapshots(&ctx, node_id, realm_id, true).await;
+        assert!(
+            result.is_err(),
+            "replication failure must surface as an error, got {result:?}"
+        );
+
+        assert!(
+            read_node_stat(&ctx, node_usage_global_key(node_id))
+                .await
+                .is_some()
+        );
+        assert!(
+            read_node_stat(&ctx, node_usage_group_key(group_id, node_id))
+                .await
+                .is_some()
+        );
         assert!(
             read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
                 .await

@@ -230,6 +230,7 @@ pub struct RealmQuotaConfig {
     pub warn_threshold_percent: u32,
     pub group_overrides: Vec<RealmGroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
+    /// Redacted from unauthenticated `/info/realm` responses.
     pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
 }
@@ -377,10 +378,12 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
     responses(
         (status = 200, description = "Realm information", body = RealmInfoResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_realm_info(
     State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<RealmInfoResponse>)> {
     let config = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
@@ -399,6 +402,8 @@ pub async fn get_realm_info(
         config,
         present_nodes,
         interface_services_status(&state).await,
+        auth.as_ref()
+            .is_some_and(|auth| auth.realm_id == state.get_realm_id()),
     )?;
     Ok((StatusCode::OK, Json(response)))
 }
@@ -625,6 +630,7 @@ fn map_realm_info_response(
     config: RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     interfaces: InterfaceServicesStatus,
+    include_user_quota_overrides: bool,
 ) -> ServerResult<RealmInfoResponse> {
     let discovery = serde_json::to_value(&config.discovery)
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
@@ -654,6 +660,11 @@ fn map_realm_info_response(
         })
         .collect();
 
+    let mut quota = RealmQuotaConfig::from(config.quota);
+    if !include_user_quota_overrides {
+        quota.user_group_cap_overrides.clear();
+    }
+
     Ok(RealmInfoResponse {
         realm_id: config.realm_id.to_string(),
         description: config.description,
@@ -672,7 +683,7 @@ fn map_realm_info_response(
             .collect(),
         discovery,
         nodes,
-        quota: RealmQuotaConfig::from(config.quota),
+        quota,
         interfaces,
     })
 }
@@ -919,8 +930,8 @@ mod tests {
     use super::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RealmQuotaConfig, RequestSummary, ServiceStatus, ServicesStatus, get_info, get_realm_info,
-        get_usage, map_set_realm_quota_error, set_realm_quota,
+        RealmQuotaConfig, RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus,
+        get_info, get_realm_info, get_usage, map_set_realm_quota_error, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -1384,18 +1395,60 @@ mod tests {
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.default_group_quota_bytes = Some(4096);
 
-        let (status, Json(stored)) =
-            set_realm_quota(State(state.clone()), Extension(Some(auth)), Json(body))
-                .await
-                .unwrap();
+        let (status, Json(stored)) = set_realm_quota(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(body),
+        )
+        .await
+        .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored.default_group_quota_bytes, Some(4096));
         assert_eq!(stored.max_devices_per_user, None);
 
-        let (status, Json(info)) = get_realm_info(State(state)).await.unwrap();
+        let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(info.quota.default_group_quota_bytes, Some(4096));
         assert_eq!(info.quota.max_devices_per_user, None);
+    }
+
+    #[tokio::test]
+    async fn get_realm_info_redacts_user_quota_overrides_for_anonymous_callers() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.user_group_cap_overrides = vec![RealmUserGroupCapOverride {
+            user_id: admin.to_string(),
+            max_groups: Some(1),
+        }];
+
+        let (_status, Json(_stored)) = set_realm_quota(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let (_status, Json(anonymous)) = get_realm_info(State(state.clone()), Extension(None))
+            .await
+            .unwrap();
+        assert!(anonymous.quota.user_group_cap_overrides.is_empty());
+
+        let (_status, Json(authenticated)) = get_realm_info(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(authenticated.quota.user_group_cap_overrides.len(), 1);
+        assert_eq!(
+            authenticated.quota.user_group_cap_overrides[0].user_id,
+            admin.to_string()
+        );
     }
 
     #[tokio::test]
