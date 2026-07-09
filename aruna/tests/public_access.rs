@@ -1,5 +1,7 @@
 mod shared;
 
+use aruna_api::routes::groups::AddGroupMemberRequest;
+use aruna_core::UserId;
 use aruna_core::structs::blob_bucket_permission_path;
 use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
@@ -32,6 +34,31 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
 
         let group =
             create_group_via_http(&seed.base_url, &bearer_token, "public-access-e2e").await?;
+        let credential_group =
+            create_group_via_http(&seed.base_url, &bearer_token, "public-access-credentials")
+                .await?;
+        let member_id = UserId::local(Ulid::new(), seed.realm_id);
+        let member_token = create_bearer_token(
+            seed.context.as_ref(),
+            member_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let http = reqwest::Client::new();
+        let add_member = http
+            .post(format!(
+                "{}/api/v1/groups/{}/members",
+                seed.base_url, credential_group.group_id
+            ))
+            .bearer_auth(&bearer_token)
+            .json(&AddGroupMemberRequest {
+                user_id: member_id.to_string(),
+                role_ids: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(add_member.status(), StatusCode::CREATED);
         let s3_endpoint = seed
             .s3
             .as_ref()
@@ -39,6 +66,13 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let credentials =
             create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
         let s3 = s3_client(s3_endpoint, &credentials);
+        let cross_group_credentials = create_s3_credentials_via_http(
+            &seed.base_url,
+            &member_token,
+            &credential_group.group_id,
+        )
+        .await?;
+        let cross_group_s3 = s3_client(s3_endpoint, &cross_group_credentials);
 
         let bucket = "public-profiles";
         let key = "profiles/demo/mode.json";
@@ -57,7 +91,6 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             .send()
             .await?;
 
-        let http = reqwest::Client::new();
         let object_url = format!("{}/{bucket}/{key}", s3_endpoint.endpoint_url);
 
         // Before any public role exists, anonymous reads are denied.
@@ -206,10 +239,15 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
             "absent bucket should match private anonymous denial: {absent_body}"
         );
 
-        // Authenticated requests inherit public grants: signed access is never
-        // weaker than unsigned access (the signing key belongs to the same
-        // group here, but the grant flows through the public role's path).
-        let signed = s3.get_object().bucket(bucket).key(key).send().await?;
+        // Authenticated requests inherit public grants even when the signing
+        // key belongs to another group; signed access is never weaker than
+        // unsigned access.
+        let signed = cross_group_s3
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
         let signed_body = signed.body.collect().await?.into_bytes();
         assert_eq!(signed_body.as_ref(), PUBLIC_BODY);
 

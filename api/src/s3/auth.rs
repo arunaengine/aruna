@@ -81,12 +81,14 @@ impl S3Access for AuthProvider {
             return Err(s3_error!(AccessDenied, "Credential has expired"));
         }
 
-        let required_permission = match action {
+        let required_permission = match &action {
             Action::Read => Permission::READ,
             Action::Write => Permission::WRITE,
         };
 
-        let path = self.build_authorization_path(cx, &user_access).await?;
+        let path = self
+            .build_authorization_path(cx, &user_access, &action)
+            .await?;
 
         let allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -209,6 +211,7 @@ impl AuthProvider {
         &self,
         cx: &mut S3AccessContext<'_>,
         user_access: &UserAccess,
+        action: &Action,
     ) -> S3Result<String> {
         let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
             return Ok(self.group_data_path(user_access.group_id));
@@ -217,7 +220,7 @@ impl AuthProvider {
 
         let group_id = match self.find_bucket_info(&bucket).await? {
             Some(bucket_info) => {
-                if bucket_info.group_id != user_access.group_id {
+                if bucket_info.group_id != user_access.group_id && !matches!(action, Action::Read) {
                     return Err(s3_error!(
                         AccessDenied,
                         "Bucket belongs to a different group"
