@@ -12,6 +12,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 pub const MARK_READ_SCAN_PAGE_SIZE: usize = 512;
+pub const MARK_READ_MAX_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkReadInput {
@@ -33,6 +34,7 @@ pub struct MarkReadOperation {
     marked: usize,
     ids_remaining: usize,
     pending_next: Option<Key>,
+    too_many_ids: bool,
     output: Option<Result<MarkReadOutput, MarkReadError>>,
 }
 
@@ -51,6 +53,8 @@ pub enum MarkReadError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("mark read id count exceeds cap {max}")]
+    TooManyIds { max: usize },
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -63,8 +67,11 @@ pub enum MarkReadError {
 
 impl MarkReadOperation {
     pub fn new(mut input: MarkReadInput) -> Self {
-        input.ids.sort_unstable();
-        input.ids.dedup();
+        let too_many_ids = input.ids.len() > MARK_READ_MAX_IDS;
+        if !too_many_ids {
+            input.ids.sort_unstable();
+            input.ids.dedup();
+        }
         let ids_remaining = input.ids.len();
         Self {
             input,
@@ -72,6 +79,7 @@ impl MarkReadOperation {
             marked: 0,
             ids_remaining,
             pending_next: None,
+            too_many_ids,
             output: None,
         }
     }
@@ -195,6 +203,11 @@ impl Operation for MarkReadOperation {
     type Error = MarkReadError;
 
     fn start(&mut self) -> Effects {
+        if self.too_many_ids {
+            return self.fail(MarkReadError::TooManyIds {
+                max: MARK_READ_MAX_IDS,
+            });
+        }
         if self.input.ids.is_empty() && self.input.up_to_ms.is_none() {
             return self.finish();
         }
@@ -473,6 +486,26 @@ mod tests {
         );
         let stored = read_all(&context.storage_handle, recipient).await;
         assert!(stored.iter().all(|r| r.read_at_ms.is_none()));
+    }
+
+    #[test]
+    fn rejects_too_many_ids() {
+        let recipient = user(1, 1);
+        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::new()).collect();
+        let mut operation = MarkReadOperation::new(MarkReadInput {
+            recipient,
+            ids,
+            up_to_ms: None,
+            now_ms: 1,
+        });
+
+        assert!(operation.start().is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(MarkReadError::TooManyIds {
+                max: MARK_READ_MAX_IDS
+            })
+        );
     }
 
     #[tokio::test]

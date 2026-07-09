@@ -7,6 +7,7 @@ use aruna_operations::notifications::dispatch::{
     unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
+use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -278,6 +279,9 @@ pub async fn mark_read(
     Json(request): Json<MarkReadApiRequest>,
 ) -> ServerResult<(StatusCode, Json<MarkReadApiResponse>)> {
     let auth = require_unrestricted_realm_auth(&state, auth)?;
+    if request.ids.len() > MARK_READ_MAX_IDS {
+        return Err(ServerError::BadRequest);
+    }
     let ids = request
         .ids
         .iter()
@@ -482,6 +486,26 @@ mod tests {
         )
         .await
         .expect_err("bad id must be rejected");
+        assert!(matches!(error, ServerError::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn mark_read_rejects_too_many_ids() {
+        let realm_id = realm_id(6);
+        let (_dir, state) = build_state(realm_id, node(6)).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+        let error = mark_read(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(MarkReadApiRequest {
+                ids: (0..=MARK_READ_MAX_IDS)
+                    .map(|_| Ulid::new().to_string())
+                    .collect(),
+                up_to_ms: None,
+            }),
+        )
+        .await
+        .expect_err("too many ids must be rejected");
         assert!(matches!(error, ServerError::BadRequest));
     }
 

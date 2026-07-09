@@ -18,7 +18,7 @@ use crate::notifications::client::{
 };
 use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
-use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
+use crate::notifications::mark_read::{MARK_READ_MAX_IDS, MarkReadInput, MarkReadOperation};
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
@@ -144,6 +144,12 @@ async fn build_response(
             ids,
             up_to_ms,
         } => {
+            if ids.len() > MARK_READ_MAX_IDS {
+                return NotificationTransportMessage::Reject(format!(
+                    "mark read id count {} exceeds cap {MARK_READ_MAX_IDS}",
+                    ids.len()
+                ));
+            }
             if let Err(reason) =
                 verify_recipient_local_holder(&recipient, &realm_config, local_node_id)
             {
@@ -932,6 +938,20 @@ mod tests {
                 .await
                 .expect("unread count after"),
             (0, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_mark_read_rejects_too_many_ids() {
+        let (a, b, recipient) = delivery_pair(75).await;
+        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::new()).collect();
+
+        let error = mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+            .await
+            .expect_err("too many ids must be rejected");
+        assert!(
+            error.contains("exceeds cap"),
+            "unexpected reject reason: {error}"
         );
     }
 
