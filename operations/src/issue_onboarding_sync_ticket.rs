@@ -19,7 +19,10 @@ const USER_SYNC_TICKET_PAGE_SIZE: usize = 512;
 pub struct IssueOnboardingSyncTicketInput {
     pub realm_signing_key: SigningKey,
     pub realm_id: RealmId,
+    /// Node the ticket is issued to.
     pub node_id: NodeId,
+    /// Local issuer node that owns the bootstrap node-usage snapshot.
+    pub issuer_node_id: NodeId,
     pub now: u64,
     pub ttl_secs: u64,
 }
@@ -67,6 +70,11 @@ impl IssueOnboardingSyncTicketOperation {
             },
             DocumentSyncTarget::RealmConfig {
                 realm_id: input.realm_id,
+            },
+            DocumentSyncTarget::NodeUsage {
+                realm_id: input.realm_id,
+                node_id: input.issuer_node_id,
+                group_id: None,
             },
         ];
         Self {
@@ -188,6 +196,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::RealmId;
     use aruna_core::types::UserId;
     use aruna_storage::storage;
@@ -195,6 +204,48 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[test]
+    fn ticket_includes_shared_node_usage_for_issuer_node() {
+        let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let joiner_node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let issuer_node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let mut operation =
+            IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
+                realm_signing_key,
+                realm_id,
+                node_id: joiner_node_id,
+                issuer_node_id,
+                now: 100,
+                ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+            });
+
+        assert_eq!(operation.start().len(), 1);
+        assert!(
+            operation
+                .step(Event::Storage(StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                }))
+                .is_empty()
+        );
+        let ticket = operation.finalize().unwrap();
+
+        assert_eq!(ticket.payload.node_id, joiner_node_id.to_string());
+        assert_eq!(
+            ticket.payload.documents,
+            vec![
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentSyncTarget::NodeUsage {
+                    realm_id,
+                    node_id: issuer_node_id,
+                    group_id: None,
+                },
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn ticket_user_discovery_paginates_beyond_ten_thousand() {
@@ -210,6 +261,7 @@ mod tests {
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+        let issuer_node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
         let user_count = 10_005usize;
         let writes = (0..user_count)
             .map(|index| {
@@ -238,6 +290,7 @@ mod tests {
                 realm_signing_key,
                 realm_id,
                 node_id,
+                issuer_node_id,
                 now: 100,
                 ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
             }),
@@ -253,6 +306,16 @@ mod tests {
             .filter(|document| matches!(document, DocumentSyncTarget::User { .. }))
             .count();
         assert_eq!(users, user_count);
-        assert_eq!(ticket.payload.documents.len(), user_count + 2);
+        assert!(
+            ticket
+                .payload
+                .documents
+                .contains(&DocumentSyncTarget::NodeUsage {
+                    realm_id,
+                    node_id: issuer_node_id,
+                    group_id: None,
+                })
+        );
+        assert_eq!(ticket.payload.documents.len(), user_count + 3);
     }
 }

@@ -91,6 +91,7 @@ pub async fn bootstrap_onboarding_finalize(
             realm_signing_key: input.realm_signing_key,
             realm_id: input.realm_id,
             node_id: input.node_id,
+            issuer_node_id: input.local_node_id,
             now: input.now,
             ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
         }),
