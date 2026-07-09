@@ -252,6 +252,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Republish a full set of node usage snapshots after startup-mode core
+    // document announcement has had a chance to queue the shared node-usage topic
+    // genesis. Best-effort: failures are retried by the debounced publisher.
+    if let Err(error) = aruna_operations::usage_stats::publish_and_refresh_usage_snapshots(
+        driver_ctx.as_ref(),
+        config.node_id,
+        config.realm_id,
+        true,
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to publish initial node usage snapshots");
+    }
+
     drive(
         ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: config.realm_id,

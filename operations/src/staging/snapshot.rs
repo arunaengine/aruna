@@ -21,6 +21,7 @@ pub struct MaterializeSnapshotInput {
     pub source_path: String,
     pub bucket: String,
     pub key: String,
+    pub quota_ceiling: Option<u64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -81,6 +82,7 @@ pub async fn materialize_snapshot(
             checksum_type: None,
             exists: false,
             version_source: Some(version_source.clone()),
+            quota_ceiling: input.quota_ceiling,
         }),
         context,
     )

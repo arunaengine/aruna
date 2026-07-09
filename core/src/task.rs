@@ -22,6 +22,7 @@ pub enum TaskKey {
         peers: Vec<NodeId>,
     },
     DrainDocumentSyncOutbox,
+    PublishUsageSnapshots,
     DrainMetadataProjectionQueue,
     DrainMetadataMaterializationQueue,
     DrainMetadataGraphPruneQueue,

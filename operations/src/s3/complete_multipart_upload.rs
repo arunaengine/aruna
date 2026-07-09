@@ -3,7 +3,10 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError,
+    schedule_usage_snapshot_publish_effect,
+};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -48,11 +51,13 @@ pub enum CompleteMultipartUploadState {
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteLiveReplicationObligation,
+    EnforceQuota,
     UpdateUsage,
     CommitFinalizeTransaction,
     RegisterBlobInDht,
     CleanupDuplicate,
     CleanupPartBlobs,
+    AbortFinalizeTransaction,
     ResetUploadTransaction,
     ReadUploadForReset,
     WriteUploadReset,
@@ -96,6 +101,10 @@ pub enum CompleteMultipartUploadError {
     PartEtagMismatch,
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
+    #[error(transparent)]
+    QuotaGateError(#[from] QuotaGateError),
+    #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
+    QuotaExceeded { limit: u64, usage: u64 },
     #[error("CompleteMultipartUpload failed")]
     CompleteMultipartUploadFailed,
 }
@@ -119,6 +128,10 @@ pub struct CompleteMultipartUploadInput {
     pub checksum_type: MultipartChecksumType,
     pub object_size: Option<u64>,
     pub created_by: UserId,
+    /// Hard ceiling (bytes) the group's realm-wide `logical_bytes` may reach,
+    /// resolved from the realm quota config at the request surface. `None` =
+    /// unlimited, so no gate is enforced.
+    pub quota_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +148,7 @@ pub struct CompleteMultipartUploadOperation {
     input: CompleteMultipartUploadInput,
     txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
+    upload_parts: Vec<MultipartUploadPart>,
     resolved_parts: Vec<MultipartUploadPart>,
     composed_location: Option<BackendLocation>,
     final_location: Option<BackendLocation>,
@@ -145,6 +159,7 @@ pub struct CompleteMultipartUploadOperation {
     new_blob: bool,
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
+    quota_gate: Option<QuotaGate>,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -157,6 +172,7 @@ impl CompleteMultipartUploadOperation {
             input,
             txn_id: None,
             upload_record: None,
+            upload_parts: Vec::new(),
             resolved_parts: Vec::new(),
             composed_location: None,
             final_location: None,
@@ -167,6 +183,7 @@ impl CompleteMultipartUploadOperation {
             new_blob: false,
             was_live: false,
             usage_update: None,
+            quota_gate: None,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -181,6 +198,18 @@ impl CompleteMultipartUploadOperation {
 
     fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
         self.pending_error = Some(error);
+        // Any open finalize transaction must be aborted before we start the reset
+        // transaction, otherwise the old txn is orphaned in the storage actor and
+        // pins an LSM snapshot forever. The original error is preserved in
+        // `pending_error` and surfaced once cleanup completes.
+        if let Some(txn_id) = self.txn_id.take() {
+            self.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
+        }
+        self.continue_error_cleanup()
+    }
+
+    fn continue_error_cleanup(&mut self) -> Effects {
         if self.upload_record.is_some() {
             self.state = CompleteMultipartUploadState::ResetUploadTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -196,6 +225,14 @@ impl CompleteMultipartUploadOperation {
             })]
         } else {
             self.emit_pending_error()
+        }
+    }
+
+    fn handle_abort_finalize_transaction(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. })
+            | Event::Storage(StorageEvent::Error { .. }) => self.continue_error_cleanup(),
+            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
 
@@ -317,15 +354,18 @@ impl CompleteMultipartUploadOperation {
     fn extract_requested_parts(
         &self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
-    ) -> Result<Vec<MultipartUploadPart>, CompleteMultipartUploadError> {
+    ) -> Result<(Vec<MultipartUploadPart>, Vec<MultipartUploadPart>), CompleteMultipartUploadError>
+    {
         if self.input.completed_parts.is_empty() {
             return Err(CompleteMultipartUploadError::MissingParts);
         }
 
         let mut all_parts = HashMap::new();
+        let mut upload_parts = Vec::new();
         for (key, value) in values {
             let part_key = MultipartUploadPartKey::from_bytes(key.as_ref())?;
             let part_record = MultipartUploadPart::from_bytes(value.as_ref())?;
+            upload_parts.push(part_record.clone());
             all_parts.insert(part_key.part_number, part_record);
         }
 
@@ -353,7 +393,7 @@ impl CompleteMultipartUploadOperation {
             return Err(CompleteMultipartUploadError::InvalidObjectSize);
         }
 
-        Ok(resolved)
+        Ok((resolved, upload_parts))
     }
 
     fn handle_upload_parts_read(&mut self, event: Event) -> Effects {
@@ -361,14 +401,15 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
 
-        let resolved = match self.extract_requested_parts(values) {
-            Ok(resolved) => resolved,
+        let (resolved, upload_parts) = match self.extract_requested_parts(values) {
+            Ok(parts) => parts,
             Err(err) => return self.schedule_error(err),
         };
         self.composite_hashes = match compute_composite_hashes(&resolved) {
             Ok(hashes) => hashes,
             Err(err) => return self.schedule_error(err),
         };
+        self.upload_parts = upload_parts;
         self.resolved_parts = resolved.clone();
 
         self.state = CompleteMultipartUploadState::ComposeBlob;
@@ -726,8 +767,8 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
-        let mut deletes = Vec::with_capacity(self.resolved_parts.len() + 1);
-        for record in &self.resolved_parts {
+        let mut deletes = Vec::with_capacity(self.upload_parts.len() + 1);
+        for record in &self.upload_parts {
             let key = match MultipartUploadPartKey::new(self.input.upload_id, record.part_number)
                 .to_bytes()
             {
@@ -794,7 +835,7 @@ impl CompleteMultipartUploadOperation {
         let Some(size) = self
             .final_location
             .as_ref()
-            .map(|location| i64::try_from(location.blob_size).unwrap_or(i64::MAX))
+            .map(|location| i128::from(location.blob_size))
         else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -810,11 +851,74 @@ impl CompleteMultipartUploadOperation {
             stored_bytes: if self.new_blob { size } else { 0 },
             ..group_delta
         };
-        let mut update = UsageCounterUpdate::with_global(group_id, group_delta, global_delta);
+        self.usage_update = Some(UsageCounterUpdate::with_global(
+            group_id,
+            group_delta,
+            global_delta,
+        ));
+
+        // Enforce the hard group quota before the counters commit. Only a positive
+        // logical-bytes delta can push a group over its ceiling.
+        let object_size = self
+            .final_location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .unwrap_or(0);
+        if let Some(ceiling) = self.input.quota_ceiling
+            && object_size > 0
+        {
+            let mut gate = QuotaGate::new_for_realm(
+                ceiling,
+                object_size,
+                group_id,
+                self.input.node_id,
+                self.input.realm_id,
+            );
+            self.state = CompleteMultipartUploadState::EnforceQuota;
+            let effects = gate.start(txn_id);
+            self.quota_gate = Some(gate);
+            effects
+        } else {
+            self.start_usage_update(txn_id)
+        }
+    }
+
+    fn start_usage_update(&mut self, txn_id: TxnId) -> Effects {
         self.state = CompleteMultipartUploadState::UpdateUsage;
-        let effects = update.start(txn_id);
-        self.usage_update = Some(update);
-        effects
+        match self.usage_update.as_mut() {
+            Some(update) => update.start(txn_id),
+            None => {
+                self.schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed)
+            }
+        }
+    }
+
+    fn handle_enforce_quota(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+        };
+        let Some(gate) = self.quota_gate.as_mut() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        match gate.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                if gate.is_exceeded() {
+                    let limit = gate.ceiling();
+                    let usage = gate.projected_usage();
+                    // schedule_error resets the upload back to Open and cleans up
+                    // the composed blob, mirroring every other finalize-phase error.
+                    self.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+                        limit,
+                        usage,
+                    })
+                } else {
+                    self.start_usage_update(txn_id)
+                }
+            }
+            Err(err) => self.schedule_error(err.into()),
+        }
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -908,7 +1012,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn cleanup_next_part_blob(&mut self) -> Effects {
-        let Some(record) = self.resolved_parts.get(self.cleanup_part_index) else {
+        let Some(record) = self.upload_parts.get(self.cleanup_part_index) else {
             self.state = CompleteMultipartUploadState::Finish;
             self.composed_location = None;
             let Some(location) = self.final_location.clone() else {
@@ -929,7 +1033,7 @@ impl CompleteMultipartUploadOperation {
                 checksum_type: self.input.checksum_type,
                 response_hashes,
             }));
-            return smallvec![];
+            return smallvec![schedule_usage_snapshot_publish_effect()];
         };
 
         self.state = CompleteMultipartUploadState::CleanupPartBlobs;
@@ -1081,6 +1185,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            CompleteMultipartUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteMultipartUploadState::UpdateUsage => self.handle_usage_update(event),
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)
@@ -1090,6 +1195,9 @@ impl Operation for CompleteMultipartUploadOperation {
             }
             CompleteMultipartUploadState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             CompleteMultipartUploadState::CleanupPartBlobs => self.handle_cleanup_part_blob(event),
+            CompleteMultipartUploadState::AbortFinalizeTransaction => {
+                self.handle_abort_finalize_transaction(event)
+            }
             CompleteMultipartUploadState::ResetUploadTransaction => {
                 self.handle_reset_transaction_started(event)
             }
@@ -1201,5 +1309,205 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
         ChecksumAlgorithm::Crc32 => hashes.crc32.to_vec(),
         ChecksumAlgorithm::Crc32c => hashes.crc32c.to_vec(),
         ChecksumAlgorithm::Crc64Nvme => hashes.crc64nvme.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finalize_input() -> CompleteMultipartUploadInput {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        CompleteMultipartUploadInput {
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            upload_id: Ulid::new(),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            completed_parts: vec![],
+            expected_checksums: vec![],
+            checksum_type: MultipartChecksumType::FullObject,
+            object_size: Some(10),
+            created_by: UserId::local(Ulid::new(), realm_id),
+            quota_ceiling: Some(30),
+        }
+    }
+
+    fn open_upload_record(input: &CompleteMultipartUploadInput) -> MultipartUpload {
+        MultipartUpload {
+            upload_id: input.upload_id,
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            group_id: Ulid::new(),
+            created_by: input.created_by,
+            created_at: SystemTime::now(),
+            status: MultipartUploadStatus::Completing,
+            checksum_hint: None,
+        }
+    }
+
+    fn part_record(part_number: u16, blob_size: u64) -> MultipartUploadPart {
+        MultipartUploadPart {
+            part_number,
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "multipart".to_string(),
+                backend_path: format!("part-{part_number}"),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+                created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+                created_at: SystemTime::now(),
+                staging: false,
+                partial: true,
+                blob_size,
+                hashes: HashMap::new(),
+            },
+            created_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn delete_upload_records_includes_omitted_parts() {
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.upload_parts = vec![part_record(1, 10), part_record(2, 20)];
+        op.resolved_parts = vec![op.upload_parts[0].clone()];
+
+        let effects = op.delete_upload_records();
+
+        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
+        else {
+            panic!("expected batch delete effect");
+        };
+        assert_eq!(deletes.len(), 3);
+        let omitted_key = MultipartUploadPartKey::new(op.input.upload_id, 2)
+            .to_bytes()
+            .unwrap();
+        assert!(deletes.iter().any(|(_, key)| key.as_ref() == omitted_key));
+    }
+
+    #[test]
+    fn cleanup_part_blobs_includes_omitted_parts() {
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let requested = part_record(1, 10);
+        let omitted = part_record(2, 20);
+        op.final_location = Some(BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "objects".to_string(),
+            backend_path: "object".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        });
+        op.version_id = Some(Ulid::new());
+        op.upload_parts = vec![requested.clone(), omitted.clone()];
+        op.resolved_parts = vec![requested.clone()];
+
+        let effects = op.begin_cleanup_part_blobs();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { location })] if location == &requested.location
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete { location })] if location == &omitted.location
+        ));
+    }
+
+    // A quota rejection at EnforceQuota leaves the finalize transaction open. It
+    // must be aborted before the reset transaction starts, otherwise the storage
+    // actor orphans the txn and pins an LSM snapshot forever.
+    #[test]
+    fn quota_rejection_aborts_finalize_txn_before_reset() {
+        let input = finalize_input();
+        let record = open_upload_record(&input);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let finalize_txn = TxnId::new();
+        op.txn_id = Some(finalize_txn);
+        op.upload_record = Some(record);
+        op.state = CompleteMultipartUploadState::EnforceQuota;
+
+        let effects = op.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+            limit: 30,
+            usage: 35,
+        });
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id }) if txn_id == finalize_txn
+        ));
+        assert_eq!(
+            op.state,
+            CompleteMultipartUploadState::AbortFinalizeTransaction
+        );
+        // Cleared so the reset StartTransaction can never overwrite (orphan) it.
+        assert_eq!(op.txn_id, None);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: finalize_txn,
+        }));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::StartTransaction { read: false })
+        ));
+        assert_eq!(
+            op.state,
+            CompleteMultipartUploadState::ResetUploadTransaction
+        );
+        assert_eq!(
+            op.pending_error,
+            Some(CompleteMultipartUploadError::QuotaExceeded {
+                limit: 30,
+                usage: 35
+            })
+        );
+    }
+
+    // If the finalize-txn abort itself errors, the original quota error must still
+    // be surfaced rather than masked by the abort failure.
+    #[test]
+    fn quota_rejection_abort_failure_preserves_original_error() {
+        let input = finalize_input();
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let finalize_txn = TxnId::new();
+        op.txn_id = Some(finalize_txn);
+        op.state = CompleteMultipartUploadState::EnforceQuota;
+
+        let effects = op.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
+            limit: 30,
+            usage: 35,
+        });
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id }) if txn_id == finalize_txn
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert_eq!(
+            op.finalize(),
+            Err(CompleteMultipartUploadError::QuotaExceeded {
+                limit: 30,
+                usage: 35
+            })
+        );
     }
 }

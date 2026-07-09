@@ -1,30 +1,40 @@
 use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
+use aruna_core::errors::StorageError;
+use aruna_core::structs::{
+    Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
+};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters};
+use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::set_realm_quota::{
+    SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
+};
 use aruna_operations::status::load_node_observability_status;
-use aruna_operations::usage_stats::LoadUsageCountersOperation;
+use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::routing::{get, put};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::warn;
+use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info, get_realm_info, get_usage)
+    paths(get_info, get_realm_info, set_realm_quota, get_usage)
 )]
 pub struct InfoApiDoc;
 
@@ -32,6 +42,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/info", get(get_info))
         .route("/info/realm", get(get_realm_info))
+        .route("/info/realm/quota", put(set_realm_quota))
         .route("/info/usage", get(get_usage))
 }
 
@@ -206,7 +217,109 @@ pub struct RealmInfoResponse {
     #[schema(value_type = Object)]
     pub discovery: Value,
     pub nodes: Vec<RealmNodeInfoResponse>,
+    pub quota: RealmQuotaConfig,
     pub interfaces: InterfaceServicesStatus,
+}
+
+/// Realm-wide quota policy. Used both as the response for the current settings
+/// and as the replace-semantics request body for updating them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmQuotaConfig {
+    pub default_group_quota_bytes: Option<u64>,
+    pub grace_factor_percent: u32,
+    pub warn_threshold_percent: u32,
+    pub group_overrides: Vec<RealmGroupQuotaOverride>,
+    pub max_groups_per_user: Option<u32>,
+    /// Redacted from unauthenticated `/info/realm` responses.
+    pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
+    pub max_devices_per_user: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmGroupQuotaOverride {
+    pub group_id: String,
+    pub quota_bytes: Option<u64>,
+    pub grace_factor_percent: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmUserGroupCapOverride {
+    pub user_id: String,
+    pub max_groups: Option<u32>,
+}
+
+impl From<QuotaConfig> for RealmQuotaConfig {
+    fn from(quota: QuotaConfig) -> Self {
+        Self {
+            default_group_quota_bytes: quota.default_group_quota_bytes,
+            grace_factor_percent: quota.grace_factor_percent,
+            warn_threshold_percent: quota.warn_threshold_percent,
+            group_overrides: quota
+                .group_overrides
+                .into_iter()
+                .map(|over| RealmGroupQuotaOverride {
+                    group_id: over.group_id.to_string(),
+                    quota_bytes: over.quota_bytes,
+                    grace_factor_percent: over.grace_factor_percent,
+                })
+                .collect(),
+            max_groups_per_user: quota.max_groups_per_user,
+            user_group_cap_overrides: quota
+                .user_group_cap_overrides
+                .into_iter()
+                .map(|over| RealmUserGroupCapOverride {
+                    user_id: over.user_id.to_string(),
+                    max_groups: over.max_groups,
+                })
+                .collect(),
+            max_devices_per_user: quota.max_devices_per_user,
+        }
+    }
+}
+
+impl RealmQuotaConfig {
+    fn into_quota_config(self) -> ServerResult<QuotaConfig> {
+        let group_overrides = self
+            .group_overrides
+            .into_iter()
+            .map(|over| {
+                Ok(GroupQuotaOverride {
+                    group_id: Ulid::from_string(&over.group_id).map_err(|_| {
+                        ServerError::BadRequestReason(format!(
+                            "invalid group id in group_overrides: {}",
+                            over.group_id
+                        ))
+                    })?,
+                    quota_bytes: over.quota_bytes,
+                    grace_factor_percent: over.grace_factor_percent,
+                })
+            })
+            .collect::<ServerResult<Vec<_>>>()?;
+        let user_group_cap_overrides = self
+            .user_group_cap_overrides
+            .into_iter()
+            .map(|over| {
+                Ok(UserGroupCapOverride {
+                    user_id: UserId::from_string(&over.user_id).map_err(|_| {
+                        ServerError::BadRequestReason(format!(
+                            "invalid user id in user_group_cap_overrides: {}",
+                            over.user_id
+                        ))
+                    })?,
+                    max_groups: over.max_groups,
+                })
+            })
+            .collect::<ServerResult<Vec<_>>>()?;
+        Ok(QuotaConfig {
+            default_group_quota_bytes: self.default_group_quota_bytes,
+            grace_factor_percent: self.grace_factor_percent,
+            warn_threshold_percent: self.warn_threshold_percent,
+            group_overrides,
+            max_groups_per_user: self.max_groups_per_user,
+            user_group_cap_overrides,
+            max_devices_per_user: self.max_devices_per_user,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -265,10 +378,12 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
     responses(
         (status = 200, description = "Realm information", body = RealmInfoResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
-    )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_realm_info(
     State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<RealmInfoResponse>)> {
     let config = drive(
         GetRealmConfigOperation::new(state.get_realm_id()),
@@ -287,10 +402,89 @@ pub async fn get_realm_info(
         config,
         present_nodes,
         interface_services_status(&state).await,
+        auth.as_ref()
+            .is_some_and(|auth| auth.realm_id == state.get_realm_id()),
     )?;
     Ok((StatusCode::OK, Json(response)))
 }
 
+async fn authorize_realm_config_admin(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id || !state.is_management_node() {
+        return Err(ServerError::Forbidden);
+    }
+
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path: format!("/{realm_id}/admin/config"),
+            required_permission: Permission::WRITE,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    if !allowed {
+        return Err(ServerError::Forbidden);
+    }
+
+    Ok(auth)
+}
+
+#[utoipa::path(
+    put,
+    path = "/info/realm/quota",
+    tag = "info",
+    request_body = RealmQuotaConfig,
+    responses(
+        (status = 200, description = "Updated realm quota configuration", body = RealmQuotaConfig),
+        (status = 400, description = "Invalid quota configuration", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
+        (status = 409, description = "Concurrent quota update conflict", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_realm_quota(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<RealmQuotaConfig>,
+) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
+    let auth = authorize_realm_config_admin(&state, auth).await?;
+    let quota = request.into_quota_config()?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: auth.realm_id,
+    };
+    let stored = drive(
+        SetRealmQuotaOperation::new(SetRealmQuotaConfig { actor, quota }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_set_realm_quota_error)?;
+    Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
+}
+
+fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
+    match error {
+        SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
+        SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
+        SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+/// Storage usage. The flat fields report this node's local counters (kept for
+/// backward compatibility) and are always present. `realm` reports the
+/// realm-wide total summed across every node and is only included for
+/// authenticated callers, so unauthenticated requests never disclose it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UsageResponse {
     pub buckets: u64,
@@ -298,9 +492,63 @@ pub struct UsageResponse {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<GroupQuotaStatus>,
 }
 
-impl From<UsageCounters> for UsageResponse {
+/// Per-group quota status derived from the realm quota config. Attached only to
+/// the group usage endpoint; `/info/usage` and the plain constructors leave it
+/// `None` so their output is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct GroupQuotaStatus {
+    /// Effective pre-grace group quota (override else default). `None` = unlimited.
+    pub quota_bytes: Option<u64>,
+    /// Enforced hard cap (quota x grace). `None` = unlimited.
+    pub ceiling_bytes: Option<u64>,
+    pub warn_threshold_percent: u32,
+    /// True when the group's realm-wide `logical_bytes` has reached the
+    /// fractional `quota_bytes * warn_threshold_percent / 100` threshold; always
+    /// false when unlimited.
+    pub warning: bool,
+}
+
+impl GroupQuotaStatus {
+    /// Builds the status from the realm quota config and the group's realm-wide
+    /// `logical_bytes` — the same counter the put-object `QuotaGate` enforces.
+    pub fn resolve(
+        quota: &QuotaConfig,
+        group_id: &aruna_core::types::GroupId,
+        realm_group_logical_bytes: u64,
+    ) -> Self {
+        let quota_bytes = quota.effective_group_quota_bytes(group_id);
+        let warning = match quota_bytes {
+            Some(limit) => {
+                u128::from(realm_group_logical_bytes) * 100
+                    >= u128::from(limit) * u128::from(quota.warn_threshold_percent)
+            }
+            None => false,
+        };
+        Self {
+            quota_bytes,
+            ceiling_bytes: quota.effective_group_ceiling(group_id),
+            warn_threshold_percent: quota.warn_threshold_percent,
+            warning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageTotals {
+    pub buckets: u64,
+    pub objects: u64,
+    pub stored_blobs: u64,
+    pub stored_bytes: u64,
+    pub logical_bytes: u64,
+}
+
+impl From<UsageCounters> for UsageTotals {
     fn from(counters: UsageCounters) -> Self {
         Self {
             buckets: counters.buckets,
@@ -312,10 +560,37 @@ impl From<UsageCounters> for UsageResponse {
     }
 }
 
+impl UsageResponse {
+    pub fn new(local: UsageCounters, realm: UsageCounters) -> Self {
+        Self::with_realm(local, Some(realm.into()))
+    }
+
+    pub fn with_realm(local: UsageCounters, realm: Option<UsageTotals>) -> Self {
+        Self {
+            buckets: local.buckets,
+            objects: local.objects,
+            stored_blobs: local.stored_blobs,
+            stored_bytes: local.stored_bytes,
+            logical_bytes: local.logical_bytes,
+            realm,
+            quota: None,
+        }
+    }
+}
+
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
     drive(LoadUsageCountersOperation::new(key), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+pub async fn load_realm_usage(
+    state: &ServerState,
+    scope: RealmUsageScope,
+) -> ServerResult<UsageCounters> {
+    aruna_operations::usage_stats::load_realm_usage(&state.get_ctx(), state.get_node_id(), scope)
+        .await
+        .map_err(ServerError::InternalError)
 }
 
 #[utoipa::path(
@@ -323,14 +598,31 @@ pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerRes
     path = "/info/usage",
     tag = "info",
     responses(
-        (status = 200, description = "Aggregate storage usage on this node", body = UsageResponse)
-    )
+        (
+            status = 200,
+            description = "Local storage usage always; realm-wide totals only for authenticated callers",
+            body = UsageResponse
+        )
+    ),
+    security((), ("bearer_auth" = []))
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    let counters = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
-    Ok((StatusCode::OK, Json(UsageResponse::from(counters))))
+    let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
+    let realm = match auth {
+        Some(_) => Some(
+            load_realm_usage(&state, RealmUsageScope::Global)
+                .await?
+                .into(),
+        ),
+        None => None,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(UsageResponse::with_realm(local, realm)),
+    ))
 }
 
 fn map_realm_info_response(
@@ -338,6 +630,7 @@ fn map_realm_info_response(
     config: RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     interfaces: InterfaceServicesStatus,
+    include_user_quota_overrides: bool,
 ) -> ServerResult<RealmInfoResponse> {
     let discovery = serde_json::to_value(&config.discovery)
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
@@ -367,6 +660,11 @@ fn map_realm_info_response(
         })
         .collect();
 
+    let mut quota = RealmQuotaConfig::from(config.quota);
+    if !include_user_quota_overrides {
+        quota.user_group_cap_overrides.clear();
+    }
+
     Ok(RealmInfoResponse {
         realm_id: config.realm_id.to_string(),
         description: config.description,
@@ -385,6 +683,7 @@ fn map_realm_info_response(
             .collect(),
         discovery,
         nodes,
+        quota,
         interfaces,
     })
 }
@@ -631,20 +930,31 @@ mod tests {
     use super::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RequestSummary, ServiceStatus, ServicesStatus, get_info,
+        RealmQuotaConfig, RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus,
+        get_info, get_realm_info, get_usage, map_set_realm_quota_error, set_realm_quota,
     };
+    use crate::error::ServerError;
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
-    use aruna_operations::driver::DriverContext;
+    use aruna_core::errors::StorageError;
+    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
+    use aruna_operations::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
-    use axum::Json;
+    use aruna_tasks::TaskHandle;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use axum::{Extension, Json};
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
@@ -825,5 +1135,376 @@ mod tests {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/info"));
+    }
+
+    async fn seed_usage_state(state: &Arc<ServerState>) {
+        use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+        use aruna_core::structs::{
+            NodeUsageSnapshot, node_usage_global_key, usage_global_shard_key,
+        };
+
+        let ctx = state.get_ctx();
+        // This node's live local total.
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: usage_global_shard_key(0).into(),
+                value: aruna_core::structs::UsageCounters {
+                    buckets: 2,
+                    ..Default::default()
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+        // A remote node's replicated snapshot.
+        let remote = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: node_usage_global_key(remote).into(),
+                value: NodeUsageSnapshot {
+                    node_id: remote,
+                    counters: aruna_core::structs::UsageCounters {
+                        buckets: 3,
+                        ..Default::default()
+                    },
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    fn test_auth_context(state: &Arc<ServerState>) -> AuthContext {
+        AuthContext {
+            user_id: UserId::local(Ulid::new(), state.get_realm_id()),
+            realm_id: state.get_realm_id(),
+            path_restrictions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_usage_reports_realm_totals_for_authenticated_callers() {
+        let (state, _tempdir) = setup_state().await;
+        seed_usage_state(&state).await;
+
+        let auth = test_auth_context(&state);
+        let (status, Json(response)) = get_usage(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.buckets, 2, "flat fields report local total");
+        let realm = response.realm.expect("authenticated caller sees realm");
+        assert_eq!(realm.buckets, 5, "realm sums local and remote");
+    }
+
+    #[tokio::test]
+    async fn get_usage_omits_realm_totals_for_unauthenticated_callers() {
+        let (state, _tempdir) = setup_state().await;
+        seed_usage_state(&state).await;
+
+        let (status, Json(response)) = get_usage(State(state), Extension(None)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.buckets, 2,
+            "flat local fields stay unauthenticated"
+        );
+        assert!(
+            response.realm.is_none(),
+            "unauthenticated callers must not see realm-wide totals"
+        );
+    }
+
+    #[test]
+    fn group_quota_status_reports_warning_and_unlimited() {
+        let group = Ulid::new();
+        let unlimited_group = Ulid::new();
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            warn_threshold_percent: 85,
+            group_overrides: vec![aruna_core::structs::GroupQuotaOverride {
+                group_id: unlimited_group,
+                quota_bytes: None,
+                grace_factor_percent: None,
+            }],
+            ..QuotaConfig::default()
+        };
+
+        // Finite default quota, usage below the 850-byte warn threshold.
+        let below = super::GroupQuotaStatus::resolve(&quota, &group, 800);
+        assert_eq!(below.quota_bytes, Some(1_000));
+        assert_eq!(below.ceiling_bytes, Some(1_100));
+        assert_eq!(below.warn_threshold_percent, 85);
+        assert!(!below.warning);
+
+        // At the threshold the warning fires.
+        let at = super::GroupQuotaStatus::resolve(&quota, &group, 850);
+        assert!(at.warning);
+
+        // An override with quota_bytes: None is unlimited and never warns.
+        let unlimited = super::GroupQuotaStatus::resolve(&quota, &unlimited_group, u64::MAX);
+        assert_eq!(unlimited.quota_bytes, None);
+        assert_eq!(unlimited.ceiling_bytes, None);
+        assert!(!unlimited.warning);
+    }
+
+    #[test]
+    fn group_quota_status_uses_fractional_warn_threshold_without_flooring() {
+        let group = Ulid::new();
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(3),
+            warn_threshold_percent: 85,
+            ..QuotaConfig::default()
+        };
+
+        let below = super::GroupQuotaStatus::resolve(&quota, &group, 2);
+        assert!(!below.warning);
+        let at = super::GroupQuotaStatus::resolve(&quota, &group, 3);
+        assert!(at.warning);
+
+        let tiny_quota = QuotaConfig {
+            default_group_quota_bytes: Some(1),
+            warn_threshold_percent: 85,
+            ..QuotaConfig::default()
+        };
+        let zero = super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0);
+        assert!(!zero.warning);
+    }
+
+    #[test]
+    fn openapi_includes_realm_quota_path() {
+        let openapi = ApiDoc::openapi();
+
+        assert!(openapi.paths.paths.contains_key("/info/realm/quota"));
+    }
+
+    #[test]
+    fn set_realm_quota_transaction_conflict_maps_to_http_conflict() {
+        let error = map_set_realm_quota_error(SetRealmQuotaError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+
+        assert!(matches!(
+            error,
+            ServerError::Conflict(message) if message.contains("retry")
+        ));
+    }
+
+    async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        });
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let node_id = iroh::SecretKey::generate().public();
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id,
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: vec![],
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: Actor {
+                    node_id,
+                    user_id,
+                    realm_id,
+                },
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::management_node(realm_signing_key).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        );
+
+        (state, realm_id, user_id, tempdir)
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_requires_authentication() {
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let body = RealmQuotaConfig::from(QuotaConfig::default());
+
+        let error = set_realm_quota(State(state), Extension(None), Json(body))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ServerError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_rejects_non_admin() {
+        let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        let body = RealmQuotaConfig::from(QuotaConfig::default());
+
+        let error = set_realm_quota(State(state), Extension(Some(stranger)), Json(body))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn admin_sets_and_reads_realm_quota() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.default_group_quota_bytes = Some(4096);
+
+        let (status, Json(stored)) = set_realm_quota(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored.default_group_quota_bytes, Some(4096));
+        assert_eq!(stored.max_devices_per_user, None);
+
+        let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info.quota.default_group_quota_bytes, Some(4096));
+        assert_eq!(info.quota.max_devices_per_user, None);
+    }
+
+    #[tokio::test]
+    async fn get_realm_info_redacts_user_quota_overrides_for_anonymous_callers() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.user_group_cap_overrides = vec![RealmUserGroupCapOverride {
+            user_id: admin.to_string(),
+            max_groups: Some(1),
+        }];
+
+        let (_status, Json(_stored)) = set_realm_quota(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let (_status, Json(anonymous)) = get_realm_info(State(state.clone()), Extension(None))
+            .await
+            .unwrap();
+        assert!(anonymous.quota.user_group_cap_overrides.is_empty());
+
+        let (_status, Json(authenticated)) = get_realm_info(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(authenticated.quota.user_group_cap_overrides.len(), 1);
+        assert_eq!(
+            authenticated.quota.user_group_cap_overrides[0].user_id,
+            admin.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_surfaces_invalid_reason_in_bad_request_body() {
+        use axum::response::IntoResponse;
+
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.warn_threshold_percent = 0;
+
+        let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::BadRequestReason(_)));
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: crate::error::ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed.code.as_deref(),
+            Some("Bad request"),
+            "machine code stays identical to plain BadRequest"
+        );
+        assert!(
+            parsed.error.contains("warn_threshold_percent"),
+            "body must carry the validation reason, got: {}",
+            parsed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn set_realm_quota_rejects_unsupported_device_cap() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let mut body = RealmQuotaConfig::from(QuotaConfig::default());
+        body.max_devices_per_user = Some(2);
+
+        let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
+        ));
     }
 }

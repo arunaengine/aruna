@@ -320,6 +320,7 @@ impl ServerState {
                     realm_signing_key: realm_signing_key.clone(),
                     realm_id: self.realm_id,
                     node_id,
+                    issuer_node_id: self.node_id,
                     now: chrono::Utc::now().timestamp().max(0) as u64,
                     ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
                 }),

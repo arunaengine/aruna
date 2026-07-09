@@ -50,6 +50,9 @@ use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
+use crate::usage_stats::{
+    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
+};
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
@@ -384,6 +387,7 @@ impl OperationsTaskHandler {
         let Some(subbatch) = subbatch else {
             return outcome;
         };
+        let requested_targets = subbatch.targets.clone();
         let sync_started = Instant::now();
         let event = net_handle
             .send_effect(Effect::Net(NetEffect::DocumentSync(
@@ -394,14 +398,21 @@ impl OperationsTaskHandler {
             )))
             .await;
         outcome.sync_elapsed = sync_started.elapsed();
-        self.finish_sync_drain_subbatch(retry_key, subbatch.record_keys, event, outcome)
-            .await
+        self.finish_sync_drain_subbatch(
+            retry_key,
+            subbatch.record_keys,
+            requested_targets,
+            event,
+            outcome,
+        )
+        .await
     }
 
     async fn finish_sync_drain_subbatch(
         &self,
         retry_key: &TaskKey,
         record_keys: Vec<Vec<u8>>,
+        requested_targets: Vec<DocumentSyncTarget>,
         event: Event,
         mut outcome: DrainSyncOutcome,
     ) -> DrainSyncOutcome {
@@ -414,6 +425,16 @@ impl OperationsTaskHandler {
             })) => {
                 process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
                     .await;
+                if let Some(net_handle) = self.context.net_handle.as_ref() {
+                    let mut refresh_targets = targets.clone();
+                    refresh_targets.extend(requested_targets);
+                    refresh_realm_usage_summary_for_targets(
+                        self.context.as_ref(),
+                        net_handle.node_id(),
+                        &refresh_targets,
+                    )
+                    .await;
+                }
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -489,6 +510,33 @@ impl OperationsTaskHandler {
             return Err(());
         }
         Ok(())
+    }
+
+    async fn publish_usage_snapshots(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!("Cannot publish usage snapshots without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        let realm_id = *net_handle.realm_id();
+        match crate::usage_stats::publish_and_refresh_usage_snapshots(
+            &self.context,
+            node_id,
+            realm_id,
+            false,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = %error, "Failed to publish usage snapshots");
+                self.reschedule_timer(
+                    TaskKey::PublishUsageSnapshots,
+                    crate::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
+        }
     }
 
     async fn drain_metadata_materialization_queue(&self) {
@@ -684,6 +732,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -699,6 +748,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     spawn_durable_queue_rearm(&context, &task_handle);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+    restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -750,6 +800,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 target,
                 peers,
             } => {
+                let requested_target = target.clone();
                 let retry_key = TaskKey::SyncDocument {
                     node_id,
                     target: target.clone(),
@@ -778,6 +829,14 @@ impl InboundTaskHandler for OperationsTaskHandler {
                         process_metadata_graph_tombstones(
                             self.context.as_ref(),
                             metadata_graph_tombstones,
+                        )
+                        .await;
+                        let mut refresh_targets = targets.clone();
+                        refresh_targets.push(requested_target);
+                        refresh_realm_usage_summary_for_targets(
+                            self.context.as_ref(),
+                            net_handle.node_id(),
+                            &refresh_targets,
                         )
                         .await;
                         if self
@@ -816,6 +875,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::DrainDocumentSyncOutbox => {
                 self.drain_document_sync_outbox().await;
+            }
+            TaskKey::PublishUsageSnapshots => {
+                self.publish_usage_snapshots().await;
             }
             TaskKey::DrainMetadataProjectionQueue => {
                 self.drain_metadata_projection_queue().await;
@@ -1093,6 +1155,7 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 vec![key.clone()],
+                Vec::new(),
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     target: Some(record.target.clone()),
                     error: "only 1/2 peers synced".to_string(),
@@ -1138,6 +1201,7 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 vec![key.clone()],
+                Vec::new(),
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     target: Some(record.target.clone()),
                     error: "sync failed before all peers acknowledged".to_string(),
@@ -1183,6 +1247,7 @@ mod tests {
             .finish_sync_drain_subbatch(
                 &TaskKey::DrainDocumentSyncOutbox,
                 Vec::new(),
+                Vec::new(),
                 Event::Net(NetEvent::DocumentSync(
                     DocumentSyncNetEvent::DocumentsReconciled {
                         applied: 1,
@@ -1202,5 +1267,218 @@ mod tests {
         let jobs = read_graph_prune_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
+    }
+
+    #[tokio::test]
+    async fn drain_reconcile_refreshes_realm_usage_summary() {
+        use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+        use aruna_core::structs::{
+            NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, node_usage_global_key,
+            usage_global_shard_key,
+        };
+        use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+
+        async fn write_stat(
+            storage: &aruna_storage::StorageHandle,
+            key_space: &str,
+            key: Vec<u8>,
+            value: Vec<u8>,
+        ) {
+            match storage
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                }))
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected write event: {other:?}"),
+            }
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let remote = node(2);
+
+        // Local global counters (10) plus a remote node's snapshot (5) should sum
+        // to 15 in the refreshed realm summary cache.
+        write_stat(
+            &storage,
+            USAGE_STATS_KEYSPACE,
+            usage_global_shard_key(0),
+            UsageCounters {
+                logical_bytes: 10,
+                ..Default::default()
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+        write_stat(
+            &storage,
+            USAGE_NODE_STATS_KEYSPACE,
+            node_usage_global_key(remote),
+            NodeUsageSnapshot {
+                node_id: remote,
+                counters: UsageCounters {
+                    logical_bytes: 5,
+                    ..Default::default()
+                },
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                Vec::new(),
+                Vec::new(),
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsReconciled {
+                        applied: 1,
+                        targets: vec![DocumentSyncTarget::NodeUsage {
+                            realm_id,
+                            node_id: remote,
+                            group_id: None,
+                        }],
+                        metadata_create_events: Vec::new(),
+                        metadata_graph_tombstones: Vec::new(),
+                    },
+                )),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(!outcome.retry_needed);
+        let summary = match storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected read event: {other:?}"),
+        };
+        let summary = summary.expect("realm usage summary refreshed by drain reconcile");
+        assert_eq!(
+            UsageCounters::from_bytes(summary.as_ref())
+                .unwrap()
+                .logical_bytes,
+            15
+        );
+
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config() {
+        use aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE;
+        use aruna_core::structs::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
+        use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let realm_id = RealmId::from_bytes([45u8; 32]);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+                value: UsageCounters {
+                    logical_bytes: 99,
+                    ..Default::default()
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                Vec::new(),
+                vec![DocumentSyncTarget::RealmConfig { realm_id }],
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsReconciled {
+                        applied: 0,
+                        targets: Vec::new(),
+                        metadata_create_events: Vec::new(),
+                        metadata_graph_tombstones: Vec::new(),
+                    },
+                )),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(!outcome.retry_needed);
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key: NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec().into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+            other => panic!("expected summary cache to be cleared, got {other:?}"),
+        }
+
+        net.shutdown().await;
     }
 }

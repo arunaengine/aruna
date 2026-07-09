@@ -3,7 +3,9 @@ use crate::blob::blob_keyspace_helper::{
     delete_hash_path_index_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -13,8 +15,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
-    MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -56,14 +58,23 @@ enum HeadTransitionContinuation {
 struct VersionSummary {
     version_id: Ulid,
     materialized_hash: Option<[u8; 32]>,
+    logical_size: Option<u64>,
     deleted: bool,
 }
 
 impl VersionSummary {
     fn from_blob_version(version_id: Ulid, version: &BlobVersion) -> Self {
+        let (materialized_hash, logical_size) = match &version.state {
+            BlobVersionState::Materialized { blob_hash, .. } => (Some(*blob_hash), None),
+            BlobVersionState::Reference {
+                cached_metadata, ..
+            } => (None, Some(cached_metadata.content_length)),
+            BlobVersionState::Deleted => (None, None),
+        };
         Self {
             version_id,
-            materialized_hash: version.blob_hash().copied(),
+            materialized_hash,
+            logical_size,
             deleted: version.is_deleted(),
         }
     }
@@ -263,6 +274,7 @@ impl DeleteObjectOperation {
         };
         let summary = VersionSummary::from_blob_version(version_id, &version);
         let materialized_hash = summary.materialized_hash;
+        self.target_size = summary.logical_size;
         self.target_version = Some(summary);
 
         if let Some(hash) = materialized_hash {
@@ -567,14 +579,11 @@ impl DeleteObjectOperation {
                     .latest_remaining
                     .as_ref()
                     .is_some_and(|latest| !latest.is_deleted());
-                i64::from(live_after) - i64::from(live_before)
+                i128::from(u8::from(live_after)) - i128::from(u8::from(live_before))
             } else {
                 0
             };
-            let logical_bytes = match (target.materialized_hash, self.target_size) {
-                (Some(_), Some(size)) => -i64::try_from(size).unwrap_or(i64::MAX),
-                _ => 0,
-            };
+            let logical_bytes = self.target_size.map_or(0, |size| -i128::from(size));
             UsageDelta {
                 objects,
                 logical_bytes,
@@ -738,7 +747,7 @@ impl DeleteObjectOperation {
                     version_id,
                     delete_marker,
                 }));
-                return smallvec![];
+                return smallvec![schedule_usage_snapshot_publish_effect()];
             }
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
@@ -748,7 +757,7 @@ impl DeleteObjectOperation {
             version_id,
             delete_marker: true,
         }));
-        smallvec![]
+        smallvec![schedule_usage_snapshot_publish_effect()]
     }
 }
 
@@ -1086,6 +1095,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )
@@ -1236,6 +1246,7 @@ mod test {
                 checksum_type: None,
                 exists: false,
                 version_source: None,
+                quota_ceiling: None,
             }),
             &context,
         )

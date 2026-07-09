@@ -209,6 +209,7 @@ async fn complete_upload(
             checksum_type,
             object_size,
             created_by,
+            quota_ceiling: None,
         }),
         &context.driver,
     )
@@ -325,6 +326,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             checksum_type: MultipartChecksumType::Composite,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
+            quota_ceiling: None,
         }),
         &context.driver,
     )
@@ -594,6 +596,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             checksum_type: None,
             exists: false,
             version_source: None,
+            quota_ceiling: None,
         }),
         &context.driver,
     )
@@ -688,6 +691,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             checksum_type: MultipartChecksumType::FullObject,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
+            quota_ceiling: None,
         }),
         &context.driver,
     )
@@ -883,6 +887,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
             checksum_type: None,
             exists: false,
             version_source: None,
+            quota_ceiling: None,
         }),
         &context.driver,
     )
@@ -1303,6 +1308,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
             checksum_type: MultipartChecksumType::FullObject,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
+            quota_ceiling: None,
         }),
         &context.driver,
     )

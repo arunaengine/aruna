@@ -1,3 +1,4 @@
+use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,97 @@ use thiserror::Error;
 
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const USAGE_GLOBAL_SHARD_COUNT: usize = 64;
+
+/// Keys in the node-usage keyspace. Per-node snapshots use fixed-length keys so
+/// their prefixes are unambiguous: `n/` + node id for a node's global total,
+/// `g/` + group id + node id for a node's per-group total (group first so all
+/// nodes' snapshots for one group form a single scan range). Local-only keys use
+/// text prefixes (`dirty/`, `summary/`) that never collide with the binary
+/// snapshot prefixes.
+pub const NODE_USAGE_GLOBAL_PREFIX: &[u8] = b"n/";
+pub const NODE_USAGE_GROUP_PREFIX: &[u8] = b"g/";
+pub const NODE_USAGE_DIRTY_PREFIX: &[u8] = b"dirty/";
+pub const NODE_USAGE_DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
+pub const NODE_USAGE_DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
+pub const NODE_USAGE_SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
+pub const NODE_USAGE_SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
+
+/// A single node's usage total distributed over the sync layer. Single writer
+/// per key (each node writes only its own snapshots), so ingest is last-write-wins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeUsageSnapshot {
+    pub node_id: NodeId,
+    pub counters: UsageCounters,
+}
+
+impl NodeUsageSnapshot {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn node_usage_global_key(node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_GLOBAL_PREFIX.len() + 32);
+    key.extend_from_slice(NODE_USAGE_GLOBAL_PREFIX);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+pub fn node_usage_group_prefix(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn node_usage_group_key(group_id: GroupId, node_id: NodeId) -> Vec<u8> {
+    let mut key = node_usage_group_prefix(group_id);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+/// Recovers the owning node id from a snapshot key produced by
+/// [`node_usage_global_key`] or [`node_usage_group_key`].
+pub fn node_usage_key_node_id(key: &[u8]) -> Option<NodeId> {
+    let tail = match key.strip_prefix(NODE_USAGE_GLOBAL_PREFIX) {
+        Some(rest) => rest,
+        None => key.strip_prefix(NODE_USAGE_GROUP_PREFIX)?.get(16..)?,
+    };
+    let bytes: [u8; 32] = tail.try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
+}
+
+pub fn node_usage_dirty_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_DIRTY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_DIRTY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+/// Recovers the group id from a `dirty/group/<ulid>` marker key.
+pub fn node_usage_dirty_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(NODE_USAGE_DIRTY_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
+/// Recovers the group id from a `g/<group><node>` per-group snapshot key.
+pub fn node_usage_group_key_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(NODE_USAGE_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.get(..16)?.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
+pub fn node_usage_summary_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_SUMMARY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_SUMMARY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
 
 pub fn usage_global_shard_index(group_id: GroupId) -> usize {
     group_id
@@ -37,7 +129,8 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
 
 /// Maintained usage aggregates. `stored_*` fields track physical,
 /// content-addressed blobs and are only meaningful on the global counter;
-/// `logical_bytes` sums materialized version sizes and is the per-group quota basis.
+/// `logical_bytes` sums materialized and reference version sizes and is the
+/// per-group quota basis.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub buckets: u64,
@@ -89,11 +182,11 @@ impl UsageCounters {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageDelta {
-    pub buckets: i64,
-    pub objects: i64,
-    pub stored_blobs: i64,
-    pub stored_bytes: i64,
-    pub logical_bytes: i64,
+    pub buckets: i128,
+    pub objects: i128,
+    pub stored_blobs: i128,
+    pub stored_bytes: i128,
+    pub logical_bytes: i128,
 }
 
 impl UsageDelta {
@@ -108,21 +201,31 @@ pub enum UsageCounterError {
     Underflow {
         field: &'static str,
         value: u64,
-        delta: i64,
+        delta: i128,
     },
     #[error("usage counter {field} would overflow: {value} + {delta}")]
     Overflow {
         field: &'static str,
         value: u64,
-        delta: u64,
+        delta: u128,
     },
 }
 
-fn apply_delta(field: &'static str, value: u64, delta: i64) -> Result<u64, UsageCounterError> {
+fn apply_delta(field: &'static str, value: u64, delta: i128) -> Result<u64, UsageCounterError> {
     if delta >= 0 {
-        add_counter(field, value, delta as u64)
+        let amount = u64::try_from(delta).map_err(|_| UsageCounterError::Overflow {
+            field,
+            value,
+            delta: delta as u128,
+        })?;
+        add_counter(field, value, amount)
     } else {
-        let amount = delta.unsigned_abs();
+        let amount =
+            u64::try_from(delta.unsigned_abs()).map_err(|_| UsageCounterError::Underflow {
+                field,
+                value,
+                delta,
+            })?;
         value
             .checked_sub(amount)
             .ok_or(UsageCounterError::Underflow {
@@ -137,7 +240,7 @@ fn add_counter(field: &'static str, value: u64, delta: u64) -> Result<u64, Usage
     value.checked_add(delta).ok_or(UsageCounterError::Overflow {
         field,
         value,
-        delta,
+        delta: u128::from(delta),
     })
 }
 
@@ -189,6 +292,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_accepts_delta_larger_than_i64_max() {
+        let mut counters = UsageCounters::default();
+        let large = i128::from(i64::MAX) + 1;
+
+        counters
+            .apply(&UsageDelta {
+                logical_bytes: large,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(counters.logical_bytes, i64::MAX as u64 + 1);
+    }
+
+    #[test]
     fn counters_round_trip() {
         let counters = UsageCounters {
             buckets: 1,
@@ -199,5 +317,46 @@ mod tests {
         };
         let bytes = counters.to_bytes().unwrap();
         assert_eq!(UsageCounters::from_bytes(&bytes).unwrap(), counters);
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn node_usage_snapshot_round_trips() {
+        let snapshot = NodeUsageSnapshot {
+            node_id: node(7),
+            counters: UsageCounters {
+                buckets: 2,
+                logical_bytes: 9,
+                ..Default::default()
+            },
+        };
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(NodeUsageSnapshot::from_bytes(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn node_usage_keys_recover_node_and_group_ids() {
+        let node_id = node(3);
+        let group_id = ulid::Ulid::from_bytes([5u8; 16]);
+
+        let global_key = node_usage_global_key(node_id);
+        assert!(global_key.starts_with(NODE_USAGE_GLOBAL_PREFIX));
+        assert_eq!(node_usage_key_node_id(&global_key), Some(node_id));
+
+        let group_key = node_usage_group_key(group_id, node_id);
+        assert!(group_key.starts_with(&node_usage_group_prefix(group_id)));
+        assert_eq!(node_usage_key_node_id(&group_key), Some(node_id));
+        assert_eq!(node_usage_group_key_group_id(&group_key), Some(group_id));
+        assert_eq!(node_usage_group_key_group_id(&global_key), None);
+
+        // Group snapshots for one group form a contiguous scan range.
+        assert!(group_key.starts_with(NODE_USAGE_GROUP_PREFIX));
+
+        let dirty_key = node_usage_dirty_group_key(group_id);
+        assert_eq!(node_usage_dirty_group_id(&dirty_key), Some(group_id));
+        assert_eq!(node_usage_dirty_group_id(NODE_USAGE_DIRTY_GLOBAL_KEY), None);
     }
 }

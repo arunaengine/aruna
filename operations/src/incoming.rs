@@ -15,6 +15,7 @@ use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
+use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentSyncEvictedDocument, DocumentSyncReconcileResult, DocumentSyncTarget,
@@ -176,6 +177,7 @@ async fn reconcile_inbound_document_sync_topics(
             error!(error = ?error, "Failed to process pending placements after document sync reconciliation");
         }
     }
+    refresh_realm_usage_summary_for_targets(context, net_handle.node_id(), &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_metadata_create_events(context, targets).await;
     let project_elapsed = project_started.elapsed();

@@ -1,4 +1,6 @@
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::usage_stats::{
+    UsageCounterUpdate, UsageUpdateError, schedule_usage_snapshot_publish_effect,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -192,7 +194,7 @@ impl CreateBucketOperation {
         self.txn_id = None;
         self.state = CreateBucketState::Finish;
         self.output = Some(Ok(self.bucket_info.clone()));
-        smallvec![]
+        smallvec![schedule_usage_snapshot_publish_effect()]
     }
 }
 

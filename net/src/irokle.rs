@@ -7,9 +7,9 @@ use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH, group_role_id_from_path,
-    group_role_path, group_role_user_assignment_from_path, group_role_user_assignment_path,
-    realm_config_node_id_from_path, realm_config_node_path,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+    group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
+    group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
     realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
     realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
 };
@@ -45,8 +45,9 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeUsageSnapshot,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, group_owner_index_key,
+    node_usage_key_node_id,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{RoleId, TxnId, UserId, Value};
@@ -1512,7 +1513,7 @@ impl DocumentSyncService {
             // merged clock is the new applied watermark.
             cursor.merge(&topic_clock);
             let mut deferred_creates = false;
-            for event in events {
+            for (event, actor_id) in events {
                 let target_topic_id = event.target().sync_topic_id();
                 if target_topic_id != topic_id {
                     warn!(
@@ -1523,6 +1524,47 @@ impl DocumentSyncService {
                     continue;
                 }
                 match event {
+                    DocumentSyncEvent::Upsert {
+                        target:
+                            target @ DocumentSyncTarget::NodeUsage {
+                                node_id: snapshot_node,
+                                ..
+                            },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        // Node-usage snapshots ride a single shared realm topic
+                        // that every realm publisher can write, so validate that
+                        // the signed publisher owns the claimed node and that the
+                        // payload's own node id matches its target before applying.
+                        // A rejected event is skipped (never `?`) so the cursor
+                        // still advances past it and a forgery cannot wedge the
+                        // topic's reconcile loop.
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&snapshot_node),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                node_id = %snapshot_node,
+                                "Rejecting node usage snapshot: publisher is not the owning node"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_node_usage_upsert(&target, &bytes) {
+                            warn!(
+                                %topic_id,
+                                node_id = %snapshot_node,
+                                %reason,
+                                "Rejecting invalid node usage snapshot"
+                            );
+                            continue;
+                        }
+                        self.apply_upsert(target.clone(), bytes, change).await?;
+                        applied_targets.push(target);
+                    }
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
@@ -1609,6 +1651,26 @@ impl DocumentSyncService {
                             applied_targets.push(target);
                         }
                     }
+                    DocumentSyncEvent::Delete {
+                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        ..
+                    }
+                    | DocumentSyncEvent::AdminOperation {
+                        target: target @ DocumentSyncTarget::NodeUsage { .. },
+                        ..
+                    } => {
+                        // Node-usage snapshots only ever sync as owner-validated
+                        // upserts. A signed Delete or AdminOperation on the shared
+                        // realm topic would otherwise `?`-propagate through the
+                        // generic arm and wedge every peer's reconcile forever, so
+                        // skip it and let the cursor advance past the hostile op.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported non-upsert node usage document event"
+                        );
+                        continue;
+                    }
                     DocumentSyncEvent::Upsert { ref target, .. }
                     | DocumentSyncEvent::Delete { ref target, .. }
                         if admin_document_target_for_reduced_document(target).is_some() =>
@@ -1663,18 +1725,22 @@ impl DocumentSyncService {
     }
 
     /// Returns the decoded document events above the applied cursor, reading
-    /// only the unapplied portion of the topic history where possible.
+    /// only the unapplied portion of the topic history where possible. Each
+    /// event is paired with the authenticated `actor_id` of the op that carried
+    /// it: irokle admits an op only after verifying its signature against
+    /// `body.author` and enforcing `actor_id == actor_id_for(topic, author)`, so
+    /// the returned actor id is a trustworthy proxy for the signed publisher.
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
-    ) -> Result<Vec<DocumentSyncEvent>> {
+    ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId)>> {
         match self.node.open_topic::<DocumentSyncEvent>(topic_id) {
             Ok(topic) => Ok(topic
                 .history_after(cursor, HistoryOrder::OldestFirst)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .into_iter()
-                .map(|record| record.event)
+                .map(|record| (record.event, record.meta.actor_id))
                 .collect()),
             // Topics we hold ops for without being a listed member still
             // reconcile via the full history.
@@ -1691,14 +1757,16 @@ impl DocumentSyncService {
                     if cursor.get(&op.signed.body.actor_id) >= op.signed.body.actor_seq {
                         continue;
                     }
+                    let actor_id = op.signed.body.actor_id;
                     let TopicPayload::Event(envelope) = op.signed.body.payload else {
                         continue;
                     };
-                    events.push(
+                    events.push((
                         envelope
                             .decode_event::<DocumentSyncEvent>()
                             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                    );
+                        actor_id,
+                    ));
                 }
                 Ok(events)
             }
@@ -1900,6 +1968,13 @@ impl DocumentSyncService {
                 .apply_metadata_graph_lifecycle(record, bytes)
                 .await
                 .map(|_| ());
+        }
+        if let DocumentSyncTarget::NodeUsage { .. } = target {
+            // Structural guard for the shared node-usage keyspace. The reconcile
+            // loop already validated the signed publisher and this payload, but
+            // re-check the snapshot's self-consistency here so the generic
+            // storage write below can never persist an unvalidated snapshot.
+            validate_node_usage_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
         self.storage_write(
             target.storage_keyspace().to_string(),
@@ -2215,6 +2290,14 @@ fn overlay_realm_config_reducer_materialization(
         config.description = description;
     }
 
+    if !reducer_state
+        .conflicts
+        .contains_key(REALM_CONFIG_QUOTA_PATH)
+        && let Some(quota) = reducer_state.materialized_realm_config_quota()
+    {
+        config.quota = quota;
+    }
+
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
@@ -2263,7 +2346,9 @@ fn realm_config_from_reducer_materialization(
         oidc_providers: Vec::new(),
         discovery,
         nodes: Vec::new(),
-        quota: Default::default(),
+        quota: reducer_state
+            .materialized_realm_config_quota()
+            .unwrap_or_default(),
         description: String::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
@@ -2864,9 +2949,10 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
             | AdminDocumentOperation::RealmConfigSettingsSet { .. }
             | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
+            | AdminDocumentOperation::RealmConfigQuotaSet { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, and description updates"
+            "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, and quota updates"
                 .to_string(),
         ));
     }
@@ -3460,6 +3546,36 @@ fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
+/// Validates the self-consistency of a replicated node-usage snapshot against
+/// its sync target: the payload must decode, its embedded `node_id` must match
+/// the target's node, and the target's derived storage key must attribute back
+/// to that same node. Returns a human-readable reason on rejection. Does not
+/// check the publisher's identity (the caller enforces that against the signed
+/// actor). A zero-counter snapshot is valid: stale-group cleanup publishes them.
+fn validate_node_usage_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::NodeUsage { node_id, .. } = target else {
+        return Err("target is not a node usage snapshot".to_string());
+    };
+    let snapshot = NodeUsageSnapshot::from_bytes(bytes)
+        .map_err(|error| format!("undecodable node usage snapshot: {error}"))?;
+    if snapshot.node_id != *node_id {
+        return Err(format!(
+            "snapshot node id {} does not match target node id {node_id}",
+            snapshot.node_id
+        ));
+    }
+    let key = target.storage_key();
+    if node_usage_key_node_id(key.as_ref()) != Some(*node_id) {
+        return Err(format!(
+            "node usage storage key does not attribute to target node id {node_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic_id.as_bytes());
@@ -3831,9 +3947,10 @@ mod tests {
         subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, MetadataReplicationConfig, OidcProviderConfig,
-        Permission, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint,
+        Actor, Group, GroupAuthorizationDocument, GroupQuotaOverride, MetadataReplicationConfig,
+        OidcProviderConfig, Permission, QuotaConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+        StaticRealmEndpoint, UserGroupCapOverride,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
@@ -4603,6 +4720,80 @@ mod tests {
             reducer_state.materialized_realm_config_discovery(),
             Some(discovery)
         );
+    }
+
+    #[tokio::test]
+    async fn quota_survives_reducer_materialization_without_existing_config_doc() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([61; 32]);
+        let actor = test_actor(
+            8,
+            UserId::local(Ulid::from_parts(1_384, 1), realm_id),
+            realm_id,
+        );
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(9_000),
+            grace_factor_percent: 130,
+            warn_threshold_percent: 70,
+            group_overrides: vec![GroupQuotaOverride {
+                group_id: Ulid::from_parts(1_385, 1),
+                quota_bytes: Some(4_500),
+                grace_factor_percent: Some(140),
+            }],
+            max_groups_per_user: Some(7),
+            user_group_cap_overrides: vec![UserGroupCapOverride {
+                user_id: UserId::local(Ulid::from_parts(1_386, 1), realm_id),
+                max_groups: Some(2),
+            }],
+            max_devices_per_user: Some(6),
+        };
+        let expected_quota = QuotaConfig {
+            max_devices_per_user: None,
+            ..quota.clone()
+        };
+
+        // Quota lands before any config doc exists; it must be recorded in the
+        // reducer and later carried through realm_config_from_reducer_materialization.
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_387, 1),
+                target.clone(),
+                &actor,
+                1,
+                AdminDocumentOperation::RealmConfigQuotaSet {
+                    quota: quota.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config quota op applies");
+
+        let metadata_replication = MetadataReplicationConfig::new(5);
+        let discovery = test_discovery(23, "https://quota-materialization.example:443");
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_388, 1),
+                target.clone(),
+                &actor,
+                2,
+                AdminDocumentOperation::RealmConfigSettingsSet {
+                    metadata_replication: metadata_replication.clone(),
+                    discovery: discovery.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("realm config settings op bootstraps config doc");
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.quota, expected_quota);
+        assert_eq!(config.metadata_replication, metadata_replication);
     }
 
     #[tokio::test]
@@ -7749,6 +7940,189 @@ mod tests {
         assert!(
             cursor.dominates(&topic_clock),
             "cursor must advance past the hostile ops"
+        );
+
+        service.shutdown().await;
+    }
+    #[test]
+    fn validate_node_usage_upsert_accepts_owner_and_rejects_forgeries() {
+        use aruna_core::structs::UsageCounters;
+
+        let node_id = node(7);
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let global = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        };
+        let group = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: Some(group_id),
+        };
+
+        // The owning node's own snapshot validates as global and per-group.
+        let owned = NodeUsageSnapshot {
+            node_id,
+            counters: UsageCounters {
+                buckets: 3,
+                ..Default::default()
+            },
+        };
+        let owned_bytes = owned.to_bytes().unwrap();
+        assert!(validate_node_usage_upsert(&global, &owned_bytes).is_ok());
+        assert!(validate_node_usage_upsert(&group, &owned_bytes).is_ok());
+
+        // Zero-counter snapshots (stale-group cleanup) are legitimate upserts.
+        let zero = NodeUsageSnapshot {
+            node_id,
+            counters: UsageCounters::default(),
+        };
+        assert!(validate_node_usage_upsert(&global, &zero.to_bytes().unwrap()).is_ok());
+
+        // A snapshot whose embedded node id is a different node is rejected.
+        let misattributed = NodeUsageSnapshot {
+            node_id: node(9),
+            counters: UsageCounters {
+                buckets: 99,
+                ..Default::default()
+            },
+        };
+        assert!(validate_node_usage_upsert(&global, &misattributed.to_bytes().unwrap()).is_err());
+
+        // Undecodable payloads and non node-usage targets are rejected.
+        assert!(validate_node_usage_upsert(&global, b"not-a-snapshot").is_err());
+        assert!(
+            validate_node_usage_upsert(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes)
+                .is_err()
+        );
+    }
+
+    // A forged non-upsert node-usage event (here a signed Delete) on the shared
+    // realm topic must be skipped, not `?`-propagated: otherwise every peer's
+    // reconcile of that topic errors at the op forever and realm usage freezes.
+    #[tokio::test]
+    async fn reconcile_skips_forged_non_upsert_node_usage_event() {
+        use aruna_core::structs::UsageCounters;
+
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(53).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let realm_id = RealmId::from_bytes([53u8; 32]);
+        let target = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id: local_node,
+            group_id: None,
+        };
+        let topic_id = target.sync_topic_id();
+
+        let change = |kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind,
+        };
+
+        let snapshot = NodeUsageSnapshot {
+            node_id: local_node,
+            counters: UsageCounters {
+                buckets: 5,
+                ..Default::default()
+            },
+        };
+        let snapshot_bytes = snapshot.to_bytes().expect("snapshot serializes");
+
+        // Hostile Delete first, then a legitimate owner-signed Upsert on the same
+        // topic. Publishing appends both ops and advances the local cursor.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Delete {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        change: change(DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: snapshot_bytes.clone(),
+                        change: change(DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
+        // peer receiving them via sync would (its cursor has not yet advanced).
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        // (a) Reconcile completes without error despite the hostile Delete.
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips the forged delete instead of wedging");
+
+        // (c) The legitimate upsert on the same topic still applied.
+        assert!(result.targets.contains(&target));
+        let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .expect("node usage snapshot applied");
+        assert_eq!(
+            NodeUsageSnapshot::from_bytes(&stored).expect("snapshot decodes"),
+            snapshot
+        );
+
+        // (b) The cursor advanced past the hostile op.
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the hostile op"
         );
 
         service.shutdown().await;

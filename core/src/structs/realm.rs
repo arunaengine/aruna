@@ -162,6 +162,7 @@ pub struct QuotaConfig {
     pub group_overrides: Vec<GroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
     pub user_group_cap_overrides: Vec<UserGroupCapOverride>,
+    pub max_devices_per_user: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -186,6 +187,7 @@ impl Default for QuotaConfig {
             group_overrides: Vec::new(),
             max_groups_per_user: Some(3),
             user_group_cap_overrides: Vec::new(),
+            max_devices_per_user: None,
         }
     }
 }
@@ -198,6 +200,41 @@ impl QuotaConfig {
             .find(|over| over.user_id == *user_id)
             .map(|over| over.max_groups)
             .unwrap_or(self.max_groups_per_user)
+    }
+
+    /// Resolves the effective pre-grace quota (in bytes) for a group: the group
+    /// override's `quota_bytes` when an override exists — an existing override
+    /// with `quota_bytes: None` means the group is explicitly unlimited — else
+    /// the realm `default_group_quota_bytes`. `None` means unlimited.
+    pub fn effective_group_quota_bytes(&self, group_id: &GroupId) -> Option<u64> {
+        match self
+            .group_overrides
+            .iter()
+            .find(|over| over.group_id == *group_id)
+        {
+            Some(over) => over.quota_bytes,
+            None => self.default_group_quota_bytes,
+        }
+    }
+
+    /// Resolves the hard ceiling (in bytes) a group's realm-wide `logical_bytes`
+    /// may reach before writes are rejected: the effective quota
+    /// (`effective_group_quota_bytes`) scaled by the effective grace factor (group
+    /// override if present, else the global `grace_factor_percent`). Returns
+    /// `None` when no quota applies — an existing override with `quota_bytes: None`
+    /// or no override and no `default_group_quota_bytes` — i.e. the group is
+    /// unlimited and no gate is enforced.
+    pub fn effective_group_ceiling(&self, group_id: &GroupId) -> Option<u64> {
+        let over = self
+            .group_overrides
+            .iter()
+            .find(|over| over.group_id == *group_id);
+        let quota = self.effective_group_quota_bytes(group_id)?;
+        let grace = over
+            .and_then(|over| over.grace_factor_percent)
+            .unwrap_or(self.grace_factor_percent);
+        let ceiling = u128::from(quota) * u128::from(grace) / 100;
+        Some(ceiling.min(u128::from(u64::MAX)) as u64)
     }
 }
 
@@ -523,6 +560,66 @@ mod test {
         let restored = RealmConfigDocument::from_bytes(&bytes).expect("from bytes");
 
         assert_eq!(document, restored);
+    }
+
+    #[test]
+    fn effective_group_ceiling_resolves_override_and_grace() {
+        let group = Ulid::from_bytes([1u8; 16]);
+        let other = Ulid::from_bytes([2u8; 16]);
+        let quota = super::QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            group_overrides: vec![super::GroupQuotaOverride {
+                group_id: group,
+                quota_bytes: Some(2_000),
+                grace_factor_percent: Some(150),
+            }],
+            ..super::QuotaConfig::default()
+        };
+
+        // Override quota_bytes and grace win for the overridden group.
+        assert_eq!(quota.effective_group_ceiling(&group), Some(3_000));
+        // Default quota and global grace apply otherwise.
+        assert_eq!(quota.effective_group_ceiling(&other), Some(1_100));
+
+        // No default and no override => unlimited (no gate).
+        let unlimited = super::QuotaConfig {
+            default_group_quota_bytes: None,
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(unlimited.effective_group_ceiling(&other), None);
+
+        // An existing override with quota_bytes: None is explicitly unlimited even
+        // when a finite default exists.
+        let unlimited_override = super::QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            group_overrides: vec![super::GroupQuotaOverride {
+                group_id: group,
+                quota_bytes: None,
+                grace_factor_percent: None,
+            }],
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(unlimited_override.effective_group_ceiling(&group), None);
+        assert_eq!(
+            unlimited_override.effective_group_ceiling(&other),
+            Some(1_100)
+        );
+
+        let huge = super::QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 100,
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(huge.effective_group_ceiling(&other), Some(u64::MAX));
+
+        let over_huge = super::QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 110,
+            ..super::QuotaConfig::default()
+        };
+        assert_eq!(over_huge.effective_group_ceiling(&other), Some(u64::MAX));
     }
 
     #[test]
