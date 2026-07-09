@@ -413,13 +413,20 @@ impl AddGroupRoleOperation {
     fn handle_write_group_auth_doc_and_admin_state(
         &mut self,
         event: Event,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
-        new_members: Vec<UserId>,
+        state: AddGroupRoleState,
     ) -> Effects {
+        let AddGroupRoleState::WriteGroupAuthDocAndAdminState {
+            txn_id,
+            group,
+            auth_doc,
+            admin_outbox_written,
+            stale_conflict_delete_keys,
+            new_members,
+        } = state
+        else {
+            unreachable!("handler only accepts WriteGroupAuthDocAndAdminState");
+        };
+
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -735,22 +742,9 @@ impl Operation for AddGroupRoleOperation {
             AddGroupRoleState::GetAuthDocAndAdminState { txn_id, group } => {
                 self.handle_get_auth_doc_and_admin_state(event, txn_id, group)
             }
-            AddGroupRoleState::WriteGroupAuthDocAndAdminState {
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_delete_keys,
-                new_members,
-            } => self.handle_write_group_auth_doc_and_admin_state(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_delete_keys,
-                new_members,
-            ),
+            state @ AddGroupRoleState::WriteGroupAuthDocAndAdminState { .. } => {
+                self.handle_write_group_auth_doc_and_admin_state(event, state)
+            }
             AddGroupRoleState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
