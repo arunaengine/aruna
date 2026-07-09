@@ -117,19 +117,17 @@ impl UnreadCountOperation {
             return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
         };
 
-        let page_len = values.len();
-        for (index, (_, value)) in values.into_iter().enumerate() {
+        for (_, value) in values {
             let record = match NotificationRecord::from_bytes(&value) {
                 Ok(record) => record,
                 Err(error) => return self.fail(error.into()),
             };
             self.examined += 1;
             if record.read_at_ms.is_none() {
-                self.count += 1;
                 if self.count == UNREAD_COUNT_CAP {
-                    let more = index + 1 < page_len || next_start_after.is_some();
-                    return self.finish(more);
+                    return self.finish(true);
                 }
+                self.count += 1;
             }
         }
 
@@ -284,6 +282,23 @@ mod tests {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (0..100).map(|ts| record(recipient, ts, false)).collect();
+        seed(&context.storage_handle, &records).await;
+
+        assert_eq!(
+            count(&context, recipient).await,
+            UnreadCountOutput {
+                count: 100,
+                capped: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_exactly_100_with_older_read_rows_is_not_capped() {
+        let (_tempdir, context) = context_with_storage();
+        let recipient = user(1, 1);
+        let mut records: Vec<_> = (100..200).map(|ts| record(recipient, ts, false)).collect();
+        records.extend((0..50).map(|ts| record(recipient, ts, true)));
         seed(&context.storage_handle, &records).await;
 
         assert_eq!(
