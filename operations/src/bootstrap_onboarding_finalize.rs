@@ -117,7 +117,7 @@ pub async fn bootstrap_onboarding_finalize(
         .allow_document_sync_peers(&ticket.payload.documents, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
 
-    drive(
+    let consumed = drive(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
             enrollment_id: input.enrollment_id,
             secret_hash: input.secret_hash,
@@ -128,7 +128,9 @@ pub async fn bootstrap_onboarding_finalize(
     )
     .await?;
 
-    emit_node_onboarded_notification(input.realm_id, input.node_id, context.as_ref()).await;
+    if consumed.consumed_now {
+        emit_node_onboarded_notification(input.realm_id, input.node_id, context.as_ref()).await;
+    }
 
     Ok(BootstrapOnboardingFinalizeOutput {
         mode: reserved.mode,
@@ -612,6 +614,42 @@ mod tests {
                 }
             );
         }
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn same_node_retry_after_consumed_does_not_emit_duplicate_onboarded() {
+        let fixture = setup_finalize_fixture().await;
+        let admin_one = UserId::new(Ulid::from_bytes([42u8; 16]), fixture.realm_id);
+        let admin_two = UserId::new(Ulid::from_bytes([43u8; 16]), fixture.realm_id);
+        write_realm_admins(&fixture, &[admin_one, admin_two]).await;
+
+        let (context, net_handle) = context_with_net(&fixture).await;
+        bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        bootstrap_onboarding_finalize(
+            finalize_input(
+                &fixture,
+                fixture.joiner_node_id,
+                ONBOARDING_SECRET_EXPIRES_AT + 1,
+            ),
+            context,
+        )
+        .await
+        .unwrap();
+
+        let rows = read_outbox_rows(&fixture.storage_handle).await;
+        assert_eq!(rows.len(), 2);
+        let mut recipients: Vec<UserId> = rows.iter().map(|row| row.record.recipient).collect();
+        recipients.sort();
+        let mut expected = vec![admin_one, admin_two];
+        expected.sort();
+        assert_eq!(recipients, expected);
+
         net_handle.shutdown().await;
     }
 
