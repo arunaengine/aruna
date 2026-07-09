@@ -3,6 +3,7 @@ pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::{
     Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
 };
@@ -438,7 +439,8 @@ async fn authorize_realm_config_admin(
         (status = 200, description = "Updated realm quota configuration", body = RealmQuotaConfig),
         (status = 400, description = "Invalid quota configuration", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
-        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
+        (status = 409, description = "Concurrent quota update conflict", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -459,12 +461,19 @@ pub async fn set_realm_quota(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| match error {
+    .map_err(map_set_realm_quota_error)?;
+    Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
+}
+
+fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
+    match error {
         SetRealmQuotaError::RealmConfigNotFound => ServerError::NotFound,
         SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
+        SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
-    })?;
-    Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
+    }
 }
 
 /// Storage usage. The flat fields report this node's local counters (kept for
@@ -494,8 +503,9 @@ pub struct GroupQuotaStatus {
     /// Enforced hard cap (quota x grace). `None` = unlimited.
     pub ceiling_bytes: Option<u64>,
     pub warn_threshold_percent: u32,
-    /// True when the group's realm-wide `logical_bytes` has reached
-    /// `quota_bytes * warn_threshold_percent / 100`; always false when unlimited.
+    /// True when the group's realm-wide `logical_bytes` has reached the
+    /// fractional `quota_bytes * warn_threshold_percent / 100` threshold; always
+    /// false when unlimited.
     pub warning: bool,
 }
 
@@ -510,8 +520,8 @@ impl GroupQuotaStatus {
         let quota_bytes = quota.effective_group_quota_bytes(group_id);
         let warning = match quota_bytes {
             Some(limit) => {
-                let threshold = u128::from(limit) * u128::from(quota.warn_threshold_percent) / 100;
-                u128::from(realm_group_logical_bytes) >= threshold
+                u128::from(realm_group_logical_bytes) * 100
+                    >= u128::from(limit) * u128::from(quota.warn_threshold_percent)
             }
             None => false,
         };
@@ -910,19 +920,21 @@ mod tests {
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
         RealmQuotaConfig, RequestSummary, ServiceStatus, ServicesStatus, get_info, get_realm_info,
-        get_usage, set_realm_quota,
+        get_usage, map_set_realm_quota_error, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::errors::StorageError;
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, QuotaConfig, RealmId};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
@@ -1232,10 +1244,45 @@ mod tests {
     }
 
     #[test]
+    fn group_quota_status_uses_fractional_warn_threshold_without_flooring() {
+        let group = Ulid::new();
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(3),
+            warn_threshold_percent: 85,
+            ..QuotaConfig::default()
+        };
+
+        let below = super::GroupQuotaStatus::resolve(&quota, &group, 2);
+        assert!(!below.warning);
+        let at = super::GroupQuotaStatus::resolve(&quota, &group, 3);
+        assert!(at.warning);
+
+        let tiny_quota = QuotaConfig {
+            default_group_quota_bytes: Some(1),
+            warn_threshold_percent: 85,
+            ..QuotaConfig::default()
+        };
+        let zero = super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0);
+        assert!(!zero.warning);
+    }
+
+    #[test]
     fn openapi_includes_realm_quota_path() {
         let openapi = ApiDoc::openapi();
 
         assert!(openapi.paths.paths.contains_key("/info/realm/quota"));
+    }
+
+    #[test]
+    fn set_realm_quota_transaction_conflict_maps_to_http_conflict() {
+        let error = map_set_realm_quota_error(SetRealmQuotaError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+
+        assert!(matches!(
+            error,
+            ServerError::Conflict(message) if message.contains("retry")
+        ));
     }
 
     async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {

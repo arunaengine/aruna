@@ -920,6 +920,10 @@ fn quota_value(quota: &QuotaConfig) -> String {
 fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
     let mut quota = quota.clone();
     quota.max_devices_per_user = None;
+    quota.group_overrides.sort_by_key(|over| over.group_id);
+    quota
+        .user_group_cap_overrides
+        .sort_by_key(|over| over.user_id);
     quota
 }
 
@@ -1041,8 +1045,8 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use crate::structs::{
-        Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        Actor, GroupQuotaOverride, MetadataReplicationConfig, OidcProviderConfig, Permission,
+        QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
@@ -2650,6 +2654,89 @@ mod tests {
             .expect("quota reducer value exists")
             .value = Some(serde_json::to_string(&quota).unwrap());
         assert_eq!(state.materialized_realm_config_quota(), Some(expected));
+    }
+
+    #[test]
+    fn realm_config_quota_override_order_is_canonical_for_conflict_detection() {
+        let group_a = Ulid::from_bytes([1; 16]);
+        let group_b = Ulid::from_bytes([2; 16]);
+        let user_a = user_id_with_seed(3);
+        let user_b = user_id_with_seed(4);
+        let expected = QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 125,
+            warn_threshold_percent: 80,
+            group_overrides: vec![
+                GroupQuotaOverride {
+                    group_id: group_a,
+                    quota_bytes: Some(500),
+                    grace_factor_percent: None,
+                },
+                GroupQuotaOverride {
+                    group_id: group_b,
+                    quota_bytes: Some(750),
+                    grace_factor_percent: Some(150),
+                },
+            ],
+            max_groups_per_user: Some(4),
+            user_group_cap_overrides: vec![
+                UserGroupCapOverride {
+                    user_id: user_a,
+                    max_groups: Some(2),
+                },
+                UserGroupCapOverride {
+                    user_id: user_b,
+                    max_groups: Some(3),
+                },
+            ],
+            max_devices_per_user: None,
+        };
+        let reordered = QuotaConfig {
+            group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
+            user_group_cap_overrides: expected
+                .user_group_cap_overrides
+                .iter()
+                .cloned()
+                .rev()
+                .collect(),
+            max_devices_per_user: Some(6),
+            ..expected.clone()
+        };
+
+        let first = realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigQuotaSet {
+                quota: expected.clone(),
+            },
+        );
+        let second = realm_config_event(
+            2,
+            node(2),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigQuotaSet { quota: reordered },
+        );
+
+        let mut state = realm_config_state();
+        state.apply(&first).unwrap();
+        state.apply(&second).unwrap();
+
+        assert!(state.conflicts.is_empty());
+        assert_eq!(
+            state.materialized_realm_config_quota(),
+            Some(expected.clone())
+        );
+
+        let stored_value = state
+            .user_subject_ids
+            .get(REALM_CONFIG_QUOTA_PATH)
+            .and_then(|version| version.value.as_deref())
+            .expect("quota reducer value exists");
+        let stored_quota: QuotaConfig = serde_json::from_str(stored_value).unwrap();
+        assert_eq!(stored_quota, expected);
     }
 
     #[test]
