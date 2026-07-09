@@ -282,10 +282,6 @@ impl CheckPermissionsOperation {
             for (path, permission) in role.permissions {
                 let glob = Glob::new(&path)?.compile_matcher();
                 if glob.is_match(&self.config.path) {
-                    if public && permission != Permission::READ {
-                        continue;
-                    }
-
                     if public
                         && permission == Permission::READ
                         && self.config.required_permission == Permission::READ
@@ -565,6 +561,22 @@ mod test {
                 .unwrap()
         );
 
+        let public_direct_write = Role {
+            role_id: Ulid::new(),
+            name: "public-direct-write".to_string(),
+            permissions: HashMap::from([(path.clone(), Permission::WRITE)]),
+            assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
+        };
+        assert!(
+            write_operation
+                .check_permissions(vec![super::CollectedRole {
+                    role: public_direct_write,
+                    direct: true,
+                    public: true,
+                }])
+                .unwrap()
+        );
+
         let public_deny = Role {
             role_id: Ulid::new(),
             name: "public-deny".to_string(),
@@ -576,6 +588,12 @@ mod test {
             name: "direct-read".to_string(),
             permissions: HashMap::from([(path.clone(), Permission::READ)]),
             assigned_users: HashSet::from([user_id]),
+        };
+        let public_direct_deny = Role {
+            role_id: Ulid::new(),
+            name: "public-direct-deny".to_string(),
+            permissions: HashMap::from([(path.clone(), Permission::DENY)]),
+            assigned_users: HashSet::from([UserId::nil(realm_id), user_id]),
         };
         let mut read_operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
@@ -592,6 +610,22 @@ mod test {
                     super::CollectedRole {
                         role: public_deny,
                         direct: false,
+                        public: true,
+                    },
+                    super::CollectedRole {
+                        role: direct_read.clone(),
+                        direct: true,
+                        public: false,
+                    },
+                ])
+                .unwrap()
+        );
+        assert!(
+            !read_operation
+                .check_permissions(vec![
+                    super::CollectedRole {
+                        role: public_direct_deny,
+                        direct: true,
                         public: true,
                     },
                     super::CollectedRole {
