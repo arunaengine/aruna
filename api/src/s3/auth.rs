@@ -86,17 +86,13 @@ impl S3Access for AuthProvider {
             Action::Write => Permission::WRITE,
         };
 
-        let path = self
+        let (path, auth_context) = self
             .build_authorization_path(cx, &user_access, &action)
             .await?;
 
         let allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: user_access.user_identity.realm_id,
-                    path_restrictions: user_access.path_restrictions.clone(),
-                },
+                auth_context,
                 path,
                 required_permission,
             }),
@@ -212,19 +208,30 @@ impl AuthProvider {
         cx: &mut S3AccessContext<'_>,
         user_access: &UserAccess,
         action: &Action,
-    ) -> S3Result<String> {
+    ) -> S3Result<(String, AuthContext)> {
+        let mut auth_context = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
         let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
-            return Ok(self.group_data_path(user_access.group_id));
+            return Ok((self.group_data_path(user_access.group_id), auth_context));
         };
         let key = cx.s3_path().get_object_key().map(str::to_owned);
 
         let group_id = match self.find_bucket_info(&bucket).await? {
             Some(bucket_info) => {
-                if bucket_info.group_id != user_access.group_id && !matches!(action, Action::Read) {
-                    return Err(s3_error!(
-                        AccessDenied,
-                        "Bucket belongs to a different group"
-                    ));
+                if bucket_info.group_id != user_access.group_id {
+                    if !matches!(action, Action::Read)
+                        || !is_anonymous_object_read_operation(cx.s3_op().name())
+                        || key.is_none()
+                    {
+                        return Err(s3_error!(
+                            AccessDenied,
+                            "Bucket belongs to a different group"
+                        ));
+                    }
+                    auth_context = AuthContext::anonymous(self.realm_id);
                 }
                 cx.extensions_mut().insert(bucket_info.clone());
                 bucket_info.group_id
@@ -238,12 +245,19 @@ impl AuthProvider {
             }
         };
 
-        Ok(match key {
-            Some(key) => {
-                blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key)
-            }
-            None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
-        })
+        Ok((
+            match key {
+                Some(key) => blob_object_permission_path(
+                    self.realm_id,
+                    group_id,
+                    self.node_id,
+                    &bucket,
+                    &key,
+                ),
+                None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
+            },
+            auth_context,
+        ))
     }
 
     fn group_data_path(&self, group_id: ulid::Ulid) -> String {
