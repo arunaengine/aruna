@@ -136,13 +136,14 @@ Delivery is decoupled from emission by a durable, per-origin-node outbox.
   later. Outbox timers are restored at startup by scanning the outbox, so a
   crash does not strand undelivered rows. A row older than the 48h retention is
   dropped with a `warn!`.
-- **Fair paged drain.** Each drain run pages the FIFO in full (batch 512),
-  delivering to each holder at most once per page and, once a holder's delivery
-  has failed this run, marking its remaining records for retry without another
-  RPC. Because the scan covers the whole queue every run and pages **past**
-  retry-marked rows, a single dead holder cannot starve deliveries to healthy
-  holders behind it: it costs one timeout per run, not one per record, however
-  many of its records are queued ahead.
+- **Fair paged drain.** Each drain run captures a read snapshot and pages that
+  FIFO in full (batch 512), delivering to each holder at most once per page and,
+  once a holder's delivery has failed this run, marking its remaining records
+  for retry without another RPC. The fixed snapshot keeps a live producer from
+  extending a run forever; rows appended during the scan trigger a follow-up
+  run. Because the scan pages **past** retry-marked rows, a single dead holder
+  cannot starve deliveries to healthy holders behind it: it costs one timeout
+  per run, not one per record, however many of its records are queued ahead.
 - **Holder re-resolved every drain.** The outbox row stores the record, never
   its holder. `resolve_inbox_holder` runs on every drain, so deliveries
   automatically re-rank when the sync-eligible set changes (see §8).

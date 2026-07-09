@@ -6,6 +6,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::structs::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -33,12 +34,14 @@ pub fn schedule_notification_outbox_drain_effect() -> Effect {
 pub struct NotificationOutboxBatch {
     pub records: Vec<(Vec<u8>, NotificationOutboxRecord)>,
     pub has_more: bool,
+    pub next_start_after: Option<Vec<u8>>,
 }
 
 pub async fn read_notification_outbox_batch(
     storage: &StorageHandle,
     start_after: Option<Vec<u8>>,
     limit: usize,
+    txn_id: Option<TxnId>,
 ) -> Result<NotificationOutboxBatch, String> {
     let read_limit = limit.saturating_add(1);
     match storage
@@ -47,14 +50,16 @@ pub async fn read_notification_outbox_batch(
             prefix: None,
             start: start_after.map(|key| IterStart::After(ByteView::from(key))),
             limit: read_limit,
-            txn_id: None,
+            txn_id,
         })
         .await
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
             let has_more = values.len() > limit;
-            let mut records = Vec::with_capacity(values.len().min(limit));
-            for (key, value) in values.into_iter().take(limit) {
+            let page: Vec<_> = values.into_iter().take(limit).collect();
+            let next_start_after = page.last().map(|(key, _)| key.to_vec());
+            let mut records = Vec::with_capacity(page.len());
+            for (key, value) in page {
                 match postcard::from_bytes(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
@@ -64,7 +69,11 @@ pub async fn read_notification_outbox_batch(
                     }
                 }
             }
-            Ok(NotificationOutboxBatch { records, has_more })
+            Ok(NotificationOutboxBatch {
+                records,
+                has_more,
+                next_start_after,
+            })
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
@@ -252,6 +261,26 @@ mod tests {
         }
     }
 
+    async fn start_read_snapshot(storage: &StorageHandle) -> TxnId {
+        match storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected transaction start event: {other:?}"),
+        }
+    }
+
+    async fn close_read_snapshot(storage: &StorageHandle, txn_id: TxnId) {
+        match storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
+            other => panic!("unexpected transaction commit event: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn outbox_batch_reads_fifo() {
         let (_dir, storage) = temp_storage();
@@ -262,7 +291,7 @@ mod tests {
             write_outbox(&storage, record).await;
         }
 
-        let batch = read_notification_outbox_batch(&storage, None, 3)
+        let batch = read_notification_outbox_batch(&storage, None, 3, None)
             .await
             .expect("outbox read succeeds");
         assert!(!batch.has_more);
@@ -276,11 +305,78 @@ mod tests {
             ]
         );
 
-        let partial = read_notification_outbox_batch(&storage, None, 2)
+        let partial = read_notification_outbox_batch(&storage, None, 2, None)
             .await
             .expect("outbox read succeeds");
         assert!(partial.has_more);
         assert_eq!(partial.records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn outbox_snapshot_excludes_records_appended_between_pages() {
+        let (_dir, storage) = temp_storage();
+        let records: Vec<NotificationOutboxRecord> = (1..=3u128)
+            .map(|seq| outbox_record_with_id(Ulid::from_parts(seq as u64, 0)))
+            .collect();
+        write_outbox(&storage, &records[0]).await;
+        write_outbox(&storage, &records[1]).await;
+
+        let txn_id = start_read_snapshot(&storage).await;
+        let first = read_notification_outbox_batch(&storage, None, 1, Some(txn_id))
+            .await
+            .expect("first snapshot page");
+        assert_eq!(first.records[0].1, records[0]);
+        assert!(first.has_more);
+
+        write_outbox(&storage, &records[2]).await;
+
+        let second =
+            read_notification_outbox_batch(&storage, first.next_start_after, 1, Some(txn_id))
+                .await
+                .expect("second snapshot page");
+        assert_eq!(second.records[0].1, records[1]);
+        assert!(!second.has_more);
+        close_read_snapshot(&storage, txn_id).await;
+
+        let appended = read_notification_outbox_batch(&storage, second.next_start_after, 1, None)
+            .await
+            .expect("live page after snapshot");
+        assert_eq!(appended.records[0].1, records[2]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_cursor_advances_past_malformed_records() {
+        let (_dir, storage) = temp_storage();
+        let valid = outbox_record_with_id(Ulid::from_parts(2, 0));
+        write_outbox(&storage, &valid).await;
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                key: notification_outbox_key(Ulid::from_parts(1, 0)),
+                value: ByteView::from(vec![1, 2, 3]),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected outbox write event: {other:?}"),
+        }
+
+        let txn_id = start_read_snapshot(&storage).await;
+        let malformed = read_notification_outbox_batch(&storage, None, 1, Some(txn_id))
+            .await
+            .expect("malformed snapshot page");
+        assert!(malformed.records.is_empty());
+        assert!(malformed.has_more);
+        assert!(malformed.next_start_after.is_some());
+
+        let next =
+            read_notification_outbox_batch(&storage, malformed.next_start_after, 1, Some(txn_id))
+                .await
+                .expect("snapshot page after malformed row");
+        assert_eq!(next.records[0].1, valid);
+        assert!(!next.has_more);
+        close_read_snapshot(&storage, txn_id).await;
     }
 
     #[tokio::test]
@@ -301,10 +397,14 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let batch =
-            read_notification_outbox_batch(&storage, None, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE)
-                .await
-                .expect("outbox read succeeds");
+        let batch = read_notification_outbox_batch(
+            &storage,
+            None,
+            NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
+            None,
+        )
+        .await
+        .expect("outbox read succeeds");
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.records[0].1, valid);
 

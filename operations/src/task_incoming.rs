@@ -771,22 +771,42 @@ impl OperationsTaskHandler {
         };
         let local_node_id = net_handle.node_id();
 
+        let snapshot_txn_id = match self
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Failed to start notification outbox snapshot");
+                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                    .await;
+                return;
+            }
+            other => {
+                warn!(event = ?other, "Unexpected notification outbox snapshot start result");
+                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                    .await;
+                return;
+            }
+        };
+
         let mut start_after: Option<Vec<u8>> = None;
-        let mut has_more = false;
         let mut retry_needed = false;
         let mut realm_configs: HashMap<RealmId, Option<RealmConfigDocument>> = HashMap::new();
         // One delivery attempt per remote holder per run: later records for a
         // holder already found unreachable are marked retry without another RPC.
         let mut failed_holders: HashSet<aruna_core::NodeId> = HashSet::new();
 
-        // Scan the whole outbox every run, not a fixed page count: a healthy
-        // holder's records must be attempted regardless of how many retry-marked
-        // rows (e.g. a dead holder's backlog) sit ahead of them in the FIFO.
+        // Scan the snapshot in full so a dead holder cannot hide healthy records
+        // behind it, while rows appended during this run wait for the next run.
         loop {
             let batch = match read_notification_outbox_batch(
                 &self.context.storage_handle,
                 start_after.clone(),
                 NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
+                Some(snapshot_txn_id),
             )
             .await
             {
@@ -798,12 +818,14 @@ impl OperationsTaskHandler {
                 }
             };
 
+            let has_more = batch.has_more;
+            start_after = batch.next_start_after;
             if batch.records.is_empty() {
-                has_more = batch.has_more;
+                if has_more && start_after.is_some() {
+                    continue;
+                }
                 break;
             }
-            has_more = batch.has_more;
-            start_after = batch.records.last().map(|(key, _)| key.clone());
 
             let mut local_records: Vec<NotificationRecord> = Vec::new();
             let mut local_keys: Vec<Vec<u8>> = Vec::new();
@@ -913,11 +935,41 @@ impl OperationsTaskHandler {
             }
         }
 
+        match self
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction {
+                txn_id: snapshot_txn_id,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Failed to close notification outbox snapshot");
+                retry_needed = true;
+            }
+            other => {
+                warn!(event = ?other, "Unexpected notification outbox snapshot close result");
+                retry_needed = true;
+            }
+        }
+
         if retry_needed {
             self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
                 .await;
-        } else if has_more {
-            self.reschedule_timer(retry_key, Duration::ZERO).await;
+        } else {
+            match read_notification_outbox_batch(&self.context.storage_handle, None, 1, None).await
+            {
+                Ok(batch) if !batch.records.is_empty() || batch.has_more => {
+                    self.reschedule_timer(retry_key, Duration::ZERO).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "Failed to check for notification outbox records appended during drain");
+                    self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                        .await;
+                }
+            }
         }
     }
 
@@ -1860,7 +1912,7 @@ mod tests {
 
         let inbox = read_inbox_records(&storage).await;
         assert_eq!(inbox, vec![record]);
-        let remaining = read_notification_outbox_batch(&storage, None, 1024)
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());
@@ -1889,7 +1941,7 @@ mod tests {
         let handler = OperationsTaskHandler::new(context);
         handler.drain_notification_outbox().await;
 
-        let remaining = read_notification_outbox_batch(&storage, None, 1024)
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
             .await
             .expect("outbox read");
         assert_eq!(remaining.records.len(), 1);
@@ -1939,7 +1991,7 @@ mod tests {
         handler.drain_notification_outbox().await;
 
         assert!(read_inbox_records(&storage).await.is_empty());
-        let remaining = read_notification_outbox_batch(&storage, None, 1024)
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());
@@ -2007,7 +2059,7 @@ mod tests {
         handler.drain_notification_outbox().await;
 
         assert_eq!(read_inbox_records(&storage_b).await, vec![record]);
-        let remaining = read_notification_outbox_batch(&storage_a, None, 1024)
+        let remaining = read_notification_outbox_batch(&storage_a, None, 1024, None)
             .await
             .expect("outbox read");
         assert!(remaining.records.is_empty());
