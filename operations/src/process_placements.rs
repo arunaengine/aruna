@@ -15,9 +15,10 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_effect,
+    placement_satisfied, realm_nodes_from_config_bytes, schedule_placement_retry_after,
     select_sync_peers, sort_node_ids, write_placement_effect,
 };
+use std::time::Duration;
 use tracing::warn;
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
@@ -26,6 +27,9 @@ const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 pub struct PlacementConfig {
     pub realm_id: RealmId,
     pub local_node_id: NodeId,
+    /// In-memory backoff duration the driver uses for the retry re-arm; not
+    /// persisted anywhere.
+    pub retry_after: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +41,7 @@ pub struct ProcessPlacementsOperation {
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
     retry_needed: bool,
+    rearmed: bool,
     output: Option<Result<(), PlacementError>>,
 }
 
@@ -93,6 +98,7 @@ impl ProcessPlacementsOperation {
             next_start_after: None,
             current: None,
             retry_needed: false,
+            rearmed: false,
             output: None,
         }
     }
@@ -139,6 +145,18 @@ impl ProcessPlacementsOperation {
             );
             return self.emit_next_record();
         }
+        if record.target.is_admin_document() {
+            // Admin documents never take placements; drain any stale row instead of
+            // retrying it forever. The satisfied-delete path continues the sweep once
+            // the delete result arrives.
+            self.current = None;
+            self.retry_needed = false;
+            self.state = PlacementState::StorePlacement;
+            return smallvec![delete_placement_effect(
+                self.config.realm_id,
+                &record.target
+            )];
+        }
 
         let missing_peer_count = missing_peer_count(&record);
         let mut selected_peers = record.selected_peers;
@@ -166,12 +184,16 @@ impl ProcessPlacementsOperation {
         }
 
         self.state = PlacementState::Publish;
+        // Only the placement's authoritative origin may mint the document's topic
+        // genesis; a replica-holder node re-publishing waits for it to replicate in.
+        let allow_genesis = record.authoritative_node_id == self.config.local_node_id;
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document_with_peers(
                 record.target.topic_id(),
                 self.config.local_node_id,
                 Some(record.target),
                 newly_selected,
+                allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
@@ -214,7 +236,8 @@ impl ProcessPlacementsOperation {
 }
 
 impl Operation for ProcessPlacementsOperation {
-    type Output = ();
+    /// `true` when this tick re-armed the placement retry timer.
+    type Output = bool;
     type Error = PlacementError;
 
     fn start(&mut self) -> Effects {
@@ -286,10 +309,12 @@ impl Operation for ProcessPlacementsOperation {
                 Event::Storage(StorageEvent::WriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     if self.retry_needed {
+                        self.rearmed = true;
                         self.state = PlacementState::ScheduleRetry;
-                        smallvec![schedule_placement_retry_effect(
+                        smallvec![schedule_placement_retry_after(
                             self.config.realm_id,
                             self.config.local_node_id,
+                            self.config.retry_after,
                         )]
                     } else {
                         self.emit_next_record()
@@ -319,7 +344,10 @@ impl Operation for ProcessPlacementsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
+        match self.output {
+            Some(Err(error)) => Err(error),
+            _ => Ok(self.rearmed),
+        }
     }
 
     fn abort(&mut self) -> Effects {
@@ -330,6 +358,7 @@ impl Operation for ProcessPlacementsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -342,12 +371,19 @@ mod tests {
         }
     }
 
+    fn metadata_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([seed; 16]),
+        }
+    }
+
     #[test]
     fn task_schedule_error_is_non_blocking_after_placement_write() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.state = PlacementState::ScheduleRetry;
         operation.retry_needed = true;
@@ -359,16 +395,17 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(operation.state, PlacementState::Finish);
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.finalize(), Ok(false));
     }
 
     #[test]
     fn two_remote_peers_complete_existing_default_pending_placement() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let target = group_target(4);
+        let target = metadata_target(4);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.current = Some(CurrentPlacement {
             target: target.clone(),
@@ -395,11 +432,12 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_nodes = vec![authoritative, node(2), node(3), node(4)];
         operation.records = vec![new_placement(
             realm_id,
-            group_target(5),
+            metadata_target(5),
             authoritative,
             3,
             vec![node(2)],
@@ -418,11 +456,12 @@ mod tests {
     #[test]
     fn process_placement_does_not_replace_existing_holders() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let target = group_target(6);
+        let target = metadata_target(6);
         let authoritative = node(1);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.current = Some(CurrentPlacement {
             target,
@@ -449,11 +488,12 @@ mod tests {
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_nodes = vec![authoritative, node(2)];
         operation.records = vec![new_placement(
             realm_id,
-            group_target(7),
+            metadata_target(7),
             authoritative,
             2,
             Vec::new(),
@@ -464,5 +504,103 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
         assert_eq!(current.newly_selected, vec![node(2)]);
+    }
+
+    #[test]
+    fn admin_target_placement_is_drained_not_retried() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(1),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        operation.realm_nodes = vec![node(1), node(2), node(3)];
+        operation.records = vec![new_placement(
+            realm_id,
+            group_target(4),
+            node(1),
+            3,
+            Vec::new(),
+        )];
+
+        let effects = operation.emit_next_record();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == SYNC_PLACEMENT_KEYSPACE
+        ));
+        assert!(!operation.retry_needed);
+        assert_eq!(operation.state, PlacementState::StorePlacement);
+        assert!(operation.current.is_none());
+    }
+
+    fn announce_outbox_allow_genesis(effects: Effects, document_bytes: Vec<u8>) -> bool {
+        let Some(Effect::SubOperation(mut sub)) = effects.into_iter().next() else {
+            panic!("expected announce sub-operation");
+        };
+        let _read = sub.start();
+        let write_effects = sub.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(vec![0u8]),
+            value: Some(aruna_core::types::Value::from(document_bytes)),
+        }));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = write_effects.as_slice() else {
+            panic!("expected announce outbox write, got {write_effects:?}");
+        };
+        let record: aruna_core::document::DocumentSyncOutboxRecord =
+            postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
+        record.allow_genesis
+    }
+
+    fn graph_lifecycle_fixture() -> (DocumentSyncTarget, Vec<u8>) {
+        let record = aruna_core::metadata::MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:placement-test".to_string(),
+            RealmId::from_bytes([8u8; 32]),
+            aruna_core::types::GroupId::new(),
+            Ulid::from_bytes([9u8; 16]),
+            42,
+        );
+        let bytes = postcard::to_allocvec(&record).expect("lifecycle record serializes");
+        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: record.graph_iri.clone(),
+        };
+        (target, bytes)
+    }
+
+    fn placement_announce_allow_genesis(
+        local: NodeId,
+        authoritative: NodeId,
+        target: DocumentSyncTarget,
+        document_bytes: Vec<u8>,
+    ) -> bool {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: local,
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        operation.realm_nodes = vec![node(1), node(2), node(3), local];
+        operation.records = vec![new_placement(
+            realm_id,
+            target,
+            authoritative,
+            3,
+            Vec::new(),
+        )];
+        announce_outbox_allow_genesis(operation.emit_next_record(), document_bytes)
+    }
+
+    #[test]
+    fn announce_allow_genesis_tracks_authoritative_origin() {
+        let local = node(1);
+        let (target, bytes) = graph_lifecycle_fixture();
+        assert!(
+            placement_announce_allow_genesis(local, local, target.clone(), bytes.clone()),
+            "origin (authoritative == local) may mint genesis"
+        );
+        assert!(
+            !placement_announce_allow_genesis(node(9), local, target, bytes),
+            "replica-holder (authoritative != local) must not mint genesis"
+        );
     }
 }

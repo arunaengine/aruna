@@ -544,6 +544,7 @@ async fn publish_document_to_peer(
                     target: target.clone(),
                     change: document_change_for_publish(node.net.node_id(), &target, &bytes)?,
                     bytes,
+                    allow_genesis: true,
                 }],
                 peers: vec![peer],
             },

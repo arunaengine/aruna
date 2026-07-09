@@ -28,7 +28,8 @@ pub mod util;
 
 pub use document::{
     DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect,
-    DocumentSyncEvent, DocumentSyncNetEvent, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentSyncEvent, DocumentSyncEvictedDocument, DocumentSyncNetEvent, DocumentSyncRevision,
+    DocumentSyncTarget,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;

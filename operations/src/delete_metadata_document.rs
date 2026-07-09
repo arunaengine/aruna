@@ -158,6 +158,11 @@ impl DeleteMetadataDocumentOperation {
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
         let change =
             metadata_document_lifecycle_revision_change(lifecycle_record, self.actor.node_id);
+        // Delete tombstones are published by the document's holder onto its own
+        // per-document sync topics; the graph-lifecycle topic in particular is
+        // first written here, so these writes must be able to mint their genesis
+        // or the whole delete batch stalls. Per-document topics are single-origin,
+        // so this does not risk the shared-topic fork this feature guards against.
         Ok(new_outbox_record_with_id(
             lifecycle_record.event_id(),
             self.actor.node_id,
@@ -166,6 +171,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
+            true,
         ))
     }
 
@@ -210,6 +216,9 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
+            // First (and only) write to the per-graph lifecycle topic, so the
+            // deleting holder originates and may mint its genesis.
+            true,
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))
@@ -243,6 +252,10 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Delete { change },
+            // Registry delete rides the document's own topic and shares the delete
+            // publish batch with the tombstones above; keep it consistent so the
+            // batch is not blocked mid-flight.
+            true,
         );
         Ok(smallvec![
             write_outbox_effect_with_txn(&outbox, Some(txn_id))

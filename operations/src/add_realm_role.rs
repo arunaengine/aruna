@@ -281,6 +281,7 @@ impl AddRealmRoleOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event.clone()),
                 },
+                false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }

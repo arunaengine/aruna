@@ -17,8 +17,9 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncNetEvent,
-    DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
+    DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
+    DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -59,8 +60,10 @@ use irokle_crate::history::HistoryOrder;
 use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
 use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
-use irokle_crate::{EventEnvelope, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
-use parking_lot::RwLock;
+use irokle_crate::{
+    EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
+};
+use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -87,6 +90,14 @@ struct PendingMetadataCreateApply {
     lifecycle_revision: Option<DocumentSyncChange>,
 }
 
+#[derive(Default)]
+struct PublishEventsOutcome {
+    published: BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock>,
+    published_indices: Vec<usize>,
+    retry_indices: Vec<usize>,
+    retry_error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct DocumentSyncService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
@@ -96,6 +107,12 @@ pub struct DocumentSyncService {
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
+    // Genesis tie-break evictions from every admission path (irokle's own
+    // accept/resync loops via the net sink, plus this service's bootstrap and
+    // batch-sync paths) funnel into this sender; the embedder drains the
+    // receiver once via `take_eviction_receiver` and re-emits the payloads.
+    eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
+    eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -149,12 +166,14 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let (eviction_tx, eviction_rx) = tokio::sync::mpsc::unbounded_channel();
         let net = Arc::new(
-            irokle_crate::net::IrohNet::new_with_alpns_and_config(
+            irokle_crate::net::IrohNet::new_with_alpns_config_and_sink(
                 endpoint,
                 node.clone(),
                 alpns,
                 runtime,
+                Some(eviction_tx.clone()),
             )
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
@@ -169,11 +188,118 @@ impl DocumentSyncService {
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
+            eviction_tx,
+            eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
         })
     }
 
     pub fn node(&self) -> irokle_crate::Irokle<irokle_crate::FjallStorage> {
         self.node.clone()
+    }
+
+    /// Takes the genesis tie-break eviction receiver. The embedder calls this
+    /// once to drive the re-emission consumer; later calls return `None`.
+    pub fn take_eviction_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>> {
+        self.eviction_rx.lock().take()
+    }
+
+    /// Decodes a genesis tie-break eviction into the document outbox events that
+    /// must be re-emitted onto the winning chain. Every item sets
+    /// `allow_genesis: false` so the loser replays through the normal outbox
+    /// drain instead of minting a rival genesis, and original ids are preserved
+    /// where the outbox format can carry them. Control ops are skipped,
+    /// whole-document admin poison is dropped with a warning (mirroring the
+    /// reconcile skip arm), and ops not authored by the local node are rejected
+    /// since an eviction is by construction the local node's own chain.
+    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentSyncEvictedDocument> {
+        let local_peer = self.node.peer_id();
+        let mut documents = Vec::new();
+        for evicted in eviction.evicted {
+            if evicted.author != local_peer {
+                warn!(
+                    topic_id = %eviction.topic_id,
+                    author = %evicted.author,
+                    "Skipping evicted op not authored by the local node"
+                );
+                continue;
+            }
+            let TopicPayload::Event(envelope) = evicted.payload else {
+                // Non-event control op (e.g. AddPeer/RemovePeer): nothing to re-emit.
+                continue;
+            };
+            let event = match envelope.decode_event::<DocumentSyncEvent>() {
+                Ok(event) => event,
+                Err(error) => {
+                    warn!(
+                        topic_id = %eviction.topic_id,
+                        op_id = %evicted.op_id,
+                        %error,
+                        "Skipping evicted op that is not a document sync event"
+                    );
+                    continue;
+                }
+            };
+            match event {
+                DocumentSyncEvent::AdminOperation { target, event } => {
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: None,
+                        target,
+                        event: DocumentSyncOutboxEvent::AdminOperation { event },
+                        allow_genesis: false,
+                    });
+                }
+                DocumentSyncEvent::Upsert {
+                    event_id,
+                    target,
+                    bytes,
+                    change,
+                } => {
+                    if admin_document_target_for_reduced_document(&target).is_some() {
+                        warn!(
+                            topic_id = %eviction.topic_id,
+                            ?target,
+                            "Dropping evicted whole-document admin upsert"
+                        );
+                        continue;
+                    }
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: Some(event_id),
+                        target,
+                        event: DocumentSyncOutboxEvent::Upsert { bytes, change },
+                        allow_genesis: false,
+                    });
+                }
+                DocumentSyncEvent::Delete {
+                    event_id,
+                    target,
+                    change,
+                } => {
+                    if admin_document_target_for_reduced_document(&target).is_some() {
+                        warn!(
+                            topic_id = %eviction.topic_id,
+                            ?target,
+                            "Dropping evicted whole-document admin delete"
+                        );
+                        continue;
+                    }
+                    documents.push(DocumentSyncEvictedDocument {
+                        event_id: Some(event_id),
+                        target,
+                        event: DocumentSyncOutboxEvent::Delete { change },
+                        allow_genesis: false,
+                    });
+                }
+            }
+        }
+        documents
+    }
+
+    /// Forwards evictions produced by this service's own admission paths into
+    /// the shared eviction sink.
+    fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
+        forward_evictions_to(&self.eviction_tx, evictions);
     }
 
     fn local_node_id(&self) -> Result<NodeId> {
@@ -337,7 +463,10 @@ impl DocumentSyncService {
         let mut seen_topics = BTreeSet::new();
         for target in targets {
             if seen_topics.insert(target.sync_topic_id()) {
-                self.ensure_topic(target, &sync_peers)?;
+                // Called on the realm node that already holds these documents to
+                // admit an onboarding peer, so it may create any still-missing
+                // topic genesis for documents it originated/holds.
+                self.ensure_topic(target, &sync_peers, true)?;
             }
         }
 
@@ -410,7 +539,25 @@ impl DocumentSyncService {
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
         match self.publish_events(documents, peers).await {
-            Ok(()) => DocumentSyncNetEvent::DocumentsPublished { targets },
+            Ok(outcome) if outcome.retry_indices.is_empty() => {
+                DocumentSyncNetEvent::DocumentsPublished { targets }
+            }
+            Ok(outcome) if outcome.published_indices.is_empty() => DocumentSyncNetEvent::Error {
+                target: outcome
+                    .retry_indices
+                    .first()
+                    .and_then(|index| targets.get(*index).cloned()),
+                error: outcome
+                    .retry_error
+                    .unwrap_or_else(|| "Document sync topic not ready".to_string()),
+            },
+            Ok(outcome) => DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                published_indices: outcome.published_indices,
+                retry_indices: outcome.retry_indices,
+                error: outcome
+                    .retry_error
+                    .unwrap_or_else(|| "Document sync topic not ready".to_string()),
+            },
             Err(error) => DocumentSyncNetEvent::Error {
                 target: None,
                 error: error.to_string(),
@@ -587,41 +734,44 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
-    ) -> Result<()> {
+    ) -> Result<PublishEventsOutcome> {
         if documents.is_empty() {
-            return Ok(());
+            return Ok(PublishEventsOutcome::default());
         }
         let sync_peers = self.sync_peers(peers);
         self.allow_sync_peers(&sync_peers)?;
         let service = self.clone();
-        let published = tokio::task::spawn_blocking(move || {
+        let mut outcome = tokio::task::spawn_blocking(move || {
             service.publish_events_blocking(documents, &sync_peers)
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
+        let published = std::mem::take(&mut outcome.published);
         self.advance_topic_cursors(published).await?;
-        self.flush_database()
+        self.flush_database()?;
+        Ok(outcome)
     }
 
     fn publish_events_blocking(
         &self,
         documents: Vec<DocumentSyncPublish>,
         sync_peers: &BTreeSet<PeerId>,
-    ) -> Result<BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock>> {
+    ) -> Result<PublishEventsOutcome> {
         let publish_started = Instant::now();
         let document_count = documents.len();
         let mut fast_path = 0usize;
         let mut fallback = 0usize;
         let oplog = Oplog::with_storage(self.node.storage().clone());
-        let mut published: BTreeMap<irokle_crate::TopicId, irokle_crate::ActorClock> =
-            BTreeMap::new();
-        for document in documents {
+        let mut outcome = PublishEventsOutcome::default();
+        for (index, document) in documents.into_iter().enumerate() {
+            let allow_genesis = document.allow_genesis();
             let event = match document {
                 DocumentSyncPublish::Upsert {
                     event_id,
                     target,
                     bytes,
                     change,
+                    ..
                 } => DocumentSyncEvent::Upsert {
                     event_id,
                     target,
@@ -632,12 +782,13 @@ impl DocumentSyncService {
                     event_id,
                     target,
                     change,
+                    ..
                 } => DocumentSyncEvent::Delete {
                     event_id,
                     target,
                     change,
                 },
-                DocumentSyncPublish::AdminOperation { target, event } => {
+                DocumentSyncPublish::AdminOperation { target, event, .. } => {
                     DocumentSyncEvent::AdminOperation { target, event }
                 }
             };
@@ -646,31 +797,47 @@ impl DocumentSyncService {
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let op = self.publish_event_op(
+            let op = match self.publish_event_op(
                 &oplog,
                 &target,
                 topic_id,
                 actor_id,
                 envelope,
                 sync_peers,
+                allow_genesis,
                 &mut fast_path,
                 &mut fallback,
-            )?;
-            published
+            ) {
+                Ok(op) => op,
+                Err(NetError::TopicNotReady(topic)) => {
+                    outcome.retry_indices.push(index);
+                    outcome
+                        .retry_error
+                        .get_or_insert_with(|| NetError::TopicNotReady(topic).to_string());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            outcome.published_indices.push(index);
+            outcome
+                .published
                 .entry(topic_id)
                 .or_default()
                 .observe(op.signed.body.actor_id, op.signed.body.actor_seq);
         }
+        let published_count = outcome.published_indices.len();
         info!(
             event = "pipeline.publish.summary",
             documents = document_count,
+            published = published_count,
+            retry = outcome.retry_indices.len(),
             fast_path,
             fallback,
-            existing = document_count - fast_path - fallback,
+            existing = published_count.saturating_sub(fast_path + fallback),
             total_ms = duration_ms(publish_started.elapsed()),
             "Document sync publish batch breakdown"
         );
-        Ok(published)
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -682,6 +849,7 @@ impl DocumentSyncService {
         actor_id: irokle_crate::ActorId,
         envelope: EventEnvelope,
         sync_peers: &BTreeSet<PeerId>,
+        allow_genesis: bool,
         fast_path: &mut usize,
         fallback: &mut usize,
     ) -> Result<irokle_crate::Op> {
@@ -695,6 +863,11 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .is_none();
         if topic_missing {
+            // Only the document's origin may mint its topic genesis. Any other
+            // publisher waits (retryable) for that genesis to replicate in.
+            if !allow_genesis {
+                return Err(NetError::TopicNotReady(topic_id.to_string()));
+            }
             let genesis = TopicGenesis {
                 event_type_id: DocumentSyncEvent::TYPE_ID.to_string(),
                 initial_peers: sync_peers.clone(),
@@ -718,7 +891,7 @@ impl DocumentSyncService {
                 }
             }
         }
-        let topic_id = self.ensure_topic(target, sync_peers)?;
+        let topic_id = self.ensure_topic(target, sync_peers, allow_genesis)?;
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))
@@ -771,6 +944,7 @@ impl DocumentSyncService {
         &self,
         target: &DocumentSyncTarget,
         peers: &BTreeSet<PeerId>,
+        allow_genesis: bool,
     ) -> Result<irokle_crate::TopicId> {
         let topic_id = target.sync_topic_id();
         let mut genesis_error = None;
@@ -809,6 +983,12 @@ impl DocumentSyncService {
                     self.net.schedule_topic_recheck(topic_id)?;
                 }
                 return Ok(topic_id);
+            }
+
+            // Only the document's origin may mint the genesis; other publishers
+            // wait (retryable) for it to replicate in.
+            if !allow_genesis {
+                return Err(NetError::TopicNotReady(topic_id.to_string()));
             }
 
             let actor_id = irokle_crate::actor_id_for(topic_id, self.node.peer_id());
@@ -1088,8 +1268,17 @@ impl DocumentSyncService {
         let node = self.node.clone();
         let net = self.net.clone();
         let data_known = known_topics.clone();
+        let eviction_tx = self.eviction_tx.clone();
         let (failed_topics, followup) = tokio::task::spawn_blocking(move || {
-            process_batch_data_responses(&node, &net, peer, &data_known, failed_topics, responses)
+            process_batch_data_responses(
+                &node,
+                &net,
+                peer,
+                &data_known,
+                failed_topics,
+                responses,
+                &eviction_tx,
+            )
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
@@ -1216,10 +1405,11 @@ impl DocumentSyncService {
             match response {
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
                 SyncMessage::Data(data) if data.topic_id == topic_id => {
-                    let ack = self
+                    let (ack, evictions) = self
                         .node
-                        .receive_sync_data_from(peer, data)
+                        .receive_sync_data_from_evicting(peer, data)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                    self.forward_evictions(evictions);
                     received_data = true;
                     followup.push(SyncMessage::Ack(ack));
                 }
@@ -1418,6 +1608,19 @@ impl DocumentSyncService {
                             }
                             applied_targets.push(target);
                         }
+                    }
+                    DocumentSyncEvent::Upsert { ref target, .. }
+                    | DocumentSyncEvent::Delete { ref target, .. }
+                        if admin_document_target_for_reduced_document(target).is_some() =>
+                    {
+                        // apply_upsert/apply_delete refuse whole-document admin sync, so
+                        // skip it here to let the cursor advance instead of wedging reconcile.
+                        warn!(
+                            %topic_id,
+                            ?target,
+                            "Skipping unsupported whole-document admin sync event"
+                        );
+                        continue;
                     }
                     event => {
                         let target = event.target().clone();
@@ -3459,6 +3662,17 @@ fn process_batch_summary_responses(
     Ok((responded_topics, failed_topics, sync_messages))
 }
 
+fn forward_evictions_to(
+    sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
+    evictions: Vec<TopicEviction>,
+) {
+    for eviction in evictions {
+        if sink.send(eviction).is_err() {
+            warn!("Document sync eviction consumer closed; dropping re-emitted payloads");
+        }
+    }
+}
+
 fn process_batch_data_responses(
     node: &irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: &irokle_crate::net::IrohNet<irokle_crate::FjallStorage>,
@@ -3466,6 +3680,7 @@ fn process_batch_data_responses(
     known_topics: &BTreeSet<irokle_crate::TopicId>,
     mut failed_topics: BTreeSet<irokle_crate::TopicId>,
     responses: Vec<SyncMessage>,
+    eviction_tx: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
 ) -> Result<(BTreeSet<irokle_crate::TopicId>, Vec<SyncMessage>)> {
     let mut followup = Vec::new();
     let mut acks = Vec::new();
@@ -3479,8 +3694,11 @@ fn process_batch_data_responses(
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
             SyncMessage::Data(data) if known_topics.contains(&data.topic_id) => {
                 let topic_id = data.topic_id;
-                let ack = match node.receive_sync_data_from(peer, data) {
-                    Ok(ack) => ack,
+                let ack = match node.receive_sync_data_from_evicting(peer, data) {
+                    Ok((ack, evictions)) => {
+                        forward_evictions_to(eviction_tx, evictions);
+                        ack
+                    }
                     Err(error) => {
                         warn!(
                             %peer,
@@ -6327,6 +6545,7 @@ mod tests {
                         target: target.clone(),
                         bytes: restart_payload(),
                         change: revision_change(),
+                        allow_genesis: true,
                     }],
                     Vec::new(),
                 )
@@ -7027,5 +7246,511 @@ mod tests {
         assert_eq!(prune_jobs[0].graph_iri, tombstone.graph_iri);
         assert_eq!(prune_jobs[0].attempts, 0);
         assert!(prune_jobs[0].last_error.is_none());
+    }
+
+    // A publisher that is not the document's origin (allow_genesis=false) must not
+    // mint a missing topic's genesis: it gets a retryable error and no topic is
+    // created. The origin (allow_genesis=true) creates the topic and publishes.
+    #[tokio::test]
+    async fn missing_topic_publish_requires_allow_genesis() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(61).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::new(),
+        };
+        let topic_id = target.sync_topic_id();
+        let change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        let blocked = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::new(),
+                    target: target.clone(),
+                    bytes: b"blocked".to_vec(),
+                    change,
+                    allow_genesis: false,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(blocked, DocumentSyncNetEvent::Error { .. }),
+            "non-origin publish must fail retryably: {blocked:?}"
+        );
+        assert!(
+            !service.has_topic(topic_id).expect("topic lookup"),
+            "no genesis may be minted without allow_genesis"
+        );
+
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::new(),
+                    target: target.clone(),
+                    bytes: b"origin".to_vec(),
+                    change,
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "origin publish must succeed: {published:?}"
+        );
+        assert!(
+            service.has_topic(topic_id).expect("topic lookup"),
+            "origin publish must create the topic genesis"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_not_ready_publish_does_not_block_ready_batch_record() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(62).await,
+            storage,
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let local_node = service.local_node_id().expect("local node id");
+        let blocked_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_parts(62, 1),
+        };
+        let ready_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_parts(62, 2),
+        };
+        let blocked_topic = blocked_target.sync_topic_id();
+        let ready_topic = ready_target.sync_topic_id();
+        let change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(62, 3),
+                actor: local_node,
+                updated_at_ms: 1,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        };
+
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(62, 4),
+                        target: blocked_target.clone(),
+                        bytes: b"blocked".to_vec(),
+                        change,
+                        allow_genesis: false,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(62, 5),
+                        target: ready_target.clone(),
+                        bytes: b"ready".to_vec(),
+                        change,
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+
+        match published {
+            DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                published_indices,
+                retry_indices,
+                error,
+            } => {
+                assert_eq!(published_indices, vec![1]);
+                assert_eq!(retry_indices, vec![0]);
+                assert!(error.contains(&blocked_topic.to_string()));
+            }
+            other => panic!("expected partial publish, got {other:?}"),
+        }
+        assert!(
+            !service
+                .has_topic(blocked_topic)
+                .expect("blocked topic lookup"),
+            "not-ready record must not mint genesis"
+        );
+        assert!(
+            service.has_topic(ready_topic).expect("ready topic lookup"),
+            "ready record behind not-ready record must publish"
+        );
+    }
+
+    // Two services fork one admin topic (each mints its own genesis carrying a
+    // unique admin event). The genesis tie-break resets exactly the losing side,
+    // whose admin event is evicted and decodes back into a re-emittable outbox
+    // publish that preserves the original embedded event id (the applier dedup
+    // key) and refuses to mint a rival genesis.
+    #[tokio::test]
+    async fn forked_admin_topic_eviction_reemits_with_preserved_event_id() {
+        let (_dir_a, storage_a) = test_storage();
+        let (_dir_b, storage_b) = test_storage();
+        let doc_a = tempfile::tempdir().expect("doc a");
+        let doc_b = tempfile::tempdir().expect("doc b");
+        let service_a = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(71).await,
+            storage_a,
+            doc_a.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("service a opens");
+        let service_b = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(72).await,
+            storage_b,
+            doc_b.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("service b opens");
+
+        let node_a = service_a.local_node_id().expect("node a id");
+        let node_b = service_b.local_node_id().expect("node b id");
+
+        let realm_id = RealmId::from_bytes([71; 32]);
+        let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let admin_target = AdminDocumentTarget::User { user_id };
+        let topic_id = target.sync_topic_id();
+
+        let event_a_id = Ulid::from_parts(0xA1, 1);
+        let event_b_id = Ulid::from_parts(0xB2, 2);
+        let admin_a = test_admin_event(
+            event_a_id,
+            admin_target.clone(),
+            &test_actor(1, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "from-a".into(),
+            },
+        );
+        let admin_b = test_admin_event(
+            event_b_id,
+            admin_target.clone(),
+            &test_actor(2, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "from-b".into(),
+            },
+        );
+
+        // Each side lists the other in its genesis peer set, so the loser is a
+        // member of the winner's topic after the reset.
+        let published_a = service_a
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(admin_a),
+                    allow_genesis: true,
+                }],
+                vec![node_b],
+            )
+            .await;
+        assert!(
+            matches!(published_a, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "service a publish: {published_a:?}"
+        );
+        let published_b = service_b
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(admin_b),
+                    allow_genesis: true,
+                }],
+                vec![node_a],
+            )
+            .await;
+        assert!(
+            matches!(published_b, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "service b publish: {published_b:?}"
+        );
+
+        let node_a_handle = service_a.node();
+        let node_b_handle = service_b.node();
+        let genesis_a = node_a_handle
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis;
+        let genesis_b = node_b_handle
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis;
+        assert_ne!(
+            genesis_a, genesis_b,
+            "the two nodes forked distinct genesis"
+        );
+
+        // The smaller genesis wins; the side holding the larger genesis loses.
+        let (
+            loser,
+            loser_node,
+            winner_node,
+            loser_event_id,
+            winner_genesis,
+            winner_peer,
+            loser_peer,
+        ) = if genesis_a > genesis_b {
+            (
+                &service_a,
+                &node_a_handle,
+                &node_b_handle,
+                event_a_id,
+                genesis_b,
+                node_id_to_peer_id(&node_b),
+                node_id_to_peer_id(&node_a),
+            )
+        } else {
+            (
+                &service_b,
+                &node_b_handle,
+                &node_a_handle,
+                event_b_id,
+                genesis_a,
+                node_id_to_peer_id(&node_a),
+                node_id_to_peer_id(&node_b),
+            )
+        };
+
+        let winner_ops =
+            irokle_crate::oplog::topological(winner_node.storage(), &topic_id).unwrap();
+        let loser_ops = irokle_crate::oplog::topological(loser_node.storage(), &topic_id).unwrap();
+
+        // The winner keeps its genesis and produces no eviction.
+        let (_winner_ack, winner_side) = winner_node
+            .receive_sync_data_from_evicting(
+                loser_peer,
+                SyncData {
+                    topic_id,
+                    ops: loser_ops,
+                },
+            )
+            .unwrap();
+        assert!(
+            winner_side.is_empty(),
+            "winner keeps its genesis; no eviction"
+        );
+
+        // The loser resets and evicts its own admin chain.
+        let (_loser_ack, evictions) = loser_node
+            .receive_sync_data_from_evicting(
+                winner_peer,
+                SyncData {
+                    topic_id,
+                    ops: winner_ops,
+                },
+            )
+            .unwrap();
+        assert_eq!(evictions.len(), 1, "exactly the loser side resets");
+
+        // Both sides now agree on the winning genesis.
+        assert_eq!(
+            loser_node
+                .storage()
+                .topic_state(&topic_id)
+                .unwrap()
+                .unwrap()
+                .genesis,
+            winner_genesis
+        );
+        assert_eq!(
+            winner_node
+                .storage()
+                .topic_state(&topic_id)
+                .unwrap()
+                .unwrap()
+                .genesis,
+            winner_genesis
+        );
+
+        // The evicted admin event re-emits with its original event id preserved
+        // and allow_genesis cleared.
+        let reemitted = loser.decode_eviction(evictions.into_iter().next().unwrap());
+        assert_eq!(reemitted.len(), 1);
+        let reemitted = &reemitted[0];
+        assert_eq!(&reemitted.target, &target);
+        assert!(
+            !reemitted.allow_genesis,
+            "re-emission must not mint a rival genesis"
+        );
+        assert!(
+            reemitted.event_id.is_none(),
+            "admin outbox re-emission uses the embedded admin event id"
+        );
+        match &reemitted.event {
+            DocumentSyncOutboxEvent::AdminOperation { event } => {
+                assert_eq!(
+                    event.event_id, loser_event_id,
+                    "embedded admin event id must survive for applier dedup"
+                );
+            }
+            other => panic!("expected an AdminOperation re-emission, got {other:?}"),
+        }
+    }
+
+    // Whole-document admin sync is refused by apply_upsert/apply_delete. If reconcile
+    // `?`-propagated that refusal the applied-ops cursor would never advance, so each
+    // reconcile would re-materialize the whole post-cursor history. The upsert/delete
+    // must be skipped while the admin operation on the same topic still applies.
+    #[tokio::test]
+    async fn reconcile_skips_whole_document_admin_sync_events() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(54).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let realm_id = RealmId::from_bytes([54u8; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_400, 1), realm_id);
+        let target = DocumentSyncTarget::User { user_id };
+        let topic_id = target.sync_topic_id();
+
+        let change = |kind| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::new(),
+                actor: service.local_node_id().expect("local node id"),
+                updated_at_ms: 1,
+            },
+            kind,
+        };
+        let actor = test_actor(8, user_id, realm_id);
+        let admin_event = test_admin_event(
+            Ulid::from_parts(1_401, 1),
+            AdminDocumentTarget::User { user_id },
+            &actor,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "Skip Survivor".to_string(),
+            },
+        );
+
+        // Two hostile whole-document ops (upsert then delete) precede a legitimate
+        // owner-authored admin operation on the same topic.
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        bytes: b"whole-document-admin-upsert".to_vec(),
+                        change: change(DocumentSyncChangeKind::Upsert),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Delete {
+                        event_id: Ulid::new(),
+                        target: target.clone(),
+                        change: change(DocumentSyncChangeKind::Delete),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(admin_event),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        // Reset the cursor so reconcile reprocesses every op as a fresh peer would.
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        // Reconcile completes despite the hostile whole-document ops.
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("reconcile skips whole-document admin sync instead of wedging");
+
+        // The admin operation on the same topic still applied.
+        assert!(result.targets.contains(&target));
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user materialized by the admin operation");
+        assert_eq!(
+            User::from_bytes(&stored_user).expect("user decodes").name,
+            "Skip Survivor"
+        );
+
+        // The cursor advanced past the hostile ops.
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past the hostile ops"
+        );
+
+        service.shutdown().await;
     }
 }

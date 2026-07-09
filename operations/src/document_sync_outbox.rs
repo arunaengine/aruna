@@ -4,9 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
-use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
@@ -48,8 +47,9 @@ pub fn new_outbox_record(
     target: DocumentSyncTarget,
     peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event)
+    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event, allow_genesis)
 }
 
 pub fn new_outbox_record_with_id(
@@ -58,6 +58,7 @@ pub fn new_outbox_record_with_id(
     target: DocumentSyncTarget,
     mut peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     crate::sync_placement::sort_node_ids(&mut peers);
     DocumentSyncOutboxRecord {
@@ -67,6 +68,7 @@ pub fn new_outbox_record_with_id(
         peers,
         event,
         updated_at: unix_timestamp_secs(),
+        allow_genesis,
     }
 }
 
@@ -97,6 +99,42 @@ pub fn write_outbox_effect_with_txn(
     }))
 }
 
+fn decode_outbox_record(bytes: &[u8]) -> Result<DocumentSyncOutboxRecord, postcard::Error> {
+    match postcard::from_bytes::<DocumentSyncOutboxRecord>(bytes) {
+        Ok(record) => Ok(record),
+        Err(_) => postcard::from_bytes::<LegacyDocumentSyncOutboxRecord>(bytes).map(Into::into),
+    }
+}
+
+/// Pre-`allow_genesis` mirror of [`DocumentSyncOutboxRecord`], used only to
+/// decode outbox rows persisted before that field existed. Keep field order
+/// identical to the historical layout.
+#[derive(serde::Deserialize)]
+struct LegacyDocumentSyncOutboxRecord {
+    outbox_id: Ulid,
+    node_id: NodeId,
+    target: DocumentSyncTarget,
+    peers: Vec<NodeId>,
+    event: DocumentSyncOutboxEvent,
+    updated_at: u64,
+}
+
+impl From<LegacyDocumentSyncOutboxRecord> for DocumentSyncOutboxRecord {
+    fn from(legacy: LegacyDocumentSyncOutboxRecord) -> Self {
+        Self {
+            outbox_id: legacy.outbox_id,
+            node_id: legacy.node_id,
+            target: legacy.target,
+            peers: legacy.peers,
+            event: legacy.event,
+            updated_at: legacy.updated_at,
+            // Before `allow_genesis` existed, outbox publishes could mint missing
+            // sync topic genesis. Preserve that behavior for already-queued work.
+            allow_genesis: true,
+        }
+    }
+}
+
 pub fn schedule_outbox_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainDocumentSyncOutbox,
@@ -117,7 +155,7 @@ pub async fn read_outbox_record(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(|error| error.to_string()))
+            .map(|bytes| decode_outbox_record(&bytes).map_err(|error| error.to_string()))
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
@@ -149,7 +187,7 @@ pub async fn read_outbox_records(
             let has_more = values.len() > limit;
             let mut records = Vec::with_capacity(values.len().min(limit));
             for (key, value) in values.into_iter().take(limit) {
-                match postcard::from_bytes(&value) {
+                match decode_outbox_record(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();
@@ -222,9 +260,9 @@ pub async fn restore_document_sync_outbox_timers(
 
     if has_records {
         let event = task_handle
-            .send_effect(schedule_outbox_drain_effect())
+            .schedule_timer_if_idle(TaskKey::DrainDocumentSyncOutbox, Duration::ZERO)
             .await;
-        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
+        if let TaskEvent::Error { message, .. } = event {
             warn!(message = %message, "Failed to restore document sync outbox timer");
         }
     }
@@ -237,6 +275,7 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
+    use aruna_core::handle::Handle;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -309,6 +348,69 @@ mod tests {
         }
     }
 
+    fn legacy_pre_allow_genesis_bytes(record: &DocumentSyncOutboxRecord) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct LegacyRecord {
+            outbox_id: Ulid,
+            node_id: NodeId,
+            target: DocumentSyncTarget,
+            peers: Vec<NodeId>,
+            event: DocumentSyncOutboxEvent,
+            updated_at: u64,
+        }
+
+        postcard::to_allocvec(&LegacyRecord {
+            outbox_id: record.outbox_id,
+            node_id: record.node_id,
+            target: record.target.clone(),
+            peers: record.peers.clone(),
+            event: record.event.clone(),
+            updated_at: record.updated_at,
+        })
+        .expect("legacy record serializes")
+    }
+
+    #[tokio::test]
+    async fn legacy_pre_allow_genesis_outbox_record_is_preserved() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let mut legacy = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![4, 5],
+                change: change(),
+            },
+            false,
+        );
+        legacy.outbox_id = Ulid::from_parts(3, 4);
+        legacy.updated_at = 42;
+        let key = outbox_key(&legacy).to_vec();
+        write_raw_outbox_record(
+            &storage,
+            key.clone(),
+            legacy_pre_allow_genesis_bytes(&legacy),
+        )
+        .await;
+
+        let mut expected = legacy;
+        expected.allow_genesis = true;
+        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+            .await
+            .expect("outbox read succeeds");
+
+        assert_eq!(batch.records, vec![(key.clone(), expected.clone())]);
+        assert!(!batch.has_more);
+        assert_eq!(
+            read_outbox_record(&storage, &key)
+                .await
+                .expect("legacy record was preserved"),
+            Some(expected)
+        );
+    }
+
     #[tokio::test]
     async fn malformed_outbox_record_is_deleted() {
         let dir = tempdir().expect("temp dir");
@@ -345,6 +447,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            false,
         );
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
         match storage
@@ -393,6 +496,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -412,12 +516,14 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
             postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
+        assert!(decoded.allow_genesis);
     }
 
     #[test]
@@ -429,6 +535,7 @@ mod tests {
             DocumentSyncOutboxEvent::Delete {
                 change: delete_change(),
             },
+            false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
         let decoded: DocumentSyncOutboxRecord =
@@ -443,8 +550,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
-        let right = new_outbox_record(node(1), target(), vec![node(2)], event);
+        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
+        let right = new_outbox_record(node(1), target(), vec![node(2)], event, false);
         let prefix = outbox_prefix(&left.event);
 
         assert_ne!(outbox_key(&left), outbox_key(&right));
@@ -458,7 +565,7 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
+        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(
             node(1),
@@ -467,6 +574,7 @@ mod tests {
             },
             vec![node(2)],
             event,
+            false,
         );
         newer.outbox_id = Ulid::from_parts(2, 0);
 
@@ -482,10 +590,16 @@ mod tests {
             target.clone(),
             Vec::new(),
             user_admin_event(user_id, 1),
+            false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
-        let mut later =
-            new_outbox_record(node(1), target, Vec::new(), user_admin_event(user_id, 2));
+        let mut later = new_outbox_record(
+            node(1),
+            target,
+            Vec::new(),
+            user_admin_event(user_id, 2),
+            false,
+        );
         later.outbox_id = Ulid::from_parts(1, 1);
 
         assert!(outbox_key(&earlier) < outbox_key(&later));

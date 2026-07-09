@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
+use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -45,7 +46,7 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
+use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -56,6 +57,9 @@ const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
+    // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
+    // a restarted node simply retries from the base interval.
+    retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
 }
 
 struct DrainSubBatch {
@@ -63,6 +67,23 @@ struct DrainSubBatch {
     documents: Vec<DocumentSyncPublish>,
     targets: Vec<DocumentSyncTarget>,
     record_keys: Vec<Vec<u8>>,
+}
+
+impl DrainSubBatch {
+    fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
+        let mut targets = Vec::with_capacity(indices.len());
+        let mut record_keys = Vec::with_capacity(indices.len());
+        for &index in indices {
+            targets.push(self.targets.get(index)?.clone());
+            record_keys.push(self.record_keys.get(index)?.clone());
+        }
+        Some(Self {
+            peers: self.peers.clone(),
+            documents: Vec::new(),
+            targets,
+            record_keys,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -77,6 +98,7 @@ fn document_publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentSyncTarget,
     event: DocumentSyncOutboxEvent,
+    allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
         DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
@@ -84,15 +106,19 @@ fn document_publish_from_outbox(
             target,
             bytes,
             change,
+            allow_genesis,
         },
         DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
             event_id,
             target,
             change,
+            allow_genesis,
         },
-        DocumentSyncOutboxEvent::AdminOperation { event } => {
-            DocumentSyncPublish::AdminOperation { target, event }
-        }
+        DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
+            target,
+            event,
+            allow_genesis,
+        },
     }
 }
 
@@ -107,7 +133,46 @@ impl DrainSyncOutcome {
 
 impl OperationsTaskHandler {
     fn new(context: Arc<DriverContext>) -> Self {
-        Self { context }
+        Self {
+            context,
+            retry_backoff: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Backoff interval for the next re-arm of `key`, derived from the in-memory
+    /// attempt count without mutating it.
+    fn backoff_after(&self, key: &TaskKey) -> Duration {
+        let attempts = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .get(key)
+            .copied()
+            .unwrap_or(0);
+        Duration::from_secs(timer_retry_after_secs(attempts))
+    }
+
+    fn note_retry_backoff(&self, key: &TaskKey) {
+        let mut backoff = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned");
+        let attempts = backoff.entry(key.clone()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+    }
+
+    fn reset_backoff(&self, key: &TaskKey) {
+        self.retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .remove(key);
+    }
+
+    /// Re-arms `key` at its current backoff interval and records the attempt.
+    async fn reschedule_with_backoff(&self, key: TaskKey) -> bool {
+        let after = self.backoff_after(&key);
+        self.note_retry_backoff(&key);
+        self.reschedule_timer(key, after).await
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
@@ -146,14 +211,15 @@ impl OperationsTaskHandler {
                 Ok(batch) if batch.records.is_empty() => {
                     if batch.has_more {
                         self.reschedule_timer(retry_key, Duration::ZERO).await;
+                    } else {
+                        self.reset_backoff(&retry_key);
                     }
                     return;
                 }
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(error = %error, "Failed to read document sync outbox record");
-                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                        .await;
+                    self.reschedule_with_backoff(retry_key).await;
                     return;
                 }
             };
@@ -167,16 +233,19 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                .await;
+            self.reschedule_with_backoff(retry_key).await;
             return;
         };
 
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record) in batch.records {
-            let document =
-                document_publish_from_outbox(record.outbox_id, record.target.clone(), record.event);
+            let document = document_publish_from_outbox(
+                record.outbox_id,
+                record.target.clone(),
+                record.event,
+                record.allow_genesis,
+            );
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();
             if subbatches
@@ -229,6 +298,31 @@ impl OperationsTaskHandler {
                 })) => {
                     awaiting_sync = Some(subbatch);
                 }
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                        published_indices,
+                        retry_indices,
+                        error,
+                    },
+                )) => {
+                    warn!(
+                        key = ?retry_key,
+                        published = published_indices.len(),
+                        retry = retry_indices.len(),
+                        error = %error,
+                        "Partially created local document sync batch"
+                    );
+                    totals.retry_needed = true;
+                    match subbatch.sync_subset(&published_indices) {
+                        Some(published_subbatch) if !published_subbatch.record_keys.is_empty() => {
+                            awaiting_sync = Some(published_subbatch);
+                        }
+                        Some(_) => {}
+                        None => {
+                            warn!(key = ?retry_key, "Invalid partial document publish indices");
+                        }
+                    }
+                }
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     error, ..
                 })) => {
@@ -271,11 +365,12 @@ impl OperationsTaskHandler {
         );
 
         if totals.retry_needed {
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                .await;
+            self.reschedule_with_backoff(retry_key).await;
         } else if batch.has_more {
             self.reschedule_timer(retry_key, std::time::Duration::ZERO)
                 .await;
+        } else {
+            self.reset_backoff(&retry_key);
         }
     }
 
@@ -632,17 +727,22 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
+                let retry_key = TaskKey::SyncPlacements { realm_id, node_id };
                 let op = ProcessPlacementsOperation::new(PlacementConfig {
                     realm_id,
                     local_node_id: node_id,
+                    retry_after: self.backoff_after(&retry_key),
                 });
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process pending sync placements timer event");
-                    self.reschedule_timer(
-                        TaskKey::SyncPlacements { realm_id, node_id },
-                        SYNC_PLACEMENT_RETRY_AFTER,
-                    )
-                    .await;
+                match drive(op, self.context.as_ref()).await {
+                    // The sweep re-armed itself for still-pending placements: grow the
+                    // backoff so a persistently unsatisfiable placement stops hot-looping.
+                    Ok(true) => self.note_retry_backoff(&retry_key),
+                    // A clean sweep clears the backoff for the next unrelated re-arm.
+                    Ok(false) => self.reset_backoff(&retry_key),
+                    Err(err) => {
+                        error!(error = ?err, "Failed to process pending sync placements timer event");
+                        self.reschedule_with_backoff(retry_key).await;
+                    }
                 }
             }
             TaskKey::SyncDocument {
@@ -840,15 +940,44 @@ mod tests {
                 bytes: vec![1, 2, 3],
                 change,
             },
+            true,
         );
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
+        assert!(publish.allow_genesis());
         assert!(matches!(
             publish,
             DocumentSyncPublish::Upsert { bytes, change: actual, .. }
                 if bytes == vec![1, 2, 3] && actual == change
         ));
+    }
+
+    #[test]
+    fn partial_publish_indices_select_exact_outbox_records() {
+        let duplicate_target = target();
+        let other_target = DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(7, 2),
+        };
+        let subbatch = DrainSubBatch {
+            peers: vec![node(2)],
+            documents: Vec::new(),
+            targets: vec![
+                duplicate_target.clone(),
+                other_target,
+                duplicate_target.clone(),
+            ],
+            record_keys: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+        };
+
+        let selected = subbatch
+            .sync_subset(&[2])
+            .expect("published index selects a record");
+
+        assert_eq!(selected.targets, vec![duplicate_target]);
+        assert_eq!(selected.record_keys, vec![b"third".to_vec()]);
+        assert!(selected.documents.is_empty());
+        assert!(subbatch.sync_subset(&[3]).is_none());
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(
@@ -881,12 +1010,56 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            false,
         );
         write_outbox_record(&storage, &record).await;
 
         let restored_key = restore_document_sync_outbox_timer_and_receive_key(&storage).await;
 
         assert_eq!(restored_key, TaskKey::DrainDocumentSyncOutbox);
+    }
+
+    #[tokio::test]
+    async fn restore_document_sync_outbox_timers_keeps_existing_backoff_timer() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"restore durable work".to_vec(),
+                change: change(),
+            },
+            false,
+        );
+        write_outbox_record(&storage, &record).await;
+
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(1);
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+            .await;
+        match task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::from_secs(3600),
+            }))
+            .await
+        {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            other => panic!("unexpected timer schedule event: {other:?}"),
+        }
+
+        restore_document_sync_outbox_timers(&storage, &task_handle).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+                .await
+                .is_err(),
+            "durable rearm must not replace an active backoff timer"
+        );
     }
 
     #[tokio::test]
@@ -910,6 +1083,7 @@ mod tests {
                 bytes: b"retained work".to_vec(),
                 change: change(),
             },
+            false,
         );
         let key = outbox_key(&record).to_vec();
 
@@ -955,6 +1129,7 @@ mod tests {
                 bytes: b"retry after restart".to_vec(),
                 change: change(),
             },
+            false,
         );
         let key = outbox_key(&record).to_vec();
         write_outbox_record(&storage, &record).await;

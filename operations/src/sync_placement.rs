@@ -158,12 +158,20 @@ pub fn delete_placement_effect(realm_id: RealmId, target: &DocumentSyncTarget) -
 }
 
 pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    schedule_placement_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
+}
+
+pub fn schedule_placement_retry_after(
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    after: Duration,
+) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::SyncPlacements {
             realm_id,
             node_id: local_node_id,
         },
-        after: SYNC_PLACEMENT_RETRY_AFTER,
+        after,
     })
 }
 
