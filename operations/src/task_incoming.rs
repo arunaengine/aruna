@@ -46,6 +46,7 @@ use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
     NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
     read_notification_outbox_batch, restore_notification_outbox_timer,
+    restore_notification_outbox_timer_if_idle,
 };
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
@@ -957,7 +958,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
-        restore_notification_outbox_timer(
+        restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
             &task_handle,
             NOTIFICATION_DELIVERY_RETRY_AFTER,

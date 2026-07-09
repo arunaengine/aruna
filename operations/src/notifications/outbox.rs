@@ -100,12 +100,29 @@ pub async fn delete_notification_outbox_records(
     }
 }
 
-// ShortenTimer, never ResetTimer: the 5s durable-queue re-arm loop calls this too,
-// and a ResetTimer there would clobber a pending 30s retry deadline back to `after`.
+// ShortenTimer, never ResetTimer: this path may wake earlier, but must not push
+// an existing retry deadline later.
 pub async fn restore_notification_outbox_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
     after: Duration,
+) {
+    restore_notification_outbox_timer_with(storage, task_handle, after, false).await;
+}
+
+pub async fn restore_notification_outbox_timer_if_idle(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    after: Duration,
+) {
+    restore_notification_outbox_timer_with(storage, task_handle, after, true).await;
+}
+
+async fn restore_notification_outbox_timer_with(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    after: Duration,
+    if_idle: bool,
 ) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
@@ -130,12 +147,20 @@ pub async fn restore_notification_outbox_timer(
     };
 
     if has_records {
-        let event = task_handle
-            .send_effect(Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::DrainNotificationOutbox,
-                after,
-            }))
-            .await;
+        let event = if if_idle {
+            Event::Task(
+                task_handle
+                    .schedule_timer_if_idle(TaskKey::DrainNotificationOutbox, after)
+                    .await,
+            )
+        } else {
+            task_handle
+                .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+                    key: TaskKey::DrainNotificationOutbox,
+                    after,
+                }))
+                .await
+        };
         if let Event::Task(TaskEvent::Error { message, .. }) = event {
             warn!(message = %message, "Failed to restore notification outbox timer");
         }
@@ -154,16 +179,34 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Semaphore, mpsc};
 
     struct RecordingHandler {
         seen: mpsc::Sender<TaskKey>,
+    }
+
+    struct BlockingHandler {
+        seen: mpsc::Sender<TaskKey>,
+        release: Arc<Semaphore>,
     }
 
     #[async_trait]
     impl InboundTaskHandler for RecordingHandler {
         async fn handle_timer(&self, key: TaskKey) {
             let _ = self.seen.send(key).await;
+        }
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for BlockingHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            let _ = self.seen.send(key).await;
+            let _permit = self
+                .release
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
         }
     }
 
@@ -347,6 +390,45 @@ mod tests {
         assert!(
             after <= Duration::from_secs(3600),
             "restore must ShortenTimer, not ResetTimer to the later deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_if_idle_does_not_refire_running_drain() {
+        let (_dir, storage) = temp_storage();
+        write_outbox(&storage, &outbox_record_with_id(Ulid::from_parts(1, 0))).await;
+        let task_handle = TaskHandle::new();
+        let (seen_tx, mut seen_rx) = mpsc::channel(2);
+        let release = Arc::new(Semaphore::new(0));
+        task_handle
+            .set_inbound_handler(Arc::new(BlockingHandler {
+                seen: seen_tx,
+                release: release.clone(),
+            }))
+            .await;
+
+        let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainNotificationOutbox,
+                after: Duration::ZERO,
+            }))
+            .await
+        else {
+            panic!("expected timer scheduled");
+        };
+        let first = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .expect("running drain should start")
+            .expect("handler should send first key");
+        assert_eq!(first, TaskKey::DrainNotificationOutbox);
+
+        restore_notification_outbox_timer_if_idle(&storage, &task_handle, Duration::ZERO).await;
+        release.add_permits(1);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), seen_rx.recv())
+                .await
+                .is_err()
         );
     }
 }
