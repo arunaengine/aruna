@@ -11,9 +11,9 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, KIND_LABEL_KEY, MetadataRegistryRecord, MetadataReplicationConfig,
-    NodePlacementEntry, OidcProviderConfig, PlacementOverride, PlacementStrategy, QuotaConfig,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+    Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, MetadataRegistryRecord,
+    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, PlacementOverride,
+    PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -1188,8 +1188,22 @@ pub fn realm_config_placement_override_path(subject: &[u8]) -> String {
 }
 
 pub fn binding_scope_key(scope: &BindingScope) -> String {
-    let scope = normalized_binding_scope(scope);
-    hex::encode(postcard::to_allocvec(&scope).expect("binding scope serializes"))
+    match scope {
+        BindingScope::Realm => "realm".to_string(),
+        BindingScope::Group(group_id) => format!("group:{group_id}"),
+        BindingScope::Class(class) => match class {
+            DocumentClass::Admin => "class:admin",
+            DocumentClass::Group => "class:group",
+            DocumentClass::User => "class:user",
+            DocumentClass::Metadata => "class:metadata",
+            DocumentClass::MetadataRegistry => "class:metadata_registry",
+        }
+        .to_string(),
+        BindingScope::MetadataPathPrefix(prefix) => format!(
+            "metadata_path_prefix:{}",
+            MetadataRegistryRecord::normalize_document_path(prefix)
+        ),
+    }
 }
 
 fn normalized_binding_scope(scope: &BindingScope) -> BindingScope {
@@ -1390,15 +1404,17 @@ mod tests {
         GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DEFAULT_STRATEGY_PATH,
         REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
         REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
-        group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-        group_role_user_assignment_path, metadata_replication_value, oidc_provider_value,
-        realm_config_node_id_from_path, realm_config_node_path,
-        realm_config_oidc_provider_id_from_path, realm_config_oidc_provider_path,
-        realm_config_placement_node_id_from_path, realm_config_placement_node_path,
-        realm_config_placement_strategy_id_from_path, realm_config_placement_strategy_path,
-        realm_config_strategy_binding_path, realm_discovery_value, realm_role_id_from_path,
-        realm_role_path, realm_role_user_assignment_from_path, realm_role_user_assignment_path,
-        role_definition_value, user_attribute_path, user_subject_id_path,
+        binding_scope_key, group_role_id_from_path, group_role_path,
+        group_role_user_assignment_from_path, group_role_user_assignment_path,
+        metadata_replication_value, oidc_provider_value, realm_config_node_id_from_path,
+        realm_config_node_path, realm_config_oidc_provider_id_from_path,
+        realm_config_oidc_provider_path, realm_config_placement_node_id_from_path,
+        realm_config_placement_node_path, realm_config_placement_strategy_id_from_path,
+        realm_config_placement_strategy_path, realm_config_strategy_binding_path,
+        realm_config_strategy_binding_scope_key_from_path, realm_discovery_value,
+        realm_role_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
+        realm_role_user_assignment_path, role_definition_value, user_attribute_path,
+        user_subject_id_path,
     };
     use crate::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
@@ -3369,6 +3385,53 @@ mod tests {
     }
 
     #[test]
+    fn binding_scope_keys_use_stable_canonical_text_and_parse_from_paths() {
+        let group_id = group_id();
+        let cases = [
+            (BindingScope::Realm, "realm".to_string()),
+            (BindingScope::Group(group_id), format!("group:{group_id}")),
+            (
+                BindingScope::Class(DocumentClass::Admin),
+                "class:admin".to_string(),
+            ),
+            (
+                BindingScope::Class(DocumentClass::Group),
+                "class:group".to_string(),
+            ),
+            (
+                BindingScope::Class(DocumentClass::User),
+                "class:user".to_string(),
+            ),
+            (
+                BindingScope::Class(DocumentClass::Metadata),
+                "class:metadata".to_string(),
+            ),
+            (
+                BindingScope::Class(DocumentClass::MetadataRegistry),
+                "class:metadata_registry".to_string(),
+            ),
+            (
+                BindingScope::MetadataPathPrefix(" /datasets/important/ ".to_string()),
+                "metadata_path_prefix:datasets/important".to_string(),
+            ),
+        ];
+
+        for (scope, expected_key) in cases {
+            assert_eq!(binding_scope_key(&scope), expected_key);
+
+            let path = realm_config_strategy_binding_path(&scope);
+            assert_eq!(
+                path,
+                format!("realm_config.placement.bindings.{expected_key}")
+            );
+            assert_eq!(
+                realm_config_strategy_binding_scope_key_from_path(&path),
+                Some(expected_key.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn realm_config_placement_entry_materializes() {
         let mut state = realm_config_state();
         let config_node = node(11);
@@ -3660,7 +3723,7 @@ mod tests {
             strategy_id: Ulid::from_bytes([4; 16]),
         };
         upsert_placement_strategy(&mut state, 9, 9, binding.strategy_id);
-        let scope_key = super::binding_scope_key(&scope);
+        let scope_key = binding_scope_key(&scope);
         let set_origin = node(1);
         let set = realm_config_event(
             1,
@@ -3713,8 +3776,8 @@ mod tests {
             scope: canonical_scope.clone(),
             strategy_id: binding.strategy_id,
         };
-        let canonical_scope_key = super::binding_scope_key(&canonical_scope);
-        let raw_scope_key = hex::encode(postcard::to_allocvec(&raw_scope).unwrap());
+        let canonical_scope_key = binding_scope_key(&canonical_scope);
+        let unnormalized_path = "realm_config.placement.bindings.metadata_path_prefix:/datasets/";
         let set_origin = node(1);
         let set = realm_config_event(
             1,
@@ -3734,11 +3797,7 @@ mod tests {
                 .user_subject_ids
                 .contains_key(&realm_config_strategy_binding_path(&canonical_scope))
         );
-        assert!(
-            !state
-                .user_subject_ids
-                .contains_key(&format!("realm_config.placement.bindings.{raw_scope_key}"))
-        );
+        assert!(!state.user_subject_ids.contains_key(unnormalized_path));
 
         let removal = realm_config_event(
             2,
