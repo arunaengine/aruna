@@ -461,13 +461,14 @@ fn overlay_realm_config_reducer_materialization(
         config.ensure_node(node_id, kind);
     }
 
-    if !reducer_state
-        .conflicts
+    if reducer_state
+        .user_subject_ids
         .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
-        && let Some(default_strategy_id) =
-            reducer_state.materialized_realm_config_default_strategy()
+        || reducer_state
+            .conflicts
+            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
     {
-        config.default_strategy_id = Some(default_strategy_id);
+        config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
     }
 
     let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
@@ -614,6 +615,7 @@ fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
 mod tests {
     use aruna_core::admin_document_reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
+        REALM_CONFIG_DEFAULT_STRATEGY_PATH,
     };
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
@@ -925,6 +927,56 @@ mod tests {
         assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
         assert_eq!(config.strategy_bindings, vec![binding]);
         assert_eq!(config.placement_overrides, vec![record]);
+    }
+
+    #[test]
+    fn overlay_clears_prior_default_strategy_on_reducer_conflict() {
+        let realm_id = RealmId::from_bytes([22; 32]);
+        let actor_a = actor(22, realm_id);
+        let actor_b = actor(23, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        let prior_default = Ulid::from_bytes([5; 16]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.default_strategy_id = Some(prior_default);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, Some(prior_default));
+
+        for (event_id, actor, strategy_id) in [
+            (
+                Ulid::from_bytes([6; 16]),
+                &actor_a,
+                Ulid::from_bytes([7; 16]),
+            ),
+            (
+                Ulid::from_bytes([8; 16]),
+                &actor_b,
+                Ulid::from_bytes([9; 16]),
+            ),
+        ] {
+            state
+                .apply(&AdminDocumentEvent {
+                    event_id,
+                    target: target.clone(),
+                    origin_node_id: actor.node_id,
+                    origin_seq: 1,
+                    observed: AdminDocumentClock::default(),
+                    actor: actor.clone(),
+                    op: AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                })
+                .unwrap();
+        }
+
+        assert!(
+            state
+                .conflicts
+                .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        );
+        assert_eq!(state.materialized_realm_config_default_strategy(), None);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, None);
     }
 
     #[test]

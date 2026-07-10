@@ -2492,13 +2492,14 @@ fn overlay_realm_config_reducer_materialization(
         config.quota = quota;
     }
 
-    if !reducer_state
-        .conflicts
+    if reducer_state
+        .user_subject_ids
         .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
-        && let Some(default_strategy_id) =
-            reducer_state.materialized_realm_config_default_strategy()
+        || reducer_state
+            .conflicts
+            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
     {
-        config.default_strategy_id = Some(default_strategy_id);
+        config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
     }
 
     for path in reducer_state.conflicts.keys() {
@@ -5341,6 +5342,55 @@ mod tests {
             reducer_state.materialized_realm_config_default_strategy(),
             Some(strategy.strategy_id)
         );
+    }
+
+    #[test]
+    fn realm_config_overlay_clears_prior_default_strategy_on_reducer_conflict() {
+        let realm_id = RealmId::from_bytes([73; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_520, 1), realm_id);
+        let actor_a = test_actor(35, user_id, realm_id);
+        let actor_b = test_actor(36, user_id, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        let prior_default = Ulid::from_parts(1_521, 1);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.default_strategy_id = Some(prior_default);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, Some(prior_default));
+
+        for (event_id, actor, strategy_id) in [
+            (
+                Ulid::from_parts(1_522, 1),
+                &actor_a,
+                Ulid::from_parts(1_523, 1),
+            ),
+            (
+                Ulid::from_parts(1_524, 1),
+                &actor_b,
+                Ulid::from_parts(1_525, 1),
+            ),
+        ] {
+            state
+                .apply(&test_admin_event(
+                    event_id,
+                    target.clone(),
+                    actor,
+                    1,
+                    AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                ))
+                .unwrap();
+        }
+
+        assert!(
+            state
+                .conflicts
+                .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        );
+        assert_eq!(state.materialized_realm_config_default_strategy(), None);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, None);
     }
 
     #[tokio::test]
