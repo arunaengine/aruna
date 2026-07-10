@@ -478,6 +478,8 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::NodeKindMismatch { .. },
         ) => ServerError::BadRequest,
+        BootstrapOnboardingFinalizeError::ReservedNodeLabel
+        | BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -584,7 +586,7 @@ fn wrap_realm_private_key(
 mod tests {
     use super::{
         ServerError, bootstrap_onboarding, create_onboarding_secret, list_onboarding_secrets,
-        revoke_onboarding_secret,
+        map_finalize_error, revoke_onboarding_secret,
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -603,6 +605,7 @@ mod tests {
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -709,6 +712,18 @@ mod tests {
         );
 
         (state, realm_id, node_id, user_id, net_handle, tempdir)
+    }
+
+    #[test]
+    fn placement_validation_errors_map_to_bad_request() {
+        assert!(matches!(
+            map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel),
+            ServerError::BadRequest
+        ));
+        assert!(matches!(
+            map_finalize_error(BootstrapOnboardingFinalizeError::NodeLocationTooLong),
+            ServerError::BadRequest
+        ));
     }
 
     #[tokio::test]

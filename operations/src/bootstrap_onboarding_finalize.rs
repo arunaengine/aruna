@@ -94,6 +94,8 @@ pub async fn bootstrap_onboarding_finalize(
     input: BootstrapOnboardingFinalizeInput,
     context: Arc<DriverContext>,
 ) -> Result<BootstrapOnboardingFinalizeOutput, BootstrapOnboardingFinalizeError> {
+    let placement_entry = build_joiner_placement_entry(&input)?;
+
     let reserved = drive(
         ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
             enrollment_id: input.enrollment_id,
@@ -108,7 +110,7 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
 
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
-    set_joiner_placement_entry(&input, context.as_ref()).await?;
+    set_joiner_placement_entry(&input, placement_entry, context.as_ref()).await?;
     process_pending_placements(&input, context.as_ref()).await?;
 
     let ticket = drive(
@@ -252,24 +254,31 @@ async fn ensure_realm_node_once(
     Ok(())
 }
 
-async fn set_joiner_placement_entry(
+fn build_joiner_placement_entry(
     input: &BootstrapOnboardingFinalizeInput,
-    context: &DriverContext,
-) -> Result<(), BootstrapOnboardingFinalizeError> {
+) -> Result<NodePlacementEntry, BootstrapOnboardingFinalizeError> {
     if input.node_labels.contains_key(KIND_LABEL_KEY) {
         return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel);
     }
     let (location, weight) =
         normalize_node_placement_input(input.node_location.as_deref(), input.node_weight)
             .map_err(|_| BootstrapOnboardingFinalizeError::NodeLocationTooLong)?;
-    let entry = NodePlacementEntry {
+
+    Ok(NodePlacementEntry {
         node_id: input.node_id,
         location,
         weight,
         full: false,
         draining: false,
         labels: input.node_labels.clone(),
-    };
+    })
+}
+
+async fn set_joiner_placement_entry(
+    input: &BootstrapOnboardingFinalizeInput,
+    entry: NodePlacementEntry,
+    context: &DriverContext,
+) -> Result<(), BootstrapOnboardingFinalizeError> {
     drive(
         SetNodePlacementOperation::new(SetNodePlacementConfig {
             actor: Actor {
@@ -486,6 +495,18 @@ mod tests {
             .expect("joiner placement entry set during finalize");
         assert_eq!(entry.location, location);
         assert_eq!(entry.weight, weight);
+    }
+
+    async fn assert_realm_excludes_node_and_placement(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+    ) {
+        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+            .await
+            .unwrap();
+        assert!(!document.has_node(node_id));
+        assert!(document.placement_entry(node_id).is_none());
     }
 
     async fn context_with_net(fixture: &FinalizeFixture) -> (Arc<DriverContext>, NetHandle) {
@@ -858,6 +879,16 @@ mod tests {
             result,
             Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel)
         );
+        assert_eq!(
+            read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
+            OnboardingSecretState::Available
+        );
+        assert_realm_excludes_node_and_placement(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -871,5 +902,15 @@ mod tests {
             result,
             Err(BootstrapOnboardingFinalizeError::NodeLocationTooLong)
         );
+        assert_eq!(
+            read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
+            OnboardingSecretState::Available
+        );
+        assert_realm_excludes_node_and_placement(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+        )
+        .await;
     }
 }
