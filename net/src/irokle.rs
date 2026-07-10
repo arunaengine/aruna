@@ -8202,12 +8202,12 @@ mod tests {
         );
 
         assert!(
-            apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change.clone())
+            apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change)
                 .await
                 .expect("upsert lifecycle applies")
         );
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change.clone())
+            !apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, change)
                 .await
                 .expect("equal upsert lifecycle is idempotent")
         );
@@ -8298,22 +8298,14 @@ mod tests {
             epoch: 9,
         };
         assert!(
-            apply_metadata_document_lifecycle_to_storage(
-                &storage,
-                &local_delete,
-                local_change.clone(),
-            )
-            .await
-            .expect("delete lifecycle applies")
+            apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, local_change,)
+                .await
+                .expect("delete lifecycle applies")
         );
         assert!(
-            !apply_metadata_document_lifecycle_to_storage(
-                &storage,
-                &local_delete,
-                local_change.clone(),
-            )
-            .await
-            .expect("equal delete lifecycle is idempotent")
+            !apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, local_change,)
+                .await
+                .expect("equal delete lifecycle is idempotent")
         );
 
         let stale_delete = metadata_delete_lifecycle(

@@ -484,7 +484,7 @@ fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigD
     );
 }
 
-fn sort_node_ids(nodes: &mut Vec<aruna_core::NodeId>) {
+fn sort_node_ids(nodes: &mut [aruna_core::NodeId]) {
     nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 }
 
