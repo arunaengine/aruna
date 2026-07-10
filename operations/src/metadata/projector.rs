@@ -45,8 +45,10 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
-use crate::placement::placement_ref_for_target;
-use crate::sync_placement::{complete_authoritative_holders, sort_node_ids};
+use crate::placement::{
+    PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
+};
+use crate::sync_placement::sort_node_ids;
 use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
@@ -726,21 +728,6 @@ fn expand_create_event_holders(
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
-
-    let Some(realm_config) = realm_config else {
-        if !holders.contains(&event.node_id) {
-            holders.push(event.node_id);
-        }
-        sort_node_ids(&mut holders);
-        event.record.holder_node_ids = holders;
-        return Ok(event);
-    };
-
-    let candidates = realm_config.sync_eligible_node_ids()?;
-    holders.retain(|node_id| candidates.contains(node_id));
-    if candidates.contains(&event.node_id) && !holders.contains(&event.node_id) {
-        holders.push(event.node_id);
-    }
     sort_node_ids(&mut holders);
 
     if local_node_id != Some(event.node_id) {
@@ -751,19 +738,14 @@ fn expand_create_event_holders(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let document_path = event.record.document_path.clone();
-    let desired_holder_count =
-        realm_config.metadata_replication_factor_for(event.record.group_id, Some(&document_path));
-
-    // Rank via the resolver over the realm config's placement map; labels for
-    // affinity are not needed for the default metadata strategy.
-    event.record.holder_node_ids = complete_authoritative_holders(
-        realm_config,
-        &target,
-        Some(&document_path),
-        &holders,
-        desired_holder_count,
-    );
+    let context = PlacementResolutionContext {
+        group_id: Some(event.record.group_id),
+        metadata_path: Some(event.record.document_path.as_str()),
+    };
+    event.record.holder_node_ids = realm_config
+        .and_then(|config| plan_target_placement(config, &target, context))
+        .map(|plan| plan.holders)
+        .unwrap_or_default();
     Ok(event)
 }
 
@@ -803,7 +785,14 @@ pub fn create_event_outbox_record(
     // metadata create/lifecycle envelope carries it (else the nil fallback).
     let placement = realm_config
         .map(|config| {
-            placement_ref_for_target(config, &target, Some(event.record.document_path.as_str()))
+            placement_ref_for_target(
+                config,
+                &target,
+                PlacementResolutionContext {
+                    group_id: Some(event.record.group_id),
+                    metadata_path: Some(event.record.document_path.as_str()),
+                },
+            )
         })
         .unwrap_or(aruna_core::structs::PlacementRef::NIL);
     let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
@@ -970,7 +959,7 @@ mod tests {
     use aruna_core::storage_entries::{
         metadata_create_event_write_entry, metadata_pending_projection_key,
     };
-    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -1229,6 +1218,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_strategy_replica_count_overrides_legacy_factor() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids = vec![node(1), node(4)];
+        let mut config = RealmConfigDocument::new(event.record.realm_id, Vec::new(), 4);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            name: "metadata-two".to_string(),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for candidate in [node(1), node(2), node(3), node(4)] {
+            config.ensure_node(candidate, RealmNodeKind::Server);
+        }
+
+        let expanded =
+            expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
+                .expect("holders resolve");
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let expected = plan_target_placement(
+            &config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(event.record.group_id),
+                metadata_path: Some(event.record.document_path.as_str()),
+            },
+        )
+        .expect("strategy resolves")
+        .holders;
+
+        assert_eq!(config.metadata_replication.default_replication_factor, 4);
+        assert_eq!(expanded.record.holder_node_ids, expected);
+        assert_eq!(expanded.record.holder_node_ids.len(), 2);
+    }
+
+    #[test]
     fn metadata_origin_excludes_user_node_from_holders() {
         let mut event = create_event();
         event.node_id = node(1);
@@ -1243,9 +1273,11 @@ mod tests {
         let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
             .expect("holders expand");
 
+        let mut actual = expanded.record.holder_node_ids;
+        sort_node_ids(&mut actual);
         let mut expected = vec![node(2), node(3), node(4)];
         sort_node_ids(&mut expected);
-        assert_eq!(expanded.record.holder_node_ids, expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1262,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_recipient_preserves_single_authoritative_holder() {
+    fn metadata_recipient_does_not_synthesize_origin_holder() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids.clear();
@@ -1271,7 +1303,7 @@ mod tests {
         let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
             .expect("holders normalize");
 
-        assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
+        assert!(expanded.record.holder_node_ids.is_empty());
     }
 
     #[test]

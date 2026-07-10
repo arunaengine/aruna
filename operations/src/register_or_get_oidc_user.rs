@@ -212,7 +212,7 @@ impl RegisterOrGetOidcUserOperation {
         let placement = self
             .realm_config
             .as_ref()
-            .map(|config| placement_ref_for_target(config, &document_target, None))
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let document_revision = initial_user_document_sync_change(&self.input.actor, placement);
         let mut reducer_state = AdminDocumentReducerState::new(admin_target);

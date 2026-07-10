@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::placement::rank_eligible_holders;
+use crate::placement::{PlacementResolutionContext, rank_eligible_holders};
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, missing_holder_count, new_placement,
     placement_prefix, placement_satisfied, schedule_placement_retry_after, sort_node_ids,
@@ -164,11 +164,15 @@ impl ProcessPlacementsOperation {
         let mut selected_holders = record.selected_holders;
         sort_node_ids(&mut selected_holders);
         let newly_selected: Vec<NodeId> = match self.realm_config.as_ref() {
-            Some(config) => rank_eligible_holders(config, &record.target, None)
-                .into_iter()
-                .filter(|node_id| !selected_holders.contains(node_id))
-                .take(missing_holder_count)
-                .collect(),
+            Some(config) => rank_eligible_holders(
+                config,
+                &record.target,
+                PlacementResolutionContext::default(),
+            )
+            .into_iter()
+            .filter(|node_id| !selected_holders.contains(node_id))
+            .take(missing_holder_count)
+            .collect(),
             None => Vec::new(),
         };
         let network_peers: Vec<NodeId> = newly_selected
@@ -195,11 +199,12 @@ impl ProcessPlacementsOperation {
         let allow_genesis = !matches!(&record.target, DocumentSyncTarget::NodeInfo { .. })
             && record.origin_node_id == self.config.local_node_id;
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document_with_peers(
+            AnnounceTopicOperation::new_for_document_with_peers_and_placement(
                 record.target.topic_id(),
                 self.config.local_node_id,
                 Some(record.target),
                 network_peers,
+                record.placement,
                 allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
@@ -617,13 +622,17 @@ mod tests {
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_config = Some(config_with(&[local, remote]));
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([7; 16]),
+            epoch: 4,
+        };
         operation.records = vec![new_placement(
             realm_id,
             target,
             node(9),
             2,
             Vec::new(),
-            PlacementRef::NIL,
+            placement,
         )];
 
         let effects = operation.emit_next_record();
@@ -631,7 +640,13 @@ mod tests {
         let current = operation.current.as_ref().expect("placement is active");
         assert!(current.newly_selected.contains(&local));
         assert!(current.newly_selected.contains(&remote));
-        assert_eq!(announce_outbox_record(effects, bytes).peers, vec![remote]);
+        let outbox = announce_outbox_record(effects, bytes);
+        assert_eq!(outbox.peers, vec![remote]);
+        let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } = outbox.event
+        else {
+            panic!("expected upsert outbox event");
+        };
+        assert_eq!(change.placement, placement);
     }
 
     fn placement_announce_allow_genesis(

@@ -31,6 +31,12 @@ pub struct PlacementView {
     pub nodes: Vec<ResolvedNode>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlacementResolutionContext<'a> {
+    pub group_id: Option<GroupId>,
+    pub metadata_path: Option<&'a str>,
+}
+
 /// Assembles one [`ResolvedNode`] per configured node with a parseable id.
 ///
 /// Placement fields come from the matching `placement_map` entry; unmapped
@@ -163,7 +169,7 @@ pub fn resolve_holders(
 pub fn strategy_for_target<'a>(
     config: &'a RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
 ) -> Option<(&'a PlacementStrategy, Option<&'a PlacementOverride>)> {
     let subject = subject_bytes(target);
     let override_ = config
@@ -171,7 +177,7 @@ pub fn strategy_for_target<'a>(
         .iter()
         .find(|over| over.subject == subject);
 
-    let strategy = match resolve_strategy(config, target, metadata_path, override_) {
+    let strategy = match resolve_strategy(config, target, context, override_) {
         Ok(Some(strategy)) => strategy,
         Ok(None) => config.strategies.first()?,
         Err(()) => return None,
@@ -342,7 +348,7 @@ fn group_id_of(target: &DocumentSyncTarget) -> Option<GroupId> {
 fn resolve_strategy<'a>(
     config: &'a RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
     override_: Option<&PlacementOverride>,
 ) -> Result<Option<&'a PlacementStrategy>, ()> {
     if let Some(id) = override_.and_then(|over| over.strategy_id) {
@@ -353,7 +359,7 @@ fn resolve_strategy<'a>(
     if matches!(
         class,
         DocumentClass::Metadata | DocumentClass::MetadataRegistry
-    ) && let Some(path) = metadata_path
+    ) && let Some(path) = context.metadata_path
     {
         let path = MetadataRegistryRecord::normalize_document_path(path);
         let best = config
@@ -372,7 +378,7 @@ fn resolve_strategy<'a>(
         }
     }
 
-    if let Some(group_id) = group_id_of(target)
+    if let Some(group_id) = context.group_id.or_else(|| group_id_of(target))
         && let Some(strategy) = binding_strategy(config, &BindingScope::Group(group_id))?
     {
         return Ok(Some(strategy));
@@ -856,10 +862,17 @@ mod tests {
         }];
 
         let winner = |config: &RealmConfigDocument| {
-            strategy_for_target(config, &target, path)
-                .unwrap()
-                .0
-                .strategy_id
+            strategy_for_target(
+                config,
+                &target,
+                PlacementResolutionContext {
+                    metadata_path: path,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0
+            .strategy_id
         };
 
         assert_eq!(winner(&config), sid(10)); // override
@@ -901,26 +914,34 @@ mod tests {
         config.strategies = vec![strat(10), strat(11)];
 
         config.default_strategy_id = Some(missing);
-        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+        let datasets = PlacementResolutionContext {
+            metadata_path: Some("datasets/x"),
+            ..Default::default()
+        };
+        assert!(strategy_for_target(&config, &target, datasets).is_none());
 
         config.default_strategy_id = Some(sid(11));
         config.strategy_bindings = vec![binding(
             BindingScope::MetadataPathPrefix("datasets".to_string()),
             99,
         )];
-        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+        assert!(strategy_for_target(&config, &target, datasets).is_none());
 
         config.strategy_bindings = vec![binding(BindingScope::Group(group_id), 99)];
-        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+        let other = PlacementResolutionContext {
+            metadata_path: Some("other/x"),
+            ..Default::default()
+        };
+        assert!(strategy_for_target(&config, &target, other).is_none());
 
         config.strategy_bindings = vec![binding(
             BindingScope::Class(DocumentClass::MetadataRegistry),
             99,
         )];
-        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+        assert!(strategy_for_target(&config, &target, other).is_none());
 
         config.strategy_bindings = vec![binding(BindingScope::Realm, 99)];
-        assert!(strategy_for_target(&config, &target, Some("other/x")).is_none());
+        assert!(strategy_for_target(&config, &target, other).is_none());
 
         config.strategy_bindings.clear();
         config.placement_overrides = vec![PlacementOverride {
@@ -929,12 +950,12 @@ mod tests {
             excluded: Vec::new(),
             strategy_id: Some(missing),
         }];
-        assert!(strategy_for_target(&config, &target, Some("datasets/x")).is_none());
+        assert!(strategy_for_target(&config, &target, datasets).is_none());
 
         config.placement_overrides.clear();
         config.default_strategy_id = None;
         assert_eq!(
-            strategy_for_target(&config, &target, Some("datasets/x"))
+            strategy_for_target(&config, &target, datasets)
                 .unwrap()
                 .0
                 .strategy_id,
@@ -963,15 +984,63 @@ mod tests {
         config.default_strategy_id = Some(sid(12));
 
         let strategy_id = |path: &str| {
-            strategy_for_target(&config, &target, Some(path))
-                .unwrap()
-                .0
-                .strategy_id
+            strategy_for_target(
+                &config,
+                &target,
+                PlacementResolutionContext {
+                    metadata_path: Some(path),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0
+            .strategy_id
         };
 
         assert_eq!(strategy_id("datasets"), sid(10));
         assert_eq!(strategy_id("/datasets/x"), sid(10));
         assert_eq!(strategy_id("datasets-private/x"), sid(11));
+    }
+
+    #[test]
+    fn metadata_lifecycle_uses_group_and_path_from_context() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = sid(2);
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: sid(3),
+        };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.strategies = vec![strat(10), strat(11), strat(12)];
+        config.strategy_bindings = vec![
+            binding(
+                BindingScope::MetadataPathPrefix("datasets/important".to_string()),
+                10,
+            ),
+            binding(BindingScope::Group(group_id), 11),
+        ];
+        config.default_strategy_id = Some(sid(12));
+        let context = PlacementResolutionContext {
+            group_id: Some(group_id),
+            metadata_path: Some("datasets/important/item"),
+        };
+
+        assert_eq!(
+            strategy_for_target(&config, &target, context)
+                .unwrap()
+                .0
+                .strategy_id,
+            sid(10)
+        );
+        config
+            .strategy_bindings
+            .retain(|binding| !matches!(&binding.scope, BindingScope::MetadataPathPrefix(_)));
+        assert_eq!(
+            strategy_for_target(&config, &target, context)
+                .unwrap()
+                .0
+                .strategy_id,
+            sid(11)
+        );
     }
 
     #[test]

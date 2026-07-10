@@ -36,7 +36,7 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
-use crate::placement::placement_ref_for_target;
+use crate::placement::{PlacementResolutionContext, placement_ref_for_target};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -47,9 +47,9 @@ pub struct DeleteMetadataDocumentOperation {
     lifecycle_record: Option<MetadataGraphLifecycleRecord>,
     document_lifecycle_record: Option<MetadataDocumentLifecycleRecord>,
     prune_job_record: Option<MetadataGraphPruneJobRecord>,
-    /// Placement reference for this document, resolved from the realm config so
-    /// every delete envelope carries the same reference as the create/update.
-    placement_ref: PlacementRef,
+    document_lifecycle_placement_ref: PlacementRef,
+    graph_lifecycle_placement_ref: PlacementRef,
+    registry_placement_ref: PlacementRef,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -112,7 +112,9 @@ impl DeleteMetadataDocumentOperation {
             lifecycle_record: None,
             document_lifecycle_record: None,
             prune_job_record: None,
-            placement_ref: PlacementRef::NIL,
+            document_lifecycle_placement_ref: PlacementRef::NIL,
+            graph_lifecycle_placement_ref: PlacementRef::NIL,
+            registry_placement_ref: PlacementRef::NIL,
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -170,7 +172,7 @@ impl DeleteMetadataDocumentOperation {
         let change = metadata_document_lifecycle_revision_change(
             lifecycle_record,
             self.actor.node_id,
-            self.placement_ref,
+            self.document_lifecycle_placement_ref,
         );
         // Delete tombstones are published by the document's holder onto its own
         // per-document sync topics; the graph-lifecycle topic in particular is
@@ -221,7 +223,7 @@ impl DeleteMetadataDocumentOperation {
                 updated_at_ms: lifecycle_record.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: self.placement_ref,
+            placement: self.graph_lifecycle_placement_ref,
         };
         let outbox = new_outbox_record_with_id(
             outbox_id,
@@ -259,7 +261,7 @@ impl DeleteMetadataDocumentOperation {
         let change = metadata_document_lifecycle_revision_change(
             lifecycle_record,
             self.actor.node_id,
-            self.placement_ref,
+            self.registry_placement_ref,
         );
         let outbox = new_outbox_record_with_id(
             lifecycle_record.event_id(),
@@ -356,14 +358,34 @@ impl Operation for DeleteMetadataDocumentOperation {
                     if let Some(bytes) = value {
                         match RealmConfigDocument::from_bytes(&bytes) {
                             Ok(config) => {
-                                let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+                                let context = PlacementResolutionContext {
+                                    group_id: Some(record.group_id),
+                                    metadata_path: Some(record.document_path.as_str()),
+                                };
+                                let document_lifecycle_target =
+                                    DocumentSyncTarget::MetadataDocumentLifecycle {
+                                        document_id: record.document_id,
+                                    };
+                                self.document_lifecycle_placement_ref = placement_ref_for_target(
+                                    &config,
+                                    &document_lifecycle_target,
+                                    context,
+                                );
+                                let graph_lifecycle_target =
+                                    DocumentSyncTarget::MetadataGraphLifecycle {
+                                        graph_iri: record.graph_iri.clone(),
+                                    };
+                                self.graph_lifecycle_placement_ref = placement_ref_for_target(
+                                    &config,
+                                    &graph_lifecycle_target,
+                                    context,
+                                );
+                                let registry_target = DocumentSyncTarget::MetadataRegistry {
+                                    group_id: record.group_id,
                                     document_id: record.document_id,
                                 };
-                                self.placement_ref = placement_ref_for_target(
-                                    &config,
-                                    &target,
-                                    Some(record.document_path.as_str()),
-                                );
+                                self.registry_placement_ref =
+                                    placement_ref_for_target(&config, &registry_target, context);
                             }
                             Err(error) => {
                                 return self
@@ -430,7 +452,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     match write_document_lifecycle_with_revision_effect(
                         document_lifecycle_record,
                         self.actor.node_id,
-                        self.placement_ref,
+                        self.document_lifecycle_placement_ref,
                         Some(txn_id),
                     ) {
                         Ok(effect) => smallvec![effect],
@@ -711,7 +733,9 @@ mod tests {
         METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     };
     use aruna_core::storage_entries::document_sync_revision_key;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{
+        BindingScope, DocumentClass, PlacementOverride, PlacementStrategy, RealmId, StrategyBinding,
+    };
 
     fn actor() -> aruna_core::structs::Actor {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -745,6 +769,13 @@ mod tests {
             updated_at_ms: 2,
             last_event_id,
         }
+    }
+
+    fn outbox_from_effects(effects: Effects) -> DocumentSyncOutboxRecord {
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected outbox write, got {effects:?}");
+        };
+        postcard::from_bytes(value.as_ref()).expect("outbox record decodes")
     }
 
     #[test]
@@ -782,6 +813,117 @@ mod tests {
         assert_eq!(event.event_id, outbox.outbox_id);
         assert_eq!(event.tombstone, tombstone);
         assert_eq!(event.deleted_after_event_id, record.last_event_id);
+    }
+
+    #[test]
+    fn delete_resolves_each_target_placement_reference_independently() {
+        let actor = actor();
+        let record = record(&actor);
+        let graph_target = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: record.graph_iri.clone(),
+        };
+        let strategy_ids = [
+            Ulid::from_bytes([1; 16]),
+            Ulid::from_bytes([2; 16]),
+            Ulid::from_bytes([3; 16]),
+        ];
+        let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
+        config.strategies = strategy_ids
+            .into_iter()
+            .map(|strategy_id| PlacementStrategy {
+                strategy_id,
+                name: strategy_id.to_string(),
+                replica_count: Some(1),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            })
+            .collect();
+        config.default_strategy_id = Some(strategy_ids[0]);
+        config.strategy_bindings = vec![
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::Metadata),
+                strategy_id: strategy_ids[0],
+            },
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                strategy_id: strategy_ids[2],
+            },
+        ];
+        config.placement_overrides = vec![PlacementOverride {
+            subject: crate::placement::subject_bytes(&graph_target),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(strategy_ids[1]),
+        }];
+        let mut operation = DeleteMetadataDocumentOperation::new(
+            actor.clone(),
+            record.group_id,
+            record.document_id,
+        );
+        let _ = operation.start();
+        let _ = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: crate::metadata::repository::metadata_registry_key(
+                record.group_id,
+                record.document_id,
+            ),
+            value: Some(postcard::to_allocvec(&record).unwrap().into()),
+        }));
+
+        let _ = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: Some(postcard::to_allocvec(&config).unwrap().into()),
+        }));
+
+        let expected = |strategy_id| PlacementRef {
+            strategy_id,
+            epoch: 0,
+        };
+        assert_eq!(
+            operation.document_lifecycle_placement_ref,
+            expected(strategy_ids[0])
+        );
+        assert_eq!(
+            operation.graph_lifecycle_placement_ref,
+            expected(strategy_ids[1])
+        );
+        assert_eq!(operation.registry_placement_ref, expected(strategy_ids[2]));
+
+        let document_outbox = operation
+            .document_lifecycle_outbox_record(&record)
+            .expect("document lifecycle outbox builds");
+        let graph_outbox = outbox_from_effects(
+            operation
+                .graph_lifecycle_outbox_effect(&record, Ulid::new())
+                .expect("graph lifecycle outbox builds"),
+        );
+        let registry_outbox = outbox_from_effects(
+            operation
+                .registry_delete_outbox_effect(&record, Ulid::new())
+                .expect("registry delete outbox builds"),
+        );
+        let DocumentSyncOutboxEvent::Upsert {
+            change: document_change,
+            ..
+        } = document_outbox.event
+        else {
+            panic!("expected document lifecycle upsert");
+        };
+        let DocumentSyncOutboxEvent::Upsert {
+            change: graph_change,
+            ..
+        } = graph_outbox.event
+        else {
+            panic!("expected graph lifecycle upsert");
+        };
+        let DocumentSyncOutboxEvent::Delete {
+            change: registry_change,
+        } = registry_outbox.event
+        else {
+            panic!("expected registry delete");
+        };
+        assert_eq!(document_change.placement, expected(strategy_ids[0]));
+        assert_eq!(graph_change.placement, expected(strategy_ids[1]));
+        assert_eq!(registry_change.placement, expected(strategy_ids[2]));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
 
-use crate::placement::rank_eligible_holders;
+use crate::placement::{PlacementResolutionContext, rank_eligible_holders};
 
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -24,7 +24,7 @@ pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub fn complete_authoritative_holders(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
     existing_holders: &[NodeId],
     desired_holder_count: usize,
 ) -> Vec<NodeId> {
@@ -35,7 +35,7 @@ pub fn complete_authoritative_holders(
     }
 
     let held: HashSet<NodeId> = holders.iter().copied().collect();
-    for candidate in rank_eligible_holders(config, target, metadata_path) {
+    for candidate in rank_eligible_holders(config, target, context) {
         if holders.len() >= desired_holder_count {
             break;
         }
@@ -195,7 +195,13 @@ mod tests {
         let existing = vec![node(1), node(3), node(3)];
         let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
 
-        let holders = complete_authoritative_holders(&config, &target(), None, &existing, 4);
+        let holders = complete_authoritative_holders(
+            &config,
+            &target(),
+            PlacementResolutionContext::default(),
+            &existing,
+            4,
+        );
 
         assert!(holders.contains(&node(1)));
         assert!(holders.contains(&node(3)));
@@ -207,10 +213,22 @@ mod tests {
         let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
         let existing = vec![node(2)];
 
-        let first = complete_authoritative_holders(&config, &target(), None, &existing, 3);
+        let first = complete_authoritative_holders(
+            &config,
+            &target(),
+            PlacementResolutionContext::default(),
+            &existing,
+            3,
+        );
         // A node observing the members in a different order derives the same set.
         let reversed = config_with(&[node(5), node(4), node(3), node(2), node(1)]);
-        let second = complete_authoritative_holders(&reversed, &target(), None, &existing, 3);
+        let second = complete_authoritative_holders(
+            &reversed,
+            &target(),
+            PlacementResolutionContext::default(),
+            &existing,
+            3,
+        );
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 3);

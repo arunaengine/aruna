@@ -49,6 +49,7 @@ pub struct AnnounceTopicOperation {
     local_node_id: NodeId,
     peers: Vec<NodeId>,
     document_bytes: Option<Vec<u8>>,
+    placement: PlacementRef,
     allow_genesis: bool,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
@@ -106,12 +107,31 @@ impl AnnounceTopicOperation {
         peers: Vec<NodeId>,
         allow_genesis: bool,
     ) -> Self {
+        Self::new_for_document_with_peers_and_placement(
+            topic,
+            local_node_id,
+            document,
+            peers,
+            PlacementRef::NIL,
+            allow_genesis,
+        )
+    }
+
+    pub fn new_for_document_with_peers_and_placement(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: Option<DocumentSyncTarget>,
+        peers: Vec<NodeId>,
+        placement: PlacementRef,
+        allow_genesis: bool,
+    ) -> Self {
         Self {
             topic,
             document,
             local_node_id,
             peers,
             document_bytes: None,
+            placement,
             allow_genesis,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
@@ -134,6 +154,7 @@ impl AnnounceTopicOperation {
             local_node_id,
             peers,
             document_bytes: Some(bytes),
+            placement: PlacementRef::NIL,
             allow_genesis,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
@@ -252,7 +273,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.updated_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
-                    placement: PlacementRef::NIL,
+                    placement: self.placement,
                 })
             }
             DocumentSyncTarget::MetadataCreateEvent {
@@ -276,7 +297,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.occurred_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
-                    placement: PlacementRef::NIL,
+                    placement: self.placement,
                 })
             }
             DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
@@ -291,7 +312,7 @@ impl AnnounceTopicOperation {
                 Ok(metadata_document_lifecycle_revision_change(
                     &record,
                     self.local_node_id,
-                    PlacementRef::NIL,
+                    self.placement,
                 ))
             }
             DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
@@ -312,7 +333,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: record.updated_at_ms,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
-                    placement: PlacementRef::NIL,
+                    placement: self.placement,
                 })
             }
             // Node usage snapshots, watch-interest digests, and node info/heartbeat
@@ -332,7 +353,7 @@ impl AnnounceTopicOperation {
                         updated_at_ms: now,
                     },
                     kind: DocumentSyncChangeKind::Upsert,
-                    placement: PlacementRef::NIL,
+                    placement: self.placement,
                 })
             }
         }
@@ -557,6 +578,48 @@ mod tests {
             assert_eq!(actual, bytes);
             assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
         }
+    }
+
+    #[test]
+    fn placement_aware_announce_stamps_resolved_reference() {
+        let local_node_id = local_node_id();
+        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:placed-announce".to_string(),
+            RealmId::from_bytes([2u8; 32]),
+            GroupId::new(),
+            Ulid::new(),
+            42,
+        );
+        let document = DocumentSyncTarget::MetadataGraphLifecycle {
+            graph_iri: lifecycle.graph_iri.clone(),
+        };
+        let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([8; 16]),
+            epoch: 3,
+        };
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_placement(
+            document.topic_id(),
+            local_node_id,
+            Some(document),
+            Vec::new(),
+            placement,
+            true,
+        );
+
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(bytes.into()),
+        }));
+        let record = written_outbox_record(effects.as_slice());
+        let DocumentSyncOutboxEvent::Upsert { change, .. } = record.event else {
+            panic!("expected revisioned upsert");
+        };
+        assert_eq!(change.placement, placement);
     }
 
     #[test]

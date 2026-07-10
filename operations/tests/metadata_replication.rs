@@ -227,6 +227,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([43u8; 32]);
     let nodes = vec![spawn_node(realm_id).await?];
+    install_realm_config(&nodes, &realm_id).await?;
     let node = &nodes[0];
     let group_id = Ulid::new();
     let mut events = Vec::new();

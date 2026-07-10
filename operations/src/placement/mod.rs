@@ -8,8 +8,8 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument};
 
 pub use resolver::{
-    PlacementView, ResolvedNode, build_view, document_class, resolve_holders, strategy_for_target,
-    subject_bytes,
+    PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
+    resolve_holders, strategy_for_target, subject_bytes,
 };
 
 /// Placement reference stamped into a change's sync envelope for `target`.
@@ -21,9 +21,9 @@ pub use resolver::{
 pub fn placement_ref_for_target(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
 ) -> PlacementRef {
-    match strategy_for_target(config, target, metadata_path) {
+    match strategy_for_target(config, target, context) {
         Some((strategy, _)) => PlacementRef {
             strategy_id: strategy.strategy_id,
             epoch: 0,
@@ -46,9 +46,9 @@ pub struct TargetPlacementPlan {
 pub fn plan_target_placement(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
 ) -> Option<TargetPlacementPlan> {
-    let (strategy, override_) = strategy_for_target(config, target, metadata_path)?;
+    let (strategy, override_) = strategy_for_target(config, target, context)?;
     let view = build_view(config);
     let holders = resolve_holders(&view, strategy, &subject_bytes(target), 0, override_);
     let desired_count = match strategy.replica_count {
@@ -71,9 +71,9 @@ pub fn plan_target_placement(
 pub fn rank_eligible_holders(
     config: &RealmConfigDocument,
     target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
+    context: PlacementResolutionContext<'_>,
 ) -> Vec<NodeId> {
-    let Some((strategy, override_)) = strategy_for_target(config, target, metadata_path) else {
+    let Some((strategy, override_)) = strategy_for_target(config, target, context) else {
         return Vec::new();
     };
     let mut uncapped = strategy.clone();

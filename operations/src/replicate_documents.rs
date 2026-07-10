@@ -13,7 +13,9 @@ use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::placement::{placement_ref_for_target, plan_target_placement};
+use crate::placement::{
+    PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
+};
 use crate::sync_placement::{
     delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
     write_placement_effect,
@@ -152,7 +154,11 @@ impl ReplicateDocumentsOperation {
         };
         // Placement plan for the document's bound strategy. `None` means the
         // realm has no strategy for this target (skip, like the old zero-replica case).
-        let Some(plan) = plan_target_placement(realm_config, &document, None) else {
+        let Some(plan) = plan_target_placement(
+            realm_config,
+            &document,
+            PlacementResolutionContext::default(),
+        ) else {
             return self.emit_next_publish();
         };
         let desired_count = plan.desired_count;
@@ -200,11 +206,12 @@ impl ReplicateDocumentsOperation {
 
         self.state = ReplicateDocumentsState::Publish;
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document_with_peers(
+            AnnounceTopicOperation::new_for_document_with_peers_and_placement(
                 document.topic_id(),
                 self.config.local_node_id,
                 Some(document),
                 network_peers,
+                placement,
                 self.config.allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
@@ -245,7 +252,11 @@ impl ReplicateDocumentsOperation {
         };
         warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
         let (desired_count, selected_holders, placement) = match self.realm_config.as_ref() {
-            Some(realm_config) => match plan_target_placement(realm_config, &target, None) {
+            Some(realm_config) => match plan_target_placement(
+                realm_config,
+                &target,
+                PlacementResolutionContext::default(),
+            ) {
                 Some(plan) => (
                     plan.desired_count.max(1),
                     plan.holders
@@ -257,7 +268,11 @@ impl ReplicateDocumentsOperation {
                 None => (
                     1,
                     Vec::new(),
-                    placement_ref_for_target(realm_config, &target, None),
+                    placement_ref_for_target(
+                        realm_config,
+                        &target,
+                        PlacementResolutionContext::default(),
+                    ),
                 ),
             },
             None => (1, Vec::new(), aruna_core::structs::PlacementRef::NIL),
@@ -548,9 +563,10 @@ mod tests {
         let origin = node(1);
         let target = node_info_target(realm_id, origin);
         let config = config_with(&[node(2), node(3), node(4)], Some(3));
-        let mut expected_holders = plan_target_placement(&config, &target, None)
-            .expect("placement plan")
-            .holders;
+        let mut expected_holders =
+            plan_target_placement(&config, &target, PlacementResolutionContext::default())
+                .expect("placement plan")
+                .holders;
         crate::sync_placement::sort_node_ids(&mut expected_holders);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -603,9 +619,10 @@ mod tests {
                 labels: BTreeMap::new(),
             },
         ];
-        let mut expected_holders = plan_target_placement(&config, &target, None)
-            .expect("placement plan")
-            .holders;
+        let mut expected_holders =
+            plan_target_placement(&config, &target, PlacementResolutionContext::default())
+                .expect("placement plan")
+                .holders;
         crate::sync_placement::sort_node_ids(&mut expected_holders);
         assert!(expected_holders.contains(&origin));
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -713,10 +730,12 @@ mod tests {
             postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
         assert_eq!(outbox.target, target);
         assert!(outbox.peers.is_empty());
-        assert!(matches!(
-            outbox.event,
-            aruna_core::document::DocumentSyncOutboxEvent::Upsert { .. }
-        ));
+        let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } = outbox.event
+        else {
+            panic!("expected upsert outbox event");
+        };
+        assert_eq!(change.placement, record.placement);
+        assert_ne!(change.placement, aruna_core::structs::PlacementRef::NIL);
     }
 
     #[test]

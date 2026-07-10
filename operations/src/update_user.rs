@@ -350,7 +350,7 @@ impl UpdateUserOperation {
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
             .transpose()?
-            .map(|config| placement_ref_for_target(&config, &document_target, None))
+            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
             .unwrap_or(PlacementRef::NIL);
         let document_revision = local_user_document_sync_change(
             previous_document_revision.as_ref(),
