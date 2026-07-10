@@ -188,9 +188,10 @@ impl ProcessPlacementsOperation {
         }
 
         self.state = PlacementState::Publish;
-        // Only the placement's authoritative origin may mint the document's topic
-        // genesis; a replica-holder node re-publishing waits for it to replicate in.
-        let allow_genesis = record.authoritative_node_id == self.config.local_node_id;
+        // NodeInfo genesis is reserved for the explicit core-document bootstrap;
+        // ordinary documents retain authority-derived genesis on placement retry.
+        let allow_genesis = !matches!(&record.target, DocumentSyncTarget::NodeInfo { .. })
+            && record.authoritative_node_id == self.config.local_node_id;
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document_with_peers(
                 record.target.topic_id(),
@@ -619,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn announce_allow_genesis_tracks_authoritative_origin() {
+    fn ordinary_document_retry_allow_genesis_tracks_authoritative_origin() {
         let local = node(1);
         let (target, bytes) = graph_lifecycle_fixture();
         assert!(
@@ -629,6 +630,21 @@ mod tests {
         assert!(
             !placement_announce_allow_genesis(node(9), local, target, bytes),
             "replica-holder (authoritative != local) must not mint genesis"
+        );
+    }
+
+    #[test]
+    fn node_info_authoritative_retry_disallows_genesis() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let local = node(1);
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id,
+            node_id: local,
+        };
+
+        assert!(
+            !placement_announce_allow_genesis(local, local, target, b"node info".to_vec()),
+            "NodeInfo retries must not mint shared-topic genesis"
         );
     }
 }

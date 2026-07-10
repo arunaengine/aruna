@@ -97,7 +97,9 @@ async fn replicate_node_info(
             local_node_id: node_id,
             excluded_peers: Vec::new(),
             documents: vec![DocumentSyncTarget::NodeInfo { realm_id, node_id }],
-            allow_genesis: true,
+            // Shared-topic genesis is bootstrapped by announce_core_documents;
+            // startup seeds and periodic heartbeats only publish into it.
+            allow_genesis: false,
         }),
         ctx,
     )
@@ -278,14 +280,18 @@ mod tests {
         assert_eq!(stored.utilization.documents_held, 0);
 
         let outbox = read_outbox(&ctx).await;
-        assert!(outbox.iter().any(|record| matches!(
-            &record.event,
-            DocumentSyncOutboxEvent::Upsert { .. }
-        ) && record.target
-            == DocumentSyncTarget::NodeInfo {
-                realm_id,
-                node_id: local
-            }));
+        let record = outbox
+            .iter()
+            .find(|record| {
+                matches!(&record.event, DocumentSyncOutboxEvent::Upsert { .. })
+                    && record.target
+                        == DocumentSyncTarget::NodeInfo {
+                            realm_id,
+                            node_id: local,
+                        }
+            })
+            .expect("node info upsert queued");
+        assert!(!record.allow_genesis);
     }
 
     #[tokio::test]
@@ -325,6 +331,20 @@ mod tests {
         assert_eq!(second.labels, labels);
         assert!(second.updated_at_ms >= first.updated_at_ms);
         assert!(second.utilization.heartbeat_at_ms >= first.utilization.heartbeat_at_ms);
+
+        let node_info_records: Vec<_> = read_outbox(&ctx)
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.target
+                    == DocumentSyncTarget::NodeInfo {
+                        realm_id,
+                        node_id: local,
+                    }
+            })
+            .collect();
+        assert_eq!(node_info_records.len(), 2);
+        assert!(node_info_records.iter().all(|record| !record.allow_genesis));
     }
 
     #[tokio::test]
