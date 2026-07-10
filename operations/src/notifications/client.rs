@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::NotificationRecord;
+use aruna_core::structs::{NotificationRecord, WatchEvent, WatchEventMask, WatchSubscription};
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -113,6 +113,85 @@ pub async fn mark_read_remote(
     .await?
     {
         NotificationTransportMessage::MarkReadResult { marked } => Ok(marked),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn create_watch_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+) -> Result<WatchSubscription, String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::CreateWatch {
+            owner,
+            path_prefix,
+            event_mask,
+        },
+    )
+    .await?
+    {
+        NotificationTransportMessage::WatchCreated { subscription } => Ok(subscription),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn delete_watch_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::DeleteWatch { owner, watch_id },
+    )
+    .await?
+    {
+        NotificationTransportMessage::WatchDeleted => Ok(()),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn deliver_watch_events_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    events: Vec<WatchEvent>,
+) -> Result<u32, String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::DeliverWatchEvents { events },
+    )
+    .await?
+    {
+        NotificationTransportMessage::WatchEventsAck { written } => Ok(written),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
+pub async fn list_watches_remote(
+    net_handle: &NetHandle,
+    holder: NodeId,
+    owner: UserId,
+) -> Result<Vec<WatchSubscription>, String> {
+    match send_notification_request(
+        net_handle,
+        holder,
+        NotificationTransportMessage::ListWatches { owner },
+    )
+    .await?
+    {
+        NotificationTransportMessage::WatchList { subscriptions } => Ok(subscriptions),
         NotificationTransportMessage::Reject(reason) => Err(reason),
         _ => Err("unexpected notification response".to_string()),
     }

@@ -15,11 +15,15 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
+    AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
+    WatchEventKind, blob_bucket_permission_path, data_watch_resource_path,
 };
+use aruna_core::types::UserId;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -318,8 +322,39 @@ impl ArunaS3Service {
         }
     }
 
+    /// Post-commit, best-effort resource-watch emission for a committed object
+    /// write. A failed emission only warns and never affects the already-successful
+    /// upload.
+    async fn emit_data_uploaded_watch(
+        &self,
+        actor: UserId,
+        group_id: ulid::Ulid,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+    ) {
+        let path = data_watch_resource_path(group_id, self.node_id, &bucket, &key);
+        let event = WatchEvent {
+            event_id: ulid::Ulid::new(),
+            realm_id: self.realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path,
+            actor,
+            occurred_at_ms: unix_timestamp_millis(),
+            detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id: self.node_id,
+                bucket,
+                key,
+                size_bytes,
+            },
+        };
+        emit_resource_watch_event(self.state.as_ref(), event).await;
+    }
+
     async fn complete_multipart_upload_response(
         &self,
+        group_id: ulid::Ulid,
         bucket: String,
         key: String,
         checksum_request: &UploadChecksumRequest,
@@ -346,6 +381,10 @@ impl ArunaS3Service {
             s3_checksum_type_from_multipart(result.checksum_type),
         ));
 
+        let watch_actor = replication_auth.user_id;
+        let watch_bucket = replication_bucket.clone();
+        let watch_key = replication_key.clone();
+        let watch_size = result.location.blob_size;
         self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
@@ -354,6 +393,8 @@ impl ArunaS3Service {
             false,
         )
         .await;
+        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
+            .await;
 
         Ok(S3Response::new(output))
     }
@@ -362,6 +403,7 @@ impl ArunaS3Service {
         &self,
         checksum_request: &UploadChecksumRequest,
         replication_auth: AuthContext,
+        group_id: ulid::Ulid,
         replication_bucket: String,
         replication_key: String,
         result: PutObjectResult,
@@ -382,6 +424,10 @@ impl ArunaS3Service {
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
         ));
+        let watch_actor = replication_auth.user_id;
+        let watch_bucket = replication_bucket.clone();
+        let watch_key = replication_key.clone();
+        let watch_size = result.location.blob_size;
         self.queue_live_version_replication(
             replication_auth,
             replication_bucket,
@@ -390,6 +436,8 @@ impl ArunaS3Service {
             false,
         )
         .await;
+        self.emit_data_uploaded_watch(watch_actor, group_id, watch_bucket, watch_key, watch_size)
+            .await;
 
         Ok(S3Response::new(output))
     }
@@ -896,6 +944,7 @@ impl S3 for ArunaS3Service {
         self.put_object_response(
             &checksum_request,
             replication_auth,
+            group_id,
             replication_bucket,
             replication_key,
             result,
@@ -1067,6 +1116,7 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to complete multipart upload"))?;
 
         self.complete_multipart_upload_response(
+            group_id,
             req.input.bucket,
             req.input.key,
             &checksum_request,
@@ -1398,15 +1448,20 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
-        BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-        PortableSourceDescriptor, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
+        Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
+        GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
+        PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+        WatchEventMask, WatchInterestEntry, WatchInterestTable,
     };
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::notifications::watch::subscriptions::create_watch_subscription;
     use aruna_operations::replication::queue::{
         LiveReplicationObligationRecord, live_replication_obligation_key,
     };
@@ -1489,6 +1544,7 @@ mod tests {
             .put_object_response(
                 &checksum_request,
                 auth,
+                Ulid::new(),
                 bucket.clone(),
                 key,
                 PutObjectResult {
@@ -1510,6 +1566,251 @@ mod tests {
             .is_some(),
             "durable obligation should remain repairable when queue kick fails"
         );
+    }
+
+    async fn build_watch_context(
+        realm_id: RealmId,
+        secret: [u8; 32],
+    ) -> (TempDir, Arc<DriverContext>, NetHandle) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.ensure_node(net.node_id(), RealmNodeKind::Server);
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        write_storage_value(
+            &storage_handle,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            realm_config.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        (storage_dir, context, net)
+    }
+
+    fn data_uploaded_interest(
+        realm_id: RealmId,
+        holder: NodeId,
+        path_prefix: String,
+    ) -> WatchInterestTable {
+        let mut table = WatchInterestTable::default();
+        table.insert(
+            realm_id,
+            holder,
+            vec![WatchInterestEntry {
+                path_prefix,
+                event_mask: WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            }],
+        );
+        table
+    }
+
+    async fn install_watch_authorization(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        group_id: Ulid,
+        watcher: UserId,
+    ) {
+        let actor = Actor {
+            node_id,
+            user_id: watcher,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(watcher, realm_id, group_id);
+        write_storage_value(
+            &context.storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            realm_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &context.storage_handle,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    async fn read_watch_inbox_rows(context: &DriverContext) -> Vec<NotificationRecord> {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1024,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| NotificationRecord::from_bytes(&value).unwrap())
+                .collect(),
+            other => panic!("unexpected inbox iter event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_object_immediately_expands_watch_event_for_local_holder() {
+        let realm_id = RealmId([41u8; 32]);
+        let (_storage_dir, context, net) = build_watch_context(realm_id, [41u8; 32]).await;
+        let holder = net.node_id();
+
+        let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let watcher = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+        let watch_prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
+        net.replace_watch_interest(data_uploaded_interest(
+            realm_id,
+            holder,
+            watch_prefix.clone(),
+        ));
+        install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
+        create_watch_subscription(
+            &context.storage_handle,
+            watcher,
+            watch_prefix,
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            0,
+        )
+        .await
+        .expect("watch subscription creates");
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        };
+        let checksum_request = UploadChecksumRequest {
+            expected: Vec::new(),
+            response_algorithm: None,
+            checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        };
+
+        service
+            .put_object_response(
+                &checksum_request,
+                auth,
+                group_id,
+                "bucket".to_string(),
+                "object".to_string(),
+                PutObjectResult {
+                    location: response_location(user_id),
+                    version_id: Ulid::new(),
+                },
+            )
+            .await
+            .expect("committed PUT response should succeed");
+
+        let rows = read_watch_inbox_rows(context.as_ref()).await;
+        assert_eq!(rows.len(), 1, "the local holder expands immediately");
+        let record = &rows[0];
+        assert_eq!(record.recipient, watcher);
+        assert_eq!(record.class, NotificationClass::Transient);
+        match &record.kind {
+            NotificationKind::DataUploaded {
+                path,
+                group_id: event_group_id,
+                node_id: event_node_id,
+                bucket,
+                key,
+                size_bytes,
+                actor_user_id,
+            } => {
+                assert_eq!(
+                    path,
+                    &data_watch_resource_path(group_id, net.node_id(), "bucket", "object")
+                );
+                assert_eq!(*event_group_id, group_id);
+                assert_eq!(*event_node_id, net.node_id());
+                assert_eq!(bucket, "bucket");
+                assert_eq!(key, "object");
+                // response_location reports a 2-byte blob.
+                assert_eq!(*size_bytes, 2);
+                assert_eq!(*actor_user_id, user_id);
+            }
+            other => panic!("unexpected notification kind: {other:?}"),
+        }
+
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn put_object_with_anonymous_actor_emits_no_watch_event() {
+        let realm_id = RealmId([42u8; 32]);
+        let (_storage_dir, context, net) = build_watch_context(realm_id, [42u8; 32]).await;
+        let holder = net.node_id();
+        net.replace_watch_interest(data_uploaded_interest(
+            realm_id,
+            holder,
+            data_watch_resource_path(Ulid::new(), net.node_id(), "bucket", ""),
+        ));
+
+        let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
+        let anonymous = UserId::nil(realm_id);
+        let group_id = Ulid::new();
+        let auth = AuthContext {
+            user_id: anonymous,
+            realm_id,
+            path_restrictions: None,
+        };
+        let checksum_request = UploadChecksumRequest {
+            expected: Vec::new(),
+            response_algorithm: None,
+            checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        };
+
+        service
+            .put_object_response(
+                &checksum_request,
+                auth,
+                group_id,
+                "bucket".to_string(),
+                "object".to_string(),
+                PutObjectResult {
+                    location: response_location(anonymous),
+                    version_id: Ulid::new(),
+                },
+            )
+            .await
+            .expect("committed PUT response should succeed");
+
+        assert!(
+            read_watch_inbox_rows(context.as_ref()).await.is_empty(),
+            "an anonymous actor must not emit a watch event"
+        );
+
+        net.shutdown().await;
     }
 
     #[tokio::test]

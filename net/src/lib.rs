@@ -10,6 +10,7 @@ pub mod error;
 pub mod streams;
 mod telemetry;
 
+use std::collections::HashMap;
 use std::mem;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,9 +31,10 @@ use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
-    realm_endpoint_announcement_signing_bytes,
+    RealmConfigDocument, RealmEndpointAnnouncement, RealmId, WatchInterestEntry,
+    WatchInterestTable, realm_endpoint_announcement_signing_bytes,
 };
+use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
@@ -42,7 +44,7 @@ use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
@@ -55,6 +57,7 @@ pub use error::{NetError, Result};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
+const NOTIFICATION_WAKE_CAPACITY: usize = 256;
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
 
@@ -390,6 +393,8 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    watch_interest: Arc<RwLock<WatchInterestTable>>,
+    notification_wakes: broadcast::Sender<UserId>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     document_sync: Arc<DocumentSyncService>,
@@ -511,6 +516,8 @@ impl NetHandle {
             .await?
             .unwrap_or_default();
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
+        let (notification_wakes, _) = broadcast::channel(NOTIFICATION_WAKE_CAPACITY);
         let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
             &realm_peer_nodes,
@@ -780,6 +787,8 @@ impl NetHandle {
             discovery_method,
             relay_method,
             realm_peers,
+            watch_interest,
+            notification_wakes,
             dht_signed_authorized_nodes,
             dht,
             document_sync,
@@ -967,6 +976,41 @@ impl NetHandle {
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {
         self.inner.realm_peers.read().clone()
+    }
+
+    /// Cheap clone of the origin-side watch interest cache. Consumers match
+    /// events against this table without any per-event storage read.
+    pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
+        self.inner.watch_interest.read().clone()
+    }
+
+    /// Replaces the whole watch interest cache (startup and full rebuilds).
+    pub fn replace_watch_interest(&self, table: WatchInterestTable) {
+        *self.inner.watch_interest.write() = table;
+    }
+
+    /// Subscribes to the per-node notification wake bus. Each subscriber gets an
+    /// independent receiver carrying the `UserId` whose inbox just changed; live
+    /// streams filter by recipient and refetch the unread count on wake.
+    pub fn subscribe_notification_wakes(&self) -> broadcast::Receiver<UserId> {
+        self.inner.notification_wakes.subscribe()
+    }
+
+    /// Best-effort wake fired after a successful inbox mutation (new record or a
+    /// mark-read that changed the unread count). A send with no subscribers is a
+    /// no-op, never an error; nothing may fail through this path.
+    pub fn notify_inbox_activity(&self, recipient: UserId) {
+        let _ = self.inner.notification_wakes.send(recipient);
+    }
+
+    /// Replaces one realm's node map after a reconcile touched its digests,
+    /// leaving every other realm's cached interest untouched.
+    pub fn update_watch_interest_realm(
+        &self,
+        realm_id: RealmId,
+        nodes: HashMap<NodeId, Vec<WatchInterestEntry>>,
+    ) {
+        self.inner.watch_interest.write().set_realm(realm_id, nodes);
     }
 
     async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
@@ -2570,6 +2614,55 @@ mod tests {
                 .ip_addrs()
                 .all(|socket| !socket.ip().is_unspecified())
         );
+        handle.shutdown().await;
+        Ok(())
+    }
+
+    async fn notification_wake_handle() -> Result<(TempDir, NetHandle)> {
+        let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
+        let storage = aruna_storage::FjallStorage::open(
+            temp_dir
+                .path()
+                .to_str()
+                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
+        )
+        .map_err(|e| NetError::Io(e.to_string()))?;
+        let config = NetConfig {
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        };
+        let handle = NetHandle::new(config, storage).await?;
+        Ok((temp_dir, handle))
+    }
+
+    fn wake_user(seed: u8) -> UserId {
+        UserId::new(
+            ulid::Ulid::from_bytes([seed; 16]),
+            RealmId::from_bytes([seed; 32]),
+        )
+    }
+
+    #[tokio::test]
+    async fn notification_wake_without_subscriber_is_noop() -> Result<()> {
+        let (_dir, handle) = notification_wake_handle().await?;
+        // No subscribers: the send must not panic or error.
+        handle.notify_inbox_activity(wake_user(1));
+        handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notification_wake_reaches_subscriber() -> Result<()> {
+        let (_dir, handle) = notification_wake_handle().await?;
+        let mut rx = handle.subscribe_notification_wakes();
+        let recipient = wake_user(7);
+        handle.notify_inbox_activity(recipient);
+        let woken = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("wake arrives")
+            .expect("channel open");
+        assert_eq!(woken, recipient);
         handle.shutdown().await;
         Ok(())
     }

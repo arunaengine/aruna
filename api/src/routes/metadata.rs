@@ -5,7 +5,11 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
-use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
+use aruna_core::structs::{
+    Actor, AuthContext, MetadataRegistryRecord, Permission, WatchEvent, WatchEventDetail,
+    WatchEventKind,
+};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -27,6 +31,7 @@ use aruna_operations::metadata::api::{
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
     search_metadata as run_search_metadata,
 };
+use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
@@ -485,11 +490,30 @@ pub async fn create_metadata_document(
                 payload,
             },
         ),
-        ctx,
+        ctx.clone(),
     )
     .await
     .map_err(map_create_metadata_error)?;
     let result = created.record;
+
+    // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
+    // emission only warns and never affects the already-successful create.
+    emit_resource_watch_event(
+        ctx.as_ref(),
+        WatchEvent {
+            event_id: Ulid::new(),
+            realm_id: state.get_realm_id(),
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{}/{}", result.group_id, result.document_path),
+            actor: auth.user_id,
+            occurred_at_ms: unix_timestamp_millis(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id: result.group_id,
+                document_id: result.document_id,
+            },
+        },
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,

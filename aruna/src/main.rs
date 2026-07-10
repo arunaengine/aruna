@@ -151,9 +151,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 // CreateRealm mints the realm-auth/realm-config genesis via its admin
-                // operation outbox records, but not the shared node-usage topic. As
-                // the realm-bootstrap node, announce the core documents here so the
-                // node-usage genesis is minted on the fresh-bootstrap path too.
+                // operation outbox records, but not the shared node-usage and
+                // watch-interest topics. Announce core documents here so their
+                // genesis is minted on the fresh-bootstrap path too.
                 announce_core_documents(
                     driver_ctx.as_ref(),
                     config.node_id,
@@ -207,8 +207,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // A joining node is never the realm-bootstrap node: it announces the
-            // shared node-usage topic with allow_genesis=false and waits for the
-            // bootstrap node's genesis to replicate in.
+            // shared topics with allow_genesis=false after onboarding fetched a
+            // representative target for each.
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
                 .await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
@@ -244,11 +244,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
-            // A provisioned node re-announces core documents on restart as a
-            // holder, but the shared node-usage genesis already exists from the
-            // bootstrap node, so it never needs to mint it.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
-                .await?;
+            // The realm-bootstrap node retains genesis authority so a missing
+            // shared topic can be repaired after a partial first boot. Onboarded
+            // nodes still wait for that authoritative genesis.
+            announce_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                &config.realm_id,
+                config.is_initial_node(),
+            )
+            .await?;
         }
     }
 
@@ -324,7 +329,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
     let s3_bound_addr = s3_listener.local_addr().unwrap();
     state
-        .register_s3_interface(s3_bound_addr, &config.s3_host)
+        .register_s3_interface(
+            s3_bound_addr,
+            config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
+        )
         .await;
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
 

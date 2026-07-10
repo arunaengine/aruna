@@ -41,7 +41,7 @@ use crate::metadata::prune_queue::{
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::notifications::client::deliver_remote;
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
     NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
@@ -52,6 +52,10 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::{
     NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
     process_notification_prune_batch, restore_notification_prune_timer,
+};
+use crate::notifications::watch::interest::{
+    WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
+    refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
@@ -441,9 +445,9 @@ impl OperationsTaskHandler {
             })) => {
                 process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
                     .await;
+                let mut refresh_targets = targets.clone();
+                refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    let mut refresh_targets = targets.clone();
-                    refresh_targets.extend(requested_targets);
                     refresh_realm_usage_summary_for_targets(
                         self.context.as_ref(),
                         net_handle.node_id(),
@@ -451,6 +455,7 @@ impl OperationsTaskHandler {
                     )
                     .await;
                 }
+                refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets).await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -549,6 +554,36 @@ impl OperationsTaskHandler {
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
                     crate::usage_stats::USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn publish_watch_interest(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!("Cannot publish watch interest without net handle");
+            return;
+        };
+        let node_id = net_handle.node_id();
+        match crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
+            .await
+        {
+            // Fold this node's freshly written digest into the origin-side cache;
+            // the local write bypasses the reconcile path that refreshes remotes.
+            Ok(true) => {
+                let table = crate::notifications::watch::interest::rebuild_watch_interest_table(
+                    &self.context.storage_handle,
+                )
+                .await;
+                net_handle.replace_watch_interest(table);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(error = %error, "Failed to publish watch interest");
+                self.reschedule_timer(
+                    TaskKey::PublishWatchInterest,
+                    WATCH_INTEREST_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }
@@ -892,8 +927,13 @@ impl OperationsTaskHandler {
             }
 
             if !local_records.is_empty() {
-                match upsert_inbox_records(&self.context.storage_handle, &local_records).await {
-                    Ok(_) => {
+                match upsert_inbox_records_reporting(&self.context.storage_handle, &local_records)
+                    .await
+                {
+                    Ok(outcome) => {
+                        for recipient in &outcome.recipients {
+                            net_handle.notify_inbox_activity(*recipient);
+                        }
                         if let Err(error) = delete_notification_outbox_records(
                             &self.context.storage_handle,
                             local_keys,
@@ -1010,6 +1050,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
             &task_handle,
@@ -1029,10 +1070,17 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
     crate::queue_lag::spawn_queue_lag_monitor(&context);
+    // Prime the origin-side watch interest cache from any digests already in
+    // local storage so matching works before the first reconcile.
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        let table = rebuild_watch_interest_table(&context.storage_handle).await;
+        net_handle.replace_watch_interest(table);
+    }
     spawn_durable_queue_rearm(&context, &task_handle);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+    restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
@@ -1125,6 +1173,8 @@ impl InboundTaskHandler for OperationsTaskHandler {
                             &refresh_targets,
                         )
                         .await;
+                        refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets)
+                            .await;
                         if self
                             .project_reconciled_metadata_create_events(
                                 &retry_key,
@@ -1185,6 +1235,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PruneNotifications => {
                 self.prune_notifications().await;
+            }
+            TaskKey::PublishWatchInterest => {
+                self.publish_watch_interest().await;
             }
         }
     }

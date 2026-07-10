@@ -26,9 +26,6 @@ impl NotificationClass {
     }
 }
 
-/// Append-only postcard enum: postcard encodes the variant index, so existing
-/// variants must never be removed, reordered, or have fields changed; new
-/// variants are appended at the end only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationKind {
     AddedToGroup {
@@ -48,6 +45,21 @@ pub enum NotificationKind {
         realm_id: RealmId,
         node_id: NodeId,
     },
+    MetadataCreated {
+        path: String,
+        group_id: GroupId,
+        document_id: Ulid,
+        actor_user_id: UserId,
+    },
+    DataUploaded {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -59,6 +71,9 @@ impl NotificationKind {
             | NotificationKind::RemovedFromGroup { .. }
             | NotificationKind::GroupMemberAdded { .. } => "group.membership",
             NotificationKind::NodeOnboarded { .. } => "node.onboarding",
+            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. } => {
+                "resource.watch"
+            }
         }
     }
 
@@ -69,6 +84,8 @@ impl NotificationKind {
             NotificationKind::RemovedFromGroup { .. } => "removed_from_group",
             NotificationKind::GroupMemberAdded { .. } => "group_member_added",
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
+            NotificationKind::MetadataCreated { .. } => "metadata_created",
+            NotificationKind::DataUploaded { .. } => "data_uploaded",
         }
     }
 }
@@ -233,6 +250,9 @@ mod tests {
     #[test]
     fn notification_record_roundtrips_through_postcard() {
         let recipient = user(1, 2);
+        let metadata_group_id = Ulid::new();
+        let data_group_id = Ulid::new();
+        let data_node_id = make_node_id(8);
         for kind in [
             NotificationKind::AddedToGroup {
                 group_id: Ulid::new(),
@@ -250,6 +270,26 @@ mod tests {
             NotificationKind::NodeOnboarded {
                 realm_id: RealmId([1; 32]),
                 node_id: make_node_id(7),
+            },
+            NotificationKind::MetadataCreated {
+                path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+                group_id: metadata_group_id,
+                document_id: Ulid::new(),
+                actor_user_id: user(1, 5),
+            },
+            NotificationKind::DataUploaded {
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "key",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+                size_bytes: 4096,
+                actor_user_id: user(1, 6),
             },
         ] {
             let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
@@ -406,13 +446,40 @@ mod tests {
             realm_id: RealmId([1; 32]),
             node_id: make_node_id(1),
         };
+        let metadata_group_id = Ulid::new();
+        let metadata_created = NotificationKind::MetadataCreated {
+            path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+            group_id: metadata_group_id,
+            document_id: Ulid::new(),
+            actor_user_id: user(1, 5),
+        };
+        let data_group_id = Ulid::new();
+        let data_node_id = make_node_id(2);
+        let data_uploaded = NotificationKind::DataUploaded {
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "key",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            size_bytes: 1,
+            actor_user_id: user(1, 6),
+        };
         assert_eq!(added.category(), "group.membership");
         assert_eq!(removed.category(), "group.membership");
         assert_eq!(member.category(), "group.membership");
         assert_eq!(onboarded.category(), "node.onboarding");
+        assert_eq!(metadata_created.category(), "resource.watch");
+        assert_eq!(data_uploaded.category(), "resource.watch");
         assert_eq!(added.name(), "added_to_group");
         assert_eq!(removed.name(), "removed_from_group");
         assert_eq!(member.name(), "group_member_added");
         assert_eq!(onboarded.name(), "node_onboarded");
+        assert_eq!(metadata_created.name(), "metadata_created");
+        assert_eq!(data_uploaded.name(), "data_uploaded");
     }
 }
