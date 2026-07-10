@@ -18,8 +18,8 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_OUTBOX_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -28,8 +28,8 @@ use crate::metadata::{
 };
 use crate::structs::{
     MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
-    WatchForwardOutboxRecord, WatchSubscription, notification_inbox_key, notification_outbox_key,
-    notification_prune_index_key, watch_forward_outbox_key, watch_subscription_key,
+    WatchSubscription, notification_inbox_key, notification_outbox_key,
+    notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
@@ -463,16 +463,6 @@ pub fn watch_subscription_delete_entry(owner: UserId, watch_id: Ulid) -> (KeySpa
         NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
         watch_subscription_key(owner, watch_id),
     )
-}
-
-pub fn watch_forward_outbox_write_entry(
-    record: &WatchForwardOutboxRecord,
-) -> Result<(KeySpace, Key, Value), ConversionError> {
-    Ok((
-        NOTIFICATION_WATCH_OUTBOX_KEYSPACE.to_string(),
-        watch_forward_outbox_key(record.outbox_id),
-        record.to_bytes()?.into(),
-    ))
 }
 
 pub fn admin_document_reducer_state_write_entry(
