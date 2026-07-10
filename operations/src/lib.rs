@@ -39,6 +39,7 @@ pub mod list_metadata_documents;
 pub mod list_onboarding_secrets;
 pub mod list_users;
 pub mod metadata;
+pub mod mutate_realm_placement;
 pub mod node_info;
 pub mod notifications;
 pub mod onboarding_secret_state;
