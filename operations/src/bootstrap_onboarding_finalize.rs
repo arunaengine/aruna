@@ -322,11 +322,13 @@ mod tests {
     use crate::onboarding_secret_state::secret_state_key;
     use crate::reserve_onboarding_secret::ReserveOnboardingSecretError;
     use aruna_core::NodeId;
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
         OnboardingMode, OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
+        OnboardingSyncTicket,
     };
     use aruna_core::structs::{
         Actor, KIND_LABEL_KEY, NotificationKind, NotificationOutboxRecord,
@@ -336,6 +338,7 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
+    use irokle::Storage;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -628,6 +631,37 @@ mod tests {
                 node_id: fixture.joiner_node_id.to_string(),
             }
         );
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_ticket_signs_and_admits_issuer_node_info_target() {
+        let fixture = setup_finalize_fixture().await;
+        let (context, net_handle) = context_with_net(&fixture).await;
+
+        let result = bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            context,
+        )
+        .await
+        .unwrap();
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id: fixture.realm_id,
+            node_id: fixture.local_node_id,
+        };
+        let ticket = OnboardingSyncTicket::decode(&result.onboarding_sync_ticket).unwrap();
+
+        ticket.verify(fixture.joiner_node_id, &target, 10).unwrap();
+        let state = net_handle
+            .document_sync_node()
+            .storage()
+            .topic_state(&target.sync_topic_id())
+            .unwrap()
+            .expect("issuer node-info topic admitted during finalize");
+        assert!(state.members.contains(&irokle::PeerId::from_bytes(
+            *fixture.joiner_node_id.as_bytes()
+        )));
+
         net_handle.shutdown().await;
     }
 

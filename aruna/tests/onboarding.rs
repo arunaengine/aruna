@@ -8,6 +8,7 @@ use aruna_core::handle::Handle;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
 use aruna_core::structs::{Actor, User};
 use aruna_operations::driver::drive;
+use aruna_operations::node_info::read_node_info_document;
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
@@ -76,6 +77,16 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .await
             .expect("joiner user should be bootstrapped"),
         expected_user
+    );
+    assert_eq!(
+        read_node_info_document(&joiner.context.storage_handle, seed.net.node_id())
+            .await
+            .unwrap()
+            .expect("issuer node info should be fetched from the onboarding ticket"),
+        read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
+            .await
+            .unwrap()
+            .expect("seed fixture should publish issuer node info")
     );
 
     wait_for_realm_nodes(

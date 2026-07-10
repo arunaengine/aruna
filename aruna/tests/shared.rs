@@ -18,8 +18,8 @@ use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
 use aruna_core::structs::{
-    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, PathRestriction,
-    RealmId, TokenClaims, UserAccess,
+    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, NodeUrls,
+    PathRestriction, RealmId, TokenClaims, UserAccess,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -34,6 +34,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::node_info::publish_node_info;
 use aruna_operations::s3::get_user_access::GetUserAccessOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -539,6 +540,19 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     let full_storage_config =
         (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
     let context = initialize_context(storage, net.clone(), full_storage_config.as_ref()).await?;
+
+    publish_node_info(
+        context.as_ref(),
+        net.node_id(),
+        realm_id,
+        Default::default(),
+        NodeUrls {
+            api: None,
+            s3: None,
+        },
+    )
+    .await
+    .map_err(std::io::Error::other)?;
 
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
