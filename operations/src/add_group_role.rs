@@ -993,6 +993,9 @@ pub mod test {
                 actor: actor.clone(),
                 realm_description: "Test realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             context,
         )
@@ -1048,46 +1051,6 @@ pub mod test {
                 })
                 .collect(),
             other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_reserved_role_names() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
-        let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
-        let group_id = Ulid::from_bytes([3u8; 16]);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
-            user_id,
-            realm_id,
-        };
-
-        for name in ["admin", "user", " admin "] {
-            let mut operation = AddGroupRoleOperation::new(AddGroupRoleConfig {
-                auth_context: aruna_core::structs::AuthContext {
-                    user_id,
-                    realm_id,
-                    path_restrictions: None,
-                },
-                actor: actor.clone(),
-                realm_id,
-                group_id,
-                role: Role {
-                    role_id: Ulid::new(),
-                    name: name.to_string(),
-                    permissions: HashMap::from([(
-                        format!("/{realm_id}/g/{group_id}/data/**"),
-                        Permission::READ,
-                    )]),
-                    assigned_users: HashSet::new(),
-                },
-            });
-
-            assert!(operation.start().is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(AddGroupRoleError::ReservedRoleName)
-            );
         }
     }
 

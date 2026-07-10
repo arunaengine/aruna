@@ -2297,6 +2297,7 @@ mod tests {
                 updated_at_ms: seed as u64,
             },
             kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
 
         DocumentSyncEvictedDocument {

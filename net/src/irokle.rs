@@ -8226,6 +8226,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         };
 
         let published = service
