@@ -80,16 +80,18 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
-    assert_eq!(
-        read_node_info_document(&joiner.context.storage_handle, seed.net.node_id())
-            .await
-            .unwrap()
-            .expect("issuer node info should be fetched from the onboarding ticket"),
-        read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
-            .await
-            .unwrap()
-            .expect("seed fixture should publish issuer node info")
-    );
+    let issuer_info = read_node_info_document(&joiner.context.storage_handle, seed.net.node_id())
+        .await?
+        .expect("issuer node info should be fetched from the onboarding ticket");
+    let seed_info = read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
+        .await?
+        .expect("seed fixture should publish issuer node info");
+    assert_eq!(issuer_info, seed_info);
+    assert_eq!(issuer_info.node_id, seed.net.node_id());
+    assert_eq!(issuer_info.urls.api, None);
+    assert_eq!(issuer_info.urls.s3, None);
+    assert_eq!(issuer_info.utilization.documents_held, None);
+    assert_eq!(issuer_info.utilization.load_permille, None);
     let realm_config = drive(
         GetRealmConfigOperation::new(joiner.config.realm_id),
         joiner.context.as_ref(),
@@ -105,6 +107,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         read_node_info_document(&joiner.context.storage_handle, joiner.config.node_id)
             .await?
             .expect("joiner startup should seed its node info after fetching realm config");
+    assert_eq!(joiner_info.node_id, joiner.config.node_id);
     assert_eq!(joiner_info.labels, selector_labels);
     assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");
     assert_eq!(
