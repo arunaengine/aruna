@@ -151,9 +151,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 // CreateRealm mints the realm-auth/realm-config genesis via its admin
-                // operation outbox records, but not the shared node-usage topic. As
-                // the realm-bootstrap node, announce the core documents here so the
-                // node-usage genesis is minted on the fresh-bootstrap path too.
+                // operation outbox records, but not the shared node-usage and
+                // watch-interest topics. Announce core documents here so their
+                // genesis is minted on the fresh-bootstrap path too.
                 announce_core_documents(
                     driver_ctx.as_ref(),
                     config.node_id,
@@ -207,8 +207,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // A joining node is never the realm-bootstrap node: it announces the
-            // shared node-usage topic with allow_genesis=false and waits for the
-            // bootstrap node's genesis to replicate in.
+            // shared topics with allow_genesis=false after onboarding fetched a
+            // representative target for each.
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
                 .await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
@@ -245,8 +245,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // A provisioned node re-announces core documents on restart as a
-            // holder, but the shared node-usage genesis already exists from the
-            // bootstrap node, so it never needs to mint it.
+            // holder, but shared-topic genesis already exists from the bootstrap
+            // node, so it never needs to mint it.
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
                 .await?;
         }

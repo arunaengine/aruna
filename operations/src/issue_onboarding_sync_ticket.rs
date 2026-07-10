@@ -76,6 +76,10 @@ impl IssueOnboardingSyncTicketOperation {
                 node_id: input.issuer_node_id,
                 group_id: None,
             },
+            DocumentSyncTarget::WatchInterest {
+                realm_id: input.realm_id,
+                node_id: input.issuer_node_id,
+            },
         ];
         Self {
             input,
@@ -206,7 +210,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn ticket_includes_shared_node_usage_for_issuer_node() {
+    fn ticket_includes_shared_realm_topics_for_issuer_node() {
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let joiner_node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -242,6 +246,10 @@ mod tests {
                     realm_id,
                     node_id: issuer_node_id,
                     group_id: None,
+                },
+                DocumentSyncTarget::WatchInterest {
+                    realm_id,
+                    node_id: issuer_node_id,
                 },
             ]
         );
@@ -316,6 +324,15 @@ mod tests {
                     group_id: None,
                 })
         );
-        assert_eq!(ticket.payload.documents.len(), user_count + 3);
+        assert!(
+            ticket
+                .payload
+                .documents
+                .contains(&DocumentSyncTarget::WatchInterest {
+                    realm_id,
+                    node_id: issuer_node_id,
+                })
+        );
+        assert_eq!(ticket.payload.documents.len(), user_count + 4);
     }
 }
