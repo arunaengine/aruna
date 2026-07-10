@@ -183,6 +183,17 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(45), dht_fallback_inner())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "DHT fallback test exceeded 45 seconds",
+            )
+        })?
+}
+
+async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let temp_c = tempdir()?;
@@ -230,7 +241,7 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
         .refresh_realm_peers_from_document(&realm_config)
         .await?;
 
-    let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+    let (stream_tx, stream_rx) = mpsc::unbounded_channel();
     handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
         stream_tx: Some(stream_tx),
     }));
@@ -280,9 +291,13 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
             })
     }));
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
-    handle_c.shutdown().await;
+    drop(opened_stream);
+    drop(stream_rx);
+    tokio::join!(
+        handle_a.shutdown(),
+        handle_b.shutdown(),
+        handle_c.shutdown()
+    );
 
     Ok(())
 }
