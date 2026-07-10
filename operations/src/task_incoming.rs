@@ -1,17 +1,20 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncTarget};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
+use byteview::ByteView;
 use tracing::{error, info, warn};
 
 use crate::announce_realm_presence::{
@@ -36,6 +39,19 @@ use crate::metadata::prune_queue::{
     METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER,
     metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
+};
+use crate::notifications::client::deliver_remote;
+use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::outbox::{
+    NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
+    NOTIFICATION_OUTBOX_RETENTION_MS, delete_notification_outbox_records,
+    read_notification_outbox_batch, restore_notification_outbox_timer,
+    restore_notification_outbox_timer_if_idle,
+};
+use crate::notifications::placement::resolve_inbox_holder;
+use crate::notifications::prune::{
+    NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
+    process_notification_prune_batch, restore_notification_prune_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
@@ -711,6 +727,267 @@ impl OperationsTaskHandler {
             }
         }
     }
+
+    async fn read_realm_config(&self, realm_id: RealmId) -> Option<RealmConfigDocument> {
+        match self
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => match RealmConfigDocument::from_bytes(&bytes) {
+                Ok(document) => Some(document),
+                Err(error) => {
+                    warn!(realm_id = %realm_id, error = %error, "Failed to decode realm config for notification drain");
+                    None
+                }
+            },
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(realm_id = %realm_id, error = %error, "Failed to read realm config for notification drain");
+                None
+            }
+            other => {
+                warn!(realm_id = %realm_id, event = ?other, "Unexpected realm config read result for notification drain");
+                None
+            }
+        }
+    }
+
+    async fn drain_notification_outbox(&self) {
+        let retry_key = TaskKey::DrainNotificationOutbox;
+
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!(key = ?retry_key, "Cannot drain notification outbox without net handle");
+            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                .await;
+            return;
+        };
+        let local_node_id = net_handle.node_id();
+
+        let snapshot_txn_id = match self
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Failed to start notification outbox snapshot");
+                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                    .await;
+                return;
+            }
+            other => {
+                warn!(event = ?other, "Unexpected notification outbox snapshot start result");
+                self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                    .await;
+                return;
+            }
+        };
+
+        let mut start_after: Option<Vec<u8>> = None;
+        let mut retry_needed = false;
+        let mut realm_configs: HashMap<RealmId, Option<RealmConfigDocument>> = HashMap::new();
+        // One delivery attempt per remote holder per run: later records for a
+        // holder already found unreachable are marked retry without another RPC.
+        let mut failed_holders: HashSet<aruna_core::NodeId> = HashSet::new();
+
+        // Scan the snapshot in full so a dead holder cannot hide healthy records
+        // behind it, while rows appended during this run wait for the next run.
+        loop {
+            let batch = match read_notification_outbox_batch(
+                &self.context.storage_handle,
+                start_after.clone(),
+                NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
+                Some(snapshot_txn_id),
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(error = %error, "Failed to read notification outbox record");
+                    retry_needed = true;
+                    break;
+                }
+            };
+
+            let has_more = batch.has_more;
+            start_after = batch.next_start_after;
+            if batch.records.is_empty() {
+                if has_more && start_after.is_some() {
+                    continue;
+                }
+                break;
+            }
+
+            let mut local_records: Vec<NotificationRecord> = Vec::new();
+            let mut local_keys: Vec<Vec<u8>> = Vec::new();
+            let mut remote_groups: HashMap<
+                aruna_core::NodeId,
+                (Vec<NotificationRecord>, Vec<Vec<u8>>),
+            > = HashMap::new();
+
+            for (record_key, outbox_record) in batch.records {
+                let age_ms =
+                    unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
+                if age_ms > NOTIFICATION_OUTBOX_RETENTION_MS {
+                    warn!(outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
+                    if let Err(error) = delete_notification_outbox_records(
+                        &self.context.storage_handle,
+                        vec![record_key],
+                    )
+                    .await
+                    {
+                        warn!(error = %error, "Failed to delete expired notification outbox record");
+                        retry_needed = true;
+                    }
+                    continue;
+                }
+
+                let record = outbox_record.record;
+                let realm_id = record.recipient.realm_id;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    realm_configs.entry(realm_id)
+                {
+                    let config = self.read_realm_config(realm_id).await;
+                    entry.insert(config);
+                }
+                let Some(config) = realm_configs.get(&realm_id).and_then(Option::as_ref) else {
+                    warn!(realm_id = %realm_id, "Notification realm config unavailable; retrying delivery");
+                    retry_needed = true;
+                    continue;
+                };
+
+                let holder = match resolve_inbox_holder(&record.recipient, config) {
+                    Ok(holder) => holder,
+                    Err(error) => {
+                        warn!(recipient = %record.recipient, error = %error, "Failed to resolve notification inbox holder");
+                        retry_needed = true;
+                        continue;
+                    }
+                };
+                let Some(holder) = holder else {
+                    warn!(recipient = %record.recipient, "No eligible notification inbox holder; retrying delivery");
+                    retry_needed = true;
+                    continue;
+                };
+
+                if holder == local_node_id {
+                    local_records.push(record);
+                    local_keys.push(record_key);
+                } else if failed_holders.contains(&holder) {
+                    retry_needed = true;
+                } else {
+                    let group = remote_groups.entry(holder).or_default();
+                    group.0.push(record);
+                    group.1.push(record_key);
+                }
+            }
+
+            if !local_records.is_empty() {
+                match upsert_inbox_records(&self.context.storage_handle, &local_records).await {
+                    Ok(_) => {
+                        if let Err(error) = delete_notification_outbox_records(
+                            &self.context.storage_handle,
+                            local_keys,
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "Failed to delete delivered notification outbox records");
+                            retry_needed = true;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "Failed to deliver notifications to local inbox");
+                        retry_needed = true;
+                    }
+                }
+            }
+
+            for (holder, (records, keys)) in remote_groups {
+                match deliver_remote(net_handle, holder, records).await {
+                    Ok(_) => {
+                        if let Err(error) =
+                            delete_notification_outbox_records(&self.context.storage_handle, keys)
+                                .await
+                        {
+                            warn!(error = %error, "Failed to delete delivered notification outbox records");
+                            retry_needed = true;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(holder = %holder, error = %error, "Failed to deliver notifications to remote holder");
+                        failed_holders.insert(holder);
+                        retry_needed = true;
+                    }
+                }
+            }
+
+            if !has_more {
+                break;
+            }
+        }
+
+        match self
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction {
+                txn_id: snapshot_txn_id,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(error = %error, "Failed to close notification outbox snapshot");
+                retry_needed = true;
+            }
+            other => {
+                warn!(event = ?other, "Unexpected notification outbox snapshot close result");
+                retry_needed = true;
+            }
+        }
+
+        if retry_needed {
+            self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                .await;
+        } else {
+            match read_notification_outbox_batch(&self.context.storage_handle, None, 1, None).await
+            {
+                Ok(batch) if !batch.records.is_empty() || batch.has_more => {
+                    self.reschedule_timer(retry_key, Duration::ZERO).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "Failed to check for notification outbox records appended during drain");
+                    self.reschedule_timer(retry_key, NOTIFICATION_DELIVERY_RETRY_AFTER)
+                        .await;
+                }
+            }
+        }
+    }
+
+    async fn prune_notifications(&self) {
+        let after = match process_notification_prune_batch(&self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => outcome
+                .next_due_after
+                .unwrap_or(NOTIFICATION_PRUNE_POLL_AFTER)
+                .min(NOTIFICATION_PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(error = %error, "Failed to prune notifications");
+                NOTIFICATION_PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneNotifications, after)
+            .await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -733,9 +1010,16 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_notification_outbox_timer_if_idle(
+            &context.storage_handle,
+            &task_handle,
+            NOTIFICATION_DELIVERY_RETRY_AFTER,
+        )
+        .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
@@ -749,9 +1033,11 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+    restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
+    restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
 }
@@ -894,6 +1180,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::DrainReferenceMetadataRefreshQueue => {
                 self.drain_reference_metadata_refresh_queue().await;
             }
+            TaskKey::DrainNotificationOutbox => {
+                self.drain_notification_outbox().await;
+            }
+            TaskKey::PruneNotifications => {
+                self.prune_notifications().await;
+            }
         }
     }
 }
@@ -910,15 +1202,23 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+    use aruna_core::keyspaces::{METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
-    use aruna_core::structs::RealmId;
+    use aruna_core::storage_entries::notification_outbox_write_entry;
+    use aruna_core::structs::{
+        Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, RealmConfigDocument,
+        RealmId, RealmNodeKind,
+    };
+    use aruna_core::types::UserId;
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use ulid::Ulid;
+
+    use crate::notifications::outbox::new_notification_outbox_record;
 
     struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,
@@ -1480,5 +1780,288 @@ mod tests {
         }
 
         net.shutdown().await;
+    }
+
+    async fn make_net_handle(
+        realm_id: RealmId,
+        storage: &aruna_storage::StorageHandle,
+        secret: [u8; 32],
+    ) -> NetHandle {
+        NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle")
+    }
+
+    async fn write_realm_config(
+        storage: &aruna_storage::StorageHandle,
+        realm_id: RealmId,
+        config: &RealmConfigDocument,
+        node_id: aruna_core::NodeId,
+    ) {
+        let actor = Actor {
+            node_id,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let bytes = config.to_bytes(&actor).expect("config serializes");
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write event: {other:?}"),
+        }
+    }
+
+    async fn write_notification_outbox(
+        storage: &aruna_storage::StorageHandle,
+        record: &NotificationOutboxRecord,
+    ) {
+        let (key_space, key, value) =
+            notification_outbox_write_entry(record).expect("outbox entry");
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected outbox write event: {other:?}"),
+        }
+    }
+
+    async fn read_inbox_records(storage: &aruna_storage::StorageHandle) -> Vec<NotificationRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1024,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| NotificationRecord::from_bytes(&value).expect("record decodes"))
+                .collect(),
+            other => panic!("unexpected inbox iter event: {other:?}"),
+        }
+    }
+
+    fn notification_recipient(realm_id: RealmId) -> UserId {
+        UserId::new(Ulid::from_bytes([9u8; 16]), realm_id)
+    }
+
+    fn notification_record(realm_id: RealmId, created_at_ms: u64) -> NotificationRecord {
+        let recipient = notification_recipient(realm_id);
+        NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::from_bytes([1u8; 16]),
+                actor_user_id: recipient,
+            },
+            created_at_ms,
+        )
+    }
+
+    #[tokio::test]
+    async fn notification_drain_delivers_locally_when_self_is_holder() {
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net_handle = make_net_handle(realm_id, &storage, [21u8; 32]).await;
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(net_handle.node_id(), RealmNodeKind::Server);
+        write_realm_config(&storage, realm_id, &config, net_handle.node_id()).await;
+
+        let record = notification_record(realm_id, 1_700_000_000_000);
+        let outbox = new_notification_outbox_record(record.clone());
+        write_notification_outbox(&storage, &outbox).await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+        handler.drain_notification_outbox().await;
+
+        let inbox = read_inbox_records(&storage).await;
+        assert_eq!(inbox, vec![record]);
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+            .await
+            .expect("outbox read");
+        assert!(remaining.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_drain_retries_when_holder_unresolvable() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net_handle = make_net_handle(realm_id, &storage, [22u8; 32]).await;
+
+        let record = notification_record(realm_id, 1_700_000_000_000);
+        let outbox = new_notification_outbox_record(record);
+        write_notification_outbox(&storage, &outbox).await;
+
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+        });
+        let handler = OperationsTaskHandler::new(context);
+        handler.drain_notification_outbox().await;
+
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+            .await
+            .expect("outbox read");
+        assert_eq!(remaining.records.len(), 1);
+        assert!(read_inbox_records(&storage).await.is_empty());
+
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = task_handle
+            .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::DrainNotificationOutbox,
+                after: Duration::from_secs(10_000),
+            }))
+            .await
+        else {
+            panic!("expected timer scheduled");
+        };
+        assert!(
+            after <= NOTIFICATION_DELIVERY_RETRY_AFTER,
+            "an unresolvable holder must re-arm the retry timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_drain_drops_expired_records_with_warn() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net_handle = make_net_handle(realm_id, &storage, [23u8; 32]).await;
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(net_handle.node_id(), RealmNodeKind::Server);
+        write_realm_config(&storage, realm_id, &config, net_handle.node_id()).await;
+
+        let outbox = NotificationOutboxRecord {
+            outbox_id: Ulid::from_parts(1, 0),
+            record: notification_record(realm_id, 1_000),
+        };
+        write_notification_outbox(&storage, &outbox).await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+        handler.drain_notification_outbox().await;
+
+        assert!(read_inbox_records(&storage).await.is_empty());
+        let remaining = read_notification_outbox_batch(&storage, None, 1024, None)
+            .await
+            .expect("outbox read");
+        assert!(remaining.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_drain_delivers_to_remote_holder() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+
+        let dir_a = tempdir().expect("temp dir");
+        let storage_a =
+            FjallStorage::open(dir_a.path().to_str().expect("temp path")).expect("storage opens");
+        let net_a = make_net_handle(realm_id, &storage_a, [24u8; 32]).await;
+
+        let dir_b = tempdir().expect("temp dir");
+        let storage_b =
+            FjallStorage::open(dir_b.path().to_str().expect("temp path")).expect("storage opens");
+        let net_b = make_net_handle(realm_id, &storage_b, [25u8; 32]).await;
+
+        net_a.add_peer_addr(net_b.endpoint_addr()).await;
+
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(net_a.node_id(), RealmNodeKind::Server);
+        config.ensure_node(net_b.node_id(), RealmNodeKind::Server);
+        write_realm_config(&storage_a, realm_id, &config, net_a.node_id()).await;
+        write_realm_config(&storage_b, realm_id, &config, net_b.node_id()).await;
+
+        let b_id = net_b.node_id();
+        let recipient = loop {
+            let candidate = UserId::new(Ulid::new(), realm_id);
+            if resolve_inbox_holder(&candidate, &config).expect("resolve holder") == Some(b_id) {
+                break candidate;
+            }
+        };
+
+        let record = NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::from_bytes([1u8; 16]),
+                actor_user_id: recipient,
+            },
+            1_700_000_000_000,
+        );
+        let outbox = new_notification_outbox_record(record.clone());
+        write_notification_outbox(&storage_a, &outbox).await;
+
+        let context_b = Arc::new(DriverContext {
+            storage_handle: storage_b.clone(),
+            net_handle: Some(net_b),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        crate::incoming::initialize_net_incoming(context_b.clone());
+
+        let context_a = Arc::new(DriverContext {
+            storage_handle: storage_a.clone(),
+            net_handle: Some(net_a),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context_a);
+        handler.drain_notification_outbox().await;
+
+        assert_eq!(read_inbox_records(&storage_b).await, vec![record]);
+        let remaining = read_notification_outbox_batch(&storage_a, None, 1024, None)
+            .await
+            .expect("outbox read");
+        assert!(remaining.records.is_empty());
     }
 }

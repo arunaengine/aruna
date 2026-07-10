@@ -216,10 +216,14 @@ struct Actor {
 impl Actor {
     fn new(endpoint: Endpoint, options: ConnectionPoolOptions) -> (Self, Sender<ActorMessage>) {
         let (tx, rx) = mpsc::channel(256);
+        let request_timeout = options.connect_timeout;
         let context = Arc::new(PoolContext {
             endpoint,
             options,
-            owner: ConnectionPool { tx: tx.clone() },
+            owner: ConnectionPool {
+                tx: tx.clone(),
+                request_timeout,
+            },
         });
         (
             Self {
@@ -306,6 +310,7 @@ impl Actor {
 #[derive(Clone)]
 pub struct ConnectionPool {
     tx: Sender<ActorMessage>,
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for ConnectionPool {
@@ -316,9 +321,13 @@ impl std::fmt::Debug for ConnectionPool {
 
 impl ConnectionPool {
     pub fn new(endpoint: Endpoint, options: ConnectionPoolOptions) -> Self {
+        let request_timeout = options.connect_timeout;
         let (actor, tx) = Actor::new(endpoint, options);
         tokio::spawn(actor.run());
-        Self { tx }
+        Self {
+            tx,
+            request_timeout,
+        }
     }
 
     pub async fn get_or_connect(
@@ -328,11 +337,18 @@ impl ConnectionPool {
     ) -> std::result::Result<ConnectionLease, PoolConnectError> {
         let key = ConnectionKey { node_id, alpn };
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(ActorMessage::RequestLease(RequestLease { key, tx }))
-            .await
-            .map_err(|_| PoolConnectError::Shutdown)?;
-        rx.await.map_err(|_| PoolConnectError::Shutdown)?
+        match tokio::time::timeout(self.request_timeout, async {
+            self.tx
+                .send(ActorMessage::RequestLease(RequestLease { key, tx }))
+                .await
+                .map_err(|_| PoolConnectError::Shutdown)?;
+            rx.await.map_err(|_| PoolConnectError::Shutdown)?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(PoolConnectError::Timeout),
+        }
     }
 
     pub async fn shutdown(&self) -> std::result::Result<(), ConnectionPoolError> {
@@ -354,6 +370,25 @@ impl ConnectionPool {
             .send(ActorMessage::ConnectionIdle { key })
             .await
             .map_err(|_| ConnectionPoolError::Shutdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lease_request_times_out_when_actor_does_not_reply() {
+        let (tx, _rx) = mpsc::channel(1);
+        let pool = ConnectionPool {
+            tx,
+            request_timeout: Duration::from_millis(10),
+        };
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+
+        let result = pool.get_or_connect(node_id, Alpn::Bao).await;
+
+        assert!(matches!(result, Err(PoolConnectError::Timeout)));
     }
 }
 

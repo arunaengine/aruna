@@ -12,6 +12,7 @@ pub mod drs;
 pub mod groups;
 pub mod info;
 pub mod metadata;
+pub mod notifications;
 pub mod onboarding;
 pub mod staging;
 pub mod users;
@@ -27,6 +28,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(credentials::router())
         .merge(groups::router())
         .merge(metadata::router())
+        .merge(notifications::router())
         .merge(users::router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(from_fn(request_tracing_middleware))

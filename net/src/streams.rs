@@ -239,7 +239,12 @@ pub async fn run_accept_loop(
                         Some(Alpn::Dht) => {
                             run_dht_connection(conn, dht_handler, peer_id).await;
                         }
-                        Some(alpn @ (Alpn::Bao | Alpn::DocumentSync | Alpn::Metadata)) => {
+                        Some(
+                            alpn @ (Alpn::Bao
+                            | Alpn::DocumentSync
+                            | Alpn::Metadata
+                            | Alpn::Notification),
+                        ) => {
                             if alpn == Alpn::DocumentSync {
                                 document_sync.register_inbound_connection(&conn);
                             }

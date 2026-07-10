@@ -358,14 +358,24 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
     initialize_task_incoming(test.context.clone(), TaskHandle::new()).await;
 
     wait_for_projected_record(&test, group_id, &record).await?;
+    // The restored background timer may materialize the job before this manual batch runs.
     let materialized = process_metadata_materialization_batch(test.context.as_ref()).await?;
-    assert_eq!(materialized.processed, 1);
+    assert!(materialized.processed <= 1);
 
-    let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let mut fetched = None;
+    for _ in 0..200 {
+        if let Ok(document) = drive(
+            GetMetadataDocumentOperation::new(group_id, document_id),
+            test.context.as_ref(),
+        )
+        .await
+        {
+            fetched = Some(document);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let fetched = fetched.ok_or("timed out waiting for metadata materialization")?;
     assert_eq!(fetched.record, record);
     assert!(fetched.jsonld.contains("Scheduled Recovery Dataset"));
     Ok(())

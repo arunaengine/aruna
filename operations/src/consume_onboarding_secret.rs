@@ -24,10 +24,16 @@ pub struct ConsumeOnboardingSecretInput {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct ConsumeOnboardingSecretOutput {
+    pub record: OnboardingSecretRecord,
+    pub consumed_now: bool,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct ConsumeOnboardingSecretOperation {
     input: ConsumeOnboardingSecretInput,
     state: ConsumeOnboardingSecretState,
-    output: Option<Result<OnboardingSecretRecord, ConsumeOnboardingSecretError>>,
+    output: Option<Result<ConsumeOnboardingSecretOutput, ConsumeOnboardingSecretError>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +49,7 @@ enum ConsumeOnboardingSecretState {
     },
     CommitTransaction {
         record: OnboardingSecretRecord,
+        consumed_now: bool,
     },
     Finish,
     Error,
@@ -83,7 +90,7 @@ impl ConsumeOnboardingSecretOperation {
 }
 
 impl Operation for ConsumeOnboardingSecretOperation {
-    type Output = OnboardingSecretRecord;
+    type Output = ConsumeOnboardingSecretOutput;
     type Error = ConsumeOnboardingSecretError;
 
     fn start(&mut self) -> Effects {
@@ -222,6 +229,7 @@ impl Operation for ConsumeOnboardingSecretOperation {
                         record.claimed_node_id = Some(self.input.node_id.clone());
                         self.state = ConsumeOnboardingSecretState::CommitTransaction {
                             record: record.clone(),
+                            consumed_now: false,
                         };
                         return smallvec![Effect::Storage(StorageEffect::CommitTransaction {
                             txn_id,
@@ -287,10 +295,14 @@ impl Operation for ConsumeOnboardingSecretOperation {
 
                 self.state = ConsumeOnboardingSecretState::CommitTransaction {
                     record: record.clone(),
+                    consumed_now: true,
                 };
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            ConsumeOnboardingSecretState::CommitTransaction { record } => {
+            ConsumeOnboardingSecretState::CommitTransaction {
+                record,
+                consumed_now,
+            } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
@@ -304,7 +316,10 @@ impl Operation for ConsumeOnboardingSecretOperation {
                 };
 
                 self.state = ConsumeOnboardingSecretState::Finish;
-                self.output = Some(Ok(record));
+                self.output = Some(Ok(ConsumeOnboardingSecretOutput {
+                    record,
+                    consumed_now,
+                }));
                 smallvec![]
             }
             ConsumeOnboardingSecretState::Init
@@ -402,7 +417,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(consumed.claimed_node_id.as_deref(), Some("node-a"));
+        assert_eq!(consumed.record.claimed_node_id.as_deref(), Some("node-a"));
+        assert!(consumed.consumed_now);
 
         let second = drive(
             ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
@@ -414,7 +430,7 @@ mod tests {
             &context,
         )
         .await;
-        assert!(second.is_ok());
+        assert!(!second.unwrap().consumed_now);
 
         let different_node = drive(
             ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
