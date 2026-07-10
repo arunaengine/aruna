@@ -315,7 +315,7 @@ async fn seed_realm_config_sync_topic(
         },
     )?;
 
-    match nodes[0]
+    match nodes[1]
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::PublishDocuments {

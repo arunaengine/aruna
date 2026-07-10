@@ -47,9 +47,10 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
-    NodeInfoDocument, NodeUsageSnapshot, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    Role, User, WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
+    Group, GroupAuthorizationDocument, KIND_LABEL_KEY, MetadataRegistryRecord,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role, User,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
     node_usage_key_node_id, watch_interest_dirty_key, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
@@ -1851,6 +1852,58 @@ impl DocumentSyncService {
                             "Skipping unsupported whole-document admin sync event"
                         );
                         continue;
+                    }
+                    DocumentSyncEvent::AdminOperation { target, event }
+                        if is_realm_config_placement_operation(&event.op) =>
+                    {
+                        let current_config = match &target {
+                            DocumentSyncTarget::RealmConfig { .. } => match self
+                                .storage_read(
+                                    target.storage_keyspace().to_string(),
+                                    target.storage_key(),
+                                )
+                                .await?
+                            {
+                                Some(bytes) => match RealmConfigDocument::from_bytes(&bytes) {
+                                    Ok(config) => Some(config),
+                                    Err(error) => {
+                                        warn!(
+                                            %topic_id,
+                                            event_id = %event.event_id,
+                                            %error,
+                                            "Rejecting realm config placement admin operation: current realm config is invalid"
+                                        );
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            },
+                            _ => None,
+                        };
+                        if let Err(reason) = validate_replicated_realm_config_placement_event(
+                            topic_id,
+                            actor_id,
+                            &target,
+                            &event,
+                            current_config.as_ref(),
+                        ) {
+                            warn!(
+                                %topic_id,
+                                event_id = %event.event_id,
+                                origin_node_id = %event.origin_node_id,
+                                %reason,
+                                "Rejecting unauthorized realm config placement admin operation"
+                            );
+                            continue;
+                        }
+
+                        apply_admin_document_operation_to_storage(
+                            &self.storage,
+                            target.clone(),
+                            *event,
+                        )
+                        .await?;
+                        applied_targets.push(target);
                     }
                     event => {
                         let target = event.target().clone();
@@ -3882,6 +3935,88 @@ fn metadata_document_delete_write_entries(
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
+}
+
+fn is_realm_config_placement_operation(op: &AdminDocumentOperation) -> bool {
+    matches!(
+        op,
+        AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
+            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
+            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+    )
+}
+
+fn validate_replicated_realm_config_placement_event(
+    topic_id: irokle_crate::TopicId,
+    authenticated_actor_id: irokle_crate::ActorId,
+    target: &DocumentSyncTarget,
+    event: &AdminDocumentEvent,
+    current_config: Option<&RealmConfigDocument>,
+) -> std::result::Result<(), String> {
+    if !is_realm_config_placement_operation(&event.op) {
+        return Err("event is not a realm config placement operation".to_string());
+    }
+    match &event.op {
+        AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
+            if entry.labels.contains_key(KIND_LABEL_KEY) =>
+        {
+            return Err(format!(
+                "placement entry must not set reserved label {KIND_LABEL_KEY}"
+            ));
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
+            if strategy.replica_count == Some(0) =>
+        {
+            return Err("placement strategy replica count must be greater than zero".to_string());
+        }
+        _ => {}
+    }
+
+    let DocumentSyncTarget::RealmConfig { realm_id } = target else {
+        return Err("document sync target is not a realm config".to_string());
+    };
+    if target.sync_topic_id() != topic_id {
+        return Err("document sync target does not belong to the reconciled topic".to_string());
+    }
+    let AdminDocumentTarget::RealmConfig {
+        realm_id: event_realm_id,
+    } = &event.target
+    else {
+        return Err("admin event target is not a realm config".to_string());
+    };
+    if event_realm_id != realm_id || event.actor.realm_id != *realm_id {
+        return Err("document target, admin event, and actor realms do not match".to_string());
+    }
+    if event.origin_node_id != event.actor.node_id {
+        return Err("event origin node does not match its actor node".to_string());
+    }
+
+    let expected_actor_id =
+        irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&event.origin_node_id));
+    if authenticated_actor_id != expected_actor_id {
+        return Err("authenticated publisher does not match the event origin node".to_string());
+    }
+
+    let Some(current_config) = current_config else {
+        return Err("current realm config is unavailable".to_string());
+    };
+    if current_config.realm_id != *realm_id {
+        return Err("current realm config does not match the event realm".to_string());
+    }
+    let origin_node_id = event.origin_node_id.to_string();
+    if !current_config.nodes.iter().any(|node| {
+        node.node_id == origin_node_id && matches!(&node.kind, RealmNodeKind::Management)
+    }) {
+        return Err("event origin is not a current management node".to_string());
+    }
+
+    Ok(())
 }
 
 /// Validates the self-consistency of a replicated node-usage snapshot against
@@ -8687,6 +8822,396 @@ mod tests {
 
         service.shutdown().await;
     }
+
+    #[test]
+    fn replicated_realm_config_placement_validation_requires_management_publisher() {
+        let realm_id = RealmId::from_bytes([63; 32]);
+        let other_realm_id = RealmId::from_bytes([64; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_600, 1), realm_id);
+        let actor = test_actor(63, user_id, realm_id);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id();
+        let authenticated_actor_id =
+            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+
+        let entry = NodePlacementEntry {
+            node_id: actor.node_id,
+            location: "eu-west".to_string(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_parts(1_601, 1),
+            name: "default".to_string(),
+            replica_count: Some(3),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let binding = StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::Metadata),
+            strategy_id: strategy.strategy_id,
+        };
+        let record = PlacementOverride {
+            subject: b"placement-subject".to_vec(),
+            pinned: vec![actor.node_id],
+            excluded: Vec::new(),
+            strategy_id: Some(strategy.strategy_id),
+        };
+        let placement_operations = vec![
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: entry.clone(),
+            },
+            AdminDocumentOperation::RealmConfigNodePlacementRemoved {
+                node_id: actor.node_id,
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+                strategy_id: strategy.strategy_id,
+            },
+            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                strategy_id: strategy.strategy_id,
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: binding.clone(),
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+                scope: binding.scope.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: record.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
+                subject: record.subject.clone(),
+            },
+        ];
+
+        for (index, op) in placement_operations.into_iter().enumerate() {
+            assert!(is_realm_config_placement_operation(&op));
+            let event = test_admin_event(
+                Ulid::from_parts(1_602 + index as u64, 1),
+                AdminDocumentTarget::RealmConfig { realm_id },
+                &actor,
+                index as u64 + 1,
+                op,
+            );
+            assert!(
+                validate_replicated_realm_config_placement_event(
+                    topic_id,
+                    authenticated_actor_id,
+                    &target,
+                    &event,
+                    Some(&config),
+                )
+                .is_ok()
+            );
+        }
+        assert!(!is_realm_config_placement_operation(
+            &AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "unrelated".to_string(),
+            }
+        ));
+
+        let valid_event = test_admin_event(
+            Ulid::from_parts(1_620, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &actor,
+            10,
+            AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
+        );
+
+        let mut wrong_realm = valid_event.clone();
+        wrong_realm.target = AdminDocumentTarget::RealmConfig {
+            realm_id: other_realm_id,
+        };
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &wrong_realm,
+                Some(&config),
+            )
+            .is_err()
+        );
+
+        let mut wrong_actor_realm = valid_event.clone();
+        wrong_actor_realm.actor.realm_id = other_realm_id;
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &wrong_actor_realm,
+                Some(&config),
+            )
+            .is_err()
+        );
+
+        let mut wrong_origin = valid_event.clone();
+        wrong_origin.origin_node_id = node(65);
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &wrong_origin,
+                Some(&config),
+            )
+            .is_err()
+        );
+
+        let wrong_authenticated_actor_id =
+            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&node(66)));
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                wrong_authenticated_actor_id,
+                &target,
+                &valid_event,
+                Some(&config),
+            )
+            .is_err()
+        );
+
+        let mut server_config = config.clone();
+        server_config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &valid_event,
+                Some(&server_config),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &valid_event,
+                None,
+            )
+            .is_err()
+        );
+
+        let mut invalid_strategy_event = valid_event;
+        invalid_strategy_event.op = AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            strategy: PlacementStrategy {
+                replica_count: Some(0),
+                ..strategy
+            },
+        };
+        assert!(
+            validate_replicated_realm_config_placement_event(
+                topic_id,
+                authenticated_actor_id,
+                &target,
+                &invalid_strategy_event,
+                Some(&config),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unauthorized_placement_ops_and_advances_cursor() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(63).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let realm_id = RealmId::from_bytes([63; 32]);
+        let other_realm_id = RealmId::from_bytes([64; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_630, 1), realm_id);
+        let local_actor = test_actor(63, user_id, realm_id);
+        let claimed_actor = test_actor(64, user_id, realm_id);
+        assert_eq!(
+            service.local_node_id().expect("local node id"),
+            local_actor.node_id
+        );
+
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let topic_id = target.sync_topic_id();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
+        config.ensure_node(claimed_actor.node_id, RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                target.clone(),
+                config
+                    .to_bytes(&local_actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let placement_entry = |node_id| NodePlacementEntry {
+            node_id,
+            location: "eu".to_string(),
+            weight: 250,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+        let wrong_realm_event = test_admin_event(
+            Ulid::from_parts(1_631, 1),
+            AdminDocumentTarget::RealmConfig {
+                realm_id: other_realm_id,
+            },
+            &local_actor,
+            1,
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(node(90)),
+            },
+        );
+        let impersonated_event = test_admin_event(
+            Ulid::from_parts(1_632, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &claimed_actor,
+            1,
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(node(91)),
+            },
+        );
+        let reducer_invalid_event = test_admin_event(
+            Ulid::from_parts(1_633, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            2,
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: PlacementStrategy {
+                    strategy_id: Ulid::from_parts(1_633, 2),
+                    name: "invalid".to_string(),
+                    replica_count: Some(0),
+                    distinct_locations: false,
+                    affinity: Vec::new(),
+                },
+            },
+        );
+        let valid_event = test_admin_event(
+            Ulid::from_parts(1_634, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &local_actor,
+            3,
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(local_actor.node_id),
+            },
+        );
+        // This deliberately has the same publisher/claimed-actor mismatch as the
+        // rejected placement event. Unrelated admin operations keep their prior behavior.
+        let unrelated_event = test_admin_event(
+            Ulid::from_parts(1_635, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &claimed_actor,
+            2,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "unrelated operation applied".to_string(),
+            },
+        );
+
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(wrong_realm_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(impersonated_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(reducer_invalid_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(valid_event),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::AdminOperation {
+                        target: target.clone(),
+                        event: Box::new(unrelated_event),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(topic_id),
+                ByteView::from(
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes"),
+                ),
+            )
+            .await
+            .expect("cursor reset");
+
+        let result = service
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("unauthorized placement events are skipped");
+        assert!(result.targets.contains(&target));
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert_eq!(config.description, "unrelated operation applied");
+        assert_eq!(
+            config.placement_map,
+            vec![placement_entry(local_actor.node_id)]
+        );
+
+        let cursor_bytes = read_storage_value(
+            &storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = service
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "cursor must advance past unauthorized placement events"
+        );
+
+        service.shutdown().await;
+    }
+
     #[test]
     fn validate_node_usage_upsert_accepts_owner_and_rejects_forgeries() {
         use aruna_core::structs::UsageCounters;
