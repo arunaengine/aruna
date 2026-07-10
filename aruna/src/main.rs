@@ -4,7 +4,7 @@ use aruna::bootstrap::{
     announce_core_documents, ensure_initial_local_onboarding_secret,
     fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
-use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
@@ -18,7 +18,7 @@ use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
-use aruna_core::structs::{Actor, RealmNodeKind};
+use aruna_core::structs::{Actor, NodeUrls, RealmNodeKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -131,24 +131,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to publish initial node usage snapshots");
     }
 
-    // Seed (or refresh) this node's info document from config so realm peers see
-    // this node's labels, urls, and utilization. The periodic PublishNodeInfo
-    // heartbeat republishes it; here we set the config-sourced labels/urls once.
-    if let Err(error) = aruna_operations::node_info::publish_node_info(
-        driver_ctx.as_ref(),
-        config.node_id,
-        config.realm_id,
-        config.node_labels.clone(),
-        aruna_core::structs::NodeUrls {
-            api: None,
-            s3: Some(config.s3_host.clone()),
-        },
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to publish initial node info document");
-    }
-
     let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
     if replayed_metadata_events > 0 {
         info!(
@@ -160,15 +142,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
-            if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
-                announce_core_documents(
-                    driver_ctx.as_ref(),
-                    config.node_id,
-                    &config.realm_id,
-                    true,
-                )
-                .await?;
-            } else {
+            if !realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
                 drive(
                     CreateRealmOperation::new(CreateRealmConfig {
                         actor: Actor {
@@ -185,18 +159,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     driver_ctx.as_ref(),
                 )
                 .await?;
-                // CreateRealm mints the realm-auth/realm-config genesis via its admin
-                // operation outbox records, but not the shared node-usage and
-                // watch-interest topics. Announce core documents here so their
-                // genesis is minted on the fresh-bootstrap path too.
-                announce_core_documents(
-                    driver_ctx.as_ref(),
-                    config.node_id,
-                    &config.realm_id,
-                    true,
-                )
-                .await?;
             }
+            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
+            // CreateRealm mints the realm-auth/realm-config genesis via its admin
+            // operation outbox records, but not the shared realm topics. Seed
+            // NodeInfo first so its stored document is included in bootstrap.
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, true)
+                .await?;
 
             if config.is_initial_node() {
                 match ensure_initial_local_onboarding_secret(
@@ -241,6 +210,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
                 }
             }
+            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
             // A joining node is never the realm-bootstrap node: it announces the
             // shared topics with allow_genesis=false after onboarding fetched a
             // representative target for each.
@@ -279,6 +249,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
+            seed_local_node_info(driver_ctx.as_ref(), &config).await?;
             // The realm-bootstrap node retains genesis authority so a missing
             // shared topic can be repaired after a partial first boot. Onboarded
             // nodes still wait for that authoritative genesis.
@@ -400,6 +371,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     Ok(())
+}
+
+async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
+    aruna_operations::node_info::seed_node_info_document(
+        ctx,
+        config.node_id,
+        config.realm_id,
+        NodeUrls {
+            api: None,
+            s3: Some(config.s3_host.clone()),
+        },
+    )
+    .await
 }
 
 async fn shutdown_runtime(

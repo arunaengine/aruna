@@ -565,8 +565,9 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parses `ARUNA_NODE_LABELS` in `k=v,k2=v2` form. Rejects malformed pairs and
-/// the derived-only [`KIND_LABEL_KEY`], which is stamped from `RealmNode.kind`.
+/// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
+/// in `k=v,k2=v2` form. Rejects malformed pairs and the derived-only
+/// [`KIND_LABEL_KEY`], which is stamped from `RealmNode.kind`.
 fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
     const KEY: &str = "ARUNA_NODE_LABELS";
     let raw = dotenvy::var(KEY).unwrap_or_default();

@@ -18,6 +18,8 @@ use aruna_tasks::TaskHandle;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
+use crate::get_realm_config::GetRealmConfigOperation;
+use crate::placement::build_view;
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Interval between node-info heartbeat republishes. Peers treat a node's
@@ -32,21 +34,19 @@ pub fn schedule_node_info_publish_effect(after: Duration) -> Effect {
     })
 }
 
-/// Assembles this node's info document from the given labels/urls plus current
-/// local usage, persists it under the single-writer node-info key, and
-/// replicates it over the shared realm topic. Used at startup with
-/// config-sourced labels/urls to seed (or refresh) the document.
-pub async fn publish_node_info(
+/// Assembles this node's info document from its current placement-view labels,
+/// the given urls, and current local usage, then persists it under the
+/// single-writer node-info key without queuing replication.
+pub async fn seed_node_info_document(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
-    labels: BTreeMap<String, String>,
     urls: NodeUrls,
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let document = NodeInfoDocument {
         node_id,
-        labels,
+        labels: current_placement_labels(ctx, node_id, realm_id).await?,
         urls,
         utilization: NodeUtilization {
             storage_bytes_used: local_storage_bytes(ctx).await?,
@@ -56,14 +56,27 @@ pub async fn publish_node_info(
         },
         updated_at_ms: now,
     };
-    write_node_info_document(&ctx.storage_handle, &document).await?;
+    write_node_info_document(&ctx.storage_handle, &document).await
+}
+
+/// Seeds this node's current info document and replicates it over the shared
+/// realm topic. Bootstrap callers must use [`seed_node_info_document`] before
+/// announcing the core documents so the authorized announcement is queued
+/// first.
+pub async fn publish_node_info(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    urls: NodeUrls,
+) -> Result<(), String> {
+    seed_node_info_document(ctx, node_id, realm_id, urls).await?;
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
-/// Heartbeat: refreshes the persisted node-info document's dynamic fields
-/// (utilization + heartbeat/updated timestamps) and republishes it. Labels and
-/// urls are preserved from the stored document (seeded at startup from config).
-/// A missing document is a no-op: the startup seed always runs first.
+/// Heartbeat: refreshes the persisted node-info document's placement-view
+/// labels, utilization, and timestamps, then republishes it. URLs remain the
+/// startup-seeded values. A missing document is a no-op: the startup seed always
+/// runs first.
 pub async fn refresh_node_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -73,11 +86,28 @@ pub async fn refresh_node_info_heartbeat(
         return Ok(());
     };
     let now = unix_timestamp_millis();
+    document.labels = current_placement_labels(ctx, node_id, realm_id).await?;
     document.utilization.storage_bytes_used = local_storage_bytes(ctx).await?;
     document.utilization.heartbeat_at_ms = now;
     document.updated_at_ms = now;
     write_node_info_document(&ctx.storage_handle, &document).await?;
     replicate_node_info(ctx, node_id, realm_id).await
+}
+
+async fn current_placement_labels(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+) -> Result<BTreeMap<String, String>, String> {
+    let config = drive(GetRealmConfigOperation::new(realm_id), ctx)
+        .await
+        .map_err(|error| format!("failed to read realm config for node info: {error}"))?;
+    build_view(&config)
+        .nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| node.labels)
+        .ok_or_else(|| format!("node {node_id} is missing from the realm placement view"))
 }
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
@@ -98,7 +128,7 @@ async fn replicate_node_info(
             excluded_peers: Vec::new(),
             documents: vec![DocumentSyncTarget::NodeInfo { realm_id, node_id }],
             // Shared-topic genesis is bootstrapped by announce_core_documents;
-            // startup seeds and periodic heartbeats only publish into it.
+            // explicit publishes and periodic heartbeats only publish into it.
             allow_genesis: false,
         }),
         ctx,
@@ -188,7 +218,9 @@ mod tests {
     use super::*;
     use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::{
+        KIND_LABEL_KEY, NodePlacementEntry, RealmConfigDocument, RealmNodeKind,
+    };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
@@ -206,19 +238,27 @@ mod tests {
         }
     }
 
-    async fn seed_realm_config(ctx: &DriverContext, realm_id: RealmId, nodes: &[NodeId]) {
+    fn realm_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
         for node_id in nodes {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }
+        config
+    }
+
+    async fn write_realm_config(ctx: &DriverContext, config: &RealmConfigDocument) {
+        let node_id = config.node_ids().unwrap()[0];
         let actor = aruna_core::structs::Actor {
-            node_id: nodes[0],
-            user_id: aruna_core::types::UserId::nil(realm_id),
-            realm_id,
+            node_id,
+            user_id: aruna_core::types::UserId::nil(config.realm_id),
+            realm_id: config.realm_id,
         };
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
-        ctx.storage_handle
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: config.realm_id,
+        };
+        let event = ctx
+            .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: target.storage_keyspace().to_string(),
                 key: target.storage_key(),
@@ -226,6 +266,10 @@ mod tests {
                 txn_id: None,
             })
             .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
     }
 
     async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentSyncOutboxRecord> {
@@ -249,19 +293,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_writes_document_and_queues_outbox() {
+    async fn seed_writes_document_without_queuing_outbox() {
+        let dir = tempdir().unwrap();
+        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let local = node(1);
+        let mut config = realm_config(realm_id, &[local]);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: local,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+        });
+        write_realm_config(&ctx, &config).await;
+
+        seed_node_info_document(
+            &ctx,
+            local,
+            realm_id,
+            NodeUrls {
+                api: None,
+                s3: Some("s3.example".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = read_node_info_document(&ctx.storage_handle, local)
+            .await
+            .unwrap()
+            .expect("seeded node info document");
+        assert_eq!(stored.labels.get("tier").unwrap(), "hot");
+        assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
+        assert_eq!(stored.utilization.storage_bytes_used, 0);
+        assert!(read_outbox(&ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_uses_selector_labels_and_queues_outbox() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let local = node(1);
-        seed_realm_config(&ctx, realm_id, &[local, node(2)]).await;
+        let mut config = realm_config(realm_id, &[local, node(2)]);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: local,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+        });
+        let expected_labels = build_view(&config)
+            .nodes
+            .into_iter()
+            .find(|node| node.node_id == local)
+            .unwrap()
+            .labels;
+        write_realm_config(&ctx, &config).await;
 
-        let labels = BTreeMap::from([("tier".to_string(), "hot".to_string())]);
         publish_node_info(
             &ctx,
             local,
             realm_id,
-            labels.clone(),
             NodeUrls {
                 api: None,
                 s3: Some("s3.example".to_string()),
@@ -275,7 +371,8 @@ mod tests {
             .unwrap()
             .expect("node info document persisted");
         assert_eq!(stored.node_id, local);
-        assert_eq!(stored.labels, labels);
+        assert_eq!(stored.labels, expected_labels);
+        assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
         assert_eq!(stored.urls.s3.as_deref(), Some("s3.example"));
         assert_eq!(stored.utilization.documents_held, 0);
 
@@ -295,19 +392,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_preserves_labels_and_advances_timestamp() {
+    async fn heartbeat_reflects_placement_changes_and_drops_stale_labels() {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let local = node(1);
-        seed_realm_config(&ctx, realm_id, &[local]).await;
+        let mut config = realm_config(realm_id, &[local]);
+        config.placement_map.push(NodePlacementEntry {
+            node_id: local,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([
+                ("stale".to_string(), "remove-me".to_string()),
+                ("zone".to_string(), "a".to_string()),
+            ]),
+        });
+        write_realm_config(&ctx, &config).await;
 
-        let labels = BTreeMap::from([("zone".to_string(), "a".to_string())]);
         publish_node_info(
             &ctx,
             local,
             realm_id,
-            labels.clone(),
             NodeUrls {
                 api: None,
                 s3: None,
@@ -320,6 +427,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        config.placement_map[0].labels = BTreeMap::from([
+            ("rack".to_string(), "r7".to_string()),
+            ("zone".to_string(), "b".to_string()),
+        ]);
+        let expected_labels = build_view(&config).nodes[0].labels.clone();
+        write_realm_config(&ctx, &config).await;
+
         refresh_node_info_heartbeat(&ctx, local, realm_id)
             .await
             .unwrap();
@@ -328,7 +442,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(second.labels, labels);
+        assert_eq!(second.labels, expected_labels);
+        assert_eq!(second.labels.get("zone").unwrap(), "b");
+        assert!(!second.labels.contains_key("stale"));
         assert!(second.updated_at_ms >= first.updated_at_ms);
         assert!(second.utilization.heartbeat_at_ms >= first.utilization.heartbeat_at_ms);
 
@@ -353,7 +469,7 @@ mod tests {
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let local = node(1);
-        seed_realm_config(&ctx, realm_id, &[local]).await;
+        write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
         refresh_node_info_heartbeat(&ctx, local, realm_id)
             .await

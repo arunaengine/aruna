@@ -34,7 +34,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node_info::publish_node_info;
+use aruna_operations::node_info::seed_node_info_document;
 use aruna_operations::s3::get_user_access::GetUserAccessOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -541,19 +541,6 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
     let context = initialize_context(storage, net.clone(), full_storage_config.as_ref()).await?;
 
-    publish_node_info(
-        context.as_ref(),
-        net.node_id(),
-        realm_id,
-        Default::default(),
-        NodeUrls {
-            api: None,
-            s3: None,
-        },
-    )
-    .await
-    .map_err(std::io::Error::other)?;
-
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {
@@ -570,6 +557,17 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         context.as_ref(),
     )
     .await?;
+    seed_node_info_document(
+        context.as_ref(),
+        net.node_id(),
+        realm_id,
+        NodeUrls {
+            api: None,
+            s3: None,
+        },
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     announce_core_documents(context.as_ref(), net.node_id(), &realm_id, true).await?;
     drive(
         ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
@@ -661,6 +659,17 @@ async fn spawn_joiner_node_with_mode(
         OnboardingPhase::CoreDocumentsFetched,
     )
     .await?;
+    seed_node_info_document(
+        joiner_context.as_ref(),
+        config.node_id,
+        config.realm_id,
+        NodeUrls {
+            api: None,
+            s3: Some(config.s3_host.clone()),
+        },
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     announce_core_documents(
         joiner_context.as_ref(),
         config.node_id,
@@ -850,6 +859,7 @@ async fn load_config_with_env(
         ("S3_HOST", "127.0.0.1:0".to_string()),
         ("S3_ADDRESS", "127.0.0.1:0".to_string()),
         ("ONBOARDING_SECRET", onboarding_secret),
+        ("ARUNA_NODE_LABELS", "fixture=joiner".to_string()),
     ];
 
     let _lock = env_lock().lock().await;

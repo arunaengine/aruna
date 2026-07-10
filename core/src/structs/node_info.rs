@@ -57,7 +57,7 @@ mod tests {
     fn node_info_document_round_trips() {
         let document = NodeInfoDocument {
             node_id: node(1),
-            labels: BTreeMap::from([(KIND_LABEL_KEY.to_string(), "Server".to_string())]),
+            labels: BTreeMap::from([(KIND_LABEL_KEY.to_string(), "server".to_string())]),
             urls: NodeUrls {
                 api: Some("https://api.example".to_string()),
                 s3: None,
