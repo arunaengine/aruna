@@ -2341,6 +2341,7 @@ mod tests {
                 realm_id: RealmId::from_bytes([seed; 32]),
             },
             event: aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+            placement: aruna_core::structs::PlacementRef::NIL,
             allow_genesis: false,
         }
     }

@@ -9753,6 +9753,8 @@ mod tests {
     async fn topic_not_ready_publish_does_not_block_ready_batch_record() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([62; 32]);
+        let placement = aruna_core::structs::PlacementRef::NIL;
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(62).await,
             storage,
@@ -9761,6 +9763,7 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
@@ -9771,8 +9774,8 @@ mod tests {
         let ready_target = DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_parts(62, 2),
         };
-        let blocked_topic = blocked_target.sync_topic_id();
-        let ready_topic = ready_target.sync_topic_id();
+        let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
+        let ready_topic = ready_target.sync_topic_id(realm_id, &placement);
         let change = DocumentSyncChange {
             base: None,
             current: DocumentSyncRevision {
@@ -9782,7 +9785,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: aruna_core::structs::PlacementRef::NIL,
+            placement,
         };
 
         let published = service

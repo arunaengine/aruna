@@ -149,12 +149,18 @@ struct LegacyDocumentSyncOutboxRecord {
 
 impl From<LegacyDocumentSyncOutboxRecord> for DocumentSyncOutboxRecord {
     fn from(legacy: LegacyDocumentSyncOutboxRecord) -> Self {
+        let placement = match &legacy.event {
+            DocumentSyncOutboxEvent::Upsert { change, .. }
+            | DocumentSyncOutboxEvent::Delete { change } => change.placement,
+            DocumentSyncOutboxEvent::AdminOperation { .. } => PlacementRef::NIL,
+        };
         Self {
             outbox_id: legacy.outbox_id,
             node_id: legacy.node_id,
             target: legacy.target,
             peers: legacy.peers,
             event: legacy.event,
+            placement,
             updated_at: legacy.updated_at,
             // Before `allow_genesis` existed, outbox publishes could mint missing
             // sync topic genesis. Preserve that behavior for already-queued work.
@@ -421,6 +427,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            PlacementRef::NIL,
             false,
         );
         legacy.outbox_id = Ulid::from_parts(3, 4);
@@ -435,7 +442,7 @@ mod tests {
 
         let mut expected = legacy;
         expected.allow_genesis = true;
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
             .expect("outbox read succeeds");
 
