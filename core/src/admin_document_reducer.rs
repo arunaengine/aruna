@@ -13,7 +13,8 @@ use crate::admin_documents::{
 use crate::structs::{
     Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, MetadataRegistryRecord,
     MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, PlacementOverride,
-    PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+    PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind, StrategyBinding,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -70,6 +71,115 @@ pub struct AdminDocumentReducerState {
     pub user_name: Option<AdminDocumentAttributeVersion>,
     #[serde(default)]
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
+}
+
+/// Overlays the realm-config placement paths owned by `reducer_state` onto `config`.
+/// Paths absent from both the reducer values and conflicts remain untouched.
+pub fn overlay_realm_config_placement_reducer_materialization(
+    config: &mut RealmConfigDocument,
+    reducer_state: &AdminDocumentReducerState,
+) {
+    if reducer_state
+        .user_subject_ids
+        .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        || reducer_state
+            .conflicts
+            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+    {
+        config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
+    }
+
+    let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(node_id) = realm_config_placement_node_id_from_path(path) {
+            config
+                .placement_map
+                .retain(|entry| entry.node_id != node_id);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(node_id) = realm_config_placement_node_id_from_path(path) else {
+            continue;
+        };
+        config
+            .placement_map
+            .retain(|entry| entry.node_id != node_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(entry) = materialized_placement_map.get(&node_id) {
+            config.placement_map.push(entry.clone());
+        }
+    }
+
+    let materialized_strategies = reducer_state.materialized_realm_config_placement_strategies();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) {
+            config
+                .strategies
+                .retain(|strategy| strategy.strategy_id != strategy_id);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) else {
+            continue;
+        };
+        config
+            .strategies
+            .retain(|strategy| strategy.strategy_id != strategy_id);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(strategy) = materialized_strategies.get(&strategy_id) {
+            config.strategies.push(strategy.clone());
+        }
+    }
+
+    let materialized_bindings = reducer_state.materialized_realm_config_strategy_bindings();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) {
+            config
+                .strategy_bindings
+                .retain(|binding| binding_scope_key(&binding.scope) != scope_key);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) else {
+            continue;
+        };
+        config
+            .strategy_bindings
+            .retain(|binding| binding_scope_key(&binding.scope) != scope_key);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(binding) = materialized_bindings.get(scope_key) {
+            config.strategy_bindings.push(binding.clone());
+        }
+    }
+
+    let materialized_overrides = reducer_state.materialized_realm_config_placement_overrides();
+    for path in reducer_state.conflicts.keys() {
+        if let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) {
+            config
+                .placement_overrides
+                .retain(|record| hex::encode(&record.subject) != subject_key);
+        }
+    }
+    for path in reducer_state.user_subject_ids.keys() {
+        let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) else {
+            continue;
+        };
+        config
+            .placement_overrides
+            .retain(|record| hex::encode(&record.subject) != subject_key);
+        if reducer_state.conflicts.contains_key(path) {
+            continue;
+        }
+        if let Some(record) = materialized_overrides.get(subject_key) {
+            config.placement_overrides.push(record.clone());
+        }
+    }
 }
 
 impl AdminDocumentReducerState {
@@ -1356,7 +1466,8 @@ mod tests {
         REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
         binding_scope_key, group_role_id_from_path, group_role_path,
         group_role_user_assignment_from_path, group_role_user_assignment_path,
-        metadata_replication_value, oidc_provider_value, realm_config_node_id_from_path,
+        metadata_replication_value, oidc_provider_value,
+        overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
         realm_config_node_path, realm_config_oidc_provider_id_from_path,
         realm_config_oidc_provider_path, realm_config_placement_node_id_from_path,
         realm_config_placement_node_path, realm_config_placement_strategy_id_from_path,
@@ -1374,7 +1485,8 @@ mod tests {
         Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, GroupQuotaOverride,
         KIND_LABEL_KEY, LabelMatch, MetadataReplicationConfig, NodePlacementEntry,
         OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy, QuotaConfig,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding, UserGroupCapOverride,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+        UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
@@ -3379,6 +3491,106 @@ mod tests {
                 Some(expected_key.as_str())
             );
         }
+    }
+
+    #[test]
+    fn realm_config_placement_overlay_replaces_owned_paths_deterministically() {
+        let owned_node = node(11);
+        let unowned_node = node(12);
+        let owned_entry = placement_entry(owned_node, 250);
+        let unowned_entry = placement_entry(unowned_node, 100);
+        let owned_strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
+        let unowned_strategy = placement_strategy(Ulid::from_bytes([5; 16]), None);
+        let owned_binding = StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: owned_strategy.strategy_id,
+        };
+        let unowned_binding = StrategyBinding {
+            scope: BindingScope::Realm,
+            strategy_id: unowned_strategy.strategy_id,
+        };
+        let owned_override = PlacementOverride {
+            subject: b"owned".to_vec(),
+            pinned: vec![owned_node],
+            excluded: Vec::new(),
+            strategy_id: Some(owned_strategy.strategy_id),
+        };
+        let unowned_override = PlacementOverride {
+            subject: b"unowned".to_vec(),
+            pinned: vec![unowned_node],
+            excluded: Vec::new(),
+            strategy_id: Some(unowned_strategy.strategy_id),
+        };
+
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        config.placement_map = vec![unowned_entry.clone(), placement_entry(owned_node, 1)];
+        config.strategies = vec![
+            unowned_strategy.clone(),
+            placement_strategy(owned_strategy.strategy_id, Some(1)),
+        ];
+        config.default_strategy_id = Some(unowned_strategy.strategy_id);
+        config.strategy_bindings = vec![
+            unowned_binding.clone(),
+            StrategyBinding {
+                scope: owned_binding.scope.clone(),
+                strategy_id: unowned_strategy.strategy_id,
+            },
+        ];
+        config.placement_overrides = vec![
+            unowned_override.clone(),
+            PlacementOverride {
+                subject: owned_override.subject.clone(),
+                pinned: Vec::new(),
+                excluded: vec![owned_node],
+                strategy_id: None,
+            },
+        ];
+
+        let untouched = config.clone();
+        overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state());
+        assert_eq!(config, untouched);
+
+        let mut state = realm_config_state();
+        let actor = actor(node(1));
+        for op in [
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: owned_entry.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: owned_strategy.clone(),
+            },
+            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                strategy_id: owned_strategy.strategy_id,
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: owned_binding.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: owned_override.clone(),
+            },
+        ] {
+            state.apply_operation(&actor, op).unwrap();
+        }
+
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        assert_eq!(config.placement_map, vec![unowned_entry, owned_entry]);
+        assert_eq!(
+            config.strategies,
+            vec![unowned_strategy.clone(), owned_strategy.clone()]
+        );
+        assert_eq!(config.default_strategy_id, Some(owned_strategy.strategy_id));
+        assert_eq!(
+            config.strategy_bindings,
+            vec![unowned_binding, owned_binding]
+        );
+        assert_eq!(
+            config.placement_overrides,
+            vec![unowned_override, owned_override]
+        );
+
+        let materialized = config.clone();
+        overlay_realm_config_placement_reducer_materialization(&mut config, &state);
+        assert_eq!(config, materialized);
     }
 
     #[test]

@@ -1,12 +1,8 @@
-use std::str::FromStr;
-
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_DEFAULT_STRATEGY_PATH,
-    binding_scope_key, realm_config_placement_node_id_from_path,
-    realm_config_placement_override_subject_key_from_path,
-    realm_config_placement_strategy_id_from_path,
-    realm_config_strategy_binding_scope_key_from_path,
+    AdminDocumentReducerError, AdminDocumentReducerState,
+    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
+    realm_config_node_path,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
@@ -447,7 +443,7 @@ fn overlay_realm_config_reducer_materialization(
     reducer_state: &AdminDocumentReducerState,
 ) {
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_node_from_path(path) {
+        if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
         }
     }
@@ -461,91 +457,7 @@ fn overlay_realm_config_reducer_materialization(
         config.ensure_node(node_id, kind);
     }
 
-    if reducer_state
-        .user_subject_ids
-        .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
-        || reducer_state
-            .conflicts
-            .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
-    {
-        config.default_strategy_id = reducer_state.materialized_realm_config_default_strategy();
-    }
-
-    let materialized_placement_map = reducer_state.materialized_realm_config_placement_map();
-    for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_placement_node_id_from_path(path) {
-            remove_realm_config_placement_entry(config, &node_id);
-        }
-    }
-    for path in reducer_state.user_subject_ids.keys() {
-        let Some(node_id) = realm_config_placement_node_id_from_path(path) else {
-            continue;
-        };
-        remove_realm_config_placement_entry(config, &node_id);
-        if reducer_state.conflicts.contains_key(path) {
-            continue;
-        }
-        if let Some(entry) = materialized_placement_map.get(&node_id) {
-            config.placement_map.push(entry.clone());
-        }
-    }
-
-    let materialized_strategies = reducer_state.materialized_realm_config_placement_strategies();
-    for path in reducer_state.conflicts.keys() {
-        if let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) {
-            remove_realm_config_placement_strategy(config, &strategy_id);
-        }
-    }
-    for path in reducer_state.user_subject_ids.keys() {
-        let Some(strategy_id) = realm_config_placement_strategy_id_from_path(path) else {
-            continue;
-        };
-        remove_realm_config_placement_strategy(config, &strategy_id);
-        if reducer_state.conflicts.contains_key(path) {
-            continue;
-        }
-        if let Some(strategy) = materialized_strategies.get(&strategy_id) {
-            config.strategies.push(strategy.clone());
-        }
-    }
-
-    let materialized_bindings = reducer_state.materialized_realm_config_strategy_bindings();
-    for path in reducer_state.conflicts.keys() {
-        if let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) {
-            remove_realm_config_strategy_binding(config, scope_key);
-        }
-    }
-    for path in reducer_state.user_subject_ids.keys() {
-        let Some(scope_key) = realm_config_strategy_binding_scope_key_from_path(path) else {
-            continue;
-        };
-        remove_realm_config_strategy_binding(config, scope_key);
-        if reducer_state.conflicts.contains_key(path) {
-            continue;
-        }
-        if let Some(binding) = materialized_bindings.get(scope_key) {
-            config.strategy_bindings.push(binding.clone());
-        }
-    }
-
-    let materialized_overrides = reducer_state.materialized_realm_config_placement_overrides();
-    for path in reducer_state.conflicts.keys() {
-        if let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) {
-            remove_realm_config_placement_override(config, subject_key);
-        }
-    }
-    for path in reducer_state.user_subject_ids.keys() {
-        let Some(subject_key) = realm_config_placement_override_subject_key_from_path(path) else {
-            continue;
-        };
-        remove_realm_config_placement_override(config, subject_key);
-        if reducer_state.conflicts.contains_key(path) {
-            continue;
-        }
-        if let Some(record) = materialized_overrides.get(subject_key) {
-            config.placement_overrides.push(record.clone());
-        }
-    }
+    overlay_realm_config_placement_reducer_materialization(config, reducer_state);
 }
 
 fn realm_config_node_ensure_is_noop(
@@ -576,39 +488,6 @@ fn realm_config_document_has_node_kind(
 fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
     let node_id = node_id.to_string();
     config.nodes.retain(|node| node.node_id != node_id);
-}
-
-fn remove_realm_config_placement_entry(config: &mut RealmConfigDocument, node_id: &NodeId) {
-    config
-        .placement_map
-        .retain(|entry| entry.node_id != *node_id);
-}
-
-fn remove_realm_config_placement_strategy(config: &mut RealmConfigDocument, strategy_id: &Ulid) {
-    config
-        .strategies
-        .retain(|strategy| strategy.strategy_id != *strategy_id);
-}
-
-fn remove_realm_config_strategy_binding(config: &mut RealmConfigDocument, scope_key: &str) {
-    config
-        .strategy_bindings
-        .retain(|binding| binding_scope_key(&binding.scope) != scope_key);
-}
-
-fn remove_realm_config_placement_override(config: &mut RealmConfigDocument, subject_key: &str) {
-    config
-        .placement_overrides
-        .retain(|record| hex::encode(&record.subject) != subject_key);
-}
-
-fn realm_config_node_path(node_id: &NodeId) -> String {
-    format!("realm_config.nodes.{node_id}")
-}
-
-fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
-    let node_id = path.strip_prefix("realm_config.nodes.")?;
-    NodeId::from_str(node_id).ok()
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, realm_config_placement_node_path,
+    AdminDocumentReducerError, AdminDocumentReducerState,
+    overlay_realm_config_placement_reducer_materialization,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
@@ -159,10 +160,7 @@ impl SetNodePlacementOperation {
                 entry: self.config.entry.clone(),
             },
         )?;
-        // Derive the stored entry from the reducer's materialized state so the
-        // local write agrees with the replicated overlay in net::irokle: a
-        // conflicted placement path leaves the previously stored entry in place.
-        apply_reducer_placement_entry(&mut document, &reducer_state, &self.config.entry);
+        overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_reducer_state.as_ref(),
@@ -347,31 +345,6 @@ impl Operation for SetNodePlacementOperation {
     }
 }
 
-/// Overlays the reducer's materialized placement entry onto the config document,
-/// mirroring the replicated materialization in `net::irokle` and
-/// `ensure_realm_config`: the stored entry is always dropped first, a conflicted
-/// placement path leaves it removed, and only a non-conflicted materialized
-/// value is re-added.
-fn apply_reducer_placement_entry(
-    document: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
-    entry: &NodePlacementEntry,
-) {
-    let path = realm_config_placement_node_path(&entry.node_id);
-    document
-        .placement_map
-        .retain(|existing| existing.node_id != entry.node_id);
-    if reducer_state.conflicts.contains_key(&path) {
-        return;
-    }
-    if let Some(materialized) = reducer_state
-        .materialized_realm_config_placement_map()
-        .get(&entry.node_id)
-    {
-        document.placement_map.push(materialized.clone());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,7 +458,7 @@ mod tests {
     #[test]
     fn conflicted_placement_path_removes_entry() {
         use aruna_core::admin_document_reducer::{
-            AdminDocumentConflict, AdminDocumentConflictValue,
+            AdminDocumentConflict, AdminDocumentConflictValue, realm_config_placement_node_path,
         };
         use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentTarget};
         use ulid::Ulid;
@@ -521,7 +494,7 @@ mod tests {
         );
 
         // Conflicted path: the previously stored entry is removed, not retained.
-        apply_reducer_placement_entry(&mut document, &reducer_state, &entry);
+        overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
         assert!(document.placement_entry(entry.node_id).is_none());
     }
 }
