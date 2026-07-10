@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+use aruna_core::structs::{
+    AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy, RealmNodeKind,
+};
 use ulid::Ulid;
 
 use crate::placement::{PlacementView, ResolvedNode, resolve_holders};
@@ -37,6 +39,18 @@ fn view(weights: &[(u8, u32)]) -> PlacementView {
     PlacementView { nodes }
 }
 
+fn located_node(seed: u8, location: &str, weight: u32) -> ResolvedNode {
+    ResolvedNode {
+        node_id: node_id(seed),
+        kind: RealmNodeKind::Server,
+        location: location.to_string(),
+        weight,
+        full: false,
+        draining: false,
+        labels: BTreeMap::new(),
+    }
+}
+
 fn replica_one() -> PlacementStrategy {
     PlacementStrategy {
         strategy_id: Ulid::nil(),
@@ -57,6 +71,16 @@ fn share_of(view: &PlacementView, strategy: &PlacementStrategy, seed: u8) -> f64
         .filter(|&counter| top_holder(view, strategy, counter) == target)
         .count();
     hits as f64 / SUBJECTS as f64
+}
+
+fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
+    AffinityRule {
+        matcher: LabelMatch {
+            key: key.to_string(),
+            value: value.to_string(),
+        },
+        effect: AffinityEffect::Multiply { permille },
+    }
 }
 
 #[test]
@@ -113,5 +137,31 @@ fn reweight_moves_only_toward_bumped_node() {
     assert!(
         (0.04..0.12).contains(&fraction),
         "movement fraction {fraction} outside proportional-minimum band"
+    );
+}
+
+#[test]
+fn multiply_affinity_changes_cross_location_distribution() {
+    let mut boosted = located_node(1, "a", 100);
+    boosted
+        .labels
+        .insert("tier".to_string(), "boosted".to_string());
+    let view = PlacementView {
+        nodes: vec![boosted, located_node(2, "b", 100)],
+    };
+    let baseline = replica_one();
+    let mut multiplied = baseline.clone();
+    multiplied.affinity = vec![multiply_rule("tier", "boosted", 3_000)];
+
+    let baseline_share = share_of(&view, &baseline, 1);
+    let multiplied_share = share_of(&view, &multiplied, 1);
+
+    assert!(
+        (baseline_share - 0.50).abs() < 0.02,
+        "baseline location share {baseline_share}"
+    );
+    assert!(
+        (multiplied_share - 0.75).abs() < 0.02,
+        "multiplied location share {multiplied_share}"
     );
 }

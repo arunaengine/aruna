@@ -121,7 +121,7 @@ pub fn resolve_holders(
         }
     }
 
-    let ranked = ranked_locations(view, subject, epoch);
+    let ranked = ranked_locations(view, strategy, subject, epoch);
     'outer: for location in &ranked {
         if reached(&result) {
             break;
@@ -220,6 +220,7 @@ struct RankedLocation<'a> {
 
 fn ranked_locations<'a>(
     view: &'a PlacementView,
+    strategy: &PlacementStrategy,
     subject: &[u8],
     epoch: u64,
 ) -> Vec<RankedLocation<'a>> {
@@ -228,12 +229,10 @@ fn ranked_locations<'a>(
         let slot = groups
             .entry(node.location.as_str())
             .or_insert((0, Vec::new()));
-        // W_loc sums configured weights only; full/draining are excluded so a
-        // status flip never reshuffles location order, and non-sync-eligible
-        // kinds (User) never contribute — kind is static, so this keeps the
-        // no-reshuffle invariant (both load-bearing).
-        if node.kind.is_sync_eligible() {
-            slot.0 = slot.0.saturating_add(u64::from(node.weight));
+        // Availability status and subject-level exclusions deliberately do not
+        // affect W_loc, preserving location order when a candidate is rejected.
+        if node.kind.is_sync_eligible() && passes_filters(node, strategy) {
+            slot.0 = slot.0.saturating_add(effective_weight(node, strategy));
         }
         slot.1.push(index);
     }
@@ -707,6 +706,31 @@ mod tests {
     }
 
     #[test]
+    fn filtered_nodes_contribute_zero_to_location_weight() {
+        let mut hot_a = resolved(1, RealmNodeKind::Server, "a", 100);
+        hot_a.labels.insert("tier".to_string(), "hot".to_string());
+        let mut hot_b = resolved(2, RealmNodeKind::Server, "b", 100);
+        hot_b.labels.insert("tier".to_string(), "hot".to_string());
+        let mut cold_b = resolved(3, RealmNodeKind::Server, "b", 900);
+        cold_b.labels.insert("tier".to_string(), "cold".to_string());
+        let view = PlacementView {
+            nodes: vec![hot_a, hot_b, cold_b],
+        };
+        let mut strategy = strategy(Some(1), false);
+        strategy.affinity = vec![filter_rule("tier", "hot")];
+
+        let weights: BTreeMap<String, u64> = ranked_locations(&view, &strategy, b"subject", 0)
+            .into_iter()
+            .map(|location| (location.name.to_string(), location.w_loc))
+            .collect();
+
+        assert_eq!(
+            weights,
+            BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 100)])
+        );
+    }
+
+    #[test]
     fn pinned_first_excluded_skipped_and_counts_toward_target() {
         let mut pinned_full = resolved(3, RealmNodeKind::Server, "c", 100);
         pinned_full.full = true;
@@ -1021,11 +1045,12 @@ mod tests {
                 PlacementView { nodes }
             };
 
-            let baseline: Vec<String> = ranked_locations(&build(false), b"subject", 0)
+            let strategy = strategy(None, false);
+            let baseline: Vec<String> = ranked_locations(&build(false), &strategy, b"subject", 0)
                 .iter()
                 .map(|location| location.name.to_string())
                 .collect();
-            let flipped: Vec<String> = ranked_locations(&build(true), b"subject", 0)
+            let flipped: Vec<String> = ranked_locations(&build(true), &strategy, b"subject", 0)
                 .iter()
                 .map(|location| location.name.to_string())
                 .collect();
@@ -1054,10 +1079,11 @@ mod tests {
                 })
                 .collect();
             let view = PlacementView { nodes: nodes.clone() };
+            let strategy = strategy(None, false);
 
             // W_loc counts only sync-eligible node weights; User weights never
             // contribute to a location's rendezvous weight.
-            for location in ranked_locations(&view, b"subject", 0) {
+            for location in ranked_locations(&view, &strategy, b"subject", 0) {
                 let expected: u64 = nodes
                     .iter()
                     .filter(|node| {
