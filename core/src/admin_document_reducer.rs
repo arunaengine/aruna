@@ -1673,9 +1673,9 @@ mod tests {
     use crate::structs::{
         Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, GroupQuotaOverride,
         KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig,
-        NodePlacementEntry,
-        OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy, QuotaConfig,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+        NodePlacementEntry, OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy,
+        QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        StrategyBinding,
         UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
