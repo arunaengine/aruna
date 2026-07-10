@@ -11,10 +11,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
-    NotificationKind, NotificationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    WatchInterestDigest, WatchSubscription, data_watch_resource_path, watch_interest_node_key,
-    watch_notification_id,
+    NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, data_watch_resource_path,
+    watch_interest_node_key, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
@@ -438,10 +438,11 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::SyncDocument {
-                target: DocumentSyncTarget::WatchInterest {
+                topic: DocumentSyncTarget::WatchInterest {
                     realm_id,
                     node_id: old_holder,
-                },
+                }
+                .sync_topic_id(realm_id, &PlacementRef::NIL),
                 peers: vec![old_holder],
             },
         )))
