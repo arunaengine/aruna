@@ -113,16 +113,20 @@ pub fn route_resource_event(
 
 /// Expands one origin watch event into recipient-addressed records against the
 /// holder's local watch subscriptions. A subscription matches when the event
-/// path starts with its prefix, its mask selects the event kind, and its owner is
-/// not the actor (no self-notify). Each record's id is deterministic in
-/// `(event_id, watch_id)` and its timestamp is the event's, so re-expanding a
-/// redelivered event mints identical records for the holder's idempotent upsert.
+/// path starts with its prefix, its mask selects the event kind, it existed when
+/// the event occurred, and its owner is not the actor (no self-notify). Each
+/// record's id is deterministic in `(event_id, watch_id)` and its timestamp is
+/// the event's, so re-expanding a redelivered event mints identical records for
+/// the holder's idempotent upsert.
 pub fn route_watch_event(
     event: &WatchEvent,
     subscriptions: &[WatchSubscription],
 ) -> Vec<NotificationRecord> {
     let mut records = Vec::new();
     for subscription in subscriptions {
+        if subscription.created_at_ms > event.occurred_at_ms {
+            continue;
+        }
         if subscription.owner == event.actor {
             continue;
         }
@@ -325,6 +329,8 @@ mod tests {
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {
+        let resource = aruna_core::structs::parse_data_watch_resource_path(path)
+            .expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
             realm_id: REALM,
@@ -333,9 +339,35 @@ mod tests {
             actor,
             occurred_at_ms: 5_000,
             detail: WatchEventDetail::DataUploaded {
-                bucket: "bucket".to_string(),
-                key: "object".to_string(),
+                group_id: resource.group_id,
+                node_id: resource.node_id,
+                bucket: resource.bucket.to_string(),
+                key: resource.key_prefix.to_string(),
                 size_bytes: 10,
+            },
+        }
+    }
+
+    fn data_path(node_id: aruna_core::NodeId, bucket: &str, key: &str) -> String {
+        aruna_core::structs::data_watch_resource_path(
+            Ulid::from_bytes([6u8; 16]),
+            node_id,
+            bucket,
+            key,
+        )
+    }
+
+    fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {
+        WatchEvent {
+            event_id: Ulid::from_bytes([8u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/datasets/project/runs/run-42"),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
             },
         }
     }
@@ -344,34 +376,38 @@ mod tests {
     fn watch_event_matches_prefix_mask_and_skips_self() {
         let owner = user(1);
         let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         let subs = vec![
             // Matches: prefix + mask.
             watch_subscription(
                 owner,
-                "bucket/",
+                &data_path(data_node, "bucket", ""),
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             ),
             // Prefix mismatch.
             watch_subscription(
                 owner,
-                "other/",
+                &data_path(data_node, "other", ""),
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             ),
             // Mask mismatch.
             watch_subscription(
                 owner,
-                "bucket/",
+                &data_path(data_node, "bucket", ""),
                 WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
             ),
             // Self-notify: owner is the actor.
             watch_subscription(
                 actor,
-                "bucket/",
+                &data_path(data_node, "bucket", ""),
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             ),
         ];
 
-        let records = route_watch_event(&upload_event(actor, "bucket/object"), &subs);
+        let records = route_watch_event(
+            &upload_event(actor, &data_path(data_node, "bucket", "object")),
+            &subs,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].recipient, owner);
         assert_eq!(records[0].class, NotificationClass::Transient);
@@ -383,15 +419,47 @@ mod tests {
     }
 
     #[test]
+    fn nested_metadata_document_path_matches_canonical_prefix() {
+        let owner = user(1);
+        let actor = user(2);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let document_id = Ulid::from_bytes([4u8; 16]);
+        let subscription = watch_subscription(
+            owner,
+            &format!("meta/{group_id}/datasets/project"),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        );
+
+        let records = route_watch_event(
+            &metadata_event(actor, group_id, document_id),
+            &[subscription],
+        );
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0].kind,
+            NotificationKind::MetadataCreated {
+                path,
+                group_id: event_group_id,
+                document_id: event_document_id,
+                ..
+            } if path == &format!("meta/{group_id}/datasets/project/runs/run-42")
+                && event_group_id == &group_id
+                && event_document_id == &document_id
+        ));
+    }
+
+    #[test]
     fn watch_event_ids_are_deterministic_across_invocations() {
         let owner = user(1);
         let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         let subs = vec![watch_subscription(
             owner,
-            "bucket/",
+            &data_path(data_node, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         )];
-        let event = upload_event(actor, "bucket/object");
+        let event = upload_event(actor, &data_path(data_node, "bucket", "object"));
 
         let first = route_watch_event(&event, &subs);
         let second = route_watch_event(&event, &subs);
@@ -402,28 +470,63 @@ mod tests {
     #[test]
     fn watch_event_with_no_matches_is_empty() {
         let actor = user(2);
-        assert!(route_watch_event(&upload_event(actor, "bucket/object"), &[]).is_empty());
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        assert!(
+            route_watch_event(
+                &upload_event(actor, &data_path(data_node, "bucket", "object")),
+                &[]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
-    fn watch_prefix_matching_is_plain_string_prefix() {
+    fn delayed_watch_event_skips_subscriptions_created_after_it_occurred() {
+        let owner = user(1);
+        let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let prefix = data_path(data_node, "bucket", "");
+        let mut existing = watch_subscription(owner, &prefix, mask);
+        existing.created_at_ms = 5_000;
+        let mut retroactive = watch_subscription(user(3), &prefix, mask);
+        retroactive.created_at_ms = 5_001;
+
+        let records = route_watch_event(
+            &upload_event(actor, &data_path(data_node, "bucket", "object")),
+            &[existing, retroactive],
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, owner);
+    }
+
+    #[test]
+    fn watch_data_prefix_is_node_disambiguated() {
         let owner = user(1);
         let actor = user(2);
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let watched_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let scoped = vec![watch_subscription(
+            owner,
+            &data_path(watched_node, "reports", ""),
+            mask,
+        )];
 
-        // A bare prefix is a plain string prefix, so it also spans sibling names
-        // that merely start with it.
-        let unscoped = vec![watch_subscription(owner, "reports", mask)];
-        assert_eq!(
-            route_watch_event(&upload_event(actor, "reports-private/x"), &unscoped).len(),
-            1
+        assert!(
+            route_watch_event(
+                &upload_event(actor, &data_path(other_node, "reports", "x")),
+                &scoped
+            )
+            .is_empty()
         );
-
-        // A trailing slash scopes the prefix to exactly one bucket/segment.
-        let scoped = vec![watch_subscription(owner, "reports/", mask)];
-        assert!(route_watch_event(&upload_event(actor, "reports-private/x"), &scoped).is_empty());
         assert_eq!(
-            route_watch_event(&upload_event(actor, "reports/x"), &scoped).len(),
+            route_watch_event(
+                &upload_event(actor, &data_path(watched_node, "reports", "x")),
+                &scoped
+            )
+            .len(),
             1
         );
     }

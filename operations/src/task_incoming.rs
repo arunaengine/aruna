@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId, WatchEvent};
+use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
@@ -40,7 +40,7 @@ use crate::metadata::prune_queue::{
     metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
     process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
-use crate::notifications::client::{deliver_remote, deliver_watch_events_remote};
+use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::outbox::{
     NOTIFICATION_DELIVERY_RETRY_AFTER, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE,
@@ -53,15 +53,9 @@ use crate::notifications::prune::{
     NOTIFICATION_PRUNE_POLL_AFTER, NOTIFICATION_PRUNE_RETRY_AFTER,
     process_notification_prune_batch, restore_notification_prune_timer,
 };
-use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
-};
-use crate::notifications::watch::outbox::{
-    WATCH_FORWARD_DELIVERY_RETRY_AFTER, WATCH_FORWARD_OUTBOX_DRAIN_BATCH_SIZE,
-    WATCH_FORWARD_OUTBOX_RETENTION_MS, delete_watch_forward_outbox_records,
-    read_watch_forward_outbox_batch, restore_watch_forward_outbox_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::queue_backoff::timer_retry_after_secs;
@@ -82,10 +76,6 @@ use crate::usage_stats::{
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
-
-/// Watch forward-outbox rows coalesced for one delivery target: the events to
-/// expand/forward and the outbox keys to delete once they land.
-type WatchDrainGroup = (Vec<WatchEvent>, Vec<Vec<u8>>);
 
 #[derive(Debug)]
 struct OperationsTaskHandler {
@@ -1023,145 +1013,6 @@ impl OperationsTaskHandler {
         }
     }
 
-    async fn drain_notification_watch_outbox(&self) {
-        let retry_key = TaskKey::DrainNotificationWatchOutbox;
-
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(key = ?retry_key, "Cannot drain watch forward outbox without net handle");
-            self.reschedule_timer(retry_key, WATCH_FORWARD_DELIVERY_RETRY_AFTER)
-                .await;
-            return;
-        };
-        let local_node_id = net_handle.node_id();
-
-        let mut start_after: Option<Vec<u8>> = None;
-        let mut has_more = false;
-        let mut retry_needed = false;
-        // One delivery attempt per remote holder per run: later rows for a holder
-        // already found unreachable are marked retry without another RPC.
-        let mut failed_holders: HashSet<aruna_core::NodeId> = HashSet::new();
-
-        // Scan the whole outbox every run so a healthy holder's rows are attempted
-        // regardless of how many retry-marked rows sit ahead of them in the FIFO.
-        loop {
-            let batch = match read_watch_forward_outbox_batch(
-                &self.context.storage_handle,
-                start_after.clone(),
-                WATCH_FORWARD_OUTBOX_DRAIN_BATCH_SIZE,
-            )
-            .await
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    warn!(error = %error, "Failed to read watch forward outbox record");
-                    retry_needed = true;
-                    break;
-                }
-            };
-
-            if batch.records.is_empty() {
-                has_more = batch.has_more;
-                break;
-            }
-            has_more = batch.has_more;
-            start_after = batch.records.last().map(|(key, _)| key.clone());
-
-            // Locally-held rows expand against local subscriptions, grouped by
-            // realm; remote rows batch per (holder, realm) since the holder rejects
-            // a mixed-realm batch.
-            let mut local_by_realm: HashMap<RealmId, WatchDrainGroup> = HashMap::new();
-            let mut remote_by_target: HashMap<(aruna_core::NodeId, RealmId), WatchDrainGroup> =
-                HashMap::new();
-
-            for (record_key, outbox_record) in batch.records {
-                let age_ms =
-                    unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
-                if age_ms > WATCH_FORWARD_OUTBOX_RETENTION_MS {
-                    warn!(outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired watch forward outbox record");
-                    if let Err(error) = delete_watch_forward_outbox_records(
-                        &self.context.storage_handle,
-                        vec![record_key],
-                    )
-                    .await
-                    {
-                        warn!(error = %error, "Failed to delete expired watch forward outbox record");
-                        retry_needed = true;
-                    }
-                    continue;
-                }
-
-                let holder = outbox_record.holder_node;
-                let realm_id = outbox_record.event.realm_id;
-                if holder == local_node_id {
-                    let entry = local_by_realm.entry(realm_id).or_default();
-                    entry.0.push(outbox_record.event);
-                    entry.1.push(record_key);
-                } else if failed_holders.contains(&holder) {
-                    retry_needed = true;
-                } else {
-                    let entry = remote_by_target.entry((holder, realm_id)).or_default();
-                    entry.0.push(outbox_record.event);
-                    entry.1.push(record_key);
-                }
-            }
-
-            for (realm_id, (events, keys)) in local_by_realm {
-                match expand_watch_events(&self.context.storage_handle, realm_id, &events).await {
-                    Ok(outcome) => {
-                        for recipient in &outcome.recipients {
-                            net_handle.notify_inbox_activity(*recipient);
-                        }
-                        if let Err(error) =
-                            delete_watch_forward_outbox_records(&self.context.storage_handle, keys)
-                                .await
-                        {
-                            warn!(error = %error, "Failed to delete expanded watch forward outbox records");
-                            retry_needed = true;
-                        }
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Failed to expand watch events into local inbox");
-                        retry_needed = true;
-                    }
-                }
-            }
-
-            for ((holder, _realm_id), (events, keys)) in remote_by_target {
-                if failed_holders.contains(&holder) {
-                    retry_needed = true;
-                    continue;
-                }
-                match deliver_watch_events_remote(net_handle, holder, events).await {
-                    Ok(_) => {
-                        if let Err(error) =
-                            delete_watch_forward_outbox_records(&self.context.storage_handle, keys)
-                                .await
-                        {
-                            warn!(error = %error, "Failed to delete delivered watch forward outbox records");
-                            retry_needed = true;
-                        }
-                    }
-                    Err(error) => {
-                        warn!(holder = %holder, error = %error, "Failed to deliver watch events to remote holder");
-                        failed_holders.insert(holder);
-                        retry_needed = true;
-                    }
-                }
-            }
-
-            if !has_more {
-                break;
-            }
-        }
-
-        if retry_needed {
-            self.reschedule_timer(retry_key, WATCH_FORWARD_DELIVERY_RETRY_AFTER)
-                .await;
-        } else if has_more {
-            self.reschedule_timer(retry_key, Duration::ZERO).await;
-        }
-    }
-
     async fn prune_notifications(&self) {
         let after = match process_notification_prune_batch(&self.context).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
@@ -1206,12 +1057,6 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
             NOTIFICATION_DELIVERY_RETRY_AFTER,
         )
         .await;
-        restore_watch_forward_outbox_timer(
-            &context.storage_handle,
-            &task_handle,
-            WATCH_FORWARD_DELIVERY_RETRY_AFTER,
-        )
-        .await;
         restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -1237,7 +1082,6 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
     restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
-    restore_watch_forward_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
@@ -1393,9 +1237,6 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PublishWatchInterest => {
                 self.publish_watch_interest().await;
-            }
-            TaskKey::DrainNotificationWatchOutbox => {
-                self.drain_notification_watch_outbox().await;
             }
         }
     }

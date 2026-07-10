@@ -504,7 +504,7 @@ pub async fn create_metadata_document(
             event_id: Ulid::new(),
             realm_id: state.get_realm_id(),
             kind: WatchEventKind::MetadataCreated,
-            path: format!("meta/{}/{}", result.group_id, result.document_id),
+            path: format!("meta/{}/{}", result.group_id, result.document_path),
             actor: auth.user_id,
             occurred_at_ms: unix_timestamp_millis(),
             detail: WatchEventDetail::MetadataCreated {

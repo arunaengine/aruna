@@ -6,14 +6,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    NOTIFICATION_WATCH_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
-    Actor, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass, NotificationKind,
-    NotificationRecord, RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail,
-    WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
-    watch_interest_node_key, watch_notification_id,
+    Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
+    NotificationKind, NotificationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
+    WatchInterestDigest, WatchSubscription, data_watch_resource_path, watch_interest_node_key,
+    watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
@@ -26,6 +27,7 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
+use aruna_operations::notifications::watch::interest::ensure_local_watch_interest_digest;
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -39,9 +41,8 @@ use ulid::Ulid;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
-// The forward-outbox drain fires immediately (ResetTimer ZERO) and the publish
-// debounce is 2s, so a few seconds comfortably bounds the window an erroneous
-// delivery would need to land in for the negative assertions.
+// Interest publication is debounced by 2s, so a few seconds comfortably bounds
+// the window an erroneous delivery would need to land in for negative assertions.
 const NEGATIVE_WAIT: Duration = Duration::from_secs(5);
 
 struct TestNode {
@@ -64,15 +65,20 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
     let uploader = UserId::local(Ulid::new(), realm_id);
+    let group_id = Ulid::new();
+    let data_node_id = nodes[1].net.node_id();
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
+    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let subscription = create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
 
     // Node B must observe the holder's interest before the upload matches.
     wait_for_holder(
         &nodes[1],
         realm_id,
-        "bucket/reports/probe",
+        &probe,
         WatchEventKind::DataUploaded,
         holder,
         true,
@@ -85,7 +91,10 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
         event_id,
         realm_id,
         uploader,
-        "bucket/reports/q3/summary.csv",
+        group_id,
+        data_node_id,
+        "bucket",
+        "reports/q3/summary.csv",
         occurred_at_ms,
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
@@ -121,12 +130,24 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     match &record.kind {
         NotificationKind::DataUploaded {
             path,
+            group_id: event_group_id,
+            node_id: event_node_id,
             bucket,
             key,
             size_bytes,
             actor_user_id,
         } => {
-            assert_eq!(path, "bucket/reports/q3/summary.csv");
+            assert_eq!(
+                path,
+                &data_watch_resource_path(
+                    group_id,
+                    data_node_id,
+                    "bucket",
+                    "reports/q3/summary.csv"
+                )
+            );
+            assert_eq!(*event_group_id, group_id);
+            assert_eq!(*event_node_id, data_node_id);
             assert_eq!(bucket, "bucket");
             assert_eq!(key, "reports/q3/summary.csv");
             assert_eq!(*size_bytes, 2048);
@@ -148,8 +169,8 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
     Ok(())
 }
 
-// An event whose path matches no watched prefix writes nothing: the origin never
-// stages a forward-outbox row and no inbox record materializes anywhere.
+// An event whose path matches no watched prefix is not forwarded, and no inbox
+// record materializes anywhere.
 #[tokio::test]
 async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([91u8; 32]);
@@ -158,13 +179,18 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
     let uploader = UserId::local(Ulid::new(), realm_id);
+    let group_id = Ulid::new();
+    let data_node_id = nodes[1].net.node_id();
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
+    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
-        "bucket/reports/probe",
+        &probe,
         WatchEventKind::DataUploaded,
         holder,
         true,
@@ -176,19 +202,15 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
         Ulid::new(),
         realm_id,
         uploader,
-        "logs/app/2026.log",
+        group_id,
+        data_node_id,
+        "logs",
+        "app/2026.log",
         unix_timestamp_millis(),
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
 
-    assert_eq!(
-        watch_outbox_len(&nodes[1]).await,
-        0,
-        "an unmatched event must not stage a forward-outbox row"
-    );
-
     sleep(NEGATIVE_WAIT).await;
-    assert_eq!(watch_outbox_len(&nodes[1]).await, 0);
     for node in &nodes {
         assert_eq!(
             inbox_len(node).await,
@@ -202,9 +224,8 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-// A matching event whose actor is the watcher itself is forwarded and processed
-// end to end, but the holder's expansion suppresses the self-notify, so the
-// watcher's inbox stays empty.
+// A matching event whose actor is the watcher itself is forwarded directly, but
+// the holder's expansion suppresses self-notify, so the watcher's inbox stays empty.
 #[tokio::test]
 async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([92u8; 32]);
@@ -212,36 +233,37 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[0].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let group_id = Ulid::new();
+    let data_node_id = nodes[1].net.node_id();
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
+    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/");
+    let probe = data_watch_resource_path(group_id, data_node_id, "bucket", "reports/probe");
 
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    create_watch_via(&nodes[0], watcher, "bucket/reports/", mask).await?;
+    create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
     wait_for_holder(
         &nodes[1],
         realm_id,
-        "bucket/reports/probe",
+        &probe,
         WatchEventKind::DataUploaded,
         holder,
         true,
     )
     .await?;
 
-    // Actor == watcher and the path matches, so the origin does forward the event
-    // (the outbox is written and then drained), proving the empty inbox is the
-    // self-notify suppression rather than a missed match.
+    // Actor == watcher and the path matches, so the origin forwards the event,
+    // proving the empty inbox is self-notify suppression rather than a missed match.
     let event = upload_event(
         Ulid::new(),
         realm_id,
         watcher,
-        "bucket/reports/self.csv",
+        group_id,
+        data_node_id,
+        "bucket",
+        "reports/self.csv",
         unix_timestamp_millis(),
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
-
-    wait_for(POLL_TIMEOUT, || {
-        let node_b = &nodes[1];
-        async move { watch_outbox_len(node_b).await == 0 }
-    })
-    .await?;
 
     sleep(NEGATIVE_WAIT).await;
     for node in &nodes {
@@ -267,16 +289,20 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     let config = realm_config_for(&nodes, realm_id);
     let holder = nodes[2].net.node_id();
     let watcher = user_with_holder(&config, holder, realm_id);
+    let group_id = Ulid::new();
+    let prefix = format!("meta/{group_id}/datasets/team");
+    let probe = format!("{prefix}/runs/run-42");
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
 
     // Create through node A while the holder is node C: exercises the remote
     // create arm on the way to publishing the digest.
     let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
-    let subscription = create_watch_via(&nodes[0], watcher, "meta/team/", mask).await?;
+    let subscription = create_watch_via(&nodes[0], watcher, &prefix, mask).await?;
 
     wait_for_holder(
         &nodes[1],
         realm_id,
-        "meta/team/doc",
+        &probe,
         WatchEventKind::MetadataCreated,
         holder,
         true,
@@ -289,7 +315,7 @@ async fn digest_converges_and_retracts_across_nodes() -> Result<(), Box<dyn std:
     wait_for_holder(
         &nodes[1],
         realm_id,
-        "meta/team/doc",
+        &probe,
         WatchEventKind::MetadataCreated,
         holder,
         false,
@@ -321,6 +347,8 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     let holder = nodes[0].net.node_id();
     let owner = user_with_holder(&config, holder, realm_id);
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let group_id = Ulid::new();
+    let data_node_id = nodes[1].net.node_id();
 
     // Node B is not the holder, so every create proxies to node A over the wire.
     for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
@@ -328,7 +356,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
             nodes[1].context.as_ref(),
             nodes[1].net.node_id(),
             owner,
-            format!("bucket/{index}/"),
+            data_watch_resource_path(group_id, data_node_id, "bucket", &format!("{index}/")),
             mask,
         )
         .await
@@ -339,7 +367,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
         nodes[1].context.as_ref(),
         nodes[1].net.node_id(),
         owner,
-        "bucket/overflow/".to_string(),
+        data_watch_resource_path(group_id, data_node_id, "bucket", "overflow/"),
         mask,
     )
     .await
@@ -357,20 +385,22 @@ fn upload_event(
     event_id: Ulid,
     realm_id: RealmId,
     actor: UserId,
-    path: &str,
+    group_id: Ulid,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
     occurred_at_ms: u64,
 ) -> WatchEvent {
-    let (bucket, key) = path
-        .split_once('/')
-        .expect("data watch path contains bucket and key");
     WatchEvent {
         event_id,
         realm_id,
         kind: WatchEventKind::DataUploaded,
-        path: path.to_string(),
+        path: data_watch_resource_path(group_id, node_id, bucket, key),
         actor,
         occurred_at_ms,
         detail: WatchEventDetail::DataUploaded {
+            group_id,
+            node_id,
             bucket: bucket.to_string(),
             key: key.to_string(),
             size_bytes: 2048,
@@ -434,10 +464,6 @@ async fn list_via(node: &TestNode, recipient: UserId) -> Vec<NotificationRecord>
     .0
 }
 
-async fn watch_outbox_len(node: &TestNode) -> usize {
-    iter_len(node, NOTIFICATION_WATCH_OUTBOX_KEYSPACE).await
-}
-
 async fn inbox_len(node: &TestNode) -> usize {
     iter_len(node, NOTIFICATION_INBOX_KEYSPACE).await
 }
@@ -493,8 +519,7 @@ async fn build_realm_nodes(
     }
     mesh_nodes(&nodes).await;
     install_realm_config(&nodes, *realm_id).await?;
-    // Mirror production core-document announcement: the shared watch-interest
-    // topic is bootstrapped once, then dirty digest publishes use false.
+    // Mirror production core-document announcement for every node.
     bootstrap_watch_interest_topic(&nodes, *realm_id).await?;
     Ok(nodes)
 }
@@ -579,54 +604,76 @@ async fn install_realm_config(
     Ok(())
 }
 
+async fn install_group_authorization(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    group_id: Ulid,
+    owner: UserId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    for node in nodes {
+        let actor = Actor {
+            node_id: node.net.node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        for (key, value) in [
+            (realm_id.as_bytes().to_vec(), realm_auth.to_bytes(&actor)?),
+            (group_id.to_bytes().to_vec(), group_auth.to_bytes(&actor)?),
+        ] {
+            match node
+                .context
+                .storage_handle
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                }))
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => {
+                    return Err(format!("unexpected authorization write event: {other:?}").into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn bootstrap_watch_interest_topic(
     nodes: &[TestNode],
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(publisher) = nodes.first() else {
-        return Ok(());
-    };
-    let node_id = publisher.net.node_id();
-    let digest = WatchInterestDigest {
-        node_id,
-        entries: Vec::new(),
-    };
-    let key = watch_interest_node_key(realm_id, node_id);
-
-    match publisher
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-            key: key.clone().into(),
-            value: digest.to_bytes()?.into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => return Err(format!("unexpected watch-interest digest write: {other:?}").into()),
+    let mut keys = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let node_id = node.net.node_id();
+        ensure_local_watch_interest_digest(&node.context.storage_handle, realm_id, node_id).await?;
+        drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id,
+                local_node_id: node_id,
+                excluded_peers: Vec::new(),
+                documents: vec![DocumentSyncTarget::WatchInterest { realm_id, node_id }],
+                allow_genesis: index == 0,
+            }),
+            node.context.as_ref(),
+        )
+        .await?;
+        keys.push(watch_interest_node_key(realm_id, node_id));
     }
 
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: node_id,
-            excluded_peers: Vec::new(),
-            documents: vec![DocumentSyncTarget::WatchInterest { realm_id, node_id }],
-            allow_genesis: true,
-        }),
-        publisher.context.as_ref(),
-    )
-    .await?;
-
     for node in nodes {
-        wait_for(POLL_TIMEOUT, || async {
-            read_watch_interest_digest(node, key.clone())
-                .await
-                .is_some()
-        })
-        .await?;
+        for key in &keys {
+            wait_for(POLL_TIMEOUT, || async {
+                read_watch_interest_digest(node, key.clone())
+                    .await
+                    .is_some()
+            })
+            .await?;
+        }
     }
     Ok(())
 }

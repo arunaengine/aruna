@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::RealmConfigDocument;
+use aruna_core::structs::{RealmConfigDocument, WatchSubscription};
 use aruna_core::types::UserId;
 
 use crate::sync_placement::select_topic_peers;
@@ -25,6 +25,23 @@ pub fn resolve_inbox_holder(
             .into_iter()
             .next(),
     )
+}
+
+pub fn filter_locally_held_watch_subscriptions(
+    subscriptions: Vec<WatchSubscription>,
+    realm_config: &RealmConfigDocument,
+    local_node_id: NodeId,
+) -> Result<(Vec<WatchSubscription>, bool), ConversionError> {
+    let mut locally_held = Vec::with_capacity(subscriptions.len());
+    let mut found_stale = false;
+    for subscription in subscriptions {
+        if resolve_inbox_holder(&subscription.owner, realm_config)? == Some(local_node_id) {
+            locally_held.push(subscription);
+        } else {
+            found_stale = true;
+        }
+    }
+    Ok((locally_held, found_stale))
 }
 
 #[cfg(test)]

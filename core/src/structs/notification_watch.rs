@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -12,9 +13,46 @@ use crate::types::{GroupId, Key, UserId};
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
 pub const NOTIFICATION_WATCH_MAX_PREFIX_LEN: usize = 1024;
 
-/// Append-only postcard enum: postcard encodes the variant index, so existing
-/// variants must never be removed, reordered, or have fields changed; new
-/// variants are appended at the end only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataWatchResourcePath<'a> {
+    pub group_id: GroupId,
+    pub node_id: NodeId,
+    pub bucket: &'a str,
+    pub key_prefix: &'a str,
+}
+
+pub fn data_watch_resource_path(
+    group_id: GroupId,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
+) -> String {
+    format!("s3/{group_id}/{node_id}/{bucket}/{key}")
+}
+
+pub fn parse_data_watch_resource_path(path: &str) -> Option<DataWatchResourcePath<'_>> {
+    let mut segments = path.strip_prefix("s3/")?.splitn(4, '/');
+    let raw_group_id = segments.next()?;
+    let raw_node_id = segments.next()?;
+    let bucket = segments.next()?;
+    let key_prefix = segments.next()?;
+    let group_id = Ulid::from_str(raw_group_id).ok()?;
+    let node_id = NodeId::from_str(raw_node_id).ok()?;
+    if group_id.is_nil()
+        || raw_group_id != group_id.to_string()
+        || raw_node_id != node_id.to_string()
+        || bucket.is_empty()
+    {
+        return None;
+    }
+    Some(DataWatchResourcePath {
+        group_id,
+        node_id,
+        bucket,
+        key_prefix,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchEventKind {
     MetadataCreated,
@@ -117,7 +155,7 @@ pub struct WatchEvent {
     pub detail: WatchEventDetail,
 }
 
-/// Kind-specific payload carried by a [`WatchEvent`]. Append-only postcard enum.
+/// Kind-specific payload carried by a [`WatchEvent`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchEventDetail {
     MetadataCreated {
@@ -125,6 +163,8 @@ pub enum WatchEventDetail {
         document_id: Ulid,
     },
     DataUploaded {
+        group_id: GroupId,
+        node_id: NodeId,
         bucket: String,
         key: String,
         size_bytes: u64,
@@ -154,11 +194,15 @@ impl WatchEvent {
                 actor_user_id: self.actor,
             },
             WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
                 bucket,
                 key,
                 size_bytes,
             } => NotificationKind::DataUploaded {
                 path: self.path.clone(),
+                group_id: *group_id,
+                node_id: *node_id,
                 bucket: bucket.clone(),
                 key: key.clone(),
                 size_bytes: *size_bytes,
@@ -184,30 +228,6 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&hash.as_bytes()[..16]);
     Ulid::from_bytes(bytes)
-}
-
-/// Durable origin-node forward-outbox row (transport plane). Unlike the inbox
-/// outbox, the target holder is minted at emit time (from the interest table) and
-/// stored, since the holder set is per-event fan-out, not per-recipient.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WatchForwardOutboxRecord {
-    pub outbox_id: Ulid,
-    pub holder_node: NodeId,
-    pub event: WatchEvent,
-}
-
-impl WatchForwardOutboxRecord {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-pub fn watch_forward_outbox_key(outbox_id: Ulid) -> Key {
-    ByteView::from(outbox_id.to_bytes())
 }
 
 /// Durable watch subscription row on the owner's inbox-holder node. Placed and
@@ -563,15 +583,16 @@ mod tests {
     }
 
     fn metadata_event(actor: UserId) -> WatchEvent {
+        let group_id = Ulid::from_bytes([3u8; 16]);
         WatchEvent {
             event_id: Ulid::from_bytes([9u8; 16]),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::MetadataCreated,
-            path: "meta/group/doc".to_string(),
+            path: format!("meta/{group_id}/datasets/project/run-42"),
             actor,
             occurred_at_ms: 1_700_000_000_000,
             detail: WatchEventDetail::MetadataCreated {
-                group_id: Ulid::from_bytes([3u8; 16]),
+                group_id,
                 document_id: Ulid::from_bytes([4u8; 16]),
             },
         }
@@ -586,14 +607,18 @@ mod tests {
             metadata
         );
 
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let node_id = node(6);
         let uploaded = WatchEvent {
             event_id: Ulid::from_bytes([10u8; 16]),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::DataUploaded,
-            path: "bucket/object".to_string(),
+            path: data_watch_resource_path(group_id, node_id, "bucket", "object"),
             actor,
             occurred_at_ms: 42,
             detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
                 bucket: "bucket".to_string(),
                 key: "object".to_string(),
                 size_bytes: 8192,
@@ -615,7 +640,13 @@ mod tests {
                 document_id,
                 actor_user_id,
             } => {
-                assert_eq!(path, "meta/group/doc");
+                assert_eq!(
+                    path,
+                    format!(
+                        "meta/{}/datasets/project/run-42",
+                        Ulid::from_bytes([3u8; 16])
+                    )
+                );
                 assert_eq!(group_id, Ulid::from_bytes([3u8; 16]));
                 assert_eq!(document_id, Ulid::from_bytes([4u8; 16]));
                 assert_eq!(actor_user_id, actor);
@@ -623,14 +654,18 @@ mod tests {
             other => panic!("unexpected kind: {other:?}"),
         }
 
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let node_id = node(6);
         let uploaded = WatchEvent {
             event_id: Ulid::new(),
             realm_id: RealmId([1u8; 32]),
             kind: WatchEventKind::DataUploaded,
-            path: "bucket/object".to_string(),
+            path: data_watch_resource_path(group_id, node_id, "bucket", "object"),
             actor,
             occurred_at_ms: 1,
             detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
                 bucket: "bucket".to_string(),
                 key: "object".to_string(),
                 size_bytes: 5,
@@ -639,12 +674,19 @@ mod tests {
         match uploaded.notification_kind() {
             NotificationKind::DataUploaded {
                 path,
+                group_id: event_group_id,
+                node_id: event_node_id,
                 bucket,
                 key,
                 size_bytes,
                 actor_user_id,
             } => {
-                assert_eq!(path, "bucket/object");
+                assert_eq!(
+                    path,
+                    data_watch_resource_path(group_id, node_id, "bucket", "object")
+                );
+                assert_eq!(event_group_id, group_id);
+                assert_eq!(event_node_id, node_id);
                 assert_eq!(bucket, "bucket");
                 assert_eq!(key, "object");
                 assert_eq!(size_bytes, 5);
@@ -652,6 +694,26 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_resource_path_is_node_disambiguated_and_roundtrips() {
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let first_node = node(6);
+        let second_node = node(7);
+        let first = data_watch_resource_path(group_id, first_node, "bucket", "reports/q3");
+        let second = data_watch_resource_path(group_id, second_node, "bucket", "reports/q3");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            parse_data_watch_resource_path(&first),
+            Some(DataWatchResourcePath {
+                group_id,
+                node_id: first_node,
+                bucket: "bucket",
+                key_prefix: "reports/q3",
+            })
+        );
     }
 
     #[test]
@@ -669,23 +731,6 @@ mod tests {
         assert_ne!(
             watch_notification_id(event_id, watch_id),
             watch_notification_id(Ulid::from_bytes([9u8; 16]), watch_id)
-        );
-    }
-
-    #[test]
-    fn forward_outbox_record_roundtrips_and_keys_are_fifo() {
-        let record = WatchForwardOutboxRecord {
-            outbox_id: Ulid::from_parts(1, 0),
-            holder_node: node(3),
-            event: metadata_event(user(1, 2)),
-        };
-        assert_eq!(
-            WatchForwardOutboxRecord::from_bytes(&record.to_bytes().unwrap()).unwrap(),
-            record
-        );
-        assert!(
-            watch_forward_outbox_key(Ulid::from_parts(1, 0))
-                < watch_forward_outbox_key(Ulid::from_parts(2, 0))
         );
     }
 

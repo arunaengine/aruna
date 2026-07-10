@@ -26,9 +26,6 @@ impl NotificationClass {
     }
 }
 
-/// Append-only postcard enum: postcard encodes the variant index, so existing
-/// variants must never be removed, reordered, or have fields changed; new
-/// variants are appended at the end only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationKind {
     AddedToGroup {
@@ -56,6 +53,8 @@ pub enum NotificationKind {
     },
     DataUploaded {
         path: String,
+        group_id: GroupId,
+        node_id: NodeId,
         bucket: String,
         key: String,
         size_bytes: u64,
@@ -251,6 +250,9 @@ mod tests {
     #[test]
     fn notification_record_roundtrips_through_postcard() {
         let recipient = user(1, 2);
+        let metadata_group_id = Ulid::new();
+        let data_group_id = Ulid::new();
+        let data_node_id = make_node_id(8);
         for kind in [
             NotificationKind::AddedToGroup {
                 group_id: Ulid::new(),
@@ -270,13 +272,20 @@ mod tests {
                 node_id: make_node_id(7),
             },
             NotificationKind::MetadataCreated {
-                path: "meta/group/doc".to_string(),
-                group_id: Ulid::new(),
+                path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+                group_id: metadata_group_id,
                 document_id: Ulid::new(),
                 actor_user_id: user(1, 5),
             },
             NotificationKind::DataUploaded {
-                path: "bucket/key".to_string(),
+                path: crate::structs::data_watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "key",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
                 bucket: "bucket".to_string(),
                 key: "key".to_string(),
                 size_bytes: 4096,
@@ -437,14 +446,24 @@ mod tests {
             realm_id: RealmId([1; 32]),
             node_id: make_node_id(1),
         };
+        let metadata_group_id = Ulid::new();
         let metadata_created = NotificationKind::MetadataCreated {
-            path: "meta/group/doc".to_string(),
-            group_id: Ulid::new(),
+            path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+            group_id: metadata_group_id,
             document_id: Ulid::new(),
             actor_user_id: user(1, 5),
         };
+        let data_group_id = Ulid::new();
+        let data_node_id = make_node_id(2);
         let data_uploaded = NotificationKind::DataUploaded {
-            path: "bucket/key".to_string(),
+            path: crate::structs::data_watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "key",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             size_bytes: 1,

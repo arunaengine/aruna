@@ -56,8 +56,8 @@ pub async fn create_watch_subscription(
     if path_prefix.is_empty() {
         return Err(WatchSubscriptionError::EmptyPrefix);
     }
-    // Emitted event paths carry no leading slash (`{bucket}/{key}`,
-    // `meta/{group_id}/{document_id}`), so a leading-slash prefix could never
+    // Emitted event paths carry no leading slash (`s3/{group}/{node}/{bucket}/{key}`,
+    // `meta/{group_id}/{document_path}`), so a leading-slash prefix could never
     // match; reject it as a backstop behind the API-layer validation.
     if path_prefix.starts_with('/') {
         return Err(WatchSubscriptionError::LeadingSlash);

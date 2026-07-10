@@ -1,11 +1,11 @@
-use crate::auth::require_realm_auth;
+use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
+    NotificationRecord, Permission, WatchEventKind, WatchEventMask, WatchSubscription,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
@@ -15,6 +15,7 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
+use aruna_operations::notifications::watch::authorization::watch_permission_path;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -154,11 +155,11 @@ pub struct WatchListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateWatchRequest {
-    /// Watched path prefix, matched as a plain string prefix against event
-    /// paths. Data events use `{bucket}/{key}`; metadata events use
-    /// `meta/{group_id}/{document_id}`. No leading slash. Matching is a plain
-    /// prefix, so `reports` also matches a bucket named `reports-private`; add a
-    /// trailing slash (`reports/`) to scope to exactly one bucket/segment.
+    /// Canonical watched resource prefix. Data events use
+    /// `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and metadata events use
+    /// `meta/{group_id}/{normalized_document_path-prefix}`. The slash after the
+    /// bucket or metadata group is required; no leading slash is allowed. Event
+    /// kinds cannot be combined because they use distinct namespaces.
     pub path_prefix: String,
     pub events: Vec<String>,
 }
@@ -202,8 +203,9 @@ fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
     }
 }
 
-/// Notification endpoints are identity-scoped with no path-based permission
-/// check, so path-restricted (delegated) tokens must not reach them.
+/// Watch subscriptions cannot retain token-only path restrictions on their
+/// holder, so path-restricted (delegated) tokens must not reach notification
+/// endpoints even though create performs a resource permission check.
 fn require_unrestricted_realm_auth(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -295,12 +297,16 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         }
         NotificationKind::DataUploaded {
             path,
+            group_id,
+            node_id,
             bucket,
             key,
             size_bytes,
             actor_user_id,
         } => {
             response.path = Some(path.clone());
+            response.group_id = Some(group_id.to_string());
+            response.node_id = Some(node_id.to_string());
             response.bucket = Some(bucket.clone());
             response.key = Some(key.clone());
             response.size_bytes = Some(*size_bytes);
@@ -308,6 +314,17 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         }
     }
     response
+}
+
+async fn authorize_watch(
+    state: &ServerState,
+    auth: &AuthContext,
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+) -> ServerResult<()> {
+    let permission_path = watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
+        .ok_or(ServerError::BadRequest)?;
+    ensure_permission(state, auth, permission_path, Permission::READ).await
 }
 
 #[utoipa::path(
@@ -662,11 +679,11 @@ pub async fn list_watches(
     post,
     path = "/notifications/watches",
     tag = "notifications",
-    description = "Create a watch subscription. The path prefix is matched as a plain string prefix against event paths: data events use `{bucket}/{key}` and metadata events use `meta/{group_id}/{document_id}`, both without a leading slash. Because matching is a plain prefix, `reports` also matches a bucket named `reports-private`; add a trailing slash (`reports/`) to scope to exactly one bucket/segment. A leading slash is rejected with 400.",
+    description = "Create an authorized watch subscription using a canonical resource prefix. Data events use `s3/{group_id}/{node_id}/{bucket}/{key-prefix}` and require READ on that exact node's blob bucket permission path. Metadata events use `meta/{group_id}/{normalized_document_path-prefix}` and require READ on the group's metadata permission path. The slash after the bucket or metadata group is required, no leading slash is allowed, and metadata/data event kinds cannot be combined because their canonical namespaces differ.",
     request_body = CreateWatchRequest,
     responses(
         (status = 201, description = "Watch subscription created", body = WatchResponse),
-        (status = 400, description = "Invalid path prefix (empty, leading slash, or too long) or event name", body = ErrorResponse),
+        (status = 400, description = "Invalid or non-canonical path prefix, or invalid event name", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 409, description = "Per-user watch cap reached", body = ErrorResponse),
@@ -693,6 +710,9 @@ pub async fn create_watch(
         let kind = WatchEventKind::from_name(name).ok_or(ServerError::BadRequest)?;
         event_mask.insert(kind);
     }
+    // A remote holder receives only the durable subscription, not this request's
+    // AuthContext. Authorize the immutable canonical identity before dispatch.
+    authorize_watch(&state, &auth, &request.path_prefix, event_mask).await?;
 
     let subscription = create_watch_for_user(
         &state.get_ctx(),
@@ -749,10 +769,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        Actor, NodeCapabilities, PathRestriction, Permission, RealmConfigDocument, RealmId,
-        RealmNodeKind,
+        Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, Permission,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+        data_watch_resource_path,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::DriverContext;
@@ -862,6 +883,61 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected realm config write event: {other:?}"),
         }
+    }
+
+    async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected fixture write event: {other:?}"),
+        }
+    }
+
+    async fn install_group_authorization(
+        state: &ServerState,
+        realm_id: RealmId,
+        group_id: Ulid,
+        owner: UserId,
+        readers: &[UserId],
+    ) {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let viewer = group_auth
+            .roles
+            .values_mut()
+            .find(|role| role.name == "viewer")
+            .expect("default viewer role");
+        viewer.assigned_users.extend(readers.iter().copied());
+
+        write_fixture(
+            state,
+            AUTH_KEYSPACE,
+            ByteView::from(realm_id.as_bytes().to_vec()),
+            ByteView::from(realm_auth.to_bytes(&actor).expect("realm auth serializes")),
+        )
+        .await;
+        write_fixture(
+            state,
+            AUTH_KEYSPACE,
+            ByteView::from(group_id.to_bytes().to_vec()),
+            ByteView::from(group_auth.to_bytes(&actor).expect("group auth serializes")),
+        )
+        .await;
     }
 
     fn direct_record(recipient: UserId, seed: u8) -> NotificationRecord {
@@ -1279,7 +1355,7 @@ mod tests {
             recipient,
             NotificationClass::Transient,
             NotificationKind::MetadataCreated {
-                path: "meta/group/doc".to_string(),
+                path: format!("meta/{group_id}/datasets/project/run-42"),
                 group_id,
                 document_id,
                 actor_user_id: actor,
@@ -1288,7 +1364,10 @@ mod tests {
         ));
         assert_eq!(metadata_created.kind, "metadata_created");
         assert_eq!(metadata_created.category, "resource.watch");
-        assert_eq!(metadata_created.path, Some("meta/group/doc".to_string()));
+        assert_eq!(
+            metadata_created.path,
+            Some(format!("meta/{group_id}/datasets/project/run-42"))
+        );
         assert_eq!(metadata_created.group_id, Some(group_id.to_string()));
         assert_eq!(metadata_created.document_id, Some(document_id.to_string()));
         assert_eq!(metadata_created.actor_user_id, Some(actor.to_string()));
@@ -1297,7 +1376,9 @@ mod tests {
             recipient,
             NotificationClass::Transient,
             NotificationKind::DataUploaded {
-                path: "bucket/object".to_string(),
+                path: data_watch_resource_path(group_id, onboarded_node, "bucket", "object"),
+                group_id,
+                node_id: onboarded_node,
                 bucket: "bucket".to_string(),
                 key: "object".to_string(),
                 size_bytes: 4096,
@@ -1307,7 +1388,17 @@ mod tests {
         ));
         assert_eq!(data_uploaded.kind, "data_uploaded");
         assert_eq!(data_uploaded.category, "resource.watch");
-        assert_eq!(data_uploaded.path, Some("bucket/object".to_string()));
+        assert_eq!(
+            data_uploaded.path,
+            Some(data_watch_resource_path(
+                group_id,
+                onboarded_node,
+                "bucket",
+                "object"
+            ))
+        );
+        assert_eq!(data_uploaded.group_id, Some(group_id.to_string()));
+        assert_eq!(data_uploaded.node_id, Some(onboarded_node.to_string()));
         assert_eq!(data_uploaded.bucket, Some("bucket".to_string()));
         assert_eq!(data_uploaded.key, Some("object".to_string()));
         assert_eq!(data_uploaded.size_bytes, Some(4096));
@@ -1321,20 +1412,23 @@ mod tests {
         let (_dir, state) = build_state(realm_id, holder).await;
         install_local_holder_config(&state, realm_id, holder).await;
         let user_id = UserId::new(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
+        let path_prefix = data_watch_resource_path(group_id, node(60), "bucket", "prefix");
 
         let (status, created) = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(CreateWatchRequest {
-                path_prefix: "bucket/prefix".to_string(),
-                events: vec!["metadata_created".to_string(), "data_uploaded".to_string()],
+                path_prefix: path_prefix.clone(),
+                events: vec!["data_uploaded".to_string()],
             }),
         )
         .await
         .expect("create succeeds");
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created.path_prefix, "bucket/prefix");
-        assert_eq!(created.events, vec!["metadata_created", "data_uploaded"]);
+        assert_eq!(created.path_prefix, path_prefix);
+        assert_eq!(created.events, vec!["data_uploaded"]);
 
         let (_, listed) = list_watches(
             State(state.clone()),
@@ -1358,6 +1452,107 @@ mod tests {
             .await
             .expect("list after delete succeeds");
         assert!(empty.watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_watch_requires_metadata_group_read_permission() {
+        let realm_id = realm_id(15);
+        let holder = node(15);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let authorized = UserId::new(Ulid::new(), realm_id);
+        let unauthorized = UserId::new(Ulid::new(), realm_id);
+        let group_id = Ulid::new();
+        install_group_authorization(&state, realm_id, group_id, authorized, &[]).await;
+        let path_prefix = format!("meta/{group_id}/datasets/proteomics");
+
+        let error = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(unauthorized, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: path_prefix.clone(),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("user without metadata READ must be rejected");
+        assert!(matches!(error, ServerError::Forbidden));
+
+        let (status, created) = create_watch(
+            State(state),
+            Extension(Some(auth_for(authorized, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: path_prefix.clone(),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect("metadata reader may create a watch");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.path_prefix, path_prefix);
+    }
+
+    #[tokio::test]
+    async fn create_watch_uses_canonical_remote_node_bucket_permission() {
+        let realm_id = realm_id(16);
+        let holder = node(16);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let authorized = UserId::new(Ulid::new(), realm_id);
+        let unauthorized = UserId::new(Ulid::new(), realm_id);
+        let bucket_group_id = Ulid::new();
+        install_group_authorization(&state, realm_id, bucket_group_id, authorized, &[]).await;
+        let remote_bucket_node = node(99);
+        let path_prefix =
+            data_watch_resource_path(bucket_group_id, remote_bucket_node, "reports", "quarterly");
+
+        let error = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(unauthorized, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: path_prefix.clone(),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect_err("user without bucket READ must be rejected");
+        assert!(matches!(error, ServerError::Forbidden));
+
+        let (status, created) = create_watch(
+            State(state),
+            Extension(Some(auth_for(authorized, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: path_prefix.clone(),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect("bucket reader may create a watch");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.path_prefix, path_prefix);
+    }
+
+    #[tokio::test]
+    async fn create_watch_rejects_mixed_event_namespaces() {
+        let realm_id = realm_id(17);
+        let holder = node(17);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        let user_id = UserId::new(Ulid::new(), realm_id);
+        let metadata_group_id = Ulid::new();
+        let path_prefix = format!("meta/{metadata_group_id}/datasets/shared");
+        let events = vec!["metadata_created".to_string(), "data_uploaded".to_string()];
+
+        let error = create_watch(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix,
+                events,
+            }),
+        )
+        .await
+        .expect_err("one prefix cannot represent both canonical namespaces");
+        assert!(matches!(error, ServerError::BadRequest));
     }
 
     #[tokio::test]
@@ -1403,7 +1598,7 @@ mod tests {
         assert!(matches!(empty_events, ServerError::BadRequest));
 
         let unknown_event = create_watch(
-            State(state),
+            State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
@@ -1413,6 +1608,43 @@ mod tests {
         .await
         .expect_err("unknown event must be rejected");
         assert!(matches!(unknown_event, ServerError::BadRequest));
+
+        let unscoped_data = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: "reports".to_string(),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a prefix without a bucket boundary is ambiguous");
+        assert!(matches!(unscoped_data, ServerError::BadRequest));
+
+        let group_id = Ulid::new();
+        let unscoped_metadata = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{group_id}"),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a metadata prefix without the group boundary is ambiguous");
+        assert!(matches!(unscoped_metadata, ServerError::BadRequest));
+
+        let noncanonical_metadata = create_watch(
+            State(state),
+            Extension(Some(auth_for(user_id, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{group_id}/datasets/proteomics/"),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("metadata prefixes must use normalized document paths");
+        assert!(matches!(noncanonical_metadata, ServerError::BadRequest));
     }
 
     #[tokio::test]
