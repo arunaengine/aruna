@@ -78,6 +78,7 @@ pub struct UnreadCountApiResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MarkReadApiRequest {
+    #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
     pub up_to_ms: Option<u64>,
@@ -469,6 +470,15 @@ mod tests {
         let raw = vec![7u8; 24];
         let encoded = encode_cursor(Some(raw.clone()));
         assert_eq!(decode_cursor(encoded.as_deref()).unwrap(), Some(raw));
+    }
+
+    #[test]
+    fn mark_read_request_defaults_missing_ids() {
+        let request: MarkReadApiRequest =
+            serde_json::from_str(r#"{"up_to_ms":123}"#).expect("request deserializes");
+
+        assert!(request.ids.is_empty());
+        assert_eq!(request.up_to_ms, Some(123));
     }
 
     #[tokio::test]

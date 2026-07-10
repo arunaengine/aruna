@@ -281,7 +281,7 @@ impl AddUserToGroupOperation {
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
         let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
 
-        let newly_added = !auth_doc
+        let was_member = auth_doc
             .roles
             .values()
             .any(|role| role.assigned_users.contains(&self.input.user_id));
@@ -301,6 +301,11 @@ impl AddUserToGroupOperation {
                 role.assigned_users.remove(&self.input.user_id);
             }
         }
+        let newly_added = !was_member
+            && auth_doc
+                .roles
+                .values()
+                .any(|role| role.assigned_users.contains(&self.input.user_id));
 
         let key = auth_doc.group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
@@ -788,7 +793,7 @@ pub mod test {
     use ulid::Ulid;
 
     use crate::add_user_to_group::{
-        AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
+        AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation, AddUserToGroupState,
     };
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -866,6 +871,37 @@ pub mod test {
                     dot: role_dot,
                 },
             )]),
+        }
+    }
+
+    fn reducer_state_with_role_conflict(
+        group_id: Ulid,
+        role_id: RoleId,
+    ) -> AdminDocumentReducerState {
+        let path = format!("group.roles.{role_id}");
+        AdminDocumentReducerState {
+            target: AdminDocumentTarget::Group { group_id },
+            clock: AdminDocumentClock::default(),
+            applied_event_ids: BTreeSet::new(),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::from([(
+                path.clone(),
+                AdminDocumentConflict {
+                    path,
+                    values: vec![
+                        AdminDocumentConflictValue {
+                            value: Some(role_id.to_string()),
+                            dot: dot(21),
+                        },
+                        AdminDocumentConflictValue {
+                            value: None,
+                            dot: dot(22),
+                        },
+                    ],
+                },
+            )]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
         }
     }
 
@@ -1149,6 +1185,64 @@ pub mod test {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::NotificationsEmitted));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
+    }
+
+    #[test]
+    fn unresolved_role_conflict_does_not_emit_membership_notification() {
+        let realm_id = RealmId::from_bytes([31u8; 32]);
+        let actor = Actor {
+            node_id: node(32),
+            user_id: UserId::local(Ulid::from_bytes([33u8; 16]), realm_id),
+            realm_id,
+        };
+        let member_id = UserId::local(Ulid::from_bytes([34u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([35u8; 16]);
+        let role_id = Ulid::from_bytes([36u8; 16]);
+        let auth_doc = seeded_user_role_doc(group_id, role_id);
+        let reducer_state = reducer_state_with_role_conflict(group_id, role_id);
+        let mut operation = AddUserToGroupOperation::new(AddUserToGroupInput {
+            actor: actor.clone(),
+            group_id,
+            user_id: member_id,
+            role_ids: HashSet::from([role_id]),
+        });
+        let txn_id = TxnId::new();
+
+        operation
+            .emit_write_auth_doc_and_admin_state(
+                txn_id,
+                Some(auth_doc.to_bytes(&actor).unwrap().into()),
+                Some(postcard::to_allocvec(&reducer_state).unwrap().into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            &operation.state,
+            AddUserToGroupState::WriteAuthDocAndAdminState {
+                newly_added: false,
+                ..
+            }
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        let result = operation.finalize().unwrap();
+        assert!(!result.roles[&role_id].assigned_users.contains(&member_id));
     }
 
     #[tokio::test]
