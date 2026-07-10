@@ -9768,11 +9768,14 @@ mod tests {
         .expect("document sync service opens");
 
         let local_node = service.local_node_id().expect("local node id");
-        let blocked_target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_parts(62, 1),
+        let blocked_target = DocumentSyncTarget::NodeUsage {
+            realm_id,
+            node_id: local_node,
+            group_id: None,
         };
-        let ready_target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_parts(62, 2),
+        let ready_target = DocumentSyncTarget::WatchInterest {
+            realm_id,
+            node_id: local_node,
         };
         let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
         let ready_topic = ready_target.sync_topic_id(realm_id, &placement);
