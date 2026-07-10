@@ -5344,6 +5344,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dangling_strategy_references_materialize_through_storage() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([72; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_510, 1), realm_id);
+        let strategy_actor = test_actor(30, user_id, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                document_target.clone(),
+                seed_config
+                    .to_bytes(&strategy_actor)
+                    .expect("seed realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("seed realm config writes");
+
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_parts(1_511, 1),
+            name: "removed".to_string(),
+            replica_count: Some(3),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            document_target.clone(),
+            test_admin_event(
+                Ulid::from_parts(1_512, 1),
+                target.clone(),
+                &strategy_actor,
+                1,
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: strategy.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("placement strategy applies");
+
+        let binding = StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: strategy.strategy_id,
+        };
+        let record = PlacementOverride {
+            subject: b"dangling-document-subject".to_vec(),
+            pinned: vec![strategy_actor.node_id],
+            excluded: Vec::new(),
+            strategy_id: Some(strategy.strategy_id),
+        };
+        let observed_strategy =
+            AdminDocumentClock::default().with_observed(strategy_actor.node_id, 1);
+        for (index, (actor, op)) in [
+            (
+                test_actor(31, user_id, realm_id),
+                AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+                    strategy_id: strategy.strategy_id,
+                },
+            ),
+            (
+                test_actor(32, user_id, realm_id),
+                AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                    strategy_id: strategy.strategy_id,
+                },
+            ),
+            (
+                test_actor(33, user_id, realm_id),
+                AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    binding: binding.clone(),
+                },
+            ),
+            (
+                test_actor(34, user_id, realm_id),
+                AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                    record: record.clone(),
+                },
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = test_admin_event(
+                Ulid::from_parts(1_513 + index as u64, 1),
+                target.clone(),
+                &actor,
+                1,
+                op,
+            );
+            event.observed = observed_strategy.clone();
+            apply_admin_document_operation_to_storage(&storage, document_target.clone(), event)
+                .await
+                .expect("concurrent placement operation applies");
+        }
+
+        let config = read_realm_config_doc(&storage, realm_id).await;
+        assert!(config.strategies.is_empty());
+        assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
+        assert_eq!(config.strategy_bindings, vec![binding]);
+        assert_eq!(config.placement_overrides, vec![record]);
+
+        let state_value = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&state_value).expect("reducer state decodes");
+        assert!(
+            reducer_state
+                .materialized_realm_config_placement_strategies()
+                .is_empty()
+        );
+        assert_eq!(
+            reducer_state.materialized_realm_config_default_strategy(),
+            Some(strategy.strategy_id)
+        );
+    }
+
+    #[tokio::test]
     async fn realm_config_settings_op_alone_creates_config_doc() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([49; 32]);

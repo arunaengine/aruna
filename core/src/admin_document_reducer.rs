@@ -39,10 +39,6 @@ pub enum AdminDocumentReducerError {
     ReservedPlacementLabel,
     #[error("placement strategy replica count must not be zero")]
     ZeroPlacementReplicaCount,
-    #[error("placement strategy {0} is not configured")]
-    UnknownPlacementStrategy(Ulid),
-    #[error("placement strategy {0} is still referenced")]
-    PlacementStrategyInUse(Ulid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +310,6 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
             ) => {
-                self.ensure_placement_strategy_not_referenced(strategy_id)?;
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_placement_strategy_path(strategy_id),
@@ -325,7 +320,6 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
             ) => {
-                self.ensure_placement_strategy_exists(strategy_id)?;
                 self.apply_realm_config_setting(
                     event,
                     REALM_CONFIG_DEFAULT_STRATEGY_PATH,
@@ -336,7 +330,6 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigStrategyBindingSet { binding },
             ) => {
-                self.ensure_placement_strategy_exists(&binding.strategy_id)?;
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_strategy_binding_path(&binding.scope),
@@ -357,9 +350,6 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementOverrideSet { record },
             ) => {
-                if let Some(strategy_id) = record.strategy_id.as_ref() {
-                    self.ensure_placement_strategy_exists(strategy_id)?;
-                }
                 self.apply_realm_config_placement_field(
                     event,
                     realm_config_placement_override_path(&record.subject),
@@ -709,46 +699,6 @@ impl AdminDocumentReducerState {
                     .then(|| (subject_key.to_string(), record))
             })
             .collect()
-    }
-
-    fn ensure_placement_strategy_exists(
-        &self,
-        strategy_id: &Ulid,
-    ) -> Result<(), AdminDocumentReducerError> {
-        if self
-            .materialized_realm_config_placement_strategies()
-            .contains_key(strategy_id)
-        {
-            Ok(())
-        } else {
-            Err(AdminDocumentReducerError::UnknownPlacementStrategy(
-                *strategy_id,
-            ))
-        }
-    }
-
-    fn ensure_placement_strategy_not_referenced(
-        &self,
-        strategy_id: &Ulid,
-    ) -> Result<(), AdminDocumentReducerError> {
-        let default_references =
-            self.materialized_realm_config_default_strategy().as_ref() == Some(strategy_id);
-        let binding_references = self
-            .materialized_realm_config_strategy_bindings()
-            .values()
-            .any(|binding| &binding.strategy_id == strategy_id);
-        let override_references = self
-            .materialized_realm_config_placement_overrides()
-            .values()
-            .any(|record| record.strategy_id.as_ref() == Some(strategy_id));
-
-        if default_references || binding_references || override_references {
-            Err(AdminDocumentReducerError::PlacementStrategyInUse(
-                *strategy_id,
-            ))
-        } else {
-            Ok(())
-        }
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -3621,10 +3571,10 @@ mod tests {
     }
 
     #[test]
-    fn realm_config_strategy_refs_reject_unknown_strategy() {
+    fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_independent() {
         let strategy_id = Ulid::from_bytes([4; 16]);
         let subject = b"document-subject".to_vec();
-        let ops = vec![
+        let reference_ops = vec![
             AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
             AdminDocumentOperation::RealmConfigStrategyBindingSet {
                 binding: StrategyBinding {
@@ -3642,75 +3592,78 @@ mod tests {
             },
         ];
 
-        for (index, op) in ops.into_iter().enumerate() {
-            let mut state = realm_config_state();
-            let before = state.clone();
-
-            assert_eq!(
-                state.apply(&realm_config_event(
-                    20 + index as u8,
-                    node(20 + index as u8),
-                    1,
-                    AdminDocumentClock::default(),
-                    op,
-                )),
-                Err(AdminDocumentReducerError::UnknownPlacementStrategy(
-                    strategy_id
-                ))
+        for (index, reference_op) in reference_ops.into_iter().enumerate() {
+            let seed = 40 + index as u8 * 10;
+            let strategy_origin = node(seed);
+            let mut initial = realm_config_state();
+            upsert_placement_strategy(&mut initial, seed, seed, strategy_id);
+            let observed_strategy = AdminDocumentClock::default().with_observed(strategy_origin, 1);
+            let removal = realm_config_event(
+                seed + 1,
+                node(seed + 1),
+                1,
+                observed_strategy.clone(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
             );
-            assert_eq!(state, before);
-        }
-    }
-
-    #[test]
-    fn realm_config_placement_strategy_remove_rejects_dependents() {
-        let strategy_id = Ulid::from_bytes([4; 16]);
-        let ops = vec![
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                binding: StrategyBinding {
-                    scope: BindingScope::Class(DocumentClass::MetadataRegistry),
-                    strategy_id,
-                },
-            },
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
-                record: PlacementOverride {
-                    subject: b"document-subject".to_vec(),
-                    pinned: vec![node(4)],
-                    excluded: Vec::new(),
-                    strategy_id: Some(strategy_id),
-                },
-            },
-        ];
-
-        for (index, op) in ops.into_iter().enumerate() {
-            let mut state = realm_config_state();
-            let seed = 30 + (index as u8 * 3);
-            upsert_placement_strategy(&mut state, seed, seed, strategy_id);
-            state
-                .apply(&realm_config_event(
-                    seed + 1,
-                    node(seed + 1),
-                    1,
-                    AdminDocumentClock::default(),
-                    op,
-                ))
-                .unwrap();
-            let before = state.clone();
-
-            assert_eq!(
-                state.apply(&realm_config_event(
-                    seed + 2,
-                    node(seed + 2),
-                    1,
-                    AdminDocumentClock::default(),
-                    AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
-                )),
-                Err(AdminDocumentReducerError::PlacementStrategyInUse(
-                    strategy_id
-                ))
+            let reference = realm_config_event(
+                seed + 2,
+                node(seed + 2),
+                1,
+                observed_strategy,
+                reference_op.clone(),
             );
-            assert_eq!(state, before);
+
+            let mut remove_first = initial.clone();
+            assert_eq!(
+                remove_first.apply(&removal),
+                Ok(AdminDocumentApplyStatus::Applied)
+            );
+            assert_eq!(
+                remove_first.apply(&reference),
+                Ok(AdminDocumentApplyStatus::Applied)
+            );
+
+            let mut reference_first = initial;
+            assert_eq!(
+                reference_first.apply(&reference),
+                Ok(AdminDocumentApplyStatus::Applied)
+            );
+            assert_eq!(
+                reference_first.apply(&removal),
+                Ok(AdminDocumentApplyStatus::Applied)
+            );
+
+            assert_eq!(remove_first, reference_first);
+            assert!(
+                remove_first
+                    .materialized_realm_config_placement_strategies()
+                    .is_empty()
+            );
+            assert!(remove_first.conflicts.is_empty());
+
+            match reference_op {
+                AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => assert_eq!(
+                    remove_first.materialized_realm_config_default_strategy(),
+                    Some(strategy_id)
+                ),
+                AdminDocumentOperation::RealmConfigStrategyBindingSet { .. } => assert_eq!(
+                    remove_first
+                        .materialized_realm_config_strategy_bindings()
+                        .values()
+                        .map(|binding| binding.strategy_id)
+                        .collect::<Vec<_>>(),
+                    vec![strategy_id]
+                ),
+                AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. } => assert_eq!(
+                    remove_first
+                        .materialized_realm_config_placement_overrides()
+                        .values()
+                        .filter_map(|record| record.strategy_id)
+                        .collect::<Vec<_>>(),
+                    vec![strategy_id]
+                ),
+                _ => unreachable!("test only contains strategy reference operations"),
+            }
         }
     }
 
