@@ -30,7 +30,8 @@ use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish,
 };
 use crate::notifications::watch::subscriptions::{
-    create_watch_subscription, delete_watch_subscription, list_watch_subscriptions,
+    create_replicated_watch_subscription, delete_replicated_watch_subscription,
+    list_watch_subscriptions,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -199,8 +200,9 @@ async fn build_response(
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match create_watch_subscription(
-                &context.storage_handle,
+            match create_replicated_watch_subscription(
+                context,
+                local_node_id,
                 owner,
                 path_prefix,
                 event_mask,
@@ -221,7 +223,15 @@ async fn build_response(
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match delete_watch_subscription(&context.storage_handle, owner, watch_id).await {
+            match delete_replicated_watch_subscription(
+                context,
+                local_node_id,
+                owner,
+                watch_id,
+                unix_timestamp_millis(),
+            )
+            .await
+            {
                 Ok(()) => {
                     schedule_watch_interest_publish(context).await;
                     NotificationTransportMessage::WatchDeleted

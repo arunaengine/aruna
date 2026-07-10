@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::document::{DocumentSyncNetEvent, DocumentSyncTarget};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
@@ -17,17 +17,22 @@ use aruna_core::structs::{
     watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
-use aruna_core::{NodeId, UserId};
+use aruna_core::{DocumentSyncEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::notifications::dispatch::{
     WatchDispatchError, create_watch_for_user, delete_watch_for_user, list_notifications_for_user,
+    list_watches_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
-use aruna_operations::notifications::watch::interest::ensure_local_watch_interest_digest;
+use aruna_operations::notifications::watch::interest::{
+    ensure_local_watch_interest_digest, mark_watch_interest_dirty,
+    refresh_watch_interest_for_targets,
+};
+use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -91,10 +96,12 @@ async fn watch_on_node_a_fires_for_upload_on_node_b_visible_via_node_c()
         event_id,
         realm_id,
         uploader,
-        group_id,
-        data_node_id,
-        "bucket",
-        "reports/q3/summary.csv",
+        UploadLocation {
+            group_id,
+            node_id: data_node_id,
+            bucket: "bucket",
+            key: "reports/q3/summary.csv",
+        },
         occurred_at_ms,
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
@@ -202,10 +209,12 @@ async fn unmatched_event_writes_nothing() -> Result<(), Box<dyn std::error::Erro
         Ulid::new(),
         realm_id,
         uploader,
-        group_id,
-        data_node_id,
-        "logs",
-        "app/2026.log",
+        UploadLocation {
+            group_id,
+            node_id: data_node_id,
+            bucket: "logs",
+            key: "app/2026.log",
+        },
         unix_timestamp_millis(),
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
@@ -257,10 +266,12 @@ async fn self_authored_event_notifies_no_one() -> Result<(), Box<dyn std::error:
         Ulid::new(),
         realm_id,
         watcher,
-        group_id,
-        data_node_id,
-        "bucket",
-        "reports/self.csv",
+        UploadLocation {
+            group_id,
+            node_id: data_node_id,
+            bucket: "bucket",
+            key: "reports/self.csv",
+        },
         unix_timestamp_millis(),
     );
     emit_resource_watch_event(nodes[1].context.as_ref(), event).await;
@@ -381,16 +392,143 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     Ok(())
 }
 
+#[tokio::test]
+async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([95u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let full_config = realm_config_for(&nodes, realm_id);
+    let mut reduced_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    for node in &nodes[..2] {
+        reduced_config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+    install_config_document(&nodes, realm_id, &reduced_config).await?;
+
+    let (watcher, old_holder, new_holder) =
+        user_with_changed_holder(&reduced_config, &full_config, realm_id);
+    let group_id = Ulid::new();
+    let data_node_id = nodes[0].net.node_id();
+    let prefix = data_watch_resource_path(group_id, data_node_id, "bucket", "reranked/");
+    let probe = format!("{prefix}probe");
+    install_group_authorization(&nodes, realm_id, group_id, watcher).await?;
+
+    let subscription = create_watch_via(
+        &nodes[0],
+        watcher,
+        &prefix,
+        WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+    )
+    .await?;
+    let old_holder_node = node_by_id(&nodes, old_holder);
+    wait_for(POLL_TIMEOUT, || async {
+        list_watch_subscriptions(&old_holder_node.context.storage_handle, watcher)
+            .await
+            .is_ok_and(|rows| rows.contains(&subscription))
+    })
+    .await?;
+
+    install_config_document(&nodes, realm_id, &full_config).await?;
+    let new_holder_node = node_by_id(&nodes, new_holder);
+    let sync_event = new_holder_node
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::SyncDocument {
+                target: DocumentSyncTarget::WatchInterest {
+                    realm_id,
+                    node_id: old_holder,
+                },
+                peers: vec![old_holder],
+            },
+        )))
+        .await;
+    let reconciled = match sync_event {
+        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            targets,
+            ..
+        })) => targets,
+        other => return Err(format!("unexpected subscription history sync: {other:?}").into()),
+    };
+    refresh_watch_interest_for_targets(new_holder_node.context.as_ref(), &reconciled).await;
+    for node in &nodes {
+        mark_watch_interest_dirty(node.context.as_ref(), realm_id).await?;
+    }
+
+    wait_for(POLL_TIMEOUT, || async {
+        list_watch_subscriptions(&new_holder_node.context.storage_handle, watcher)
+            .await
+            .is_ok_and(|rows| rows.contains(&subscription))
+    })
+    .await?;
+    wait_for(POLL_TIMEOUT, || async {
+        nodes[1].net.watch_interest_snapshot().matching_nodes(
+            realm_id,
+            &probe,
+            WatchEventKind::DataUploaded,
+        ) == vec![new_holder]
+    })
+    .await?;
+    assert_eq!(
+        list_watches_for_user(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher).await?,
+        vec![subscription.clone()]
+    );
+
+    let event_id = Ulid::new();
+    emit_resource_watch_event(
+        nodes[1].context.as_ref(),
+        upload_event(
+            event_id,
+            realm_id,
+            UserId::local(Ulid::new(), realm_id),
+            UploadLocation {
+                group_id,
+                node_id: data_node_id,
+                bucket: "bucket",
+                key: "reranked/object",
+            },
+            unix_timestamp_millis(),
+        ),
+    )
+    .await;
+    let expected_id = watch_notification_id(event_id, subscription.watch_id);
+    wait_for(POLL_TIMEOUT, || async {
+        list_via(&nodes[0], watcher)
+            .await
+            .iter()
+            .any(|record| record.notification_id == expected_id)
+    })
+    .await?;
+
+    delete_watch_via(&nodes[0], watcher, subscription.watch_id).await?;
+    wait_for(POLL_TIMEOUT, || async {
+        list_watches_for_user(nodes[1].context.as_ref(), nodes[1].net.node_id(), watcher)
+            .await
+            .is_ok_and(|rows| rows.is_empty())
+    })
+    .await?;
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+struct UploadLocation<'a> {
+    group_id: Ulid,
+    node_id: NodeId,
+    bucket: &'a str,
+    key: &'a str,
+}
+
 fn upload_event(
     event_id: Ulid,
     realm_id: RealmId,
     actor: UserId,
-    group_id: Ulid,
-    node_id: NodeId,
-    bucket: &str,
-    key: &str,
+    location: UploadLocation<'_>,
     occurred_at_ms: u64,
 ) -> WatchEvent {
+    let UploadLocation {
+        group_id,
+        node_id,
+        bucket,
+        key,
+    } = location;
     WatchEvent {
         event_id,
         realm_id,
@@ -509,6 +647,29 @@ fn user_with_holder(
     panic!("no user hashed to holder {holder} within the sampling bound");
 }
 
+fn user_with_changed_holder(
+    before: &RealmConfigDocument,
+    after: &RealmConfigDocument,
+    realm_id: RealmId,
+) -> (UserId, NodeId, NodeId) {
+    for _ in 0..10_000 {
+        let candidate = UserId::local(Ulid::new(), realm_id);
+        let old_holder = resolve_inbox_holder(&candidate, before).unwrap().unwrap();
+        let new_holder = resolve_inbox_holder(&candidate, after).unwrap().unwrap();
+        if old_holder != new_holder {
+            return (candidate, old_holder, new_holder);
+        }
+    }
+    panic!("no user changed holder within the sampling bound");
+}
+
+fn node_by_id(nodes: &[TestNode], node_id: NodeId) -> &TestNode {
+    nodes
+        .iter()
+        .find(|node| node.net.node_id() == node_id)
+        .expect("holder belongs to test mesh")
+}
+
 async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
@@ -578,6 +739,14 @@ async fn install_realm_config(
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = realm_config_for(nodes, realm_id);
+    install_config_document(nodes, realm_id, &config).await
+}
+
+async fn install_config_document(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
@@ -599,7 +768,7 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_realm_peers_from_document(config).await?;
     }
     Ok(())
 }

@@ -575,6 +575,10 @@ enum JsonDocumentSyncTarget {
         realm_id: String,
         node_id: String,
     },
+    WatchSubscription {
+        owner: String,
+        watch_id: String,
+    },
 }
 
 fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
@@ -635,6 +639,12 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
             JsonDocumentSyncTarget::WatchInterest {
                 realm_id: realm_id.to_string(),
                 node_id: node_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::WatchSubscription { owner, watch_id } => {
+            JsonDocumentSyncTarget::WatchSubscription {
+                owner: owner.to_string(),
+                watch_id: watch_id.to_string(),
             }
         }
     }

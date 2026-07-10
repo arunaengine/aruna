@@ -1,9 +1,15 @@
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
+    DocumentSyncRevision, DocumentSyncTarget,
+};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::storage_entries::{
-    watch_subscription_delete_entry, watch_subscription_write_entry,
+    document_sync_revision_write_entry, watch_subscription_delete_entry,
+    watch_subscription_write_entry,
 };
 use aruna_core::structs::{
     NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, RealmId, WatchEventMask,
@@ -14,6 +20,10 @@ use aruna_storage::StorageHandle;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
+use crate::driver::DriverContext;
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -34,6 +44,8 @@ pub enum WatchSubscriptionError {
     PrefixTooLong,
     #[error("watch event mask must select at least one event")]
     EmptyMask,
+    #[error("watch event mask contains an unknown event")]
+    InvalidMask,
     #[error("notification watch subscription cap reached")]
     CapExceeded,
     #[error("{0}")]
@@ -46,8 +58,40 @@ enum CreateFailure {
     Fatal(String),
 }
 
+#[derive(Clone)]
+struct WatchReplication {
+    revision: DocumentSyncChange,
+    outbox: DocumentSyncOutboxRecord,
+}
+
 pub async fn create_watch_subscription(
     storage: &StorageHandle,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+    now_ms: u64,
+) -> Result<WatchSubscription, WatchSubscriptionError> {
+    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    create_subscription(storage, subscription, None).await
+}
+
+pub async fn create_replicated_watch_subscription(
+    context: &DriverContext,
+    local_node_id: aruna_core::NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+    now_ms: u64,
+) -> Result<WatchSubscription, WatchSubscriptionError> {
+    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    let replication = watch_upsert_replication(local_node_id, &subscription)?;
+    let subscription =
+        create_subscription(&context.storage_handle, subscription, Some(replication)).await?;
+    schedule_replication(context).await;
+    Ok(subscription)
+}
+
+fn validated_subscription(
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
@@ -68,26 +112,45 @@ pub async fn create_watch_subscription(
     if event_mask.is_empty() {
         return Err(WatchSubscriptionError::EmptyMask);
     }
+    if event_mask.bits() & !(WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED) != 0
+    {
+        return Err(WatchSubscriptionError::InvalidMask);
+    }
 
-    let subscription = WatchSubscription::new(owner, path_prefix, event_mask, now_ms);
-    match create_once(storage, &subscription).await {
+    Ok(WatchSubscription::new(
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+    ))
+}
+
+async fn create_subscription(
+    storage: &StorageHandle,
+    subscription: WatchSubscription,
+    replication: Option<WatchReplication>,
+) -> Result<WatchSubscription, WatchSubscriptionError> {
+    match create_once(storage, &subscription, replication.as_ref()).await {
         Ok(()) => Ok(subscription),
         Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
         Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-        Err(CreateFailure::Conflict) => match create_once(storage, &subscription).await {
-            Ok(()) => Ok(subscription),
-            Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
-            Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-            Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                "watch subscription create conflicted twice".to_string(),
-            )),
-        },
+        Err(CreateFailure::Conflict) => {
+            match create_once(storage, &subscription, replication.as_ref()).await {
+                Ok(()) => Ok(subscription),
+                Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
+                Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
+                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
+                    "watch subscription create conflicted twice".to_string(),
+                )),
+            }
+        }
     }
 }
 
 async fn create_once(
     storage: &StorageHandle,
     subscription: &WatchSubscription,
+    replication: Option<&WatchReplication>,
 ) -> Result<(), CreateFailure> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -128,23 +191,45 @@ async fn create_once(
         return Err(CreateFailure::Cap);
     }
 
-    let (key_space, key, value) = match watch_subscription_write_entry(subscription) {
+    let subscription_write = match watch_subscription_write_entry(subscription) {
         Ok(entry) => entry,
         Err(error) => {
             abort_txn(storage, txn_id).await;
             return Err(CreateFailure::Fatal(error.to_string()));
         }
     };
+    let mut writes = vec![subscription_write];
+    writes.push(watch_interest_dirty_marker_write(
+        subscription.owner.realm_id,
+    ));
+    if let Some(replication) = replication {
+        let target = watch_subscription_target(subscription.owner, subscription.watch_id);
+        let revision_entry =
+            match document_sync_revision_write_entry(&target, &replication.revision) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    abort_txn(storage, txn_id).await;
+                    return Err(CreateFailure::Fatal(error.to_string()));
+                }
+            };
+        let outbox_entry = match outbox_write_entry(&replication.outbox) {
+            Ok(entry) => entry,
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error.to_string()));
+            }
+        };
+        writes.push(revision_entry);
+        writes.push(outbox_entry);
+    }
     match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
             txn_id: Some(txn_id),
         })
         .await
     {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(abort_and_classify(storage, txn_id, error).await);
         }
@@ -155,8 +240,6 @@ async fn create_once(
             )));
         }
     }
-
-    write_dirty_marker(storage, subscription.owner.realm_id, txn_id).await?;
 
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -175,15 +258,44 @@ pub async fn delete_watch_subscription(
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), WatchSubscriptionError> {
-    match delete_once(storage, owner, watch_id).await {
-        Ok(()) => Ok(()),
-        Err(CreateFailure::Conflict) => match delete_once(storage, owner, watch_id).await {
-            Ok(()) => Ok(()),
-            Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                "watch subscription delete conflicted twice".to_string(),
-            )),
-            Err(other) => Err(delete_failure(other)),
-        },
+    delete_subscription(storage, owner, watch_id, None)
+        .await
+        .map(|_| ())
+}
+
+pub async fn delete_replicated_watch_subscription(
+    context: &DriverContext,
+    local_node_id: aruna_core::NodeId,
+    owner: UserId,
+    watch_id: Ulid,
+    now_ms: u64,
+) -> Result<(), WatchSubscriptionError> {
+    let replication = watch_delete_replication(local_node_id, owner, watch_id, now_ms);
+    let deleted =
+        delete_subscription(&context.storage_handle, owner, watch_id, Some(replication)).await?;
+    if deleted {
+        schedule_replication(context).await;
+    }
+    Ok(())
+}
+
+async fn delete_subscription(
+    storage: &StorageHandle,
+    owner: UserId,
+    watch_id: Ulid,
+    replication: Option<WatchReplication>,
+) -> Result<bool, WatchSubscriptionError> {
+    match delete_once(storage, owner, watch_id, replication.as_ref()).await {
+        Ok(deleted) => Ok(deleted),
+        Err(CreateFailure::Conflict) => {
+            match delete_once(storage, owner, watch_id, replication.as_ref()).await {
+                Ok(deleted) => Ok(deleted),
+                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
+                    "watch subscription delete conflicted twice".to_string(),
+                )),
+                Err(other) => Err(delete_failure(other)),
+            }
+        }
         Err(other) => Err(delete_failure(other)),
     }
 }
@@ -206,10 +318,8 @@ async fn delete_once(
     storage: &StorageHandle,
     owner: UserId,
     watch_id: Ulid,
-) -> Result<(), CreateFailure> {
-    // Row delete and the interest dirty marker share one transaction so the
-    // publisher can never miss the change; both are blind writes, so no read set
-    // means the commit does not spuriously conflict with concurrent CRUD.
+    replication: Option<&WatchReplication>,
+) -> Result<bool, CreateFailure> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -222,6 +332,31 @@ async fn delete_once(
             )));
         }
     };
+
+    let (_, subscription_key) = watch_subscription_delete_entry(owner, watch_id);
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            key: subscription_key,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_txn(storage, txn_id).await;
+            return Ok(false);
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(abort_and_classify(storage, txn_id, error).await);
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Fatal(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    }
 
     let (key_space, key) = watch_subscription_delete_entry(owner, watch_id);
     match storage
@@ -244,13 +379,51 @@ async fn delete_once(
         }
     }
 
-    write_dirty_marker(storage, owner.realm_id, txn_id).await?;
+    let mut writes = vec![watch_interest_dirty_marker_write(owner.realm_id)];
+    if let Some(replication) = replication {
+        let target = watch_subscription_target(owner, watch_id);
+        let revision_entry =
+            match document_sync_revision_write_entry(&target, &replication.revision) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    abort_txn(storage, txn_id).await;
+                    return Err(CreateFailure::Fatal(error.to_string()));
+                }
+            };
+        let outbox_entry = match outbox_write_entry(&replication.outbox) {
+            Ok(entry) => entry,
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(CreateFailure::Fatal(error.to_string()));
+            }
+        };
+        writes.push(revision_entry);
+        writes.push(outbox_entry);
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(abort_and_classify(storage, txn_id, error).await);
+        }
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Fatal(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    }
 
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
         Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
         other => Err(CreateFailure::Fatal(format!(
             "unexpected storage event: {other:?}"
@@ -258,35 +431,77 @@ async fn delete_once(
     }
 }
 
-/// Writes the realm's interest dirty marker inside `txn_id` and aborts the
-/// transaction on failure. A blind write (no prior read of the marker key) so it
-/// never adds a conflict of its own.
-async fn write_dirty_marker(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    txn_id: TxnId,
-) -> Result<(), CreateFailure> {
-    let (key_space, key, value) = watch_interest_dirty_marker_write(realm_id);
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(abort_and_classify(storage, txn_id, error).await)
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )))
-        }
-    }
+fn watch_subscription_target(owner: UserId, watch_id: Ulid) -> DocumentSyncTarget {
+    DocumentSyncTarget::WatchSubscription { owner, watch_id }
+}
+
+fn watch_upsert_replication(
+    local_node_id: aruna_core::NodeId,
+    subscription: &WatchSubscription,
+) -> Result<WatchReplication, WatchSubscriptionError> {
+    let outbox_id = Ulid::new();
+    let revision = DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: outbox_id,
+            actor: local_node_id,
+            updated_at_ms: subscription.created_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+    };
+    let target = watch_subscription_target(subscription.owner, subscription.watch_id);
+    let outbox = new_outbox_record_with_id(
+        outbox_id,
+        local_node_id,
+        target,
+        Vec::new(),
+        DocumentSyncOutboxEvent::Upsert {
+            bytes: subscription
+                .to_bytes()
+                .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
+            change: revision,
+        },
+        false,
+    );
+    Ok(WatchReplication { revision, outbox })
+}
+
+fn watch_delete_replication(
+    local_node_id: aruna_core::NodeId,
+    owner: UserId,
+    watch_id: Ulid,
+    now_ms: u64,
+) -> WatchReplication {
+    let outbox_id = Ulid::new();
+    let revision = DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 2,
+            event_id: outbox_id,
+            actor: local_node_id,
+            updated_at_ms: now_ms,
+        },
+        kind: DocumentSyncChangeKind::Delete,
+    };
+    let outbox = new_outbox_record_with_id(
+        outbox_id,
+        local_node_id,
+        watch_subscription_target(owner, watch_id),
+        Vec::new(),
+        DocumentSyncOutboxEvent::Delete { change: revision },
+        false,
+    );
+    WatchReplication { revision, outbox }
+}
+
+async fn schedule_replication(context: &DriverContext) {
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        return;
+    };
+    let _ = task_handle
+        .send_effect(schedule_outbox_drain_effect())
+        .await;
 }
 
 pub async fn list_watch_subscriptions(

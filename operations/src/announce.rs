@@ -226,6 +226,10 @@ impl AnnounceTopicOperation {
                 "whole-document admin sync is unsupported; admin documents must sync as operations"
                     .to_string(),
             )),
+            DocumentSyncTarget::WatchSubscription { .. } => Err(AnnounceTopicError::DocumentSync(
+                "watch subscriptions must sync through atomic watch CRUD outbox records"
+                    .to_string(),
+            )),
             DocumentSyncTarget::MetadataRegistry {
                 group_id,
                 document_id,

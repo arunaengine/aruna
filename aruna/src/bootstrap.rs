@@ -13,7 +13,9 @@ use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::interest::ensure_local_watch_interest_digest;
+use aruna_operations::notifications::watch::interest::{
+    ensure_local_watch_interest_digest, mark_watch_interest_dirty,
+};
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -93,6 +95,11 @@ async fn core_document_targets(
     ensure_local_watch_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
         .await
         .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
+    // Rebuild from replicated subscription rows on every startup. This closes
+    // crash windows around membership reconciliation and remote row application.
+    mark_watch_interest_dirty(driver_ctx, realm_id)
+        .await
+        .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
 
     let mut documents = vec![
         DocumentSyncTarget::RealmAuthorization { realm_id },

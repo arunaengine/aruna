@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -9,6 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
     RealmConfigDocument, RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchInterestDigest,
@@ -432,6 +433,7 @@ pub async fn restore_watch_interest_publish_timer(
 /// skipped defensively, and empty digests contribute nothing.
 pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInterestTable {
     let mut table = WatchInterestTable::default();
+    let mut eligible_by_realm: HashMap<RealmId, Option<HashSet<NodeId>>> = HashMap::new();
     let entries = match iter_all(
         storage,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
@@ -461,13 +463,32 @@ pub async fn rebuild_watch_interest_table(storage: &StorageHandle) -> WatchInter
         if key_node_id != Some(digest.node_id) {
             continue;
         }
+        if let std::collections::hash_map::Entry::Vacant(entry) = eligible_by_realm.entry(realm_id)
+        {
+            let eligible = match sync_eligible_nodes(storage, realm_id).await {
+                Ok(eligible) => Some(eligible),
+                Err(error) => {
+                    warn!(%realm_id, %error, "Ignoring watch interest without a current realm config");
+                    None
+                }
+            };
+            entry.insert(eligible);
+        }
+        if !eligible_by_realm
+            .get(&realm_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|eligible| eligible.contains(&digest.node_id))
+        {
+            continue;
+        }
         table.insert(realm_id, digest.node_id, digest.entries);
     }
     table
 }
 
-/// Refreshes the in-memory watch-interest cache for exactly the realms whose
-/// `WatchInterest` digests a document-sync reconcile touched. Mirrors
+/// Refreshes the in-memory watch-interest cache for realms whose interest or
+/// membership changed, and schedules local digest rebuilds when replicated
+/// subscriptions or placement membership changed. Mirrors
 /// `refresh_realm_usage_summary_for_targets`: shared by every reconcile handler
 /// (inbound apply, durable outbox drain, and the `SyncDocument` timer) so a
 /// digest that lands on any of those paths updates the origin-side table.
@@ -479,9 +500,25 @@ pub async fn refresh_watch_interest_for_targets(
         return;
     };
     let mut realms: BTreeSet<RealmId> = BTreeSet::new();
+    let mut dirty_realms: BTreeSet<RealmId> = BTreeSet::new();
     for target in targets {
-        if let DocumentSyncTarget::WatchInterest { realm_id, .. } = target {
-            realms.insert(*realm_id);
+        match target {
+            DocumentSyncTarget::WatchInterest { realm_id, .. } => {
+                realms.insert(*realm_id);
+            }
+            DocumentSyncTarget::WatchSubscription { owner, .. } => {
+                dirty_realms.insert(owner.realm_id);
+            }
+            DocumentSyncTarget::RealmConfig { realm_id } => {
+                realms.insert(*realm_id);
+                dirty_realms.insert(*realm_id);
+            }
+            _ => {}
+        }
+    }
+    for realm_id in dirty_realms {
+        if let Err(error) = mark_watch_interest_dirty(ctx, realm_id).await {
+            warn!(%realm_id, %error, "Failed to schedule watch interest rebuild after document reconciliation");
         }
     }
     if realms.is_empty() {
@@ -491,7 +528,10 @@ pub async fn refresh_watch_interest_for_targets(
         match build_realm_node_map(&ctx.storage_handle, realm_id).await {
             Ok(nodes) => net_handle.update_watch_interest_realm(realm_id, nodes),
             Err(error) => {
-                warn!(error = %error, "Failed to refresh watch interest after document sync reconciliation")
+                // Membership is a security boundary. Fail closed instead of
+                // retaining a previously cached removed node.
+                net_handle.update_watch_interest_realm(realm_id, HashMap::new());
+                warn!(%realm_id, error = %error, "Cleared watch interest after failed realm refresh")
             }
         }
     }
@@ -503,6 +543,7 @@ async fn build_realm_node_map(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> Result<HashMap<NodeId, Vec<WatchInterestEntry>>, String> {
+    let eligible = sync_eligible_nodes(storage, realm_id).await?;
     let entries = iter_all(
         storage,
         NOTIFICATION_WATCH_INTEREST_KEYSPACE,
@@ -512,13 +553,50 @@ async fn build_realm_node_map(
     let mut nodes: HashMap<NodeId, Vec<WatchInterestEntry>> = HashMap::new();
     for (key, value) in entries {
         let key_node_id = watch_interest_key_node_id(key.as_ref());
-        let digest = WatchInterestDigest::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-        if key_node_id != Some(digest.node_id) || digest.entries.is_empty() {
+        let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
+            Ok(digest) => digest,
+            Err(error) => {
+                warn!(%realm_id, %error, "Skipping malformed watch interest digest");
+                continue;
+            }
+        };
+        if key_node_id != Some(digest.node_id)
+            || !eligible.contains(&digest.node_id)
+            || digest.entries.is_empty()
+        {
             continue;
         }
         nodes.insert(digest.node_id, digest.entries);
     }
     Ok(nodes)
+}
+
+async fn sync_eligible_nodes(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+) -> Result<HashSet<NodeId>, String> {
+    let value = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: Key::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => value,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            return Err(format!("realm config {realm_id} not found"));
+        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected realm config read event: {other:?}")),
+    };
+    RealmConfigDocument::from_bytes(value.as_ref())
+        .map_err(|error| error.to_string())?
+        .sync_eligible_node_ids()
+        .map(|nodes| nodes.into_iter().collect())
+        .map_err(|error| error.to_string())
 }
 
 async fn iter_all(
@@ -998,6 +1076,7 @@ mod tests {
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let realm_id = RealmId([3u8; 32]);
         let holder = node(11);
+        install_realm_config(&ctx, realm_id, &[holder]).await;
 
         write_digest(
             &ctx,
@@ -1011,13 +1090,17 @@ mod tests {
             },
         )
         .await;
-        // An empty digest from another node must not add a matchable holder.
+        // A positive digest from a node outside current membership must not add
+        // a matchable holder.
         write_digest(
             &ctx,
             realm_id,
             &WatchInterestDigest {
                 node_id: node(12),
-                entries: Vec::new(),
+                entries: vec![WatchInterestEntry {
+                    path_prefix: "bucket/".to_string(),
+                    event_mask: mask(),
+                }],
             },
         )
         .await;
@@ -1035,6 +1118,7 @@ mod tests {
         let realm_id = RealmId([4u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm_id, [70u8; 32]).await;
         let holder = node(13);
+        install_realm_config(&ctx, realm_id, &[holder]).await;
 
         assert!(net.watch_interest_snapshot().is_empty());
 
@@ -1062,5 +1146,58 @@ mod tests {
             snapshot.matching_nodes(realm_id, "data/x", WatchEventKind::MetadataCreated),
             vec![holder]
         );
+    }
+
+    #[tokio::test]
+    async fn realm_config_refresh_retracts_removed_digest_holder() {
+        let realm_id = RealmId([5u8; 32]);
+        let (_dir, ctx, net) = ctx_with_net(realm_id, [71u8; 32]).await;
+        let retained = node(14);
+        let removed = node(15);
+        install_realm_config(&ctx, realm_id, &[retained, removed]).await;
+        for holder in [retained, removed] {
+            write_digest(
+                &ctx,
+                realm_id,
+                &WatchInterestDigest {
+                    node_id: holder,
+                    entries: vec![WatchInterestEntry {
+                        path_prefix: "data/".to_string(),
+                        event_mask: mask(),
+                    }],
+                },
+            )
+            .await;
+        }
+        refresh_watch_interest_for_targets(
+            &ctx,
+            &[DocumentSyncTarget::WatchInterest {
+                realm_id,
+                node_id: retained,
+            }],
+        )
+        .await;
+        assert_eq!(
+            net.watch_interest_snapshot().matching_nodes(
+                realm_id,
+                "data/x",
+                WatchEventKind::MetadataCreated,
+            ),
+            vec![retained, removed]
+        );
+
+        install_realm_config(&ctx, realm_id, &[retained]).await;
+        refresh_watch_interest_for_targets(&ctx, &[DocumentSyncTarget::RealmConfig { realm_id }])
+            .await;
+
+        assert_eq!(
+            net.watch_interest_snapshot().matching_nodes(
+                realm_id,
+                "data/x",
+                WatchEventKind::MetadataCreated,
+            ),
+            vec![retained]
+        );
+        assert!(read_digest(&ctx, realm_id, removed).await.is_some());
     }
 }

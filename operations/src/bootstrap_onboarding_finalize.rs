@@ -26,6 +26,7 @@ use crate::issue_onboarding_sync_ticket::{
 };
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
+use crate::notifications::watch::interest::mark_watch_interest_dirty;
 use crate::process_placements::{PlacementConfig, PlacementError, ProcessPlacementsOperation};
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
@@ -183,7 +184,12 @@ async fn ensure_realm_node_with_retries(
     let mut last_conflict = None;
     for _ in 0..REALM_NODE_UPDATE_RETRIES {
         match ensure_realm_node_once(input, mode, context).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if let Err(error) = mark_watch_interest_dirty(context, input.realm_id).await {
+                    warn!(%error, "Failed to rebuild watch placement after onboarding realm change");
+                }
+                return Ok(());
+            }
             Err(EnsureRealmConfigError::StorageError(StorageError::TransactionConflict)) => {
                 last_conflict = Some(StorageError::TransactionConflict);
             }

@@ -22,12 +22,13 @@ use aruna_core::document::{
     DocumentSyncReconcileResult, DocumentSyncTarget,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
-    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -45,9 +46,10 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{
-    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeUsageSnapshot,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User, WatchInterestDigest,
-    group_owner_index_key, node_usage_key_node_id, watch_interest_key_node_id,
+    Group, GroupAuthorizationDocument, MetadataRegistryRecord, NOTIFICATION_WATCH_MAX_PREFIX_LEN,
+    NodeUsageSnapshot, RealmAuthorizationDocument, RealmConfigDocument, RealmId, Role, User,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
+    node_usage_key_node_id, watch_interest_dirty_key, watch_interest_key_node_id,
     watch_interest_key_realm_id,
 };
 use aruna_core::telemetry::duration_ms;
@@ -1526,6 +1528,38 @@ impl DocumentSyncService {
                 }
                 match event {
                     DocumentSyncEvent::Upsert {
+                        target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
+                        bytes,
+                        change,
+                        ..
+                    } => {
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&change.current.actor),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                %owner,
+                                %watch_id,
+                                "Rejecting watch subscription whose revision actor is not its publisher"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) =
+                            validate_watch_subscription_upsert(&target, &bytes, &change)
+                        {
+                            warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription");
+                            continue;
+                        }
+                        if self
+                            .apply_watch_subscription_change(target.clone(), Some(bytes), change)
+                            .await?
+                        {
+                            applied_targets.push(target);
+                        }
+                    }
+                    DocumentSyncEvent::Upsert {
                         target:
                             target @ DocumentSyncTarget::NodeUsage {
                                 node_id: snapshot_node,
@@ -1692,6 +1726,35 @@ impl DocumentSyncService {
                             if record.is_deleted() {
                                 metadata_graph_tombstones.push(record);
                             }
+                            applied_targets.push(target);
+                        }
+                    }
+                    DocumentSyncEvent::Delete {
+                        target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
+                        change,
+                        ..
+                    } => {
+                        let expected_actor = irokle_crate::actor_id_for(
+                            topic_id,
+                            node_id_to_peer_id(&change.current.actor),
+                        );
+                        if actor_id != expected_actor {
+                            warn!(
+                                %topic_id,
+                                %owner,
+                                %watch_id,
+                                "Rejecting watch subscription delete whose revision actor is not its publisher"
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_watch_subscription_delete(&target, &change) {
+                            warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription delete");
+                            continue;
+                        }
+                        if self
+                            .apply_watch_subscription_change(target.clone(), None, change)
+                            .await?
+                        {
                             applied_targets.push(target);
                         }
                     }
@@ -2037,6 +2100,15 @@ impl DocumentSyncService {
             bytes.into(),
         )
         .await
+    }
+
+    async fn apply_watch_subscription_change(
+        &self,
+        target: DocumentSyncTarget,
+        bytes: Option<Vec<u8>>,
+        change: DocumentSyncChange,
+    ) -> Result<bool> {
+        apply_watch_subscription_change_to_storage(&self.storage, target, bytes, change).await
     }
 
     async fn apply_metadata_registry_upsert(
@@ -3446,6 +3518,134 @@ async fn storage_read_from(
     }
 }
 
+async fn apply_watch_subscription_change_to_storage(
+    storage: &StorageHandle,
+    target: DocumentSyncTarget,
+    bytes: Option<Vec<u8>>,
+    change: DocumentSyncChange,
+) -> Result<bool> {
+    for _ in 0..2 {
+        let txn_id = match storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(NetError::Dht(error.to_string()));
+            }
+            other => {
+                return Err(NetError::Dht(format!(
+                    "unexpected transaction start while applying watch subscription: {other:?}"
+                )));
+            }
+        };
+
+        let current = match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                key: document_sync_revision_key(&target),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => match value
+                .map(|value| postcard::from_bytes::<DocumentSyncChange>(value.as_ref()))
+                .transpose()
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    let _ = storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(NetError::Bootstrap(error.to_string()));
+                }
+            },
+            Event::Storage(StorageEvent::Error { error }) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(NetError::Dht(error.to_string()));
+            }
+            other => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(NetError::Dht(format!(
+                    "unexpected revision read while applying watch subscription: {other:?}"
+                )));
+            }
+        };
+
+        // Watch ids are immutable and never reused. The first valid upsert wins,
+        // and any delete permanently fences delayed/replayed creates.
+        let apply = match (current.as_ref().map(|local| local.kind), change.kind) {
+            (None, _) => true,
+            (Some(DocumentSyncChangeKind::Upsert), DocumentSyncChangeKind::Delete) => true,
+            (Some(DocumentSyncChangeKind::Upsert), DocumentSyncChangeKind::Upsert)
+            | (Some(DocumentSyncChangeKind::Delete), _) => false,
+        };
+        if !apply {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(false);
+        }
+
+        let realm_id = match &target {
+            DocumentSyncTarget::WatchSubscription { owner, .. } => owner.realm_id,
+            _ => unreachable!("watch subscription apply requires a subscription target"),
+        };
+        let revision_entry = match document_sync_revision_write_entry(&target, &change) {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(NetError::Bootstrap(error.to_string()));
+            }
+        };
+        let mut writes = vec![
+            revision_entry,
+            (
+                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                ByteView::from(watch_interest_dirty_key(realm_id)),
+                ByteView::from(Ulid::new().to_bytes().to_vec()),
+            ),
+        ];
+        let deletes = if let Some(bytes) = bytes.as_ref() {
+            writes.push((
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+                ByteView::from(bytes.clone()),
+            ));
+            Vec::new()
+        } else {
+            vec![(target.storage_keyspace().to_string(), target.storage_key())]
+        };
+
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
+        {
+            Ok(()) => return Ok(true),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "watch subscription apply conflicted twice".to_string(),
+    ))
+}
+
 async fn storage_batch_write_to(
     storage: &StorageHandle,
     writes: Vec<(String, ByteView, Value)>,
@@ -3660,6 +3860,67 @@ fn validate_watch_interest_upsert(
         return Err(format!(
             "watch interest storage key does not attribute to target realm id {realm_id}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_watch_subscription_upsert(
+    target: &DocumentSyncTarget,
+    bytes: &[u8],
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+        return Err("target is not a watch subscription".to_string());
+    };
+    validate_watch_subscription_target(*owner, *watch_id)?;
+    if change.kind != DocumentSyncChangeKind::Upsert || change.current.generation != 1 {
+        return Err(
+            "watch subscription upsert must carry generation 1 upsert revision".to_string(),
+        );
+    }
+    let subscription = WatchSubscription::from_bytes(bytes)
+        .map_err(|error| format!("undecodable watch subscription: {error}"))?;
+    if subscription.owner != *owner || subscription.watch_id != *watch_id {
+        return Err("watch subscription payload does not match its target".to_string());
+    }
+    if subscription.path_prefix.is_empty()
+        || subscription.path_prefix.starts_with('/')
+        || subscription.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
+    {
+        return Err("watch subscription path prefix is invalid".to_string());
+    }
+    let known_mask = WatchEventMask::METADATA_CREATED | WatchEventMask::DATA_UPLOADED;
+    if subscription.event_mask.is_empty() || subscription.event_mask.bits() & !known_mask != 0 {
+        return Err("watch subscription event mask is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_watch_subscription_delete(
+    target: &DocumentSyncTarget,
+    change: &DocumentSyncChange,
+) -> std::result::Result<(), String> {
+    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+        return Err("target is not a watch subscription".to_string());
+    };
+    validate_watch_subscription_target(*owner, *watch_id)?;
+    if change.kind != DocumentSyncChangeKind::Delete || change.current.generation != 2 {
+        return Err(
+            "watch subscription delete must carry generation 2 delete revision".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_watch_subscription_target(
+    owner: UserId,
+    watch_id: Ulid,
+) -> std::result::Result<(), String> {
+    if owner.is_nil() {
+        return Err("watch subscription owner must not be nil".to_string());
+    }
+    if watch_id.is_nil() {
+        return Err("watch subscription id must not be nil".to_string());
     }
     Ok(())
 }

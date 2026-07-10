@@ -445,9 +445,9 @@ impl OperationsTaskHandler {
             })) => {
                 process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
                     .await;
+                let mut refresh_targets = targets.clone();
+                refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    let mut refresh_targets = targets.clone();
-                    refresh_targets.extend(requested_targets);
                     refresh_realm_usage_summary_for_targets(
                         self.context.as_ref(),
                         net_handle.node_id(),
@@ -455,7 +455,7 @@ impl OperationsTaskHandler {
                     )
                     .await;
                 }
-                refresh_watch_interest_for_targets(self.context.as_ref(), &targets).await;
+                refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets).await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -1173,7 +1173,8 @@ impl InboundTaskHandler for OperationsTaskHandler {
                             &refresh_targets,
                         )
                         .await;
-                        refresh_watch_interest_for_targets(self.context.as_ref(), &targets).await;
+                        refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets)
+                            .await;
                         if self
                             .project_reconciled_metadata_create_events(
                                 &retry_key,

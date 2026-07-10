@@ -18,8 +18,8 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_watch_subscription,
-    delete_watch_subscription, list_watch_subscriptions,
+    WATCH_SUBSCRIPTION_CAP_REACHED, WatchSubscriptionError, create_replicated_watch_subscription,
+    delete_replicated_watch_subscription, list_watch_subscriptions,
 };
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
@@ -205,8 +205,9 @@ pub async fn create_watch_for_user(
 ) -> Result<WatchSubscription, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
-        let subscription = create_watch_subscription(
-            &context.storage_handle,
+        let subscription = create_replicated_watch_subscription(
+            context,
+            local_node_id,
             owner,
             path_prefix,
             event_mask,
@@ -244,9 +245,15 @@ pub async fn delete_watch_for_user(
 ) -> Result<(), WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
-        delete_watch_subscription(&context.storage_handle, owner, watch_id)
-            .await
-            .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
+        delete_replicated_watch_subscription(
+            context,
+            local_node_id,
+            owner,
+            watch_id,
+            unix_timestamp_millis(),
+        )
+        .await
+        .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
         schedule_watch_interest_publish(context).await;
         Ok(())
     } else {

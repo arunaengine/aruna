@@ -427,7 +427,7 @@ struct UnreadStreamState {
     next_holder_recheck: Instant,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamStep {
     /// Unconditional emit: a wake fired (or the wake bus lagged).
     Emit,
@@ -443,6 +443,32 @@ fn drain_pending_wakes(rx: &mut InboxWakeReceiver) {
     // Collapse any wakes buffered during the coalesce window into the single
     // refetch that follows; a closed/lagged channel simply stops the drain.
     while rx.try_recv().is_ok() {}
+}
+
+async fn next_local_stream_step(
+    rx: &mut InboxWakeReceiver,
+    recipient: UserId,
+    recheck_deadline: Instant,
+) -> StreamStep {
+    use tokio::sync::broadcast::error::RecvError;
+
+    tokio::select! {
+        biased;
+        // Once overdue, holder re-resolution must win over a continuously ready
+        // node-wide wake bus carrying traffic for other recipients.
+        _ = tokio::time::sleep_until(recheck_deadline) => StreamStep::Recheck,
+        recv = rx.recv() => match recv {
+            Ok(woken) if woken == recipient => {
+                tokio::time::sleep(NOTIFICATION_STREAM_COALESCE).await;
+                drain_pending_wakes(rx);
+                StreamStep::Emit
+            }
+            Ok(_) => StreamStep::Wait,
+            // Never tear the stream down for lag; refetch instead.
+            Err(RecvError::Lagged(_)) => StreamStep::Emit,
+            Err(RecvError::Closed) => StreamStep::End,
+        },
+    }
 }
 
 async fn fetch_unread_count(state: &UnreadStreamState) -> Option<(u64, bool)> {
@@ -490,22 +516,7 @@ fn unread_count_stream(
             let recheck_deadline = state.next_holder_recheck;
             let step = match &mut state.mode {
                 UnreadStreamMode::Local(rx) => {
-                    use tokio::sync::broadcast::error::RecvError;
-                    tokio::select! {
-                        biased;
-                        recv = rx.recv() => match recv {
-                            Ok(woken) if woken == recipient => {
-                                tokio::time::sleep(NOTIFICATION_STREAM_COALESCE).await;
-                                drain_pending_wakes(rx);
-                                StreamStep::Emit
-                            }
-                            Ok(_) => StreamStep::Wait,
-                            // Never tear the stream down for lag; refetch instead.
-                            Err(RecvError::Lagged(_)) => StreamStep::Emit,
-                            Err(RecvError::Closed) => StreamStep::End,
-                        },
-                        _ = tokio::time::sleep_until(recheck_deadline) => StreamStep::Recheck,
-                    }
+                    next_local_stream_step(rx, recipient, recheck_deadline).await
                 }
                 UnreadStreamMode::Remote => {
                     tokio::time::sleep(remote_poll).await;
@@ -1221,6 +1232,24 @@ mod tests {
             .expect("recheck backstop emits without a wake")
             .expect("stream open");
         assert_eq!(after_recheck, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_local_recheck_wins_over_unrelated_wake() {
+        let realm_id = realm_id(15);
+        let recipient = UserId::new(Ulid::new(), realm_id);
+        let unrelated = UserId::new(Ulid::new(), realm_id);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(unrelated).expect("receiver is open");
+
+        let step = next_local_stream_step(
+            &mut rx,
+            recipient,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(step, StreamStep::Recheck);
     }
 
     // The remote arm polls the holder and emits only on change: the initial poll

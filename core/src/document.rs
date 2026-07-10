@@ -8,8 +8,8 @@ use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
-    USER_KEYSPACE,
+    NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
 use crate::storage_entries::{
@@ -17,6 +17,7 @@ use crate::storage_entries::{
 };
 use crate::structs::{
     RealmId, node_usage_global_key, node_usage_group_key, watch_interest_node_key,
+    watch_subscription_key,
 };
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -60,6 +61,10 @@ pub enum DocumentSyncTarget {
     WatchInterest {
         realm_id: RealmId,
         node_id: NodeId,
+    },
+    WatchSubscription {
+        owner: UserId,
+        watch_id: Ulid,
     },
 }
 
@@ -289,6 +294,7 @@ impl DocumentSyncTarget {
             }
             Self::NodeUsage { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
+            Self::WatchSubscription { owner, .. } => TopicId::realm(owner.realm_id),
         }
     }
 
@@ -304,6 +310,7 @@ impl DocumentSyncTarget {
             Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
             Self::NodeUsage { .. } => USAGE_NODE_STATS_KEYSPACE,
             Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+            Self::WatchSubscription { .. } => NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
         }
     }
 
@@ -342,6 +349,9 @@ impl DocumentSyncTarget {
             Self::WatchInterest { realm_id, node_id } => {
                 ByteView::from(watch_interest_node_key(*realm_id, *node_id))
             }
+            Self::WatchSubscription { owner, watch_id } => {
+                watch_subscription_key(*owner, *watch_id)
+            }
         }
     }
 
@@ -378,7 +388,9 @@ impl DocumentSyncTarget {
             Self::NodeUsage { .. } => bytes.extend_from_slice(b"/node-usage"),
             // Likewise realm-shared: every node's watch-interest digest rides one
             // topic so origin nodes receive all holders' interest.
-            Self::WatchInterest { .. } => bytes.extend_from_slice(b"/watch-interest"),
+            Self::WatchInterest { .. } | Self::WatchSubscription { .. } => {
+                bytes.extend_from_slice(b"/watch-interest")
+            }
         }
         irokle::TopicId::hash(bytes)
     }
@@ -779,8 +791,10 @@ mod tests {
 
     #[test]
     fn watch_interest_targets_share_one_realm_topic_and_map_to_digest_keys() {
-        use crate::keyspaces::NOTIFICATION_WATCH_INTEREST_KEYSPACE;
-        use crate::structs::watch_interest_node_key;
+        use crate::keyspaces::{
+            NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+        };
+        use crate::structs::{watch_interest_node_key, watch_subscription_key};
 
         let realm_id = test_realm(2);
         let node_id = test_node(1);
@@ -789,10 +803,16 @@ mod tests {
             node_id: test_node(9),
         };
         let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+        let owner = UserId::new(test_ulid(10), realm_id);
+        let subscription = DocumentSyncTarget::WatchSubscription {
+            owner,
+            watch_id: test_ulid(11),
+        };
 
         // Rides the realm domain topic and one shared sync topic across nodes.
         assert_eq!(target.topic_id(), TopicId::realm(realm_id));
         assert_eq!(target.sync_topic_id(), other.sync_topic_id());
+        assert_eq!(target.sync_topic_id(), subscription.sync_topic_id());
         // Distinct from the node-usage topic that shares the same realm domain.
         assert_ne!(
             target.sync_topic_id(),
@@ -811,6 +831,14 @@ mod tests {
         assert_eq!(
             target.storage_key().as_ref(),
             watch_interest_node_key(realm_id, node_id).as_slice()
+        );
+        assert_eq!(
+            subscription.storage_keyspace(),
+            NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE
+        );
+        assert_eq!(
+            subscription.storage_key().as_ref(),
+            watch_subscription_key(owner, test_ulid(11)).as_ref()
         );
     }
 

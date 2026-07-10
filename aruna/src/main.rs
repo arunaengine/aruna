@@ -244,11 +244,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
-            // A provisioned node re-announces core documents on restart as a
-            // holder, but shared-topic genesis already exists from the bootstrap
-            // node, so it never needs to mint it.
-            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id, false)
-                .await?;
+            // The realm-bootstrap node retains genesis authority so a missing
+            // shared topic can be repaired after a partial first boot. Onboarded
+            // nodes still wait for that authoritative genesis.
+            announce_core_documents(
+                driver_ctx.as_ref(),
+                config.node_id,
+                &config.realm_id,
+                config.is_initial_node(),
+            )
+            .await?;
         }
     }
 
