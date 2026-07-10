@@ -186,7 +186,9 @@ impl ReplicateDocumentsOperation {
         if selected_peers.is_empty()
             && !matches!(
                 document,
-                DocumentSyncTarget::NodeUsage { .. } | DocumentSyncTarget::WatchInterest { .. }
+                DocumentSyncTarget::NodeUsage { .. }
+                    | DocumentSyncTarget::WatchInterest { .. }
+                    | DocumentSyncTarget::NodeInfo { .. }
             )
         {
             return match self.emit_placement_update() {
@@ -392,6 +394,10 @@ mod tests {
         DocumentSyncTarget::WatchInterest { realm_id, node_id }
     }
 
+    fn node_info_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeInfo { realm_id, node_id }
+    }
+
     fn config_with(nodes: &[NodeId], replica: Option<u32>) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
         let strategy = PlacementStrategy {
@@ -519,6 +525,56 @@ mod tests {
             matches!(operation.placement_action, Some(PlacementAction::Write(ref record)) if record.target == target)
         );
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn shared_node_info_queues_upsert_without_remote_peers() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = node_info_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
+
+        let mut effects = operation.emit_next_publish();
+
+        let Some(PlacementAction::Write(record)) = operation.placement_action.as_ref() else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.target, target);
+        assert!(record.selected_peers.is_empty());
+
+        let [Effect::SubOperation(announce)] = effects.as_mut_slice() else {
+            panic!("expected node info announce suboperation");
+        };
+        assert!(matches!(
+            announce.start().as_slice(),
+            [Effect::Storage(
+                aruna_core::effects::StorageEffect::Read { .. }
+            )]
+        ));
+        let outbox_effects = announce.step(Event::Storage(StorageEvent::ReadResult {
+            key: target.storage_key(),
+            value: Some(b"node info".to_vec().into()),
+        }));
+        let [Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. })] =
+            outbox_effects.as_slice()
+        else {
+            panic!("expected node info outbox write");
+        };
+        let outbox: aruna_core::document::DocumentSyncOutboxRecord =
+            postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
+        assert_eq!(outbox.target, target);
+        assert!(outbox.peers.is_empty());
+        assert!(matches!(
+            outbox.event,
+            aruna_core::document::DocumentSyncOutboxEvent::Upsert { .. }
+        ));
     }
 
     #[test]
