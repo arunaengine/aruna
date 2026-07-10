@@ -2834,6 +2834,28 @@ async fn apply_admin_document_operation_to_storage(
     }
 }
 
+async fn persist_stale_admin_document_event(
+    storage: &StorageHandle,
+    apply_status: AdminDocumentApplyStatus,
+    reducer_state: &AdminDocumentReducerState,
+) -> Result<bool> {
+    match apply_status {
+        AdminDocumentApplyStatus::Applied => Ok(false),
+        AdminDocumentApplyStatus::Duplicate => Ok(true),
+        AdminDocumentApplyStatus::StaleOriginSequence => {
+            storage_batch_write_to(
+                storage,
+                vec![
+                    admin_document_reducer_state_write_entry(reducer_state)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                ],
+            )
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
 async fn apply_user_admin_document_operation_to_storage(
     storage: &StorageHandle,
     document_target: DocumentSyncTarget,
@@ -2886,7 +2908,7 @@ async fn apply_user_admin_document_operation_to_storage(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if apply_status != AdminDocumentApplyStatus::Applied {
+    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
         return Ok(());
     }
 
@@ -3028,7 +3050,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if apply_status != AdminDocumentApplyStatus::Applied {
+    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
         return Ok(());
     }
 
@@ -3122,7 +3144,7 @@ async fn apply_realm_authorization_admin_document_operation_to_storage(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if apply_status != AdminDocumentApplyStatus::Applied {
+    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
         return Ok(());
     }
 
@@ -3226,7 +3248,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if apply_status != AdminDocumentApplyStatus::Applied {
+    if persist_stale_admin_document_event(storage, apply_status, &reducer_state).await? {
         return Ok(());
     }
 
@@ -6690,6 +6712,69 @@ mod tests {
             .await,
             Some(subject_index_value(user_id))
         );
+    }
+
+    #[tokio::test]
+    async fn stale_user_admin_operation_is_recorded_without_rematerializing_older_value() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let user_id = UserId::local(Ulid::from_parts(3, 1), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id,
+            realm_id,
+        };
+        let target = AdminDocumentTarget::User { user_id };
+        let newer = AdminDocumentEvent {
+            event_id: Ulid::from_parts(4, 2),
+            target: target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default(),
+            actor: actor.clone(),
+            op: AdminDocumentOperation::UserNameSet {
+                name: "newer".to_string(),
+            },
+        };
+        let older = AdminDocumentEvent {
+            event_id: Ulid::from_parts(4, 1),
+            target: target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::UserNameSet {
+                name: "older".to_string(),
+            },
+        };
+
+        for event in [newer, older.clone(), older.clone()] {
+            apply_user_admin_document_operation_to_storage(
+                &storage,
+                DocumentSyncTarget::User { user_id },
+                event,
+            )
+            .await
+            .expect("out-of-order admin operation applies");
+        }
+
+        let stored_user = read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into())
+            .await
+            .expect("user exists");
+        let user = User::from_bytes(&stored_user).expect("user decodes");
+        assert_eq!(user.name, "newer");
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert_eq!(reducer_state.applied_event_ids.len(), 2);
+        assert!(reducer_state.applied_event_ids.contains(&older.event_id));
+        assert_eq!(reducer_state.clock.sequence_for(&older.origin_node_id), 2);
     }
 
     #[tokio::test]

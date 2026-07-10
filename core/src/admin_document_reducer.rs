@@ -75,6 +75,12 @@ pub struct AdminDocumentReducerState {
 
 /// Overlays the realm-config placement paths owned by `reducer_state` onto `config`.
 /// Paths absent from both the reducer values and conflicts remain untouched.
+///
+/// The final repair uses the live strategy with the lowest id as the deterministic
+/// fallback for missing defaults, bindings, and explicit override strategy ids. If
+/// no strategy is live, references are cleared while override pins and exclusions
+/// are retained. Reducer values are not changed, so a later strategy upsert can
+/// restore an assignment that was only dangling in the materialized snapshot.
 pub fn overlay_realm_config_placement_reducer_materialization(
     config: &mut RealmConfigDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -180,6 +186,46 @@ pub fn overlay_realm_config_placement_reducer_materialization(
             config.placement_overrides.push(record.clone());
         }
     }
+
+    repair_realm_config_placement_references(config);
+}
+
+fn repair_realm_config_placement_references(config: &mut RealmConfigDocument) {
+    let live_strategy_ids: BTreeSet<_> = config
+        .strategies
+        .iter()
+        .map(|strategy| strategy.strategy_id)
+        .collect();
+    let fallback_strategy_id = live_strategy_ids.first().copied();
+
+    let Some(fallback_strategy_id) = fallback_strategy_id else {
+        config.default_strategy_id = None;
+        config.strategy_bindings.clear();
+        for record in &mut config.placement_overrides {
+            record.strategy_id = None;
+        }
+        return;
+    };
+
+    if config
+        .default_strategy_id
+        .is_none_or(|strategy_id| !live_strategy_ids.contains(&strategy_id))
+    {
+        config.default_strategy_id = Some(fallback_strategy_id);
+    }
+    for binding in &mut config.strategy_bindings {
+        if !live_strategy_ids.contains(&binding.strategy_id) {
+            binding.strategy_id = fallback_strategy_id;
+        }
+    }
+    for record in &mut config.placement_overrides {
+        if record
+            .strategy_id
+            .is_some_and(|strategy_id| !live_strategy_ids.contains(&strategy_id))
+        {
+            record.strategy_id = Some(fallback_strategy_id);
+        }
+    }
 }
 
 impl AdminDocumentReducerState {
@@ -224,9 +270,9 @@ impl AdminDocumentReducerState {
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
-        if event.origin_seq <= self.clock.sequence_for(&event.origin_node_id) {
-            return Ok(AdminDocumentApplyStatus::StaleOriginSequence);
-        }
+        let stale_on_all_paths = operation_paths(&event.op)
+            .iter()
+            .all(|path| self.event_is_stale_for_path(event, path));
 
         match (&event.target, &event.op) {
             (
@@ -477,6 +523,12 @@ impl AdminDocumentReducerState {
                 );
             }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
+        }
+
+        if stale_on_all_paths {
+            self.applied_event_ids.insert(event.event_id);
+            self.clock.advance(event.origin_node_id, event.origin_seq);
+            return Ok(AdminDocumentApplyStatus::StaleOriginSequence);
         }
 
         self.applied_event_ids.insert(event.event_id);
@@ -1071,6 +1123,11 @@ impl AdminDocumentReducerState {
     ) -> Option<AdminDocumentAttributeVersion> {
         let dot = event.dot();
 
+        if self.event_is_stale_for_path(event, path) {
+            return current;
+        }
+        self.remove_conflict_values_superseded_by(event, path);
+
         if self.conflict_is_observed(event, path) {
             self.conflicts.remove(path);
             return Some(AdminDocumentAttributeVersion { value, dot });
@@ -1106,6 +1163,11 @@ impl AdminDocumentReducerState {
         value: String,
     ) -> Option<AdminDocumentAttributeVersion> {
         let dot = event.dot();
+
+        if self.event_is_stale_for_path(event, path) {
+            return current;
+        }
+        self.remove_conflict_values_superseded_by(event, path);
 
         if self.conflict_is_observed(event, path) {
             self.conflicts.remove(path);
@@ -1158,6 +1220,47 @@ impl AdminDocumentReducerState {
         })
     }
 
+    fn event_is_stale_for_path(&self, event: &AdminDocumentEvent, path: &str) -> bool {
+        let same_origin_at_or_after = |dot: &AdminDocumentDot| {
+            dot.origin_node_id == event.origin_node_id && dot.origin_seq >= event.origin_seq
+        };
+
+        self.version_for_path(path)
+            .is_some_and(|version| same_origin_at_or_after(&version.dot))
+            || self.conflicts.get(path).is_some_and(|conflict| {
+                conflict
+                    .values
+                    .iter()
+                    .any(|value| same_origin_at_or_after(&value.dot))
+            })
+    }
+
+    fn version_for_path(&self, path: &str) -> Option<&AdminDocumentAttributeVersion> {
+        if path == USER_NAME_PATH {
+            return self.user_name.as_ref();
+        }
+        if let Some(key) = path.strip_prefix("user.attributes.") {
+            return self.user_attributes.get(key);
+        }
+        if let Some(subject_id) = path.strip_prefix("user.subject_ids.") {
+            return self.user_subject_ids.get(subject_id);
+        }
+        self.user_subject_ids.get(path)
+    }
+
+    fn remove_conflict_values_superseded_by(&mut self, event: &AdminDocumentEvent, path: &str) {
+        let should_remove_conflict = self.conflicts.get_mut(path).is_some_and(|conflict| {
+            conflict.values.retain(|value| {
+                value.dot.origin_node_id != event.origin_node_id
+                    || value.dot.origin_seq >= event.origin_seq
+            });
+            conflict.values.is_empty()
+        });
+        if should_remove_conflict {
+            self.conflicts.remove(path);
+        }
+    }
+
     fn record_conflict_value(&mut self, path: &str, value: Option<String>, dot: AdminDocumentDot) {
         let conflict =
             self.conflicts
@@ -1190,6 +1293,86 @@ pub const REALM_CONFIG_DEFAULT_STRATEGY_PATH: &str = "realm_config.placement.def
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
         || (event.origin_node_id == dot.origin_node_id && event.origin_seq > dot.origin_seq)
+}
+
+fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
+    match op {
+        AdminDocumentOperation::GroupRoleAdded { role_id }
+        | AdminDocumentOperation::GroupRoleCreated {
+            role: AdminDocumentRoleDefinition { role_id, .. },
+        }
+        | AdminDocumentOperation::GroupRoleRemoved { role_id } => vec![group_role_path(role_id)],
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id } => {
+            vec![group_role_user_assignment_path(role_id, user_id)]
+        }
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => vec![user_attribute_path(key)],
+        AdminDocumentOperation::UserNameSet { .. } => vec![USER_NAME_PATH.to_string()],
+        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
+        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => {
+            vec![user_subject_id_path(subject_id)]
+        }
+        AdminDocumentOperation::RealmRoleAdded { role_id }
+        | AdminDocumentOperation::RealmRoleCreated {
+            role: AdminDocumentRoleDefinition { role_id, .. },
+        } => vec![realm_role_path(role_id)],
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+            vec![realm_role_user_assignment_path(role_id, user_id)]
+        }
+        AdminDocumentOperation::RealmConfigNodeEnsured { node_id, .. } => {
+            vec![realm_config_node_path(node_id)]
+        }
+        AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider } => {
+            vec![realm_config_oidc_provider_path(&provider.id)]
+        }
+        AdminDocumentOperation::RealmConfigOidcProviderRemoved { provider_id } => {
+            vec![realm_config_oidc_provider_path(provider_id)]
+        }
+        AdminDocumentOperation::RealmConfigSettingsSet { .. } => vec![
+            REALM_CONFIG_METADATA_REPLICATION_PATH.to_string(),
+            REALM_CONFIG_DISCOVERY_PATH.to_string(),
+        ],
+        AdminDocumentOperation::GroupCreated { .. } => vec![
+            GROUP_DISPLAY_NAME_PATH.to_string(),
+            GROUP_REALM_ID_PATH.to_string(),
+            GROUP_OWNER_PATH.to_string(),
+        ],
+        AdminDocumentOperation::RealmConfigDescriptionSet { .. } => {
+            vec![REALM_CONFIG_DESCRIPTION_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigQuotaSet { .. } => {
+            vec![REALM_CONFIG_QUOTA_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
+            vec![realm_config_placement_node_path(&entry.node_id)]
+        }
+        AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id } => {
+            vec![realm_config_placement_node_path(node_id)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } => {
+            vec![realm_config_placement_strategy_path(&strategy.strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id } => {
+            vec![realm_config_placement_strategy_path(strategy_id)]
+        }
+        AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
+            vec![REALM_CONFIG_DEFAULT_STRATEGY_PATH.to_string()]
+        }
+        AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => {
+            vec![realm_config_strategy_binding_path(&binding.scope)]
+        }
+        AdminDocumentOperation::RealmConfigStrategyBindingRemoved { scope } => {
+            vec![realm_config_strategy_binding_path(scope)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+            vec![realm_config_placement_override_path(&record.subject)]
+        }
+        AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { subject } => {
+            vec![realm_config_placement_override_path(subject)]
+        }
+    }
 }
 
 fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
@@ -2157,8 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_origin_sequence_is_ignored() {
-        let mut state = user_state();
+    fn same_origin_out_of_order_disjoint_updates_converge() {
         let origin = node(1);
         let newer = event(
             2,
@@ -2181,14 +2363,198 @@ mod tests {
             },
         );
 
-        state.apply(&newer).unwrap();
-        let before_stale = state.clone();
-
+        let mut newer_first = user_state();
         assert_eq!(
-            state.apply(&stale),
+            newer_first.apply(&newer),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            newer_first.apply(&stale),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        let mut older_first = user_state();
+        older_first.apply(&stale).unwrap();
+        older_first.apply(&newer).unwrap();
+
+        assert_eq!(newer_first, older_first);
+        assert_eq!(
+            newer_first.materialized_user_attributes(),
+            BTreeMap::from([
+                ("department".to_string(), "biology".to_string()),
+                ("orcid".to_string(), "0000-0002-1825-0097".to_string()),
+            ])
+        );
+        assert_eq!(newer_first.clock.sequence_for(&origin), 2);
+    }
+
+    #[test]
+    fn same_origin_out_of_order_same_field_is_stale_and_duplicate_replay_is_idempotent() {
+        let origin = node(1);
+        let older = event(
+            1,
+            origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "physics".to_string(),
+            },
+        );
+        let newer = event(
+            2,
+            origin,
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "biology".to_string(),
+            },
+        );
+
+        let mut newer_first = user_state();
+        assert_eq!(
+            newer_first.apply(&newer),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        let before_stale = newer_first.clone();
+        assert_eq!(
+            newer_first.apply(&older),
             Ok(AdminDocumentApplyStatus::StaleOriginSequence)
         );
-        assert_eq!(state, before_stale);
+        assert_eq!(
+            newer_first.materialized_user_attributes(),
+            before_stale.materialized_user_attributes()
+        );
+        assert!(newer_first.applied_event_ids.contains(&older.event_id));
+        assert_eq!(
+            newer_first.apply(&newer),
+            Ok(AdminDocumentApplyStatus::Duplicate)
+        );
+
+        let mut older_first = user_state();
+        older_first.apply(&older).unwrap();
+        older_first.apply(&newer).unwrap();
+        assert_eq!(newer_first, older_first);
+        assert_eq!(
+            older_first.apply(&older),
+            Ok(AdminDocumentApplyStatus::Duplicate)
+        );
+        assert_eq!(
+            newer_first
+                .materialized_user_attributes()
+                .get("department")
+                .map(String::as_str),
+            Some("biology")
+        );
+        assert!(newer_first.conflicts.is_empty());
+    }
+
+    #[test]
+    fn newer_same_origin_value_replaces_its_older_conflict_value_in_any_order() {
+        let first_origin = node(1);
+        let concurrent_origin = node(2);
+        let older = event(
+            1,
+            first_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "physics".to_string(),
+            },
+        );
+        let concurrent = event(
+            2,
+            concurrent_origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "chemistry".to_string(),
+            },
+        );
+        let newer = event(
+            3,
+            first_origin,
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::UserAttributeSet {
+                key: "department".to_string(),
+                value: "biology".to_string(),
+            },
+        );
+
+        let mut conflict_first = user_state();
+        conflict_first.apply(&older).unwrap();
+        conflict_first.apply(&concurrent).unwrap();
+        conflict_first.apply(&newer).unwrap();
+
+        let mut newer_first = user_state();
+        newer_first.apply(&older).unwrap();
+        newer_first.apply(&newer).unwrap();
+        newer_first.apply(&concurrent).unwrap();
+
+        assert_eq!(conflict_first, newer_first);
+        let conflict = conflict_first
+            .conflicts
+            .get("user.attributes.department")
+            .expect("newer and concurrent values conflict");
+        assert_eq!(conflict.values.len(), 2);
+        assert!(conflict.values.iter().all(|value| value.dot != older.dot()));
+    }
+
+    #[test]
+    fn same_origin_out_of_order_multi_field_operation_is_atomically_stale() {
+        let origin = node(1);
+        let older = realm_config_event(
+            1,
+            origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: RealmDiscoveryConfig::Static {
+                    endpoints: Vec::new(),
+                },
+            },
+        );
+        let newer_metadata = MetadataReplicationConfig::new(5);
+        let newer_discovery = RealmDiscoveryConfig::Dynamic {
+            methods: Vec::new(),
+        };
+        let newer = realm_config_event(
+            2,
+            origin,
+            2,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: newer_metadata.clone(),
+                discovery: newer_discovery.clone(),
+            },
+        );
+
+        let mut newer_first = realm_config_state();
+        newer_first.apply(&newer).unwrap();
+        assert_eq!(
+            newer_first.apply(&older),
+            Ok(AdminDocumentApplyStatus::StaleOriginSequence)
+        );
+
+        let mut older_first = realm_config_state();
+        older_first.apply(&older).unwrap();
+        older_first.apply(&newer).unwrap();
+
+        assert_eq!(newer_first, older_first);
+        assert_eq!(
+            newer_first.materialized_realm_config_metadata_replication(),
+            Some(newer_metadata)
+        );
+        assert_eq!(
+            newer_first.materialized_realm_config_discovery(),
+            Some(newer_discovery)
+        );
+        assert!(newer_first.conflicts.is_empty());
     }
 
     #[test]
@@ -3594,6 +3960,34 @@ mod tests {
     }
 
     #[test]
+    fn realm_config_placement_repair_clears_refs_but_preserves_override_without_live_strategy() {
+        let missing_strategy_id = Ulid::from_bytes([8; 16]);
+        let pinned = node(11);
+        let excluded = node(12);
+        let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        config.default_strategy_id = Some(missing_strategy_id);
+        config.strategy_bindings = vec![StrategyBinding {
+            scope: BindingScope::Realm,
+            strategy_id: missing_strategy_id,
+        }];
+        config.placement_overrides = vec![PlacementOverride {
+            subject: b"document-subject".to_vec(),
+            pinned: vec![pinned],
+            excluded: vec![excluded],
+            strategy_id: Some(missing_strategy_id),
+        }];
+
+        overlay_realm_config_placement_reducer_materialization(&mut config, &realm_config_state());
+
+        assert_eq!(config.default_strategy_id, None);
+        assert!(config.strategy_bindings.is_empty());
+        assert_eq!(config.placement_overrides.len(), 1);
+        assert_eq!(config.placement_overrides[0].strategy_id, None);
+        assert_eq!(config.placement_overrides[0].pinned, vec![pinned]);
+        assert_eq!(config.placement_overrides[0].excluded, vec![excluded]);
+    }
+
+    #[test]
     fn realm_config_placement_entry_materializes() {
         let mut state = realm_config_state();
         let config_node = node(11);
@@ -3785,6 +4179,7 @@ mod tests {
     #[test]
     fn concurrent_realm_config_strategy_remove_and_references_are_replay_order_independent() {
         let strategy_id = Ulid::from_bytes([4; 16]);
+        let fallback_strategy_id = Ulid::from_bytes([3; 16]);
         let subject = b"document-subject".to_vec();
         let reference_ops = vec![
             AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
@@ -3853,30 +4248,117 @@ mod tests {
             );
             assert!(remove_first.conflicts.is_empty());
 
+            let mut base_config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+            base_config.strategies = vec![
+                placement_strategy(fallback_strategy_id, Some(1)),
+                placement_strategy(strategy_id, Some(3)),
+            ];
+            base_config.default_strategy_id = Some(fallback_strategy_id);
+
+            let mut remove_first_config = base_config.clone();
+            overlay_realm_config_placement_reducer_materialization(
+                &mut remove_first_config,
+                &remove_first,
+            );
+            let mut reference_first_config = base_config;
+            overlay_realm_config_placement_reducer_materialization(
+                &mut reference_first_config,
+                &reference_first,
+            );
+            assert_eq!(remove_first_config, reference_first_config);
+            assert_eq!(
+                remove_first_config.default_strategy_id,
+                Some(fallback_strategy_id)
+            );
+            assert!(remove_first_config.strategy(&strategy_id).is_none());
+            assert_realm_config_strategy_references_are_live(&remove_first_config);
+
+            match &reference_op {
+                AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {}
+                AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+                    remove_first_config
+                        .strategy_bindings
+                        .iter()
+                        .any(|materialized| {
+                            materialized.scope == binding.scope
+                                && materialized.strategy_id == fallback_strategy_id
+                        })
+                ),
+                AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => {
+                    let materialized = remove_first_config
+                        .placement_overrides
+                        .iter()
+                        .find(|materialized| materialized.subject == record.subject)
+                        .expect("override remains materialized");
+                    assert_eq!(materialized.strategy_id, Some(fallback_strategy_id));
+                    assert_eq!(materialized.pinned, record.pinned);
+                    assert_eq!(materialized.excluded, record.excluded);
+                }
+                _ => unreachable!("test only contains strategy reference operations"),
+            }
+
+            let restoration = realm_config_event(
+                seed + 3,
+                node(seed + 3),
+                1,
+                AdminDocumentClock::default().with_observed(removal.origin_node_id, 1),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: placement_strategy(strategy_id, Some(3)),
+                },
+            );
+            remove_first.apply(&restoration).unwrap();
+            overlay_realm_config_placement_reducer_materialization(
+                &mut remove_first_config,
+                &remove_first,
+            );
+            assert!(remove_first_config.strategy(&strategy_id).is_some());
+            assert_realm_config_strategy_references_are_live(&remove_first_config);
             match reference_op {
-                AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => assert_eq!(
-                    remove_first.materialized_realm_config_default_strategy(),
-                    Some(strategy_id)
+                AdminDocumentOperation::RealmConfigDefaultStrategySet { .. } => {
+                    assert_eq!(remove_first_config.default_strategy_id, Some(strategy_id))
+                }
+                AdminDocumentOperation::RealmConfigStrategyBindingSet { binding } => assert!(
+                    remove_first_config
+                        .strategy_bindings
+                        .iter()
+                        .any(|materialized| {
+                            materialized.scope == binding.scope
+                                && materialized.strategy_id == strategy_id
+                        })
                 ),
-                AdminDocumentOperation::RealmConfigStrategyBindingSet { .. } => assert_eq!(
-                    remove_first
-                        .materialized_realm_config_strategy_bindings()
-                        .values()
-                        .map(|binding| binding.strategy_id)
-                        .collect::<Vec<_>>(),
-                    vec![strategy_id]
-                ),
-                AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. } => assert_eq!(
-                    remove_first
-                        .materialized_realm_config_placement_overrides()
-                        .values()
-                        .filter_map(|record| record.strategy_id)
-                        .collect::<Vec<_>>(),
-                    vec![strategy_id]
+                AdminDocumentOperation::RealmConfigPlacementOverrideSet { record } => assert!(
+                    remove_first_config
+                        .placement_overrides
+                        .iter()
+                        .any(|materialized| {
+                            materialized.subject == record.subject
+                                && materialized.strategy_id == Some(strategy_id)
+                                && materialized.pinned == record.pinned
+                                && materialized.excluded == record.excluded
+                        })
                 ),
                 _ => unreachable!("test only contains strategy reference operations"),
             }
         }
+    }
+
+    fn assert_realm_config_strategy_references_are_live(config: &RealmConfigDocument) {
+        assert!(
+            config
+                .default_strategy_id
+                .is_none_or(|strategy_id| config.strategy(&strategy_id).is_some())
+        );
+        assert!(
+            config
+                .strategy_bindings
+                .iter()
+                .all(|binding| config.strategy(&binding.strategy_id).is_some())
+        );
+        assert!(config.placement_overrides.iter().all(|record| {
+            record
+                .strategy_id
+                .is_none_or(|strategy_id| config.strategy(&strategy_id).is_some())
+        }));
     }
 
     #[test]

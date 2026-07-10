@@ -424,6 +424,10 @@ fn binding_strategy<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::admin_document_reducer::{
+        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
+    };
+    use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::structs::{
         AffinityRule, NodePlacementEntry, RealmId, RealmNode, StrategyBinding,
     };
@@ -960,6 +964,45 @@ mod tests {
                 .0
                 .strategy_id,
             sid(10)
+        );
+    }
+
+    #[test]
+    fn reducer_materialization_repairs_dangling_refs_and_keeps_resolution_nonempty() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let live = sid(10);
+        let missing = sid(99);
+        let holder = node_id(1);
+        let excluded = node_id(2);
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let subject = subject_bytes(&target);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(holder, RealmNodeKind::Server);
+        config.strategies = vec![strat(10)];
+        config.default_strategy_id = Some(missing);
+        config.strategy_bindings = vec![binding(BindingScope::Realm, 99)];
+        config.placement_overrides = vec![PlacementOverride {
+            subject: subject.clone(),
+            pinned: vec![holder],
+            excluded: vec![excluded],
+            strategy_id: Some(missing),
+        }];
+        let reducer_state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+
+        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state);
+
+        assert_eq!(config.default_strategy_id, Some(live));
+        assert_eq!(config.strategy_bindings[0].strategy_id, live);
+        assert_eq!(config.placement_overrides[0].strategy_id, Some(live));
+        assert_eq!(config.placement_overrides[0].pinned, vec![holder]);
+        assert_eq!(config.placement_overrides[0].excluded, vec![excluded]);
+        let (strategy, override_) =
+            strategy_for_target(&config, &target, PlacementResolutionContext::default())
+                .expect("repaired placement remains resolvable");
+        assert_eq!(strategy.strategy_id, live);
+        assert!(
+            !resolve_holders(&build_view(&config), strategy, &subject, 0, override_).is_empty()
         );
     }
 
