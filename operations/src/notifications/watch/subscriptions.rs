@@ -12,8 +12,8 @@ use aruna_core::storage_entries::{
     watch_subscription_write_entry,
 };
 use aruna_core::structs::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, RealmId, WatchEventMask,
-    WatchSubscription, watch_subscription_prefix,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef, RealmId,
+    WatchEventMask, WatchSubscription, watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -449,6 +449,7 @@ fn watch_upsert_replication(
             updated_at_ms: subscription.created_at_ms,
         },
         kind: DocumentSyncChangeKind::Upsert,
+        placement: PlacementRef::NIL,
     };
     let target = watch_subscription_target(subscription.owner, subscription.watch_id);
     let outbox = new_outbox_record_with_id(
@@ -483,6 +484,7 @@ fn watch_delete_replication(
             updated_at_ms: now_ms,
         },
         kind: DocumentSyncChangeKind::Delete,
+        placement: PlacementRef::NIL,
     };
     let outbox = new_outbox_record_with_id(
         outbox_id,
