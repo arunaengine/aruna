@@ -77,10 +77,10 @@ pub enum DocumentSyncTarget {
 pub struct PendingDocumentPlacement {
     pub realm_id: RealmId,
     pub target: DocumentSyncTarget,
-    pub desired_peer_count: usize,
-    pub selected_peers: Vec<NodeId>,
+    pub desired_holder_count: usize,
+    pub selected_holders: Vec<NodeId>,
     pub updated_at: u64,
-    pub authoritative_node_id: NodeId,
+    pub origin_node_id: NodeId,
     pub placement: PlacementRef,
 }
 

@@ -60,35 +60,33 @@ pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
 pub fn new_placement(
     realm_id: RealmId,
     target: DocumentSyncTarget,
-    authoritative_node_id: NodeId,
-    desired_peer_count: usize,
-    mut selected_peers: Vec<NodeId>,
+    origin_node_id: NodeId,
+    desired_holder_count: usize,
+    mut selected_holders: Vec<NodeId>,
     placement: PlacementRef,
 ) -> PendingDocumentPlacement {
-    selected_peers.retain(|node_id| *node_id != authoritative_node_id);
-    sort_node_ids(&mut selected_peers);
+    sort_node_ids(&mut selected_holders);
     PendingDocumentPlacement {
         realm_id,
         target,
-        desired_peer_count,
-        selected_peers,
+        desired_holder_count,
+        selected_holders,
         updated_at: unix_timestamp_secs(),
-        authoritative_node_id,
+        origin_node_id,
         placement,
     }
 }
 
-pub fn missing_peer_count(record: &PendingDocumentPlacement) -> usize {
-    let mut selected_peers = record.selected_peers.clone();
-    selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
-    sort_node_ids(&mut selected_peers);
+pub fn missing_holder_count(record: &PendingDocumentPlacement) -> usize {
+    let mut selected_holders = record.selected_holders.clone();
+    sort_node_ids(&mut selected_holders);
     record
-        .desired_peer_count
-        .saturating_sub(selected_peers.len().saturating_add(1))
+        .desired_holder_count
+        .saturating_sub(selected_holders.len())
 }
 
-pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize) -> bool {
-    selected_peer_count.saturating_add(1) >= desired_peer_count
+pub fn placement_satisfied(selected_holder_count: usize, desired_holder_count: usize) -> bool {
+    selected_holder_count >= desired_holder_count
 }
 
 pub fn schedule_document_sync_effect(
@@ -237,27 +235,27 @@ mod tests {
     }
 
     #[test]
-    fn placement_deduplicates_peers_and_computes_missing_count() {
+    fn placement_deduplicates_holders_and_computes_missing_count() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
-        let authoritative = node(1);
-        let peer = node(5);
+        let origin = node(1);
+        let holder = node(5);
         let placement = new_placement(
             realm_id,
             target(),
-            authoritative,
+            origin,
             3,
-            vec![peer, peer],
+            vec![holder, holder],
             PlacementRef::NIL,
         );
 
         assert_eq!(placement.realm_id, realm_id);
-        assert_eq!(placement.authoritative_node_id, authoritative);
-        assert_eq!(placement.selected_peers, vec![peer]);
-        assert_eq!(missing_peer_count(&placement), 1);
+        assert_eq!(placement.origin_node_id, origin);
+        assert_eq!(placement.selected_holders, vec![holder]);
+        assert_eq!(missing_holder_count(&placement), 2);
     }
 
     #[test]
-    fn placement_counts_authoritative_node_toward_desired_peer_count() {
+    fn placement_does_not_count_origin_implicitly() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let placement = new_placement(
             realm_id,
@@ -268,45 +266,50 @@ mod tests {
             PlacementRef::NIL,
         );
 
-        assert_eq!(missing_peer_count(&placement), 0);
-        assert!(placement_satisfied(
-            placement.selected_peers.len(),
-            placement.desired_peer_count
+        assert_eq!(missing_holder_count(&placement), 1);
+        assert!(!placement_satisfied(
+            placement.selected_holders.len(),
+            placement.desired_holder_count
         ));
     }
 
     #[test]
-    fn placement_records_authoritative_holder_explicitly() {
+    fn placement_records_origin_separately() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
-        let authoritative = node(7);
+        let origin = node(7);
 
         let placement = new_placement(
             realm_id,
             target(),
-            authoritative,
+            origin,
             3,
             vec![node(8)],
             PlacementRef::NIL,
         );
 
-        assert_eq!(placement.authoritative_node_id, authoritative);
+        assert_eq!(placement.origin_node_id, origin);
+        assert!(!placement.selected_holders.contains(&origin));
     }
 
     #[test]
-    fn placement_deduplicates_selected_peers_and_excludes_authoritative() {
+    fn placement_counts_origin_only_when_selected_as_holder() {
         let realm_id = RealmId::from_bytes([6u8; 32]);
-        let authoritative = node(7);
+        let origin = node(7);
 
         let placement = new_placement(
             realm_id,
             target(),
-            authoritative,
+            origin,
             3,
-            vec![node(8), authoritative, node(8), node(9)],
+            vec![node(8), origin, node(8), node(9)],
             PlacementRef::NIL,
         );
 
-        assert_eq!(placement.selected_peers, vec![node(9), node(8)]);
-        assert_eq!(missing_peer_count(&placement), 0);
+        assert_eq!(placement.selected_holders, vec![origin, node(9), node(8)]);
+        assert_eq!(missing_holder_count(&placement), 0);
+        assert!(placement_satisfied(
+            placement.selected_holders.len(),
+            placement.desired_holder_count
+        ));
     }
 }

@@ -86,9 +86,9 @@ struct TopicListEntry {
     topic_id: String,
     target: JsonDocumentSyncTarget,
     status: &'static str,
-    desired_peer_count: usize,
-    selected_peer_count: usize,
-    missing_peer_count: usize,
+    desired_holder_count: usize,
+    selected_holder_count: usize,
+    missing_holder_count: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -500,21 +500,21 @@ impl Serialize for JsonPendingDocumentPlacement {
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
+        state.serialize_field("origin_node_id", &self.0.origin_node_id.to_string())?;
+        state.serialize_field("desired_holder_count", &self.0.desired_holder_count)?;
         state.serialize_field(
-            "authoritative_node_id",
-            &self.0.authoritative_node_id.to_string(),
-        )?;
-        state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
-        state.serialize_field(
-            "selected_peers",
+            "selected_holders",
             &self
                 .0
-                .selected_peers
+                .selected_holders
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
         )?;
-        state.serialize_field("missing_peer_count", &placement_missing_peer_count(&self.0))?;
+        state.serialize_field(
+            "missing_holder_count",
+            &placement_missing_holder_count(&self.0),
+        )?;
         state.serialize_field("updated_at", &self.0.updated_at)?;
         state.end()
     }
@@ -524,14 +524,13 @@ fn placement_topic_id(placement: &PendingDocumentPlacement) -> String {
     placement.target.sync_topic_id().to_string()
 }
 
-fn placement_missing_peer_count(placement: &PendingDocumentPlacement) -> usize {
-    let mut selected_peers = placement.selected_peers.clone();
-    selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
-    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    selected_peers.dedup();
+fn placement_missing_holder_count(placement: &PendingDocumentPlacement) -> usize {
+    let mut selected_holders = placement.selected_holders.clone();
+    selected_holders.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    selected_holders.dedup();
     placement
-        .desired_peer_count
-        .saturating_sub(selected_peers.len().saturating_add(1))
+        .desired_holder_count
+        .saturating_sub(selected_holders.len())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1139,9 +1138,9 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
             topic_id: placement_topic_id(&placement),
             target: json_document_sync_target(&placement.target),
             status: "under_replicated",
-            desired_peer_count: placement.desired_peer_count,
-            selected_peer_count: placement.selected_peers.len(),
-            missing_peer_count: placement_missing_peer_count(&placement),
+            desired_holder_count: placement.desired_holder_count,
+            selected_holder_count: placement.selected_holders.len(),
+            missing_holder_count: placement_missing_holder_count(&placement),
         })
         .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
@@ -1505,7 +1504,7 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        placement_missing_peer_count, raw_field,
+        placement_missing_holder_count, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1810,16 +1809,22 @@ mod tests {
             realm_id: RealmId::from_bytes([4_u8; 32]),
         };
         let realm_id = RealmId::from_bytes([4_u8; 32]);
-        let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
-        let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
+        let selected_holder = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
+        let origin_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
         let placement = aruna_operations::sync_placement::new_placement(
             realm_id,
             target.clone(),
-            authoritative_node_id,
+            origin_node_id,
             3,
-            vec![selected_peer],
+            vec![selected_holder],
             aruna_core::structs::PlacementRef::NIL,
         );
+        let json = serde_json::to_value(super::JsonPendingDocumentPlacement(placement.clone()))
+            .expect("placement serializes as JSON");
+        assert_eq!(json["origin_node_id"], origin_node_id.to_string());
+        assert_eq!(json["desired_holder_count"], 3);
+        assert_eq!(json["missing_holder_count"], 2);
+        assert!(json.get("authoritative_node_id").is_none());
         let value = postcard::to_allocvec(&placement).unwrap();
         let key = aruna_operations::sync_placement::placement_key(realm_id, &target);
 
@@ -1834,10 +1839,10 @@ mod tests {
             DecodedValue::PendingDocumentPlacement { data } => {
                 assert_eq!(data.0.realm_id, realm_id);
                 assert_eq!(data.0.target, target);
-                assert_eq!(data.0.authoritative_node_id, authoritative_node_id);
-                assert_eq!(data.0.desired_peer_count, 3);
-                assert_eq!(data.0.selected_peers, vec![selected_peer]);
-                assert_eq!(placement_missing_peer_count(&data.0), 1);
+                assert_eq!(data.0.origin_node_id, origin_node_id);
+                assert_eq!(data.0.desired_holder_count, 3);
+                assert_eq!(data.0.selected_holders, vec![selected_holder]);
+                assert_eq!(placement_missing_holder_count(&data.0), 2);
             }
             other => panic!("expected pending topic placement, got {other:?}"),
         }

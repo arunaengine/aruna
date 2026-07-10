@@ -15,8 +15,9 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::placement::rank_eligible_holders;
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    placement_satisfied, schedule_placement_retry_after, sort_node_ids, write_placement_effect,
+    decode_placement, delete_placement_effect, missing_holder_count, new_placement,
+    placement_prefix, placement_satisfied, schedule_placement_retry_after, sort_node_ids,
+    write_placement_effect,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -60,9 +61,9 @@ enum PlacementState {
 #[derive(Debug, Clone, PartialEq)]
 struct CurrentPlacement {
     target: DocumentSyncTarget,
-    authoritative_node_id: NodeId,
-    desired_peer_count: usize,
-    selected_peers: Vec<NodeId>,
+    origin_node_id: NodeId,
+    desired_holder_count: usize,
+    selected_holders: Vec<NodeId>,
     newly_selected: Vec<NodeId>,
     placement: PlacementRef,
 }
@@ -159,45 +160,46 @@ impl ProcessPlacementsOperation {
             )];
         }
 
-        let missing_peer_count = missing_peer_count(&record);
-        let mut selected_peers = record.selected_peers;
-        selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
-        sort_node_ids(&mut selected_peers);
-        let mut excluded_peers = selected_peers.clone();
-        excluded_peers.push(record.authoritative_node_id);
-        sort_node_ids(&mut excluded_peers);
+        let missing_holder_count = missing_holder_count(&record);
+        let mut selected_holders = record.selected_holders;
+        sort_node_ids(&mut selected_holders);
         let newly_selected: Vec<NodeId> = match self.realm_config.as_ref() {
             Some(config) => rank_eligible_holders(config, &record.target, None)
                 .into_iter()
-                .filter(|node_id| !excluded_peers.contains(node_id))
-                .take(missing_peer_count)
+                .filter(|node_id| !selected_holders.contains(node_id))
+                .take(missing_holder_count)
                 .collect(),
             None => Vec::new(),
         };
+        let network_peers: Vec<NodeId> = newly_selected
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.config.local_node_id)
+            .collect();
         self.current = Some(CurrentPlacement {
             target: record.target.clone(),
-            authoritative_node_id: record.authoritative_node_id,
-            desired_peer_count: record.desired_peer_count,
-            selected_peers,
+            origin_node_id: record.origin_node_id,
+            desired_holder_count: record.desired_holder_count,
+            selected_holders,
             newly_selected: newly_selected.clone(),
             placement: record.placement,
         });
 
-        if newly_selected.is_empty() {
+        if network_peers.is_empty() {
             return self.emit_placement_update();
         }
 
         self.state = PlacementState::Publish;
         // NodeInfo genesis is reserved for the explicit core-document bootstrap;
-        // ordinary documents retain authority-derived genesis on placement retry.
+        // ordinary documents retain origin-derived genesis on placement retry.
         let allow_genesis = !matches!(&record.target, DocumentSyncTarget::NodeInfo { .. })
-            && record.authoritative_node_id == self.config.local_node_id;
+            && record.origin_node_id == self.config.local_node_id;
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document_with_peers(
                 record.target.topic_id(),
                 self.config.local_node_id,
                 Some(record.target),
-                newly_selected,
+                network_peers,
                 allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
@@ -210,14 +212,11 @@ impl ProcessPlacementsOperation {
         let Some(mut current) = self.current.take() else {
             return self.emit_next_record();
         };
-        current.selected_peers.append(&mut current.newly_selected);
-        current
-            .selected_peers
-            .retain(|node_id| *node_id != current.authoritative_node_id);
-        sort_node_ids(&mut current.selected_peers);
+        current.selected_holders.append(&mut current.newly_selected);
+        sort_node_ids(&mut current.selected_holders);
 
         self.state = PlacementState::StorePlacement;
-        if placement_satisfied(current.selected_peers.len(), current.desired_peer_count) {
+        if placement_satisfied(current.selected_holders.len(), current.desired_holder_count) {
             self.retry_needed = false;
             return smallvec![delete_placement_effect(
                 self.config.realm_id,
@@ -228,9 +227,9 @@ impl ProcessPlacementsOperation {
         let record = new_placement(
             self.config.realm_id,
             current.target,
-            current.authoritative_node_id,
-            current.desired_peer_count,
-            current.selected_peers,
+            current.origin_node_id,
+            current.desired_holder_count,
+            current.selected_holders,
             current.placement,
         );
         self.retry_needed = true;
@@ -303,7 +302,9 @@ impl Operation for ProcessPlacementsOperation {
                         Err(error) => {
                             warn!(error = %error, "Document sync failed; keeping placement pending");
                             if let Some(current) = self.current.as_mut() {
-                                current.newly_selected.clear();
+                                current
+                                    .newly_selected
+                                    .retain(|node_id| *node_id == self.config.local_node_id);
                             }
                             self.emit_placement_update()
                         }
@@ -423,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn two_remote_peers_complete_existing_default_pending_placement() {
+    fn three_selected_holders_complete_existing_pending_placement() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let target = metadata_target(4);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
@@ -433,9 +434,9 @@ mod tests {
         });
         operation.current = Some(CurrentPlacement {
             target: target.clone(),
-            authoritative_node_id: node(1),
-            desired_peer_count: 3,
-            selected_peers: vec![node(2), node(3)],
+            origin_node_id: node(1),
+            desired_holder_count: 3,
+            selected_holders: vec![node(1), node(2), node(3)],
             newly_selected: Vec::new(),
             placement: PlacementRef::NIL,
         });
@@ -451,19 +452,19 @@ mod tests {
     }
 
     #[test]
-    fn process_placement_uses_record_authoritative_holder() {
+    fn process_placement_may_select_origin_as_holder() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let authoritative = node(1);
+        let origin = node(1);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_config = Some(config_with(&[authoritative, node(2), node(3), node(4)]));
+        operation.realm_config = Some(config_with(&[origin, node(2)]));
         operation.records = vec![new_placement(
             realm_id,
             metadata_target(5),
-            authoritative,
+            origin,
             3,
             vec![node(2)],
             PlacementRef::NIL,
@@ -473,9 +474,9 @@ mod tests {
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
-        assert_eq!(current.authoritative_node_id, authoritative);
-        assert_eq!(current.selected_peers, vec![node(2)]);
-        assert!(!current.newly_selected.contains(&authoritative));
+        assert_eq!(current.origin_node_id, origin);
+        assert_eq!(current.selected_holders, vec![node(2)]);
+        assert!(current.newly_selected.contains(&origin));
         assert!(!current.newly_selected.contains(&node(2)));
     }
 
@@ -483,7 +484,7 @@ mod tests {
     fn process_placement_does_not_replace_existing_holders() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let target = metadata_target(6);
-        let authoritative = node(1);
+        let origin = node(1);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
@@ -491,9 +492,9 @@ mod tests {
         });
         operation.current = Some(CurrentPlacement {
             target,
-            authoritative_node_id: authoritative,
-            desired_peer_count: 5,
-            selected_peers: vec![node(2)],
+            origin_node_id: origin,
+            desired_holder_count: 5,
+            selected_holders: vec![node(2)],
             newly_selected: vec![node(3)],
             placement: PlacementRef::NIL,
         });
@@ -504,24 +505,24 @@ mod tests {
             panic!("expected placement write");
         };
         let record = decode_placement(value.as_ref()).expect("placement decodes");
-        assert_eq!(record.authoritative_node_id, authoritative);
-        assert_eq!(record.selected_peers, vec![node(2), node(3)]);
+        assert_eq!(record.origin_node_id, origin);
+        assert_eq!(record.selected_holders, vec![node(2), node(3)]);
     }
 
     #[test]
-    fn process_placement_excludes_authoritative_holder_from_new_selection() {
+    fn process_placement_does_not_implicitly_count_origin() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
-        let authoritative = node(1);
+        let origin = node(1);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.realm_config = Some(config_with(&[authoritative, node(2)]));
+        operation.realm_config = Some(config_with(&[origin, node(2)]));
         operation.records = vec![new_placement(
             realm_id,
             metadata_target(7),
-            authoritative,
+            origin,
             2,
             Vec::new(),
             PlacementRef::NIL,
@@ -531,7 +532,9 @@ mod tests {
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
-        assert_eq!(current.newly_selected, vec![node(2)]);
+        assert_eq!(current.newly_selected.len(), 2);
+        assert!(current.newly_selected.contains(&origin));
+        assert!(current.newly_selected.contains(&node(2)));
     }
 
     #[test]
@@ -563,7 +566,10 @@ mod tests {
         assert!(operation.current.is_none());
     }
 
-    fn announce_outbox_allow_genesis(effects: Effects, document_bytes: Vec<u8>) -> bool {
+    fn announce_outbox_record(
+        effects: Effects,
+        document_bytes: Vec<u8>,
+    ) -> aruna_core::document::DocumentSyncOutboxRecord {
         let Some(Effect::SubOperation(mut sub)) = effects.into_iter().next() else {
             panic!("expected announce sub-operation");
         };
@@ -577,7 +583,11 @@ mod tests {
         };
         let record: aruna_core::document::DocumentSyncOutboxRecord =
             postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
-        record.allow_genesis
+        record
+    }
+
+    fn announce_outbox_allow_genesis(effects: Effects, document_bytes: Vec<u8>) -> bool {
+        announce_outbox_record(effects, document_bytes).allow_genesis
     }
 
     fn graph_lifecycle_fixture() -> (DocumentSyncTarget, Vec<u8>) {
@@ -595,9 +605,38 @@ mod tests {
         (target, bytes)
     }
 
+    #[test]
+    fn process_local_holder_is_counted_but_not_a_network_peer() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let local = node(1);
+        let remote = node(2);
+        let (target, bytes) = graph_lifecycle_fixture();
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: local,
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        operation.realm_config = Some(config_with(&[local, remote]));
+        operation.records = vec![new_placement(
+            realm_id,
+            target,
+            node(9),
+            2,
+            Vec::new(),
+            PlacementRef::NIL,
+        )];
+
+        let effects = operation.emit_next_record();
+
+        let current = operation.current.as_ref().expect("placement is active");
+        assert!(current.newly_selected.contains(&local));
+        assert!(current.newly_selected.contains(&remote));
+        assert_eq!(announce_outbox_record(effects, bytes).peers, vec![remote]);
+    }
+
     fn placement_announce_allow_genesis(
         local: NodeId,
-        authoritative: NodeId,
+        origin: NodeId,
         target: DocumentSyncTarget,
         document_bytes: Vec<u8>,
     ) -> bool {
@@ -611,7 +650,7 @@ mod tests {
         operation.records = vec![new_placement(
             realm_id,
             target,
-            authoritative,
+            origin,
             3,
             Vec::new(),
             PlacementRef::NIL,
@@ -620,21 +659,21 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_document_retry_allow_genesis_tracks_authoritative_origin() {
+    fn ordinary_document_retry_allow_genesis_tracks_origin() {
         let local = node(1);
         let (target, bytes) = graph_lifecycle_fixture();
         assert!(
             placement_announce_allow_genesis(local, local, target.clone(), bytes.clone()),
-            "origin (authoritative == local) may mint genesis"
+            "local origin may mint genesis"
         );
         assert!(
             !placement_announce_allow_genesis(node(9), local, target, bytes),
-            "replica-holder (authoritative != local) must not mint genesis"
+            "non-origin publisher must not mint genesis"
         );
     }
 
     #[test]
-    fn node_info_authoritative_retry_disallows_genesis() {
+    fn node_info_origin_retry_disallows_genesis() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let local = node(1);
         let target = DocumentSyncTarget::NodeInfo {
