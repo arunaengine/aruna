@@ -77,6 +77,8 @@ pub enum DocumentSyncTarget {
 pub struct PendingDocumentPlacement {
     pub realm_id: RealmId,
     pub target: DocumentSyncTarget,
+    pub group_id: Option<GroupId>,
+    pub metadata_path: Option<String>,
     pub desired_holder_count: usize,
     pub selected_holders: Vec<NodeId>,
     pub updated_at: u64,

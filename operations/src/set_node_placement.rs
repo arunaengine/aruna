@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::sync_placement::schedule_placement_revalidation_effect;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetNodePlacementConfig {
@@ -56,6 +57,7 @@ enum SetNodePlacementState {
     ScheduleDocumentSyncOutboxDrain {
         document: RealmConfigDocument,
     },
+    SchedulePlacementRevalidation,
     Finish,
     Error,
 }
@@ -306,16 +308,37 @@ impl Operation for SetNodePlacementOperation {
             },
             SetNodePlacementState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.state = SetNodePlacementState::SchedulePlacementRevalidation;
+                    smallvec![schedule_placement_revalidation_effect(
+                        self.config.actor.realm_id,
+                        self.config.actor.node_id,
+                    )]
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
+                    self.state = SetNodePlacementState::SchedulePlacementRevalidation;
+                    smallvec![schedule_placement_revalidation_effect(
+                        self.config.actor.realm_id,
+                        self.config.actor.node_id,
+                    )]
+                }
+                other => self.unexpected_event(
+                    "document sync outbox drain timer schedule",
+                    format!("{other:?}"),
+                ),
+            },
+            SetNodePlacementState::SchedulePlacementRevalidation => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetNodePlacementState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
+                    warn!(error = %message, "Failed to schedule placement revalidation after realm config mutation");
                     self.state = SetNodePlacementState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
+                    "placement revalidation timer schedule",
                     format!("{other:?}"),
                 ),
             },
@@ -453,6 +476,51 @@ mod tests {
                 AdminDocumentReducerError::ReservedPlacementLabel
             )
         ));
+    }
+
+    #[test]
+    fn local_config_mutation_schedules_zero_delay_placement_revalidation() {
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let entry = NodePlacementEntry {
+            node_id: node(2),
+            location: String::new(),
+            weight: DEFAULT_NODE_WEIGHT,
+            full: true,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+        let mut operation = SetNodePlacementOperation::new(SetNodePlacementConfig {
+            actor: actor.clone(),
+            entry,
+        });
+        operation.state = SetNodePlacementState::ScheduleDocumentSyncOutboxDrain {
+            document: RealmConfigDocument::new(realm_id, Vec::new(), 3),
+        };
+
+        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: aruna_core::task::TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
+                key: aruna_core::task::TaskKey::SyncPlacements {
+                    realm_id: scheduled_realm,
+                    node_id,
+                },
+                after,
+            })] if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
+        ));
+        assert_eq!(
+            operation.state,
+            SetNodePlacementState::SchedulePlacementRevalidation
+        );
     }
 
     #[test]

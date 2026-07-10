@@ -73,11 +73,37 @@ pub fn rank_eligible_holders(
     target: &DocumentSyncTarget,
     context: PlacementResolutionContext<'_>,
 ) -> Vec<NodeId> {
+    rank_eligible_holders_excluding(config, target, context, &[])
+}
+
+pub fn rank_eligible_holders_excluding(
+    config: &RealmConfigDocument,
+    target: &DocumentSyncTarget,
+    context: PlacementResolutionContext<'_>,
+    excluded: &[NodeId],
+) -> Vec<NodeId> {
     let Some((strategy, override_)) = strategy_for_target(config, target, context) else {
         return Vec::new();
     };
     let mut uncapped = strategy.clone();
     uncapped.replica_count = None;
+    let mut effective_override = override_.cloned();
+    if !excluded.is_empty() {
+        let override_ =
+            effective_override.get_or_insert_with(|| aruna_core::structs::PlacementOverride {
+                subject: subject_bytes(target),
+                pinned: Vec::new(),
+                excluded: Vec::new(),
+                strategy_id: None,
+            });
+        override_.excluded.extend_from_slice(excluded);
+    }
     let view = build_view(config);
-    resolve_holders(&view, &uncapped, &subject_bytes(target), 0, override_)
+    resolve_holders(
+        &view,
+        &uncapped,
+        &subject_bytes(target),
+        0,
+        effective_override.as_ref().or(override_),
+    )
 }

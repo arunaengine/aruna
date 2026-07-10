@@ -1,66 +1,57 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::errors::ConversionError;
+use aruna_core::storage_entries::{
+    document_placement_delete_entry, document_placement_key, document_placement_write_entry,
+};
+use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::Key;
+use aruna_core::types::{GroupId, Key, TxnId};
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
 
-use crate::placement::{PlacementResolutionContext, rank_eligible_holders};
-
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
-
-/// Monotonic top-up: keeps every `existing_holders` entry and appends
-/// resolver-ranked eligible nodes (best-first, skipping already-held ones)
-/// until `desired_holder_count` is reached. The stored set is node-id sorted so
-/// any two nodes materialise an identical holder set from an identical record.
-pub fn complete_authoritative_holders(
-    config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
-    context: PlacementResolutionContext<'_>,
-    existing_holders: &[NodeId],
-    desired_holder_count: usize,
-) -> Vec<NodeId> {
-    let mut holders = existing_holders.to_vec();
-    sort_node_ids(&mut holders);
-    if holders.len() >= desired_holder_count {
-        return holders;
-    }
-
-    let held: HashSet<NodeId> = holders.iter().copied().collect();
-    for candidate in rank_eligible_holders(config, target, context) {
-        if holders.len() >= desired_holder_count {
-            break;
-        }
-        if !held.contains(&candidate) {
-            holders.push(candidate);
-        }
-    }
-    sort_node_ids(&mut holders);
-    holders
-}
 
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
 }
 
 pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
-    let mut bytes = realm_id.as_bytes().to_vec();
-    bytes.extend_from_slice(target.sync_topic_id().to_string().as_bytes());
-    ByteView::from(bytes)
+    document_placement_key(realm_id, target)
 }
 
 pub fn new_placement(
     realm_id: RealmId,
     target: DocumentSyncTarget,
     origin_node_id: NodeId,
+    desired_holder_count: usize,
+    selected_holders: Vec<NodeId>,
+    placement: PlacementRef,
+) -> PendingDocumentPlacement {
+    new_placement_with_context(
+        realm_id,
+        target,
+        origin_node_id,
+        None,
+        None,
+        desired_holder_count,
+        selected_holders,
+        placement,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn new_placement_with_context(
+    realm_id: RealmId,
+    target: DocumentSyncTarget,
+    origin_node_id: NodeId,
+    group_id: Option<GroupId>,
+    metadata_path: Option<String>,
     desired_holder_count: usize,
     mut selected_holders: Vec<NodeId>,
     placement: PlacementRef,
@@ -69,6 +60,8 @@ pub fn new_placement(
     PendingDocumentPlacement {
         realm_id,
         target,
+        group_id,
+        metadata_path,
         desired_holder_count,
         selected_holders,
         updated_at: unix_timestamp_secs(),
@@ -107,25 +100,39 @@ pub fn schedule_document_sync_effect(
 
 pub fn write_placement_effect(
     record: &PendingDocumentPlacement,
-) -> Result<Effect, postcard::Error> {
+) -> Result<Effect, ConversionError> {
+    let (key_space, key, value) = document_placement_write_entry(record)?;
     Ok(Effect::Storage(StorageEffect::Write {
-        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(record.realm_id, &record.target),
-        value: ByteView::from(postcard::to_allocvec(record)?),
+        key_space,
+        key,
+        value,
         txn_id: None,
     }))
 }
 
 pub fn delete_placement_effect(realm_id: RealmId, target: &DocumentSyncTarget) -> Effect {
+    delete_placement_effect_with_txn(realm_id, target, None)
+}
+
+pub fn delete_placement_effect_with_txn(
+    realm_id: RealmId,
+    target: &DocumentSyncTarget,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    let (key_space, key) = document_placement_delete_entry(realm_id, target);
     Effect::Storage(StorageEffect::Delete {
-        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(realm_id, target),
-        txn_id: None,
+        key_space,
+        key,
+        txn_id,
     })
 }
 
 pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
     schedule_placement_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
+}
+
+pub fn schedule_placement_revalidation_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    schedule_placement_retry_after(realm_id, local_node_id, Duration::ZERO)
 }
 
 pub fn schedule_placement_retry_after(
@@ -158,8 +165,7 @@ fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use ulid::Ulid;
+    use aruna_core::structs::RealmId;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -171,68 +177,6 @@ mod tests {
         DocumentSyncTarget::RealmConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
         }
-    }
-
-    fn config_with(nodes: &[NodeId]) -> RealmConfigDocument {
-        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
-        let strategy = aruna_core::structs::PlacementStrategy {
-            strategy_id: Ulid::from_bytes([9u8; 16]),
-            name: "test".to_string(),
-            replica_count: None,
-            distinct_locations: false,
-            affinity: Vec::new(),
-        };
-        config.default_strategy_id = Some(strategy.strategy_id);
-        config.strategies = vec![strategy];
-        for node_id in nodes {
-            config.ensure_node(*node_id, RealmNodeKind::Server);
-        }
-        config
-    }
-
-    #[test]
-    fn authoritative_holder_completion_is_monotonic() {
-        let existing = vec![node(1), node(3), node(3)];
-        let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
-
-        let holders = complete_authoritative_holders(
-            &config,
-            &target(),
-            PlacementResolutionContext::default(),
-            &existing,
-            4,
-        );
-
-        assert!(holders.contains(&node(1)));
-        assert!(holders.contains(&node(3)));
-        assert_eq!(holders.len(), 4);
-    }
-
-    #[test]
-    fn authoritative_holder_completion_is_cross_node_identical() {
-        let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
-        let existing = vec![node(2)];
-
-        let first = complete_authoritative_holders(
-            &config,
-            &target(),
-            PlacementResolutionContext::default(),
-            &existing,
-            3,
-        );
-        // A node observing the members in a different order derives the same set.
-        let reversed = config_with(&[node(5), node(4), node(3), node(2), node(1)]);
-        let second = complete_authoritative_holders(
-            &reversed,
-            &target(),
-            PlacementResolutionContext::default(),
-            &existing,
-            3,
-        );
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 3);
-        assert!(first.contains(&node(2)));
     }
 
     #[test]
@@ -329,5 +273,32 @@ mod tests {
             placement.selected_holders.len(),
             placement.desired_holder_count
         ));
+    }
+
+    #[test]
+    fn metadata_resolution_context_survives_placement_roundtrip() {
+        let group_id = GroupId::from_bytes([8; 16]);
+        let placement = new_placement_with_context(
+            RealmId::from_bytes([7; 32]),
+            DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: GroupId::from_bytes([9; 16]),
+            },
+            node(1),
+            Some(group_id),
+            Some("datasets/context/object".to_string()),
+            2,
+            vec![node(1), node(2)],
+            PlacementRef::NIL,
+        );
+
+        let bytes = postcard::to_allocvec(&placement).expect("placement serializes");
+        let decoded = decode_placement(&bytes).expect("placement decodes");
+
+        assert_eq!(decoded.group_id, Some(group_id));
+        assert_eq!(
+            decoded.metadata_path.as_deref(),
+            Some("datasets/context/object")
+        );
+        assert_eq!(decoded, placement);
     }
 }

@@ -37,13 +37,14 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, document_sync_revision_key,
-    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
-    metadata_document_lifecycle_key, metadata_document_lifecycle_write_entry,
-    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
-    metadata_registry_write_entries, stale_admin_document_conflict_delete_entries,
-    stale_subject_index_deletes, subject_index_writes,
+    admin_document_reducer_state_write_entry, document_placement_delete_entry,
+    document_sync_revision_key, document_sync_revision_write_entry,
+    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
+    metadata_registry_delete_entries, metadata_registry_write_entries,
+    stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
+    subject_index_writes,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, KIND_LABEL_KEY, MetadataRegistryRecord,
@@ -2727,11 +2728,12 @@ async fn apply_metadata_registry_delete_to_storage(
     if metadata_document_delete_matches_registry(&delete, group_id, document_id)
         && !metadata_registry_live_after_delete(storage, group_id, document_id, &delete).await?
     {
-        storage_batch_delete_to(
-            storage,
-            metadata_registry_delete_entries(group_id, document_id),
-        )
-        .await?;
+        let mut deletes = metadata_registry_delete_entries(group_id, document_id);
+        deletes.push(document_placement_delete_entry(
+            delete.tombstone.realm_id,
+            &DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+        ));
+        storage_batch_delete_to(storage, deletes).await?;
     }
     Ok(())
 }
@@ -8112,11 +8114,26 @@ mod tests {
             Ulid::from_parts(43, 1),
             record.last_event_id,
         );
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let placement_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let placement = aruna_core::document::PendingDocumentPlacement {
+            realm_id,
+            target: placement_target.clone(),
+            group_id: Some(group_id),
+            metadata_path: Some(record.document_path.clone()),
+            desired_holder_count: 1,
+            selected_holders: record.holder_node_ids.clone(),
+            updated_at: 1,
+            origin_node_id: node(1),
+            placement: aruna_core::structs::PlacementRef::NIL,
+        };
         storage_batch_write_to(
             &storage,
             vec![
                 metadata_document_lifecycle_write_entry(&lifecycle)
                     .expect("lifecycle entry builds"),
+                aruna_core::storage_entries::document_placement_write_entry(&placement)
+                    .expect("placement entry builds"),
             ],
         )
         .await
@@ -8149,6 +8166,15 @@ mod tests {
                 &storage,
                 METADATA_HOLDERS_KEYSPACE,
                 metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE,
+                aruna_core::storage_entries::document_placement_key(realm_id, &placement_target,),
             )
             .await
             .is_none()

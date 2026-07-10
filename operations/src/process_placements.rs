@@ -13,11 +13,10 @@ use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::placement::{PlacementResolutionContext, rank_eligible_holders};
+use crate::placement::{PlacementResolutionContext, plan_target_placement};
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, missing_holder_count, new_placement,
-    placement_prefix, placement_satisfied, schedule_placement_retry_after, sort_node_ids,
-    write_placement_effect,
+    decode_placement, delete_placement_effect, new_placement_with_context, placement_prefix,
+    placement_satisfied, schedule_placement_retry_after, sort_node_ids, write_placement_effect,
 };
 use std::time::Duration;
 use tracing::warn;
@@ -60,12 +59,9 @@ enum PlacementState {
 
 #[derive(Debug, Clone, PartialEq)]
 struct CurrentPlacement {
-    target: DocumentSyncTarget,
-    origin_node_id: NodeId,
-    desired_holder_count: usize,
-    selected_holders: Vec<NodeId>,
-    newly_selected: Vec<NodeId>,
-    placement: PlacementRef,
+    planned: PendingDocumentPlacement,
+    selected_holders_after_failure: Vec<NodeId>,
+    newly_required_remote_holders: Vec<NodeId>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -160,37 +156,52 @@ impl ProcessPlacementsOperation {
             )];
         }
 
-        let missing_holder_count = missing_holder_count(&record);
-        let mut selected_holders = record.selected_holders;
-        sort_node_ids(&mut selected_holders);
-        let newly_selected: Vec<NodeId> = match self.realm_config.as_ref() {
-            Some(config) => rank_eligible_holders(
-                config,
-                &record.target,
-                PlacementResolutionContext::default(),
-            )
-            .into_iter()
-            .filter(|node_id| !selected_holders.contains(node_id))
-            .take(missing_holder_count)
-            .collect(),
-            None => Vec::new(),
+        let context = PlacementResolutionContext {
+            group_id: record.group_id,
+            metadata_path: record.metadata_path.as_deref(),
         };
-        let network_peers: Vec<NodeId> = newly_selected
+        let mut previously_selected = record.selected_holders.clone();
+        sort_node_ids(&mut previously_selected);
+        let (desired_holder_count, mut planned_holders, placement) = self
+            .realm_config
+            .as_ref()
+            .and_then(|config| plan_target_placement(config, &record.target, context))
+            .map(|plan| (plan.desired_count, plan.holders, plan.placement))
+            .unwrap_or((record.desired_holder_count, Vec::new(), PlacementRef::NIL));
+        sort_node_ids(&mut planned_holders);
+
+        let selected_holders_after_failure: Vec<NodeId> = planned_holders
             .iter()
             .copied()
-            .filter(|node_id| *node_id != self.config.local_node_id)
+            .filter(|node_id| {
+                previously_selected.contains(node_id) || *node_id == self.config.local_node_id
+            })
             .collect();
+        let newly_required_remote_holders: Vec<NodeId> = planned_holders
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                *node_id != self.config.local_node_id && !previously_selected.contains(node_id)
+            })
+            .collect();
+        let planned = new_placement_with_context(
+            self.config.realm_id,
+            record.target.clone(),
+            record.origin_node_id,
+            record.group_id,
+            record.metadata_path.clone(),
+            desired_holder_count,
+            planned_holders,
+            placement,
+        );
         self.current = Some(CurrentPlacement {
-            target: record.target.clone(),
-            origin_node_id: record.origin_node_id,
-            desired_holder_count: record.desired_holder_count,
-            selected_holders,
-            newly_selected: newly_selected.clone(),
-            placement: record.placement,
+            planned,
+            selected_holders_after_failure,
+            newly_required_remote_holders: newly_required_remote_holders.clone(),
         });
 
-        if network_peers.is_empty() {
-            return self.emit_placement_update();
+        if newly_required_remote_holders.is_empty() {
+            return self.emit_placement_update(false);
         }
 
         self.state = PlacementState::Publish;
@@ -203,8 +214,8 @@ impl ProcessPlacementsOperation {
                 record.target.topic_id(),
                 self.config.local_node_id,
                 Some(record.target),
-                network_peers,
-                record.placement,
+                newly_required_remote_holders,
+                placement,
                 allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
@@ -213,32 +224,21 @@ impl ProcessPlacementsOperation {
         ))]
     }
 
-    fn emit_placement_update(&mut self) -> Effects {
+    fn emit_placement_update(&mut self, publication_failed: bool) -> Effects {
         let Some(mut current) = self.current.take() else {
             return self.emit_next_record();
         };
-        current.selected_holders.append(&mut current.newly_selected);
-        sort_node_ids(&mut current.selected_holders);
-
-        self.state = PlacementState::StorePlacement;
-        if placement_satisfied(current.selected_holders.len(), current.desired_holder_count) {
-            self.retry_needed = false;
-            return smallvec![delete_placement_effect(
-                self.config.realm_id,
-                &current.target
-            )];
+        if publication_failed {
+            current.planned.selected_holders = current.selected_holders_after_failure;
         }
 
-        let record = new_placement(
-            self.config.realm_id,
-            current.target,
-            current.origin_node_id,
-            current.desired_holder_count,
-            current.selected_holders,
-            current.placement,
-        );
-        self.retry_needed = true;
-        match write_placement_effect(&record) {
+        self.state = PlacementState::StorePlacement;
+        self.retry_needed = publication_failed
+            || !placement_satisfied(
+                current.planned.selected_holders.len(),
+                current.planned.desired_holder_count,
+            );
+        match write_placement_effect(&current.planned) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(PlacementError::Placement(error.to_string())),
         }
@@ -303,15 +303,10 @@ impl Operation for ProcessPlacementsOperation {
             PlacementState::Publish => match event {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
-                        Ok(()) => self.emit_placement_update(),
+                        Ok(()) => self.emit_placement_update(false),
                         Err(error) => {
                             warn!(error = %error, "Document sync failed; keeping placement pending");
-                            if let Some(current) = self.current.as_mut() {
-                                current
-                                    .newly_selected
-                                    .retain(|node_id| *node_id == self.config.local_node_id);
-                            }
-                            self.emit_placement_update()
+                            self.emit_placement_update(true)
                         }
                     }
                 }
@@ -370,8 +365,11 @@ impl Operation for ProcessPlacementsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER;
-    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use crate::sync_placement::{SYNC_PLACEMENT_RETRY_AFTER, new_placement};
+    use aruna_core::structs::{
+        BindingScope, NodePlacementEntry, PlacementStrategy, RealmNodeKind, StrategyBinding,
+    };
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -429,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn three_selected_holders_complete_existing_pending_placement() {
+    fn completed_inventory_record_is_rewritten_not_deleted() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let target = metadata_target(4);
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
@@ -437,22 +435,23 @@ mod tests {
             local_node_id: node(1),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.current = Some(CurrentPlacement {
-            target: target.clone(),
-            origin_node_id: node(1),
-            desired_holder_count: 3,
-            selected_holders: vec![node(1), node(2), node(3)],
-            newly_selected: Vec::new(),
-            placement: PlacementRef::NIL,
-        });
+        operation.realm_config = Some(config_with(&[node(1), node(2), node(3)]));
+        operation.records = vec![new_placement(
+            realm_id,
+            target,
+            node(1),
+            3,
+            vec![node(1), node(2), node(3)],
+            PlacementRef::NIL,
+        )];
 
-        let effects = operation.emit_placement_update();
+        let effects = operation.emit_next_record();
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                if key_space == SYNC_PLACEMENT_KEYSPACE
-        ));
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected retained placement write, got {effects:?}");
+        };
+        let record = decode_placement(value.as_ref()).expect("placement decodes");
+        assert_eq!(record.selected_holders.len(), 3);
         assert!(!operation.retry_needed);
     }
 
@@ -479,39 +478,69 @@ mod tests {
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
-        assert_eq!(current.origin_node_id, origin);
-        assert_eq!(current.selected_holders, vec![node(2)]);
-        assert!(current.newly_selected.contains(&origin));
-        assert!(!current.newly_selected.contains(&node(2)));
+        assert_eq!(current.planned.origin_node_id, origin);
+        assert!(current.planned.selected_holders.contains(&origin));
+        assert!(current.planned.selected_holders.contains(&node(2)));
+        assert!(current.newly_required_remote_holders.contains(&origin));
+        assert!(!current.newly_required_remote_holders.contains(&node(2)));
     }
 
     #[test]
-    fn process_placement_does_not_replace_existing_holders() {
+    fn full_and_draining_holders_are_replaced_in_exact_record() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let target = metadata_target(6);
-        let origin = node(1);
+        let mut config = config_with(&[node(1), node(2), node(3), node(4)]);
+        config.strategies[0].replica_count = Some(2);
+        config.placement_map = vec![
+            NodePlacementEntry {
+                node_id: node(1),
+                location: String::new(),
+                weight: 100,
+                full: true,
+                draining: false,
+                labels: BTreeMap::new(),
+            },
+            NodePlacementEntry {
+                node_id: node(2),
+                location: String::new(),
+                weight: 100,
+                full: false,
+                draining: true,
+                labels: BTreeMap::new(),
+            },
+        ];
         let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
             realm_id,
             local_node_id: node(9),
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
-        operation.current = Some(CurrentPlacement {
+        operation.realm_config = Some(config);
+        operation.records = vec![new_placement(
+            realm_id,
             target,
-            origin_node_id: origin,
-            desired_holder_count: 5,
-            selected_holders: vec![node(2)],
-            newly_selected: vec![node(3)],
-            placement: PlacementRef::NIL,
-        });
+            node(1),
+            2,
+            vec![node(1), node(2)],
+            PlacementRef::NIL,
+        )];
 
-        let effects = operation.emit_placement_update();
+        let effects = operation.emit_next_record();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected placement write");
         };
         let record = decode_placement(value.as_ref()).expect("placement decodes");
-        assert_eq!(record.origin_node_id, origin);
-        assert_eq!(record.selected_holders, vec![node(2), node(3)]);
+        assert_eq!(record.desired_holder_count, 2);
+        assert_eq!(record.selected_holders.len(), 2);
+        assert!(record.selected_holders.contains(&node(3)));
+        assert!(record.selected_holders.contains(&node(4)));
+        assert!(!record.selected_holders.contains(&node(1)));
+        assert!(!record.selected_holders.contains(&node(2)));
+        assert!(!operation.retry_needed);
     }
 
     #[test]
@@ -537,9 +566,71 @@ mod tests {
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let current = operation.current.expect("placement is active");
-        assert_eq!(current.newly_selected.len(), 2);
-        assert!(current.newly_selected.contains(&origin));
-        assert!(current.newly_selected.contains(&node(2)));
+        assert_eq!(current.newly_required_remote_holders.len(), 2);
+        assert!(current.newly_required_remote_holders.contains(&origin));
+        assert!(current.newly_required_remote_holders.contains(&node(2)));
+    }
+
+    #[test]
+    fn metadata_binding_and_replica_change_replace_count_ref_and_holders() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let target = metadata_target(8);
+        let path_strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([10; 16]),
+            name: "path".to_string(),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let mut config = config_with(&[node(1), node(2), node(3)]);
+        config.strategies[0].replica_count = Some(1);
+        config.strategies.push(path_strategy.clone());
+        config.strategy_bindings.push(StrategyBinding {
+            scope: BindingScope::MetadataPathPrefix("datasets/special".to_string()),
+            strategy_id: path_strategy.strategy_id,
+        });
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        operation.realm_config = Some(config);
+        operation.records = vec![new_placement_with_context(
+            realm_id,
+            target,
+            node(1),
+            Some(Ulid::from_bytes([4; 16])),
+            Some("datasets/special/object".to_string()),
+            1,
+            vec![node(1)],
+            PlacementRef {
+                strategy_id: Ulid::from_bytes([9; 16]),
+                epoch: 0,
+            },
+        )];
+
+        let effects = operation.emit_next_record();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let current = operation.current.as_ref().expect("placement is active");
+        assert_eq!(current.planned.desired_holder_count, 2);
+        assert_eq!(current.planned.selected_holders.len(), 2);
+        assert_eq!(
+            current.planned.placement.strategy_id,
+            path_strategy.strategy_id
+        );
+        assert_eq!(
+            current.planned.metadata_path.as_deref(),
+            Some("datasets/special/object")
+        );
+
+        let effects = operation.emit_placement_update(false);
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected exact placement write");
+        };
+        let record = decode_placement(value.as_ref()).expect("placement decodes");
+        assert_eq!(record.desired_holder_count, 2);
+        assert_eq!(record.selected_holders.len(), 2);
+        assert_eq!(record.placement.strategy_id, path_strategy.strategy_id);
     }
 
     #[test]
@@ -622,31 +713,30 @@ mod tests {
             retry_after: SYNC_PLACEMENT_RETRY_AFTER,
         });
         operation.realm_config = Some(config_with(&[local, remote]));
-        let placement = PlacementRef {
-            strategy_id: Ulid::from_bytes([7; 16]),
-            epoch: 4,
-        };
         operation.records = vec![new_placement(
             realm_id,
             target,
             node(9),
             2,
             Vec::new(),
-            placement,
+            PlacementRef::NIL,
         )];
 
         let effects = operation.emit_next_record();
 
         let current = operation.current.as_ref().expect("placement is active");
-        assert!(current.newly_selected.contains(&local));
-        assert!(current.newly_selected.contains(&remote));
+        assert!(current.planned.selected_holders.contains(&local));
+        assert!(current.planned.selected_holders.contains(&remote));
+        assert_eq!(current.selected_holders_after_failure, vec![local]);
+        assert_eq!(current.newly_required_remote_holders, vec![remote]);
+        let expected_placement = current.planned.placement;
         let outbox = announce_outbox_record(effects, bytes);
         assert_eq!(outbox.peers, vec![remote]);
         let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } = outbox.event
         else {
             panic!("expected upsert outbox event");
         };
-        assert_eq!(change.placement, placement);
+        assert_eq!(change.placement, expected_placement);
     }
 
     fn placement_announce_allow_genesis(

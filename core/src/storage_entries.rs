@@ -6,7 +6,7 @@ use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerS
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentSyncTarget, PendingDocumentPlacement,
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
@@ -19,7 +19,7 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    SYNC_PLACEMENT_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -27,8 +27,8 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
-    WatchSubscription, notification_inbox_key, notification_outbox_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, RealmId,
+    User, WatchSubscription, notification_inbox_key, notification_outbox_key,
     notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
@@ -110,6 +110,32 @@ pub fn metadata_event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
     ByteView::from(bytes)
+}
+
+pub fn document_placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
+    let mut bytes = realm_id.as_bytes().to_vec();
+    bytes.extend_from_slice(target.sync_topic_id().to_string().as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn document_placement_write_entry(
+    record: &PendingDocumentPlacement,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        SYNC_PLACEMENT_KEYSPACE.to_string(),
+        document_placement_key(record.realm_id, &record.target),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn document_placement_delete_entry(
+    realm_id: RealmId,
+    target: &DocumentSyncTarget,
+) -> (KeySpace, Key) {
+    (
+        SYNC_PLACEMENT_KEYSPACE.to_string(),
+        document_placement_key(realm_id, target),
+    )
 }
 
 pub fn metadata_pending_projection_key(document_id: Ulid, event_id: Ulid) -> Key {

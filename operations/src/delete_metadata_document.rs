@@ -37,6 +37,7 @@ use crate::metadata::repository::{
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
 use crate::placement::{PlacementResolutionContext, placement_ref_for_target};
+use crate::sync_placement::delete_placement_effect_with_txn;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -67,6 +68,7 @@ enum DeleteMetadataDocumentState {
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
+    DeletePlacementInventory,
     WriteAudit,
     WriteDocumentLifecycleOutbox,
     WriteGraphLifecycleOutbox,
@@ -519,6 +521,26 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
+                    self.state = DeleteMetadataDocumentState::DeletePlacementInventory;
+                    smallvec![delete_placement_effect_with_txn(
+                        record.realm_id,
+                        &DocumentSyncTarget::MetadataDocumentLifecycle {
+                            document_id: record.document_id,
+                        },
+                        Some(txn_id),
+                    )]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::DeletePlacementInventory => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
                     self.state = DeleteMetadataDocumentState::WriteAudit;
                     match write_audit_effect(&self.audit_record(record), Ulid::new(), Some(txn_id))
                     {
@@ -529,7 +551,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("holders delete result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("placement inventory delete result", format!("{other:?}"))
+                }
             },
             DeleteMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {

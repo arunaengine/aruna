@@ -15,9 +15,10 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::placement::{
     PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
+    rank_eligible_holders_excluding,
 };
 use crate::sync_placement::{
-    delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
+    new_placement, placement_satisfied, schedule_placement_retry_effect, sort_node_ids,
     write_placement_effect,
 };
 
@@ -59,7 +60,6 @@ enum ReplicateDocumentsState {
 #[derive(Debug, Clone, PartialEq)]
 enum PlacementAction {
     Write(PendingDocumentPlacement),
-    Delete(DocumentSyncTarget),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -166,29 +166,30 @@ impl ReplicateDocumentsOperation {
 
         let local_node_id = self.config.local_node_id;
         let excluded_peers = &self.config.excluded_peers;
-        let selected_holders: Vec<NodeId> = plan
-            .holders
-            .into_iter()
-            .filter(|node_id| *node_id == local_node_id || !excluded_peers.contains(node_id))
-            .collect();
+        let mut selected_holders = rank_eligible_holders_excluding(
+            realm_config,
+            &document,
+            PlacementResolutionContext::default(),
+            excluded_peers,
+        )
+        .into_iter()
+        .take(desired_count)
+        .collect();
+        sort_node_ids(&mut selected_holders);
         let network_peers: Vec<NodeId> = selected_holders
             .iter()
             .copied()
             .filter(|node_id| *node_id != local_node_id)
             .collect();
 
-        self.placement_action = if placement_satisfied(selected_holders.len(), desired_count) {
-            Some(PlacementAction::Delete(document.clone()))
-        } else {
-            Some(PlacementAction::Write(new_placement(
-                self.config.realm_id,
-                document.clone(),
-                local_node_id,
-                desired_count,
-                selected_holders,
-                placement,
-            )))
-        };
+        self.placement_action = Some(PlacementAction::Write(new_placement(
+            self.config.realm_id,
+            document.clone(),
+            local_node_id,
+            desired_count,
+            selected_holders,
+            placement,
+        )));
 
         if network_peers.is_empty()
             && !matches!(
@@ -227,17 +228,14 @@ impl ReplicateDocumentsOperation {
         self.state = ReplicateDocumentsState::StorePlacement;
         match action {
             PlacementAction::Write(record) => {
-                self.retry_needed = true;
+                self.retry_needed = self.retry_needed
+                    || !placement_satisfied(
+                        record.selected_holders.len(),
+                        record.desired_holder_count,
+                    );
                 Ok(smallvec![write_placement_effect(&record).map_err(
                     |error| ReplicateDocumentsError::Placement(error.to_string())
                 )?])
-            }
-            PlacementAction::Delete(target) => {
-                self.retry_needed = false;
-                Ok(smallvec![delete_placement_effect(
-                    self.config.realm_id,
-                    &target
-                )])
             }
         }
     }
@@ -246,10 +244,8 @@ impl ReplicateDocumentsOperation {
         let Some(action) = self.placement_action.take() else {
             return self.fail(ReplicateDocumentsError::DocumentSync(error));
         };
-        let target = match action {
-            PlacementAction::Write(record) => record.target,
-            PlacementAction::Delete(target) => target,
-        };
+        let PlacementAction::Write(previous) = action;
+        let target = previous.target;
         warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
         let (desired_count, selected_holders, placement) = match self.realm_config.as_ref() {
             Some(realm_config) => match plan_target_placement(
@@ -258,15 +254,21 @@ impl ReplicateDocumentsOperation {
                 PlacementResolutionContext::default(),
             ) {
                 Some(plan) => (
-                    plan.desired_count.max(1),
-                    plan.holders
-                        .into_iter()
-                        .filter(|node_id| *node_id == self.config.local_node_id)
-                        .collect(),
+                    plan.desired_count,
+                    rank_eligible_holders_excluding(
+                        realm_config,
+                        &target,
+                        PlacementResolutionContext::default(),
+                        &self.config.excluded_peers,
+                    )
+                    .into_iter()
+                    .take(plan.desired_count)
+                    .filter(|node_id| *node_id == self.config.local_node_id)
+                    .collect(),
                     plan.placement,
                 ),
                 None => (
-                    1,
+                    previous.desired_holder_count,
                     Vec::new(),
                     placement_ref_for_target(
                         realm_config,
@@ -275,8 +277,13 @@ impl ReplicateDocumentsOperation {
                     ),
                 ),
             },
-            None => (1, Vec::new(), aruna_core::structs::PlacementRef::NIL),
+            None => (
+                previous.desired_holder_count,
+                Vec::new(),
+                previous.placement,
+            ),
         };
+        self.retry_needed = true;
         self.placement_action = Some(PlacementAction::Write(new_placement(
             self.config.realm_id,
             target,
@@ -389,7 +396,7 @@ impl Operation for ReplicateDocumentsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{NodePlacementEntry, PlacementStrategy, RealmNodeKind};
+    use aruna_core::structs::{NodePlacementEntry, PlacementRef, PlacementStrategy, RealmNodeKind};
     use aruna_core::task::TaskEvent;
     use std::collections::BTreeMap;
     use ulid::Ulid;
@@ -487,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn eligible_origin_is_counted_as_a_selected_holder() {
+    fn satisfied_placement_is_retained_after_successful_publication() {
         let target = metadata_target(4);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
@@ -500,10 +507,24 @@ mod tests {
 
         let effects = operation.emit_next_publish();
 
-        assert!(
-            matches!(operation.placement_action, Some(PlacementAction::Delete(ref delete_target)) if *delete_target == target)
-        );
+        let Some(PlacementAction::Write(record)) = operation.placement_action.as_ref() else {
+            panic!("expected completed placement inventory");
+        };
+        assert_eq!(record.target, target);
+        assert_eq!(record.selected_holders.len(), 3);
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
+        let [Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected completed placement write");
+        };
+        let stored = crate::sync_placement::decode_placement(value.as_ref()).unwrap();
+        assert_eq!(stored.selected_holders.len(), 3);
+        assert!(!operation.retry_needed);
     }
 
     #[test]
@@ -528,6 +549,8 @@ mod tests {
             panic!("expected pending placement write");
         };
         assert_eq!(record.origin_node_id, local_node_id);
+        assert_eq!(record.group_id, None);
+        assert_eq!(record.metadata_path, None);
         assert!(record.selected_holders.contains(&local_node_id));
         assert!(record.selected_holders.contains(&node(2)));
         assert_eq!(record.selected_holders.len(), 2);
@@ -583,6 +606,62 @@ mod tests {
         assert_eq!(outbox.peers, expected_holders);
         assert_eq!(outbox.peers.len(), 3);
         assert!(!outbox.peers.contains(&origin));
+    }
+
+    #[test]
+    fn excluded_top_ranked_holder_is_replaced_for_publish_and_inventory() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let origin = node(1);
+        let target = node_info_target(realm_id, origin);
+        let config = config_with(&[node(2), node(3), node(4)], Some(2));
+        let original =
+            plan_target_placement(&config, &target, PlacementResolutionContext::default())
+                .expect("placement plan")
+                .holders;
+        let excluded = original[0];
+        let mut expected = rank_eligible_holders_excluding(
+            &config,
+            &target,
+            PlacementResolutionContext::default(),
+            &[excluded],
+        )
+        .into_iter()
+        .take(2)
+        .collect();
+        sort_node_ids(&mut expected);
+        assert_eq!(expected.len(), 2);
+        assert!(!expected.contains(&excluded));
+        assert!(expected.iter().any(|holder| !original.contains(holder)));
+
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: origin,
+            excluded_peers: vec![excluded],
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config);
+
+        let effects = operation.emit_next_publish();
+        let Some(PlacementAction::Write(record)) = operation.placement_action.as_ref() else {
+            panic!("expected placement inventory");
+        };
+        assert_eq!(record.selected_holders, expected);
+        assert!(!record.selected_holders.contains(&excluded));
+        let outbox = node_info_outbox(effects, &target);
+        assert_eq!(outbox.peers, expected);
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
+        let [Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected placement inventory write");
+        };
+        let stored = crate::sync_placement::decode_placement(value.as_ref()).unwrap();
+        assert_eq!(stored.selected_holders, expected);
+        assert!(!stored.selected_holders.contains(&excluded));
     }
 
     #[test]
@@ -752,7 +831,14 @@ mod tests {
         });
         operation.realm_config = Some(config_with(&[local_node_id, node(2)], Some(3)));
         operation.state = ReplicateDocumentsState::Publish;
-        operation.placement_action = Some(PlacementAction::Delete(target));
+        operation.placement_action = Some(PlacementAction::Write(new_placement(
+            realm_id,
+            target,
+            local_node_id,
+            3,
+            vec![local_node_id, node(2)],
+            PlacementRef::NIL,
+        )));
 
         let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
             result: Err("publish failed".to_string()),
