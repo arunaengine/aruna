@@ -190,7 +190,12 @@ pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
         DocumentSyncTarget::MetadataCreateEvent { .. }
         | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
         | DocumentSyncTarget::MetadataGraphLifecycle { .. } => DocumentClass::Metadata,
-        _ => DocumentClass::Admin,
+        DocumentSyncTarget::RealmAuthorization { .. }
+        | DocumentSyncTarget::RealmConfig { .. }
+        | DocumentSyncTarget::NodeUsage { .. }
+        | DocumentSyncTarget::WatchInterest { .. }
+        | DocumentSyncTarget::WatchSubscription { .. }
+        | DocumentSyncTarget::NodeInfo { .. } => DocumentClass::Admin,
     }
 }
 
@@ -416,6 +421,7 @@ mod tests {
     use aruna_core::structs::{
         AffinityRule, NodePlacementEntry, RealmId, RealmNode, StrategyBinding,
     };
+    use aruna_core::types::UserId;
     use proptest::prelude::*;
     use ulid::Ulid;
 
@@ -994,33 +1000,86 @@ mod tests {
 
     #[test]
     fn document_class_maps_variants() {
-        assert_eq!(
-            document_class(&DocumentSyncTarget::Group { group_id: sid(1) }),
-            DocumentClass::Group
-        );
-        assert_eq!(
-            document_class(&DocumentSyncTarget::GroupAuthorization { group_id: sid(1) }),
-            DocumentClass::Group
-        );
-        assert_eq!(
-            document_class(&DocumentSyncTarget::MetadataRegistry {
-                group_id: sid(1),
-                document_id: sid(2),
-            }),
-            DocumentClass::MetadataRegistry
-        );
-        assert_eq!(
-            document_class(&DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: sid(2)
-            }),
-            DocumentClass::Metadata
-        );
-        assert_eq!(
-            document_class(&DocumentSyncTarget::RealmConfig {
-                realm_id: RealmId::from_bytes([1u8; 32]),
-            }),
-            DocumentClass::Admin
-        );
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let user_id = UserId::local(sid(2), realm_id);
+        let targets = [
+            (
+                DocumentSyncTarget::Group { group_id: sid(1) },
+                DocumentClass::Group,
+            ),
+            (
+                DocumentSyncTarget::GroupAuthorization { group_id: sid(1) },
+                DocumentClass::Group,
+            ),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentClass::Admin,
+            ),
+            (DocumentSyncTarget::User { user_id }, DocumentClass::User),
+            (
+                DocumentSyncTarget::MetadataRegistry {
+                    group_id: sid(1),
+                    document_id: sid(2),
+                },
+                DocumentClass::MetadataRegistry,
+            ),
+            (
+                DocumentSyncTarget::MetadataCreateEvent {
+                    document_id: sid(2),
+                    event_id: sid(3),
+                },
+                DocumentClass::Metadata,
+            ),
+            (
+                DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: sid(2),
+                },
+                DocumentClass::Metadata,
+            ),
+            (
+                DocumentSyncTarget::MetadataGraphLifecycle {
+                    graph_iri: "https://example.test/graph".to_string(),
+                },
+                DocumentClass::Metadata,
+            ),
+            (
+                DocumentSyncTarget::NodeUsage {
+                    realm_id,
+                    node_id: node_id(1),
+                    group_id: Some(sid(1)),
+                },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentSyncTarget::WatchInterest {
+                    realm_id,
+                    node_id: node_id(1),
+                },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentSyncTarget::WatchSubscription {
+                    owner: user_id,
+                    watch_id: sid(4),
+                },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentSyncTarget::NodeInfo {
+                    realm_id,
+                    node_id: node_id(1),
+                },
+                DocumentClass::Admin,
+            ),
+        ];
+
+        for (target, expected) in targets {
+            assert_eq!(document_class(&target), expected, "{target:?}");
+        }
     }
 
     proptest! {
