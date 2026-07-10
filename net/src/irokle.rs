@@ -9392,8 +9392,8 @@ mod tests {
             },
             utilization: NodeUtilization {
                 storage_bytes_used: 1,
-                documents_held: 0,
-                load_permille: 0,
+                documents_held: None,
+                load_permille: None,
                 heartbeat_at_ms: 5,
             },
             updated_at_ms: 5,

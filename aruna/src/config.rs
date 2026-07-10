@@ -75,6 +75,7 @@ pub struct Config {
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
     pub s3_host: String,
+    pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
@@ -283,10 +284,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .unwrap_or(3)
         .max(1);
     let s3_host = dotenvy::var("S3_HOST")?;
-    let s3_public_url = optional_nonempty_env("S3_PUBLIC_URL")?;
-    if let Some(url) = &s3_public_url {
-        validate_s3_public_url(url)?;
-    }
+    let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
+    let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
     let node_labels = parse_node_labels_env()?;
@@ -420,6 +419,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             relay_method,
             default_metadata_replication_factor,
             s3_host,
+            api_public_url,
             s3_public_url,
             s3_address,
             onboarding_secret,
@@ -530,12 +530,20 @@ fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
     }
 }
 
-fn validate_s3_public_url(value: &str) -> Result<(), SetupError> {
-    let url = reqwest::Url::parse(value)
-        .map_err(|error| invalid_config_value("S3_PUBLIC_URL", value, error))?;
+fn optional_public_url_env(key: &'static str) -> Result<Option<String>, SetupError> {
+    let value = optional_nonempty_env(key)?;
+    if let Some(url) = &value {
+        validate_public_url(key, url)?;
+    }
+    Ok(value)
+}
+
+fn validate_public_url(key: &'static str, value: &str) -> Result<(), SetupError> {
+    let url =
+        reqwest::Url::parse(value).map_err(|error| invalid_config_value(key, value, error))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(invalid_config_value(
-            "S3_PUBLIC_URL",
+            key,
             value,
             "expected an absolute HTTP or HTTPS URL with a host",
         ));
@@ -1291,7 +1299,7 @@ mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
         fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
-        persist_node_state, portal_config_env, validate_s3_public_url,
+        persist_node_state, portal_config_env, validate_public_url,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -1334,32 +1342,34 @@ mod tests {
     }
 
     #[test]
-    fn s3_public_url_accepts_absolute_http_and_https_urls() {
+    fn public_url_accepts_absolute_http_and_https_urls() {
         for value in [
             "http://localhost:1337",
             "https://s3.example.test/base/path/",
         ] {
-            validate_s3_public_url(value).unwrap();
+            validate_public_url("API_PUBLIC_URL", value).unwrap();
         }
     }
 
     #[test]
-    fn s3_public_url_rejects_invalid_schemes_and_hostless_values() {
-        for value in [
-            "file:///tmp/s3",
-            "mailto:admin@example.test",
-            "ftp://s3.example.test",
-            "https://",
-            "/relative/path",
-        ] {
-            let error = validate_s3_public_url(value).expect_err("invalid URL should fail");
-            assert!(matches!(
-                error,
-                super::SetupError::InvalidConfigValue {
-                    key: "S3_PUBLIC_URL",
-                    ..
-                }
-            ));
+    fn public_url_rejects_invalid_values_with_the_requested_env_key() {
+        for key in ["API_PUBLIC_URL", "S3_PUBLIC_URL"] {
+            for value in [
+                "file:///tmp/s3",
+                "mailto:admin@example.test",
+                "ftp://s3.example.test",
+                "https://",
+                "/relative/path",
+            ] {
+                let error = validate_public_url(key, value).expect_err("invalid URL should fail");
+                assert!(matches!(
+                    error,
+                    super::SetupError::InvalidConfigValue {
+                        key: error_key,
+                        ..
+                    } if error_key == key
+                ));
+            }
         }
     }
 
@@ -1555,6 +1565,8 @@ mod tests {
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("API_PUBLIC_URL", "https://api.example.test".to_string()),
+            ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             ("ARUNA_FJALL_PERSIST_MODE", "sync_all".to_string()),
             ("OIDC_PROVIDER_IDS", "main".to_string()),
@@ -1571,6 +1583,8 @@ mod tests {
             "SOCKET_ADDRESS",
             "P2P_SOCKET_ADDRESS",
             "S3_HOST",
+            "API_PUBLIC_URL",
+            "S3_PUBLIC_URL",
             "S3_ADDRESS",
             "ARUNA_FJALL_PERSIST_MODE",
             "OIDC_PROVIDER_IDS",
@@ -1598,6 +1612,14 @@ mod tests {
         assert_eq!(config.relay_method, RelayMethod::N0);
         assert_eq!(config.fjall_persist_policy, FjallPersistPolicy::SyncAll);
         assert!(matches!(config.portal, PortalConfig::Disabled));
+        assert_eq!(
+            config.api_public_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            config.s3_public_url.as_deref(),
+            Some("https://s3.example.test")
+        );
 
         restore_env(previous);
     }

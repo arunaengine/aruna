@@ -379,8 +379,8 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
         config.node_id,
         config.realm_id,
         NodeUrls {
-            api: None,
-            s3: Some(config.s3_host.clone()),
+            api: config.api_public_url.clone(),
+            s3: config.s3_public_url.clone(),
         },
     )
     .await

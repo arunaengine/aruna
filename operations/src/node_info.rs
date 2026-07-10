@@ -50,8 +50,8 @@ pub async fn seed_node_info_document(
         urls,
         utilization: NodeUtilization {
             storage_bytes_used: local_storage_bytes(ctx).await?,
-            documents_held: 0,
-            load_permille: 0,
+            documents_held: None,
+            load_permille: None,
             heartbeat_at_ms: now,
         },
         updated_at_ms: now,
@@ -374,7 +374,8 @@ mod tests {
         assert_eq!(stored.labels, expected_labels);
         assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
         assert_eq!(stored.urls.s3.as_deref(), Some("s3.example"));
-        assert_eq!(stored.utilization.documents_held, 0);
+        assert_eq!(stored.utilization.documents_held, None);
+        assert_eq!(stored.utilization.load_permille, None);
 
         let outbox = read_outbox(&ctx).await;
         let record = outbox

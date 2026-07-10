@@ -40,8 +40,8 @@ pub struct NodeUrls {
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct NodeUtilization {
     pub storage_bytes_used: u64,
-    pub documents_held: u64,
-    pub load_permille: u32,
+    pub documents_held: Option<u64>,
+    pub load_permille: Option<u32>,
     pub heartbeat_at_ms: u64,
 }
 
@@ -64,8 +64,8 @@ mod tests {
             },
             utilization: NodeUtilization {
                 storage_bytes_used: 1_024,
-                documents_held: 7,
-                load_permille: 250,
+                documents_held: Some(7),
+                load_permille: Some(250),
                 heartbeat_at_ms: 1_700_000_000_000,
             },
             updated_at_ms: 1_700_000_000_500,

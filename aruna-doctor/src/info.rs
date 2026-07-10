@@ -31,6 +31,8 @@ struct ConfigView {
     p2p_additional_relay_urls: Vec<String>,
     default_metadata_replication_factor: u32,
     s3_host: String,
+    api_public_url: Option<String>,
+    s3_public_url: Option<String>,
     s3_address: String,
     onboarding_secret_present: bool,
     oidc_providers: Vec<OidcProviderView>,
@@ -160,6 +162,8 @@ impl ConfigView {
             default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
                 .unwrap_or(3),
             s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
+            api_public_url: optional_nonempty_env("API_PUBLIC_URL"),
+            s3_public_url: optional_nonempty_env("S3_PUBLIC_URL"),
             s3_address: dotenvy::var("S3_ADDRESS").unwrap_or_default(),
             onboarding_secret_present: dotenvy::var("ONBOARDING_SECRET")
                 .ok()
@@ -192,6 +196,12 @@ where
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.parse::<T>())
         .transpose()?)
+}
+
+fn optional_nonempty_env(key: &str) -> Option<String> {
+    dotenvy::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn parse_list_env(key: &str) -> Vec<String> {
@@ -419,6 +429,26 @@ mod tests {
                 "https://relay-a.example".to_string(),
                 "https://relay-b.example".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_public_urls_without_fallbacks() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = TestEnvGuard::set(&[
+            ("API_PUBLIC_URL", "https://api.example.test".to_string()),
+            ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
+        ]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+
+        assert_eq!(
+            view.api_public_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            view.s3_public_url.as_deref(),
+            Some("https://s3.example.test")
         );
     }
 

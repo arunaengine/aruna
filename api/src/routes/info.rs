@@ -366,15 +366,19 @@ pub struct RealmNodeInfoDocumentResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmNodeUrlsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmNodeUtilizationResponse {
     pub storage_bytes_used: u64,
-    pub documents_held: u64,
-    pub load_permille: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents_held: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_permille: Option<u32>,
     pub heartbeat_at_ms: u64,
 }
 
@@ -1560,8 +1564,8 @@ mod tests {
             },
             utilization: NodeUtilization {
                 storage_bytes_used: 4_096,
-                documents_held: 0,
-                load_permille: 0,
+                documents_held: None,
+                load_permille: None,
                 heartbeat_at_ms: 1_700_000_000_000,
             },
             updated_at_ms: 1_700_000_000_500,
@@ -1595,6 +1599,32 @@ mod tests {
         assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
         assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
         assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
+        let serialized = serde_json::to_value(node_info).unwrap();
+        assert!(serialized["urls"].get("api").is_none());
+        assert!(serialized["utilization"].get("documents_held").is_none());
+        assert!(serialized["utilization"].get("load_permille").is_none());
+    }
+
+    #[test]
+    fn node_info_openapi_marks_optional_fields_as_not_required() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (schema, optional_fields) in [
+            ("RealmNodeUrlsResponse", &["api", "s3"][..]),
+            (
+                "RealmNodeUtilizationResponse",
+                &["documents_held", "load_permille"][..],
+            ),
+        ] {
+            let schema = &openapi["components"]["schemas"][schema];
+            for field in optional_fields {
+                assert!(schema["properties"].get(field).is_some());
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .is_some_and(|required| required.iter().any(|value| value == field))
+                );
+            }
+        }
     }
 
     #[tokio::test]

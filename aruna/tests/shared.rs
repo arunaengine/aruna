@@ -664,8 +664,8 @@ async fn spawn_joiner_node_with_mode(
         config.node_id,
         config.realm_id,
         NodeUrls {
-            api: None,
-            s3: Some(config.s3_host.clone()),
+            api: config.api_public_url.clone(),
+            s3: config.s3_public_url.clone(),
         },
     )
     .await
@@ -857,6 +857,14 @@ async fn load_config_with_env(
         ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
         ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
         ("S3_HOST", "127.0.0.1:0".to_string()),
+        (
+            "API_PUBLIC_URL",
+            "https://api.joiner.example.test".to_string(),
+        ),
+        (
+            "S3_PUBLIC_URL",
+            "https://s3.joiner.example.test".to_string(),
+        ),
         ("S3_ADDRESS", "127.0.0.1:0".to_string()),
         ("ONBOARDING_SECRET", onboarding_secret),
         ("ARUNA_NODE_LABELS", "fixture=joiner".to_string()),

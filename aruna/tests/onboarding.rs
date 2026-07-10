@@ -107,6 +107,16 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .expect("joiner startup should seed its node info after fetching realm config");
     assert_eq!(joiner_info.labels, selector_labels);
     assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");
+    assert_eq!(
+        joiner_info.urls.api.as_deref(),
+        Some("https://api.joiner.example.test")
+    );
+    assert_eq!(
+        joiner_info.urls.s3.as_deref(),
+        Some("https://s3.joiner.example.test")
+    );
+    assert_eq!(joiner_info.utilization.documents_held, None);
+    assert_eq!(joiner_info.utilization.load_permille, None);
 
     wait_for_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],
