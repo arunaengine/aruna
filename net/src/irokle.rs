@@ -10754,6 +10754,13 @@ mod tests {
         let group_id = Ulid::from_parts(1_631, 1);
         let group_target = DocumentSyncTarget::GroupAuthorization { group_id };
         let group_placement = admin_test_placement();
+        // Shard topics are join-only at publish; create the genesis eagerly.
+        service
+            .ensure_document_sync_topics(
+                &[group_target.sync_topic_id(realm_id, &group_placement)],
+                Vec::new(),
+            )
+            .expect("group shard topic genesis");
         let group_role_id = Ulid::from_parts(1_632, 1);
         let mut group_role = test_admin_event(
             Ulid::from_parts(1_633, 1),
