@@ -1675,8 +1675,7 @@ mod tests {
         KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig,
         NodePlacementEntry, OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy,
         QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
-        StrategyBinding,
-        UserGroupCapOverride,
+        StrategyBinding, UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;

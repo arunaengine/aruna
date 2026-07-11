@@ -27,8 +27,8 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, RealmId,
-    User, WatchSubscription, notification_inbox_key, notification_outbox_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
+    WatchSubscription, notification_inbox_key, notification_outbox_key,
     notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};

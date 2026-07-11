@@ -153,7 +153,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: created.record.document_id,
     };
-    let placement = placement_ref_for_target(&config, &target, None);
+    let placement = placement_ref_for_target(&config, &target, Default::default());
 
     // Wait until node B (the co-holder) has synced the document into its shard.
     wait_for_manifest_entry(&nodes[1], realm_id, placement, &target).await?;

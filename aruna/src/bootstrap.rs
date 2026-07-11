@@ -182,7 +182,7 @@ pub async fn fetch_core_onboarding_documents(
         let config = load_realm_config(driver_ctx, realm_id).await;
         for document in user_documents {
             let placement = match config.as_ref() {
-                Some(config) => placement_ref_for_target(config, &document, None),
+                Some(config) => placement_ref_for_target(config, &document, Default::default()),
                 None => aruna_core::structs::PlacementRef::NIL,
             };
             if placement == aruna_core::structs::PlacementRef::NIL {

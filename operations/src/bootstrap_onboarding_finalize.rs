@@ -334,7 +334,9 @@ async fn onboarding_sync_topics(
                 continue;
             }
             let placement = match config.as_ref() {
-                Some(config) => crate::placement::placement_ref_for_target(config, document, None),
+                Some(config) => {
+                    crate::placement::placement_ref_for_target(config, document, Default::default())
+                }
                 None => PlacementRef::NIL,
             };
             if placement == PlacementRef::NIL {
@@ -735,7 +737,9 @@ mod tests {
         let state = net_handle
             .document_sync_node()
             .storage()
-            .topic_state(&target.sync_topic_id())
+            .topic_state(
+                &target.sync_topic_id(fixture.realm_id, &aruna_core::structs::PlacementRef::NIL),
+            )
             .unwrap()
             .expect("issuer node-info topic admitted during finalize");
         assert!(state.members.contains(&irokle::PeerId::from_bytes(

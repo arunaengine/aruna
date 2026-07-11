@@ -141,7 +141,9 @@ fn resolve_publish_placement(
         return current;
     }
     match config {
-        Some(config) => crate::placement::placement_ref_for_target(config, target, None),
+        Some(config) => {
+            crate::placement::placement_ref_for_target(config, target, Default::default())
+        }
         None => aruna_core::structs::PlacementRef::NIL,
     }
 }

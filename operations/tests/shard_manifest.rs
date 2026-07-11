@@ -69,7 +69,7 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
     let document_id = created.record.document_id;
 
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let placement = placement_ref_for_target(&config, &target, None);
+    let placement = placement_ref_for_target(&config, &target, Default::default());
     assert_ne!(
         placement,
         PlacementRef::NIL,

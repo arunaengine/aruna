@@ -746,6 +746,7 @@ mod tests {
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([8; 16]),
             epoch: 3,
+            shard: 5,
         };
         let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_placement(
             document.topic_id(),

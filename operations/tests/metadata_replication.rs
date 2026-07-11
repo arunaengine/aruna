@@ -522,7 +522,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     let placement = aruna_operations::placement::placement_ref_for_target(
         &realm_config,
         &lifecycle_target,
-        None,
+        Default::default(),
     );
     assert_ne!(placement, aruna_core::structs::PlacementRef::NIL);
     let shard_topic_of = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);

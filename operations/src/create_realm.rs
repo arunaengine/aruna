@@ -225,9 +225,10 @@ impl CreateRealmOperation {
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let realm_auth_placement = placement_ref_for_target(config_doc, &realm_auth_target, None);
+        let realm_auth_placement =
+            placement_ref_for_target(config_doc, &realm_auth_target, Default::default());
         let realm_config_placement =
-            placement_ref_for_target(config_doc, &realm_config_target, None);
+            placement_ref_for_target(config_doc, &realm_config_target, Default::default());
         let realm_auth_record = new_outbox_record_with_id(
             realm_role_event.event_id,
             self.config.actor.node_id,

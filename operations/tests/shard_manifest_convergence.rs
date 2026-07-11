@@ -140,7 +140,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
 
 fn shard_of(config: &RealmConfigDocument, document_id: Ulid) -> u32 {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    placement_ref_for_target(config, &target, None).shard
+    placement_ref_for_target(config, &target, Default::default()).shard
 }
 
 fn document_ids_in_shard(config: &RealmConfigDocument, shard: u32, count: usize) -> Vec<Ulid> {

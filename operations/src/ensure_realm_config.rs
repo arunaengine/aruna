@@ -219,7 +219,7 @@ impl EnsureRealmConfigOperation {
             Some(&reducer_state),
         );
         let document_target = self.document_ref();
-        let placement = placement_ref_for_target(&document, &document_target, None);
+        let placement = placement_ref_for_target(&document, &document_target, Default::default());
         let mut writes = vec![
             (
                 document_target.storage_keyspace().to_string(),
