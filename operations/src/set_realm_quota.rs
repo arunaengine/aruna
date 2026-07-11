@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 
-use aruna_core::admin_document_reducer::{
-    AdminDocumentReducerError, AdminDocumentReducerState, REALM_CONFIG_QUOTA_PATH,
-};
+use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -14,7 +12,7 @@ use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, QuotaConfig, RealmConfigDocument};
+use aruna_core::structs::{Actor, QuotaConfig, RealmConfigDocument, checked_group_ceiling_bytes};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -168,7 +166,7 @@ impl SetRealmQuotaOperation {
         // than assigning the input directly) so the local write path agrees with
         // the replicated overlay in net/src/irokle.rs: when the quota path is
         // conflicted, both leave the previously stored quota in place.
-        apply_reducer_quota(&mut document, &reducer_state);
+        reducer_state.overlay_realm_config_quota(&mut document);
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_reducer_state.as_ref(),
@@ -352,24 +350,6 @@ impl Operation for SetRealmQuotaOperation {
     }
 }
 
-/// Overlays the reducer's materialized quota onto the config document, mirroring
-/// the replicated materialization in `net::irokle`: the stored quota is only
-/// updated from a non-conflicted, materialized value, so a conflicted quota path
-/// leaves the last agreed quota untouched instead of clobbering it with the
-/// caller's input.
-fn apply_reducer_quota(
-    document: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
-) {
-    if !reducer_state
-        .conflicts
-        .contains_key(REALM_CONFIG_QUOTA_PATH)
-        && let Some(quota) = reducer_state.materialized_realm_config_quota()
-    {
-        document.quota = quota;
-    }
-}
-
 fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
     if !(1..=100).contains(&quota.warn_threshold_percent) {
         return Err(SetRealmQuotaError::InvalidQuota {
@@ -394,6 +374,19 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
                     .to_string(),
         });
     }
+    // Reject any default quota whose grace ceiling overflows u64 so a stored
+    // config always resolves to an exact ceiling (saturation stays only as a
+    // defensive fallback for replicated configs that bypassed validation).
+    if let Some(default_quota) = quota.default_group_quota_bytes
+        && checked_group_ceiling_bytes(default_quota, quota.grace_factor_percent).is_none()
+    {
+        return Err(SetRealmQuotaError::InvalidQuota {
+            reason: format!(
+                "default quota ceiling overflows u64: {default_quota} bytes x {}% grace",
+                quota.grace_factor_percent
+            ),
+        });
+    }
     let mut seen_groups = BTreeSet::new();
     for over in &quota.group_overrides {
         if !seen_groups.insert(over.group_id) {
@@ -413,6 +406,19 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetRealmQuotaError> {
                 return Err(SetRealmQuotaError::InvalidQuota {
                     reason: format!(
                         "group override for group {} sets grace_factor_percent without quota_bytes; grace is incoherent on an unlimited quota",
+                        over.group_id
+                    ),
+                });
+            }
+        }
+        if let Some(override_quota) = over.quota_bytes {
+            let grace = over
+                .grace_factor_percent
+                .unwrap_or(quota.grace_factor_percent);
+            if checked_group_ceiling_bytes(override_quota, grace).is_none() {
+                return Err(SetRealmQuotaError::InvalidQuota {
+                    reason: format!(
+                        "group override for group {} ceiling overflows u64: {override_quota} bytes x {grace}% grace",
                         over.group_id
                     ),
                 });
@@ -699,6 +705,44 @@ mod tests {
         assert!(validate_quota(&QuotaConfig::default()).is_ok());
     }
 
+    #[test]
+    fn validate_quota_rejects_default_ceiling_overflow() {
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 110,
+            ..QuotaConfig::default()
+        };
+        assert!(matches!(
+            validate_quota(&quota),
+            Err(SetRealmQuotaError::InvalidQuota { .. })
+        ));
+        // grace exactly 100% keeps the ceiling equal to the quota — accepted.
+        let exact = QuotaConfig {
+            default_group_quota_bytes: Some(u64::MAX),
+            grace_factor_percent: 100,
+            ..QuotaConfig::default()
+        };
+        assert!(validate_quota(&exact).is_ok());
+    }
+
+    #[test]
+    fn validate_quota_rejects_override_ceiling_overflow() {
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            group_overrides: vec![GroupQuotaOverride {
+                group_id: Ulid::from_bytes([7; 16]),
+                quota_bytes: Some(u64::MAX),
+                grace_factor_percent: Some(150),
+            }],
+            ..QuotaConfig::default()
+        };
+        assert!(matches!(
+            validate_quota(&quota),
+            Err(SetRealmQuotaError::InvalidQuota { .. })
+        ));
+    }
+
     fn quota_conflict_state(
         realm_id: RealmId,
         quota_a: QuotaConfig,
@@ -743,7 +787,11 @@ mod tests {
             ..QuotaConfig::default()
         };
         let state = quota_conflict_state(realm_id, quota_a, quota_b);
-        assert!(state.conflicts.contains_key(REALM_CONFIG_QUOTA_PATH));
+        assert!(
+            state
+                .conflicts
+                .contains_key(aruna_core::admin_document_reducer::REALM_CONFIG_QUOTA_PATH)
+        );
         assert!(state.materialized_realm_config_quota().is_none());
 
         let original = QuotaConfig {
@@ -752,7 +800,7 @@ mod tests {
         };
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         document.quota = original.clone();
-        apply_reducer_quota(&mut document, &state);
+        state.overlay_realm_config_quota(&mut document);
         assert_eq!(
             document.quota, original,
             "conflicted quota path must not clobber the stored quota"
@@ -787,7 +835,7 @@ mod tests {
             .unwrap();
 
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        apply_reducer_quota(&mut document, &state);
+        state.overlay_realm_config_quota(&mut document);
         assert_eq!(document.quota, quota);
     }
 }
