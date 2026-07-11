@@ -66,6 +66,7 @@ compose_database_exists() {
   fi
 
   shopt -s nullglob
+  # shellcheck disable=SC2034 # loop variable only probes for a matching file
   for journal in "$COMPOSE_DATA_DIR"/*.jnl; do
     shopt -u nullglob
     return 0
@@ -95,9 +96,9 @@ strip_ansi_sequences() {
   local prefix
   local rest
 
-  while [[ "$value" == *"$esc["* ]]; do
-    prefix="${value%%"$esc["*}"
-    rest="${value#*"$esc["}"
+  while [[ "$value" == *"${esc}["* ]]; do
+    prefix="${value%%"${esc}["*}"
+    rest="${value#*"${esc}["}"
 
     if [[ "$rest" != *[[:alpha:]]* ]]; then
       break
