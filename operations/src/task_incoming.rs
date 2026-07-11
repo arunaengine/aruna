@@ -1701,6 +1701,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::PublishWatchInterest => {
                 self.publish_watch_interest().await;
             }
+            TaskKey::DrainJobQueue | TaskKey::PruneJobs => {}
         }
     }
 }

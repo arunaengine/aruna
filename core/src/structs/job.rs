@@ -300,6 +300,7 @@ pub fn validate_transition(from: JobState, to: JobState) -> Result<(), JobTransi
             | (Claimed, Running)
             | (Claimed, Queued)
             | (Claimed, Cancelled)
+            | (Claimed, Failed)
             | (Running, Succeeded)
             | (Running, Failed)
             | (Running, Cancelled)
@@ -436,6 +437,7 @@ mod tests {
             (JobState::Claimed, JobState::Running),
             (JobState::Claimed, JobState::Queued),
             (JobState::Claimed, JobState::Cancelled),
+            (JobState::Claimed, JobState::Failed),
             (JobState::Running, JobState::Succeeded),
             (JobState::Running, JobState::Failed),
             (JobState::Running, JobState::Cancelled),
@@ -454,8 +456,9 @@ mod tests {
             (JobState::Queued, JobState::Failed),
             (JobState::Queued, JobState::Queued),
             (JobState::Claimed, JobState::Succeeded),
-            (JobState::Claimed, JobState::Failed),
+            (JobState::Claimed, JobState::Claimed),
             (JobState::Running, JobState::Claimed),
+            (JobState::Running, JobState::Running),
         ];
         for (from, to) in illegal {
             assert_eq!(
