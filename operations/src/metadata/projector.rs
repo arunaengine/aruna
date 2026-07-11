@@ -507,6 +507,7 @@ pub async fn project_metadata_create_events(
 
         let outbox = if local_node_id == Some(event.node_id)
             && (!registry_exists || needs_materialization || holders_changed)
+            && !event.record.holder_node_ids.is_empty()
         {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
@@ -1358,6 +1359,69 @@ mod tests {
         assert_eq!(placement.desired_holder_count, expected.desired_count);
         assert_eq!(placement.selected_holders, expected_holders);
         assert_eq!(placement.placement, expected.placement);
+    }
+
+    #[tokio::test]
+    async fn local_projection_with_no_eligible_holders_keeps_placement_pending_without_outbox() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let event = create_event();
+        let config = realm_config(event.record.realm_id, &[]);
+        write_entries(
+            &storage,
+            vec![(
+                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*event.record.realm_id.as_bytes()),
+                ByteView::from(postcard::to_allocvec(&config).expect("config serializes")),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        project_metadata_create_event(&context, event.clone(), Some(event.node_id))
+            .await
+            .expect("projection succeeds");
+
+        let outboxes = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            outboxes,
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
+        ));
+
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let placement = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
+                key: crate::sync_placement::placement_key(event.record.realm_id, &target),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = placement
+        else {
+            panic!("expected pending placement inventory, got {placement:?}");
+        };
+        let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
+        assert_eq!(placement.desired_holder_count, 3);
+        assert!(placement.selected_holders.is_empty());
     }
 
     #[test]
