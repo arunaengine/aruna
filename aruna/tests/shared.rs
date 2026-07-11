@@ -833,6 +833,7 @@ async fn load_config_with_env(
         ("S3_HOST", "127.0.0.1:0".to_string()),
         ("S3_ADDRESS", "127.0.0.1:0".to_string()),
         ("ONBOARDING_SECRET", onboarding_secret),
+        ("ARUNA_EGRESS_ALLOW", "127.0.0.0/8,::1/128".to_string()),
     ];
 
     let _lock = env_lock().lock().await;

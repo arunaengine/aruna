@@ -93,6 +93,7 @@ pub(crate) mod test_utils {
         std::fs::create_dir_all(&blob_root).expect("blob root must be created");
 
         let storage_handle = storage::FjallStorage::open(temp_root).expect("storage must open");
+        seed_loopback_egress_config(&storage_handle).await;
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .expect("net handle must initialize");
@@ -121,6 +122,55 @@ pub(crate) mod test_utils {
                 metadata_handle: None,
                 task_handle: None,
             },
+        }
+    }
+
+    /// Seeds a realm config that allowlists loopback so staging tests can fetch
+    /// from their local reference servers (the operator flow for internal
+    /// endpoints). A node holds one realm config, which the blob handler reads.
+    pub(crate) async fn seed_loopback_egress_config(storage_handle: &storage::StorageHandle) {
+        use aruna_core::document::DocumentSyncTarget;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::structs::{
+            Actor, EgressAllowRule, EgressConfig, HostPattern, RealmConfigDocument, RealmId,
+        };
+
+        let realm_id = RealmId::from_bytes([0u8; 32]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.egress = EgressConfig {
+            allow: vec![
+                EgressAllowRule {
+                    host: HostPattern::Cidr("127.0.0.0/8".to_string()),
+                    ports: None,
+                    schemes: None,
+                    comment: None,
+                },
+                EgressAllowRule {
+                    host: HostPattern::Cidr("::1/128".to_string()),
+                    ports: None,
+                    schemes: None,
+                    comment: None,
+                },
+            ],
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[0u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([0u8; 16]), realm_id),
+            realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        match storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).expect("config serializes").into(),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("seed realm config write failed: {other:?}"),
         }
     }
 

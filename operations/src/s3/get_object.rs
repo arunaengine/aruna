@@ -1214,6 +1214,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        crate::staging::test_utils::seed_loopback_egress_config(&storage_handle).await;
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
@@ -1374,6 +1375,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        crate::staging::test_utils::seed_loopback_egress_config(&storage_handle).await;
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
