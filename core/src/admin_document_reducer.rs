@@ -75,35 +75,10 @@ pub struct AdminDocumentReducerState {
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
 }
 
-#[derive(Deserialize)]
-struct LegacyAdminDocumentReducerState {
-    target: AdminDocumentTarget,
-    clock: AdminDocumentClock,
-    applied_event_ids: BTreeSet<Ulid>,
-    user_attributes: BTreeMap<String, AdminDocumentAttributeVersion>,
-    conflicts: BTreeMap<String, AdminDocumentConflict>,
-    user_name: Option<AdminDocumentAttributeVersion>,
-    user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
-}
-
 pub fn decode_admin_document_reducer_state(
     bytes: &[u8],
 ) -> Result<AdminDocumentReducerState, postcard::Error> {
-    match postcard::from_bytes(bytes) {
-        Ok(state) => Ok(state),
-        Err(new_error) => postcard::from_bytes::<LegacyAdminDocumentReducerState>(bytes)
-            .map(|legacy| AdminDocumentReducerState {
-                target: legacy.target,
-                clock: legacy.clock,
-                applied_event_ids: legacy.applied_event_ids,
-                user_attributes: legacy.user_attributes,
-                conflicts: legacy.conflicts,
-                user_name: legacy.user_name,
-                user_subject_ids: legacy.user_subject_ids,
-                equivalent_value_dots: BTreeMap::new(),
-            })
-            .map_err(|_| new_error),
-    }
+    postcard::from_bytes(bytes)
 }
 
 /// Overlays the realm-config placement paths owned by `reducer_state` onto `config`.
@@ -1694,7 +1669,6 @@ mod tests {
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
-    use serde::Serialize;
     use std::collections::{BTreeMap, BTreeSet};
     use ulid::Ulid;
 
@@ -1776,35 +1750,6 @@ mod tests {
         AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
             realm_id: realm_id(),
         })
-    }
-
-    #[test]
-    fn reducer_state_decodes_without_equivalent_dot_frontier() {
-        #[derive(Serialize)]
-        struct LegacyReducerState {
-            target: AdminDocumentTarget,
-            clock: AdminDocumentClock,
-            applied_event_ids: BTreeSet<Ulid>,
-            user_attributes: BTreeMap<String, super::AdminDocumentAttributeVersion>,
-            conflicts: BTreeMap<String, super::AdminDocumentConflict>,
-            user_name: Option<super::AdminDocumentAttributeVersion>,
-            user_subject_ids: BTreeMap<String, super::AdminDocumentAttributeVersion>,
-        }
-
-        let state = user_state();
-        let legacy = LegacyReducerState {
-            target: state.target.clone(),
-            clock: state.clock.clone(),
-            applied_event_ids: state.applied_event_ids.clone(),
-            user_attributes: state.user_attributes.clone(),
-            conflicts: state.conflicts.clone(),
-            user_name: state.user_name.clone(),
-            user_subject_ids: state.user_subject_ids.clone(),
-        };
-        let bytes = postcard::to_allocvec(&legacy).unwrap();
-        let decoded = super::decode_admin_document_reducer_state(&bytes).unwrap();
-
-        assert_eq!(decoded, state);
     }
 
     fn event(
