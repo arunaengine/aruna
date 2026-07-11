@@ -409,11 +409,14 @@ impl RealmConfigDocument {
         self.metadata_replication.factor_for(group_id, path)
     }
 
-    pub fn effective_default_metadata_replication_factor(&self) -> u32 {
-        self.default_strategy_id
-            .and_then(|strategy_id| self.strategy(&strategy_id))
-            .and_then(|strategy| strategy.replica_count)
-            .unwrap_or(self.metadata_replication.default_replication_factor)
+    pub fn effective_default_metadata_replication_factor(&self) -> Option<u32> {
+        let strategy = match self.default_strategy_id {
+            Some(strategy_id) => self.strategy(&strategy_id),
+            None => self.strategies.first(),
+        };
+        strategy
+            .map(|strategy| strategy.replica_count)
+            .unwrap_or(Some(self.metadata_replication.default_replication_factor))
     }
 
     pub fn ensure_node(&mut self, node_id: NodeId, kind: RealmNodeKind) {
@@ -758,7 +761,10 @@ mod test {
                 .replica_count,
             Some(5)
         );
-        assert_eq!(document.effective_default_metadata_replication_factor(), 5);
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(5)
+        );
 
         document
             .strategies
@@ -766,10 +772,33 @@ mod test {
             .find(|strategy| strategy.strategy_id == default_strategy_id)
             .unwrap()
             .replica_count = Some(2);
-        assert_eq!(document.effective_default_metadata_replication_factor(), 2);
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(2)
+        );
+
+        document
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == default_strategy_id)
+            .unwrap()
+            .replica_count = None;
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            None
+        );
 
         document.default_strategy_id = None;
-        assert_eq!(document.effective_default_metadata_replication_factor(), 5);
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            None
+        );
+
+        document.strategies.clear();
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(5)
+        );
     }
 
     #[test]

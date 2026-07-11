@@ -667,7 +667,7 @@ fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_co
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmMetadataReplicationResponse {
-    pub default_replication_factor: u32,
+    pub default_replication_factor: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2057,7 +2057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_info_reports_active_default_strategy_replication() {
+    async fn realm_info_reports_finite_and_unbounded_default_strategy_replication() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let auth = admin_auth(realm_id, admin);
         let strategy_id = Ulid::from_bytes([24; 16]);
@@ -2079,8 +2079,44 @@ mod tests {
             .unwrap();
         }
 
+        let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            info.metadata_replication.default_replication_factor,
+            Some(2)
+        );
+
+        let mut unbounded = placement_strategy(strategy_id);
+        unbounded.replica_count = None;
+        let _ = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
+                strategy: unbounded,
+            })),
+        )
+        .await
+        .unwrap();
+
         let (_, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
-        assert_eq!(info.metadata_replication.default_replication_factor, 2);
+        assert_eq!(info.metadata_replication.default_replication_factor, None);
+        assert_eq!(
+            serde_json::to_value(info.metadata_replication).unwrap()["default_replication_factor"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn realm_metadata_replication_schema_allows_unbounded_default() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let factor = &openapi["components"]["schemas"]["RealmMetadataReplicationResponse"]["properties"]
+            ["default_replication_factor"];
+        assert_eq!(
+            factor["type"],
+            serde_json::json!(["integer", "null"]),
+            "default_replication_factor schema must represent finite and unbounded defaults"
+        );
     }
 
     #[tokio::test]
