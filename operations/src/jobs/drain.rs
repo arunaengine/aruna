@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_jobs_are_claimed_up_to_capacity() {
+    async fn claims_up_to_capacity() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         for seq in 1..=3u128 {
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_lease_is_requeued_with_backoff() {
+    async fn expired_lease_requeued() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let job_id = JobId::from_bytes([4u8; 16]);
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_lease_is_not_swept() {
+    async fn future_lease_kept() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let job_id = JobId::from_bytes([5u8; 16]);
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_uses_shorten_timer_semantics() {
+    async fn restore_shortens_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let due_far_out = unix_timestamp_millis() + 7_200_000;

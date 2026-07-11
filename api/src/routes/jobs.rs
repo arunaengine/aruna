@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_paginates_newest_first() {
+    async fn list_newest_first() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         for seq in 1..=3u64 {
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_job_is_not_found() {
+    async fn foreign_not_found() {
         let (_dir, state) = build_state().await;
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_terminal_is_noop() {
+    async fn cancel_terminal_noop() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         let job_id = JobId::from_bytes([4u8; 16]);
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_includes_jobs_path() {
+    fn openapi_has_jobs() {
         let openapi = crate::openapi::ApiDoc::openapi();
         assert!(openapi.paths.paths.contains_key("/jobs/"));
         assert!(openapi.paths.paths.contains_key("/jobs/{job_id}"));
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_cursor_is_bad_request() {
+    async fn invalid_cursor_rejected() {
         let (_dir, state) = build_state().await;
         let result = list_jobs(
             State(state.clone()),

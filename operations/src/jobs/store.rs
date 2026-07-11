@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_sets_lease_and_moves_index_atomically() {
+    async fn claim_moves_index() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(&storage, &queued_record(job_id)).await.unwrap();
@@ -793,8 +793,51 @@ mod tests {
         assert_eq!(parsed, job_id);
     }
 
+    // Perf budget: a claim is start + read + batch-write + batch-delete + commit.
     #[tokio::test]
-    async fn zombie_token_mismatch_is_rejected() {
+    async fn claim_transition_bounded() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([2u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+
+        let before = storage.snapshot_metrics().requests_total;
+        claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap();
+        assert_eq!(storage.snapshot_metrics().requests_total - before, 5);
+    }
+
+    // The framework is opt-in: a write to any other keyspace never touches a job one.
+    #[tokio::test]
+    async fn non_job_write_untouched() {
+        let (_dir, storage) = temp_storage();
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "unrelated".to_string(),
+                key: ByteView::from(vec![1]),
+                value: ByteView::from(vec![2]),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+        for key_space in [
+            JOB_KEYSPACE,
+            JOB_SCHEDULE_INDEX_KEYSPACE,
+            JOB_OWNER_INDEX_KEYSPACE,
+            JOB_DEDUP_INDEX_KEYSPACE,
+        ] {
+            let (values, _) = iter_prefix_page(&storage, key_space, None, None, 8, None)
+                .await
+                .unwrap();
+            assert!(values.is_empty(), "{key_space} must stay empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn zombie_rejected() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([1u8; 16]);
         insert_job(&storage, &queued_record(job_id)).await.unwrap();
@@ -826,7 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_increments_attempts_and_moves_back_to_due() {
+    async fn requeue_backs_off() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([4u8; 16]);
         insert_job(&storage, &queued_record(job_id)).await.unwrap();
@@ -853,7 +896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_past_max_attempts_fails_terminally() {
+    async fn requeue_exhausts() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([6u8; 16]);
         let mut record = queued_record(job_id);
@@ -877,7 +920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_before_claim_moves_fresh_job_to_cancelled() {
+    async fn cancel_before_claim() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([7u8; 16]);
         let mut record = queued_record(job_id);
@@ -895,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_request_on_terminal_is_noop() {
+    async fn cancel_terminal_noop() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([8u8; 16]);
         let mut record = queued_record(job_id);
@@ -913,7 +956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_transition_clears_dedup_index() {
+    async fn terminal_clears_dedup() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = queued_record(job_id);
@@ -952,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_record_is_deleted_on_read() {
+    async fn malformed_deleted() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([3u8; 16]);
         batch_write(
