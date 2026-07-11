@@ -112,6 +112,11 @@ pub enum MultipartObjectMetadataKey {
 }
 
 impl MultipartObjectMetadataKey {
+    const SUMMARY_TAG: u8 = 0;
+    const PART_TAG: u8 = 1;
+    const VERSION_LEN: usize = 16;
+    const PART_LEN: usize = 2;
+
     pub fn summary(version_id: Ulid) -> Self {
         Self::Summary { version_id }
     }
@@ -124,25 +129,49 @@ impl MultipartObjectMetadataKey {
     }
 
     pub fn part_prefix(version_id: Ulid) -> Result<Vec<u8>, ConversionError> {
-        let mut prefix = Self::Part {
-            version_id,
-            part_number: 0,
-        }
-        .to_bytes()?;
-        // part_number is postcard varint-encoded, so a zero part number occupies
-        // a single byte, not size_of::<u16>(). Strip exactly what it contributes
-        // to keep the full version_id in the prefix.
-        let part_number_len = postcard::to_allocvec(&0u16)?.len();
-        prefix.truncate(prefix.len().saturating_sub(part_number_len));
+        let mut prefix = Vec::with_capacity(1 + Self::VERSION_LEN);
+        prefix.push(Self::PART_TAG);
+        prefix.extend_from_slice(&version_id.to_bytes());
         Ok(prefix)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        Ok(match self {
+            Self::Summary { version_id } => {
+                let mut bytes = Vec::with_capacity(1 + Self::VERSION_LEN);
+                bytes.push(Self::SUMMARY_TAG);
+                bytes.extend_from_slice(&version_id.to_bytes());
+                bytes
+            }
+            Self::Part {
+                version_id,
+                part_number,
+            } => {
+                let mut bytes = Vec::with_capacity(1 + Self::VERSION_LEN + Self::PART_LEN);
+                bytes.push(Self::PART_TAG);
+                bytes.extend_from_slice(&version_id.to_bytes());
+                bytes.extend_from_slice(&part_number.to_be_bytes());
+                bytes
+            }
+        })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let (&tag, rest) = bytes
+            .split_first()
+            .ok_or_else(|| ConversionError::InvalidLength("empty multipart metadata key".into()))?;
+        match tag {
+            Self::SUMMARY_TAG if rest.len() == Self::VERSION_LEN => Ok(Self::Summary {
+                version_id: Ulid::from_bytes(rest.try_into()?),
+            }),
+            Self::PART_TAG if rest.len() == Self::VERSION_LEN + Self::PART_LEN => Ok(Self::Part {
+                version_id: Ulid::from_bytes(rest[..Self::VERSION_LEN].try_into()?),
+                part_number: u16::from_be_bytes(rest[Self::VERSION_LEN..].try_into()?),
+            }),
+            _ => Err(ConversionError::InvalidLength(
+                "malformed multipart metadata key".into(),
+            )),
+        }
     }
 }
 
@@ -190,13 +219,13 @@ mod test {
         let version_id = Ulid::new();
         let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
 
-        // The prefix must be the part key with only the zero part number stripped.
+        // The prefix must be the part key with the fixed part-number suffix stripped.
         let zero_part = MultipartObjectMetadataKey::part(version_id, 0)
             .to_bytes()
             .unwrap();
-        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 1]);
+        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 2]);
 
-        // Every part key for this version shares the prefix, across varint widths.
+        // Every part key for this version shares the prefix, across part numbers.
         for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
             let part_key = MultipartObjectMetadataKey::part(version_id, part_number)
                 .to_bytes()
@@ -218,5 +247,67 @@ mod test {
             .to_bytes()
             .unwrap();
         assert!(!other_key.starts_with(&prefix));
+    }
+
+    // Two versions differing only in the last ULID byte must not share a part scan.
+    #[test]
+    fn prefix_isolates_versions() {
+        let mut first_bytes = [7u8; 16];
+        let mut second_bytes = [7u8; 16];
+        first_bytes[15] = 0xAA;
+        second_bytes[15] = 0xAB;
+        let first = Ulid::from_bytes(first_bytes);
+        let second = Ulid::from_bytes(second_bytes);
+
+        let first_prefix = MultipartObjectMetadataKey::part_prefix(first).unwrap();
+        let second_prefix = MultipartObjectMetadataKey::part_prefix(second).unwrap();
+        assert_ne!(first_prefix, second_prefix);
+
+        let second_part = MultipartObjectMetadataKey::part(second, 1)
+            .to_bytes()
+            .unwrap();
+        assert!(!second_part.starts_with(&first_prefix));
+        let second_summary = MultipartObjectMetadataKey::summary(second)
+            .to_bytes()
+            .unwrap();
+        assert!(!second_summary.starts_with(&first_prefix));
+    }
+
+    #[test]
+    fn prefix_spans_parts() {
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
+        for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
+            let key = MultipartObjectMetadataKey::part(version_id, part_number)
+                .to_bytes()
+                .unwrap();
+            assert!(
+                key.starts_with(&prefix),
+                "part {part_number} missing prefix"
+            );
+        }
+        let summary = MultipartObjectMetadataKey::summary(version_id)
+            .to_bytes()
+            .unwrap();
+        assert!(!summary.starts_with(&prefix));
+    }
+
+    #[test]
+    fn key_round_trips() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let summary = MultipartObjectMetadataKey::summary(version_id);
+        assert_eq!(
+            MultipartObjectMetadataKey::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
+        for part_number in [0u16, 1, 65535] {
+            let part = MultipartObjectMetadataKey::part(version_id, part_number);
+            assert_eq!(
+                MultipartObjectMetadataKey::from_bytes(&part.to_bytes().unwrap()).unwrap(),
+                part
+            );
+        }
+        assert!(MultipartObjectMetadataKey::from_bytes(&[]).is_err());
+        assert!(MultipartObjectMetadataKey::from_bytes(&[9u8; 5]).is_err());
     }
 }

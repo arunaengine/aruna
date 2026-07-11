@@ -352,8 +352,8 @@ impl GetObjectAttributesOperation {
             };
             parts.push(part);
         }
-        // Part keys are varint-encoded, so iteration is not numeric order past
-        // the 127/255 boundaries; sort in memory to restore ascending order.
+        // Fixed big-endian part keys already iterate in ascending order; sort
+        // defensively to stay independent of storage iteration guarantees.
         parts.sort_by_key(|part| part.part_number);
         self.parts = parts;
 
