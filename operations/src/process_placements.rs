@@ -1,12 +1,20 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+    DocumentSyncTarget, PendingDocumentPlacement,
+};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+};
+use aruna_core::metadata::MetadataDocumentLifecycleRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
-    document_placement_write_entry, metadata_registry_write_entries,
+    document_placement_write_entry, document_sync_revision_key, document_sync_revision_write_entry,
+    metadata_document_key, metadata_document_lifecycle_revision_change,
+    metadata_document_lifecycle_write_entry, metadata_registry_write_entries,
 };
 use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
@@ -16,7 +24,9 @@ use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::metadata::repository::read_registry_by_document_effect;
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 use crate::placement::{PlacementResolutionContext, plan_target_placement};
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, new_placement_with_context, placement_prefix,
@@ -45,6 +55,7 @@ pub struct ProcessPlacementsOperation {
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
     retry_needed: bool,
+    metadata_refresh_queued: bool,
     rearmed: bool,
     output: Option<Result<(), PlacementError>>,
 }
@@ -56,7 +67,8 @@ enum PlacementState {
     ListPending,
     Publish,
     StorePlacement,
-    ReadMetadataRegistry,
+    ReadMetadataState,
+    ScheduleMetadataRefresh,
     ScheduleRetry,
     Finish,
     Error,
@@ -102,6 +114,7 @@ impl ProcessPlacementsOperation {
             next_start_after: None,
             current: None,
             retry_needed: false,
+            metadata_refresh_queued: false,
             rearmed: false,
             output: None,
         }
@@ -276,9 +289,23 @@ impl ProcessPlacementsOperation {
                 DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => *document_id,
                 _ => unreachable!("metadata holder changes only apply to lifecycle placements"),
             };
+            let target = current.planned.target.clone();
             self.current = Some(current);
-            self.state = PlacementState::ReadMetadataRegistry;
-            return smallvec![read_registry_by_document_effect(document_id, None)];
+            self.state = PlacementState::ReadMetadataState;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads: vec![
+                    (target.storage_keyspace().to_string(), target.storage_key(),),
+                    (
+                        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                        document_sync_revision_key(&target),
+                    ),
+                    (
+                        METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+                        metadata_document_key(document_id),
+                    ),
+                ],
+                txn_id: None,
+            })];
         }
         match write_placement_effect(&current.planned) {
             Ok(effect) => smallvec![effect],
@@ -288,6 +315,8 @@ impl ProcessPlacementsOperation {
 
     fn emit_metadata_placement_update(
         &mut self,
+        lifecycle: Option<aruna_core::types::Value>,
+        lifecycle_revision: Option<aruna_core::types::Value>,
         registry: Option<MetadataRegistryRecord>,
     ) -> Effects {
         let Some(current) = self.current.take() else {
@@ -311,6 +340,86 @@ impl ProcessPlacementsOperation {
                 Ok(entries) => writes.extend(entries),
                 Err(error) => return self.fail(error.into()),
             }
+
+            if let Some(lifecycle) = lifecycle {
+                let mut lifecycle: MetadataDocumentLifecycleRecord =
+                    match postcard::from_bytes(&lifecycle) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            return self.fail(PlacementError::ConversionError(error.into()));
+                        }
+                    };
+                if let MetadataDocumentLifecycleRecord::Upsert { event } = &mut lifecycle {
+                    event.record.holder_node_ids = current.planned.selected_holders.clone();
+                    let previous = match lifecycle_revision {
+                        Some(value) => match postcard::from_bytes::<DocumentSyncChange>(&value) {
+                            Ok(change) => change,
+                            Err(error) => {
+                                return self.fail(PlacementError::ConversionError(error.into()));
+                            }
+                        },
+                        None => metadata_document_lifecycle_revision_change(
+                            &lifecycle,
+                            self.config.local_node_id,
+                            current.planned.placement,
+                        ),
+                    };
+                    if previous.kind != DocumentSyncChangeKind::Delete {
+                        let refresh_id = ulid::Ulid::new();
+                        let now = aruna_core::util::unix_timestamp_millis();
+                        let change = DocumentSyncChange {
+                            base: Some(previous.current),
+                            current: DocumentSyncRevision {
+                                generation: previous.current.generation.saturating_add(1).max(now),
+                                event_id: refresh_id,
+                                actor: self.config.local_node_id,
+                                updated_at_ms: now,
+                            },
+                            kind: DocumentSyncChangeKind::Upsert,
+                            placement: current.planned.placement,
+                        };
+                        let bytes = match postcard::to_allocvec(&lifecycle) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                return self.fail(PlacementError::ConversionError(error.into()));
+                            }
+                        };
+                        match metadata_document_lifecycle_write_entry(&lifecycle) {
+                            Ok(entry) => writes.push(entry),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                        match document_sync_revision_write_entry(&current.planned.target, &change) {
+                            Ok(entry) => writes.push(entry),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                        let peers: Vec<NodeId> = current
+                            .planned
+                            .selected_holders
+                            .iter()
+                            .copied()
+                            .filter(|node_id| *node_id != self.config.local_node_id)
+                            .collect();
+                        if !peers.is_empty() {
+                            let outbox = new_outbox_record_with_id(
+                                refresh_id,
+                                self.config.local_node_id,
+                                current.planned.target.clone(),
+                                peers,
+                                DocumentSyncOutboxEvent::Upsert { bytes, change },
+                                current.planned.origin_node_id == self.config.local_node_id,
+                            );
+                            match outbox_write_entry(&outbox) {
+                                Ok(entry) => writes.push(entry),
+                                Err(error) => {
+                                    return self
+                                        .fail(PlacementError::ConversionError(error.into()));
+                                }
+                            }
+                            self.metadata_refresh_queued = true;
+                        }
+                    }
+                }
+            }
         }
         match document_placement_write_entry(&current.planned) {
             Ok(entry) => writes.push(entry),
@@ -321,6 +430,20 @@ impl ProcessPlacementsOperation {
             writes,
             txn_id: None,
         })]
+    }
+
+    fn finish_placement_store(&mut self) -> Effects {
+        if self.retry_needed {
+            self.rearmed = true;
+            self.state = PlacementState::ScheduleRetry;
+            smallvec![schedule_placement_retry_after(
+                self.config.realm_id,
+                self.config.local_node_id,
+                self.config.retry_after,
+            )]
+        } else {
+            self.emit_next_record()
+        }
     }
 }
 
@@ -395,25 +518,28 @@ impl Operation for ProcessPlacementsOperation {
                 Event::Storage(StorageEvent::WriteResult { .. })
                 | Event::Storage(StorageEvent::BatchWriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    if self.retry_needed {
-                        self.rearmed = true;
-                        self.state = PlacementState::ScheduleRetry;
-                        smallvec![schedule_placement_retry_after(
-                            self.config.realm_id,
-                            self.config.local_node_id,
-                            self.config.retry_after,
-                        )]
+                    if self.metadata_refresh_queued {
+                        self.state = PlacementState::ScheduleMetadataRefresh;
+                        smallvec![schedule_outbox_drain_effect()]
                     } else {
-                        self.emit_next_record()
+                        self.finish_placement_store()
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
-            PlacementState::ReadMetadataRegistry => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let registry = match value {
-                        Some(value) => match postcard::from_bytes(&value) {
+            PlacementState::ReadMetadataState => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    let [(_, lifecycle), (_, lifecycle_revision), (_, registry)] =
+                        values.as_slice()
+                    else {
+                        return self.unexpected_event(
+                            "metadata lifecycle, revision, and registry read results",
+                            format!("{} batch values", values.len()),
+                        );
+                    };
+                    let registry = match registry {
+                        Some(value) => match postcard::from_bytes(value) {
                             Ok(record) => Some(record),
                             Err(error) => {
                                 return self.fail(PlacementError::ConversionError(error.into()));
@@ -421,12 +547,31 @@ impl Operation for ProcessPlacementsOperation {
                         },
                         None => None,
                     };
-                    self.emit_metadata_placement_update(registry)
+                    self.emit_metadata_placement_update(
+                        lifecycle.clone(),
+                        lifecycle_revision.clone(),
+                        registry,
+                    )
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    self.unexpected_event("metadata registry read result", format!("{other:?}"))
+                    self.unexpected_event("metadata state batch read result", format!("{other:?}"))
                 }
+            },
+            PlacementState::ScheduleMetadataRefresh => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.metadata_refresh_queued = false;
+                    self.finish_placement_store()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(message = %message, "Failed to schedule metadata holder refresh; durable outbox remains retryable");
+                    self.metadata_refresh_queued = false;
+                    self.finish_placement_store()
+                }
+                other => self.unexpected_event(
+                    "metadata holder refresh schedule result",
+                    format!("{other:?}"),
+                ),
             },
             PlacementState::ScheduleRetry => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -503,18 +648,21 @@ mod tests {
         config
     }
 
-    fn finish_missing_metadata_registry_read(
+    fn finish_missing_metadata_state_read(
         operation: &mut ProcessPlacementsOperation,
         effects: Effects,
     ) -> Effects {
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == aruna_core::keyspaces::METADATA_DOCUMENT_INDEX_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads.len() == 3
         ));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(vec![1]), None),
+                (Key::from(vec![2]), None),
+                (Key::from(vec![3]), None),
+            ],
         }))
     }
 
@@ -653,7 +801,7 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
             result: Ok(()),
         }));
-        let effects = finish_missing_metadata_registry_read(&mut operation, effects);
+        let effects = finish_missing_metadata_state_read(&mut operation, effects);
         let record = placement_from_batch(&effects);
         assert_eq!(record.desired_holder_count, 2);
         assert_eq!(record.selected_holders.len(), 2);
@@ -718,8 +866,8 @@ mod tests {
         let effects = operation.step(transfer.finalize());
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == aruna_core::keyspaces::METADATA_DOCUMENT_INDEX_KEYSPACE
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+                if reads.len() == 3
         ));
 
         let registry = MetadataRegistryRecord {
@@ -740,13 +888,19 @@ mod tests {
             updated_at_ms: 1,
             last_event_id: Ulid::from_bytes([10; 16]),
         };
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: Some(
-                postcard::to_allocvec(&registry)
-                    .expect("registry serializes")
-                    .into(),
-            ),
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(vec![1]), None),
+                (Key::from(vec![2]), None),
+                (
+                    Key::from(vec![3]),
+                    Some(
+                        postcard::to_allocvec(&registry)
+                            .expect("registry serializes")
+                            .into(),
+                    ),
+                ),
+            ],
         }));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected atomic registry and placement update, got {effects:?}");
@@ -847,7 +1001,7 @@ mod tests {
         );
 
         let effects = operation.emit_placement_update(false);
-        let effects = finish_missing_metadata_registry_read(&mut operation, effects);
+        let effects = finish_missing_metadata_state_read(&mut operation, effects);
         let record = placement_from_batch(&effects);
         assert_eq!(record.desired_holder_count, 2);
         assert_eq!(record.selected_holders.len(), 2);

@@ -10,17 +10,20 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
     MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
 };
 use aruna_core::storage_entries::{
     metadata_create_event_write_entry, metadata_document_lifecycle_revision_change,
-    metadata_event_log_key,
+    metadata_event_log_key, metadata_registry_key,
 };
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+    Actor, MetadataRegistryRecord, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
@@ -34,12 +37,18 @@ use aruna_operations::create_metadata_document::{
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::projector::{
     project_metadata_create_events, replay_metadata_event_log,
 };
+use aruna_operations::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
+};
+use aruna_operations::placement::{PlacementResolutionContext, plan_target_placement};
+use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
@@ -103,6 +112,126 @@ async fn metadata_creation_replicates_to_all_three_holders()
     );
 
     wait_for_metadata_convergence(&nodes, group_id, document_id, &created.graph_iri).await?;
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_replan_refreshes_replacement_holder_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([46u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 4).await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let document_path = "datasets/replan-holder-refresh";
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+
+    let created = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            public: true,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Replan Holder Refresh".to_string(),
+                description: "Replacement holder index convergence".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    assert_eq!(
+        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
+        1
+    );
+
+    let initial_config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let placement_context = PlacementResolutionContext {
+        group_id: Some(group_id),
+        metadata_path: Some(document_path),
+    };
+    let mut initial_holders = plan_target_placement(&initial_config, &target, placement_context)
+        .expect("metadata lifecycle placement resolves")
+        .holders;
+    sort_node_ids(&mut initial_holders);
+    wait_for_persisted_holder_set(
+        &nodes,
+        &initial_holders,
+        group_id,
+        document_id,
+        &initial_holders,
+    )
+    .await?;
+
+    let obsolete = initial_holders[0];
+    let updated_config = drive(
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            mutation: RealmPlacementMutation::UpsertNode(NodePlacementEntry {
+                node_id: obsolete,
+                location: String::new(),
+                weight: 100,
+                full: false,
+                draining: true,
+                labels: Default::default(),
+            }),
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let mut final_holders = plan_target_placement(&updated_config, &target, placement_context)
+        .expect("updated metadata lifecycle placement resolves")
+        .holders;
+    sort_node_ids(&mut final_holders);
+    let replacement = final_holders
+        .iter()
+        .copied()
+        .find(|node_id| !initial_holders.contains(node_id))
+        .expect("replan selects a replacement holder");
+
+    wait_for_persisted_holder_set(
+        &nodes,
+        &final_holders,
+        group_id,
+        document_id,
+        &final_holders,
+    )
+    .await?;
+    let replacement_node = nodes
+        .iter()
+        .find(|node| node.net.node_id() == replacement)
+        .expect("replacement fixture node exists");
+    let (registry, holders) = read_persisted_holder_set(replacement_node, group_id, document_id)
+        .await?
+        .expect("replacement persisted metadata indexes");
+    assert!(same_holder_set(&registry.holder_node_ids, &final_holders));
+    assert!(same_holder_set(&holders, &final_holders));
+    assert!(!holders.contains(&obsolete));
+    let refreshed_event =
+        read_metadata_event_log_value(replacement_node, document_id, created.event_id)
+            .await?
+            .expect("replacement persisted refreshed lifecycle event");
+    let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
+    assert!(same_holder_set(
+        &refreshed_event.record.holder_node_ids,
+        &final_holders,
+    ));
+
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -623,6 +752,100 @@ async fn read_metadata_event_log_value(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(format!("unexpected event log read event: {other:?}").into()),
     }
+}
+
+async fn read_persisted_holder_set(
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::NodeId>)>, Box<dyn std::error::Error>> {
+    let key = metadata_registry_key(group_id, document_id);
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (METADATA_INDEX_KEYSPACE.to_string(), key.clone()),
+                (METADATA_HOLDERS_KEYSPACE.to_string(), key),
+            ],
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            let [(_, registry), (_, holders)] = values.as_slice() else {
+                return Err(
+                    format!("unexpected metadata index read count: {}", values.len()).into(),
+                );
+            };
+            match (registry, holders) {
+                (Some(registry), Some(holders)) => Ok(Some((
+                    postcard::from_bytes(registry)?,
+                    postcard::from_bytes(holders)?,
+                ))),
+                (None, None) => Ok(None),
+                _ => Err("metadata registry and holder indexes diverged".into()),
+            }
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected metadata index read event: {other:?}").into()),
+    }
+}
+
+async fn wait_for_persisted_holder_set(
+    nodes: &[TestNode],
+    node_ids: &[aruna_core::NodeId],
+    group_id: Ulid,
+    document_id: Ulid,
+    expected_holders: &[aruna_core::NodeId],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut last = Vec::new();
+    loop {
+        let mut converged = true;
+        last.clear();
+        for node_id in node_ids {
+            let node = nodes
+                .iter()
+                .find(|node| node.net.node_id() == *node_id)
+                .ok_or("holder fixture node missing")?;
+            match read_persisted_holder_set(node, group_id, document_id).await? {
+                Some((registry, holders))
+                    if same_holder_set(&registry.holder_node_ids, expected_holders)
+                        && same_holder_set(&holders, expected_holders) =>
+                {
+                    last.push(format!("{node_id}=converged"));
+                }
+                Some((registry, holders)) => {
+                    last.push(format!(
+                        "{node_id}=registry:{:?},holders:{holders:?}",
+                        registry.holder_node_ids
+                    ));
+                    converged = false;
+                }
+                None => {
+                    last.push(format!("{node_id}=missing"));
+                    converged = false;
+                }
+            }
+        }
+        if converged {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "metadata holder indexes did not converge to {expected_holders:?}: {last:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn same_holder_set(left: &[aruna_core::NodeId], right: &[aruna_core::NodeId]) -> bool {
+    left.len() == right.len()
+        && left.iter().copied().collect::<HashSet<_>>()
+            == right.iter().copied().collect::<HashSet<_>>()
 }
 
 async fn wait_for_realm_node_convergence(
