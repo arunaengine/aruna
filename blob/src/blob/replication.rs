@@ -225,7 +225,10 @@ impl BlobHandler {
             return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
         }
         drop(stream);
-        _ = writer.writer.close().await;
+        if let Err(err) = writer.writer.close().await {
+            let _ = operator.delete(&storage_path).await;
+            return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
+        }
         debug!("Decoded all chunks and wrote them into the backend");
 
         let hashes = writer.hasher.to_map();
