@@ -353,6 +353,7 @@ pub struct RealmPlacementStrategy {
     pub replica_count: Option<u32>,
     pub distinct_locations: bool,
     pub affinity: Vec<RealmPlacementAffinityRule>,
+    pub shard_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -480,6 +481,7 @@ impl From<&aruna_core::structs::PlacementStrategy> for RealmPlacementStrategy {
                     },
                 })
                 .collect(),
+            shard_count: strategy.shard_count,
         }
     }
 }
@@ -509,6 +511,7 @@ impl RealmPlacementStrategy {
                     },
                 })
                 .collect(),
+            shard_count: self.shard_count,
         })
     }
 }
@@ -1904,6 +1907,7 @@ mod tests {
             replica_count: Some(2),
             distinct_locations: true,
             affinity: Vec::new(),
+            shard_count: 64,
         }
     }
 
