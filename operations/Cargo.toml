@@ -26,6 +26,7 @@ futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
+lru = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }

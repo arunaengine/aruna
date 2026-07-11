@@ -82,6 +82,7 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", f
 iroh-io = "0.6.2"
 iroh-quinn = "0.16.1"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+lru = "0.18.0"
 md5 = "0.8.0"
 n0-future = "0.3.2"
 opendal = { version = "0.57", features = [

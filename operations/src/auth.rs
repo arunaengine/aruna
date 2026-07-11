@@ -8,9 +8,13 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use lru::LruCache;
 use std::array::TryFromSliceError;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 #[async_trait]
 pub trait ArunaBearerTokenValidationState: Sync {
@@ -164,4 +168,118 @@ pub fn decoding_key_from_base64_public_key(
     let public_key = VerifyingKey::from_bytes(&issuer_pubkey)?;
     let public_key_pem = public_key.to_public_key_pem(LineEnding::default())?;
     Ok(DecodingKey::from_ed_pem(public_key_pem.as_bytes())?)
+}
+
+/// Maximum number of issuer decoding keys retained in the process cache.
+pub const ISSUER_KEY_CACHE_CAPACITY: usize = 1024;
+/// Time an issuer decoding key is retained before it is refreshed.
+pub const ISSUER_KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Bounded, TTL + LRU cache of issuer decoding keys keyed by base64 public key.
+pub struct IssuerKeyCache {
+    entries: Mutex<LruCache<String, CachedIssuerKey>>,
+    ttl: Duration,
+}
+
+#[derive(Clone)]
+struct CachedIssuerKey {
+    key: DecodingKey,
+    inserted_at: Instant,
+}
+
+impl std::fmt::Debug for IssuerKeyCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuerKeyCache").finish_non_exhaustive()
+    }
+}
+
+impl Default for IssuerKeyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IssuerKeyCache {
+    pub fn new() -> Self {
+        Self::with_capacity_and_ttl(ISSUER_KEY_CACHE_CAPACITY, ISSUER_KEY_CACHE_TTL)
+    }
+
+    pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            entries: Mutex::new(LruCache::new(capacity)),
+            ttl,
+        }
+    }
+
+    pub async fn get_or_insert(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        let mut entries = self.entries.lock().await;
+        if let Some(entry) = entries.get(issuer_pubkey).cloned() {
+            if entry.inserted_at.elapsed() < self.ttl {
+                return Ok(entry.key);
+            }
+            entries.pop(issuer_pubkey);
+        }
+        let key = decoding_key_from_base64_public_key(issuer_pubkey)?;
+        entries.put(
+            issuer_pubkey.to_string(),
+            CachedIssuerKey {
+                key: key.clone(),
+                inserted_at: Instant::now(),
+            },
+        );
+        Ok(key)
+    }
+
+    pub async fn len(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.entries.lock().await.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
+
+    fn pubkey_b64(key: &SigningKey) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+    }
+
+    #[tokio::test]
+    async fn issuer_key_cache_evicts_beyond_capacity() {
+        let cache = IssuerKeyCache::with_capacity_and_ttl(2, ISSUER_KEY_CACHE_TTL);
+        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
+        for _ in 0..5 {
+            let key = SigningKey::generate(&mut rng);
+            cache.get_or_insert(&pubkey_b64(&key)).await.unwrap();
+        }
+        assert_eq!(cache.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn issuer_key_cache_refreshes_expired_entries() {
+        let cache = IssuerKeyCache::with_capacity_and_ttl(4, Duration::ZERO);
+        let key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let pubkey = pubkey_b64(&key);
+        cache.get_or_insert(&pubkey).await.unwrap();
+        assert_eq!(cache.len().await, 1);
+        // A zero TTL forces every lookup to expire and refresh instead of accumulating.
+        cache.get_or_insert(&pubkey).await.unwrap();
+        assert_eq!(cache.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn issuer_key_cache_rejects_invalid_pubkey() {
+        let cache = IssuerKeyCache::new();
+        assert!(cache.get_or_insert("not-base64!!").await.is_err());
+        assert!(cache.is_empty().await);
+    }
 }
