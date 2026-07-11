@@ -170,6 +170,8 @@ async fn build_staging_source_operator<'a>(
 /// Connector S3 clients must only ever sign with credentials from the
 /// connector config; ambient discovery (env/profile/IMDS) bypasses the
 /// hardened resolver and could reach the instance metadata service.
+// Only disables env/profile/imds; ecs/web-identity/sso/process stay closed by the
+// static-credential requirement in connectors/validation.rs (keep them in sync).
 fn pinned_s3_config(config: &HashMap<String, String>) -> HashMap<String, String> {
     let mut config = config.clone();
     config.insert("disable_config_load".to_string(), "true".to_string());
