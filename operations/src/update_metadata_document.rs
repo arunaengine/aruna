@@ -219,11 +219,12 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false);
+        let outbox = (!event.record.holder_node_ids.is_empty())
+            .then(|| create_event_outbox_record(event, self.realm_config.as_ref(), false));
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
         let writes =
-            metadata_event_projection_write_entries(event, &audit, Some(&outbox), &status, &job)?;
+            metadata_event_projection_write_entries(event, &audit, outbox.as_ref(), &status, &job)?;
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -728,6 +729,73 @@ mod tests {
             matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
         });
         assert_eq!(event.record.last_event_id, event.event_id);
+    }
+
+    #[test]
+    fn update_with_no_holders_persists_projection_without_lifecycle_outbox() {
+        let actor = actor();
+        let mut record = record(&actor);
+        record.holder_node_ids.clear();
+        let txn_id = Ulid::new();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        let effects = operation.step(realm_config_read(&record));
+        assert_start_transaction(effects.as_slice());
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected update batch write, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        for keyspace in [
+            METADATA_EVENT_LOG_KEYSPACE,
+            METADATA_INDEX_KEYSPACE,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            METADATA_AUDIT_KEYSPACE,
+            METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+        ] {
+            assert!(
+                writes
+                    .iter()
+                    .any(|(entry_keyspace, _, _)| entry_keyspace == keyspace),
+                "missing keyspace {keyspace} in update batch: {writes:?}"
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_REVISION_KEYSPACE)
+        );
+        let event = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataCreateEventRecord>(value)
+                    .expect("update event decodes")
+            })
+            .expect("event log write exists");
+        assert!(event.record.holder_node_ids.is_empty());
     }
 
     #[test]
