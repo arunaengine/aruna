@@ -38,6 +38,11 @@ CIDR rule exempts the addresses it contains.
 - **Mixed DNS answers hard-fail.** A hostname resolving to both a permitted and
   a denied address is refused unless allowlisted. Split-horizon deployments must
   allowlist the affected hosts.
+- **Pooled connections outlive DNS validation.** A keep-alive connection opened
+  while a hostname's records were permitted may be reused after the records
+  change, so a rebind is only re-checked once the pooled connection is evicted.
+  Filtering happens per resolution at connect time; it does not retroactively
+  close established connections.
 - **FTP is allowlist-only.** The control connection is pinned to one validated
   IP literal, but the PASV data channel stays server-controlled, so an FTP
   endpoint is refused unless an allowlist rule covers it.
