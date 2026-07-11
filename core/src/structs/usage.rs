@@ -129,6 +129,60 @@ impl QuotaStateRecord {
     }
 }
 
+pub const USAGE_HISTORY_GROUP_PREFIX: &[u8] = b"group/";
+pub const USAGE_HISTORY_GLOBAL_PREFIX: &[u8] = b"global/";
+
+/// One point in a group's (or the global) usage history. Carries the resolved
+/// quota, ceiling, and state so charts render limit lines and bands without
+/// replaying config. Node-local view of the converging realm sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistorySample {
+    pub at_ms: u64,
+    pub counters: UsageCounters,
+    pub quota_bytes: Option<u64>,
+    pub ceiling_bytes: Option<u64>,
+    pub state: QuotaState,
+}
+
+impl UsageHistorySample {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// True when this sample carries the same values as `other` ignoring `at_ms`,
+    /// so the sampler can skip writing an unchanged point.
+    pub fn same_reading(&self, other: &Self) -> bool {
+        self.counters == other.counters
+            && self.quota_bytes == other.quota_bytes
+            && self.ceiling_bytes == other.ceiling_bytes
+            && self.state == other.state
+    }
+}
+
+pub fn usage_history_group_prefix(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(USAGE_HISTORY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(USAGE_HISTORY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn usage_history_group_key(group_id: GroupId, at_ms: u64) -> Vec<u8> {
+    let mut key = usage_history_group_prefix(group_id);
+    key.extend_from_slice(&at_ms.to_be_bytes());
+    key
+}
+
+pub fn usage_history_global_key(at_ms: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(USAGE_HISTORY_GLOBAL_PREFIX.len() + 8);
+    key.extend_from_slice(USAGE_HISTORY_GLOBAL_PREFIX);
+    key.extend_from_slice(&at_ms.to_be_bytes());
+    key
+}
+
 pub fn usage_global_shard_index(group_id: GroupId) -> usize {
     group_id
         .to_bytes()
@@ -156,6 +210,30 @@ pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
     key.extend_from_slice(b"group/");
     key.extend_from_slice(&group_id.to_bytes());
     key
+}
+
+/// Key in USAGE_STATS_KEYSPACE holding the last reconciliation recount report.
+pub const USAGE_RECOUNT_REPORT_KEY: &[u8] = b"recount/last";
+
+/// Persisted summary of the last online reconciliation recount, for ops/doctor
+/// inspection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecountReport {
+    pub at_ms: u64,
+    pub keys_checked: u64,
+    pub keys_corrected: u64,
+    pub max_abs_drift_logical_bytes: u64,
+    pub conflict_aborted: bool,
+}
+
+impl RecountReport {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 /// Maintained usage aggregates. `stored_*` fields track physical,
