@@ -77,7 +77,7 @@ impl CreateUserAccessOperation {
 
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
-            let key_id = Ulid::new().to_string();
+            let key_id = Ulid::r#gen().to_string();
             let access_key = match UserAccess::build_access_key(&self.config.user_identity, &key_id)
             {
                 Ok(access_key) => access_key,
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
 
         // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn test_create_user_access_invalid_steps() {
         let user_identity = make_user_identity();
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         // 1. Invalid state: start twice -> second start calls abort since state is not Init
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
@@ -290,7 +290,7 @@ mod tests {
         let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
         op.start();
         // Feed a ReadResult instead of WriteResult
-        let key = Ulid::new().to_bytes().into();
+        let key = Ulid::r#gen().to_bytes().into();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key,
             value: None,

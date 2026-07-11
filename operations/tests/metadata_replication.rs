@@ -72,8 +72,8 @@ async fn metadata_creation_replicates_to_all_three_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
 
     let visible_nodes = drive(
         GetRealmNodesOperation::new(realm_id),
@@ -86,7 +86,7 @@ async fn metadata_creation_replicates_to_all_three_holders()
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -121,8 +121,8 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([46u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 4).await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let document_path = "datasets/replan-holder-refresh";
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
@@ -130,7 +130,7 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -178,7 +178,7 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -264,14 +264,14 @@ async fn metadata_updates_and_deletes_apply_to_local_holder()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -330,7 +330,7 @@ async fn metadata_updates_and_deletes_apply_to_local_holder()
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -359,7 +359,7 @@ async fn metadata_updates_and_deletes_apply_to_local_holder()
         DeleteMetadataDocumentOperation::new(
             Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 realm_id,
             },
             group_id,
@@ -381,11 +381,11 @@ async fn batched_metadata_create_projection_materializes_many_documents()
     let nodes = vec![spawn_node(realm_id).await?];
     install_realm_config(&nodes, &realm_id).await?;
     let node = &nodes[0];
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let mut events = Vec::new();
 
     for index in 0..8u8 {
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
@@ -408,9 +408,9 @@ async fn batched_metadata_create_projection_materializes_many_documents()
             last_event_id: Ulid::nil(),
         };
         events.push(MetadataCreateEventRecord {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             record,
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             node_id: node.net.node_id(),
             payload: MetadataCreateEventPayload::Scaffold {
                 name: format!("Batch Dataset {index}"),
@@ -459,10 +459,10 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([44u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let document_path = "datasets/reordered-delete";
-    let event_id = Ulid::new();
+    let event_id = Ulid::r#gen();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let record = MetadataRegistryRecord {
         realm_id,
@@ -485,7 +485,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     let create_event = MetadataCreateEventRecord {
         event_id,
         record: record.clone(),
-        user_id: UserId::local(Ulid::new(), realm_id),
+        user_id: UserId::local(Ulid::r#gen(), realm_id),
         node_id: nodes[0].net.node_id(),
         payload: MetadataCreateEventPayload::Scaffold {
             name: "Reordered Delete".to_string(),
@@ -497,7 +497,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     };
     let tombstone =
         MetadataGraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
-    let delete_event_id = Ulid::new();
+    let delete_event_id = Ulid::r#gen();
     let lifecycle = MetadataDocumentLifecycleRecord::Delete {
         event: MetadataDocumentDeleteRecord {
             event_id: delete_event_id,
@@ -533,7 +533,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     };
     publish_document_to_peer(
         &nodes[0],
-        Ulid::new(),
+        Ulid::r#gen(),
         stale_target.clone(),
         postcard::to_allocvec(&create_event)?,
         nodes[1].net.node_id(),

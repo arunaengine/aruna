@@ -609,7 +609,7 @@ mod test {
     fn seeds_reducer_state_and_admin_outbox() {
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
         let realm_admin_role = auth_doc
             .roles
@@ -837,7 +837,7 @@ mod test {
     fn seeds_default_and_everywhere_strategies_with_class_bindings() {
         let realm_id = RealmId::from_bytes([21; 32]);
         let actor = actor(realm_id, 3, 4);
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let mut operation = CreateRealmOperation::new(config(actor.clone()));
         operation.txn_id = Some(txn_id);
         operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
@@ -882,7 +882,7 @@ mod test {
     fn schedules_outbox_drain_and_finishes_without_direct_replication() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(realm_id, 6, 7);
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let mut operation = operation_ready_to_schedule(actor, txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -940,7 +940,7 @@ mod test {
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let realm_admin = UserId::local(Ulid::new(), realm_id);
+        let realm_admin = UserId::local(Ulid::r#gen(), realm_id);
 
         let realm_config = CreateRealmConfig {
             actor: Actor {

@@ -593,7 +593,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
+        let version_id = *self.version_id.get_or_insert_with(Ulid::r#gen);
         let pointer = CurrentVersionPointer::next_for(existing, version_id);
         let alias_context = match self.alias_context() {
             Ok(context) => context,
@@ -1321,14 +1321,14 @@ mod tests {
         CompleteMultipartUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
-            upload_id: Ulid::new(),
+            upload_id: Ulid::r#gen(),
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             completed_parts: vec![],
             expected_checksums: vec![],
             checksum_type: MultipartChecksumType::FullObject,
             object_size: Some(10),
-            created_by: UserId::local(Ulid::new(), realm_id),
+            created_by: UserId::local(Ulid::r#gen(), realm_id),
             quota_ceiling: Some(30),
         }
     }
@@ -1338,7 +1338,7 @@ mod tests {
             upload_id: input.upload_id,
             bucket: input.bucket.clone(),
             key: input.key.clone(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by: input.created_by,
             created_at: SystemTime::now(),
             status: MultipartUploadStatus::Completing,
@@ -1353,10 +1353,10 @@ mod tests {
                 root: "/tmp".to_string(),
                 storage_bucket: "multipart".to_string(),
                 backend_path: format!("part-{part_number}"),
-                ulid: Ulid::new(),
+                ulid: Ulid::r#gen(),
                 compressed: false,
                 encrypted: false,
-                created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+                created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([4u8; 32])),
                 created_at: SystemTime::now(),
                 staging: false,
                 partial: true,
@@ -1397,17 +1397,17 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "object".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
-            created_by: UserId::local(Ulid::new(), RealmId::from_bytes([4u8; 32])),
+            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([4u8; 32])),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,
             blob_size: 10,
             hashes: HashMap::new(),
         });
-        op.version_id = Some(Ulid::new());
+        op.version_id = Some(Ulid::r#gen());
         op.upload_parts = vec![requested.clone(), omitted.clone()];
         op.resolved_parts = vec![requested.clone()];
 
@@ -1432,7 +1432,7 @@ mod tests {
         let input = finalize_input();
         let record = open_upload_record(&input);
         let mut op = CompleteMultipartUploadOperation::new(input);
-        let finalize_txn = TxnId::new();
+        let finalize_txn = TxnId::r#gen();
         op.txn_id = Some(finalize_txn);
         op.upload_record = Some(record);
         op.state = CompleteMultipartUploadState::EnforceQuota;
@@ -1482,7 +1482,7 @@ mod tests {
     fn quota_rejection_abort_failure_preserves_original_error() {
         let input = finalize_input();
         let mut op = CompleteMultipartUploadOperation::new(input);
-        let finalize_txn = TxnId::new();
+        let finalize_txn = TxnId::r#gen();
         op.txn_id = Some(finalize_txn);
         op.state = CompleteMultipartUploadState::EnforceQuota;
 

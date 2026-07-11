@@ -231,9 +231,9 @@ fn composite_sha256(parts: &[&[u8]]) -> Vec<u8> {
 async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
@@ -509,12 +509,12 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 #[tokio::test]
 async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
     let context = setup_context().await;
-    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
+    let created_by = UserId::local(Ulid::r#gen(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "overwrite.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by,
             checksum_hint: None,
         }),
@@ -576,8 +576,8 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
-    let group_id = Ulid::new();
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
+    let group_id = Ulid::r#gen();
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
 
     let initial = drive(
@@ -761,9 +761,9 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
 async fn multipart_completion_deduplicates_against_existing_multipart_object() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let part1 = b"hello ";
     let part2 = b"world";
 
@@ -866,9 +866,9 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
 async fn multipart_completion_deduplicates_against_existing_put_object() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let content = b"hello world";
 
     let put = drive(
@@ -955,9 +955,9 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
 async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_location() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let part1 = b"hello ";
     let part2 = b"world";
 
@@ -1077,12 +1077,12 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
 #[tokio::test]
 async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
     let context = setup_context().await;
-    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
+    let created_by = UserId::local(Ulid::r#gen(), RealmId::from_bytes([7u8; 32]));
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by,
             checksum_hint: None,
         }),
@@ -1153,12 +1153,12 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
 #[tokio::test]
 async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
     let context = setup_context().await;
-    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
+    let created_by = UserId::local(Ulid::r#gen(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "checksum.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by,
             checksum_hint: None,
         }),
@@ -1219,14 +1219,14 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 async fn delete_object_removes_completed_multipart_metadata() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
 
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "delete-me.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by,
             checksum_hint: None,
         }),

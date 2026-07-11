@@ -444,7 +444,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
@@ -489,7 +489,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
@@ -595,7 +595,7 @@ mod tests {
         };
 
         let location = location_with_hash();
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let metadata = BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             SystemTime::now(),
@@ -685,7 +685,7 @@ mod tests {
             task_handle: None,
         };
 
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let cached_metadata = SourceMetadata {
             content_length: 11,
             content_type: Some("text/plain".to_string()),
@@ -707,7 +707,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::new()),
+            connector_id: Some(Ulid::r#gen()),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle

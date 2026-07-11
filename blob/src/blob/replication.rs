@@ -171,7 +171,7 @@ impl BlobHandler {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
-        let ulid = Ulid::new();
+        let ulid = Ulid::r#gen();
         location.root = self.backend_config.root.clone();
         location.storage_bucket = backend_bucket.clone();
         location.backend_path = match rebuild_backend_path(&location.backend_path, ulid) {

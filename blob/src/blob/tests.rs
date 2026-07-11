@@ -295,8 +295,8 @@ fn make_test_location() -> BackendLocation {
     BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "bucket".to_string(),
-        backend_path: format!("blob/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("blob/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -340,7 +340,7 @@ fn backend_config_exposes_custom_timeout_values() {
 
 #[test]
 fn replication_init_ack_accepts_matching_ack() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived);
 
     assert_eq!(validate_replication_init_ack(ack, replication_id), Ok(()));
@@ -348,7 +348,7 @@ fn replication_init_ack_accepts_matching_ack() {
 
 #[test]
 fn replication_init_ack_rejects_unexpected_message_type() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let message = ReplicationMessage::new(
         replication_id,
         MessageType::BaoTreeInfo {
@@ -367,8 +367,8 @@ fn replication_init_ack_rejects_unexpected_message_type() {
 
 #[test]
 fn replication_init_ack_rejects_wrong_replication_id() {
-    let replication_id = Ulid::new();
-    let wrong_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
+    let wrong_id = Ulid::r#gen();
     let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeInfoReceived);
 
     assert_eq!(
@@ -381,7 +381,7 @@ fn replication_init_ack_rejects_wrong_replication_id() {
 
 #[test]
 fn parse_replication_init_accepts_matching_bao_tree_info() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
     let message = ReplicationMessage::new(
@@ -400,8 +400,8 @@ fn parse_replication_init_accepts_matching_bao_tree_info() {
 
 #[test]
 fn parse_replication_init_rejects_wrong_replication_id() {
-    let replication_id = Ulid::new();
-    let wrong_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
+    let wrong_id = Ulid::r#gen();
     let message = ReplicationMessage::new(
         wrong_id,
         MessageType::BaoTreeInfo {
@@ -420,7 +420,7 @@ fn parse_replication_init_rejects_wrong_replication_id() {
 
 #[test]
 fn parse_replication_init_uses_message_id_when_unknown() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
     let message = ReplicationMessage::new(
@@ -608,7 +608,7 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::WritePart {
-            upload_id: Ulid::new(),
+            upload_id: Ulid::r#gen(),
             part_number: 1,
             created_by: test_user_id(),
             compressed: false,
@@ -691,7 +691,7 @@ async fn add_connection_rejects_nil_and_duplicate_ids() {
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
     let peer_id = net_b.node_id();
 
-    let explicit = Ulid::new();
+    let explicit = Ulid::r#gen();
     let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
     let id = handler
         .add_connection(Some(explicit), peer_id, stream)
@@ -726,8 +726,8 @@ async fn write_finalization_failure_emits_no_success_or_load() {
     let location = BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "finalization-bucket".to_string(),
-        backend_path: format!("obj/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("obj/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -762,7 +762,7 @@ async fn failed_write_cleans() {
         root: root.path().to_str().unwrap().to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
-        ulid: Ulid::new(),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -819,8 +819,8 @@ async fn compose_close_fails() {
     let target = BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "compose-target".to_string(),
-        backend_path: format!("obj/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("obj/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -865,7 +865,7 @@ async fn replication_close_fails() {
 
 #[test]
 fn build_backend_path_rejects_traversal_keys() {
-    let ulid = Ulid::new();
+    let ulid = Ulid::r#gen();
     assert!(build_backend_path("bucket", "nested/object.bin", ulid).is_ok());
 
     for key in ["../escape", "../../etc/passwd", "a/../../b", "/abs/path"] {
@@ -881,7 +881,7 @@ fn build_backend_path_rejects_traversal_keys() {
 
 #[test]
 fn rebuild_backend_path_rejects_sender_supplied_traversal() {
-    let ulid = Ulid::new();
+    let ulid = Ulid::r#gen();
     assert!(rebuild_backend_path("bucket/object_0000", ulid).is_ok());
 
     for path in ["../../etc/cron.d/evil_00", "../escape_00", "/abs/object_00"] {

@@ -924,7 +924,7 @@ pub async fn create_group_role(
         assigned_users.insert(UserId::nil(realm_id));
     }
 
-    let role_id = Ulid::new();
+    let role_id = Ulid::r#gen();
     let (_, auth_doc) = drive(
         AddGroupRoleOperation::new(AddGroupRoleConfig {
             auth_context: auth.clone(),

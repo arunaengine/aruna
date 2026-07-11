@@ -184,10 +184,10 @@ mod tests {
     async fn lists_documents_across_multiple_pages() {
         let temp = tempdir().unwrap();
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         for idx in 0..(crate::metadata::repository::LIST_METADATA_PAGE_SIZE + 5) {
-            let document_id = Ulid::new();
+            let document_id = Ulid::r#gen();
             let now = idx as u64;
             let record = MetadataRegistryRecord {
                 realm_id: RealmId([4u8; 32]),
@@ -240,9 +240,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId([5u8; 32]);
-        let group_id = Ulid::new();
-        let active_id = Ulid::new();
-        let deleted_id = Ulid::new();
+        let group_id = Ulid::r#gen();
+        let active_id = Ulid::r#gen();
+        let deleted_id = Ulid::r#gen();
 
         let active = metadata_record(realm_id, group_id, active_id, "docs/active");
         let deleted = metadata_record(realm_id, group_id, deleted_id, "docs/deleted");
@@ -292,9 +292,9 @@ mod tests {
     #[test]
     fn filters_deleted_documents_without_per_record_reads() {
         let realm_id = RealmId([6u8; 32]);
-        let group_id = Ulid::new();
-        let active = metadata_record(realm_id, group_id, Ulid::new(), "docs/active");
-        let deleted = metadata_record(realm_id, group_id, Ulid::new(), "docs/deleted");
+        let group_id = Ulid::r#gen();
+        let active = metadata_record(realm_id, group_id, Ulid::r#gen(), "docs/active");
+        let deleted = metadata_record(realm_id, group_id, Ulid::r#gen(), "docs/deleted");
         let lifecycle = MetadataGraphLifecycleRecord::deleted(
             deleted.graph_iri.clone(),
             realm_id,

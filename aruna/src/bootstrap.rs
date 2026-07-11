@@ -262,7 +262,7 @@ pub async fn ensure_initial_local_onboarding_secret(
     rand::rng().fill_bytes(&mut secret_bytes);
     let onboarding_secret = OnboardingSecret {
         seed_url,
-        enrollment_id: ulid::Ulid::new(),
+        enrollment_id: ulid::Ulid::r#gen(),
         secret: secret_bytes,
         mode: OnboardingMode::Local,
     };

@@ -357,7 +357,7 @@ impl PutObjectOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
+        let version_id = *self.version_id.get_or_insert_with(Ulid::r#gen);
         let pointer = CurrentVersionPointer::next_for(existing, version_id);
         let effect = match write_blob_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
@@ -879,7 +879,7 @@ mod test {
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -897,7 +897,7 @@ mod test {
         node_id: aruna_core::NodeId,
     ) -> PutObjectConfig {
         PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -918,10 +918,10 @@ mod test {
     #[test]
     fn quota_gate_error_aborts_transaction_and_deletes_written_blob() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = iroh::SecretKey::generate().public();
         let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let location = test_location(op.config.user_id);
 
         op.state = PutObjectState::EnforceQuota;
@@ -960,10 +960,10 @@ mod test {
     #[test]
     fn usage_update_error_aborts_transaction_and_deletes_written_blob() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = iroh::SecretKey::generate().public();
         let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let location = test_location(op.config.user_id);
 
         op.state = PutObjectState::UpdateUsage;
@@ -1006,10 +1006,10 @@ mod test {
     #[test]
     fn commit_transaction_conflict_deletes_written_blob_and_returns_conflict() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = iroh::SecretKey::generate().public();
         let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let location = test_location(op.config.user_id);
 
         op.state = PutObjectState::CommitTransaction;
@@ -1066,10 +1066,10 @@ mod test {
         let data = b"hello, world!";
         let stream = tokio_util::io::ReaderStream::new(&data[..]);
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = net_handle.node_id();
         let put_config = PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1263,12 +1263,12 @@ mod test {
 
         let data = b"hello, world!";
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
         let first = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -1295,7 +1295,7 @@ mod test {
 
         let second = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -1389,8 +1389,8 @@ mod test {
     fn put_object_current_pointer_generation_increments_from_existing_pointer() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let mut op = PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
-            group_id: Ulid::new(),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
+            group_id: Ulid::r#gen(),
             realm_id,
             node_id: iroh::SecretKey::generate().public(),
             request: PutObjectInput {
@@ -1405,13 +1405,13 @@ mod test {
             version_source: None,
             quota_ceiling: None,
         });
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         op.version_id = Some(version_id);
         op.output = Some(Ok(BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by: op.config.user_id,
@@ -1421,8 +1421,8 @@ mod test {
             blob_size: 1,
             hashes: HashMap::new(),
         }));
-        op.txn_id = Some(Ulid::new());
-        let existing = CurrentVersionPointer::new_with_generation(Ulid::new(), 4);
+        op.txn_id = Some(Ulid::r#gen());
+        let existing = CurrentVersionPointer::new_with_generation(Ulid::r#gen(), 4);
 
         let effects = op.handle_object_lookup_read(Event::Storage(StorageEvent::ReadResult {
             key: vec![0].into(),
@@ -1481,12 +1481,12 @@ mod test {
         };
 
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
         let first = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -1513,7 +1513,7 @@ mod test {
 
         let second = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -1666,8 +1666,8 @@ mod test {
         let data = b"hello, world!";
         let err = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
-                group_id: Ulid::new(),
+                user_id: aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+                group_id: Ulid::r#gen(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {

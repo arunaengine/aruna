@@ -767,15 +767,15 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
-            group_id: Ulid::new(),
-            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+            group_id: Ulid::r#gen(),
+            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
         });
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let location = BackendLocation {
             root: "/tmp".to_string(),
             storage_bucket: "aruna_test".to_string(),
             backend_path: "s3test/range.txt".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by: Default::default(),
@@ -806,10 +806,10 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::Suffix { length: 4 }),
-            group_id: Ulid::new(),
-            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+            group_id: Ulid::r#gen(),
+            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
         });
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Http,
             config: HashMap::new(),
@@ -876,8 +876,8 @@ mod test {
             key: "range.txt".to_string(),
             version_id: None,
             range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
-            group_id: Ulid::new(),
-            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+            group_id: Ulid::r#gen(),
+            user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
         });
         operation.source_metadata = Some(SourceMetadata {
             content_length: 10,
@@ -946,10 +946,10 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let blob_ulid = Ulid::new();
+        let blob_ulid = Ulid::r#gen();
         let location = BackendLocation {
             root: temp_root.to_string(),
-            storage_bucket: format!("aruna_{}", Ulid::new()),
+            storage_bucket: format!("aruna_{}", Ulid::r#gen()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
             ulid: blob_ulid,
             compressed: false,
@@ -984,7 +984,7 @@ mod test {
                 })
                 .await;
 
-            let version_id = Ulid::new();
+            let version_id = Ulid::r#gen();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1037,7 +1037,7 @@ mod test {
             key,
             version_id: None,
             range: None,
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             user_identity: Default::default(),
         });
 
@@ -1092,10 +1092,10 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let blob_ulid = Ulid::new();
+        let blob_ulid = Ulid::r#gen();
         let location = BackendLocation {
             root: temp_root.to_string(),
-            storage_bucket: format!("aruna_{}", Ulid::new()),
+            storage_bucket: format!("aruna_{}", Ulid::r#gen()),
             backend_path: format!("{bucket}/{key}_{blob_ulid}"),
             ulid: blob_ulid,
             compressed: false,
@@ -1129,7 +1129,7 @@ mod test {
                 })
                 .await;
 
-            let version_id = Ulid::new();
+            let version_id = Ulid::r#gen();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1181,7 +1181,7 @@ mod test {
             key,
             version_id: None,
             range: None,
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             user_identity: Default::default(),
         });
 
@@ -1243,8 +1243,8 @@ mod test {
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
-        let version_id = Ulid::new();
-        let connector_id = Ulid::new();
+        let version_id = Ulid::r#gen();
+        let connector_id = Ulid::r#gen();
         let cached_metadata = SourceMetadata {
             content_length: 15,
             content_type: Some("text/plain".to_string()),
@@ -1315,8 +1315,8 @@ mod test {
                 key,
                 version_id: None,
                 range: None,
-                group_id: Ulid::new(),
-                user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+                group_id: Ulid::r#gen(),
+                user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )
@@ -1401,7 +1401,7 @@ mod test {
             task_handle: None,
         };
 
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
@@ -1412,7 +1412,7 @@ mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::new()),
+            connector_id: Some(Ulid::r#gen()),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
@@ -1472,8 +1472,8 @@ mod test {
                 key: "refresh.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::new(),
-                user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+                group_id: Ulid::r#gen(),
+                user_identity: UserId::local(Ulid::r#gen(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )

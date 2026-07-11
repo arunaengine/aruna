@@ -257,7 +257,7 @@ impl AdminDocumentReducerState {
     ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             target: self.target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: observed.sequence_for(&actor.node_id) + 1,

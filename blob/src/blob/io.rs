@@ -71,7 +71,7 @@ impl BlobHandler {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
-        let ulid = Ulid::new();
+        let ulid = Ulid::r#gen();
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
@@ -123,7 +123,7 @@ impl BlobHandler {
             Ok(bucket) => bucket.to_string(),
             Err(err) => return BlobEvent::Error(err),
         };
-        let ulid = Ulid::new();
+        let ulid = Ulid::r#gen();
         let location = BackendLocation {
             root: self.backend_config.root.clone(),
             storage_bucket: multipart_bucket.clone(),
@@ -157,7 +157,7 @@ impl BlobHandler {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
-        let ulid = Ulid::new();
+        let ulid = Ulid::r#gen();
         let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
             Ok(path) => path,
             Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),

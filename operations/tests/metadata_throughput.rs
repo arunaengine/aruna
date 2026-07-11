@@ -72,7 +72,7 @@ fn throughput_gate() -> Result<(), BoxError> {
             let realm_id = RealmId([91u8 + level as u8; 32]);
             let nodes = build_realm_nodes(&realm_id, 3).await?;
             let targets = node_targets(&nodes);
-            let group_id = Ulid::new();
+            let group_id = Ulid::r#gen();
 
             let per_writer = TOTAL_CREATES / writers;
             let label = format!("tp{writers}");
@@ -130,7 +130,7 @@ fn convergence_gate() -> Result<(), BoxError> {
         let realm_id = RealmId([122u8; 32]);
         let nodes = build_realm_nodes(&realm_id, 3).await?;
         let targets = node_targets(&nodes);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         let writers = 64usize;
         let per_writer = 16usize;
@@ -194,7 +194,7 @@ fn production_path_convergence_gate() -> Result<(), BoxError> {
         let realm_id = RealmId([124u8; 32]);
         let nodes = build_realm_nodes(&realm_id, 3).await?;
         let targets = node_targets(&nodes);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         let writers = 32usize;
         let per_writer = 128usize;
@@ -330,7 +330,7 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
     wait_for_realm_node_convergence(&nodes, &realm_id).await?;
     install_realm_config(&nodes, &realm_id).await?;
 
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let targets0 = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let initial = run_writer(realm_id, group_id, "seed", 0, 1, targets0.clone()).await?;
     let initial_pair = vec![(initial[0].0, initial[0].1)];
@@ -445,7 +445,7 @@ async fn run_writer(
     for index in 0..count {
         let slot = (writer + index) % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let payload = if index % 2 == 0 {
             scaffold_payload(label, writer, index)
         } else {
@@ -456,7 +456,7 @@ async fn run_writer(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id: *node_id,
-                        user_id: UserId::local(Ulid::new(), realm_id),
+                        user_id: UserId::local(Ulid::r#gen(), realm_id),
                         realm_id,
                     },
                     group_id,

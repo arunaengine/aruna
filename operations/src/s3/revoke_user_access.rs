@@ -203,7 +203,7 @@ mod tests {
         let user_access = UserAccess {
             access_key: access_key.clone(),
             user_identity: Default::default(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             secret: "secret".to_string(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
             path_restrictions: None,

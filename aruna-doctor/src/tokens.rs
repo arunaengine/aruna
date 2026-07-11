@@ -106,7 +106,7 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let user_id = UserId::local(Ulid::new(), config.realm_id);
+    let user_id = UserId::local(Ulid::r#gen(), config.realm_id);
     let inspected = drive(
         InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
@@ -733,7 +733,7 @@ mod tests {
         let realm_id =
             aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
-        let bootstrap_user = UserId::local(Ulid::new(), realm_id);
+        let bootstrap_user = UserId::local(Ulid::r#gen(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
@@ -872,7 +872,7 @@ mod tests {
     fn aruna_token_fixture() -> (SigningKey, RealmId, UserId) {
         let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         (signing_key, realm_id, user_id)
     }
 
@@ -883,7 +883,7 @@ mod tests {
             iss: realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::new().to_string(),
+            jti: Ulid::r#gen().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,

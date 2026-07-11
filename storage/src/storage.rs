@@ -888,7 +888,7 @@ impl FjallStorage {
         fields(read)
     )]
     fn start_transaction(&mut self, read: bool) -> StorageEvent {
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
 
         let txn = if read {
             let txn = self.store.db.read_tx();
@@ -2593,7 +2593,7 @@ mod tests {
             .send_storage_effect(StorageEffect::Read {
                 key_space: "missing".to_string(),
                 key: b"key".to_vec().into(),
-                txn_id: Some(Ulid::new()),
+                txn_id: Some(Ulid::r#gen()),
             })
             .await;
 
@@ -2635,7 +2635,7 @@ mod tests {
 
         let event = handle
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: Ulid::new(),
+                txn_id: Ulid::r#gen(),
             }))
             .await;
 

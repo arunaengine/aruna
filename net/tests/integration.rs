@@ -414,10 +414,10 @@ fn test_topic_id_creation() {
     let topic2 = TopicId::from_bytes(&bytes).expect("topic roundtrip");
     assert_eq!(topic1, topic2);
 
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     let topic3 = TopicId::group(group_id);
     let topic4 = TopicId::group(group_id);
-    let topic5 = TopicId::group(Ulid::new());
+    let topic5 = TopicId::group(Ulid::r#gen());
 
     assert_eq!(topic3, topic4);
     assert_ne!(topic3, topic5);

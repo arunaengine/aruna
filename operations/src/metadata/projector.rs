@@ -1070,9 +1070,9 @@ mod tests {
 
     fn create_event() -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([3u8; 32]);
-        let group_id = Ulid::new();
-        let document_id = Ulid::new();
-        let event_id = Ulid::new();
+        let group_id = Ulid::r#gen();
+        let document_id = Ulid::r#gen();
+        let event_id = Ulid::r#gen();
         let document_path = "datasets/outbox-lifecycle";
         let record = MetadataRegistryRecord {
             realm_id,
@@ -1095,7 +1095,7 @@ mod tests {
         MetadataCreateEventRecord {
             event_id,
             record,
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             node_id: node(1),
             payload: MetadataCreateEventPayload::Scaffold {
                 name: "Lifecycle Outbox".to_string(),
@@ -1580,7 +1580,7 @@ mod tests {
         // An update of the same document reuses its id and path; only the event
         // identity/timestamps advance.
         let mut update = create.clone();
-        update.event_id = Ulid::new();
+        update.event_id = Ulid::r#gen();
         update.record.last_event_id = update.event_id;
         update.record.updated_at_ms = create.record.updated_at_ms + 1;
         update.occurred_at_ms = create.occurred_at_ms + 1;
@@ -1601,12 +1601,12 @@ mod tests {
 
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         MetadataCreateEventRecord {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             record: MetadataRegistryRecord {
                 realm_id,
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 document_id,
                 document_path: "datasets/skew".to_string(),
                 graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
@@ -1615,7 +1615,7 @@ mod tests {
                 holder_node_ids: Vec::new(),
                 created_at_ms: updated_at_ms,
                 updated_at_ms,
-                last_event_id: Ulid::new(),
+                last_event_id: Ulid::r#gen(),
             },
             user_id: UserId::nil(realm_id),
             node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),

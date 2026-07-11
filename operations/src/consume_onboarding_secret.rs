@@ -388,7 +388,7 @@ mod tests {
             task_handle: None,
         };
 
-        let enrollment_id = Ulid::new();
+        let enrollment_id = Ulid::r#gen();
         let record = OnboardingSecretRecord {
             enrollment_id,
             secret_hash: "abc".to_string(),

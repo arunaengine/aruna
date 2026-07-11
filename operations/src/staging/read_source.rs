@@ -373,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn read_operation_resolves_connector_and_hits_runtime() {
         let test_context = setup_driver_context().await;
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let connector =
             create_http_connector(&test_context.driver_context, group_id, "http://127.0.0.1:1")
                 .await;

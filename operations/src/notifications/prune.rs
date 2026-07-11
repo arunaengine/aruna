@@ -411,7 +411,7 @@ mod tests {
             recipient,
             class,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 actor_user_id: user(1, 200),
             },
             created_at_ms,

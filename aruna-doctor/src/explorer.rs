@@ -1660,11 +1660,11 @@ mod tests {
     #[test]
     fn decodes_typed_group_entries() {
         let temp = tempdir().unwrap();
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let realm_id = RealmId::from_bytes([7_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
         };
         let group = Group {
@@ -1672,7 +1672,7 @@ mod tests {
             group_id,
             realm_id,
             roles: Default::default(),
-            owner: aruna_core::UserId::local(Ulid::new(), realm_id),
+            owner: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
         };
 
         {
@@ -1737,7 +1737,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
         };
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1768,7 +1768,7 @@ mod tests {
     #[test]
     fn decodes_onboarding_secret_record_value() {
         let record = OnboardingSecretRecord {
-            enrollment_id: Ulid::new(),
+            enrollment_id: Ulid::r#gen(),
             secret_hash: "hash123".to_string(),
             mode: OnboardingMode::Server,
             expires_at: 1234,
@@ -1911,7 +1911,7 @@ mod tests {
     #[test]
     fn decodes_multipart_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         let upload = MultipartUpload {
             upload_id: Ulid::from_bytes([7_u8; 16]),
             bucket: "bucket-a".to_string(),
@@ -1943,7 +1943,7 @@ mod tests {
     #[test]
     fn decodes_multipart_upload_part_entry() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         let key = MultipartUploadPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
         let part = MultipartUploadPart {
             part_number: 5,
@@ -2234,7 +2234,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
-        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let created_by = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
         let head_value = aruna_core::structs::CurrentVersionPointer::new_with_generation(
             Ulid::from_bytes([4_u8; 16]),

@@ -4462,7 +4462,7 @@ mod tests {
     async fn remote_metadata_auth_preserves_path_restrictions() {
         let (realm_signing_key, realm_id, user_id) = realm_fixture();
         let restrictions = vec![PathRestriction {
-            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::new()),
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::r#gen()),
             permission: Permission::READ,
         }];
         let mut claims = token_claims(realm_id, user_id);
@@ -4598,7 +4598,7 @@ mod tests {
     fn realm_fixture() -> (SigningKey, RealmId, UserId) {
         let signing_key = signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         (signing_key, realm_id, user_id)
     }
 
@@ -4618,7 +4618,7 @@ mod tests {
             iss: realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::new().to_string(),
+            jti: Ulid::r#gen().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -4636,10 +4636,10 @@ mod tests {
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         MetadataRegistryRecord {
             realm_id: RealmId([7u8; 32]),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             document_id,
             document_path: document_path.to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
@@ -4707,8 +4707,8 @@ mod tests {
 
     #[test]
     fn group_snapshots_are_scoped_and_invalidate_per_group() {
-        let group_a = Ulid::new();
-        let group_b = Ulid::new();
+        let group_a = Ulid::r#gen();
+        let group_b = Ulid::r#gen();
         let mut record_a = registry_record("datasets/a");
         record_a.group_id = group_a;
         let mut record_b = registry_record("datasets/b");
@@ -4847,8 +4847,8 @@ mod tests {
 
     #[test]
     fn rejected_cold_group_fill_filters_fresh_records_for_requested_group() {
-        let group_a = Ulid::new();
-        let group_b = Ulid::new();
+        let group_a = Ulid::r#gen();
+        let group_b = Ulid::r#gen();
         let mut record_a = registry_record("datasets/a");
         record_a.group_id = group_a;
         let mut record_b = registry_record("datasets/b");
@@ -4896,7 +4896,7 @@ mod tests {
         assert!(
             registry_record_for_graph(
                 &records,
-                &MetadataRegistryRecord::graph_iri_for(Ulid::new())
+                &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
             )
             .is_none()
         );
@@ -4931,9 +4931,10 @@ mod tests {
         assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
         assert!(!anonymous.graph_visible(&cache, &private_record.graph_iri));
         assert!(!anonymous.graph_visible(&cache, &deleted_record.graph_iri));
-        assert!(
-            !anonymous.graph_visible(&cache, &MetadataRegistryRecord::graph_iri_for(Ulid::new()))
-        );
+        assert!(!anonymous.graph_visible(
+            &cache,
+            &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
+        ));
 
         let member = GraphVisibilityScope {
             records: Arc::new(records.clone()),

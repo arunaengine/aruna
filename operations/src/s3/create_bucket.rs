@@ -266,7 +266,7 @@ mod test {
         };
 
         let bucket_info = BucketInfo {
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             cors_configuration: None,

@@ -439,7 +439,7 @@ fn watch_upsert_replication(
     local_node_id: aruna_core::NodeId,
     subscription: &WatchSubscription,
 ) -> Result<WatchReplication, WatchSubscriptionError> {
-    let outbox_id = Ulid::new();
+    let outbox_id = Ulid::r#gen();
     let revision = DocumentSyncChange {
         base: None,
         current: DocumentSyncRevision {
@@ -474,7 +474,7 @@ fn watch_delete_replication(
     watch_id: Ulid,
     now_ms: u64,
 ) -> WatchReplication {
-    let outbox_id = Ulid::new();
+    let outbox_id = Ulid::r#gen();
     let revision = DocumentSyncChange {
         base: None,
         current: DocumentSyncRevision {
@@ -754,7 +754,7 @@ mod tests {
         delete_watch_subscription(&storage, owner, created.watch_id)
             .await
             .expect("deleting a missing row is ok");
-        delete_watch_subscription(&storage, owner, Ulid::new())
+        delete_watch_subscription(&storage, owner, Ulid::r#gen())
             .await
             .expect("deleting an unknown id is ok");
 

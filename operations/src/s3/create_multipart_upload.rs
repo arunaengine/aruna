@@ -95,7 +95,7 @@ impl CreateMultipartUploadOperation {
         };
 
         let record = MultipartUpload {
-            upload_id: Ulid::new(),
+            upload_id: Ulid::r#gen(),
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             group_id: self.input.group_id,

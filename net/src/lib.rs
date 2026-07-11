@@ -565,7 +565,7 @@ impl NetHandle {
             .document_sync_storage_path
             .clone()
             .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::new()))
+                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::r#gen()))
             });
         let document_sync = Arc::new(DocumentSyncService::open_with_persist_policy(
             endpoint.clone(),

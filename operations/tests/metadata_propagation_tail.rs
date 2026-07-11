@@ -82,7 +82,7 @@ fn propagation_tail_under_sustained_load() -> Result<(), BoxError> {
         let nodes = build_realm_nodes(&realm_id, 3).await?;
         let targets = node_targets(&nodes);
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let sampler = tokio::spawn(run_sampler(
@@ -201,14 +201,14 @@ async fn run_sampler(
         }
         let slot = index % targets.len();
         let (node_id, context) = targets[slot].clone();
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let t0 = Instant::now();
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id,
-                        user_id: UserId::local(Ulid::new(), realm_id),
+                        user_id: UserId::local(Ulid::r#gen(), realm_id),
                         realm_id,
                     },
                     group_id,
@@ -339,7 +339,7 @@ async fn run_paced_writer(
         ticker.tick().await;
         let slot = (writer + index) % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let payload = if index % 2 == 0 {
             scaffold_payload(label, writer, index)
         } else {
@@ -350,7 +350,7 @@ async fn run_paced_writer(
                 CreateMetadataDocumentConfig {
                     actor: Actor {
                         node_id: *node_id,
-                        user_id: UserId::local(Ulid::new(), realm_id),
+                        user_id: UserId::local(Ulid::r#gen(), realm_id),
                         realm_id,
                     },
                     group_id,

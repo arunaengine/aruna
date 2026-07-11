@@ -35,7 +35,7 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
 
     let creator = Actor {
         node_id: nodes[0].net.node_id(),
-        user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+        user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
         realm_id,
     };
 

@@ -360,7 +360,7 @@ impl ProcessPlacementsOperation {
                         ),
                     };
                     if previous.kind != DocumentSyncChangeKind::Delete {
-                        let refresh_id = ulid::Ulid::new();
+                        let refresh_id = ulid::Ulid::r#gen();
                         let now = aruna_core::util::unix_timestamp_millis();
                         let change = DocumentSyncChange {
                             base: Some(previous.current),
@@ -1189,7 +1189,7 @@ mod tests {
         let record = aruna_core::metadata::MetadataGraphLifecycleRecord::deleted(
             "urn:graph:placement-test".to_string(),
             RealmId::from_bytes([8u8; 32]),
-            aruna_core::types::GroupId::new(),
+            aruna_core::types::GroupId::r#gen(),
             Ulid::from_bytes([9u8; 16]),
             42,
         );

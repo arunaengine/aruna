@@ -665,7 +665,7 @@ fn apply_admin_reducer_operation(
 ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
-        event_id: Ulid::new(),
+        event_id: Ulid::r#gen(),
         target: state.target.clone(),
         origin_node_id: actor.node_id,
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -854,7 +854,7 @@ pub mod test {
 
         let effects = operation
             .emit_write_auth_doc_and_admin_state(
-                TxnId::new(),
+                TxnId::r#gen(),
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 None,
             )
@@ -953,7 +953,7 @@ pub mod test {
         operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
         ));
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
@@ -1138,7 +1138,7 @@ pub mod test {
         };
 
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_config = CreateRealmConfig {
             actor: Actor {
@@ -1182,7 +1182,7 @@ pub mod test {
                 realm_id,
             },
             realm_id,
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             role_ids: admin_role,
         };
 

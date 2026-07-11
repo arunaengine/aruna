@@ -106,7 +106,7 @@ mod tests {
         VersionReplicationManifest {
             bucket: "bucket".to_string(),
             key: "path/file.txt".to_string(),
-            version_id: Ulid::new(),
+            version_id: Ulid::r#gen(),
             kind: ReplicationItemKind::DeleteMarker,
             created_at: SystemTime::now(),
             created_by: test_user_id(),

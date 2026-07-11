@@ -19,7 +19,7 @@ pub const NOTIFICATION_OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
 pub fn new_notification_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
     NotificationOutboxRecord {
-        outbox_id: Ulid::new(),
+        outbox_id: Ulid::r#gen(),
         record,
     }
 }
@@ -231,7 +231,7 @@ mod tests {
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 actor_user_id: UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
             },
             1_000,

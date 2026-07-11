@@ -190,7 +190,7 @@ impl BlobHandler {
 
 pub(super) fn generate_bucket_name(prefix: Option<&str>) -> String {
     let prefix = prefix.unwrap_or("aruna-");
-    format!("{}{}", prefix, Ulid::new().to_string().to_lowercase())
+    format!("{}{}", prefix, Ulid::r#gen().to_string().to_lowercase())
 }
 
 pub(super) fn build_backend_path(

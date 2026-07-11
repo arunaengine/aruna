@@ -945,7 +945,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
         let error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
             .await
             .expect_err("unknown peer must be rejected");
@@ -974,8 +974,8 @@ mod tests {
         .await;
 
         let records = vec![
-            record(UserId::new(Ulid::new(), realm_id), 1),
-            record(UserId::new(Ulid::new(), other_realm), 2),
+            record(UserId::new(Ulid::r#gen(), realm_id), 1),
+            record(UserId::new(Ulid::r#gen(), other_realm), 2),
         ];
         let error = deliver_remote(&a.net, b.net.node_id(), records)
             .await
@@ -1165,7 +1165,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
         let deliver_error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
             .await
             .expect_err("user-kind peer must be rejected");
@@ -1301,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_mark_read_rejects_too_many_ids() {
         let (a, b, recipient) = delivery_pair(75).await;
-        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::new()).collect();
+        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::r#gen()).collect();
 
         let error = mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
             .await
@@ -1329,7 +1329,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
         let error = list_remote(&c.net, b.net.node_id(), recipient, None, 10)
             .await
             .expect_err("unknown peer must be rejected on the read path");
@@ -1403,7 +1403,7 @@ mod tests {
         )
         .await;
 
-        let recipient = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
         let sample = record(recipient, 1);
         let per_record = postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
             records: vec![sample.clone(), sample.clone()],
@@ -1510,7 +1510,7 @@ mod tests {
             "unexpected reject reason: {list_error}"
         );
 
-        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::new())
+        let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::r#gen())
             .await
             .expect_err("delete on non-holder must be rejected");
         assert!(
@@ -1547,11 +1547,11 @@ mod tests {
     #[test]
     fn inbound_metadata_watch_path_accepts_normalized_nested_document_path() {
         let realm_id = RealmId::from_bytes([79u8; 32]);
-        let actor = UserId::new(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
-        let document_id = Ulid::new();
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
+        let document_id = Ulid::r#gen();
         let mut event = WatchEvent {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             realm_id,
             kind: WatchEventKind::MetadataCreated,
             path: format!("meta/{group_id}/datasets/project/runs/run-42"),
@@ -1571,7 +1571,7 @@ mod tests {
             Err("watch event metadata path is not canonical".to_string())
         );
 
-        event.path = format!("meta/{}/datasets/project", Ulid::new());
+        event.path = format!("meta/{}/datasets/project", Ulid::r#gen());
         assert_eq!(
             validate_inbound_watch_event(&event, realm_id, 1_000),
             Err("watch event metadata path does not match detail".to_string())
@@ -1581,7 +1581,7 @@ mod tests {
     #[test]
     fn inbound_data_watch_path_requires_matching_group_and_node_identity() {
         let realm_id = RealmId::from_bytes([78u8; 32]);
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
 
         assert!(
@@ -1617,7 +1617,7 @@ mod tests {
         .await;
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         install_watch_authorization(&b, realm_id, owner, &[]).await;
         create_watch_subscription(
             &b.context.storage_handle,
@@ -1712,7 +1712,7 @@ mod tests {
         )
         .await;
 
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         let written = deliver_watch_events_remote(
             &a.net,
             b.net.node_id(),
@@ -1766,7 +1766,7 @@ mod tests {
         .await
         .expect("holder subscription");
 
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         let mut event = upload_event(realm_id, actor, "bucket/object");
         event.kind = WatchEventKind::MetadataCreated;
         let error = deliver_watch_events_remote(&a.net, b.net.node_id(), vec![event])
@@ -1795,7 +1795,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::new(), realm_id);
+        let owner = UserId::new(Ulid::r#gen(), realm_id);
         create_watch_subscription(
             &b.context.storage_handle,
             owner,
@@ -1806,7 +1806,7 @@ mod tests {
         .await
         .expect("holder subscription");
 
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         let error = deliver_watch_events_remote(
             &c.net,
             b.net.node_id(),
@@ -1850,7 +1850,7 @@ mod tests {
             "unexpected response: {empty:?}"
         );
 
-        let actor = UserId::new(Ulid::new(), realm_id);
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
         let mixed = deliver_watch_events_remote(
             &a.net,
             b.net.node_id(),
@@ -1883,7 +1883,7 @@ mod tests {
         )
         .await;
 
-        let owner = UserId::new(Ulid::new(), realm_id);
+        let owner = UserId::new(Ulid::r#gen(), realm_id);
         let error = create_watch_remote(
             &c.net,
             b.net.node_id(),

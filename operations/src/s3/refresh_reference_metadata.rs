@@ -887,8 +887,8 @@ mod tests {
             },
             bucket: "bucket".to_string(),
             key: "key".to_string(),
-            version_id: Ulid::new(),
-            created_by: UserId::local(Ulid::new(), realm_id),
+            version_id: Ulid::r#gen(),
+            created_by: UserId::local(Ulid::r#gen(), realm_id),
         }
     }
 

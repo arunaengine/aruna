@@ -303,9 +303,9 @@ impl BlobHandler {
                 stream_id
             }
             None => {
-                let mut candidate = Ulid::new();
+                let mut candidate = Ulid::r#gen();
                 while candidate.is_nil() || connections.contains_key(&candidate) {
-                    candidate = Ulid::new();
+                    candidate = Ulid::r#gen();
                 }
                 candidate
             }

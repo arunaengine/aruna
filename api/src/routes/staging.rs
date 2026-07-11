@@ -498,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn staging_queue_failure_after_snapshot_commit_leaves_obligation_repairable() {
         let test = setup_state().await;
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         write_doc(
             &test.state.get_ctx(),
             S3_BUCKET_REPLICATION_KEYSPACE,
@@ -583,8 +583,8 @@ mod tests {
         let realm_id =
             aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
-        let user_with_source_read = UserId::local(Ulid::new(), realm_id);
-        let user_without_source_read = UserId::local(Ulid::new(), realm_id);
+        let user_with_source_read = UserId::local(Ulid::r#gen(), realm_id);
+        let user_without_source_read = UserId::local(Ulid::r#gen(), realm_id);
         let actor = Actor {
             node_id,
             user_id: user_with_source_read,
@@ -598,8 +598,8 @@ mod tests {
             task_handle: None,
         });
 
-        let bucket_group_id = Ulid::new();
-        let source_group_id = Ulid::new();
+        let bucket_group_id = Ulid::r#gen();
+        let source_group_id = Ulid::r#gen();
         let mut bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
             user_with_source_read,
             realm_id,
@@ -680,7 +680,7 @@ mod tests {
 
         let bucket = "stage-bucket".to_string();
         let key = "test.txt".to_string();
-        let connector_id = Ulid::new();
+        let connector_id = Ulid::r#gen();
         let source_path = "folder/file.txt".to_string();
         let bucket_info = BucketInfo {
             group_id: bucket_group_id,

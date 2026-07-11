@@ -381,7 +381,7 @@ mod tests {
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let local_node_id = iroh::SecretKey::from_bytes(&LOCAL_NODE_SECRET).public();
         let joiner_node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
 
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
@@ -401,7 +401,7 @@ mod tests {
         .await
         .unwrap();
 
-        let enrollment_id = Ulid::new();
+        let enrollment_id = Ulid::r#gen();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {

@@ -215,7 +215,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -259,7 +259,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-opentelemetry",
- "ulid",
+ "ulid 2.0.1",
  "url",
  "utoipa",
  "utoipa-swagger-ui",
@@ -293,7 +293,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -320,7 +320,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -359,7 +359,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -392,7 +392,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -437,7 +437,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -453,7 +453,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "ulid",
+ "ulid 2.0.1",
 ]
 
 [[package]]
@@ -8103,7 +8103,16 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
- "rand 0.9.5",
+ "web-time",
+]
+
+[[package]]
+name = "ulid"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39493d572b98fe1d142e132e7a726c50c68121bce84429216a5ec20e1ad7fec5"
+dependencies = [
+ "rand 0.10.2",
  "serde",
  "web-time",
 ]
@@ -8234,7 +8243,7 @@ dependencies = [
  "quote",
  "regex",
  "syn 2.0.118",
- "ulid",
+ "ulid 1.2.1",
  "url",
 ]
 
