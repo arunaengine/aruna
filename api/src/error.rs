@@ -39,6 +39,11 @@ pub enum ServerError {
     BadGateway,
     #[error("Service unavailable")]
     ServiceUnavailable,
+    #[error("{message}")]
+    EgressDenied {
+        message: String,
+        details: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -174,7 +179,14 @@ impl IntoResponse for ServerError {
         let code = self.error_code();
         let message = self.public_message();
 
-        let body = ErrorResponse::new(&message).with_code(code);
+        let mut body = ErrorResponse::new(&message).with_code(code);
+        if let ServerError::EgressDenied {
+            details: Some(details),
+            ..
+        } = &self
+        {
+            body = body.with_details(details.clone());
+        }
 
         let mut response = (status, Json(body)).into_response();
         if matches!(self, ServerError::ServiceUnavailable) {
@@ -199,6 +211,7 @@ impl ServerError {
             ServerError::BadRequest | ServerError::BadRequestReason(_) => StatusCode::BAD_REQUEST,
             ServerError::BadGateway => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::EgressDenied { .. } => StatusCode::FORBIDDEN,
         }
     }
 
@@ -213,6 +226,7 @@ impl ServerError {
             ServerError::BadRequest | ServerError::BadRequestReason(_) => "Bad request".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),
             ServerError::ServiceUnavailable => "Service unavailable".to_string(),
+            ServerError::EgressDenied { .. } => "egress_denied".to_string(),
         }
     }
 

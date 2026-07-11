@@ -220,6 +220,9 @@ impl IntoS3Error for GetObjectError {
                 StagingSourceError::NotFound => {
                     s3_error!(NoSuchKey, "The referenced source object does not exist.")
                 }
+                err @ StagingSourceError::EgressDenied { .. } => {
+                    s3_error!(AccessDenied, "{}", err)
+                }
                 err => s3_error!(ServiceUnavailable, "{}", err),
             },
             err => internal_error(err),

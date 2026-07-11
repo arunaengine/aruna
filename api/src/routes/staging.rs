@@ -370,7 +370,32 @@ fn map_connector_resolution_error(error: SourceConnectorResolutionError) -> Serv
 fn map_staging_source_error(error: StagingSourceError) -> ServerError {
     match error {
         StagingSourceError::NotFound => ServerError::NotFound,
+        StagingSourceError::EgressDenied {
+            host,
+            port,
+            scheme,
+            reason,
+        } => egress_denied_server_error(host, port, scheme, reason),
         _ => ServerError::BadGateway,
+    }
+}
+
+fn egress_denied_server_error(
+    host: Option<String>,
+    port: Option<u16>,
+    scheme: Option<String>,
+    reason: String,
+) -> ServerError {
+    let details = serde_json::json!({
+        "host": host,
+        "port": port,
+        "scheme": scheme,
+        "reason": reason,
+    })
+    .to_string();
+    ServerError::EgressDenied {
+        message: reason,
+        details: Some(details),
     }
 }
 
