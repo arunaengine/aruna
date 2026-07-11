@@ -2056,6 +2056,7 @@ async fn apply_recount_corrections(
 
     let mut writes: Vec<(String, Key, Value)> = Vec::new();
     let mut dirty_groups: BTreeSet<GroupId> = BTreeSet::new();
+    let mut global_dirty = false;
     let mut corrected = 0u64;
     for ((key, expected, pre_observed), (_, current_value)) in drifted.iter().zip(current) {
         let current_counters = match current_value {
@@ -2077,6 +2078,8 @@ async fn apply_recount_corrections(
             && let Ok(bytes) = <[u8; 16]>::try_from(rest)
         {
             dirty_groups.insert(GroupId::from_bytes(bytes));
+        } else if key.starts_with(b"global/") {
+            global_dirty = true;
         }
     }
 
@@ -2087,13 +2090,15 @@ async fn apply_recount_corrections(
         return Ok((0, false));
     }
 
-    // Re-dirty the corrected scopes so snapshots and summaries republish.
+    // Re-dirty only the corrected scopes so snapshots and summaries republish.
     let generation = ByteView::from(ulid::Ulid::new().to_bytes().to_vec());
-    writes.push((
-        USAGE_NODE_STATS_KEYSPACE.to_string(),
-        Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
-        generation.clone(),
-    ));
+    if global_dirty {
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            generation.clone(),
+        ));
+    }
     for group_id in &dirty_groups {
         writes.push((
             USAGE_NODE_STATS_KEYSPACE.to_string(),
