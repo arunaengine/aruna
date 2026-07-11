@@ -11,8 +11,8 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind,
+    Actor, MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -504,6 +504,19 @@ impl AdminDocumentReducerState {
             .get(REALM_CONFIG_QUOTA_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(quota_from_value)
+    }
+
+    /// Canonical overlay of the reducer's materialized quota onto a realm config
+    /// document. The stored quota is only updated from a non-conflicted,
+    /// materialized value, so a conflicted quota path leaves the last agreed
+    /// quota untouched. Shared by the `set_realm_quota` operation and the
+    /// replicated `net::irokle` materialization so the two never drift.
+    pub fn overlay_realm_config_quota(&self, config: &mut RealmConfigDocument) {
+        if !self.conflicts.contains_key(REALM_CONFIG_QUOTA_PATH)
+            && let Some(quota) = self.materialized_realm_config_quota()
+        {
+            config.quota = quota;
+        }
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -2737,6 +2750,46 @@ mod tests {
             .expect("quota reducer value exists");
         let stored_quota: QuotaConfig = serde_json::from_str(stored_value).unwrap();
         assert_eq!(stored_quota, expected);
+    }
+
+    #[test]
+    fn overlay_realm_config_quota_applies_and_respects_conflict() {
+        let quota = QuotaConfig {
+            default_group_quota_bytes: Some(4_096),
+            grace_factor_percent: 120,
+            warn_threshold_percent: 80,
+            ..QuotaConfig::default()
+        };
+        let mut state = realm_config_state();
+        state
+            .apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigQuotaSet {
+                    quota: quota.clone(),
+                },
+            ))
+            .unwrap();
+
+        let mut config =
+            crate::structs::RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        state.overlay_realm_config_quota(&mut config);
+        assert_eq!(config.quota, quota);
+
+        // A conflicted quota path leaves the document's quota untouched.
+        let mut conflicted = crate::structs::RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        let baseline = conflicted.quota.clone();
+        state.conflicts.insert(
+            REALM_CONFIG_QUOTA_PATH.to_string(),
+            super::AdminDocumentConflict {
+                path: REALM_CONFIG_QUOTA_PATH.to_string(),
+                values: Vec::new(),
+            },
+        );
+        state.overlay_realm_config_quota(&mut conflicted);
+        assert_eq!(conflicted.quota, baseline);
     }
 
     #[test]
