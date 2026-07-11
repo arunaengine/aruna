@@ -1189,6 +1189,7 @@ impl S3 for ArunaS3Service {
                 || req.input.copy_source_sse_customer_key.is_some()
                 || req.input.copy_source_sse_customer_key_md5.is_some(),
         )?;
+        validate_object_key(&req.input.key)?;
         let dest_bucket_info = req.extensions.get::<BucketInfo>().cloned();
 
         let (source_bucket, source_key, source_version_id) =
@@ -1476,6 +1477,7 @@ impl S3 for ArunaS3Service {
                 || req.input.copy_source_sse_customer_key.is_some()
                 || req.input.copy_source_sse_customer_key_md5.is_some(),
         )?;
+        validate_object_key(&req.input.key)?;
 
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let part_number =
