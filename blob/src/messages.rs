@@ -1,10 +1,10 @@
 use crate::error::BlobLibError;
+use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::BackendLocation;
 use aruna_net::streams::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
 #[allow(clippy::large_enum_variant)]
@@ -30,27 +30,15 @@ impl ReplicationMessage {
 
     pub async fn send(self, sender: &mut SendStream) -> Result<(), BlobLibError> {
         let request_buf = postcard::to_allocvec(&self)?;
-        AsyncWriteExt::write_u32(sender, request_buf.len() as u32).await?;
-        AsyncWriteExt::write_all(sender, &request_buf).await?;
-        AsyncWriteExt::flush(sender).await?;
+        write_frame(sender, &request_buf, MAX_CONTROL_PLANE_FRAME).await?;
         Ok(())
     }
 
     pub async fn read(receiver: &mut RecvStream) -> Result<Self, BlobEvent> {
-        let msg_len = match receiver.read_u32().await {
-            Ok(len) => len,
-            Err(err) => return Err(BlobEvent::Error(BlobError::ReadError(err.to_string()))),
-        };
-        let mut buf = vec![0; msg_len as usize];
-        match receiver.read_exact(&mut buf).await {
-            Ok(len) => len,
-            Err(err) => return Err(BlobEvent::Error(BlobError::ReadError(err.to_string()))),
-        };
-
-        let message = match postcard::from_bytes::<ReplicationMessage>(&buf) {
-            Ok(len) => len,
-            Err(err) => return Err(BlobEvent::Error(BlobError::ConversionError(err.into()))),
-        };
-        Ok(message)
+        let buf = read_frame(receiver, MAX_CONTROL_PLANE_FRAME)
+            .await
+            .map_err(|err| BlobEvent::Error(BlobError::ReadError(err.to_string())))?;
+        postcard::from_bytes::<ReplicationMessage>(&buf)
+            .map_err(|err| BlobEvent::Error(BlobError::ConversionError(err.into())))
     }
 }
