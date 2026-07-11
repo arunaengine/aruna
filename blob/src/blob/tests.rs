@@ -30,23 +30,29 @@ mod failing_close {
     use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
     use opendal::{Buffer, Capability, Error, ErrorKind, Metadata, Operator, OperatorBuilder};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
     pub(super) struct CloseFailsBackend {
         info: Arc<AccessorInfo>,
+        aborts: Arc<AtomicUsize>,
     }
 
-    impl Default for CloseFailsBackend {
-        fn default() -> Self {
+    impl CloseFailsBackend {
+        fn new(aborts: Arc<AtomicUsize>) -> Self {
             let info = AccessorInfo::default();
             info.set_scheme("close_fails")
                 .set_root("/")
                 .set_native_capability(Capability {
                     write: true,
                     write_can_empty: true,
+                    write_can_multi: true,
                     ..Default::default()
                 });
-            Self { info: info.into() }
+            Self {
+                info: info.into(),
+                aborts,
+            }
         }
     }
 
@@ -66,11 +72,18 @@ mod failing_close {
             _path: &str,
             _args: OpWrite,
         ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((RpWrite::new(), CloseFailsWriter))
+            Ok((
+                RpWrite::new(),
+                CloseFailsWriter {
+                    aborts: self.aborts.clone(),
+                },
+            ))
         }
     }
 
-    pub(super) struct CloseFailsWriter;
+    pub(super) struct CloseFailsWriter {
+        aborts: Arc<AtomicUsize>,
+    }
 
     impl oio::Write for CloseFailsWriter {
         async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
@@ -85,12 +98,16 @@ mod failing_close {
         }
 
         async fn abort(&mut self) -> opendal::Result<()> {
+            self.aborts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
 
-    pub(super) fn operator() -> Operator {
-        OperatorBuilder::new(CloseFailsBackend::default()).finish()
+    pub(super) fn operator_with_aborts() -> (Operator, Arc<AtomicUsize>) {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let operator = OperatorBuilder::new(CloseFailsBackend::new(aborts.clone())).finish();
+        (operator, aborts)
     }
 }
 
@@ -332,7 +349,7 @@ fn parse_replication_init_uses_message_id_when_unknown() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn control_plane_timeout_reports_read_timeout() {
     let event = with_control_plane_timeout(
         tokio::time::sleep(Duration::from_millis(10)),
@@ -633,12 +650,9 @@ async fn write_finalization_failure_emits_no_success_or_load() {
         hashes: HashMap::new(),
     };
 
+    let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .write_stream_to_location(
-            location.clone(),
-            failing_close::operator(),
-            stream_from_bytes(b"payload"),
-        )
+        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
     assert!(
@@ -649,6 +663,72 @@ async fn write_finalization_failure_emits_no_success_or_load() {
         bucket_load(&context.storage_handle, &location.storage_bucket).await,
         0
     );
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compose_close_fails() {
+    let context = setup_blob_handle(5).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let Event::Blob(BlobEvent::WriteFinished { location: part }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket-a".to_string(),
+            key: "part.bin".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"part-data"),
+        })
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    let target = BackendLocation {
+        root: "/tmp".to_string(),
+        storage_bucket: "compose-target".to_string(),
+        backend_path: format!("obj/{}", Ulid::new()),
+        ulid: Ulid::new(),
+        compressed: false,
+        encrypted: false,
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: HashMap::new(),
+    };
+
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let event = handler
+        .compose_parts_to_location(target.clone(), operator, vec![part])
+        .await;
+
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "compose close failure must surface as an error, got {event:?}"
+    );
+    assert_eq!(
+        bucket_load(&context.storage_handle, &target.storage_bucket).await,
+        0
+    );
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn replication_close_fails() {
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let mut writer =
+        crate::bao_tree::OpenDalWriter::new(&operator, "obj/replica", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+    iroh_io::AsyncSliceWriter::write_bytes_at(&mut writer, 0, bytes::Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+
+    assert!(writer.finalize().await.is_err());
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
