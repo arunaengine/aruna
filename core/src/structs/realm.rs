@@ -233,8 +233,93 @@ impl QuotaConfig {
         let grace = over
             .and_then(|over| over.grace_factor_percent)
             .unwrap_or(self.grace_factor_percent);
-        let ceiling = u128::from(quota) * u128::from(grace) / 100;
-        Some(ceiling.min(u128::from(u64::MAX)) as u64)
+        // API validation rejects any stored config whose ceiling overflows, so
+        // this resolves exactly; saturation stays only as a defensive fallback
+        // for replicated configs that bypassed validation.
+        Some(checked_group_ceiling_bytes(quota, grace).unwrap_or(u64::MAX))
+    }
+
+    /// Classifies a group's realm-wide `usage_bytes` against its resolved quota,
+    /// ceiling, and the realm warn threshold. This is the pure state the usage
+    /// API reports; notification hysteresis is applied elsewhere.
+    pub fn group_quota_state(&self, group_id: &GroupId, usage_bytes: u64) -> QuotaState {
+        classify_quota_state(
+            usage_bytes,
+            self.effective_group_quota_bytes(group_id),
+            self.effective_group_ceiling(group_id),
+            self.warn_threshold_percent,
+        )
+    }
+}
+
+/// Compiled hysteresis margin, in percentage points of the pre-grace quota Q,
+/// applied only when *downgrading* a persisted quota-state notification — never
+/// to the API classification. Flapping around a boundary emits exactly one warn
+/// and one recovery.
+pub const QUOTA_STATE_HYSTERESIS_PERCENT_POINTS: u32 = 5;
+
+/// Lifecycle of a group's realm-wide usage against its quota. Ordered so
+/// `Ok < Warn < Grace < Blocked`; `Unlimited` is the no-quota sentinel and sorts
+/// below the enforced states.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum QuotaState {
+    Unlimited,
+    Ok,
+    Warn,
+    Grace,
+    Blocked,
+}
+
+impl QuotaState {
+    /// Stable machine-readable string for API payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QuotaState::Unlimited => "unlimited",
+            QuotaState::Ok => "ok",
+            QuotaState::Warn => "warn",
+            QuotaState::Grace => "grace",
+            QuotaState::Blocked => "blocked",
+        }
+    }
+}
+
+/// Explicit checked ceiling math `Q·grace/100`; `None` signals the product would
+/// exceed `u64::MAX`. API validation rejects any config that returns `None` so a
+/// stored quota always resolves to an exact ceiling.
+pub fn checked_group_ceiling_bytes(quota_bytes: u64, grace_factor_percent: u32) -> Option<u64> {
+    let ceiling = u128::from(quota_bytes) * u128::from(grace_factor_percent) / 100;
+    u64::try_from(ceiling).ok()
+}
+
+/// Pure classification of realm-wide usage `U` against pre-grace quota `Q`, hard
+/// ceiling `C`, and warn threshold `W` (percent). No hysteresis — the API state
+/// is exactly this. `Q == None` is unlimited; `Ok` when `U·100 < Q·W`; `Warn`
+/// when `Q·W ≤ U·100` and `U ≤ Q`; `Grace` when `Q < U < C`; `Blocked` when
+/// `U ≥ C`.
+pub fn classify_quota_state(
+    usage_bytes: u64,
+    quota_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    warn_threshold_percent: u32,
+) -> QuotaState {
+    let Some(quota_u64) = quota_bytes else {
+        return QuotaState::Unlimited;
+    };
+    let usage = u128::from(usage_bytes);
+    let quota = u128::from(quota_u64);
+    let ceiling = u128::from(ceiling_bytes.unwrap_or(quota_u64));
+    if usage >= ceiling {
+        return QuotaState::Blocked;
+    }
+    if usage > quota {
+        return QuotaState::Grace;
+    }
+    if usage * 100 >= quota * u128::from(warn_threshold_percent) {
+        QuotaState::Warn
+    } else {
+        QuotaState::Ok
     }
 }
 
@@ -620,6 +705,97 @@ mod test {
             ..super::QuotaConfig::default()
         };
         assert_eq!(over_huge.effective_group_ceiling(&other), Some(u64::MAX));
+    }
+
+    #[test]
+    fn classify_quota_state_threshold_matrix() {
+        use super::{QuotaState, classify_quota_state};
+
+        // Unlimited when no quota applies.
+        assert_eq!(
+            classify_quota_state(1_000_000, None, None, 85),
+            QuotaState::Unlimited
+        );
+
+        // Q = 1000, W = 85%, grace 110% => C = 1100.
+        let q = Some(1_000u64);
+        let c = Some(1_100u64);
+        // Below warn boundary.
+        assert_eq!(classify_quota_state(849, q, c, 85), QuotaState::Ok);
+        // U·100 == Q·W (850·100 == 1000·85) => warn.
+        assert_eq!(classify_quota_state(850, q, c, 85), QuotaState::Warn);
+        // Up to and including the quota stays warn.
+        assert_eq!(classify_quota_state(1_000, q, c, 85), QuotaState::Warn);
+        // One byte over the quota crosses into grace.
+        assert_eq!(classify_quota_state(1_001, q, c, 85), QuotaState::Grace);
+        // Just under the ceiling is still grace.
+        assert_eq!(classify_quota_state(1_099, q, c, 85), QuotaState::Grace);
+        // At the ceiling is blocked (no non-empty write passes the gate).
+        assert_eq!(classify_quota_state(1_100, q, c, 85), QuotaState::Blocked);
+        assert_eq!(classify_quota_state(2_000, q, c, 85), QuotaState::Blocked);
+
+        // Zero-quota config: any usage is at/over the ceiling.
+        assert_eq!(
+            classify_quota_state(0, Some(0), Some(0), 85),
+            QuotaState::Blocked
+        );
+
+        // Extreme values do not overflow.
+        assert_eq!(
+            classify_quota_state(u64::MAX, Some(u64::MAX), Some(u64::MAX), 100),
+            QuotaState::Blocked
+        );
+        // Just below the ceiling with a 50% warn threshold: firmly in warn.
+        assert_eq!(
+            classify_quota_state(u64::MAX - 1, Some(u64::MAX), Some(u64::MAX), 50),
+            QuotaState::Warn
+        );
+
+        // as_str mapping is stable.
+        assert_eq!(QuotaState::Unlimited.as_str(), "unlimited");
+        assert_eq!(QuotaState::Ok.as_str(), "ok");
+        assert_eq!(QuotaState::Warn.as_str(), "warn");
+        assert_eq!(QuotaState::Grace.as_str(), "grace");
+        assert_eq!(QuotaState::Blocked.as_str(), "blocked");
+        assert!(QuotaState::Ok < QuotaState::Warn);
+        assert!(QuotaState::Warn < QuotaState::Grace);
+        assert!(QuotaState::Grace < QuotaState::Blocked);
+    }
+
+    #[test]
+    fn checked_group_ceiling_bytes_flags_overflow() {
+        use super::checked_group_ceiling_bytes;
+        assert_eq!(checked_group_ceiling_bytes(1_000, 110), Some(1_100));
+        assert_eq!(checked_group_ceiling_bytes(u64::MAX, 100), Some(u64::MAX));
+        assert_eq!(checked_group_ceiling_bytes(u64::MAX, 110), None);
+        assert_eq!(checked_group_ceiling_bytes(u64::MAX, 101), None);
+    }
+
+    #[test]
+    fn group_quota_state_uses_override_resolution() {
+        use super::QuotaState;
+        let group = Ulid::from_bytes([1u8; 16]);
+        let other = Ulid::from_bytes([2u8; 16]);
+        let quota = super::QuotaConfig {
+            default_group_quota_bytes: Some(1_000),
+            grace_factor_percent: 110,
+            warn_threshold_percent: 85,
+            group_overrides: vec![super::GroupQuotaOverride {
+                group_id: group,
+                quota_bytes: None,
+                grace_factor_percent: None,
+            }],
+            ..super::QuotaConfig::default()
+        };
+        // Overridden group is explicitly unlimited.
+        assert_eq!(
+            quota.group_quota_state(&group, 10_000_000),
+            QuotaState::Unlimited
+        );
+        // Other group resolves the default quota/ceiling.
+        assert_eq!(quota.group_quota_state(&other, 900), QuotaState::Warn);
+        assert_eq!(quota.group_quota_state(&other, 1_050), QuotaState::Grace);
+        assert_eq!(quota.group_quota_state(&other, 1_100), QuotaState::Blocked);
     }
 
     #[test]
