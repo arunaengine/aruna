@@ -349,7 +349,7 @@ fn parse_replication_init_uses_message_id_when_unknown() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn control_plane_timeout_reports_read_timeout() {
     let event = with_control_plane_timeout(
         tokio::time::sleep(Duration::from_millis(10)),
