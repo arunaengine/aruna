@@ -18,7 +18,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -54,6 +54,7 @@ pub struct ProcessPlacementsOperation {
     records: Vec<PendingDocumentPlacement>,
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
+    txn_id: Option<TxnId>,
     retry_needed: bool,
     metadata_refresh_queued: bool,
     rearmed: bool,
@@ -67,7 +68,10 @@ enum PlacementState {
     ListPending,
     Publish,
     StorePlacement,
+    StartMetadataTransaction,
     ReadMetadataState,
+    WriteMetadataState,
+    CommitMetadataTransaction,
     ScheduleMetadataRefresh,
     ScheduleRetry,
     Finish,
@@ -113,6 +117,7 @@ impl ProcessPlacementsOperation {
             records: Vec::new(),
             next_start_after: None,
             current: None,
+            txn_id: None,
             retry_needed: false,
             metadata_refresh_queued: false,
             rearmed: false,
@@ -121,9 +126,10 @@ impl ProcessPlacementsOperation {
     }
 
     fn fail(&mut self, error: PlacementError) -> Effects {
+        let cleanup = self.abort();
         self.state = PlacementState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
@@ -285,26 +291,10 @@ impl ProcessPlacementsOperation {
                 current.planned.desired_holder_count,
             );
         if current.metadata_holders_changed {
-            let document_id = match &current.planned.target {
-                DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => *document_id,
-                _ => unreachable!("metadata holder changes only apply to lifecycle placements"),
-            };
-            let target = current.planned.target.clone();
             self.current = Some(current);
-            self.state = PlacementState::ReadMetadataState;
-            return smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads: vec![
-                    (target.storage_keyspace().to_string(), target.storage_key(),),
-                    (
-                        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
-                        document_sync_revision_key(&target),
-                    ),
-                    (
-                        METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-                        metadata_document_key(document_id),
-                    ),
-                ],
-                txn_id: None,
+            self.state = PlacementState::StartMetadataTransaction;
+            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
             })];
         }
         match write_placement_effect(&current.planned) {
@@ -321,6 +311,11 @@ impl ProcessPlacementsOperation {
     ) -> Effects {
         let Some(current) = self.current.take() else {
             return self.emit_next_record();
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(PlacementError::Placement(
+                "missing metadata replan transaction".to_string(),
+            ));
         };
         let mut writes = Vec::new();
         if let Some(mut registry) = registry {
@@ -425,11 +420,46 @@ impl ProcessPlacementsOperation {
             Ok(entry) => writes.push(entry),
             Err(error) => return self.fail(error.into()),
         }
-        self.state = PlacementState::StorePlacement;
+        self.state = PlacementState::WriteMetadataState;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
+    }
+
+    fn emit_metadata_state_read(&mut self, txn_id: TxnId) -> Effects {
+        let Some(current) = self.current.as_ref() else {
+            return self.emit_next_record();
+        };
+        let document_id = match &current.planned.target {
+            DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => *document_id,
+            _ => unreachable!("metadata holder changes only apply to lifecycle placements"),
+        };
+        let target = current.planned.target.clone();
+        self.txn_id = Some(txn_id);
+        self.state = PlacementState::ReadMetadataState;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (target.storage_keyspace().to_string(), target.storage_key()),
+                (
+                    DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                    document_sync_revision_key(&target),
+                ),
+                (
+                    METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+                    metadata_document_key(document_id),
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn retry_metadata_transaction(&mut self) -> Effects {
+        self.txn_id = None;
+        self.current = None;
+        self.metadata_refresh_queued = false;
+        self.retry_needed = true;
+        self.finish_placement_store()
     }
 
     fn finish_placement_store(&mut self) -> Effects {
@@ -528,6 +558,18 @@ impl Operation for ProcessPlacementsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
+            PlacementState::StartMetadataTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.emit_metadata_state_read(txn_id)
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) => self.retry_metadata_transaction(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata transaction start result", format!("{other:?}"))
+                }
+            },
             PlacementState::ReadMetadataState => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, lifecycle), (_, lifecycle_revision), (_, registry)] =
@@ -557,6 +599,41 @@ impl Operation for ProcessPlacementsOperation {
                 other => {
                     self.unexpected_event("metadata state batch read result", format!("{other:?}"))
                 }
+            },
+            PlacementState::WriteMetadataState => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(PlacementError::Placement(
+                            "missing metadata replan transaction".to_string(),
+                        ));
+                    };
+                    self.state = PlacementState::CommitMetadataTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata transaction write result", format!("{other:?}"))
+                }
+            },
+            PlacementState::CommitMetadataTransaction => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
+                    if self.metadata_refresh_queued {
+                        self.state = PlacementState::ScheduleMetadataRefresh;
+                        smallvec![schedule_outbox_drain_effect()]
+                    } else {
+                        self.finish_placement_store()
+                    }
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) => self.retry_metadata_transaction(),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self
+                    .unexpected_event("metadata transaction commit result", format!("{other:?}")),
             },
             PlacementState::ScheduleMetadataRefresh => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -601,7 +678,10 @@ impl Operation for ProcessPlacementsOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }
 
@@ -654,8 +734,18 @@ mod tests {
     ) -> Effects {
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
-                if reads.len() == 3
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        let txn_id = Ulid::from_bytes([14; 16]);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(read_txn_id),
+            })] if reads.len() == 3 && *read_txn_id == txn_id
         ));
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -813,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_replan_does_not_claim_replacement_without_transfer_source() {
+    fn metadata_replan_missing_source_and_transaction_conflict_remain_retryable() {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let document_id = Ulid::from_bytes([12; 16]);
         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
@@ -866,8 +956,18 @@ mod tests {
         let effects = operation.step(transfer.finalize());
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
-                if reads.len() == 3
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+        let txn_id = Ulid::from_bytes([15; 16]);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(read_txn_id),
+            })] if reads.len() == 3 && *read_txn_id == txn_id
         ));
 
         let registry = MetadataRegistryRecord {
@@ -902,9 +1002,16 @@ mod tests {
                 ),
             ],
         }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
             panic!("expected atomic registry and placement update, got {effects:?}");
         };
+        assert_eq!(*write_txn_id, txn_id);
         let registry = writes
             .iter()
             .find(|(key_space, _, _)| key_space == aruna_core::keyspaces::METADATA_INDEX_KEYSPACE)
@@ -918,6 +1025,23 @@ mod tests {
             .expect("placement update is present");
         assert_eq!(placement.selected_holders, vec![node(2)]);
         assert!(operation.retry_needed);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn_id })]
+                if *commit_txn_id == txn_id
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
+        assert!(operation.rearmed);
+        assert!(operation.retry_needed);
+        assert!(operation.txn_id.is_none());
+        assert!(!operation.metadata_refresh_queued);
     }
 
     #[test]

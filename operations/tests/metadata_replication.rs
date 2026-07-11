@@ -126,7 +126,7 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
     let document_path = "datasets/replan-holder-refresh";
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
-    let created = drive(
+    drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
@@ -173,6 +173,28 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
         &initial_holders,
     )
     .await?;
+
+    drive(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            public: true,
+            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let (latest_registry, _) = read_persisted_holder_set(&nodes[0], group_id, document_id)
+        .await?
+        .expect("origin persisted latest metadata update");
+    let latest_update_id = latest_registry.last_event_id;
 
     let obsolete = initial_holders[0];
     let updated_config = drive(
@@ -222,14 +244,15 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
     assert!(same_holder_set(&registry.holder_node_ids, &final_holders));
     assert!(same_holder_set(&holders, &final_holders));
     assert!(!holders.contains(&obsolete));
+    assert_eq!(registry.last_event_id, latest_update_id);
     let refreshed_event =
-        read_metadata_event_log_value(replacement_node, document_id, created.event_id)
+        read_metadata_event_log_value(replacement_node, document_id, latest_update_id)
             .await?
             .expect("replacement persisted refreshed lifecycle event");
     let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
-    assert!(same_holder_set(
-        &refreshed_event.record.holder_node_ids,
-        &final_holders,
+    assert!(matches!(
+        refreshed_event.payload,
+        MetadataCreateEventPayload::UpsertDataEntity { .. }
     ));
 
     shutdown_nodes(nodes).await;

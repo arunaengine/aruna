@@ -3,9 +3,13 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
+    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{
+    document_sync_revision_write_entry, metadata_document_lifecycle_write_entry,
+};
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -219,12 +223,27 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let outbox = (!event.record.holder_node_ids.is_empty())
-            .then(|| create_event_outbox_record(event, self.realm_config.as_ref(), false));
+        let lifecycle_outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false);
+        let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
-        let writes =
-            metadata_event_projection_write_entries(event, &audit, outbox.as_ref(), &status, &job)?;
+        let mut writes =
+            metadata_event_projection_write_entries(event, &audit, outbox, &status, &job)?;
+        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(event.clone()),
+        };
+        writes.push(metadata_document_lifecycle_write_entry(&lifecycle)?);
+        if outbox.is_none() {
+            let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } =
+                lifecycle_outbox.event
+            else {
+                unreachable!("metadata lifecycle update outbox must be an upsert");
+            };
+            writes.push(document_sync_revision_write_entry(
+                &lifecycle_outbox.target,
+                &change,
+            )?);
+        }
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -484,7 +503,8 @@ mod tests {
     };
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
         METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
         METADATA_MATERIALIZATION_STATUS_KEYSPACE,
     };
@@ -618,6 +638,7 @@ mod tests {
             METADATA_AUDIT_KEYSPACE,
             DOCUMENT_SYNC_OUTBOX_KEYSPACE,
             DOCUMENT_SYNC_REVISION_KEYSPACE,
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             METADATA_MATERIALIZATION_STATUS_KEYSPACE,
             METADATA_MATERIALIZATION_JOB_KEYSPACE,
             METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
@@ -666,6 +687,20 @@ mod tests {
         assert_eq!(revision.current.actor, event.node_id);
         assert_eq!(revision.current.generation, event.record.updated_at_ms);
         assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+        let lifecycle = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                    .expect("lifecycle source decodes")
+            })
+            .expect("lifecycle source write exists");
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(event.clone())
+            }
+        );
         event
     }
 
@@ -769,6 +804,8 @@ mod tests {
             METADATA_MATERIALIZATION_STATUS_KEYSPACE,
             METADATA_MATERIALIZATION_JOB_KEYSPACE,
             METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
         ] {
             assert!(
                 writes
@@ -782,11 +819,6 @@ mod tests {
                 .iter()
                 .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_OUTBOX_KEYSPACE)
         );
-        assert!(
-            writes
-                .iter()
-                .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_REVISION_KEYSPACE)
-        );
         let event = writes
             .iter()
             .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
@@ -796,6 +828,30 @@ mod tests {
             })
             .expect("event log write exists");
         assert!(event.record.holder_node_ids.is_empty());
+        let lifecycle = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                    .expect("lifecycle source decodes")
+            })
+            .expect("lifecycle source write exists");
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(event.clone())
+            }
+        );
+        let revision = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<DocumentSyncChange>(value)
+                    .expect("lifecycle revision decodes")
+            })
+            .expect("lifecycle revision write exists");
+        assert_eq!(revision.current.event_id, event.event_id);
+        assert_eq!(revision.current.generation, event.record.updated_at_ms);
     }
 
     #[test]
