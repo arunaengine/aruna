@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision, DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+    DocumentSyncTarget,
 };
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -18,7 +18,6 @@ use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -52,8 +51,6 @@ pub struct AnnounceTopicOperation {
     document_bytes: Option<Vec<u8>>,
     placement: PlacementRef,
     allow_genesis: bool,
-    require_delivery: bool,
-    transfer_outbox: Option<DocumentSyncOutboxRecord>,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
     current: Option<DocumentSyncTarget>,
@@ -67,9 +64,6 @@ enum AnnounceTopicState {
     ListUsers,
     WriteOutbox,
     ScheduleSync,
-    PublishDocument,
-    SyncDocument,
-    DeleteTransferredOutbox,
     Finish,
     Error,
 }
@@ -139,8 +133,6 @@ impl AnnounceTopicOperation {
             document_bytes: None,
             placement,
             allow_genesis,
-            require_delivery: false,
-            transfer_outbox: None,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -164,33 +156,11 @@ impl AnnounceTopicOperation {
             document_bytes: Some(bytes),
             placement: PlacementRef::NIL,
             allow_genesis,
-            require_delivery: false,
-            transfer_outbox: None,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
             output: None,
         }
-    }
-
-    pub(crate) fn new_for_document_transfer_with_peers_and_placement(
-        topic: TopicId,
-        local_node_id: NodeId,
-        document: DocumentSyncTarget,
-        peers: Vec<NodeId>,
-        placement: PlacementRef,
-        allow_genesis: bool,
-    ) -> Self {
-        let mut operation = Self::new_for_document_with_peers_and_placement(
-            topic,
-            local_node_id,
-            Some(document),
-            peers,
-            placement,
-            allow_genesis,
-        );
-        operation.require_delivery = true;
-        operation
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
@@ -208,16 +178,6 @@ impl AnnounceTopicOperation {
         self.state = AnnounceTopicState::Error;
         self.output = Some(Err(error));
         smallvec![]
-    }
-
-    fn fail_transfer(&mut self, error: AnnounceTopicError) -> Effects {
-        self.state = AnnounceTopicState::Error;
-        self.output = Some(Err(error));
-        if self.transfer_outbox.is_some() {
-            smallvec![schedule_outbox_drain_effect()]
-        } else {
-            smallvec![]
-        }
     }
 
     fn finish(&mut self) -> Effects {
@@ -254,22 +214,6 @@ impl AnnounceTopicOperation {
         )
     }
 
-    fn publish_persisted_outbox_effect(&mut self) -> Effects {
-        let Some(record) = self.transfer_outbox.as_ref() else {
-            return self.unexpected_event(
-                "persisted document sync outbox record",
-                "missing transfer outbox record".to_string(),
-            );
-        };
-        self.state = AnnounceTopicState::PublishDocument;
-        smallvec![Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::PublishDocuments {
-                documents: vec![crate::task_incoming::document_publish_from_outbox(record)],
-                peers: self.peers.clone(),
-            }
-        ))]
-    }
-
     fn write_document_outbox_event_effect(
         &mut self,
         document: DocumentSyncTarget,
@@ -287,9 +231,6 @@ impl AnnounceTopicOperation {
             PlacementRef::NIL,
             self.allow_genesis,
         );
-        if self.require_delivery {
-            self.transfer_outbox = Some(record.clone());
-        }
         match write_outbox_effect(&record) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
@@ -425,14 +366,7 @@ impl AnnounceTopicOperation {
         match self.pending.pop_front() {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
-                    if self.require_delivery && self.peers.is_empty() {
-                        match self.document_upsert_change(&document, &bytes) {
-                            Ok(_) => self.finish(),
-                            Err(error) => self.fail(error),
-                        }
-                    } else {
-                        self.write_document_outbox_effect(document, bytes)
-                    }
+                    self.write_document_outbox_effect(document, bytes)
                 } else {
                     self.current = Some(document.clone());
                     self.state = AnnounceTopicState::ReadDocument;
@@ -477,25 +411,9 @@ impl Operation for AnnounceTopicOperation {
                         );
                     };
                     let Some(bytes) = value else {
-                        if self.require_delivery {
-                            return self.fail(AnnounceTopicError::DocumentSync(format!(
-                                "required transfer source is missing for {document:?}"
-                            )));
-                        }
                         return self.next_effect();
                     };
-                    if self.require_delivery {
-                        if self.peers.is_empty() {
-                            match self.document_upsert_change(&document, &bytes) {
-                                Ok(_) => self.finish(),
-                                Err(error) => self.fail(error),
-                            }
-                        } else {
-                            self.write_document_outbox_effect(document, bytes.to_vec())
-                        }
-                    } else {
-                        self.write_document_outbox_effect(document, bytes.to_vec())
-                    }
+                    self.write_document_outbox_effect(document, bytes.to_vec())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
@@ -542,9 +460,6 @@ impl Operation for AnnounceTopicOperation {
                             "missing current document".to_string(),
                         );
                     }
-                    if self.require_delivery {
-                        return self.publish_persisted_outbox_effect();
-                    }
                     self.state = AnnounceTopicState::ScheduleSync;
                     smallvec![schedule_outbox_drain_effect()]
                 }
@@ -566,67 +481,6 @@ impl Operation for AnnounceTopicOperation {
                 other => {
                     self.unexpected_event("document sync timer schedule", format!("{other:?}"))
                 }
-            },
-            AnnounceTopicState::PublishDocument => match event {
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
-                    ..
-                })) => {
-                    let Some(document) = self.current.clone() else {
-                        return self.unexpected_event(
-                            "tracked document sync target",
-                            "missing current document".to_string(),
-                        );
-                    };
-                    self.state = AnnounceTopicState::SyncDocument;
-                    smallvec![Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::SyncDocument {
-                            target: document,
-                            peers: self.peers.clone(),
-                        }
-                    ))]
-                }
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                    error, ..
-                })) => self.fail_transfer(AnnounceTopicError::DocumentSync(error)),
-                Event::Net(NetEvent::Error(error)) => {
-                    self.fail_transfer(AnnounceTopicError::DocumentSync(format!("{error:?}")))
-                }
-                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
-                    "unexpected document publish result: {other:?}"
-                ))),
-            },
-            AnnounceTopicState::SyncDocument => match event {
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
-                    ..
-                })) => {
-                    let Some(record) = self.transfer_outbox.as_ref() else {
-                        return self.unexpected_event(
-                            "persisted document sync outbox record",
-                            "missing transfer outbox record".to_string(),
-                        );
-                    };
-                    self.state = AnnounceTopicState::DeleteTransferredOutbox;
-                    smallvec![crate::document_sync_outbox::delete_outbox_effect(record)]
-                }
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                    error, ..
-                })) => self.fail_transfer(AnnounceTopicError::DocumentSync(error)),
-                Event::Net(NetEvent::Error(error)) => {
-                    self.fail_transfer(AnnounceTopicError::DocumentSync(format!("{error:?}")))
-                }
-                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
-                    "unexpected document sync result: {other:?}"
-                ))),
-            },
-            AnnounceTopicState::DeleteTransferredOutbox => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.transfer_outbox = None;
-                    self.finish()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail_transfer(error.into()),
-                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
-                    "unexpected transfer outbox delete result: {other:?}"
-                ))),
             },
             AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {
                 smallvec![]
@@ -770,125 +624,6 @@ mod tests {
             panic!("expected revisioned upsert");
         };
         assert_eq!(change.placement, placement);
-    }
-
-    fn document_lifecycle_fixture() -> (DocumentSyncTarget, Vec<u8>) {
-        let document_id = Ulid::from_bytes([7; 16]);
-        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-            event: aruna_core::metadata::MetadataDocumentDeleteRecord {
-                event_id: Ulid::from_bytes([8; 16]),
-                tombstone: MetadataGraphLifecycleRecord::deleted(
-                    "urn:graph:transfer".to_string(),
-                    RealmId::from_bytes([2; 32]),
-                    GroupId::from_bytes([6; 16]),
-                    document_id,
-                    42,
-                ),
-                deleted_after_event_id: Ulid::from_bytes([5; 16]),
-            },
-        };
-        (
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-            postcard::to_allocvec(&lifecycle).expect("lifecycle serializes"),
-        )
-    }
-
-    #[test]
-    fn required_document_transfer_fails_without_source() {
-        let (document, _) = document_lifecycle_fixture();
-        let mut operation =
-            AnnounceTopicOperation::new_for_document_transfer_with_peers_and_placement(
-                document.topic_id(),
-                local_node_id(),
-                document,
-                vec![iroh::SecretKey::from_bytes(&[2; 32]).public()],
-                PlacementRef::NIL,
-                false,
-            );
-
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(AnnounceTopicError::DocumentSync(error))
-                if error.contains("required transfer source is missing")
-        ));
-    }
-
-    #[test]
-    fn required_document_transfer_waits_for_peer_reconciliation() {
-        let (document, bytes) = document_lifecycle_fixture();
-        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation =
-            AnnounceTopicOperation::new_for_document_transfer_with_peers_and_placement(
-                document.topic_id(),
-                local_node_id(),
-                document.clone(),
-                vec![peer],
-                PlacementRef::NIL,
-                false,
-            );
-        operation.start();
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: Some(bytes.into()),
-        }));
-        let outbox = written_outbox_record(effects.as_slice());
-        assert_eq!(outbox.target, document);
-        assert_eq!(outbox.peers, vec![peer]);
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: crate::document_sync_outbox::outbox_key(&outbox),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::PublishDocuments { peers, .. }
-            ))] if peers == &vec![peer]
-        ));
-        let effects = operation.step(Event::Net(NetEvent::DocumentSync(
-            DocumentSyncNetEvent::DocumentsPublished {
-                targets: vec![document.clone()],
-            },
-        )));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocument { target, peers }
-            ))] if target == &document && peers == &vec![peer]
-        ));
-        assert!(!operation.is_complete());
-
-        let effects = operation.step(Event::Net(NetEvent::DocumentSync(
-            DocumentSyncNetEvent::DocumentsReconciled {
-                applied: 0,
-                targets: Vec::new(),
-                metadata_create_events: Vec::new(),
-                metadata_graph_tombstones: Vec::new(),
-            },
-        )));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, key, .. })]
-                if key_space == DOCUMENT_SYNC_OUTBOX_KEYSPACE
-                    && key == &crate::document_sync_outbox::outbox_key(&outbox)
-        ));
-        assert!(!operation.is_complete());
-        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: crate::document_sync_outbox::outbox_key(&outbox),
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]

@@ -96,14 +96,6 @@ pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, 
     write_outbox_effect_with_txn(record, None)
 }
 
-pub fn delete_outbox_effect(record: &DocumentSyncOutboxRecord) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-        key: outbox_key(record),
-        txn_id: None,
-    })
-}
-
 pub fn outbox_write_entry(
     record: &DocumentSyncOutboxRecord,
 ) -> Result<(String, ByteView, ByteView), postcard::Error> {

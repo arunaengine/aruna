@@ -1440,8 +1440,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
 mod tests {
     use super::*;
     use crate::document_sync_outbox::{
-        new_outbox_record_with_id, outbox_key, read_outbox_record,
-        restore_document_sync_outbox_timers, write_outbox_effect,
+        outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -1543,11 +1542,9 @@ mod tests {
         let event_id = Ulid::from_parts(10, 1);
         let target = target();
         let change = change();
-        let record = new_outbox_record_with_id(
+        let publish = document_publish_from_outbox(
             event_id,
-            node(1),
             target.clone(),
-            Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![1, 2, 3],
                 change,
@@ -1555,7 +1552,6 @@ mod tests {
             aruna_core::structs::PlacementRef::NIL,
             true,
         );
-        let publish = document_publish_from_outbox(&record);
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
