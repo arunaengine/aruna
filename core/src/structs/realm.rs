@@ -304,12 +304,33 @@ pub fn classify_quota_state(
     ceiling_bytes: Option<u64>,
     warn_threshold_percent: u32,
 ) -> QuotaState {
+    classify_quota_state_with_margin(
+        usage_bytes,
+        quota_bytes,
+        ceiling_bytes,
+        warn_threshold_percent,
+        0,
+    )
+}
+
+/// Classification with every boundary lowered by `margin_pp` percentage points of
+/// `Q` — modelled by shifting usage up by that margin. Used only to make
+/// notification downgrades sticky (hysteresis); `margin_pp == 0` is the pure
+/// [`classify_quota_state`].
+fn classify_quota_state_with_margin(
+    usage_bytes: u64,
+    quota_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    warn_threshold_percent: u32,
+    margin_pp: u32,
+) -> QuotaState {
     let Some(quota_u64) = quota_bytes else {
         return QuotaState::Unlimited;
     };
-    let usage = u128::from(usage_bytes);
     let quota = u128::from(quota_u64);
     let ceiling = u128::from(ceiling_bytes.unwrap_or(quota_u64));
+    let margin = quota * u128::from(margin_pp) / 100;
+    let usage = u128::from(usage_bytes) + margin;
     if usage >= ceiling {
         return QuotaState::Blocked;
     }
@@ -321,6 +342,36 @@ pub fn classify_quota_state(
     } else {
         QuotaState::Ok
     }
+}
+
+/// Computes the next persisted `last_notified_state` from the raw classification
+/// and the previously notified state. Upward crossings upgrade immediately; a
+/// downgrade only applies once usage drops below the higher state's entry
+/// boundary minus the hysteresis margin. A returned value that differs from
+/// `last_notified` is exactly one notification to emit.
+pub fn next_notified_state(
+    last_notified: QuotaState,
+    usage_bytes: u64,
+    quota_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    warn_threshold_percent: u32,
+) -> QuotaState {
+    let current = classify_quota_state(usage_bytes, quota_bytes, ceiling_bytes, warn_threshold_percent);
+    if quota_bytes.is_none() {
+        return QuotaState::Unlimited;
+    }
+    if current >= last_notified {
+        return current;
+    }
+    // Downward: stay in the higher state until usage clears the margin.
+    let sticky = classify_quota_state_with_margin(
+        usage_bytes,
+        quota_bytes,
+        ceiling_bytes,
+        warn_threshold_percent,
+        QUOTA_STATE_HYSTERESIS_PERCENT_POINTS,
+    );
+    sticky.clamp(current, last_notified)
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -708,7 +759,7 @@ mod test {
     }
 
     #[test]
-    fn classify_quota_state_threshold_matrix() {
+    fn quota_state_matrix() {
         use super::{QuotaState, classify_quota_state};
 
         // Unlimited when no quota applies.
@@ -763,7 +814,58 @@ mod test {
     }
 
     #[test]
-    fn checked_group_ceiling_bytes_flags_overflow() {
+    fn hysteresis_dedupes_flapping() {
+        use super::{QuotaState, next_notified_state};
+        let q = Some(1_000u64);
+        let c = Some(1_100u64);
+        let w = 85;
+
+        let mut last = QuotaState::Ok;
+        let mut emissions: Vec<(QuotaState, QuotaState)> = Vec::new();
+        // Oscillate around the 850-byte warn boundary within the 50-byte margin.
+        for usage in [800u64, 850, 820, 860, 830, 855, 810] {
+            let next = next_notified_state(last, usage, q, c, w);
+            if next != last {
+                emissions.push((last, next));
+                last = next;
+            }
+        }
+        assert_eq!(emissions, vec![(QuotaState::Ok, QuotaState::Warn)]);
+
+        // Usage must clear the warn boundary minus the margin (< 800) to recover.
+        assert_eq!(next_notified_state(last, 799, q, c, w), QuotaState::Ok);
+        last = QuotaState::Ok;
+        // A fresh upward crossing emits again.
+        assert_eq!(next_notified_state(last, 860, q, c, w), QuotaState::Warn);
+    }
+
+    #[test]
+    fn hysteresis_sticky_downgrade() {
+        use super::{QuotaState, next_notified_state};
+        let q = Some(1_000u64);
+        let c = Some(1_100u64);
+        let w = 85;
+        // Immediate upgrade all the way to blocked.
+        assert_eq!(next_notified_state(QuotaState::Ok, 1_100, q, c, w), QuotaState::Blocked);
+        // Just under the ceiling stays blocked (1100 - 50 margin = 1050 re-arm).
+        assert_eq!(
+            next_notified_state(QuotaState::Blocked, 1_051, q, c, w),
+            QuotaState::Blocked
+        );
+        // Below the re-arm point drops to grace.
+        assert_eq!(
+            next_notified_state(QuotaState::Blocked, 1_049, q, c, w),
+            QuotaState::Grace
+        );
+        // Removing the quota transitions to unlimited.
+        assert_eq!(
+            next_notified_state(QuotaState::Grace, 5_000, None, None, w),
+            QuotaState::Unlimited
+        );
+    }
+
+    #[test]
+    fn ceiling_overflow_flagged() {
         use super::checked_group_ceiling_bytes;
         assert_eq!(checked_group_ceiling_bytes(1_000, 110), Some(1_100));
         assert_eq!(checked_group_ceiling_bytes(u64::MAX, 100), Some(u64::MAX));
@@ -772,7 +874,7 @@ mod test {
     }
 
     #[test]
-    fn group_quota_state_uses_override_resolution() {
+    fn group_state_override() {
         use super::QuotaState;
         let group = Ulid::from_bytes([1u8; 16]);
         let other = Ulid::from_bytes([2u8; 16]);

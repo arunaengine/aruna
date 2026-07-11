@@ -1,5 +1,6 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
+use crate::structs::realm::QuotaState;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,6 +21,7 @@ pub const NODE_USAGE_DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
 pub const NODE_USAGE_DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
 pub const NODE_USAGE_SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
 pub const NODE_USAGE_SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
+pub const NODE_USAGE_QUOTA_STATE_PREFIX: &[u8] = b"quota-state/";
 
 /// A single node's usage total distributed over the sync layer. Single writer
 /// per key (each node writes only its own snapshots), so ingest is last-write-wins.
@@ -96,6 +98,35 @@ pub fn node_usage_summary_group_key(group_id: GroupId) -> Vec<u8> {
     key.extend_from_slice(NODE_USAGE_SUMMARY_GROUP_PREFIX);
     key.extend_from_slice(&group_id.to_bytes());
     key
+}
+
+pub fn node_usage_quota_state_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_USAGE_QUOTA_STATE_PREFIX.len() + 16);
+    key.extend_from_slice(NODE_USAGE_QUOTA_STATE_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+/// Local-only record on a group's quota-state owner node: the classified state
+/// and the last state a notification fired for. `last_notified_state` drives the
+/// hysteresis dedupe so flapping around a boundary emits one warn and one
+/// recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaStateRecord {
+    pub state: QuotaState,
+    pub last_notified_state: QuotaState,
+    pub since_ms: u64,
+    pub updated_ms: u64,
+}
+
+impl QuotaStateRecord {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 pub fn usage_global_shard_index(group_id: GroupId) -> usize {

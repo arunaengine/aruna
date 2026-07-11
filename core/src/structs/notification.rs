@@ -5,6 +5,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::RealmId;
+use crate::structs::realm::QuotaState;
 use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -60,6 +61,14 @@ pub enum NotificationKind {
         size_bytes: u64,
         actor_user_id: UserId,
     },
+    GroupQuotaStateChanged {
+        group_id: GroupId,
+        state: QuotaState,
+        previous: QuotaState,
+        usage_bytes: u64,
+        quota_bytes: Option<u64>,
+        ceiling_bytes: Option<u64>,
+    },
 }
 
 impl NotificationKind {
@@ -74,6 +83,7 @@ impl NotificationKind {
             NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. } => {
                 "resource.watch"
             }
+            NotificationKind::GroupQuotaStateChanged { .. } => "group.quota",
         }
     }
 
@@ -86,6 +96,7 @@ impl NotificationKind {
             NotificationKind::NodeOnboarded { .. } => "node_onboarded",
             NotificationKind::MetadataCreated { .. } => "metadata_created",
             NotificationKind::DataUploaded { .. } => "data_uploaded",
+            NotificationKind::GroupQuotaStateChanged { .. } => "group_quota_state_changed",
         }
     }
 }
@@ -291,6 +302,14 @@ mod tests {
                 size_bytes: 4096,
                 actor_user_id: user(1, 6),
             },
+            NotificationKind::GroupQuotaStateChanged {
+                group_id: Ulid::new(),
+                state: crate::structs::QuotaState::Grace,
+                previous: crate::structs::QuotaState::Warn,
+                usage_bytes: 1_050,
+                quota_bytes: Some(1_000),
+                ceiling_bytes: Some(1_100),
+            },
         ] {
             let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
             let bytes = record.to_bytes().unwrap();
@@ -475,6 +494,16 @@ mod tests {
         assert_eq!(onboarded.category(), "node.onboarding");
         assert_eq!(metadata_created.category(), "resource.watch");
         assert_eq!(data_uploaded.category(), "resource.watch");
+        let quota_changed = NotificationKind::GroupQuotaStateChanged {
+            group_id: Ulid::new(),
+            state: crate::structs::QuotaState::Blocked,
+            previous: crate::structs::QuotaState::Grace,
+            usage_bytes: 1_200,
+            quota_bytes: Some(1_000),
+            ceiling_bytes: Some(1_100),
+        };
+        assert_eq!(quota_changed.category(), "group.quota");
+        assert_eq!(quota_changed.name(), "group_quota_state_changed");
         assert_eq!(added.name(), "added_to_group");
         assert_eq!(removed.name(), "removed_from_group");
         assert_eq!(member.name(), "group_member_added");
