@@ -3,10 +3,18 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     Backend, BackendConfig, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
 };
+use aruna_egress::{
+    EgressPolicy, HTTP_SCHEMES, hardened_client, preflight_resolve, resolve_and_pin_ftp,
+    validate_url,
+};
 use bytes::Bytes;
-use opendal::layers::{LoggingLayer, RetryLayer};
+use opendal::layers::{HttpClientLayer, LoggingLayer, RetryLayer};
+use opendal::raw::HttpClient;
 use opendal::{Builder, Operator, services};
+use reqwest::dns::Resolve;
 use std::collections::HashMap;
+use std::sync::Arc;
+use url::Url;
 
 pub(crate) fn init_backend_operator(
     mut config: BackendConfig,
@@ -51,8 +59,12 @@ pub(crate) fn init_operator(
 
 pub(crate) async fn head_staging_source(
     access: &ResolvedSourceAccess,
+    policy: &EgressPolicy,
+    resolver_override: Option<Arc<dyn Resolve>>,
 ) -> Result<SourceMetadata, StagingSourceError> {
-    let (operator, path, version) = build_staging_source_operator(access)?;
+    preflight_staging(access, policy, resolver_override.clone()).await?;
+    let (operator, path, version) =
+        build_staging_source_operator(access, policy, resolver_override).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
         None => operator.stat(path).await,
@@ -71,6 +83,8 @@ pub(crate) async fn head_staging_source(
 pub(crate) async fn read_staging_source(
     access: &ResolvedSourceAccess,
     range: Option<std::ops::Range<u64>>,
+    policy: &EgressPolicy,
+    resolver_override: Option<Arc<dyn Resolve>>,
 ) -> Result<
     (
         SourceMetadata,
@@ -78,8 +92,9 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
-    let (operator, path, version) = build_staging_source_operator(access)?;
-    let metadata = head_staging_source(access).await?;
+    let metadata = head_staging_source(access, policy, resolver_override.clone()).await?;
+    let (operator, path, version) =
+        build_staging_source_operator(access, policy, resolver_override).await?;
     let reader = match version {
         Some(version) => operator.reader_with(path).version(version).await,
         None => operator.reader(path).await,
@@ -99,9 +114,30 @@ pub(crate) async fn read_staging_source(
     Ok((metadata, BackendStream::new(stream)))
 }
 
-fn build_staging_source_operator(
+/// Request-time pre-flight for HTTP-family connectors so a denied endpoint
+/// surfaces a precise `EgressDenied`; FTP is gated at build time by pinning.
+async fn preflight_staging(
     access: &ResolvedSourceAccess,
-) -> Result<(Operator, &str, Option<&str>), StagingSourceError> {
+    policy: &EgressPolicy,
+    resolver_override: Option<Arc<dyn Resolve>>,
+) -> Result<(), StagingSourceError> {
+    let ResolvedSourceAccess::OpenDal { kind, config, .. } = access;
+    match kind {
+        SourceConnectorKind::Http | SourceConnectorKind::S3 | SourceConnectorKind::Webdav => {
+            let url = staging_endpoint_url(config)?;
+            preflight_resolve(policy, HTTP_SCHEMES, &url, resolver_override)
+                .await
+                .map_err(aruna_egress::EgressDenial::into_staging_error)
+        }
+        SourceConnectorKind::Ftp | SourceConnectorKind::ArunaNative => Ok(()),
+    }
+}
+
+async fn build_staging_source_operator<'a>(
+    access: &'a ResolvedSourceAccess,
+    policy: &EgressPolicy,
+    resolver_override: Option<Arc<dyn Resolve>>,
+) -> Result<(Operator, &'a str, Option<&'a str>), StagingSourceError> {
     match access {
         ResolvedSourceAccess::OpenDal {
             kind,
@@ -110,14 +146,16 @@ fn build_staging_source_operator(
             version,
         } => {
             let operator = match kind {
-                SourceConnectorKind::Http => build_service::<services::Http>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::S3 => build_service::<services::S3>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::Webdav => build_service::<services::Webdav>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
-                SourceConnectorKind::Ftp => build_service::<services::Ftp>(config.clone())
-                    .map_err(staging_operator_creation_error)?,
+                SourceConnectorKind::Http => {
+                    build_http_family::<services::Http>(config, policy, resolver_override)?
+                }
+                SourceConnectorKind::S3 => {
+                    build_http_family::<services::S3>(config, policy, resolver_override)?
+                }
+                SourceConnectorKind::Webdav => {
+                    build_http_family::<services::Webdav>(config, policy, resolver_override)?
+                }
+                SourceConnectorKind::Ftp => build_ftp_operator(config, policy).await?,
                 SourceConnectorKind::ArunaNative => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
@@ -127,12 +165,72 @@ fn build_staging_source_operator(
     }
 }
 
+fn staging_endpoint_url(config: &HashMap<String, String>) -> Result<Url, StagingSourceError> {
+    let endpoint = config.get("endpoint").ok_or_else(|| {
+        StagingSourceError::OperatorCreationFailed("connector config is missing endpoint".into())
+    })?;
+    Url::parse(endpoint).map_err(|error| StagingSourceError::EgressDenied {
+        host: None,
+        port: None,
+        scheme: None,
+        reason: format!("invalid endpoint URL: {error}"),
+    })
+}
+
+fn build_http_family<B>(
+    config: &HashMap<String, String>,
+    policy: &EgressPolicy,
+    resolver_override: Option<Arc<dyn Resolve>>,
+) -> Result<Operator, StagingSourceError>
+where
+    B: Builder,
+{
+    let url = staging_endpoint_url(config)?;
+    validate_url(policy, HTTP_SCHEMES, &url)
+        .map_err(aruna_egress::EgressDenial::into_staging_error)?;
+    let client = hardened_client(Arc::new(policy.clone()), HTTP_SCHEMES, resolver_override)
+        .map_err(|error| StagingSourceError::OperatorCreationFailed(error.to_string()))?;
+    build_staging_service::<B>(config.clone(), client).map_err(staging_operator_creation_error)
+}
+
+async fn build_ftp_operator(
+    config: &HashMap<String, String>,
+    policy: &EgressPolicy,
+) -> Result<Operator, StagingSourceError> {
+    let endpoint = config.get("endpoint").ok_or_else(|| {
+        StagingSourceError::OperatorCreationFailed("connector config is missing endpoint".into())
+    })?;
+    // FTP is allowlist-only; resolve-and-pin rewrites the host to a validated IP
+    // literal (PASV data channel stays server-controlled — known limitation).
+    let pinned = resolve_and_pin_ftp(policy, endpoint, None)
+        .await
+        .map_err(aruna_egress::EgressDenial::into_staging_error)?;
+    let mut config = config.clone();
+    config.insert("endpoint".to_string(), pinned);
+    build_service::<services::Ftp>(config).map_err(staging_operator_creation_error)
+}
+
 fn build_service<B>(config: HashMap<String, String>) -> Result<Operator, String>
 where
     B: Builder,
 {
     Ok(Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
+        .layer(LoggingLayer::default())
+        .layer(RetryLayer::new())
+        .finish())
+}
+
+fn build_staging_service<B>(
+    config: HashMap<String, String>,
+    client: reqwest::Client,
+) -> Result<Operator, String>
+where
+    B: Builder,
+{
+    Ok(Operator::from_iter::<B>(config)
+        .map_err(|error| error.to_string())?
+        .layer(HttpClientLayer::new(HttpClient::with(client)))
         .layer(LoggingLayer::default())
         .layer(RetryLayer::new())
         .finish())
@@ -172,17 +270,45 @@ mod tests {
             version: Some("v42".to_string()),
         };
 
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) =
+            build_staging_source_operator(&access, &EgressPolicy::deny_all(), None)
+                .await
+                .unwrap();
         assert_eq!(path, "file.txt");
         assert_eq!(version, Some("v42"));
     }
 
     #[tokio::test]
-    async fn ftp_build_helper_accepts_expected_keys() {
+    async fn http_literal_denied() {
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:9000".to_string())]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+
+        let error = build_staging_source_operator(&access, &EgressPolicy::deny_all(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StagingSourceError::EgressDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn ftp_pins_literal() {
+        use aruna_core::structs::{EgressAllowRule, EgressConfig, HostPattern};
+
+        let policy = EgressPolicy::from_config(&EgressConfig {
+            allow: vec![EgressAllowRule {
+                host: HostPattern::Cidr("10.0.0.0/8".to_string()),
+                ports: None,
+                schemes: None,
+                comment: None,
+            }],
+        });
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Ftp,
             config: HashMap::from([
-                ("endpoint".to_string(), "ftp://example.org:21".to_string()),
+                ("endpoint".to_string(), "ftp://10.0.0.7:21".to_string()),
                 ("root".to_string(), "/datasets".to_string()),
                 ("user".to_string(), "alice".to_string()),
                 ("password".to_string(), "secret".to_string()),
@@ -191,9 +317,26 @@ mod tests {
             version: None,
         };
 
-        let (.., path, version) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_staging_source_operator(&access, &policy, None)
+            .await
+            .unwrap();
         assert_eq!(path, "run-1/data.txt");
         assert_eq!(version, None);
+    }
+
+    #[tokio::test]
+    async fn ftp_not_allowlisted() {
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Ftp,
+            config: HashMap::from([("endpoint".to_string(), "ftp://10.0.0.7:21".to_string())]),
+            path: "run-1/data.txt".to_string(),
+            version: None,
+        };
+
+        let error = build_staging_source_operator(&access, &EgressPolicy::deny_all(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StagingSourceError::EgressDenied { .. }));
     }
 
     #[tokio::test]
@@ -208,5 +351,67 @@ mod tests {
             build_service::<services::Fs>(HashMap::from([("root".to_string(), root)])).unwrap();
         let metadata = operator.stat("hello.txt").await.unwrap();
         assert_eq!(metadata.content_length(), 11);
+    }
+
+    struct StaticResolver(std::net::IpAddr);
+
+    impl Resolve for StaticResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let addr = std::net::SocketAddr::new(self.0, 0);
+            Box::pin(async move { Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs) })
+        }
+    }
+
+    fn http_access(endpoint: &str) -> ResolvedSourceAccess {
+        ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), endpoint.to_string())]),
+            path: "file.txt".to_string(),
+            version: None,
+        }
+    }
+
+    fn allow_loopback_policy() -> EgressPolicy {
+        use aruna_core::structs::{EgressAllowRule, EgressConfig, HostPattern};
+        EgressPolicy::from_config(&EgressConfig {
+            allow: vec![EgressAllowRule {
+                host: HostPattern::Cidr("127.0.0.0/8".to_string()),
+                ports: None,
+                schemes: None,
+                comment: None,
+            }],
+        })
+    }
+
+    // A rebinding hostname resolving to loopback must be denied through the real
+    // opendal path even when a server is live at that address.
+    #[tokio::test]
+    async fn head_blocks_rebinding() {
+        let resolver: Arc<dyn Resolve> = Arc::new(StaticResolver("127.0.0.1".parse().unwrap()));
+        let access = http_access("http://rebind.test/");
+        let error = head_staging_source(&access, &EgressPolicy::deny_all(), Some(resolver))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StagingSourceError::EgressDenied { .. }));
+    }
+
+    // The same rebinding hostname passes the egress gate once loopback is
+    // allowlisted, reaching the live server instead of an EgressDenied.
+    #[tokio::test]
+    async fn head_allows_allowlisted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = axum::Router::new().fallback(|| async { "hello world" });
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let resolver: Arc<dyn Resolve> = Arc::new(StaticResolver("127.0.0.1".parse().unwrap()));
+        let access = http_access(&format!("http://rebind.test:{port}/"));
+        let result = head_staging_source(&access, &allow_loopback_policy(), Some(resolver)).await;
+        assert!(
+            !matches!(result, Err(StagingSourceError::EgressDenied { .. })),
+            "allowlisted host must pass the egress gate, got {result:?}"
+        );
     }
 }
