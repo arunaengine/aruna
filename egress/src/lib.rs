@@ -846,7 +846,8 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_v4_mapped_and_nat64() {
+    // Covers IPv4-mapped and NAT64 wrappings.
+    fn unwraps_embedded_v4() {
         assert!(builtin_deny_range(ip("::ffff:127.0.0.1")).is_some());
         assert!(builtin_deny_range(ip("64:ff9b::7f00:1")).is_some());
         // A mapped/NAT64 wrapping of a public address stays permitted.

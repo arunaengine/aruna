@@ -273,8 +273,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // Building the operator performs no I/O, so a public hostname passes the
+    // static gate and the path/version tuple is handed through untouched.
     #[tokio::test]
-    async fn filesystem_like_http_config_is_not_required_for_build_helper_tests() {
+    async fn path_version_passthrough() {
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::Http,
             config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
@@ -351,8 +353,9 @@ mod tests {
         assert!(matches!(error, StagingSourceError::EgressDenied { .. }));
     }
 
+    // build_service also backs non-HTTP services like Fs.
     #[tokio::test]
-    async fn head_and_read_support_filesystem_backed_s3_shape_via_fs_service_test() {
+    async fn fs_service_stat() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_str().unwrap().to_string();
         tokio::fs::write(dir.path().join("hello.txt"), b"hello world")
