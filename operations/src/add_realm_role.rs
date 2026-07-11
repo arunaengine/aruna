@@ -277,8 +277,10 @@ impl AddRealmRoleOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
-                    .map_err(ConversionError::from)
+                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
+                    value.as_ref(),
+                )
+                .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state

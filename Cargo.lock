@@ -374,6 +374,7 @@ dependencies = [
  "crossfire",
  "fjall",
  "futures",
+ "globset",
  "hex",
  "iroh",
  "irokle",

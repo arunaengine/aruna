@@ -17,10 +17,11 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, UserId};
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use chrono::Utc;
 use smallvec::smallvec;
+use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -268,7 +269,25 @@ impl RegisterOrGetOidcUserOperation {
             txn_id,
             user: user.clone(),
         };
-        let effects = rewrite_subject_index_effects(None, &user, txn_id)?;
+        let mut effects = rewrite_subject_index_effects(None, &user, txn_id)?;
+        let claims = postcard::to_allocvec(&BTreeSet::from([user.user_id])).map_err(|error| {
+            RegisterOrGetOidcUserError::ConversionError(ConversionError::FromStrError(
+                error.to_string(),
+            ))
+        })?;
+        let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first_mut()
+        else {
+            return Err(RegisterOrGetOidcUserError::ConversionError(
+                ConversionError::FromStrError(
+                    "new user subject index did not produce a batch write".to_string(),
+                ),
+            ));
+        };
+        writes.push((
+            USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+            ByteView::from(self.subject_key()?.into_bytes()),
+            ByteView::from(claims),
+        ));
         Ok(effects)
     }
 
@@ -486,7 +505,6 @@ mod tests {
     use super::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation, RegisterOrGetOidcUserState,
     };
-    use aruna_core::UserId;
     use aruna_core::admin_document_reducer::AdminDocumentReducerState;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{
@@ -502,7 +520,9 @@ mod tests {
     use aruna_core::structs::{Actor, User, oidc_subject_key};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
+    use aruna_core::{USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
     use byteview::ByteView;
+    use std::collections::BTreeSet;
     use ulid::Ulid;
 
     #[tokio::test]
@@ -645,8 +665,20 @@ mod tests {
         }));
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
-                assert_eq!(writes.len(), 1);
-                assert_eq!(writes[0].2.as_ref(), user_id.to_storage_key().as_slice());
+                assert_eq!(writes.len(), 2);
+                assert!(writes.iter().any(|(keyspace, _, value)| {
+                    keyspace == USER_SUBJECT_INDEX_KEYSPACE
+                        && value.as_ref() == user_id.to_storage_key().as_slice()
+                }));
+                let claims = writes
+                    .iter()
+                    .find(|(keyspace, _, _)| keyspace == USER_SUBJECT_CLAIMS_KEYSPACE)
+                    .map(|(_, _, value)| value)
+                    .expect("subject claims write exists");
+                assert_eq!(
+                    postcard::from_bytes::<BTreeSet<UserId>>(claims).expect("claims decode"),
+                    BTreeSet::from([user_id])
+                );
             }
             other => panic!("unexpected subject index write effect: {other:?}"),
         }

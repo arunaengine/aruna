@@ -71,6 +71,39 @@ pub struct AdminDocumentReducerState {
     pub user_name: Option<AdminDocumentAttributeVersion>,
     #[serde(default)]
     pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
+    #[serde(default)]
+    pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
+}
+
+#[derive(Deserialize)]
+struct LegacyAdminDocumentReducerState {
+    target: AdminDocumentTarget,
+    clock: AdminDocumentClock,
+    applied_event_ids: BTreeSet<Ulid>,
+    user_attributes: BTreeMap<String, AdminDocumentAttributeVersion>,
+    conflicts: BTreeMap<String, AdminDocumentConflict>,
+    user_name: Option<AdminDocumentAttributeVersion>,
+    user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
+}
+
+pub fn decode_admin_document_reducer_state(
+    bytes: &[u8],
+) -> Result<AdminDocumentReducerState, postcard::Error> {
+    match postcard::from_bytes(bytes) {
+        Ok(state) => Ok(state),
+        Err(new_error) => postcard::from_bytes::<LegacyAdminDocumentReducerState>(bytes)
+            .map(|legacy| AdminDocumentReducerState {
+                target: legacy.target,
+                clock: legacy.clock,
+                applied_event_ids: legacy.applied_event_ids,
+                user_attributes: legacy.user_attributes,
+                conflicts: legacy.conflicts,
+                user_name: legacy.user_name,
+                user_subject_ids: legacy.user_subject_ids,
+                equivalent_value_dots: BTreeMap::new(),
+            })
+            .map_err(|_| new_error),
+    }
 }
 
 /// Overlays the realm-config placement paths owned by `reducer_state` onto `config`.
@@ -238,6 +271,7 @@ impl AdminDocumentReducerState {
             conflicts: BTreeMap::new(),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         }
     }
 
@@ -1121,38 +1155,51 @@ impl AdminDocumentReducerState {
         current: Option<AdminDocumentAttributeVersion>,
         value: Option<String>,
     ) -> Option<AdminDocumentAttributeVersion> {
-        let dot = event.dot();
-
         if self.event_is_stale_for_path(event, path) {
             return current;
         }
         self.remove_conflict_values_superseded_by(event, path);
 
-        if self.conflict_is_observed(event, path) {
-            self.conflicts.remove(path);
-            return Some(AdminDocumentAttributeVersion { value, dot });
-        }
-
         if self.conflicts.contains_key(path) {
-            self.record_conflict_value(path, value, dot);
+            self.record_conflict_value(path, value.clone(), event.dot());
+            let equal_values = self.conflicts.get(path).is_some_and(|conflict| {
+                conflict
+                    .values
+                    .iter()
+                    .all(|candidate| candidate.value == value)
+            });
+            if equal_values {
+                let dots = self
+                    .conflicts
+                    .remove(path)
+                    .into_iter()
+                    .flat_map(|conflict| conflict.values)
+                    .map(|candidate| candidate.dot)
+                    .collect();
+                return Some(self.version_with_dots(path, value, dots));
+            }
             return None;
         }
 
         let Some(current) = current else {
-            return Some(AdminDocumentAttributeVersion { value, dot });
+            return Some(self.version_with_dots(path, value, BTreeSet::from([event.dot()])));
         };
-
-        if event_observes_dot(event, &current.dot) {
-            return Some(AdminDocumentAttributeVersion { value, dot });
+        let mut unobserved_dots = self.take_version_dots(path, &current);
+        unobserved_dots.retain(|dot| !event_observes_dot(event, dot));
+        if unobserved_dots.is_empty() {
+            return Some(self.version_with_dots(path, value, BTreeSet::from([event.dot()])));
         }
 
         if current.value != value {
-            self.record_conflict_value(path, current.value, current.dot);
-            self.record_conflict_value(path, value, dot);
+            for dot in unobserved_dots {
+                self.record_conflict_value(path, current.value.clone(), dot);
+            }
+            self.record_conflict_value(path, value, event.dot());
             return None;
         }
 
-        Some(current)
+        unobserved_dots.insert(event.dot());
+        Some(self.version_with_dots(path, value, unobserved_dots))
     }
 
     fn reduce_role_value(
@@ -1162,62 +1209,7 @@ impl AdminDocumentReducerState {
         current: Option<AdminDocumentAttributeVersion>,
         value: String,
     ) -> Option<AdminDocumentAttributeVersion> {
-        let dot = event.dot();
-
-        if self.event_is_stale_for_path(event, path) {
-            return current;
-        }
-        self.remove_conflict_values_superseded_by(event, path);
-
-        if self.conflict_is_observed(event, path) {
-            self.conflicts.remove(path);
-            return Some(AdminDocumentAttributeVersion {
-                value: Some(value),
-                dot,
-            });
-        }
-
-        if self.conflicts.contains_key(path) {
-            self.record_conflict_value(path, Some(value), dot);
-            return None;
-        }
-
-        let Some(current) = current else {
-            return Some(AdminDocumentAttributeVersion {
-                value: Some(value),
-                dot,
-            });
-        };
-
-        if current.value.as_deref() == Some(value.as_str()) {
-            if event_observes_dot(event, &current.dot) {
-                return Some(AdminDocumentAttributeVersion {
-                    value: Some(value),
-                    dot,
-                });
-            }
-            return Some(current);
-        }
-
-        if event_observes_dot(event, &current.dot) {
-            return Some(AdminDocumentAttributeVersion {
-                value: Some(value),
-                dot,
-            });
-        }
-
-        self.record_conflict_value(path, current.value, current.dot);
-        self.record_conflict_value(path, Some(value), dot);
-        None
-    }
-
-    fn conflict_is_observed(&self, event: &AdminDocumentEvent, path: &str) -> bool {
-        self.conflicts.get(path).is_some_and(|conflict| {
-            conflict
-                .values
-                .iter()
-                .all(|value| event_observes_dot(event, &value.dot))
-        })
+        self.reduce_value(event, path, current, Some(value))
     }
 
     fn event_is_stale_for_path(&self, event: &AdminDocumentEvent, path: &str) -> bool {
@@ -1227,6 +1219,10 @@ impl AdminDocumentReducerState {
 
         self.version_for_path(path)
             .is_some_and(|version| same_origin_at_or_after(&version.dot))
+            || self
+                .equivalent_value_dots
+                .get(path)
+                .is_some_and(|dots| dots.iter().any(same_origin_at_or_after))
             || self.conflicts.get(path).is_some_and(|conflict| {
                 conflict
                     .values
@@ -1250,15 +1246,39 @@ impl AdminDocumentReducerState {
 
     fn remove_conflict_values_superseded_by(&mut self, event: &AdminDocumentEvent, path: &str) {
         let should_remove_conflict = self.conflicts.get_mut(path).is_some_and(|conflict| {
-            conflict.values.retain(|value| {
-                value.dot.origin_node_id != event.origin_node_id
-                    || value.dot.origin_seq >= event.origin_seq
-            });
+            conflict
+                .values
+                .retain(|value| !event_observes_dot(event, &value.dot));
             conflict.values.is_empty()
         });
         if should_remove_conflict {
             self.conflicts.remove(path);
         }
+    }
+
+    fn take_version_dots(
+        &mut self,
+        path: &str,
+        version: &AdminDocumentAttributeVersion,
+    ) -> BTreeSet<AdminDocumentDot> {
+        let mut dots = self.equivalent_value_dots.remove(path).unwrap_or_default();
+        dots.insert(version.dot);
+        dots
+    }
+
+    fn version_with_dots(
+        &mut self,
+        path: &str,
+        value: Option<String>,
+        mut dots: BTreeSet<AdminDocumentDot>,
+    ) -> AdminDocumentAttributeVersion {
+        let dot = dots.pop_first().expect("admin value has a causal dot");
+        if dots.is_empty() {
+            self.equivalent_value_dots.remove(path);
+        } else {
+            self.equivalent_value_dots.insert(path.to_string(), dots);
+        }
+        AdminDocumentAttributeVersion { value, dot }
     }
 
     fn record_conflict_value(&mut self, path: &str, value: Option<String>, dot: AdminDocumentDot) {
@@ -1674,6 +1694,7 @@ mod tests {
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
     use crate::{NodeId, UserId};
+    use serde::Serialize;
     use std::collections::{BTreeMap, BTreeSet};
     use ulid::Ulid;
 
@@ -1755,6 +1776,35 @@ mod tests {
         AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig {
             realm_id: realm_id(),
         })
+    }
+
+    #[test]
+    fn reducer_state_decodes_without_equivalent_dot_frontier() {
+        #[derive(Serialize)]
+        struct LegacyReducerState {
+            target: AdminDocumentTarget,
+            clock: AdminDocumentClock,
+            applied_event_ids: BTreeSet<Ulid>,
+            user_attributes: BTreeMap<String, super::AdminDocumentAttributeVersion>,
+            conflicts: BTreeMap<String, super::AdminDocumentConflict>,
+            user_name: Option<super::AdminDocumentAttributeVersion>,
+            user_subject_ids: BTreeMap<String, super::AdminDocumentAttributeVersion>,
+        }
+
+        let state = user_state();
+        let legacy = LegacyReducerState {
+            target: state.target.clone(),
+            clock: state.clock.clone(),
+            applied_event_ids: state.applied_event_ids.clone(),
+            user_attributes: state.user_attributes.clone(),
+            conflicts: state.conflicts.clone(),
+            user_name: state.user_name.clone(),
+            user_subject_ids: state.user_subject_ids.clone(),
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = super::decode_admin_document_reducer_state(&bytes).unwrap();
+
+        assert_eq!(decoded, state);
     }
 
     fn event(
@@ -4059,6 +4109,78 @@ mod tests {
             .get(&realm_config_placement_node_path(&config_node))
             .expect("conflict is recorded");
         assert_eq!(conflict.values.len(), 2);
+    }
+
+    #[test]
+    fn equal_concurrent_placement_writes_preserve_causal_frontier() {
+        let config_node = node(11);
+        let origin_a = node(1);
+        let origin_b = node(2);
+        let first_a = realm_config_event(
+            1,
+            origin_a,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(config_node, 100),
+            },
+        );
+        let first_b = realm_config_event(
+            2,
+            origin_b,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(config_node, 100),
+            },
+        );
+        let second_a = realm_config_event(
+            3,
+            origin_a,
+            2,
+            AdminDocumentClock::default().with_observed(origin_a, 1),
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: placement_entry(config_node, 250),
+            },
+        );
+        let events = [first_a, first_b, second_a];
+        let mut states = Vec::new();
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut state = realm_config_state();
+            for index in order {
+                state.apply(&events[index]).unwrap();
+            }
+            states.push(state);
+        }
+
+        for state in &states[1..] {
+            assert_eq!(state, &states[0]);
+        }
+        let state = &states[0];
+        assert!(
+            !state
+                .materialized_realm_config_placement_map()
+                .contains_key(&config_node)
+        );
+        let conflict = state
+            .conflicts
+            .get(&realm_config_placement_node_path(&config_node))
+            .expect("causally concurrent values conflict");
+        assert_eq!(
+            conflict
+                .values
+                .iter()
+                .map(|candidate| candidate.dot)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([events[1].dot(), events[2].dot()])
+        );
     }
 
     #[test]

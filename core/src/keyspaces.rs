@@ -25,6 +25,7 @@ pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
+pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";

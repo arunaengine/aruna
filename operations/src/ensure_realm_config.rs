@@ -177,8 +177,10 @@ impl EnsureRealmConfigOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
-                    .map_err(ConversionError::from)
+                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
+                    value.as_ref(),
+                )
+                .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -820,7 +822,7 @@ mod tests {
         config.default_strategy_id = Some(prior_default);
 
         overlay_realm_config_reducer_materialization(&mut config, &state);
-        assert_eq!(config.default_strategy_id, Some(prior_default));
+        assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
             (

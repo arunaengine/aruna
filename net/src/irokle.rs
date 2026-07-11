@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,11 +8,12 @@ use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
     REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
-    group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
-    group_role_user_assignment_path, overlay_realm_config_placement_reducer_materialization,
-    realm_config_node_id_from_path, realm_config_node_path,
-    realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
-    realm_role_user_assignment_path, user_attribute_path, user_subject_id_path,
+    decode_admin_document_reducer_state, group_role_id_from_path, group_role_path,
+    group_role_user_assignment_from_path, group_role_user_assignment_path,
+    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
+    realm_config_node_path, realm_config_oidc_provider_id_from_path, realm_role_path,
+    realm_role_user_assignment_from_path, realm_role_user_assignment_path, user_attribute_path,
+    user_subject_id_path,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -30,6 +31,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -43,8 +45,7 @@ use aruna_core::storage_entries::{
     metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
     metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
     metadata_registry_delete_entries, metadata_registry_write_entries,
-    stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
-    subject_index_writes,
+    stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, KIND_LABEL_KEY, MetadataRegistryRecord,
@@ -59,6 +60,7 @@ use aruna_core::types::{RoleId, TxnId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
+use globset::Glob;
 use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
 use irokle_crate::TopicControl;
@@ -70,6 +72,7 @@ use irokle_crate::{
     EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
 };
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -87,6 +90,8 @@ pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const MAX_DEFERRED_ADMIN_TOPICS: usize = 1_024;
+const MAX_DEFERRED_ADMIN_TOPICS_PER_DEPENDENCY: usize = 256;
 
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
@@ -113,6 +118,7 @@ pub struct DocumentSyncService {
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     // Genesis tie-break evictions from every admission path (irokle's own
     // accept/resync loops via the net sink, plus this service's bootstrap and
     // batch-sync paths) funnel into this sender; the embedder drains the
@@ -194,6 +200,7 @@ impl DocumentSyncService {
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
         })
@@ -1473,16 +1480,61 @@ impl DocumentSyncService {
         &self,
         topic_ids: impl IntoIterator<Item = irokle_crate::TopicId>,
     ) -> Result<DocumentSyncReconcileResult> {
-        let mut seen_topics = BTreeSet::new();
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        let mut deferred_admin_topics: BTreeMap<
+            AdminEventDependency,
+            BTreeSet<irokle_crate::TopicId>,
+        > = self
+            .storage_read(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                deferred_admin_topics_key(),
+            )
+            .await?
+            .map(|bytes| postcard::from_bytes(&bytes))
+            .transpose()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .unwrap_or_default();
+        let mut queued_topics = BTreeSet::new();
+        let mut topic_queue = VecDeque::new();
+        for topic_id in topic_ids {
+            if queued_topics.insert(topic_id) {
+                topic_queue.push_back(topic_id);
+            }
+        }
+        let mut satisfied_persisted_dependencies = Vec::new();
+        for dependency in deferred_admin_topics.keys().copied().collect::<Vec<_>>() {
+            let available = match dependency {
+                AdminEventDependency::RealmConfig(realm_id) => {
+                    read_admin_realm_config(&self.storage, realm_id)
+                        .await?
+                        .is_some()
+                }
+                AdminEventDependency::RealmAuthorization(realm_id) => {
+                    read_admin_realm_authorization(&self.storage, realm_id)
+                        .await?
+                        .is_some()
+                }
+            };
+            if available {
+                satisfied_persisted_dependencies.push(dependency);
+            }
+        }
+        for dependency in satisfied_persisted_dependencies {
+            if let Some(topics) = deferred_admin_topics.remove(&dependency) {
+                for topic_id in topics {
+                    if queued_topics.insert(topic_id) {
+                        topic_queue.push_back(topic_id);
+                    }
+                }
+            }
+        }
         let mut applied_targets = Vec::new();
         let mut metadata_create_events = Vec::new();
         let mut metadata_graph_tombstones = Vec::new();
         let mut pending_metadata_creates = Vec::new();
         let mut deferred_cursor_writes = Vec::new();
-        for topic_id in topic_ids {
-            if !seen_topics.insert(topic_id) {
-                continue;
-            }
+        while let Some(topic_id) = topic_queue.pop_front() {
+            queued_topics.remove(&topic_id);
             let Some(topic) = self
                 .node
                 .storage()
@@ -1519,6 +1571,8 @@ impl DocumentSyncService {
             // merged clock is the new applied watermark.
             cursor.merge(&topic_clock);
             let mut deferred_creates = false;
+            let mut deferred_admin_events = Vec::new();
+            let mut satisfied_admin_dependencies = BTreeSet::new();
             for (event, actor_id) in events {
                 let target_topic_id = event.target().sync_topic_id();
                 if target_topic_id != topic_id {
@@ -1847,48 +1901,39 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    DocumentSyncEvent::AdminOperation { target, event }
-                        if is_realm_config_placement_operation(&event.op) =>
-                    {
-                        let current_config = match &target {
-                            DocumentSyncTarget::RealmConfig { .. } => match self
-                                .storage_read(
-                                    target.storage_keyspace().to_string(),
-                                    target.storage_key(),
-                                )
-                                .await?
-                            {
-                                Some(bytes) => match RealmConfigDocument::from_bytes(&bytes) {
-                                    Ok(config) => Some(config),
-                                    Err(error) => {
-                                        warn!(
-                                            %topic_id,
-                                            event_id = %event.event_id,
-                                            %error,
-                                            "Rejecting realm config placement admin operation: current realm config is invalid"
-                                        );
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            },
-                            _ => None,
-                        };
-                        if let Err(reason) = validate_replicated_realm_config_placement_event(
+                    DocumentSyncEvent::AdminOperation { target, event } => {
+                        match validate_replicated_admin_event(
+                            &self.storage,
                             topic_id,
                             actor_id,
                             &target,
                             &event,
-                            current_config.as_ref(),
-                        ) {
-                            warn!(
-                                %topic_id,
-                                event_id = %event.event_id,
-                                origin_node_id = %event.origin_node_id,
-                                %reason,
-                                "Rejecting unauthorized realm config placement admin operation"
-                            );
-                            continue;
+                        )
+                        .await?
+                        {
+                            AdminEventValidation::Accepted => {}
+                            AdminEventValidation::Rejected(reason) => {
+                                warn!(
+                                    %topic_id,
+                                    event_id = %event.event_id,
+                                    origin_node_id = %event.origin_node_id,
+                                    %reason,
+                                    "Rejecting invalid or unauthorized admin operation"
+                                );
+                                continue;
+                            }
+                            AdminEventValidation::Deferred { dependency, reason } => {
+                                warn!(
+                                    %topic_id,
+                                    event_id = %event.event_id,
+                                    origin_node_id = %event.origin_node_id,
+                                    %reason,
+                                    "Deferring admin operation until prerequisite state is available"
+                                );
+                                deferred_admin_events
+                                    .push((target, *event, actor_id, dependency, reason));
+                                continue;
+                            }
                         }
 
                         apply_admin_document_operation_to_storage(
@@ -1897,6 +1942,9 @@ impl DocumentSyncService {
                             *event,
                         )
                         .await?;
+                        if let Some(dependency) = satisfied_admin_dependency(&target) {
+                            satisfied_admin_dependencies.insert(dependency);
+                        }
                         applied_targets.push(target);
                     }
                     event => {
@@ -1904,6 +1952,97 @@ impl DocumentSyncService {
                         self.apply_document_event(event).await?;
                         applied_targets.push(target);
                     }
+                }
+            }
+            let mut cross_topic_dependencies = BTreeSet::new();
+            let mut pending = deferred_admin_events;
+            loop {
+                let mut progressed = false;
+                let mut retry = Vec::new();
+                for (target, event, actor_id, _dependency, _previous_reason) in pending {
+                    match validate_replicated_admin_event(
+                        &self.storage,
+                        topic_id,
+                        actor_id,
+                        &target,
+                        &event,
+                    )
+                    .await?
+                    {
+                        AdminEventValidation::Accepted => {
+                            apply_admin_document_operation_to_storage(
+                                &self.storage,
+                                target.clone(),
+                                event,
+                            )
+                            .await?;
+                            if let Some(dependency) = satisfied_admin_dependency(&target) {
+                                satisfied_admin_dependencies.insert(dependency);
+                            }
+                            applied_targets.push(target);
+                            progressed = true;
+                        }
+                        AdminEventValidation::Rejected(reason) => warn!(
+                            %topic_id,
+                            event_id = %event.event_id,
+                            %reason,
+                            "Rejecting deferred admin operation after prerequisite replay"
+                        ),
+                        AdminEventValidation::Deferred { dependency, reason } => {
+                            retry.push((target, event, actor_id, dependency, reason))
+                        }
+                    }
+                }
+                if !progressed {
+                    for (_, event, _, dependency, reason) in retry {
+                        if let Some(dependency) = dependency {
+                            cross_topic_dependencies.insert(dependency);
+                        } else {
+                            warn!(
+                                %topic_id,
+                                event_id = %event.event_id,
+                                reason = %reason,
+                                "Rejecting admin operation whose same-topic prerequisite is absent"
+                            );
+                        }
+                    }
+                    break;
+                }
+                pending = retry;
+                if pending.is_empty() {
+                    break;
+                }
+            }
+            if !cross_topic_dependencies.is_empty() {
+                remove_deferred_admin_topic(&mut deferred_admin_topics, topic_id);
+                let mut registered_dependency = false;
+                for dependency in cross_topic_dependencies {
+                    let total_topics = deferred_admin_topics
+                        .values()
+                        .map(BTreeSet::len)
+                        .sum::<usize>();
+                    let dependency_topics = deferred_admin_topics
+                        .get(&dependency)
+                        .map(BTreeSet::len)
+                        .unwrap_or_default();
+                    if total_topics < MAX_DEFERRED_ADMIN_TOPICS
+                        && dependency_topics < MAX_DEFERRED_ADMIN_TOPICS_PER_DEPENDENCY
+                    {
+                        deferred_admin_topics
+                            .entry(dependency)
+                            .or_default()
+                            .insert(topic_id);
+                        registered_dependency = true;
+                    } else {
+                        warn!(
+                            %topic_id,
+                            ?dependency,
+                            "Dropping admin dependency registration because the deferred-topic registry is full"
+                        );
+                    }
+                }
+                if registered_dependency {
+                    continue;
                 }
             }
             let value = ByteView::from(
@@ -1924,7 +2063,28 @@ impl DocumentSyncService {
                 )
                 .await?;
             }
+            let retry_topics = {
+                remove_deferred_admin_topic(&mut deferred_admin_topics, topic_id);
+                satisfied_admin_dependencies
+                    .into_iter()
+                    .filter_map(|dependency| deferred_admin_topics.remove(&dependency))
+                    .flatten()
+                    .collect::<Vec<_>>()
+            };
+            for retry_topic in retry_topics {
+                if queued_topics.insert(retry_topic) {
+                    topic_queue.push_back(retry_topic);
+                }
+            }
         }
+        self.storage_write(
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            deferred_admin_topics_key(),
+            postcard::to_allocvec(&deferred_admin_topics)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        )
+        .await?;
         self.apply_metadata_create_batch(
             pending_metadata_creates,
             deferred_cursor_writes,
@@ -2892,6 +3052,11 @@ async fn apply_user_admin_document_operation_to_storage(
                 .to_string(),
         ));
     }
+    let changed_subject_id = match &event.op {
+        AdminDocumentOperation::UserSubjectIdAdded { subject_id }
+        | AdminDocumentOperation::UserSubjectIdRemoved { subject_id } => Some(subject_id.clone()),
+        _ => None,
+    };
 
     let previous_state = storage_read_from(
         storage,
@@ -2899,7 +3064,7 @@ async fn apply_user_admin_document_operation_to_storage(
         admin_document_reducer_state_key(&event.target),
     )
     .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
@@ -2939,19 +3104,108 @@ async fn apply_user_admin_document_operation_to_storage(
         admin_document_reducer_state_write_entry(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
-    writes.extend(subject_index_writes(&user));
     writes.extend(
         admin_document_conflict_write_entries(&reducer_state)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
 
-    let mut deletes =
+    let deletes =
         stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
-    deletes.extend(stale_subject_index_deletes(
-        previous_user.as_ref(),
-        Some(&user),
-    ));
-    storage_batch_delete_and_write_transactionally(storage, deletes, writes).await
+    let subject_ids = changed_subject_id
+        .map(|subject_id| vec![subject_id])
+        .unwrap_or_else(|| user.subject_ids.clone());
+    if subject_ids.is_empty() {
+        return storage_batch_delete_and_write_transactionally(storage, deletes, writes).await;
+    }
+
+    for _ in 0..3 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let mut attempt_writes = writes.clone();
+        let mut attempt_deletes = deletes.clone();
+        for subject_id in &subject_ids {
+            let subject_key = subject_index_key(subject_id);
+            let mut claims = match storage_read_from_transaction(
+                storage,
+                USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                subject_key.clone(),
+                Some(txn_id),
+            )
+            .await?
+            {
+                Some(bytes) => postcard::from_bytes::<BTreeSet<UserId>>(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                None => {
+                    let mut claims = BTreeSet::new();
+                    if let Some(bytes) = storage_read_from_transaction(
+                        storage,
+                        USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                        subject_key.clone(),
+                        Some(txn_id),
+                    )
+                    .await?
+                    {
+                        claims.insert(
+                            UserId::from_storage_key(&bytes)
+                                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                        );
+                    }
+                    claims
+                }
+            };
+            if user.subject_ids.contains(subject_id) {
+                claims.insert(user_id);
+            } else {
+                claims.remove(&user_id);
+            }
+
+            if let Some(canonical_user_id) = claims.first().copied() {
+                attempt_writes.push((
+                    USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                    subject_key.clone(),
+                    postcard::to_allocvec(&claims)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                        .into(),
+                ));
+                attempt_writes.push((
+                    USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                    subject_key,
+                    subject_index_value(canonical_user_id),
+                ));
+            } else {
+                attempt_deletes.push((
+                    USER_SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                    subject_key.clone(),
+                ));
+                attempt_deletes.push((USER_SUBJECT_INDEX_KEYSPACE.to_string(), subject_key));
+            }
+        }
+        match storage_batch_delete_and_write_in_transaction(
+            storage,
+            txn_id,
+            attempt_deletes,
+            attempt_writes,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "user subject claim apply conflicted three times".to_string(),
+    ))
 }
 
 async fn group_write_entries_from_reducer(
@@ -3041,7 +3295,7 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
         admin_document_reducer_state_key(&event.target),
     )
     .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
@@ -3135,7 +3389,7 @@ async fn apply_realm_authorization_admin_document_operation_to_storage(
         admin_document_reducer_state_key(&event.target),
     )
     .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
@@ -3239,7 +3493,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
         admin_document_reducer_state_key(&event.target),
     )
     .await?
-    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
     .transpose()
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
@@ -3650,11 +3904,20 @@ async fn storage_read_from(
     key_space: String,
     key: ByteView,
 ) -> Result<Option<Value>> {
+    storage_read_from_transaction(storage, key_space, key, None).await
+}
+
+async fn storage_read_from_transaction(
+    storage: &StorageHandle,
+    key_space: String,
+    key: ByteView,
+    txn_id: Option<TxnId>,
+) -> Result<Option<Value>> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space,
             key,
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -3662,6 +3925,19 @@ async fn storage_read_from(
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync read: {other:?}"
+        ))),
+    }
+}
+
+async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
+    match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while starting document sync transaction: {other:?}"
         ))),
     }
 }
@@ -3818,20 +4094,7 @@ async fn storage_batch_delete_and_write_transactionally(
     deletes: Vec<(String, ByteView)>,
     writes: Vec<(String, ByteView, Value)>,
 ) -> Result<()> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(NetError::Dht(error.to_string()));
-        }
-        other => {
-            return Err(NetError::Dht(format!(
-                "unexpected storage event while starting document sync apply transaction: {other:?}"
-            )));
-        }
-    };
+    let txn_id = start_storage_transaction(storage).await?;
 
     if let Err(error) =
         storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
@@ -3949,86 +4212,678 @@ fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
 }
 
-fn is_realm_config_placement_operation(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
-            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
-            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminOperationFamily {
+    Group,
+    RealmAuthorization,
+    User,
+    RealmConfig,
 }
 
-fn validate_replicated_realm_config_placement_event(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+enum AdminEventDependency {
+    RealmConfig(RealmId),
+    RealmAuthorization(RealmId),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdminEventValidation {
+    Accepted,
+    Rejected(String),
+    Deferred {
+        dependency: Option<AdminEventDependency>,
+        reason: String,
+    },
+}
+
+fn satisfied_admin_dependency(target: &DocumentSyncTarget) -> Option<AdminEventDependency> {
+    match target {
+        DocumentSyncTarget::RealmConfig { realm_id } => {
+            Some(AdminEventDependency::RealmConfig(*realm_id))
+        }
+        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            Some(AdminEventDependency::RealmAuthorization(*realm_id))
+        }
+        _ => None,
+    }
+}
+
+fn remove_deferred_admin_topic(
+    deferred_topics: &mut BTreeMap<AdminEventDependency, BTreeSet<irokle_crate::TopicId>>,
+    topic_id: irokle_crate::TopicId,
+) {
+    for topics in deferred_topics.values_mut() {
+        topics.remove(&topic_id);
+    }
+    deferred_topics.retain(|_, topics| !topics.is_empty());
+}
+
+async fn validate_replicated_admin_event(
+    storage: &StorageHandle,
     topic_id: irokle_crate::TopicId,
     authenticated_actor_id: irokle_crate::ActorId,
     target: &DocumentSyncTarget,
     event: &AdminDocumentEvent,
-    current_config: Option<&RealmConfigDocument>,
-) -> std::result::Result<(), String> {
-    if !is_realm_config_placement_operation(&event.op) {
-        return Err("event is not a realm config placement operation".to_string());
+) -> Result<AdminEventValidation> {
+    let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
+
+    if target.sync_topic_id() != topic_id {
+        return reject("document sync target does not belong to the reconciled topic");
     }
+    if event.origin_node_id != event.actor.node_id {
+        return reject("event origin node does not match its actor node");
+    }
+    let expected_actor_id =
+        irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&event.origin_node_id));
+    if authenticated_actor_id != expected_actor_id {
+        return reject("signed publisher does not match the event origin node");
+    }
+    if event.actor.user_id.realm_id != event.actor.realm_id {
+        return reject("actor user and actor realm do not match");
+    }
+    if event.event_id.is_nil() || event.origin_seq == 0 {
+        return reject("event id and origin sequence must be non-zero");
+    }
+    if event
+        .observed
+        .sequence_for(&event.origin_node_id)
+        .checked_add(1)
+        != Some(event.origin_seq)
+    {
+        return reject("event origin sequence does not follow its observed clock");
+    }
+
+    // This match is deliberately exhaustive. Adding an operation requires an
+    // explicit inbound authorization decision here before it can reach storage.
+    let family = match &event.op {
+        AdminDocumentOperation::GroupRoleAdded { .. }
+        | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
+        | AdminDocumentOperation::GroupRoleCreated { .. }
+        | AdminDocumentOperation::GroupRoleRemoved { .. }
+        | AdminDocumentOperation::GroupCreated { .. } => AdminOperationFamily::Group,
+        AdminDocumentOperation::RealmRoleAdded { .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
+        | AdminDocumentOperation::RealmRoleCreated { .. } => {
+            AdminOperationFamily::RealmAuthorization
+        }
+        AdminDocumentOperation::UserAttributeSet { .. }
+        | AdminDocumentOperation::UserAttributeRemoved { .. }
+        | AdminDocumentOperation::UserNameSet { .. }
+        | AdminDocumentOperation::UserSubjectIdAdded { .. }
+        | AdminDocumentOperation::UserSubjectIdRemoved { .. } => AdminOperationFamily::User,
+        AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+        | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
+        | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
+        | AdminDocumentOperation::RealmConfigSettingsSet { .. }
+        | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
+        | AdminDocumentOperation::RealmConfigQuotaSet { .. }
+        | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
+        | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
+        | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
+        | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
+        | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {
+            AdminOperationFamily::RealmConfig
+        }
+    };
+
+    let target_matches = matches!(
+        (family, target, &event.target),
+        (
+            AdminOperationFamily::Group,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            AdminDocumentTarget::Group { group_id: event_group_id }
+        ) if group_id == event_group_id
+    ) || matches!(
+        (family, target, &event.target),
+        (
+            AdminOperationFamily::RealmAuthorization,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            AdminDocumentTarget::Realm { realm_id: event_realm_id }
+        ) if realm_id == event_realm_id
+    ) || matches!(
+        (family, target, &event.target),
+        (
+            AdminOperationFamily::User,
+            DocumentSyncTarget::User { user_id },
+            AdminDocumentTarget::User { user_id: event_user_id }
+        ) if user_id == event_user_id
+    ) || matches!(
+        (family, target, &event.target),
+        (
+            AdminOperationFamily::RealmConfig,
+            DocumentSyncTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
+        ) if realm_id == event_realm_id
+    );
+    if !target_matches {
+        return reject("operation, sync target, and admin event target do not match");
+    }
+
+    let target_realm = match &event.target {
+        AdminDocumentTarget::Realm { realm_id } | AdminDocumentTarget::RealmConfig { realm_id } => {
+            Some(*realm_id)
+        }
+        AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
+        AdminDocumentTarget::Group { .. } => None,
+    };
+    if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
+        return reject("admin event target and actor realms do not match");
+    }
+
     match &event.op {
+        AdminDocumentOperation::GroupCreated {
+            realm_id, owner, ..
+        } => {
+            if *realm_id != event.actor.realm_id
+                || owner.realm_id != *realm_id
+                || *owner != event.actor.user_id
+                || owner.is_nil()
+            {
+                return reject("group creation realm and owner must match the actor");
+            }
+        }
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { user_id, .. } => {
+            if user_id.realm_id != event.actor.realm_id {
+                return reject("role assignment user belongs to a different realm");
+            }
+        }
+        AdminDocumentOperation::GroupRoleAdded { .. }
+        | AdminDocumentOperation::GroupRoleCreated { .. }
+        | AdminDocumentOperation::GroupRoleRemoved { .. }
+        | AdminDocumentOperation::RealmRoleAdded { .. }
+        | AdminDocumentOperation::RealmRoleCreated { .. }
+        | AdminDocumentOperation::UserAttributeSet { .. }
+        | AdminDocumentOperation::UserAttributeRemoved { .. }
+        | AdminDocumentOperation::UserNameSet { .. }
+        | AdminDocumentOperation::UserSubjectIdAdded { .. }
+        | AdminDocumentOperation::UserSubjectIdRemoved { .. }
+        | AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+        | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
+        | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
+        | AdminDocumentOperation::RealmConfigSettingsSet { .. }
+        | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
+        | AdminDocumentOperation::RealmConfigQuotaSet { .. }
+        | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
+        | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+        | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
+        | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
             if entry.labels.contains_key(KIND_LABEL_KEY) =>
         {
-            return Err(format!(
+            return reject(&format!(
                 "placement entry must not set reserved label {KIND_LABEL_KEY}"
             ));
         }
         AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy }
             if strategy.replica_count == Some(0) =>
         {
-            return Err("placement strategy replica count must be greater than zero".to_string());
+            return reject("placement strategy replica count must be greater than zero");
         }
-        _ => {}
+        AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
+        | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. } => {}
     }
 
-    let DocumentSyncTarget::RealmConfig { realm_id } = target else {
-        return Err("document sync target is not a realm config".to_string());
+    let previous_state = read_admin_reducer_state(storage, &event.target).await?;
+    let authorized = match family {
+        AdminOperationFamily::RealmConfig => {
+            validate_realm_config_admin_authority(storage, event, previous_state.as_ref()).await?
+        }
+        AdminOperationFamily::RealmAuthorization => {
+            validate_realm_authorization_admin_authority(storage, event, previous_state.as_ref())
+                .await?
+        }
+        AdminOperationFamily::Group => validate_group_admin_authority(storage, event).await?,
+        AdminOperationFamily::User => {
+            validate_user_admin_authority(storage, event, previous_state.as_ref()).await?
+        }
     };
-    if target.sync_topic_id() != topic_id {
-        return Err("document sync target does not belong to the reconciled topic".to_string());
+    if !matches!(authorized, AdminEventValidation::Accepted) {
+        return Ok(authorized);
     }
-    let AdminDocumentTarget::RealmConfig {
+
+    let mut reducer_state =
+        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    if reducer_state.target != event.target {
+        return reject("stored admin reducer state has the wrong target");
+    }
+    if let Err(error) = reducer_state.apply(event) {
+        return Ok(AdminEventValidation::Rejected(format!(
+            "admin operation is malformed: {error}"
+        )));
+    }
+
+    Ok(AdminEventValidation::Accepted)
+}
+
+async fn read_admin_reducer_state(
+    storage: &StorageHandle,
+    target: &AdminDocumentTarget,
+) -> Result<Option<AdminDocumentReducerState>> {
+    storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(target),
+    )
+    .await?
+    .map(|bytes| decode_admin_document_reducer_state(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+async fn read_admin_realm_config(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+) -> Result<Option<RealmConfigDocument>> {
+    storage_read_from(
+        storage,
+        DocumentSyncTarget::RealmConfig { realm_id }
+            .storage_keyspace()
+            .to_string(),
+        DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+    )
+    .await?
+    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+async fn read_admin_realm_authorization(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+) -> Result<Option<RealmAuthorizationDocument>> {
+    storage_read_from(
+        storage,
+        DocumentSyncTarget::RealmAuthorization { realm_id }
+            .storage_keyspace()
+            .to_string(),
+        DocumentSyncTarget::RealmAuthorization { realm_id }.storage_key(),
+    )
+    .await?
+    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+}
+
+fn configured_node_kind<'a>(
+    config: &'a RealmConfigDocument,
+    node_id: &NodeId,
+) -> Option<&'a RealmNodeKind> {
+    let node_id = node_id.to_string();
+    config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| &node.kind)
+}
+
+async fn validate_realm_config_admin_authority(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> Result<AdminEventValidation> {
+    let AdminDocumentTarget::RealmConfig { realm_id } = event.target else {
+        return Ok(AdminEventValidation::Rejected(
+            "admin event target is not a realm config".to_string(),
+        ));
+    };
+    let current_config = read_admin_realm_config(storage, realm_id).await?;
+    if let Some(config) = current_config.as_ref() {
+        if config.realm_id != realm_id {
+            return Ok(AdminEventValidation::Rejected(
+                "stored realm config has the wrong realm".to_string(),
+            ));
+        }
+        return Ok(
+            if matches!(
+                configured_node_kind(config, &event.origin_node_id),
+                Some(RealmNodeKind::Management)
+            ) {
+                AdminEventValidation::Accepted
+            } else {
+                AdminEventValidation::Rejected(
+                    "event origin is not a current management node".to_string(),
+                )
+            },
+        );
+    }
+
+    let bootstrap = previous_state.is_none()
+        && matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id,
+                kind: RealmNodeKind::Management,
+            } if *node_id == event.origin_node_id
+        );
+    let continuing_bootstrap = previous_state.is_some_and(|state| {
+        state
+            .materialized_realm_config_nodes()
+            .get(&event.origin_node_id)
+            .is_some_and(|kind| matches!(kind, RealmNodeKind::Management))
+    });
+    Ok(if bootstrap || continuing_bootstrap {
+        AdminEventValidation::Accepted
+    } else {
+        AdminEventValidation::Deferred {
+            dependency: None,
+            reason: "realm config bootstrap must begin with a management node ensuring itself"
+                .to_string(),
+        }
+    })
+}
+
+async fn validate_realm_authorization_admin_authority(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> Result<AdminEventValidation> {
+    let AdminDocumentTarget::Realm { realm_id } = event.target else {
+        return Ok(AdminEventValidation::Rejected(
+            "admin event target is not a realm authorization document".to_string(),
+        ));
+    };
+    let current_config = read_admin_realm_config(storage, realm_id).await?;
+    if let Some(config) = current_config.as_ref() {
+        if config.realm_id != realm_id {
+            return Ok(AdminEventValidation::Rejected(
+                "stored realm config has the wrong realm".to_string(),
+            ));
+        }
+        return Ok(
+            if matches!(
+                configured_node_kind(config, &event.origin_node_id),
+                Some(RealmNodeKind::Management)
+            ) {
+                AdminEventValidation::Accepted
+            } else {
+                AdminEventValidation::Rejected(
+                    "event origin is not a current management node".to_string(),
+                )
+            },
+        );
+    }
+
+    let current_auth = read_admin_realm_authorization(storage, realm_id).await?;
+    let bootstrap = previous_state.is_none()
+        && current_auth.is_none()
+        && event.actor.user_id.is_nil_in(realm_id)
+        && matches!(
+            &event.op,
+            AdminDocumentOperation::RealmRoleCreated { role }
+                if !role.role_id.is_nil()
+                    && role.name == "realm_admin"
+                    && role.permissions == BTreeMap::from([(
+                        format!("/{realm_id}/admin/**"),
+                        aruna_core::structs::Permission::WRITE,
+                    )])
+        );
+    Ok(if bootstrap {
+        AdminEventValidation::Accepted
+    } else {
+        AdminEventValidation::Deferred {
+            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            reason: "current realm config is unavailable".to_string(),
+        }
+    })
+}
+
+async fn validate_group_admin_authority(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+) -> Result<AdminEventValidation> {
+    let AdminDocumentTarget::Group { group_id } = event.target else {
+        return Ok(AdminEventValidation::Rejected(
+            "admin event target is not a group".to_string(),
+        ));
+    };
+    let realm_id = event.actor.realm_id;
+    let Some(config) = read_admin_realm_config(storage, realm_id).await? else {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            reason: "current realm config is unavailable".to_string(),
+        });
+    };
+    if config.realm_id != realm_id || configured_node_kind(&config, &event.origin_node_id).is_none()
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "group admin event origin is not a current realm node".to_string(),
+        ));
+    }
+
+    let group_value = storage_read_from(
+        storage,
+        GROUP_KEYSPACE.to_string(),
+        group_id.to_bytes().into(),
+    )
+    .await?;
+    let group = group_value
+        .map(|bytes| Group::from_bytes(&bytes))
+        .transpose()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+
+    if let AdminDocumentOperation::GroupCreated {
         realm_id: event_realm_id,
-    } = &event.target
-    else {
-        return Err("admin event target is not a realm config".to_string());
+        display_name,
+        owner,
+    } = &event.op
+    {
+        return Ok(match group {
+            None => AdminEventValidation::Accepted,
+            Some(group)
+                if group.group_id == group_id
+                    && group.realm_id == *event_realm_id
+                    && group.display_name == *display_name
+                    && group.owner == *owner =>
+            {
+                AdminEventValidation::Accepted
+            }
+            Some(_) => AdminEventValidation::Rejected(
+                "group creation conflicts with the current group".to_string(),
+            ),
+        });
+    }
+
+    let Some(group) = group else {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: None,
+            reason: "group does not exist".to_string(),
+        });
     };
-    if event_realm_id != realm_id || event.actor.realm_id != *realm_id {
-        return Err("document target, admin event, and actor realms do not match".to_string());
+    if group.group_id != group_id || group.realm_id != realm_id || group.owner.realm_id != realm_id
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "stored group identity does not match the event".to_string(),
+        ));
     }
-    if event.origin_node_id != event.actor.node_id {
-        return Err("event origin node does not match its actor node".to_string());
+    if group.owner == event.actor.user_id {
+        return Ok(AdminEventValidation::Accepted);
+    }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. }
+            if *user_id == event.actor.user_id
+    ) {
+        return Ok(AdminEventValidation::Accepted);
     }
 
-    let expected_actor_id =
-        irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&event.origin_node_id));
-    if authenticated_actor_id != expected_actor_id {
-        return Err("authenticated publisher does not match the event origin node".to_string());
-    }
-
-    let Some(current_config) = current_config else {
-        return Err("current realm config is unavailable".to_string());
+    let realm_auth = read_admin_realm_authorization(storage, realm_id).await?;
+    let group_auth = storage_read_from(
+        storage,
+        DocumentSyncTarget::GroupAuthorization { group_id }
+            .storage_keyspace()
+            .to_string(),
+        DocumentSyncTarget::GroupAuthorization { group_id }.storage_key(),
+    )
+    .await?
+    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let Some(group_auth) = group_auth else {
+        return Ok(AdminEventValidation::Rejected(
+            "group authorization state is unavailable".to_string(),
+        ));
     };
-    if current_config.realm_id != *realm_id {
-        return Err("current realm config does not match the event realm".to_string());
+    let Some(realm_auth) = realm_auth else {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(AdminEventDependency::RealmAuthorization(realm_id)),
+            reason: "realm authorization state is unavailable".to_string(),
+        });
+    };
+    if realm_auth.realm_id != realm_id || group_auth.group_id != group_id {
+        return Ok(AdminEventValidation::Rejected(
+            "stored authorization identity does not match the group".to_string(),
+        ));
     }
-    let origin_node_id = event.origin_node_id.to_string();
-    if !current_config.nodes.iter().any(|node| {
-        node.node_id == origin_node_id && matches!(&node.kind, RealmNodeKind::Management)
-    }) {
-        return Err("event origin is not a current management node".to_string());
+    let path = match &event.op {
+        AdminDocumentOperation::GroupRoleUserAssignmentAdded { user_id, .. }
+        | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { user_id, .. } => {
+            format!("/{realm_id}/g/{group_id}/admin/users/{user_id}")
+        }
+        AdminDocumentOperation::GroupRoleAdded { .. }
+        | AdminDocumentOperation::GroupRoleCreated { .. }
+        | AdminDocumentOperation::GroupRoleRemoved { .. } => {
+            format!("/{realm_id}/g/{group_id}/admin")
+        }
+        AdminDocumentOperation::GroupCreated { .. } => unreachable!(),
+        _ => unreachable!("group authority only receives group operations"),
+    };
+    let allowed = has_current_write_permission(
+        event.actor.user_id,
+        &path,
+        realm_auth.roles.values().chain(group_auth.roles.values()),
+    );
+    Ok(if allowed {
+        AdminEventValidation::Accepted
+    } else {
+        AdminEventValidation::Rejected("actor lacks current group write authority".to_string())
+    })
+}
+
+async fn validate_user_admin_authority(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentReducerState>,
+) -> Result<AdminEventValidation> {
+    let AdminDocumentTarget::User { user_id } = event.target else {
+        return Ok(AdminEventValidation::Rejected(
+            "admin event target is not a user".to_string(),
+        ));
+    };
+    let realm_id = user_id.realm_id;
+    let Some(config) = read_admin_realm_config(storage, realm_id).await? else {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            reason: "current realm config is unavailable".to_string(),
+        });
+    };
+    if config.realm_id != realm_id {
+        return Ok(AdminEventValidation::Rejected(
+            "stored realm config has the wrong realm".to_string(),
+        ));
+    }
+    let Some(origin_kind) = configured_node_kind(&config, &event.origin_node_id) else {
+        return Ok(AdminEventValidation::Rejected(
+            "user admin event origin is not a current realm node".to_string(),
+        ));
+    };
+
+    let current_user = storage_read_from(
+        storage,
+        DocumentSyncTarget::User { user_id }
+            .storage_keyspace()
+            .to_string(),
+        DocumentSyncTarget::User { user_id }.storage_key(),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if current_user
+        .as_ref()
+        .is_some_and(|user| user.user_id != user_id)
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "stored user identity does not match the event".to_string(),
+        ));
     }
 
-    Ok(())
+    let self_service = event.actor.user_id == user_id;
+    let management_bootstrap = event.actor.user_id.is_nil_in(realm_id)
+        && matches!(origin_kind, RealmNodeKind::Management)
+        && event.origin_seq <= 2
+        && previous_state.is_none_or(|state| {
+            state
+                .clock
+                .origins
+                .keys()
+                .all(|origin| *origin == event.origin_node_id)
+        });
+    let realm_admin = if self_service || management_bootstrap {
+        false
+    } else {
+        let Some(auth) = read_admin_realm_authorization(storage, realm_id).await? else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(AdminEventDependency::RealmAuthorization(realm_id)),
+                reason: "realm authorization state is unavailable".to_string(),
+            });
+        };
+        if auth.realm_id != realm_id {
+            return Ok(AdminEventValidation::Rejected(
+                "stored realm authorization has the wrong realm".to_string(),
+            ));
+        }
+        has_current_write_permission(
+            event.actor.user_id,
+            &format!("/{realm_id}/admin/u/{user_id}"),
+            auth.roles.values(),
+        )
+    };
+    if !self_service && !management_bootstrap && !realm_admin {
+        return Ok(AdminEventValidation::Rejected(
+            "actor lacks current user write authority".to_string(),
+        ));
+    }
+
+    Ok(AdminEventValidation::Accepted)
+}
+
+fn has_current_write_permission<'a>(
+    user_id: UserId,
+    path: &str,
+    roles: impl IntoIterator<Item = &'a Role>,
+) -> bool {
+    let mut allowed = false;
+    for role in roles {
+        if user_id.is_nil() || !role.assigned_users.contains(&user_id) {
+            continue;
+        }
+        for (pattern, permission) in &role.permissions {
+            let Ok(glob) = Glob::new(pattern) else {
+                return false;
+            };
+            if !glob.compile_matcher().is_match(path) {
+                continue;
+            }
+            match permission {
+                aruna_core::structs::Permission::DENY => return false,
+                aruna_core::structs::Permission::WRITE => allowed = true,
+                aruna_core::structs::Permission::READ => {}
+            }
+        }
+    }
+    allowed
 }
 
 /// Validates the self-consistency of a replicated node-usage snapshot against
@@ -4181,6 +5036,10 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic_id.as_bytes());
     ByteView::from(key)
+}
+
+fn deferred_admin_topics_key() -> ByteView {
+    ByteView::from(b"deferred-admin-topics".to_vec())
 }
 
 async fn read_inbound_sync_messages(
@@ -4540,7 +5399,7 @@ mod tests {
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
         METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
         METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, USER_KEYSPACE,
-        USER_SUBJECT_INDEX_KEYSPACE,
+        USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataCreateEventPayload;
     use aruna_core::storage_entries::{
@@ -5404,7 +6263,7 @@ mod tests {
         config.default_strategy_id = Some(prior_default);
 
         overlay_realm_config_reducer_materialization(&mut config, &state);
-        assert_eq!(config.default_strategy_id, Some(prior_default));
+        assert_eq!(config.default_strategy_id, None);
 
         for (event_id, actor, strategy_id) in [
             (
@@ -5541,9 +6400,13 @@ mod tests {
 
         let config = read_realm_config_doc(&storage, realm_id).await;
         assert!(config.strategies.is_empty());
-        assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
-        assert_eq!(config.strategy_bindings, vec![binding]);
-        assert_eq!(config.placement_overrides, vec![record]);
+        assert_eq!(config.default_strategy_id, None);
+        assert!(config.strategy_bindings.is_empty());
+        assert_eq!(config.placement_overrides.len(), 1);
+        assert_eq!(config.placement_overrides[0].subject, record.subject);
+        assert_eq!(config.placement_overrides[0].pinned, record.pinned);
+        assert_eq!(config.placement_overrides[0].excluded, record.excluded);
+        assert_eq!(config.placement_overrides[0].strategy_id, None);
 
         let state_value = read_storage_value(
             &storage,
@@ -6821,6 +7684,17 @@ mod tests {
             .await,
             Some(subject_index_value(user_id))
         );
+        let claims = read_storage_value(
+            &storage,
+            USER_SUBJECT_CLAIMS_KEYSPACE,
+            subject_index_key("subject-created"),
+        )
+        .await
+        .expect("subject claims exist");
+        assert_eq!(
+            postcard::from_bytes::<BTreeSet<UserId>>(&claims).expect("claims decode"),
+            BTreeSet::from([user_id])
+        );
     }
 
     #[tokio::test]
@@ -6891,6 +7765,106 @@ mod tests {
             .await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_user_subject_claims_converge_and_promote_on_removal() {
+        let (_left_dir, left) = test_storage();
+        let (_right_dir, right) = test_storage();
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let mut user_ids = [
+            UserId::local(Ulid::from_parts(20, 1), realm_id),
+            UserId::local(Ulid::from_parts(21, 1), realm_id),
+        ];
+        user_ids.sort();
+        let subject_id = "shared-subject".to_string();
+        let actors = [
+            test_actor(20, user_ids[0], realm_id),
+            test_actor(21, user_ids[1], realm_id),
+        ];
+        let additions = actors.each_ref().map(|actor| {
+            test_admin_event(
+                Ulid::new(),
+                AdminDocumentTarget::User {
+                    user_id: actor.user_id,
+                },
+                actor,
+                1,
+                AdminDocumentOperation::UserSubjectIdAdded {
+                    subject_id: subject_id.clone(),
+                },
+            )
+        });
+
+        for (storage, order) in [(&left, [0, 1]), (&right, [1, 0])] {
+            for index in order {
+                apply_user_admin_document_operation_to_storage(
+                    storage,
+                    DocumentSyncTarget::User {
+                        user_id: user_ids[index],
+                    },
+                    additions[index].clone(),
+                )
+                .await
+                .expect("subject claim applies");
+            }
+        }
+
+        for storage in [&left, &right] {
+            let claims = read_storage_value(
+                storage,
+                USER_SUBJECT_CLAIMS_KEYSPACE,
+                subject_index_key(&subject_id),
+            )
+            .await
+            .expect("subject claims exist");
+            assert_eq!(
+                postcard::from_bytes::<BTreeSet<UserId>>(&claims).expect("claims decode"),
+                BTreeSet::from(user_ids)
+            );
+            assert_eq!(
+                read_storage_value(
+                    storage,
+                    USER_SUBJECT_INDEX_KEYSPACE,
+                    subject_index_key(&subject_id),
+                )
+                .await,
+                Some(subject_index_value(user_ids[0]))
+            );
+        }
+
+        let mut removal = test_admin_event(
+            Ulid::new(),
+            AdminDocumentTarget::User {
+                user_id: user_ids[0],
+            },
+            &actors[0],
+            2,
+            AdminDocumentOperation::UserSubjectIdRemoved {
+                subject_id: subject_id.clone(),
+            },
+        );
+        removal.observed.advance(actors[0].node_id, 1);
+        for storage in [&left, &right] {
+            apply_user_admin_document_operation_to_storage(
+                storage,
+                DocumentSyncTarget::User {
+                    user_id: user_ids[0],
+                },
+                removal.clone(),
+            )
+            .await
+            .expect("canonical subject removal applies");
+            assert_eq!(
+                read_storage_value(
+                    storage,
+                    USER_SUBJECT_INDEX_KEYSPACE,
+                    subject_index_key(&subject_id),
+                )
+                .await,
+                Some(subject_index_value(user_ids[1]))
+            );
+        }
     }
 
     #[tokio::test]
@@ -8864,7 +9838,22 @@ mod tests {
             kind,
             placement: aruna_core::structs::PlacementRef::NIL,
         };
-        let actor = test_actor(8, user_id, realm_id);
+        let actor = test_actor(54, user_id, realm_id);
+        assert_eq!(
+            actor.node_id,
+            service.local_node_id().expect("local node id")
+        );
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
         let admin_event = test_admin_event(
             Ulid::from_parts(1_401, 1),
             AdminDocumentTarget::User { user_id },
@@ -8959,206 +9948,581 @@ mod tests {
         service.shutdown().await;
     }
 
-    #[test]
-    fn replicated_realm_config_placement_validation_requires_management_publisher() {
+    #[tokio::test]
+    async fn inbound_admin_validation_rejects_publisher_impersonation_for_every_family() {
+        let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([63; 32]);
-        let other_realm_id = RealmId::from_bytes([64; 32]);
         let user_id = UserId::local(Ulid::from_parts(1_600, 1), realm_id);
         let actor = test_actor(63, user_id, realm_id);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
-        let topic_id = target.sync_topic_id();
-        let authenticated_actor_id =
-            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+        let group_id = Ulid::from_parts(1_601, 1);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
 
-        let entry = NodePlacementEntry {
-            node_id: actor.node_id,
-            location: "eu-west".to_string(),
-            weight: 100,
-            full: false,
-            draining: false,
-            labels: BTreeMap::new(),
-        };
-        let strategy = PlacementStrategy {
-            strategy_id: Ulid::from_parts(1_601, 1),
-            name: "default".to_string(),
-            replica_count: Some(3),
-            distinct_locations: false,
-            affinity: Vec::new(),
-        };
-        let binding = StrategyBinding {
-            scope: BindingScope::Class(DocumentClass::Metadata),
-            strategy_id: strategy.strategy_id,
-        };
-        let record = PlacementOverride {
-            subject: b"placement-subject".to_vec(),
-            pinned: vec![actor.node_id],
-            excluded: Vec::new(),
-            strategy_id: Some(strategy.strategy_id),
-        };
-        let placement_operations = vec![
-            AdminDocumentOperation::RealmConfigNodePlacementSet {
-                entry: entry.clone(),
-            },
-            AdminDocumentOperation::RealmConfigNodePlacementRemoved {
-                node_id: actor.node_id,
-            },
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
-                strategy: strategy.clone(),
-            },
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
-                strategy_id: strategy.strategy_id,
-            },
-            AdminDocumentOperation::RealmConfigDefaultStrategySet {
-                strategy_id: strategy.strategy_id,
-            },
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
-                binding: binding.clone(),
-            },
-            AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
-                scope: binding.scope.clone(),
-            },
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
-                record: record.clone(),
-            },
-            AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
-                subject: record.subject.clone(),
-            },
+        let cases = [
+            (
+                DocumentSyncTarget::RealmConfig { realm_id },
+                test_admin_event(
+                    Ulid::from_parts(1_602, 1),
+                    AdminDocumentTarget::RealmConfig { realm_id },
+                    &actor,
+                    1,
+                    AdminDocumentOperation::RealmConfigDescriptionSet {
+                        description: "forged".to_string(),
+                    },
+                ),
+            ),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                test_admin_event(
+                    Ulid::from_parts(1_603, 1),
+                    AdminDocumentTarget::Realm { realm_id },
+                    &actor,
+                    1,
+                    AdminDocumentOperation::RealmRoleAdded {
+                        role_id: Ulid::from_parts(1_604, 1),
+                    },
+                ),
+            ),
+            (
+                DocumentSyncTarget::User { user_id },
+                test_admin_event(
+                    Ulid::from_parts(1_605, 1),
+                    AdminDocumentTarget::User { user_id },
+                    &actor,
+                    1,
+                    AdminDocumentOperation::UserNameSet {
+                        name: "forged".to_string(),
+                    },
+                ),
+            ),
+            (
+                DocumentSyncTarget::GroupAuthorization { group_id },
+                test_admin_event(
+                    Ulid::from_parts(1_606, 1),
+                    AdminDocumentTarget::Group { group_id },
+                    &actor,
+                    1,
+                    AdminDocumentOperation::GroupCreated {
+                        realm_id,
+                        display_name: "forged".to_string(),
+                        owner: user_id,
+                    },
+                ),
+            ),
         ];
 
-        for (index, op) in placement_operations.into_iter().enumerate() {
-            assert!(is_realm_config_placement_operation(&op));
-            let event = test_admin_event(
-                Ulid::from_parts(1_602 + index as u64, 1),
-                AdminDocumentTarget::RealmConfig { realm_id },
-                &actor,
-                index as u64 + 1,
-                op,
-            );
+        for (target, event) in cases {
+            let topic_id = target.sync_topic_id();
+            let impersonator = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&node(64)));
             assert!(
-                validate_replicated_realm_config_placement_event(
-                    topic_id,
-                    authenticated_actor_id,
-                    &target,
-                    &event,
-                    Some(&config),
-                )
-                .is_ok()
+                matches!(
+                    validate_replicated_admin_event(
+                        &storage,
+                        topic_id,
+                        impersonator,
+                        &target,
+                        &event,
+                    )
+                    .await
+                    .expect("storage succeeds"),
+                    AdminEventValidation::Rejected(_)
+                ),
+                "publisher impersonation must be rejected for {target:?}"
             );
         }
-        assert!(!is_realm_config_placement_operation(
-            &AdminDocumentOperation::RealmConfigDescriptionSet {
-                description: "unrelated".to_string(),
-            }
+    }
+
+    #[tokio::test]
+    async fn inbound_admin_validation_enforces_management_and_preserves_genesis() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([65; 32]);
+        let nil_actor = test_actor(65, UserId::nil(realm_id), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let config_topic = config_target.sync_topic_id();
+        let publisher =
+            irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&nil_actor.node_id));
+        let ensure = test_admin_event(
+            Ulid::from_parts(1_610, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &nil_actor,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: nil_actor.node_id,
+                kind: RealmNodeKind::Management,
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                publisher,
+                &config_target,
+                &ensure,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Accepted
+        );
+        apply_admin_document_operation_to_storage(&storage, config_target.clone(), ensure)
+            .await
+            .expect("bootstrap node applies");
+
+        let mut description = test_admin_event(
+            Ulid::from_parts(1_611, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &nil_actor,
+            2,
+            AdminDocumentOperation::RealmConfigDescriptionSet {
+                description: "genesis".to_string(),
+            },
+        );
+        description.observed.advance(nil_actor.node_id, 1);
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                publisher,
+                &config_target,
+                &description,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Accepted,
+            "the management self-ensure must authorize the rest of config genesis"
+        );
+
+        let (_auth_dir, auth_storage) = test_storage();
+        let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let auth_topic = auth_target.sync_topic_id();
+        let auth_publisher =
+            irokle_crate::actor_id_for(auth_topic, node_id_to_peer_id(&nil_actor.node_id));
+        let genesis_role = test_admin_event(
+            Ulid::from_parts(1_612, 1),
+            AdminDocumentTarget::Realm { realm_id },
+            &nil_actor,
+            1,
+            AdminDocumentOperation::RealmRoleCreated {
+                role: test_admin_role_definition(
+                    Ulid::from_parts(1_613, 1),
+                    "realm_admin",
+                    &format!("/{realm_id}/admin/**"),
+                    Permission::WRITE,
+                ),
+            },
+        );
+        assert_eq!(
+            validate_replicated_admin_event(
+                &auth_storage,
+                auth_topic,
+                auth_publisher,
+                &auth_target,
+                &genesis_role,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Accepted
+        );
+
+        let server_actor = test_actor(66, UserId::local(Ulid::new(), realm_id), realm_id);
+        let mut server_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        server_config.ensure_node(server_actor.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &auth_storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                server_config
+                    .to_bytes(&server_actor)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+        for (target, event) in [
+            (
+                DocumentSyncTarget::RealmConfig { realm_id },
+                test_admin_event(
+                    Ulid::from_parts(1_614, 1),
+                    AdminDocumentTarget::RealmConfig { realm_id },
+                    &server_actor,
+                    1,
+                    AdminDocumentOperation::RealmConfigQuotaSet {
+                        quota: QuotaConfig::default(),
+                    },
+                ),
+            ),
+            (
+                DocumentSyncTarget::RealmAuthorization { realm_id },
+                test_admin_event(
+                    Ulid::from_parts(1_615, 1),
+                    AdminDocumentTarget::Realm { realm_id },
+                    &server_actor,
+                    1,
+                    AdminDocumentOperation::RealmRoleAdded {
+                        role_id: Ulid::new(),
+                    },
+                ),
+            ),
+        ] {
+            let topic_id = target.sync_topic_id();
+            let publisher =
+                irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&server_actor.node_id));
+            assert!(matches!(
+                validate_replicated_admin_event(
+                    &auth_storage,
+                    topic_id,
+                    publisher,
+                    &target,
+                    &event,
+                )
+                .await
+                .expect("storage succeeds"),
+                AdminEventValidation::Rejected(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_admin_validation_rejects_target_and_malformed_events() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([67; 32]);
+        let actor = test_actor(67, UserId::local(Ulid::new(), realm_id), realm_id);
+        let user_id = actor.user_id;
+        let other_user = UserId::local(Ulid::new(), realm_id);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+        let target = DocumentSyncTarget::User { user_id };
+        let topic_id = target.sync_topic_id();
+        let publisher = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
+
+        let wrong_target = test_admin_event(
+            Ulid::from_parts(1_620, 1),
+            AdminDocumentTarget::User {
+                user_id: other_user,
+            },
+            &actor,
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: "wrong".to_string(),
+            },
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(&storage, topic_id, publisher, &target, &wrong_target,)
+                .await
+                .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
         ));
 
-        let valid_event = test_admin_event(
-            Ulid::from_parts(1_620, 1),
-            AdminDocumentTarget::RealmConfig { realm_id },
+        let malformed = test_admin_event(
+            Ulid::from_parts(1_621, 1),
+            AdminDocumentTarget::User { user_id },
             &actor,
-            10,
-            AdminDocumentOperation::RealmConfigNodePlacementSet { entry },
-        );
-
-        let mut wrong_realm = valid_event.clone();
-        wrong_realm.target = AdminDocumentTarget::RealmConfig {
-            realm_id: other_realm_id,
-        };
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &wrong_realm,
-                Some(&config),
-            )
-            .is_err()
-        );
-
-        let mut wrong_actor_realm = valid_event.clone();
-        wrong_actor_realm.actor.realm_id = other_realm_id;
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &wrong_actor_realm,
-                Some(&config),
-            )
-            .is_err()
-        );
-
-        let mut wrong_origin = valid_event.clone();
-        wrong_origin.origin_node_id = node(65);
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &wrong_origin,
-                Some(&config),
-            )
-            .is_err()
-        );
-
-        let wrong_authenticated_actor_id =
-            irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&node(66)));
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                wrong_authenticated_actor_id,
-                &target,
-                &valid_event,
-                Some(&config),
-            )
-            .is_err()
-        );
-
-        let mut server_config = config.clone();
-        server_config.ensure_node(actor.node_id, RealmNodeKind::Server);
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &valid_event,
-                Some(&server_config),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &valid_event,
-                None,
-            )
-            .is_err()
-        );
-
-        let mut invalid_strategy_event = valid_event;
-        invalid_strategy_event.op = AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
-            strategy: PlacementStrategy {
-                replica_count: Some(0),
-                ..strategy
+            1,
+            AdminDocumentOperation::UserAttributeSet {
+                key: "display name".to_string(),
+                value: "invalid".to_string(),
             },
-        };
-        assert!(
-            validate_replicated_realm_config_placement_event(
-                topic_id,
-                authenticated_actor_id,
-                &target,
-                &invalid_strategy_event,
-                Some(&config),
-            )
-            .is_err()
+        );
+        assert!(matches!(
+            validate_replicated_admin_event(&storage, topic_id, publisher, &target, &malformed,)
+                .await
+                .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
+        assert_eq!(
+            read_storage_value(&storage, USER_KEYSPACE, user_id.to_bytes().into()).await,
+            None,
+            "rejected validation must not mutate storage"
         );
     }
 
     #[tokio::test]
-    async fn reconcile_skips_unauthorized_placement_ops_and_advances_cursor() {
+    async fn reconcile_retries_admin_events_deferred_before_realm_config() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(68).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+        )
+        .expect("document sync service opens");
+
+        let realm_id = RealmId::from_bytes([68; 32]);
+        let admin_user_id = UserId::local(Ulid::from_parts(1_625, 1), realm_id);
+        let bootstrap_actor = test_actor(68, UserId::nil(realm_id), realm_id);
+        let admin_actor = test_actor(68, admin_user_id, realm_id);
+        let role_id = Ulid::from_parts(1_626, 1);
+        let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let auth_topic = auth_target.sync_topic_id();
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let config_topic = config_target.sync_topic_id();
+        assert_ne!(auth_topic, config_topic);
+
+        let role = test_admin_event(
+            Ulid::from_parts(1_627, 1),
+            AdminDocumentTarget::Realm { realm_id },
+            &bootstrap_actor,
+            1,
+            AdminDocumentOperation::RealmRoleCreated {
+                role: test_admin_role_definition(
+                    role_id,
+                    "realm_admin",
+                    &format!("/{realm_id}/admin/**"),
+                    Permission::WRITE,
+                ),
+            },
+        );
+        let mut assignment = test_admin_event(
+            Ulid::from_parts(1_628, 1),
+            AdminDocumentTarget::Realm { realm_id },
+            &admin_actor,
+            2,
+            AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                role_id,
+                user_id: admin_user_id,
+            },
+        );
+        assignment.observed.advance(admin_actor.node_id, 1);
+        let ensure = test_admin_event(
+            Ulid::from_parts(1_629, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &bootstrap_actor,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: bootstrap_actor.node_id,
+                kind: RealmNodeKind::Management,
+            },
+        );
+        let mut settings = test_admin_event(
+            Ulid::from_parts(1_630, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &bootstrap_actor,
+            2,
+            AdminDocumentOperation::RealmConfigSettingsSet {
+                metadata_replication: MetadataReplicationConfig::new(3),
+                discovery: test_discovery(68, "https://management.example:443"),
+            },
+        );
+        settings.observed.advance(bootstrap_actor.node_id, 1);
+
+        for (target, events) in [
+            (
+                auth_target.clone(),
+                vec![Box::new(role), Box::new(assignment)],
+            ),
+            (
+                config_target.clone(),
+                vec![Box::new(settings), Box::new(ensure)],
+            ),
+        ] {
+            let documents = events
+                .into_iter()
+                .map(|event| DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event,
+                    allow_genesis: true,
+                })
+                .collect();
+            assert!(matches!(
+                service.publish_documents(documents, Vec::new()).await,
+                DocumentSyncNetEvent::DocumentsPublished { .. }
+            ));
+            service
+                .storage_write(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(target.sync_topic_id()),
+                    ByteView::from(
+                        postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                            .expect("clock serializes"),
+                    ),
+                )
+                .await
+                .expect("cursor resets");
+        }
+
+        service
+            .reconcile_document_topics([auth_topic])
+            .await
+            .expect("realm authorization reconciliation defers the assignment");
+        let auth_before_config = read_realm_auth_doc(&storage, realm_id).await;
+        assert!(
+            auth_before_config
+                .roles
+                .get(&role_id)
+                .expect("bootstrap role exists")
+                .assigned_users
+                .is_empty(),
+            "the assignment must wait for realm configuration"
+        );
+        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(auth_topic),
+            )
+            .await
+            .expect("deferred cursor remains stored"),
+        )
+        .expect("cursor decodes");
+        let auth_clock = service
+            .node()
+            .storage()
+            .actor_clock(&auth_topic)
+            .expect("auth topic clock");
+        assert!(!deferred_cursor.dominates(&auth_clock));
+        let deferred_topics: BTreeMap<AdminEventDependency, BTreeSet<irokle_crate::TopicId>> =
+            postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    deferred_admin_topics_key(),
+                )
+                .await
+                .expect("deferred topic registry is persisted"),
+            )
+            .expect("deferred topic registry decodes");
+        assert_eq!(
+            deferred_topics
+                .get(&AdminEventDependency::RealmConfig(realm_id))
+                .and_then(|topics| topics.get(&auth_topic)),
+            Some(&auth_topic)
+        );
+        assert!(
+            service
+                .document_topic_ids()
+                .expect("document topics list")
+                .contains(&auth_topic),
+            "deferred auth topic must remain discoverable"
+        );
+
+        let result = service
+            .reconcile_document_topics([config_topic])
+            .await
+            .expect("realm config reconciliation retries deferred admin topics");
+        assert!(result.targets.contains(&config_target));
+        assert!(
+            result.targets.contains(&auth_target),
+            "realm authorization target was not retried: {:?}",
+            result.targets
+        );
+        let auth = read_realm_auth_doc(&storage, realm_id).await;
+        assert!(
+            auth.roles
+                .get(&role_id)
+                .expect("realm admin role exists")
+                .assigned_users
+                .contains(&admin_user_id),
+            "the deferred assignment must apply after realm configuration"
+        );
+        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(auth_topic),
+            )
+            .await
+            .expect("applied cursor is stored"),
+        )
+        .expect("cursor decodes");
+        assert!(applied_cursor.dominates(&auth_clock));
+
+        let group_id = Ulid::from_parts(1_631, 1);
+        let group_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let group_role_id = Ulid::from_parts(1_632, 1);
+        let mut group_role = test_admin_event(
+            Ulid::from_parts(1_633, 1),
+            AdminDocumentTarget::Group { group_id },
+            &admin_actor,
+            2,
+            AdminDocumentOperation::GroupRoleCreated {
+                role: test_admin_role_definition(
+                    group_role_id,
+                    "member",
+                    &format!("/{realm_id}/g/{group_id}/**"),
+                    Permission::WRITE,
+                ),
+            },
+        );
+        group_role.observed.advance(admin_actor.node_id, 1);
+        let group_create = test_admin_event(
+            Ulid::from_parts(1_634, 1),
+            AdminDocumentTarget::Group { group_id },
+            &admin_actor,
+            1,
+            AdminDocumentOperation::GroupCreated {
+                realm_id,
+                display_name: "reordered".to_string(),
+                owner: admin_user_id,
+            },
+        );
+        assert!(matches!(
+            service
+                .publish_documents(
+                    vec![
+                        DocumentSyncPublish::AdminOperation {
+                            target: group_target.clone(),
+                            event: Box::new(group_role),
+                            allow_genesis: true,
+                        },
+                        DocumentSyncPublish::AdminOperation {
+                            target: group_target.clone(),
+                            event: Box::new(group_create),
+                            allow_genesis: true,
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .await,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(group_target.sync_topic_id()),
+                postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                    .expect("clock serializes")
+                    .into(),
+            )
+            .await
+            .expect("group cursor resets");
+        service
+            .reconcile_document_topics([group_target.sync_topic_id()])
+            .await
+            .expect("same-topic group prerequisite is retried");
+        assert!(
+            read_group_auth_doc(&storage, group_id)
+                .await
+                .roles
+                .contains_key(&group_role_id)
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_rejected_admin_ops_and_advances_cursor() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
         let service = DocumentSyncService::open_with_persist_policy(
@@ -9228,7 +10592,7 @@ mod tests {
                 entry: placement_entry(node(91)),
             },
         );
-        let reducer_invalid_event = test_admin_event(
+        let mut reducer_invalid_event = test_admin_event(
             Ulid::from_parts(1_633, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
             &local_actor,
@@ -9243,7 +10607,10 @@ mod tests {
                 },
             },
         );
-        let valid_event = test_admin_event(
+        reducer_invalid_event
+            .observed
+            .advance(local_actor.node_id, 1);
+        let mut valid_event = test_admin_event(
             Ulid::from_parts(1_634, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
             &local_actor,
@@ -9252,8 +10619,9 @@ mod tests {
                 entry: placement_entry(local_actor.node_id),
             },
         );
-        // This deliberately has the same publisher/claimed-actor mismatch as the
-        // rejected placement event. Unrelated admin operations keep their prior behavior.
+        valid_event.observed.advance(local_actor.node_id, 2);
+        // Non-placement admin operations use the same publisher binding and must
+        // not retain the old generic bypass.
         let unrelated_event = test_admin_event(
             Ulid::from_parts(1_635, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
@@ -9320,7 +10688,7 @@ mod tests {
         assert!(result.targets.contains(&target));
 
         let config = read_realm_config_doc(&storage, realm_id).await;
-        assert_eq!(config.description, "unrelated operation applied");
+        assert_eq!(config.description, "");
         assert_eq!(
             config.placement_map,
             vec![placement_entry(local_actor.node_id)]
@@ -9342,7 +10710,7 @@ mod tests {
             .expect("topic clock");
         assert!(
             cursor.dominates(&topic_clock),
-            "cursor must advance past unauthorized placement events"
+            "cursor must advance past rejected admin events"
         );
 
         service.shutdown().await;
