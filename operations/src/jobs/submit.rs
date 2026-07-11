@@ -59,7 +59,10 @@ enum SubmitState {
     Error,
 }
 
-/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the existing id.
+/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the existing
+/// id. Dedup is best-effort (read-then-write, no cross-submit lock), so under a
+/// concurrent race two jobs may share a key. Execution is at-least-once: consumers
+/// must be idempotent (`Probe`'s marker file is the example).
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
