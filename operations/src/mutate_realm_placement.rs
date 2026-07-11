@@ -565,6 +565,7 @@ mod tests {
             replica_count: Some(2),
             distinct_locations: true,
             affinity: Vec::new(),
+            shard_count: 64,
         }
     }
 
@@ -868,6 +869,7 @@ mod tests {
             name: "affinity".to_string(),
             replica_count: None,
             distinct_locations: false,
+            shard_count: 64,
             affinity: vec![aruna_core::structs::AffinityRule {
                 matcher: aruna_core::structs::LabelMatch {
                     key: "tier".to_string(),

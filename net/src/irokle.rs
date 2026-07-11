@@ -40,16 +40,16 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
-    document_sync_revision_write_entry,
-    metadata_create_event_and_pending_projection_write_entries, metadata_document_lifecycle_key,
-    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
-    metadata_graph_lifecycle_write_entry, metadata_graph_prune_job_write_entry,
-    metadata_registry_delete_entries, metadata_registry_write_entries, shard_manifest_write_entry,
+    document_sync_revision_write_entry, metadata_create_event_and_pending_projection_write_entries,
+    metadata_document_lifecycle_key, metadata_document_lifecycle_write_entry,
+    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
+    metadata_registry_write_entries, shard_manifest_write_entry,
     stale_admin_document_conflict_delete_entries, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, KIND_LABEL_KEY, MetadataRegistryRecord,
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot,
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NodeInfoDocument, NodeUsageSnapshot, PlacementRef,
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, Role, User,
     WatchEventMask, WatchInterestDigest, WatchSubscription, group_owner_index_key,
     node_usage_key_node_id, watch_interest_dirty_key, watch_interest_key_node_id,
@@ -2030,13 +2030,19 @@ impl DocumentSyncService {
                         );
                         continue;
                     }
-                    DocumentSyncEvent::AdminOperation { target, event } => {
+                    DocumentSyncEvent::AdminOperation {
+                        target,
+                        event,
+                        placement,
+                    } => {
                         match validate_replicated_admin_event(
                             &self.storage,
                             topic_id,
                             actor_id,
                             &target,
                             &event,
+                            self.realm_id,
+                            &placement,
                         )
                         .await?
                         {
@@ -2059,8 +2065,9 @@ impl DocumentSyncService {
                                     %reason,
                                     "Deferring admin operation until prerequisite state is available"
                                 );
-                                deferred_admin_events
-                                    .push((target, *event, actor_id, dependency, reason));
+                                deferred_admin_events.push((
+                                    target, *event, placement, actor_id, dependency, reason,
+                                ));
                                 continue;
                             }
                         }
@@ -2088,13 +2095,15 @@ impl DocumentSyncService {
             loop {
                 let mut progressed = false;
                 let mut retry = Vec::new();
-                for (target, event, actor_id, _dependency, _previous_reason) in pending {
+                for (target, event, placement, actor_id, _dependency, _previous_reason) in pending {
                     match validate_replicated_admin_event(
                         &self.storage,
                         topic_id,
                         actor_id,
                         &target,
                         &event,
+                        self.realm_id,
+                        &placement,
                     )
                     .await?
                     {
@@ -2118,12 +2127,12 @@ impl DocumentSyncService {
                             "Rejecting deferred admin operation after prerequisite replay"
                         ),
                         AdminEventValidation::Deferred { dependency, reason } => {
-                            retry.push((target, event, actor_id, dependency, reason))
+                            retry.push((target, event, placement, actor_id, dependency, reason))
                         }
                     }
                 }
                 if !progressed {
-                    for (_, event, _, dependency, reason) in retry {
+                    for (_, event, _, _, dependency, reason) in retry {
                         if let Some(dependency) = dependency {
                             cross_topic_dependencies.insert(dependency);
                         } else {
@@ -3948,7 +3957,7 @@ async fn metadata_document_lifecycle_write_entries_if_current(
         document_sync_revision_write_entry(&target, change)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     );
-    if let Some(manifest) = shard_manifest_write_entry(&target, &revision)
+    if let Some(manifest) = shard_manifest_write_entry(&target, change)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?
     {
         entries.push(manifest);
@@ -4402,10 +4411,12 @@ async fn validate_replicated_admin_event(
     authenticated_actor_id: irokle_crate::ActorId,
     target: &DocumentSyncTarget,
     event: &AdminDocumentEvent,
+    realm_id: RealmId,
+    placement: &PlacementRef,
 ) -> Result<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
-    if target.sync_topic_id() != topic_id {
+    if target.sync_topic_id(realm_id, placement) != topic_id {
         return reject("document sync target does not belong to the reconciled topic");
     }
     if event.origin_node_id != event.actor.node_id {
@@ -5813,6 +5824,14 @@ mod tests {
         }
     }
 
+    fn admin_test_placement() -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_parts(9_990, 1),
+            epoch: 0,
+            shard: 0,
+        }
+    }
+
     fn test_admin_event(
         event_id: Ulid,
         target: AdminDocumentTarget,
@@ -6523,6 +6542,7 @@ mod tests {
             replica_count: Some(3),
             distinct_locations: false,
             affinity: Vec::new(),
+            shard_count: 64,
         };
         apply_admin_document_operation_to_storage(
             &storage,
@@ -9417,26 +9437,11 @@ mod tests {
             Ulid::from_parts(43, 1),
             record.last_event_id,
         );
-        let realm_id = RealmId::from_bytes([42; 32]);
-        let placement_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-        let placement = aruna_core::document::PendingDocumentPlacement {
-            realm_id,
-            target: placement_target.clone(),
-            group_id: Some(group_id),
-            metadata_path: Some(record.document_path.clone()),
-            desired_holder_count: 1,
-            selected_holders: record.holder_node_ids.clone(),
-            updated_at: 1,
-            origin_node_id: node(1),
-            placement: aruna_core::structs::PlacementRef::NIL,
-        };
         storage_batch_write_to(
             &storage,
             vec![
                 metadata_document_lifecycle_write_entry(&lifecycle)
                     .expect("lifecycle entry builds"),
-                aruna_core::storage_entries::document_placement_write_entry(&placement)
-                    .expect("placement entry builds"),
             ],
         )
         .await
@@ -9473,15 +9478,6 @@ mod tests {
             .await
             .is_none()
         );
-        assert!(
-            read_storage_value(
-                &storage,
-                aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE,
-                aruna_core::storage_entries::document_placement_key(realm_id, &placement_target,),
-            )
-            .await
-            .is_none()
-        );
     }
 
     #[tokio::test]
@@ -9497,6 +9493,7 @@ mod tests {
         let placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(4, 4),
             epoch: 7,
+            shard: 3,
         };
         let change = aruna_core::storage_entries::metadata_document_lifecycle_revision_change(
             &lifecycle,
@@ -9599,6 +9596,7 @@ mod tests {
         local_change.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(25, 1),
             epoch: 9,
+            shard: 5,
         };
         assert!(
             apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, local_change,)
@@ -10301,7 +10299,8 @@ mod tests {
         ];
 
         for (target, event) in cases {
-            let topic_id = target.sync_topic_id();
+            let placement = admin_test_placement();
+            let topic_id = target.sync_topic_id(realm_id, &placement);
             let impersonator = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&node(64)));
             assert!(
                 matches!(
@@ -10311,6 +10310,8 @@ mod tests {
                         impersonator,
                         &target,
                         &event,
+                        realm_id,
+                        &placement,
                     )
                     .await
                     .expect("storage succeeds"),
@@ -10327,7 +10328,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([65; 32]);
         let nil_actor = test_actor(65, UserId::nil(realm_id), realm_id);
         let config_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let config_topic = config_target.sync_topic_id();
+        let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let publisher =
             irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&nil_actor.node_id));
         let ensure = test_admin_event(
@@ -10347,6 +10348,8 @@ mod tests {
                 publisher,
                 &config_target,
                 &ensure,
+                realm_id,
+                &PlacementRef::NIL,
             )
             .await
             .expect("storage succeeds"),
@@ -10373,6 +10376,8 @@ mod tests {
                 publisher,
                 &config_target,
                 &description,
+                realm_id,
+                &PlacementRef::NIL,
             )
             .await
             .expect("storage succeeds"),
@@ -10382,7 +10387,7 @@ mod tests {
 
         let (_auth_dir, auth_storage) = test_storage();
         let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-        let auth_topic = auth_target.sync_topic_id();
+        let auth_topic = auth_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let auth_publisher =
             irokle_crate::actor_id_for(auth_topic, node_id_to_peer_id(&nil_actor.node_id));
         let genesis_role = test_admin_event(
@@ -10406,6 +10411,8 @@ mod tests {
                 auth_publisher,
                 &auth_target,
                 &genesis_role,
+                realm_id,
+                &PlacementRef::NIL,
             )
             .await
             .expect("storage succeeds"),
@@ -10453,7 +10460,8 @@ mod tests {
                 ),
             ),
         ] {
-            let topic_id = target.sync_topic_id();
+            let placement = admin_test_placement();
+            let topic_id = target.sync_topic_id(realm_id, &placement);
             let publisher =
                 irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&server_actor.node_id));
             assert!(matches!(
@@ -10463,6 +10471,8 @@ mod tests {
                     publisher,
                     &target,
                     &event,
+                    realm_id,
+                    &placement,
                 )
                 .await
                 .expect("storage succeeds"),
@@ -10490,7 +10500,8 @@ mod tests {
         .await
         .expect("config writes");
         let target = DocumentSyncTarget::User { user_id };
-        let topic_id = target.sync_topic_id();
+        let placement = admin_test_placement();
+        let topic_id = target.sync_topic_id(realm_id, &placement);
         let publisher = irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&actor.node_id));
 
         let wrong_target = test_admin_event(
@@ -10505,9 +10516,17 @@ mod tests {
             },
         );
         assert!(matches!(
-            validate_replicated_admin_event(&storage, topic_id, publisher, &target, &wrong_target,)
-                .await
-                .expect("storage succeeds"),
+            validate_replicated_admin_event(
+                &storage,
+                topic_id,
+                publisher,
+                &target,
+                &wrong_target,
+                realm_id,
+                &placement,
+            )
+            .await
+            .expect("storage succeeds"),
             AdminEventValidation::Rejected(_)
         ));
 
@@ -10522,9 +10541,11 @@ mod tests {
             },
         );
         assert!(matches!(
-            validate_replicated_admin_event(&storage, topic_id, publisher, &target, &malformed,)
-                .await
-                .expect("storage succeeds"),
+            validate_replicated_admin_event(
+                &storage, topic_id, publisher, &target, &malformed, realm_id, &placement,
+            )
+            .await
+            .expect("storage succeeds"),
             AdminEventValidation::Rejected(_)
         ));
         assert_eq!(
@@ -10538,6 +10559,7 @@ mod tests {
     async fn reconcile_retries_admin_events_deferred_before_realm_config() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([68; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(68).await,
             storage.clone(),
@@ -10546,18 +10568,18 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
-        let realm_id = RealmId::from_bytes([68; 32]);
         let admin_user_id = UserId::local(Ulid::from_parts(1_625, 1), realm_id);
         let bootstrap_actor = test_actor(68, UserId::nil(realm_id), realm_id);
         let admin_actor = test_actor(68, admin_user_id, realm_id);
         let role_id = Ulid::from_parts(1_626, 1);
         let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-        let auth_topic = auth_target.sync_topic_id();
+        let auth_topic = auth_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let config_target = DocumentSyncTarget::RealmConfig { realm_id };
-        let config_topic = config_target.sync_topic_id();
+        let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
         assert_ne!(auth_topic, config_topic);
 
         let role = test_admin_event(
@@ -10622,6 +10644,7 @@ mod tests {
                 .map(|event| DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event,
+                    placement: PlacementRef::NIL,
                     allow_genesis: true,
                 })
                 .collect();
@@ -10632,7 +10655,7 @@ mod tests {
             service
                 .storage_write(
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    topic_cursor_key(target.sync_topic_id()),
+                    topic_cursor_key(target.sync_topic_id(realm_id, &PlacementRef::NIL)),
                     ByteView::from(
                         postcard::to_allocvec(&irokle_crate::ActorClock::default())
                             .expect("clock serializes"),
@@ -10730,6 +10753,7 @@ mod tests {
 
         let group_id = Ulid::from_parts(1_631, 1);
         let group_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let group_placement = admin_test_placement();
         let group_role_id = Ulid::from_parts(1_632, 1);
         let mut group_role = test_admin_event(
             Ulid::from_parts(1_633, 1),
@@ -10764,11 +10788,13 @@ mod tests {
                         DocumentSyncPublish::AdminOperation {
                             target: group_target.clone(),
                             event: Box::new(group_role),
+                            placement: group_placement,
                             allow_genesis: true,
                         },
                         DocumentSyncPublish::AdminOperation {
                             target: group_target.clone(),
                             event: Box::new(group_create),
+                            placement: group_placement,
                             allow_genesis: true,
                         },
                     ],
@@ -10780,7 +10806,7 @@ mod tests {
         service
             .storage_write(
                 DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                topic_cursor_key(group_target.sync_topic_id()),
+                topic_cursor_key(group_target.sync_topic_id(realm_id, &group_placement)),
                 postcard::to_allocvec(&irokle_crate::ActorClock::default())
                     .expect("clock serializes")
                     .into(),
@@ -10788,7 +10814,7 @@ mod tests {
             .await
             .expect("group cursor resets");
         service
-            .reconcile_document_topics([group_target.sync_topic_id()])
+            .reconcile_document_topics([group_target.sync_topic_id(realm_id, &group_placement)])
             .await
             .expect("same-topic group prerequisite is retried");
         assert!(
@@ -10805,6 +10831,7 @@ mod tests {
     async fn reconcile_skips_rejected_admin_ops_and_advances_cursor() {
         let (_storage_dir, storage) = test_storage();
         let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([63; 32]);
         let service = DocumentSyncService::open_with_persist_policy(
             test_endpoint(63).await,
             storage.clone(),
@@ -10813,10 +10840,10 @@ mod tests {
             vec![Alpn::DocumentSync.as_bytes().to_vec()],
             irokle_crate::net::IrohRuntimeConfig::default(),
             FjallPersistPolicy::Buffer,
+            realm_id,
         )
         .expect("document sync service opens");
 
-        let realm_id = RealmId::from_bytes([63; 32]);
         let other_realm_id = RealmId::from_bytes([64; 32]);
         let user_id = UserId::local(Ulid::from_parts(1_630, 1), realm_id);
         let local_actor = test_actor(63, user_id, realm_id);
@@ -10827,7 +10854,7 @@ mod tests {
         );
 
         let target = DocumentSyncTarget::RealmConfig { realm_id };
-        let topic_id = target.sync_topic_id();
+        let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
         config.ensure_node(claimed_actor.node_id, RealmNodeKind::Management);
@@ -10884,6 +10911,7 @@ mod tests {
                     replica_count: Some(0),
                     distinct_locations: false,
                     affinity: Vec::new(),
+                    shard_count: 64,
                 },
             },
         );
@@ -10918,26 +10946,31 @@ mod tests {
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(wrong_realm_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(impersonated_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(reducer_invalid_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(valid_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                     DocumentSyncPublish::AdminOperation {
                         target: target.clone(),
                         event: Box::new(unrelated_event),
+                        placement: PlacementRef::NIL,
                         allow_genesis: true,
                     },
                 ],
