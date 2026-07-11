@@ -24,6 +24,7 @@ use aruna_operations::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketInput, IssueOnboardingSyncTicketOperation,
     ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
+use aruna_operations::jobs::runtime::JobsRuntime;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
@@ -63,6 +64,7 @@ pub struct ServerState {
     node_id: NodeId,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
+    jobs_runtime: Arc<JobsRuntime>,
     interface_state: Arc<RwLock<InterfaceRuntimeState>>,
     portal: Arc<RwLock<PortalRuntimeState>>,
     // Per-node Prometheus registry shared with the S3 server and ops listener.
@@ -131,6 +133,7 @@ impl ServerState {
         node_capabilities: NodeCapabilities,
         claim_initial_admin_enabled: bool,
         oidc_validator: Option<Arc<OidcValidator>>,
+        jobs_runtime: Arc<JobsRuntime>,
     ) -> Self {
         let token_revocation_list = load_persisted_state::<HashSet<String, ahash::RandomState>>(
             driver_ctx.as_ref(),
@@ -159,6 +162,7 @@ impl ServerState {
             realm_id,
             node_id,
             oidc_validator,
+            jobs_runtime,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
@@ -185,6 +189,10 @@ impl ServerState {
     pub fn with_metrics(mut self, metrics: Arc<NodeMetrics>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {
+        self.jobs_runtime.clone()
     }
     pub fn get_pubkey(&self) -> [u8; 113] {
         match self.node_capabilities {

@@ -3050,6 +3050,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -3366,6 +3367,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -3416,6 +3418,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         )

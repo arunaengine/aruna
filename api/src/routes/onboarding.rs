@@ -707,6 +707,7 @@ mod tests {
                 NodeCapabilities::management_node(realm_signing_key).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

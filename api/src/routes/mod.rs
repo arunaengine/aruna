@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod drs;
 pub mod groups;
 pub mod info;
+pub mod jobs;
 pub mod metadata;
 pub mod notifications;
 pub mod onboarding;
@@ -27,6 +28,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
+        .merge(jobs::router())
         .merge(metadata::router())
         .merge(notifications::router())
         .merge(users::router())
