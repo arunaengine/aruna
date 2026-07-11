@@ -27,57 +27,142 @@ use ulid::Ulid;
 
 mod failing_close {
     use opendal::raw::oio;
-    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
-    use opendal::{Buffer, Capability, Error, ErrorKind, Metadata, Operator, OperatorBuilder};
+    use opendal::raw::{
+        OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+        RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo,
+    };
+    use opendal::{
+        Buffer, Builder, Capability, Error, ErrorKind, Metadata, OperationContext, Operator,
+    };
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    #[derive(Debug)]
-    pub(super) struct CloseFailsBackend {
-        info: Arc<AccessorInfo>,
+    fn unsupported<T>() -> opendal::Result<T> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "operation is not supported",
+        ))
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct CloseFailsBuilder {
         aborts: Arc<AtomicUsize>,
     }
 
-    impl CloseFailsBackend {
-        fn new(aborts: Arc<AtomicUsize>) -> Self {
-            let info = AccessorInfo::default();
-            info.set_scheme("close_fails")
-                .set_root("/")
-                .set_native_capability(Capability {
-                    write: true,
-                    write_can_empty: true,
-                    write_can_multi: true,
-                    ..Default::default()
-                });
-            Self {
-                info: info.into(),
-                aborts,
-            }
+    impl Builder for CloseFailsBuilder {
+        type Config = ();
+
+        fn build(self) -> opendal::Result<impl Service> {
+            Ok(CloseFailsBackend {
+                aborts: self.aborts,
+            })
         }
     }
 
-    impl Access for CloseFailsBackend {
+    #[derive(Debug)]
+    pub(super) struct CloseFailsBackend {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl Service for CloseFailsBackend {
         type Reader = ();
         type Writer = CloseFailsWriter;
         type Lister = ();
         type Deleter = ();
         type Copier = ();
 
-        fn info(&self) -> Arc<AccessorInfo> {
-            self.info.clone()
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::new("close_fails", "/", "")
         }
 
-        async fn write(
+        fn capability(&self) -> Capability {
+            Capability {
+                write: true,
+                write_can_empty: true,
+                write_can_multi: true,
+                ..Default::default()
+            }
+        }
+
+        fn write(
             &self,
+            _ctx: &OperationContext,
             _path: &str,
             _args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((
-                RpWrite::new(),
-                CloseFailsWriter {
-                    aborts: self.aborts.clone(),
-                },
-            ))
+        ) -> opendal::Result<Self::Writer> {
+            Ok(CloseFailsWriter {
+                aborts: self.aborts.clone(),
+            })
+        }
+
+        async fn create_dir(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            unsupported()
+        }
+
+        async fn stat(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            unsupported()
+        }
+
+        fn read(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            unsupported()
+        }
+
+        fn delete(&self, _ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            unsupported()
+        }
+
+        fn list(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            unsupported()
+        }
+
+        fn copy(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpCopy,
+            _opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            unsupported()
+        }
+
+        async fn rename(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            unsupported()
+        }
+
+        async fn presign(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            unsupported()
         }
     }
 
@@ -106,7 +191,10 @@ mod failing_close {
 
     pub(super) fn operator_with_aborts() -> (Operator, Arc<AtomicUsize>) {
         let aborts = Arc::new(AtomicUsize::new(0));
-        let operator = OperatorBuilder::new(CloseFailsBackend::new(aborts.clone())).finish();
+        let operator = Operator::new(CloseFailsBuilder {
+            aborts: aborts.clone(),
+        })
+        .unwrap();
         (operator, aborts)
     }
 }
