@@ -149,9 +149,11 @@ async fn build_staging_source_operator<'a>(
                 SourceConnectorKind::Http => {
                     build_http_family::<services::Http>(config, policy, resolver_override)?
                 }
-                SourceConnectorKind::S3 => {
-                    build_http_family::<services::S3>(config, policy, resolver_override)?
-                }
+                SourceConnectorKind::S3 => build_http_family::<services::S3>(
+                    &pinned_s3_config(config),
+                    policy,
+                    resolver_override,
+                )?,
                 SourceConnectorKind::Webdav => {
                     build_http_family::<services::Webdav>(config, policy, resolver_override)?
                 }
@@ -163,6 +165,16 @@ async fn build_staging_source_operator<'a>(
             Ok((operator, path.as_str(), version.as_deref()))
         }
     }
+}
+
+/// Connector S3 clients must only ever sign with credentials from the
+/// connector config; ambient discovery (env/profile/IMDS) bypasses the
+/// hardened resolver and could reach the instance metadata service.
+fn pinned_s3_config(config: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut config = config.clone();
+    config.insert("disable_config_load".to_string(), "true".to_string());
+    config.insert("disable_ec2_metadata".to_string(), "true".to_string());
+    config
 }
 
 fn staging_endpoint_url(config: &HashMap<String, String>) -> Result<Url, StagingSourceError> {
