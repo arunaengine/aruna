@@ -21,6 +21,12 @@ pub(crate) fn checked_frame_len(len: u32, max_len: usize) -> io::Result<usize> {
 }
 
 pub(crate) fn checked_send_len(len: usize, max_len: usize) -> io::Result<u32> {
+    if len == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "refusing to send a zero-length frame",
+        ));
+    }
     if len > max_len {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -127,5 +133,12 @@ mod tests {
             TEST_LIMIT as u32
         );
         assert!(checked_send_len(TEST_LIMIT + 1, TEST_LIMIT).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_send() {
+        let (mut writer, _reader) = tokio::io::duplex(4096);
+        let err = write_frame(&mut writer, &[], TEST_LIMIT).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
