@@ -1,14 +1,10 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aruna_core::handle::Handle;
 use aruna_core::structs::{AuthContext, JobId, JobRecord, JobState};
-use aruna_core::util::unix_timestamp_millis;
-use aruna_operations::jobs::store::{
-    CancelRequestOutcome, JobMutationError, list_jobs_for_user, read_job_record,
-    set_cancel_requested,
+use aruna_operations::jobs::service::{
+    CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_owned_job,
 };
-use aruna_operations::jobs::submit::schedule_job_drain_effect;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -145,21 +141,8 @@ fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
     cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
 }
 
-/// Load a job, returning 404 (never leaking existence) when it is missing or owned
-/// by another user.
-async fn load_owned_job(
-    state: &ServerState,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> ServerResult<JobRecord> {
-    let record = read_job_record(&state.get_ctx().storage_handle, job_id, None)
-        .await
-        .map_err(ServerError::InternalError)?
-        .ok_or(ServerError::NotFound)?;
-    if record.created_by != auth.user_id {
-        return Err(ServerError::NotFound);
-    }
-    Ok(record)
+fn parse_job_id(raw: &str) -> ServerResult<JobId> {
+    JobId::from_str(raw).map_err(|_| ServerError::NotFound)
 }
 
 #[utoipa::path(
@@ -191,15 +174,10 @@ pub async fn list_jobs(
         .min(MAX_LIST_LIMIT);
     let state_filter = query.state.as_deref().map(parse_state).transpose()?;
 
-    let (records, next_cursor) = list_jobs_for_user(
-        &state.get_ctx().storage_handle,
-        auth.user_id,
-        cursor,
-        limit,
-        state_filter,
-    )
-    .await
-    .map_err(ServerError::InternalError)?;
+    let (records, next_cursor) =
+        list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, state_filter)
+            .await
+            .map_err(ServerError::InternalError)?;
 
     let jobs = records.iter().map(job_status_response).collect();
     Ok((
@@ -228,8 +206,11 @@ pub async fn get_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let job_id = JobId::from_str(&job_id).map_err(|_| ServerError::NotFound)?;
-    let record = load_owned_job(&state, &auth, job_id).await?;
+    let job_id = parse_job_id(&job_id)?;
+    let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
+        .await
+        .map_err(ServerError::InternalError)?
+        .ok_or(ServerError::NotFound)?;
     Ok((StatusCode::OK, Json(job_status_response(&record))))
 }
 
@@ -251,39 +232,25 @@ pub async fn cancel_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let job_id = JobId::from_str(&job_id).map_err(|_| ServerError::NotFound)?;
-    load_owned_job(&state, &auth, job_id).await?;
+    let job_id = parse_job_id(&job_id)?;
 
-    let outcome = set_cancel_requested(
-        &state.get_ctx().storage_handle,
+    let outcome = cancel_owned_job(
+        &state.get_ctx(),
+        &state.jobs_runtime(),
+        auth.user_id,
         job_id,
-        unix_timestamp_millis(),
     )
     .await
-    .map_err(map_mutation_error)?;
+    .map_err(ServerError::InternalError)?;
 
     match outcome {
-        CancelRequestOutcome::AlreadyTerminal(record) => {
+        CancelJobOutcome::NotFound => Err(ServerError::NotFound),
+        CancelJobOutcome::AlreadyTerminal(record) => {
             Ok((StatusCode::OK, Json(job_status_response(&record))))
         }
-        CancelRequestOutcome::Flagged(record) => {
-            state.jobs_runtime().request_cancel(job_id);
-            kick_drain(&state).await;
+        CancelJobOutcome::Requested(record) => {
             Ok((StatusCode::ACCEPTED, Json(job_status_response(&record))))
         }
-    }
-}
-
-async fn kick_drain(state: &ServerState) {
-    if let Some(task_handle) = state.get_ctx().task_handle.as_ref() {
-        let _ = task_handle.send_effect(schedule_job_drain_effect()).await;
-    }
-}
-
-fn map_mutation_error(error: JobMutationError) -> ServerError {
-    match error {
-        JobMutationError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
     }
 }
 
