@@ -423,8 +423,9 @@ mod tests {
         );
     }
 
+    // UploadNotOpen from upload/complete/abort maps to NoSuchUpload (404).
     #[test]
-    fn maps_upload_not_open() {
+    fn maps_not_open() {
         for error in [
             UploadPartError::UploadNotOpen.into_s3_error(),
             CompleteMultipartUploadError::UploadNotOpen.into_s3_error(),
