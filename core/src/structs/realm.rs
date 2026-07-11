@@ -372,14 +372,15 @@ impl RealmConfigDocument {
     }
 
     /// Seeds the default placement strategies realm creation installs: a
-    /// replica-3 `default` strategy (the realm default) plus an `everywhere`
-    /// strategy bound to the `MetadataRegistry` and `Admin` document classes.
-    /// Replaces any existing strategy configuration.
+    /// `default` strategy using the configured metadata replication factor (the
+    /// realm default) plus an `everywhere` strategy bound to the
+    /// `MetadataRegistry` and `Admin` document classes. Replaces any existing
+    /// strategy configuration.
     pub fn seed_default_placement(&mut self) {
         let default_strategy = PlacementStrategy {
             strategy_id: Ulid::new(),
             name: "default".to_string(),
-            replica_count: Some(DEFAULT_METADATA_REPLICATION_FACTOR),
+            replica_count: Some(self.metadata_replication.default_replication_factor),
             distinct_locations: false,
             affinity: Vec::new(),
         };
@@ -406,6 +407,13 @@ impl RealmConfigDocument {
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
         self.metadata_replication.factor_for(group_id, path)
+    }
+
+    pub fn effective_default_metadata_replication_factor(&self) -> u32 {
+        self.default_strategy_id
+            .and_then(|strategy_id| self.strategy(&strategy_id))
+            .and_then(|strategy| strategy.replica_count)
+            .unwrap_or(self.metadata_replication.default_replication_factor)
     }
 
     pub fn ensure_node(&mut self, node_id: NodeId, kind: RealmNodeKind) {
@@ -735,6 +743,33 @@ mod test {
             document.metadata_replication_factor_for(group_id, Some("/datasets/important/item")),
             7
         );
+    }
+
+    #[test]
+    fn effective_default_replication_uses_placement_strategy_with_legacy_fallback() {
+        let mut document = RealmConfigDocument::new(RealmId([6u8; 32]), Vec::new(), 5);
+        document.seed_default_placement();
+
+        let default_strategy_id = document.default_strategy_id.unwrap();
+        assert_eq!(
+            document
+                .strategy(&default_strategy_id)
+                .unwrap()
+                .replica_count,
+            Some(5)
+        );
+        assert_eq!(document.effective_default_metadata_replication_factor(), 5);
+
+        document
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == default_strategy_id)
+            .unwrap()
+            .replica_count = Some(2);
+        assert_eq!(document.effective_default_metadata_replication_factor(), 2);
+
+        document.default_strategy_id = None;
+        assert_eq!(document.effective_default_metadata_replication_factor(), 5);
     }
 
     #[test]

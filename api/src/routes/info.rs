@@ -1182,6 +1182,7 @@ fn map_realm_info_response(
         })
         .collect();
 
+    let default_replication_factor = config.effective_default_metadata_replication_factor();
     let mut quota = RealmQuotaConfig::from(config.quota);
     if !include_user_quota_overrides {
         quota.user_group_cap_overrides.clear();
@@ -1191,7 +1192,7 @@ fn map_realm_info_response(
         realm_id: config.realm_id.to_string(),
         description: config.description,
         metadata_replication: RealmMetadataReplicationResponse {
-            default_replication_factor: config.metadata_replication.default_replication_factor,
+            default_replication_factor,
         },
         oidc_providers: config
             .oidc_providers
@@ -2053,6 +2054,33 @@ mod tests {
                 .iter()
                 .any(|record| record.subject == "abcd")
         );
+    }
+
+    #[tokio::test]
+    async fn realm_info_reports_active_default_strategy_replication() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = admin_auth(realm_id, admin);
+        let strategy_id = Ulid::from_bytes([24; 16]);
+
+        for request in [
+            RealmPlacementMutationRequest::UpsertStrategy {
+                strategy: placement_strategy(strategy_id),
+            },
+            RealmPlacementMutationRequest::SetDefaultStrategy {
+                strategy_id: strategy_id.to_string(),
+            },
+        ] {
+            let _ = mutate_realm_placement(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Ok(Json(request)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert_eq!(info.metadata_replication.default_replication_factor, 2);
     }
 
     #[tokio::test]

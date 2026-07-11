@@ -621,10 +621,11 @@ mod tests {
         assert_eq!(stored.metadata_replication.default_replication_factor, 7);
         assert_eq!(stored.description, "Ensured Realm");
         assert!(stored.has_node(actor.node_id));
-        // The create-if-missing path seeds default placement strategies so no
-        // production path builds a strategy-less config.
-        assert!(!stored.strategies.is_empty());
-        assert!(stored.default_strategy_id.is_some());
+        let default_strategy = stored
+            .default_strategy_id
+            .and_then(|strategy_id| stored.strategy(&strategy_id))
+            .expect("create-if-missing seeds a default placement strategy");
+        assert_eq!(default_strategy.replica_count, Some(7));
         assert_eq!(
             state.materialized_realm_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
