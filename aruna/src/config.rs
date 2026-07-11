@@ -744,11 +744,9 @@ async fn bootstrap_onboarded_node_state(
                 .to_string()
         });
 
+    let bootstrap_url = onboarding_bootstrap_url(&decoded_secret.seed_url)?;
     let response = onboarding_bootstrap_client()?
-        .post(format!(
-            "{}/api/v1/onboarding/bootstrap",
-            decoded_secret.seed_url.trim_end_matches('/'),
-        ))
+        .post(bootstrap_url)
         .json(&BootstrapOnboardingRequest {
             onboarding_secret: onboarding_secret.to_string(),
             node_id: node_id_string,
@@ -906,11 +904,9 @@ async fn refresh_onboarding_bootstrap(
                 .to_string()
         });
 
+    let bootstrap_url = onboarding_bootstrap_url(&decoded_secret.seed_url)?;
     let response = onboarding_bootstrap_client()?
-        .post(format!(
-            "{}/api/v1/onboarding/bootstrap",
-            decoded_secret.seed_url.trim_end_matches('/'),
-        ))
+        .post(bootstrap_url)
         .json(&BootstrapOnboardingRequest {
             onboarding_secret: onboarding_secret.to_string(),
             node_id: node_id_string,
@@ -945,11 +941,33 @@ async fn refresh_onboarding_bootstrap(
     Ok(response)
 }
 
+fn onboarding_bootstrap_url(seed_url: &str) -> Result<String, SetupError> {
+    let url = format!(
+        "{}/api/v1/onboarding/bootstrap",
+        seed_url.trim_end_matches('/')
+    );
+    aruna_egress::check_url(
+        &aruna_egress::env_allowlist_policy(),
+        aruna_egress::HTTP_SCHEMES,
+        &url,
+    )
+    .map_err(|denial| SetupError::OnboardingBootstrapFailed(format!("egress denied: {denial}")))?;
+    Ok(url)
+}
+
 fn onboarding_bootstrap_client() -> Result<reqwest::Client, SetupError> {
-    Ok(reqwest::Client::builder()
+    // Runs before any realm config exists: built-in deny table plus the
+    // pre-realm-config `ARUNA_EGRESS_ALLOW` escape hatch for internal seeds.
+    let builder = reqwest::Client::builder()
         .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
-        .timeout(ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT)
-        .build()?)
+        .timeout(ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT);
+    Ok(aruna_egress::harden_builder(
+        builder,
+        std::sync::Arc::new(aruna_egress::env_allowlist_policy()),
+        aruna_egress::HTTP_SCHEMES,
+        None,
+    )
+    .build()?)
 }
 
 fn validate_bootstrap_response(

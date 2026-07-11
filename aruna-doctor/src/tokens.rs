@@ -591,6 +591,18 @@ mod tests {
         ]))
     }
 
+    // OIDC providers run on loopback, which the deny table blocks; allowlist it.
+    fn loopback_egress_config() -> aruna_core::structs::EgressConfig {
+        aruna_core::structs::EgressConfig {
+            allow: vec![aruna_core::structs::EgressAllowRule {
+                host: aruna_core::structs::HostPattern::Cidr("127.0.0.0/8".to_string()),
+                ports: None,
+                schemes: None,
+                comment: None,
+            }],
+        }
+    }
+
     async fn spawn_oidc_provider(
         issuer: &str,
         kid: &str,
@@ -804,7 +816,9 @@ mod tests {
                 net.node_id(),
                 capabilities.clone(),
                 false,
-                Some(Arc::new(OidcValidator::new().unwrap())),
+                Some(Arc::new(
+                    OidcValidator::with_egress_config(loopback_egress_config()).unwrap(),
+                )),
             )
             .await,
         );

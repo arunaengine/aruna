@@ -11,6 +11,7 @@ rust-version.workspace = true
 aruna-api = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
+aruna-egress = { workspace = true }
 aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-storage = { workspace = true }

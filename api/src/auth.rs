@@ -3,8 +3,10 @@ use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
+    AuthContext, EgressConfig, OidcProviderConfig, Permission, TokenClaims,
+    blob_object_permission_path,
 };
+use aruna_egress::{EgressPolicy, HTTP_SCHEMES, harden_builder};
 use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
@@ -20,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -32,6 +35,7 @@ const OIDC_PROVIDER_METADATA_CACHE_TTL_SECS: u64 = 300;
 #[derive(Debug)]
 pub struct OidcValidator {
     client: reqwest::Client,
+    egress_policy: EgressPolicy,
     provider_metadata_cache: RwLock<HashMap<String, CachedOidcProviderMetadata>>,
 }
 
@@ -97,12 +101,21 @@ enum OidcAudience {
 }
 
 impl OidcValidator {
+    /// Production constructor: OIDC fetches use the built-in deny table only (no
+    /// allowlist), which still blocks rebinding and redirect tricks.
     pub fn new() -> Result<Self, AuthorizationError> {
+        Self::with_egress_config(EgressConfig::default())
+    }
+
+    pub fn with_egress_config(egress: EgressConfig) -> Result<Self, AuthorizationError> {
+        let egress_policy = EgressPolicy::from_config(&egress);
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(OIDC_HTTP_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(OIDC_HTTP_CONNECT_TIMEOUT_SECS));
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(OIDC_HTTP_TIMEOUT_SECS))
-                .connect_timeout(Duration::from_secs(OIDC_HTTP_CONNECT_TIMEOUT_SECS))
+            client: harden_builder(builder, Arc::new(egress_policy.clone()), HTTP_SCHEMES, None)
                 .build()?,
+            egress_policy,
             provider_metadata_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -137,6 +150,8 @@ impl OidcValidator {
         &self,
         provider: &OidcProviderConfig,
     ) -> Result<CachedOidcProviderMetadata, OidcError> {
+        aruna_egress::check_url(&self.egress_policy, HTTP_SCHEMES, &provider.discovery_url)
+            .map_err(|denial| OidcError::Internal(denial.to_string()))?;
         let discovery = self
             .client
             .get(&provider.discovery_url)
@@ -150,6 +165,8 @@ impl OidcValidator {
                 jsonwebtoken::errors::ErrorKind::InvalidIssuer,
             )));
         }
+        aruna_egress::check_url(&self.egress_policy, HTTP_SCHEMES, &discovery.jwks_uri)
+            .map_err(|denial| OidcError::Internal(denial.to_string()))?;
         let jwks = self
             .client
             .get(&discovery.jwks_uri)
@@ -546,6 +563,43 @@ mod test {
     use tokio::sync::RwLock;
     use ulid::Ulid;
 
+    // OIDC test servers run on loopback, which the deny table blocks; tests use
+    // a validator whose egress config allowlists loopback.
+    fn loopback_validator() -> OidcValidator {
+        use aruna_core::structs::{EgressAllowRule, EgressConfig, HostPattern};
+        OidcValidator::with_egress_config(EgressConfig {
+            allow: vec![
+                EgressAllowRule {
+                    host: HostPattern::Cidr("127.0.0.0/8".to_string()),
+                    ports: None,
+                    schemes: None,
+                    comment: None,
+                },
+                EgressAllowRule {
+                    host: HostPattern::Cidr("::1/128".to_string()),
+                    ports: None,
+                    schemes: None,
+                    comment: None,
+                },
+            ],
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oidc_blocks_metadata() {
+        use aruna_core::structs::OidcProviderConfig;
+        let validator = loopback_validator();
+        let provider = OidcProviderConfig {
+            id: "meta".to_string(),
+            issuer: "http://169.254.169.254/".to_string(),
+            audience: "aruna".to_string(),
+            discovery_url: "http://169.254.169.254/.well-known/openid-configuration".to_string(),
+        };
+        let result = validator.fetch_provider_metadata(&provider).await;
+        assert!(result.is_err(), "metadata IP must be blocked");
+    }
+
     #[tokio::test]
     async fn bucket_blob_permission_path_matches_canonical_blob_object_path() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -894,7 +948,7 @@ mod test {
             Some("Alice OIDC"),
         );
 
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
         let identity = validator.validate(&provider, &token).await.unwrap();
         assert_eq!(identity.issuer, issuer);
         assert_eq!(identity.subject_id, "subject-1");
@@ -930,7 +984,7 @@ mod test {
         };
         let token = encode(&header, &claims, &EncodingKey::from_secret(b"super-secret")).unwrap();
 
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
         let error = validator.validate(&provider, &token).await.unwrap_err();
         assert!(matches!(
             error,
@@ -964,7 +1018,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
         assert!(validator.validate(&provider, &token).await.is_err());
 
         task.abort();
@@ -995,7 +1049,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
         validator.validate(&provider, &token).await.unwrap();
         validator.validate(&provider, &token).await.unwrap();
 
@@ -1029,7 +1083,7 @@ mod test {
             Algorithm::EdDSA,
             None,
         );
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
 
         validator.validate(&provider, &token).await.unwrap();
         let expired_at = Instant::now()
@@ -1067,7 +1121,7 @@ mod test {
             audience: audience.to_string(),
             discovery_url,
         };
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
 
         let missing_azp = sign_multi_audience_oidc_token(
             issuer,
@@ -1119,7 +1173,7 @@ mod test {
             audience: audience.to_string(),
             discovery_url,
         };
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
 
         let old_token = sign_oidc_token(
             issuer,
@@ -1178,7 +1232,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new().unwrap();
+        let validator = loopback_validator();
         let error = validator.validate(&provider, &token).await.unwrap_err();
         assert!(matches!(
             error,

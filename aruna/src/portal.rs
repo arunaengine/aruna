@@ -80,10 +80,19 @@ async fn download_and_install(
         .artifact_url
         .clone()
         .ok_or(PortalArtifactError::MissingArtifactUrl)?;
-    let checksum_file =
-        download_checksum_file(&artifact_url, config.artifact_sha256.as_deref()).await?;
+    let policy = aruna_egress::env_allowlist_policy();
+    aruna_egress::check_url(&policy, aruna_egress::HTTP_SCHEMES, &artifact_url)
+        .map_err(|denial| PortalArtifactError::EgressDenied(denial.to_string()))?;
+    let client = hardened_portal_client()?;
+    let checksum_file = download_checksum_file(
+        &client,
+        &policy,
+        &artifact_url,
+        config.artifact_sha256.as_deref(),
+    )
+    .await?;
 
-    let response = reqwest::get(&artifact_url).await?;
+    let response = client.get(&artifact_url).send().await?;
     if !response.status().is_success() {
         return Err(PortalArtifactError::HttpStatus(response.status().as_u16()));
     }
@@ -97,12 +106,28 @@ async fn download_and_install(
     .await?
 }
 
+// Portal artifacts are operator-configured and fetched before any realm config
+// exists: built-in deny table plus the pre-realm-config env allowlist.
+fn hardened_portal_client() -> Result<reqwest::Client, PortalArtifactError> {
+    Ok(aruna_egress::harden_builder(
+        reqwest::Client::builder(),
+        std::sync::Arc::new(aruna_egress::env_allowlist_policy()),
+        aruna_egress::HTTP_SCHEMES,
+        None,
+    )
+    .build()?)
+}
+
 async fn download_checksum_file(
+    client: &reqwest::Client,
+    policy: &aruna_egress::EgressPolicy,
     artifact_url: &str,
     pinned_checksum: Option<&str>,
 ) -> Result<DownloadedChecksumFile, PortalArtifactError> {
     let checksum_url = format!("{artifact_url}.sha256");
-    let response = reqwest::get(&checksum_url).await?;
+    aruna_egress::check_url(policy, aruna_egress::HTTP_SCHEMES, &checksum_url)
+        .map_err(|denial| PortalArtifactError::EgressDenied(denial.to_string()))?;
+    let response = client.get(&checksum_url).send().await?;
     if !response.status().is_success() {
         return Err(PortalArtifactError::ChecksumHttpStatus(
             response.status().as_u16(),
@@ -519,6 +544,8 @@ pub enum PortalArtifactError {
     ArchiveLink(String),
     #[error("portal artifact is missing index.html")]
     MissingIndexHtml,
+    #[error("portal artifact egress denied: {0}")]
+    EgressDenied(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
