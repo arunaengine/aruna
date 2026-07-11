@@ -2927,7 +2927,6 @@ mod tests {
 
     struct SearchPaginationCluster {
         auth: AuthContext,
-        bearer: ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         nodes: Vec<DistributedMetadataNode>,
     }
@@ -2974,10 +2973,6 @@ mod tests {
             path_restrictions: None,
         };
         SearchPaginationCluster {
-            bearer: ValidatedArunaBearerTokenCarrier::new_for_test(sign_test_token(
-                &realm_signing_key,
-                &test_token_claims(realm_id, user_id),
-            )),
             auth,
             group_id,
             nodes,
@@ -2987,21 +2982,12 @@ mod tests {
     async fn seed_public_document(
         node: &DistributedMetadataNode,
         auth: &AuthContext,
-        bearer: &ValidatedArunaBearerTokenCarrier,
         group_id: Ulid,
         path: &str,
         name: &str,
     ) {
-        create_test_metadata_document(
-            node.state.clone(),
-            auth.clone(),
-            bearer.clone(),
-            group_id,
-            path,
-            name,
-            true,
-        )
-        .await;
+        create_test_metadata_document(node.state.clone(), auth.clone(), group_id, path, name, true)
+            .await;
         drain_metadata_background(node.state.as_ref()).await;
         flush_node_search(node).await;
     }
@@ -3048,7 +3034,6 @@ mod tests {
             seed_public_document(
                 node,
                 &cluster.auth,
-                &cluster.bearer,
                 cluster.group_id,
                 &format!("datasets/corpus-{index}"),
                 &format!("Corpus Document {index}"),
@@ -3106,7 +3091,6 @@ mod tests {
             seed_public_document(
                 node,
                 &cluster.auth,
-                &cluster.bearer,
                 cluster.group_id,
                 &format!("datasets/corpus-{index}"),
                 &format!("Corpus Document {index}"),
@@ -3136,7 +3120,6 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3192,7 +3175,6 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3285,7 +3267,6 @@ mod tests {
             let _ = create_metadata_document(
                 State(test.state.clone()),
                 Extension(Some(test.auth.clone())),
-                Extension(Some(test.bearer.clone())),
                 Json(CreateMetadataRequest::Scaffold(
                     CreateMetadataScaffoldRequest {
                         group_id: test.group_id.to_string(),
@@ -3329,7 +3310,6 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3393,7 +3373,6 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3429,7 +3408,6 @@ mod tests {
         let _ = replace_metadata_rocrate(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
                 rocrate: serde_json::from_str(&rocrate).unwrap(),
@@ -3472,7 +3450,6 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Extension(Some(test.bearer.clone())),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
