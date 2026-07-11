@@ -1642,6 +1642,10 @@ async fn evaluate_group_quota_state(
                 )
                 .await?;
             }
+            // Skip the rewrite when nothing meaningful changed (no write amp).
+            if existing.state == state && next == existing.last_notified_state {
+                return Ok(());
+            }
             QuotaStateRecord {
                 state,
                 last_notified_state: next,
