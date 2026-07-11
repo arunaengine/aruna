@@ -95,8 +95,7 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
     })
 }
 
-/// ShortenTimer restore keyed off the earliest `prune/` entry, run at startup and
-/// in the durable-queue re-arm loop.
+/// ShortenTimer restore keyed off the earliest `prune/` entry.
 pub async fn restore_job_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let after = match first_schedule_entry(storage, JOB_PRUNE_INDEX_PREFIX).await {
         Ok(Some((expiry_ms, _))) => {

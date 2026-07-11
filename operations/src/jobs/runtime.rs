@@ -36,8 +36,7 @@ struct RunningJob {
     completion: watch::Sender<bool>,
 }
 
-/// Registry of locally executing jobs: the cancellation tokens, the completion
-/// signals backing `wait_for_terminal`, and the concurrency cap.
+/// Registry of locally executing jobs, their cancellation tokens, and the concurrency cap.
 pub struct JobsRuntime {
     running: Mutex<HashMap<JobId, RunningJob>>,
     cap: usize,
@@ -72,8 +71,7 @@ impl JobsRuntime {
         self.cap.saturating_sub(self.running_count())
     }
 
-    /// Poke a locally running job's cancellation token. Returns `false` if the job
-    /// is not running here; the persisted `cancel_requested` flag then drives it.
+    /// Poke a locally running job's cancel token; `false` if it is not running here.
     pub fn request_cancel(&self, job_id: JobId) -> bool {
         match self
             .running
@@ -124,8 +122,7 @@ impl JobsRuntime {
         }
     }
 
-    /// Block until the job is terminal or `timeout` elapses. Uses the local
-    /// completion signal when the job runs here, else polls storage every 250ms.
+    /// Block until the job is terminal or `timeout` elapses (local signal, else 250ms poll).
     pub async fn wait_for_terminal(
         &self,
         storage: &StorageHandle,
@@ -159,8 +156,7 @@ impl JobsRuntime {
         }
     }
 
-    /// Fjall is single-process, so at startup every claimed/running job's holder is
-    /// definitionally dead: re-queue them all immediately.
+    /// At startup every claimed/running holder is definitionally dead: re-queue them all.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
@@ -462,8 +458,7 @@ mod tests {
         std::fs::write(&marker, b"partial").unwrap();
         let mut record = probe_record(job_id, 5, 0, Some(marker.to_str().unwrap().to_string()));
         record.cancel_requested = true;
-        // A prior attempt means partial state is possible, so the job is claimed and
-        // its cleanup hook runs (unlike a never-attempted fresh cancel).
+        // A prior attempt means it is claimed (not fresh-cancelled) so cleanup runs.
         record.attempts = 1;
         let claimed = claim(&storage, record).await;
 

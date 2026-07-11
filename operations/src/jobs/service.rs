@@ -13,8 +13,7 @@ use super::store::{
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 
-/// API-facing helpers so REST handlers never orchestrate storage or task effects
-/// directly (enforced by the api effect-boundary guard).
+/// API-facing helpers so REST handlers never orchestrate storage/task effects directly.
 pub async fn list_owned_jobs(
     context: &DriverContext,
     user_id: UserId,

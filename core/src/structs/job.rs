@@ -11,9 +11,7 @@ use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
 use crate::types::{Key, UserId};
 
-/// Version prefix inside the `jobs` keyspace. A single decode chokepoint plus this
-/// prefix keep the record wrappable in a version envelope later (#286) as a
-/// one-site change.
+/// Version prefix keeping the record wrappable in a version envelope later (#286).
 pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
 
 pub const JOB_DUE_INDEX_PREFIX: &[u8] = b"due/";
@@ -107,10 +105,8 @@ impl JobState {
 /// `DocumentSyncOutboxEvent`. Additive-only until a version envelope lands (#286).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPayload {
-    /// Test-only executor exercising the substrate before #256 ships a real
-    /// payload. Idempotency key: the `cleanup_marker` file path — a re-driven or
-    /// cancelled Probe removes that file, so partial state is always reconciled by
-    /// re-running from scratch.
+    /// Test-only executor. Idempotency key: the `cleanup_marker` file, which a
+    /// re-driven or cancelled Probe removes so re-running from scratch is safe.
     Probe {
         steps: u32,
         step_sleep_ms: u64,
@@ -212,8 +208,7 @@ impl JobProgress {
     }
 }
 
-/// Lease held by the executor currently owning the job. `claim_token` fences
-/// zombie executors: every executor-side write requires it to match.
+/// Lease on the job; `claim_token` fences zombie executors on every write.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobClaim {
     pub holder_node_id: NodeId,
