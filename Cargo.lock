@@ -420,6 +420,7 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
+ "lru 0.18.0",
  "opentelemetry",
  "oxrdf",
  "postcard",

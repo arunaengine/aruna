@@ -41,7 +41,6 @@ use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
@@ -49,7 +48,7 @@ use ulid::Ulid;
 use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use crate::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
     validate_aruna_bearer_token,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -131,14 +130,14 @@ struct MetadataInner {
 #[derive(Clone)]
 struct MetadataAuthValidationState {
     storage_handle: StorageHandle,
-    issuer_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
+    issuer_keys: Arc<IssuerKeyCache>,
 }
 
 impl MetadataAuthValidationState {
     fn new(storage_handle: StorageHandle) -> Self {
         Self {
             storage_handle,
-            issuer_keys: Arc::new(RwLock::new(HashMap::new())),
+            issuer_keys: Arc::new(IssuerKeyCache::new()),
         }
     }
 }
@@ -179,19 +178,7 @@ impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        let read_lock = self.issuer_keys.read().await;
-        let key = read_lock.get(issuer_pubkey).cloned();
-        drop(read_lock);
-        if let Some(key) = key {
-            return Ok(key);
-        }
-
-        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
-        self.issuer_keys
-            .write()
-            .await
-            .insert(issuer_pubkey.to_string(), decoding_key.clone());
-        Ok(decoding_key)
+        self.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
 

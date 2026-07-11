@@ -1,5 +1,5 @@
 use crate::auth::{OidcTokenSelector, OidcValidator};
-use crate::error::{OidcError, TokenError};
+use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_operations::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
 };
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -31,7 +31,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,8 +49,8 @@ pub struct ServerState {
     driver_ctx: Arc<DriverContext>,
     // Capabilities defined as in spec: Membership, Server and Local node capabilities
     node_capabilities: NodeCapabilities,
-    // Base64 encoded issuer pubkeys and jsonwebtoken serialized DecodingKeys
-    issuer_keys: Arc<RwLock<HashMap<String, DecodingKey, ahash::RandomState>>>,
+    // Bounded TTL + LRU cache of trusted issuer decoding keys
+    issuer_keys: Arc<IssuerKeyCache>,
     // Contains token id as a string, so also invalid ids get banned
     token_revocation_list: Arc<RwLock<HashSet<String, ahash::RandomState>>>,
     // Contains trusted realms
@@ -159,7 +159,7 @@ impl ServerState {
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
-            issuer_keys: Arc::new(RwLock::new(HashMap::default())),
+            issuer_keys: Arc::new(IssuerKeyCache::new()),
             initial_admin_claim,
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
@@ -332,10 +332,8 @@ impl ServerState {
         }
     }
 
-    pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
-        <Self as ArunaBearerTokenValidationState>::decoding_key_for_issuer(self, &pubkey)
-            .await
-            .map_err(Into::into)
+    pub async fn issuer_key_cache_len(&self) -> usize {
+        self.issuer_keys.len().await
     }
 
     pub async fn add_token_to_blacklist(&self, token: &str) {
@@ -479,19 +477,7 @@ impl ArunaBearerTokenValidationState for ServerState {
         &self,
         issuer_pubkey: &str,
     ) -> Result<DecodingKey, ArunaBearerTokenError> {
-        let read_lock = self.issuer_keys.read().await;
-        let key = read_lock.get(issuer_pubkey).cloned();
-        drop(read_lock);
-        if let Some(key) = key {
-            return Ok(key);
-        }
-
-        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
-        self.issuer_keys
-            .write()
-            .await
-            .insert(issuer_pubkey.to_string(), decoding_key.clone());
-        Ok(decoding_key)
+        self.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
 
