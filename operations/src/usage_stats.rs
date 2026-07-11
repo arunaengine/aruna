@@ -14,13 +14,13 @@ use aruna_core::structs::{
     GroupAuthorizationDocument, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
     NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
     NODE_USAGE_SUMMARY_GROUP_PREFIX, NotificationClass, NotificationKind, NotificationRecord,
-    NodeUsageSnapshot, QuotaStateRecord, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY,
-    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
-    next_notified_state, node_usage_dirty_group_id, node_usage_dirty_group_key,
-    node_usage_global_key, node_usage_group_key, node_usage_group_key_group_id,
-    node_usage_group_prefix, node_usage_key_node_id, node_usage_quota_state_key,
-    node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
-    usage_global_shard_key, usage_global_shard_keys, usage_group_key,
+    NodeUsageSnapshot, QuotaStateRecord, RealmConfigDocument, RealmId, RecountReport,
+    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, USAGE_RECOUNT_REPORT_KEY, UsageCounterError,
+    UsageCounters, UsageDelta, VersionKey, next_notified_state, node_usage_dirty_group_id,
+    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
+    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
+    node_usage_quota_state_key, node_usage_summary_group_key, usage_global_key_for_group,
+    usage_global_shard_index, usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -487,6 +487,153 @@ fn sum_global_usage_counters(
     Ok(total)
 }
 
+/// Shared accumulation of usage counters from the underlying keyspaces (buckets,
+/// blob locations, heads, versions). Used by both the startup rebuild FSM and the
+/// online reconciliation recount so the two derive identical expected values.
+#[derive(Debug, PartialEq)]
+pub(crate) struct UsageScanAccumulator {
+    bucket_groups: HashMap<String, GroupId>,
+    blob_sizes: HashMap<Vec<u8>, u64>,
+    current_versions: HashMap<(String, String), ulid::Ulid>,
+    global: UsageCounters,
+    global_shards: Vec<UsageCounters>,
+    groups: HashMap<GroupId, UsageCounters>,
+}
+
+impl Default for UsageScanAccumulator {
+    fn default() -> Self {
+        Self {
+            bucket_groups: HashMap::new(),
+            blob_sizes: HashMap::new(),
+            current_versions: HashMap::new(),
+            global: UsageCounters::default(),
+            global_shards: vec![UsageCounters::default(); USAGE_GLOBAL_SHARD_COUNT],
+            groups: HashMap::new(),
+        }
+    }
+}
+
+impl UsageScanAccumulator {
+    fn group_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
+        self.groups.entry(group_id).or_default()
+    }
+
+    fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
+        &mut self.global_shards[usage_global_shard_index(group_id)]
+    }
+
+    fn consume_buckets(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
+        for (key, value) in values {
+            let info = BucketInfo::from_bytes(value.as_ref())?;
+            let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+            let delta = UsageCounters {
+                buckets: 1,
+                ..Default::default()
+            };
+            self.global.add(&delta)?;
+            self.group_entry(info.group_id).add(&delta)?;
+            self.global_shard_entry(info.group_id).add(&delta)?;
+            self.bucket_groups.insert(bucket, info.group_id);
+        }
+        Ok(())
+    }
+
+    fn consume_blobs(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
+        for (key, value) in values {
+            let location = BackendLocation::from_bytes(value.as_ref())?;
+            if location.staging || location.partial {
+                continue;
+            }
+            let delta = UsageCounters {
+                stored_blobs: 1,
+                stored_bytes: location.blob_size,
+                ..Default::default()
+            };
+            self.global.add(&delta)?;
+            self.global_shards[0].add(&delta)?;
+            self.blob_sizes.insert(key.to_vec(), location.blob_size);
+        }
+        Ok(())
+    }
+
+    fn consume_heads(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
+        for (key, value) in values {
+            let head_key = BlobHeadKey::from_bytes(key.as_ref())?;
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+            self.current_versions
+                .insert((head_key.bucket, head_key.key), pointer.version_id);
+        }
+        Ok(())
+    }
+
+    fn consume_versions(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
+        for (key, value) in values {
+            let version = BlobVersion::from_bytes(value.as_ref())?;
+            let version_key = VersionKey::from_bytes(key.as_ref())?;
+            let object = (version_key.bucket.clone(), version_key.key.clone());
+            if self
+                .current_versions
+                .get(&object)
+                .is_some_and(|version_id| *version_id == version_key.version_id)
+                && !version.is_deleted()
+            {
+                let delta = UsageCounters {
+                    objects: 1,
+                    ..Default::default()
+                };
+                self.global.add(&delta)?;
+                if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
+                    self.group_entry(group_id).add(&delta)?;
+                    self.global_shard_entry(group_id).add(&delta)?;
+                } else {
+                    self.global_shards[0].add(&delta)?;
+                }
+            }
+
+            let Some(size) = (match version.state {
+                BlobVersionState::Materialized { blob_hash, .. } => {
+                    self.blob_sizes.get(blob_hash.as_slice()).copied()
+                }
+                BlobVersionState::Reference {
+                    cached_metadata, ..
+                } => Some(cached_metadata.content_length),
+                BlobVersionState::Deleted => None,
+            }) else {
+                continue;
+            };
+            let delta = UsageCounters {
+                logical_bytes: size,
+                ..Default::default()
+            };
+            self.global.add(&delta)?;
+            if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
+                self.group_entry(group_id).add(&delta)?;
+                self.global_shard_entry(group_id).add(&delta)?;
+            } else {
+                self.global_shards[0].add(&delta)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn total(&self) -> UsageCounters {
+        self.global
+    }
+
+    /// The counter rows this scan expects to exist: the 64 global shards plus one
+    /// per group with data.
+    fn expected_counter_rows(&self) -> Vec<(Vec<u8>, UsageCounters)> {
+        let mut rows = Vec::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
+        for (shard, counters) in self.global_shards.iter().enumerate() {
+            rows.push((usage_global_shard_key(shard), *counters));
+        }
+        for (group_id, counters) in &self.groups {
+            rows.push((usage_group_key(*group_id), *counters));
+        }
+        rows
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RebuildUsageStatsState {
     Init,
@@ -530,12 +677,7 @@ pub enum RebuildUsageStatsError {
 pub struct RebuildUsageStatsOperation {
     state: RebuildUsageStatsState,
     txn_id: Option<TxnId>,
-    bucket_groups: HashMap<String, GroupId>,
-    blob_sizes: HashMap<Vec<u8>, u64>,
-    current_versions: HashMap<(String, String), ulid::Ulid>,
-    global: UsageCounters,
-    global_shards: Vec<UsageCounters>,
-    groups: HashMap<GroupId, UsageCounters>,
+    accumulator: UsageScanAccumulator,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
     output: Option<Result<UsageCounters, RebuildUsageStatsError>>,
@@ -554,12 +696,7 @@ impl RebuildUsageStatsOperation {
         Self {
             state: RebuildUsageStatsState::Init,
             txn_id: None,
-            bucket_groups: HashMap::new(),
-            blob_sizes: HashMap::new(),
-            current_versions: HashMap::new(),
-            global: UsageCounters::default(),
-            global_shards: vec![UsageCounters::default(); USAGE_GLOBAL_SHARD_COUNT],
-            groups: HashMap::new(),
+            accumulator: UsageScanAccumulator::default(),
             existing_counter_keys: Vec::new(),
             stale_counter_deletes: Vec::new(),
             output: None,
@@ -593,110 +730,19 @@ impl RebuildUsageStatsOperation {
         }
     }
 
-    fn group_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
-        self.groups.entry(group_id).or_default()
-    }
-
-    fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
-        &mut self.global_shards[usage_global_shard_index(group_id)]
-    }
-
     fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildUsageStatsError> {
         match self.state {
-            RebuildUsageStatsState::ScanBuckets => {
-                for (key, value) in values {
-                    let info = BucketInfo::from_bytes(value.as_ref())?;
-                    let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
-                    let delta = UsageCounters {
-                        buckets: 1,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.group_entry(info.group_id).add(&delta)?;
-                    self.global_shard_entry(info.group_id).add(&delta)?;
-                    self.bucket_groups.insert(bucket, info.group_id);
-                }
-            }
-            RebuildUsageStatsState::ScanBlobs => {
-                for (key, value) in values {
-                    let location = BackendLocation::from_bytes(value.as_ref())?;
-                    if location.staging || location.partial {
-                        continue;
-                    }
-                    let delta = UsageCounters {
-                        stored_blobs: 1,
-                        stored_bytes: location.blob_size,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.global_shards[0].add(&delta)?;
-                    self.blob_sizes.insert(key.to_vec(), location.blob_size);
-                }
-            }
-            RebuildUsageStatsState::ScanHeads => {
-                for (key, value) in values {
-                    let head_key = BlobHeadKey::from_bytes(key.as_ref())?;
-                    let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-                    self.current_versions
-                        .insert((head_key.bucket, head_key.key), pointer.version_id);
-                }
-            }
-            RebuildUsageStatsState::ScanVersions => {
-                for (key, value) in values {
-                    let version = BlobVersion::from_bytes(value.as_ref())?;
-                    let version_key = VersionKey::from_bytes(key.as_ref())?;
-                    let object = (version_key.bucket.clone(), version_key.key.clone());
-                    if self
-                        .current_versions
-                        .get(&object)
-                        .is_some_and(|version_id| *version_id == version_key.version_id)
-                        && !version.is_deleted()
-                    {
-                        let delta = UsageCounters {
-                            objects: 1,
-                            ..Default::default()
-                        };
-                        self.global.add(&delta)?;
-                        if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied()
-                        {
-                            self.group_entry(group_id).add(&delta)?;
-                            self.global_shard_entry(group_id).add(&delta)?;
-                        } else {
-                            self.global_shards[0].add(&delta)?;
-                        }
-                    }
-
-                    let Some(size) = (match version.state {
-                        BlobVersionState::Materialized { blob_hash, .. } => {
-                            self.blob_sizes.get(blob_hash.as_slice()).copied()
-                        }
-                        BlobVersionState::Reference {
-                            cached_metadata, ..
-                        } => Some(cached_metadata.content_length),
-                        BlobVersionState::Deleted => None,
-                    }) else {
-                        continue;
-                    };
-                    let delta = UsageCounters {
-                        logical_bytes: size,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        self.group_entry(group_id).add(&delta)?;
-                        self.global_shard_entry(group_id).add(&delta)?;
-                    } else {
-                        self.global_shards[0].add(&delta)?;
-                    }
-                }
-            }
+            RebuildUsageStatsState::ScanBuckets => self.accumulator.consume_buckets(values),
+            RebuildUsageStatsState::ScanBlobs => self.accumulator.consume_blobs(values),
+            RebuildUsageStatsState::ScanHeads => self.accumulator.consume_heads(values),
+            RebuildUsageStatsState::ScanVersions => self.accumulator.consume_versions(values),
             RebuildUsageStatsState::ScanCounters => {
                 self.existing_counter_keys
                     .extend(values.iter().map(|(key, _)| key.to_vec()));
+                Ok(())
             }
-            _ => {}
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn next_scan(&mut self) -> Effects {
@@ -759,19 +805,10 @@ impl RebuildUsageStatsOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let mut writes = Vec::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
-        let mut write_keys = HashSet::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
-        for (shard, counters) in self.global_shards.iter().enumerate() {
-            let key = usage_global_shard_key(shard);
-            let bytes = match counters.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            write_keys.insert(key.clone());
-            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
-        }
-        for (group_id, counters) in &self.groups {
-            let key = usage_group_key(*group_id);
+        let expected = self.accumulator.expected_counter_rows();
+        let mut writes = Vec::with_capacity(expected.len());
+        let mut write_keys = HashSet::with_capacity(expected.len());
+        for (key, counters) in expected {
             let bytes = match counters.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.emit_error(err.into()),
@@ -839,7 +876,7 @@ impl RebuildUsageStatsOperation {
             });
         };
         self.state = RebuildUsageStatsState::Finish;
-        self.output = Some(Ok(self.global));
+        self.output = Some(Ok(self.accumulator.total()));
         smallvec![]
     }
 }
@@ -956,7 +993,7 @@ pub enum RealmUsageScope {
     Group(GroupId),
 }
 
-async fn iter_all(
+pub(crate) async fn iter_all(
     storage: &StorageHandle,
     key_space: &str,
     prefix: Option<Key>,
@@ -1428,7 +1465,9 @@ async fn clear_consumed_markers(
     }
 }
 
-async fn read_realm_config(ctx: &DriverContext) -> Result<Option<RealmConfigDocument>, String> {
+pub(crate) async fn read_realm_config(
+    ctx: &DriverContext,
+) -> Result<Option<RealmConfigDocument>, String> {
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return Ok(None);
     };
@@ -1888,6 +1927,244 @@ pub async fn load_realm_usage(
     }
 }
 
+/// Default period between online reconciliation recounts.
+pub const USAGE_RECONCILE_PERIOD: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Online, non-quiescent reconciliation of local usage counters. Recomputes
+/// expected values from the underlying keyspaces outside any transaction, then
+/// conditionally corrects only keys that drifted and have not moved since they
+/// were observed, so it converges static/injected drift without fighting live
+/// writers. Corrected keys are re-dirtied and a snapshot publish is scheduled.
+pub async fn reconcile_usage_stats(
+    ctx: &DriverContext,
+    task_handle: Option<&TaskHandle>,
+) -> Result<RecountReport, String> {
+    let storage = &ctx.storage_handle;
+    let now = unix_timestamp_millis();
+
+    let observed = read_observed_counters(storage).await?;
+
+    let mut accumulator = UsageScanAccumulator::default();
+    accumulator
+        .consume_buckets(&iter_all(storage, S3_BUCKET_KEYSPACE, None).await?)
+        .map_err(|e| e.to_string())?;
+    accumulator
+        .consume_blobs(&iter_all(storage, BLOB_LOCATIONS_KEYSPACE, None).await?)
+        .map_err(|e| e.to_string())?;
+    accumulator
+        .consume_heads(&iter_all(storage, BLOB_HEAD_KEYSPACE, None).await?)
+        .map_err(|e| e.to_string())?;
+    accumulator
+        .consume_versions(&iter_all(storage, BLOB_VERSIONS_KEYSPACE, None).await?)
+        .map_err(|e| e.to_string())?;
+
+    let mut expected: HashMap<Vec<u8>, UsageCounters> =
+        accumulator.expected_counter_rows().into_iter().collect();
+    // A counter observed but no longer backed by any data recounts to zero.
+    for key in observed.keys() {
+        expected.entry(key.clone()).or_default();
+    }
+
+    let mut keys_checked = 0u64;
+    let mut max_abs_drift = 0u64;
+    let mut drifted: Vec<(Vec<u8>, UsageCounters, UsageCounters)> = Vec::new();
+    for (key, exp) in &expected {
+        keys_checked += 1;
+        let obs = observed.get(key).copied().unwrap_or_default();
+        if *exp != obs {
+            let drift = i128::from(exp.logical_bytes) - i128::from(obs.logical_bytes);
+            max_abs_drift = max_abs_drift.max(u64::try_from(drift.unsigned_abs()).unwrap_or(u64::MAX));
+            warn!(
+                target: "quota_recount",
+                observed_logical = obs.logical_bytes,
+                expected_logical = exp.logical_bytes,
+                drift,
+                "usage counter drift detected"
+            );
+            drifted.push((key.clone(), *exp, obs));
+        }
+    }
+
+    let (keys_corrected, conflict_aborted) = if drifted.is_empty() {
+        (0, false)
+    } else {
+        apply_recount_corrections(ctx, task_handle, drifted).await?
+    };
+
+    let report = RecountReport {
+        at_ms: now,
+        keys_checked,
+        keys_corrected,
+        max_abs_drift_logical_bytes: max_abs_drift,
+        conflict_aborted,
+    };
+    write_recount_report(storage, &report).await?;
+    Ok(report)
+}
+
+async fn read_observed_counters(
+    storage: &StorageHandle,
+) -> Result<HashMap<Vec<u8>, UsageCounters>, String> {
+    let mut observed = HashMap::new();
+    for (key, value) in iter_all(storage, USAGE_STATS_KEYSPACE, None).await? {
+        let raw = key.as_ref();
+        if raw == USAGE_RECOUNT_REPORT_KEY {
+            continue;
+        }
+        if raw.starts_with(b"group/") || raw.starts_with(b"global/") {
+            observed.insert(
+                raw.to_vec(),
+                UsageCounters::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
+            );
+        }
+    }
+    Ok(observed)
+}
+
+async fn apply_recount_corrections(
+    ctx: &DriverContext,
+    task_handle: Option<&TaskHandle>,
+    drifted: Vec<(Vec<u8>, UsageCounters, UsageCounters)>,
+) -> Result<(u64, bool), String> {
+    let storage = &ctx.storage_handle;
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    else {
+        return Err("failed to start recount correction transaction".to_string());
+    };
+
+    let reads = drifted
+        .iter()
+        .map(|(key, _, _)| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key.clone())))
+        .collect();
+    let current = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => {
+            storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Err(format!("recount re-read failed: {other:?}"));
+        }
+    };
+
+    let mut writes: Vec<(String, Key, Value)> = Vec::new();
+    let mut dirty_groups: BTreeSet<GroupId> = BTreeSet::new();
+    let mut corrected = 0u64;
+    for ((key, expected, pre_observed), (_, current_value)) in drifted.iter().zip(current) {
+        let current_counters = match current_value {
+            Some(bytes) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?,
+            None => UsageCounters::default(),
+        };
+        // The key moved since it was observed: its drift was likely in-flight
+        // traffic, so leave it for the next cycle.
+        if current_counters != *pre_observed {
+            continue;
+        }
+        writes.push((
+            USAGE_STATS_KEYSPACE.to_string(),
+            Key::from(key.clone()),
+            Value::from(expected.to_bytes().map_err(|e| e.to_string())?),
+        ));
+        corrected += 1;
+        if let Some(rest) = key.strip_prefix(b"group/".as_slice())
+            && let Ok(bytes) = <[u8; 16]>::try_from(rest)
+        {
+            dirty_groups.insert(GroupId::from_bytes(bytes));
+        }
+    }
+
+    if writes.is_empty() {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return Ok((0, false));
+    }
+
+    // Re-dirty the corrected scopes so snapshots and summaries republish.
+    let generation = ByteView::from(ulid::Ulid::new().to_bytes().to_vec());
+    writes.push((
+        USAGE_NODE_STATS_KEYSPACE.to_string(),
+        Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+        generation.clone(),
+    ));
+    for group_id in &dirty_groups {
+        writes.push((
+            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            Key::from(node_usage_dirty_group_key(*group_id)),
+            generation.clone(),
+        ));
+    }
+
+    if let Event::Storage(StorageEvent::Error { error }) = storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return Err(format!("recount correction write failed: {error}"));
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            if let Some(task_handle) = task_handle {
+                let _ = task_handle
+                    .send_effect(schedule_usage_snapshot_publish_effect())
+                    .await;
+            }
+            Ok((corrected, false))
+        }
+        // A concurrent write conflicted; the whole correction is retried next cycle.
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Ok((0, true)),
+        other => Err(format!("recount correction commit failed: {other:?}")),
+    }
+}
+
+/// Arms the periodic reconciliation recount. `ShortenTimer` keeps the startup and
+/// durable re-arm loops from pushing a handler-scheduled deadline forward.
+pub async fn restore_reconcile_usage_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::ReconcileUsageStats,
+            after: USAGE_RECONCILE_PERIOD,
+        }))
+        .await
+    {
+        warn!(message = %message, "Failed to arm usage reconcile task");
+    }
+}
+
+async fn write_recount_report(storage: &StorageHandle, report: &RecountReport) -> Result<(), String> {
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_RECOUNT_REPORT_KEY.to_vec()),
+            value: Value::from(report.to_bytes().map_err(|e| e.to_string())?),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("recount report write failed: {other:?}")),
+    }
+}
+
 /// Re-arms the debounced publish task when dirty markers survived a restart.
 pub async fn restore_usage_snapshot_publish_timer(
     storage: &StorageHandle,
@@ -2069,6 +2346,72 @@ mod tests {
             .unwrap();
         assert!(done.is_none());
         assert!(update.is_done());
+    }
+
+    // Stale counters with no backing data recount to zero and persist a report.
+    #[tokio::test]
+    async fn recount_converges() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let stale = UsageCounters {
+            logical_bytes: 500,
+            objects: 2,
+            ..Default::default()
+        };
+        write_counters(&ctx, usage_group_key(group_id), stale).await;
+        write_counters(
+            &ctx,
+            usage_global_shard_key(usage_global_shard_index(group_id)),
+            stale,
+        )
+        .await;
+
+        let report = reconcile_usage_stats(&ctx, None).await.unwrap();
+        assert!(report.keys_corrected >= 2);
+        assert_eq!(report.max_abs_drift_logical_bytes, 500);
+        assert!(!report.conflict_aborted);
+
+        assert_eq!(
+            read_counters(&ctx, usage_group_key(group_id)).await,
+            UsageCounters::default()
+        );
+
+        // A dirty marker was written so the correction republishes.
+        let marker = read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()).await;
+        assert!(marker.is_some());
+
+        // Report persisted for ops inspection.
+        let stored = read_recount_report(&ctx).await;
+        assert_eq!(stored.keys_corrected, report.keys_corrected);
+    }
+
+    // A second recount over already-correct counters makes no corrections.
+    #[tokio::test]
+    async fn recount_idempotent() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        reconcile_usage_stats(&ctx, None).await.unwrap();
+        let report = reconcile_usage_stats(&ctx, None).await.unwrap();
+        assert_eq!(report.keys_corrected, 0);
+        assert!(!report.conflict_aborted);
+    }
+
+    async fn read_recount_report(ctx: &DriverContext) -> RecountReport {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: Key::from(USAGE_RECOUNT_REPORT_KEY.to_vec()),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => RecountReport::from_bytes(bytes.as_ref()).unwrap(),
+            other => panic!("recount report missing: {other:?}"),
+        }
     }
 
     #[tokio::test]
