@@ -125,7 +125,7 @@ async fn metadata_creation_replicates_to_all_three_holders()
 async fn metadata_replan_refreshes_replacement_holder_indexes()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([46u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 4).await?;
+    let (nodes, _config) = build_realm_nodes(&realm_id, 4).await?;
     let group_id = Ulid::r#gen();
     let document_id = Ulid::r#gen();
     let document_path = "datasets/replan-holder-refresh";
