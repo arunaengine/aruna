@@ -83,11 +83,36 @@ where
         (Some(issuer_pubkey), true) => issuer_pubkey,
         _ => &unvalidated_claims.claims.iss,
     };
-    let decoding_key = state.decoding_key_for_issuer(issuer).await?;
+    // Only trusted realm or delegated issuers may populate the bounded cache;
+    // untrusted issuers are verified with an ephemeral key that is discarded.
+    let decoding_key = if issuer_key_is_trusted(state, &unvalidated_claims.claims).await {
+        state.decoding_key_for_issuer(issuer).await?
+    } else {
+        decoding_key_from_base64_public_key(issuer)?
+    };
     let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::new(Algorithm::EdDSA))?;
 
     validate_aruna_bearer_token_claims(state, &claims.claims).await?;
     Ok(claims.claims)
+}
+
+async fn issuer_key_is_trusted<S>(state: &S, claims: &TokenClaims) -> bool
+where
+    S: ArunaBearerTokenValidationState + ?Sized,
+{
+    let Ok(realm_id) = RealmId::from_base64(&claims.iss) else {
+        return false;
+    };
+    if !state.is_trusted_realm(&realm_id).await {
+        return false;
+    }
+    match (&claims.delegation_signature, &claims.issuer_pubkey) {
+        (Some(delegation_signature), Some(issuer_pubkey)) => {
+            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature).is_ok()
+        }
+        (None, None) => true,
+        (_, _) => false,
+    }
 }
 
 pub async fn validate_aruna_bearer_token_claims<S>(
@@ -110,15 +135,23 @@ where
 
     match (&claims.delegation_signature, &claims.issuer_pubkey) {
         (Some(delegation_signature), Some(issuer_pubkey)) => {
-            let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&claims.iss)?;
-            let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
-            let signature = Signature::from_str(delegation_signature)?;
-            realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
-            Ok(())
+            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature)
         }
         (None, None) => Ok(()),
         (_, _) => Err(ArunaBearerTokenError::InvalidServerToken),
     }
+}
+
+fn verify_realm_delegation(
+    realm_iss: &str,
+    issuer_pubkey: &str,
+    delegation_signature: &str,
+) -> Result<(), ArunaBearerTokenError> {
+    let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(realm_iss)?;
+    let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
+    let signature = Signature::from_str(delegation_signature)?;
+    realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
+    Ok(())
 }
 
 pub fn decoding_key_from_base64_public_key(
