@@ -138,6 +138,7 @@ async fn put_object(
             exists: false,
             version_source: None,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &h.driver,
     )
@@ -249,6 +250,7 @@ async fn complete_upload(
             object_size: Some(object_size),
             created_by: h.created_by,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &h.driver,
     )
@@ -630,6 +632,7 @@ async fn try_put_object(
             exists: false,
             version_source: None,
             quota_ceiling,
+            active_node_ids: None,
         }),
         &h.driver,
     )
@@ -879,6 +882,7 @@ async fn try_complete_multipart(
             object_size: Some(data.len() as u64),
             created_by: h.created_by,
             quota_ceiling,
+            active_node_ids: None,
         }),
         &h.driver,
     )

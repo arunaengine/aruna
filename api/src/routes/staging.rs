@@ -7,7 +7,6 @@ use crate::server_state::ServerState;
 use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{AuthContext, BucketInfo, Permission};
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
 };
@@ -133,7 +132,7 @@ async fn snapshot_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
+    let (quota_ceiling, active_node_ids) = resolve_group_quota_ceiling(&state, group_id).await?;
 
     let result = stage_snapshot_blob(
         &state.get_ctx(),
@@ -147,6 +146,7 @@ async fn snapshot_blob(
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             quota_ceiling,
+            active_node_ids,
         },
     )
     .await
@@ -198,7 +198,7 @@ async fn reference_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let quota_ceiling = resolve_group_quota_ceiling(&state, group_id).await?;
+    let (quota_ceiling, active_node_ids) = resolve_group_quota_ceiling(&state, group_id).await?;
 
     let result = stage_reference_blob(
         &state.get_ctx(),
@@ -212,6 +212,7 @@ async fn reference_blob(
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             quota_ceiling,
+            active_node_ids,
         },
     )
     .await
@@ -238,14 +239,18 @@ async fn reference_blob(
 async fn resolve_group_quota_ceiling(
     state: &ServerState,
     group_id: ulid::Ulid,
-) -> ServerResult<Option<u64>> {
-    let config = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    Ok(config.quota.effective_group_ceiling(&group_id))
+) -> ServerResult<(Option<u64>, Option<std::collections::HashSet<aruna_core::NodeId>>)> {
+    let config = state
+        .cached_realm_config()
+        .await
+        .map_err(ServerError::InternalError)?;
+    let ceiling = config.quota.effective_group_ceiling(&group_id);
+    let active_node_ids = config
+        .sync_eligible_node_ids()
+        .map_err(|err| ServerError::InternalError(err.to_string()))?
+        .into_iter()
+        .collect();
+    Ok((ceiling, Some(active_node_ids)))
 }
 
 async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {

@@ -42,6 +42,9 @@ pub struct MaterializeReferenceInput {
     pub bucket: String,
     pub key: String,
     pub quota_ceiling: Option<u64>,
+    /// Nodes whose per-group snapshots the quota gate trusts, resolved from the
+    /// realm config at the request surface. `None` counts every snapshot.
+    pub active_node_ids: Option<std::collections::HashSet<NodeId>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -171,7 +174,7 @@ pub async fn materialize_reference(
                 logical_bytes,
                 input.group_id,
                 input.node_id,
-                input.realm_id,
+                input.active_node_ids.clone(),
             )
             .await?;
         }
@@ -281,13 +284,13 @@ async fn enforce_quota(
     logical_bytes: u64,
     group_id: GroupId,
     node_id: NodeId,
-    realm_id: RealmId,
+    active_node_ids: Option<std::collections::HashSet<NodeId>>,
 ) -> Result<(), MaterializeReferenceError> {
-    let mut gate = QuotaGate::new_for_realm(ceiling, logical_bytes, group_id, node_id, realm_id);
+    let mut gate = QuotaGate::new(ceiling, logical_bytes, group_id, node_id, active_node_ids);
     let mut effects = gate.start(txn_id);
     loop {
         let event = send_single_storage_effect(context, effects).await?;
-        effects = match gate.step(event, txn_id)? {
+        effects = match gate.step(event)? {
             Some(effects) => effects,
             None => break,
         };
@@ -729,6 +732,7 @@ mod tests {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             context,
         )
@@ -753,6 +757,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 quota_ceiling: None,
+                active_node_ids: None,
             },
         )
         .await
@@ -838,6 +843,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 key: "object.txt".to_string(),
                 quota_ceiling: Some(7),
+                active_node_ids: None,
             },
         )
         .await;

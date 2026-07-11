@@ -103,6 +103,9 @@ pub struct PutObjectConfig {
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
     pub quota_ceiling: Option<u64>,
+    /// Nodes whose per-group snapshots the quota gate trusts, resolved from the
+    /// realm config at the request surface. `None` counts every snapshot.
+    pub active_node_ids: Option<std::collections::HashSet<NodeId>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -509,12 +512,12 @@ impl PutObjectOperation {
                 if let Some(ceiling) = self.config.quota_ceiling
                     && location.blob_size > 0
                 {
-                    let mut gate = QuotaGate::new_for_realm(
+                    let mut gate = QuotaGate::new(
                         ceiling,
                         location.blob_size,
                         self.config.group_id,
                         self.config.node_id,
-                        self.config.realm_id,
+                        self.config.active_node_ids.clone(),
                     );
                     self.state = PutObjectState::EnforceQuota;
                     let effects = gate.start(txn_id);
@@ -546,7 +549,7 @@ impl PutObjectOperation {
         let Some(gate) = self.quota_gate.as_mut() else {
             return self.emit_error(PutObjectError::PutObjectFailed);
         };
-        match gate.step(event, txn_id) {
+        match gate.step(event) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
                 if gate.is_exceeded() {
@@ -912,6 +915,7 @@ mod test {
             exists: false,
             version_source: None,
             quota_ceiling: Some(1),
+            active_node_ids: None,
         }
     }
 
@@ -927,7 +931,7 @@ mod test {
         op.state = PutObjectState::EnforceQuota;
         op.txn_id = Some(txn_id);
         op.written_location = Some(location.clone());
-        op.quota_gate = Some(QuotaGate::new(1, 1, group_id, node_id));
+        op.quota_gate = Some(QuotaGate::new(1, 1, group_id, node_id, None));
 
         let effects = op.handle_enforce_quota(Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
@@ -1084,6 +1088,7 @@ mod test {
             exists: false,
             version_source: None,
             quota_ceiling: None,
+            active_node_ids: None,
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -1285,6 +1290,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )
@@ -1312,6 +1318,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )
@@ -1404,6 +1411,7 @@ mod test {
             exists: false,
             version_source: None,
             quota_ceiling: None,
+            active_node_ids: None,
         });
         let version_id = Ulid::new();
         op.version_id = Some(version_id);
@@ -1503,6 +1511,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )
@@ -1530,6 +1539,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )
@@ -1686,6 +1696,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )

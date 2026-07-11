@@ -1096,6 +1096,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )
@@ -1247,6 +1248,7 @@ mod test {
                 exists: false,
                 version_source: None,
                 quota_ceiling: None,
+                active_node_ids: None,
             }),
             &context,
         )

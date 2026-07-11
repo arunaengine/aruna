@@ -176,7 +176,6 @@ impl UsageCounterUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QuotaGatePhase {
     Pending,
-    ReadRealmConfig,
     ReadLocal,
     ScanRemote,
     Done,
@@ -191,14 +190,19 @@ pub enum QuotaGateError {
 }
 
 /// Embeddable read side of the hard per-group quota gate. Sums the group's
-/// realm-wide `logical_bytes` — the live local group counter plus every remote
-/// node's replicated group snapshot — inside the caller's write transaction right
-/// before it commits the counters, so a concurrent same-group write conflicts on
-/// the group counter key and cannot slip a second write past the ceiling.
+/// realm-wide `logical_bytes` — the live local group counter plus every trusted
+/// remote node's replicated group snapshot. The local group counter is read
+/// inside the caller's write transaction so a concurrent same-group write
+/// conflicts on the group counter key (via `UsageCounterUpdate`) and cannot slip
+/// a second write past the ceiling. The remote-snapshot scan runs *outside* the
+/// transaction (`txn_id: None`) so hot writes no longer read-conflict with
+/// concurrent snapshot ingest; remote group totals already lag the counters that
+/// produced them, and `ceiling`'s folded-in grace factor is deliberately the
+/// budget for that staleness.
 ///
-/// `ceiling` already folds in the grace factor; that headroom is deliberately the
-/// budget for remote snapshot staleness, since remote group totals lag the
-/// authoritative counters that produced them.
+/// `active_node_ids` is the set of nodes whose per-group snapshots count toward
+/// the sum, resolved from the realm config at the request surface. `None` counts
+/// every replicated snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
@@ -206,7 +210,6 @@ pub struct QuotaGate {
     group_key: Vec<u8>,
     remote_prefix: Vec<u8>,
     local_node_id: NodeId,
-    realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
     phase: QuotaGatePhase,
@@ -220,6 +223,7 @@ impl QuotaGate {
         delta_logical_bytes: u64,
         group_id: GroupId,
         local_node_id: NodeId,
+        active_node_ids: Option<HashSet<NodeId>>,
     ) -> Self {
         Self {
             ceiling,
@@ -227,35 +231,13 @@ impl QuotaGate {
             group_key: usage_group_key(group_id),
             remote_prefix: node_usage_group_prefix(group_id),
             local_node_id,
-            realm_id: None,
-            active_node_ids: None,
+            active_node_ids,
             usage: 0,
             phase: QuotaGatePhase::Pending,
         }
     }
 
-    pub fn new_for_realm(
-        ceiling: u64,
-        delta_logical_bytes: u64,
-        group_id: GroupId,
-        local_node_id: NodeId,
-        realm_id: RealmId,
-    ) -> Self {
-        Self {
-            realm_id: Some(realm_id),
-            ..Self::new(ceiling, delta_logical_bytes, group_id, local_node_id)
-        }
-    }
-
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        if let Some(realm_id) = self.realm_id {
-            self.phase = QuotaGatePhase::ReadRealmConfig;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
-                txn_id: Some(txn_id),
-            })];
-        }
         self.read_local_effect(txn_id)
     }
 
@@ -268,38 +250,27 @@ impl QuotaGate {
         })]
     }
 
-    fn scan_effect(&self, start_after: Option<Key>, txn_id: TxnId) -> Effects {
+    fn scan_effect(&self, start_after: Option<Key>) -> Effects {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
             prefix: Some(self.remote_prefix.clone().into()),
             start: start_after.map(IterStart::After),
             limit: Self::SCAN_LIMIT,
-            txn_id: Some(txn_id),
+            txn_id: None,
         })]
     }
 
     /// Returns `Ok(Some(effects))` while more storage work is needed and
     /// `Ok(None)` once the group's realm-wide usage has been summed.
-    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
+    pub fn step(&mut self, event: Event) -> Result<Option<Effects>, QuotaGateError> {
         match (&self.phase, event) {
-            (
-                QuotaGatePhase::ReadRealmConfig,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                if let Some(bytes) = value {
-                    let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
-                    self.active_node_ids =
-                        Some(document.sync_eligible_node_ids()?.into_iter().collect());
-                }
-                Ok(Some(self.read_local_effect(txn_id)))
-            }
             (QuotaGatePhase::ReadLocal, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 if let Some(bytes) = value {
                     let counters = UsageCounters::from_bytes(bytes.as_ref())?;
                     self.usage = self.usage.saturating_add(counters.logical_bytes);
                 }
                 self.phase = QuotaGatePhase::ScanRemote;
-                Ok(Some(self.scan_effect(None, txn_id)))
+                Ok(Some(self.scan_effect(None)))
             }
             (
                 QuotaGatePhase::ScanRemote,
@@ -329,7 +300,7 @@ impl QuotaGate {
                     self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
                 }
                 match next_start_after {
-                    Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
+                    Some(start) => Ok(Some(self.scan_effect(Some(start)))),
                     None => {
                         self.phase = QuotaGatePhase::Done;
                         Ok(None)

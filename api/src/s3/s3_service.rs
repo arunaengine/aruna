@@ -22,7 +22,6 @@ use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::replication::queue::{
     QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
@@ -116,6 +115,7 @@ pub struct ArunaS3Service {
     state: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: NodeId,
+    quota_cache: Arc<crate::quota_cache::QuotaConfigCache>,
 }
 
 impl Debug for ArunaS3Service {
@@ -132,6 +132,7 @@ impl ArunaS3Service {
             state: driver_ctx,
             realm_id,
             node_id,
+            quota_cache: Arc::new(crate::quota_cache::QuotaConfigCache::new()),
         }
     }
 
@@ -162,20 +163,32 @@ impl ArunaS3Service {
         .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
     }
 
-    /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes`
-    /// from the realm quota config, mirroring the create_group pattern of reading
-    /// realm config at the request surface. `None` means the group is unlimited.
-    async fn resolve_quota_ceiling(
-        &self,
-        group_id: aruna_core::types::GroupId,
-    ) -> S3Result<Option<u64>> {
-        let realm_config = drive(GetRealmConfigOperation::new(self.realm_id), &self.state)
+    /// Loads the realm config through the short-TTL quota cache so the hot write
+    /// path does not drive a fresh `GetRealmConfigOperation` per request.
+    async fn cached_realm_config(&self) -> S3Result<aruna_core::structs::RealmConfigDocument> {
+        self.quota_cache
+            .get(&self.state, self.realm_id)
             .await
             .map_err(|err| {
                 error!(error = %err, "Failed to load realm config for quota enforcement");
                 s3_error!(InternalError, "Failed to load realm quota configuration")
-            })?;
-        Ok(realm_config.quota.effective_group_ceiling(&group_id))
+            })
+    }
+
+    /// Resolves the quota gate inputs for a group from the cached realm config in
+    /// one read: the hard ceiling (`None` = unlimited) and the trusted node set.
+    async fn resolve_quota_ceiling(
+        &self,
+        group_id: aruna_core::types::GroupId,
+    ) -> S3Result<(Option<u64>, Option<std::collections::HashSet<NodeId>>)> {
+        let config = self.cached_realm_config().await?;
+        let ceiling = config.quota.effective_group_ceiling(&group_id);
+        let active_node_ids = config
+            .sync_eligible_node_ids()
+            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
+            .into_iter()
+            .collect();
+        Ok((ceiling, Some(active_node_ids)))
     }
 
     fn parse_replication_targets(
@@ -919,7 +932,7 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
-        let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
+        let (quota_ceiling, active_node_ids) = self.resolve_quota_ceiling(group_id).await?;
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
             user_id: user_access.user_identity,
@@ -932,6 +945,7 @@ impl S3 for ArunaS3Service {
             version_source: None,
             exists: false,
             quota_ceiling,
+            active_node_ids,
         };
         let operation = PutObjectOperation::new(config);
 
@@ -1073,7 +1087,7 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
-        let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
+        let (quota_ceiling, active_node_ids) = self.resolve_quota_ceiling(group_id).await?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
@@ -1107,6 +1121,7 @@ impl S3 for ArunaS3Service {
             object_size: req.input.mpu_object_size.map(|size| size as u64),
             created_by: user_access.user_identity,
             quota_ceiling,
+            active_node_ids,
         });
 
         let result = drive(operation, &self.state)

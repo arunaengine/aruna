@@ -132,6 +132,9 @@ pub struct CompleteMultipartUploadInput {
     /// resolved from the realm quota config at the request surface. `None` =
     /// unlimited, so no gate is enforced.
     pub quota_ceiling: Option<u64>,
+    /// Nodes whose per-group snapshots the quota gate trusts, resolved from the
+    /// realm config at the request surface. `None` counts every snapshot.
+    pub active_node_ids: Option<std::collections::HashSet<NodeId>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -867,12 +870,12 @@ impl CompleteMultipartUploadOperation {
         if let Some(ceiling) = self.input.quota_ceiling
             && object_size > 0
         {
-            let mut gate = QuotaGate::new_for_realm(
+            let mut gate = QuotaGate::new(
                 ceiling,
                 object_size,
                 group_id,
                 self.input.node_id,
-                self.input.realm_id,
+                self.input.active_node_ids.clone(),
             );
             self.state = CompleteMultipartUploadState::EnforceQuota;
             let effects = gate.start(txn_id);
@@ -901,7 +904,7 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        match gate.step(event, txn_id) {
+        match gate.step(event) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
                 if gate.is_exceeded() {
@@ -1330,6 +1333,7 @@ mod tests {
             object_size: Some(10),
             created_by: UserId::local(Ulid::new(), realm_id),
             quota_ceiling: Some(30),
+            active_node_ids: None,
         }
     }
 

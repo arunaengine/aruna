@@ -22,6 +22,9 @@ pub struct MaterializeSnapshotInput {
     pub bucket: String,
     pub key: String,
     pub quota_ceiling: Option<u64>,
+    /// Nodes whose per-group snapshots the quota gate trusts, resolved from the
+    /// realm config at the request surface. `None` counts every snapshot.
+    pub active_node_ids: Option<std::collections::HashSet<NodeId>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -83,6 +86,7 @@ pub async fn materialize_snapshot(
             exists: false,
             version_source: Some(version_source.clone()),
             quota_ceiling: input.quota_ceiling,
+            active_node_ids: input.active_node_ids.clone(),
         }),
         context,
     )

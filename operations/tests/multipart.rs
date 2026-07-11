@@ -210,6 +210,7 @@ async fn complete_upload(
             object_size,
             created_by,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
@@ -327,6 +328,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
@@ -597,6 +599,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             exists: false,
             version_source: None,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
@@ -692,6 +695,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
@@ -888,6 +892,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
             exists: false,
             version_source: None,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
@@ -1309,6 +1314,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
+            active_node_ids: None,
         }),
         &context.driver,
     )
