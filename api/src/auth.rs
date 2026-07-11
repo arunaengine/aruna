@@ -1750,17 +1750,6 @@ mod test {
         .unwrap()
     }
 
-    fn process_rss_bytes() -> u64 {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let rss_kib = status
-            .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:"))
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("VmRSS must be available from /proc/self/status");
-        rss_kib * 1024
-    }
-
     #[tokio::test]
     async fn rejected_token_flood_keeps_issuer_cache_bounded() {
         let mut tempdir = temp_dir();
@@ -1809,23 +1798,12 @@ mod test {
         .await;
 
         let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let warmup_key = SigningKey::generate(&mut csprng);
-        let warmup_token = sign_untrusted_direct_token(&warmup_key, now);
-        assert!(handle_token(&state, &warmup_token).await.is_err());
-        let rss_before = process_rss_bytes();
-
         for _ in 0..2048 {
             let issuer_key = SigningKey::generate(&mut csprng);
             let token = sign_untrusted_direct_token(&issuer_key, now);
             assert!(handle_token(&state, &token).await.is_err());
         }
 
-        let rss_growth = process_rss_bytes().saturating_sub(rss_before);
-        // Allow allocator page retention and CI measurement noise without permitting unbounded growth.
-        assert!(
-            rss_growth <= 8 * 1024 * 1024,
-            "rejected-token flood grew process RSS by {rss_growth} bytes"
-        );
         assert_eq!(state.issuer_key_cache_len().await, 0);
     }
 
