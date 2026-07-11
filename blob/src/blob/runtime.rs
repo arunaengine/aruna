@@ -87,8 +87,12 @@ impl BlobHandle {
         Event::StagingSource(staging_source_event)
     }
 
-    pub async fn store_connection(&mut self, stream: BiStream) -> Ulid {
-        self.handler.add_connection(None, stream).await
+    pub async fn store_connection(
+        &mut self,
+        peer: NodeId,
+        stream: BiStream,
+    ) -> Result<Ulid, BlobError> {
+        self.handler.add_connection(None, peer, stream).await
     }
 
     pub async fn get_status(&self) -> BlobState {
@@ -221,8 +225,9 @@ impl BlobHandler {
         )
         .await
         {
-            Ok(Ok(stream)) => BlobEvent::ConnectionEstablished {
-                stream_id: self.add_connection(None, stream).await,
+            Ok(Ok(stream)) => match self.add_connection(None, node_id, stream).await {
+                Ok(stream_id) => BlobEvent::ConnectionEstablished { stream_id },
+                Err(err) => BlobEvent::Error(err),
             },
             Ok(Err(err)) => BlobEvent::Error(BlobError::ConnectionFailed(err.to_string())),
             Err(event) => event,
@@ -276,21 +281,52 @@ impl BlobHandler {
         }
     }
 
-    pub async fn add_connection(&mut self, stream_id: Option<Ulid>, stream: BiStream) -> Ulid {
-        let stream_id = stream_id.unwrap_or_default();
-        self.connections
-            .lock()
-            .await
-            .insert(stream_id, Arc::new(Mutex::new(stream)));
-        stream_id
+    pub async fn add_connection(
+        &mut self,
+        stream_id: Option<Ulid>,
+        peer: NodeId,
+        stream: BiStream,
+    ) -> Result<Ulid, BlobError> {
+        let mut connections = self.connections.lock().await;
+        let stream_id = match stream_id {
+            Some(stream_id) => {
+                if stream_id.is_nil() {
+                    return Err(BlobError::ConnectionFailed(
+                        "refusing to register a nil stream id".to_string(),
+                    ));
+                }
+                if connections.contains_key(&stream_id) {
+                    return Err(BlobError::ConnectionFailed(format!(
+                        "stream id already registered: {stream_id}"
+                    )));
+                }
+                stream_id
+            }
+            None => {
+                let mut candidate = Ulid::new();
+                while candidate.is_nil() || connections.contains_key(&candidate) {
+                    candidate = Ulid::new();
+                }
+                candidate
+            }
+        };
+        connections.insert(
+            stream_id,
+            super::Connection {
+                peer,
+                stream: Arc::new(Mutex::new(stream)),
+            },
+        );
+        Ok(stream_id)
     }
 
     pub async fn close_connection(&mut self, stream_id: Ulid) -> BlobEvent {
         let connection = self.connections.lock().await.remove(&stream_id);
-        let Some(stream) = connection else {
+        let Some(connection) = connection else {
             return BlobEvent::ConnectionClosed { stream_id };
         };
-        let mut stream = stream.lock().await;
+        tracing::debug!(stream_id = %stream_id, peer = %connection.peer, "closing blob connection");
+        let mut stream = connection.stream.lock().await;
 
         _ = stream.0.finish();
         _ = stream.1.stop(0u32.into());
@@ -305,7 +341,7 @@ impl BlobHandler {
             .lock()
             .await
             .get(&stream_id)
-            .cloned()
+            .map(|connection| connection.stream.clone())
             .ok_or_else(|| {
                 BlobEvent::Error(BlobError::ReplicationRejected(
                     "Stream not available".to_string(),

@@ -1,10 +1,11 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
+use crate::opendal::abort_partial_writer;
 use aruna_net::streams::{RecvStream, SendStream};
 use bytes::Bytes;
-use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use futures::{AsyncReadExt, AsyncSeekExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
-use opendal::{FuturesAsyncReader, FuturesAsyncWriter, Operator};
+use opendal::{FuturesAsyncReader, Operator};
 use std::{future::Future, io, time::Duration};
 use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
 use tokio::time::timeout;
@@ -147,27 +148,27 @@ impl AsyncStreamReader for RecvStreamWrapper<'_> {
     }
 }
 
-// ----- FuturesAsyncReader/FuturesAsyncWriter impls for bao_tree ----------
+// ----- FuturesAsyncReader/opendal Writer impls for bao_tree ----------
 pub struct OpenDalWriter {
-    pub writer: FuturesAsyncWriter,
-    pub len: u64,
+    writer: opendal::Writer,
+    operator: Operator,
+    storage_path: String,
     pub hasher: Hasher,
-    pub idle_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         debug!("[OpenDalWriter] Try to write data with offset {}", offset);
         with_transfer_idle_timeout(
-            self.writer.write_all(data),
+            async {
+                self.writer
+                    .write(data.to_vec())
+                    .await
+                    .map_err(io::Error::from)
+            },
             self.idle_timeout,
             "writing replicated chunk to backend storage",
-        )
-        .await?;
-        with_transfer_idle_timeout(
-            self.writer.flush(),
-            self.idle_timeout,
-            "flushing replicated chunk to backend storage",
         )
         .await?;
         self.hasher.update(data);
@@ -177,15 +178,14 @@ impl AsyncSliceWriter for OpenDalWriter {
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
         debug!("[OpenDalWriter] Try to write bytes with offset {}", offset);
         with_transfer_idle_timeout(
-            self.writer.write_all(&data),
+            async {
+                self.writer
+                    .write(data.clone())
+                    .await
+                    .map_err(io::Error::from)
+            },
             self.idle_timeout,
             "writing replicated chunk to backend storage",
-        )
-        .await?;
-        with_transfer_idle_timeout(
-            self.writer.flush(),
-            self.idle_timeout,
-            "flushing replicated chunk to backend storage",
         )
         .await?;
         self.hasher.update(&data);
@@ -198,12 +198,6 @@ impl AsyncSliceWriter for OpenDalWriter {
     }
 
     async fn sync(&mut self) -> std::io::Result<()> {
-        with_transfer_idle_timeout(
-            self.writer.flush(),
-            self.idle_timeout,
-            "flushing replicated chunk to backend storage",
-        )
-        .await?;
         Ok(())
     }
 }
@@ -212,18 +206,39 @@ impl OpenDalWriter {
     pub async fn new(
         operator: &Operator,
         storage_path: &str,
-        blob_size: u64,
         idle_timeout: Duration,
     ) -> Result<Self, BlobLibError> {
         Ok(Self {
-            writer: operator
-                .writer(storage_path)
-                .await?
-                .into_futures_async_write(),
-            len: blob_size,
+            writer: operator.writer(storage_path).await?,
+            operator: operator.clone(),
+            storage_path: storage_path.to_string(),
             hasher: Hasher::new(),
             idle_timeout,
         })
+    }
+
+    pub async fn finalize(mut self) -> std::io::Result<()> {
+        let close_result = with_transfer_idle_timeout(
+            async {
+                self.writer
+                    .close()
+                    .await
+                    .map(|_| ())
+                    .map_err(io::Error::from)
+            },
+            self.idle_timeout,
+            "finalizing replicated blob in backend storage",
+        )
+        .await;
+        if let Err(err) = close_result {
+            abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub async fn abort(mut self) {
+        abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
     }
 }
 

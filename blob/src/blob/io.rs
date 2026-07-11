@@ -1,7 +1,7 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, build_multipart_part_path};
 use crate::hash::Hasher;
-use crate::opendal::init_backend_operator;
+use crate::opendal::{abort_partial_writer, init_backend_operator};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
@@ -38,16 +38,23 @@ impl BlobHandler {
         while let Some(chunk) = blob.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
-                Err(err) => return BlobEvent::Error(BlobError::WriteError(err.to_string())),
+                Err(err) => {
+                    abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                }
             };
             hasher.update(&bytes);
             if let Err(err) = writer.write(bytes.to_vec()).await {
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
                 return BlobEvent::Error(BlobError::WriteError(err.to_string()));
             }
             bytes_written += bytes.len() as u64;
         }
 
-        _ = writer.close().await;
+        if let Err(err) = writer.close().await {
+            abort_partial_writer(&mut writer, &operator, &storage_path).await;
+            return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+        }
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         BlobEvent::WriteFinished { location }
@@ -169,13 +176,34 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let storage_path = match location.get_storage_path() {
-            Ok(storage_path) => storage_path,
-            Err(e) => return BlobEvent::Error(e),
-        };
         let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
+        };
+        match self
+            .compose_parts_to_location(location, operator, parts)
+            .await
+        {
+            BlobEvent::WriteFinished { location } => {
+                if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+                    BlobEvent::Error(err)
+                } else {
+                    BlobEvent::WriteFinished { location }
+                }
+            }
+            other => other,
+        }
+    }
+
+    pub(super) async fn compose_parts_to_location(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        parts: Vec<BackendLocation>,
+    ) -> BlobEvent {
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
         };
         let Ok(mut writer) = operator.writer(&storage_path).await else {
             return BlobEvent::Error(BlobError::OperatorCreationFailed(
@@ -184,47 +212,49 @@ impl BlobHandler {
         };
 
         let mut hasher = Hasher::new();
-        let mut bytes_written = 0u64;
-        for part in parts {
-            let part_operator = match self.operator_from_location(&part) {
-                Ok(op) => op,
-                Err(err) => return BlobEvent::Error(err),
-            };
-            let part_storage_path = match part.get_storage_path() {
-                Ok(storage_path) => storage_path,
-                Err(err) => return BlobEvent::Error(err),
-            };
-            let reader = match part_operator.reader(&part_storage_path).await {
-                Ok(reader) => match reader.into_bytes_stream(..).await {
-                    Ok(stream) => stream,
-                    Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
-                },
-                Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
-            };
+        let compose_result: Result<u64, BlobError> = async {
+            let mut bytes_written = 0u64;
+            for part in parts {
+                let part_operator = self.operator_from_location(&part)?;
+                let part_storage_path = part.get_storage_path()?;
+                let reader = part_operator
+                    .reader(&part_storage_path)
+                    .await
+                    .map_err(|err| BlobError::ReadError(err.to_string()))?
+                    .into_bytes_stream(..)
+                    .await
+                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
 
-            let mut reader = BackendStream::new(reader);
-            while let Some(chunk) = reader.next().await {
-                let bytes = match chunk {
-                    Ok(bytes) => bytes,
-                    Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
-                };
-                hasher.update(&bytes);
-                if let Err(err) = writer.write(bytes.to_vec()).await {
-                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                let mut reader = BackendStream::new(reader);
+                while let Some(chunk) = reader.next().await {
+                    let bytes = chunk.map_err(|err| BlobError::ReadError(err.to_string()))?;
+                    hasher.update(&bytes);
+                    writer
+                        .write(bytes.to_vec())
+                        .await
+                        .map_err(|err| BlobError::WriteError(err.to_string()))?;
+                    bytes_written += bytes.len() as u64;
                 }
-                bytes_written += bytes.len() as u64;
             }
+            writer
+                .close()
+                .await
+                .map_err(|err| BlobError::WriteError(err.to_string()))?;
+            Ok(bytes_written)
         }
+        .await;
 
-        _ = writer.close().await;
-        let mut location = location;
+        let bytes_written = match compose_result {
+            Ok(bytes_written) => bytes_written,
+            Err(err) => {
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
+                return BlobEvent::Error(err);
+            }
+        };
+
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
-        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-            BlobEvent::Error(err)
-        } else {
-            BlobEvent::WriteFinished { location }
-        }
+        BlobEvent::WriteFinished { location }
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {

@@ -9,7 +9,7 @@ use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_type_from_multipart,
+    s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -905,6 +905,7 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let replication_auth = AuthContext {
@@ -964,6 +965,7 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_hint = parse_multipart_checksum_hint(&req.input)?;
 
@@ -1007,6 +1009,7 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        validate_object_key(&req.input.key)?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let body = req
@@ -1068,6 +1071,7 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let group_id = bucket_info
             .as_ref()

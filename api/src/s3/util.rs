@@ -1,7 +1,9 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{MultipartChecksumType, MultipartUploadChecksumHint};
+use aruna_core::structs::{
+    MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
+};
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
@@ -10,6 +12,7 @@ use s3s::dto::{
     ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use std::path::Path;
 use ulid::Ulid;
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
@@ -121,6 +124,15 @@ pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
 
 pub(crate) fn is_anonymous_object_read_operation(operation_name: &str) -> bool {
     matches!(operation_name, "GetObject")
+}
+
+pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
+    if key.is_empty() {
+        return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
+    }
+
+    ensure_confined_relative_path(Path::new(key))
+        .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))
 }
 
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
@@ -264,10 +276,42 @@ pub(crate) fn checksum_algorithm_from_s3(
 mod tests {
     use super::{
         get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_multipart_part_number,
+        parse_multipart_part_number, validate_object_key,
     };
     use crate::s3::auth::Action;
     use s3s::S3ErrorCode;
+
+    #[test]
+    fn validate_object_key_accepts_ordinary_keys() {
+        for key in ["object.bin", "nested/path/object.bin", "a.b..c/keep..dots"] {
+            assert!(
+                validate_object_key(key).is_ok(),
+                "key {key:?} must be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_object_key_rejects_traversal_and_control_keys() {
+        let cases = [
+            "",
+            "/absolute/key",
+            "../escape",
+            "../../etc/passwd",
+            "nested/../../escape",
+            "trailing/..",
+            "with\u{0000}null",
+            "with\u{007f}delete",
+            "with\nnewline",
+        ];
+        for key in cases {
+            assert_eq!(
+                *validate_object_key(key).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "key {key:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn anonymous_public_access_only_allows_get_object() {

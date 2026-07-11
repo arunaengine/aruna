@@ -45,6 +45,9 @@ The system is organized around **realms**. A realm is an organizational trust bo
 ### Data, metadata, and access
 
 Each Aruna node exposes an **S3-compatible API**, so researchers can keep using the tools, scripts, workflow systems, and libraries they already have instead of learning a new storage protocol. Buckets are virtual collections that mix local data, replicated data, and references to remote resources. To a user, this looks like one coherent access point. Underneath, Aruna tracks where data actually lives, which permissions apply, and whether an object should be materialized locally or fetched on demand.
+
+> [!NOTE]
+> Object keys for `PutObject`, `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` must be non-empty relative paths; they are rejected if they begin with `/`, contain an exact `..` path segment, or contain control characters.
  
 Metadata is part of the core system, not an external catalog bolted on afterwards. Descriptions are stored as **RO-Crate JSON-LD**, so datasets, files, people, instruments, workflows, software, and process runs can be described in a shared format. These descriptions live in a CRDT-based triple store, which allows concurrent edits on different nodes and merges them without a single authority arbitrating the result. Management resources such as users and groups are synchronized through durable document-sync topics, which lets nodes keep working through network outages and reconcile state once they reconnect.
  

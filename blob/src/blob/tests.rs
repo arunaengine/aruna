@@ -1,3 +1,4 @@
+use super::backend::{build_backend_path, rebuild_backend_path};
 use super::{
     BlobHandle, BlobHandler, ControlPlaneTimeoutKind,
     control_plane::control_plane_timeout_event,
@@ -7,8 +8,9 @@ use super::{
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::UserId;
+use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::BackendStream;
@@ -16,12 +18,123 @@ use aruna_core::structs::{
     Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, RealmId, ResolvedSourceAccess,
     SourceConnectorKind,
 };
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 use ulid::Ulid;
+
+mod failing_close {
+    use opendal::raw::oio;
+    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
+    use opendal::{Buffer, Capability, Error, ErrorKind, Metadata, Operator, OperatorBuilder};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    pub(super) struct CloseFailsBackend {
+        info: Arc<AccessorInfo>,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl CloseFailsBackend {
+        fn new(aborts: Arc<AtomicUsize>) -> Self {
+            let info = AccessorInfo::default();
+            info.set_scheme("close_fails")
+                .set_root("/")
+                .set_native_capability(Capability {
+                    write: true,
+                    write_can_empty: true,
+                    write_can_multi: true,
+                    ..Default::default()
+                });
+            Self {
+                info: info.into(),
+                aborts,
+            }
+        }
+    }
+
+    impl Access for CloseFailsBackend {
+        type Reader = ();
+        type Writer = CloseFailsWriter;
+        type Lister = ();
+        type Deleter = ();
+        type Copier = ();
+
+        fn info(&self) -> Arc<AccessorInfo> {
+            self.info.clone()
+        }
+
+        async fn write(
+            &self,
+            _path: &str,
+            _args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            Ok((
+                RpWrite::new(),
+                CloseFailsWriter {
+                    aborts: self.aborts.clone(),
+                },
+            ))
+        }
+    }
+
+    pub(super) struct CloseFailsWriter {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl oio::Write for CloseFailsWriter {
+        async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> opendal::Result<Metadata> {
+            Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected finalization failure",
+            ))
+        }
+
+        async fn abort(&mut self) -> opendal::Result<()> {
+            self.aborts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    pub(super) fn operator_with_aborts() -> (Operator, Arc<AtomicUsize>) {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let operator = OperatorBuilder::new(CloseFailsBackend::new(aborts.clone())).finish();
+        (operator, aborts)
+    }
+}
+
+async fn loopback_net_handle() -> (NetHandle, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let net_handle = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage_handle,
+    )
+    .await
+    .unwrap();
+    (net_handle, dir)
+}
+
+async fn connected_stream_pair() -> (NetHandle, tempfile::TempDir, NetHandle, tempfile::TempDir) {
+    let (net_a, dir_a) = loopback_net_handle().await;
+    let (net_b, dir_b) = loopback_net_handle().await;
+    net_a.add_peer_addr(net_b.endpoint_addr()).await;
+    net_b.add_peer_addr(net_a.endpoint_addr()).await;
+    (net_a, dir_a, net_b, dir_b)
+}
 
 struct TestContext {
     _temp_dir: tempfile::TempDir,
@@ -449,5 +562,259 @@ async fn staging_source_effect_dispatches_via_blob_handle() {
         event,
         Event::StagingSource(StagingSourceEvent::Error { .. })
             | Event::StagingSource(StagingSourceEvent::HeadResult { .. })
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_connections_receive_distinct_non_nil_ids() {
+    let context = setup_blob_handle(1).await;
+    let mut handler = context.blob_handle.handler.clone();
+    let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
+    let peer_id = net_b.node_id();
+
+    let stream_a = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    let stream_b = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+
+    let id_a = handler
+        .add_connection(None, peer_id, stream_a)
+        .await
+        .unwrap();
+    let id_b = handler
+        .add_connection(None, peer_id, stream_b)
+        .await
+        .unwrap();
+
+    assert!(!id_a.is_nil());
+    assert!(!id_b.is_nil());
+    assert_ne!(id_a, id_b);
+
+    handler.close_connection(id_a).await;
+    assert!(handler.connection_handle(id_a).await.is_err());
+    assert!(handler.connection_handle(id_b).await.is_ok());
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_connection_rejects_nil_and_duplicate_ids() {
+    let context = setup_blob_handle(1).await;
+    let mut handler = context.blob_handle.handler.clone();
+    let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
+    let peer_id = net_b.node_id();
+
+    let explicit = Ulid::new();
+    let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    let id = handler
+        .add_connection(Some(explicit), peer_id, stream)
+        .await
+        .unwrap();
+    assert_eq!(id, explicit);
+
+    let duplicate = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    assert!(matches!(
+        handler
+            .add_connection(Some(explicit), peer_id, duplicate)
+            .await,
+        Err(BlobError::ConnectionFailed(_))
+    ));
+
+    let nil_stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
+    assert!(matches!(
+        handler
+            .add_connection(Some(Ulid::nil()), peer_id, nil_stream)
+            .await,
+        Err(BlobError::ConnectionFailed(_))
+    ));
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn write_finalization_failure_emits_no_success_or_load() {
+    let context = setup_blob_handle(1).await;
+    let handler = context.blob_handle.handler.clone();
+    let location = BackendLocation {
+        root: "/tmp".to_string(),
+        storage_bucket: "finalization-bucket".to_string(),
+        backend_path: format!("obj/{}", Ulid::new()),
+        ulid: Ulid::new(),
+        compressed: false,
+        encrypted: false,
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: HashMap::new(),
+    };
+
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let event = handler
+        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .await;
+
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "close failure must surface as an error, got {event:?}"
+    );
+    assert_eq!(
+        bucket_load(&context.storage_handle, &location.storage_bucket).await,
+        0
+    );
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_write_cleans() {
+    let context = setup_blob_handle(1).await;
+    let root = tempdir().unwrap();
+    let location = BackendLocation {
+        root: root.path().to_str().unwrap().to_string(),
+        storage_bucket: "bucket".to_string(),
+        backend_path: "partial.bin".to_string(),
+        ulid: Ulid::new(),
+        compressed: false,
+        encrypted: false,
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: HashMap::new(),
+    };
+    let operator = crate::opendal::init_operator(
+        Backend::FileSystem,
+        HashMap::from([(
+            "root".to_string(),
+            root.path().to_str().unwrap().to_string(),
+        )]),
+    )
+    .unwrap();
+    let blob = BackendStream::new(futures::stream::iter([
+        Ok(bytes::Bytes::from_static(b"partial")),
+        Err(std::io::Error::other("injected stream failure")),
+    ]));
+
+    let event = context
+        .blob_handle
+        .handler
+        .write_stream_to_location(location.clone(), operator, blob)
+        .await;
+
+    assert!(matches!(event, BlobEvent::Error(BlobError::WriteError(_))));
+    assert!(
+        !std::path::Path::new(&location.get_full_path().unwrap()).exists(),
+        "partial filesystem target remains"
+    );
+}
+
+#[tokio::test]
+async fn compose_close_fails() {
+    let context = setup_blob_handle(5).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let Event::Blob(BlobEvent::WriteFinished { location: part }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::Write {
+            bucket: "bucket-a".to_string(),
+            key: "part.bin".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"part-data"),
+        })
+        .await
+    else {
+        panic!("part write failed")
+    };
+
+    let target = BackendLocation {
+        root: "/tmp".to_string(),
+        storage_bucket: "compose-target".to_string(),
+        backend_path: format!("obj/{}", Ulid::new()),
+        ulid: Ulid::new(),
+        compressed: false,
+        encrypted: false,
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: HashMap::new(),
+    };
+
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let event = handler
+        .compose_parts_to_location(target.clone(), operator, vec![part])
+        .await;
+
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "compose close failure must surface as an error, got {event:?}"
+    );
+    assert_eq!(
+        bucket_load(&context.storage_handle, &target.storage_bucket).await,
+        0
+    );
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn replication_close_fails() {
+    let (operator, aborts) = failing_close::operator_with_aborts();
+    let mut writer =
+        crate::bao_tree::OpenDalWriter::new(&operator, "obj/replica", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+    iroh_io::AsyncSliceWriter::write_bytes_at(&mut writer, 0, bytes::Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+
+    assert!(writer.finalize().await.is_err());
+    assert_eq!(aborts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn build_backend_path_rejects_traversal_keys() {
+    let ulid = Ulid::new();
+    assert!(build_backend_path("bucket", "nested/object.bin", ulid).is_ok());
+
+    for key in ["../escape", "../../etc/passwd", "a/../../b", "/abs/path"] {
+        assert!(
+            matches!(
+                build_backend_path("bucket", key, ulid),
+                Err(ConversionError::UnsafePath(_))
+            ),
+            "key {key:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn rebuild_backend_path_rejects_sender_supplied_traversal() {
+    let ulid = Ulid::new();
+    assert!(rebuild_backend_path("bucket/object_0000", ulid).is_ok());
+
+    for path in ["../../etc/cron.d/evil_00", "../escape_00", "/abs/object_00"] {
+        assert!(
+            matches!(
+                rebuild_backend_path(path, ulid),
+                Err(ConversionError::UnsafePath(_))
+            ),
+            "replicated path {path:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn get_storage_path_rejects_replicated_traversal_path() {
+    let mut location = make_test_location();
+    location.storage_bucket = "bucket".to_string();
+    location.backend_path = "../../etc/passwd".to_string();
+
+    assert!(matches!(
+        location.get_storage_path(),
+        Err(BlobError::ConversionError(ConversionError::UnsafePath(_)))
     ));
 }

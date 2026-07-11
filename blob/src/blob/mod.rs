@@ -1,3 +1,4 @@
+use aruna_core::NodeId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::BackendConfig;
@@ -28,6 +29,12 @@ pub type EffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::AsyncRx<mpsc::Array<EffectHandle>>;
 type SharedBiStream = Arc<Mutex<BiStream>>;
 
+#[derive(Clone, Debug)]
+struct Connection {
+    peer: NodeId,
+    stream: SharedBiStream,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlPlaneTimeoutKind {
     Connection,
@@ -40,7 +47,7 @@ pub struct BlobHandler {
     backend_config: BackendConfig,
     storage: StorageHandle,
     net: NetHandle,
-    connections: Arc<Mutex<HashMap<Ulid, SharedBiStream>>>,
+    connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
     operator_status: Arc<RwLock<aruna_core::structs::Status>>,
 }
 

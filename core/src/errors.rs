@@ -168,6 +168,8 @@ pub enum ConversionError {
     FromStrError(String),
     #[error("Failed to convert OsString to String")]
     OsStringError,
+    #[error("Unsafe path: {0}")]
+    UnsafePath(String),
     #[error(transparent)]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error(transparent)]

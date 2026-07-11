@@ -14,7 +14,6 @@ use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, ByteRanges};
 use bytes::BytesMut;
-use futures::AsyncWriteExt;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -202,7 +201,6 @@ impl BlobHandler {
         let mut writer = match OpenDalWriter::new(
             &operator,
             &storage_path,
-            location.blob_size,
             self.transfer_idle_timeout(),
         )
         .await
@@ -221,35 +219,46 @@ impl BlobHandler {
         let chunk_ranges = round_up_to_chunks(&byte_ranges);
 
         debug!("Try to decode chunks received from bidi stream");
-        if let Err(err) = decode_ranges(rx_wrapper, chunk_ranges, &mut writer, &mut ob).await {
-            return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
-        }
+        let decode_result = decode_ranges(rx_wrapper, chunk_ranges, &mut writer, &mut ob).await;
         drop(stream);
-        _ = writer.writer.close().await;
-        debug!("Decoded all chunks and wrote them into the backend");
 
-        let hashes = writer.hasher.to_map();
-        let actual_blake3 = writer.hasher.finalize().blake3;
-        if actual_blake3 != root {
-            let _ = operator.delete(&storage_path).await;
-            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
-                "replicated content hash mismatch".to_string(),
-            ));
-        }
-
-        location.hashes = hashes;
-        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-            BlobEvent::Error(err)
-        } else {
-            if !keep_alive {
-                if let Ok(stream) = self.connection_handle(stream_id).await {
-                    let mut stream = stream.lock().await;
-                    _ = stream.0.finish();
-                    _ = stream.1.stop(0u32.into());
-                }
-                self.connections.lock().await.remove(&stream_id);
+        let event = match decode_result {
+            Err(err) => {
+                writer.abort().await;
+                BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()))
             }
-            BlobEvent::ReplicationFinished { location }
+            Ok(()) => {
+                let hashes = writer.hasher.to_map();
+                let actual_blake3 = writer.hasher.finalize().blake3;
+                match writer.finalize().await {
+                    Err(err) => BlobEvent::Error(BlobError::ReplicationFailed(err.to_string())),
+                    Ok(()) => {
+                        debug!("Decoded all chunks and wrote them into the backend");
+                        if actual_blake3 != root {
+                            if let Err(err) = operator.delete(&storage_path).await {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to delete hash-mismatched replicated blob"
+                                );
+                            }
+                            BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                                "replicated content hash mismatch".to_string(),
+                            ))
+                        } else {
+                            location.hashes = hashes;
+                            match self.increment_bucket_load(&location.storage_bucket).await {
+                                Err(err) => BlobEvent::Error(err),
+                                Ok(()) => BlobEvent::ReplicationFinished { location },
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if !keep_alive {
+            _ = self.close_connection(stream_id).await;
         }
+        event
     }
 }
