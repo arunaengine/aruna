@@ -189,6 +189,7 @@ impl JobsRuntime {
                 job_id,
                 None,
                 now_ms,
+                None,
                 Some(JobError::retryable(
                     "node restarted while job was in flight",
                 )),
@@ -248,26 +249,42 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
         progress: progress.clone(),
     };
 
-    let now_ms = unix_timestamp_millis();
+    // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
+    // retention reflect completion time, not the job's start.
     match supervise(storage, job_id, token, &record, &ctx).await {
         SuperviseResult::Zombie => {}
         SuperviseResult::Outcome(JobRunOutcome::Succeeded(result)) => {
             terminal_or_none(
-                complete_job(storage, job_id, token, result, progress.snapshot(), now_ms).await,
+                complete_job(
+                    storage,
+                    job_id,
+                    token,
+                    result,
+                    progress.snapshot(),
+                    unix_timestamp_millis(),
+                )
+                .await,
                 job_id,
             );
         }
         SuperviseResult::Outcome(JobRunOutcome::Failed(error)) => {
             if error.kind == JobErrorKind::Retryable {
-                if let Err(error) =
-                    requeue_job(storage, job_id, Some(token), now_ms, Some(error)).await
+                if let Err(error) = requeue_job(
+                    storage,
+                    job_id,
+                    Some(token),
+                    unix_timestamp_millis(),
+                    None,
+                    Some(error),
+                )
+                .await
                     && !matches!(error, JobMutationError::TokenMismatch)
                 {
                     warn!(job_id = %job_id, error = %error, "Failed to requeue job");
                 }
             } else {
                 terminal_or_none(
-                    fail_job(storage, job_id, token, error, now_ms).await,
+                    fail_job(storage, job_id, token, error, unix_timestamp_millis()).await,
                     job_id,
                 );
             }
@@ -275,7 +292,7 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {
             run_cleanup(&record.payload);
             terminal_or_none(
-                cancel_running_job(storage, job_id, token, now_ms).await,
+                cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await,
                 job_id,
             );
         }
@@ -528,6 +545,33 @@ mod tests {
         assert_eq!(recovered.state, JobState::Queued);
         assert_eq!(recovered.attempts, 1);
         assert!(recovered.claim.is_none());
+    }
+
+    // finished_at must reflect completion time, not the job's start.
+    #[tokio::test]
+    async fn finished_at_fresh() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([8u8; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 30, 10, None)).await;
+
+        let t_before = unix_timestamp_millis();
+        runtime.spawn(ctx.clone(), claimed);
+        let state = runtime
+            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(state, JobState::Succeeded);
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            record.finished_at_ms.unwrap() >= t_before + 150,
+            "finished_at must be set after the payload ran, not at start"
+        );
     }
 
     // Perf budget: progress is throttled, so a 10k-step job writes O(1), not O(steps).
