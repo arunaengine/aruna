@@ -1348,12 +1348,15 @@ mod tests {
         assert_eq!(unlimited.state, "unlimited");
     }
 
+    // The warn boundary (Q*W/100 = 2.55) is not floored to 2, and grace room keeps
+    // usage at the quota in warn rather than blocked.
     #[test]
-    fn group_quota_status_uses_fractional_warn_threshold_without_flooring() {
+    fn fractional_warn_threshold() {
         let group = Ulid::new();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(3),
             warn_threshold_percent: 85,
+            grace_factor_percent: 200,
             ..QuotaConfig::default()
         };
 
