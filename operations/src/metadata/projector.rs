@@ -17,8 +17,8 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     document_placement_delete_entry, document_placement_write_entry,
-    metadata_document_lifecycle_revision_change, metadata_event_log_key,
-    metadata_graph_lifecycle_key, metadata_materialization_status_key,
+    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
+    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
     metadata_pending_projection_delete_entry, metadata_pending_projection_key,
     metadata_pending_projection_target, metadata_registry_delete_entries,
 };
@@ -583,6 +583,13 @@ pub async fn project_metadata_create_events(
                 placement_retries.insert((placement.realm_id, placement.origin_node_id));
             }
             writes.push(document_placement_write_entry(&placement)?);
+        }
+        if local_node_id == Some(event.node_id) {
+            writes.push(metadata_document_lifecycle_write_entry(
+                &MetadataDocumentLifecycleRecord::Upsert {
+                    event: Box::new(event.clone()),
+                },
+            )?);
         }
         registry_cache.insert(document_id, Some(event.record.clone()));
         projected_records.push(event.record);
@@ -1422,6 +1429,26 @@ mod tests {
         let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
         assert_eq!(placement.desired_holder_count, 3);
         assert!(placement.selected_holders.is_empty());
+
+        let lifecycle = storage
+            .send_effect(crate::document_repository::read_effect(&target, None))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = lifecycle
+        else {
+            panic!("origin must retain lifecycle transfer source, got {lifecycle:?}");
+        };
+        let lifecycle: MetadataDocumentLifecycleRecord =
+            postcard::from_bytes(&value).expect("lifecycle decodes");
+        let mut expected_event = event;
+        expected_event.record.holder_node_ids.clear();
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(expected_event)
+            }
+        );
     }
 
     #[test]

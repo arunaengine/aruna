@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncPublish,
+    DocumentSyncRevision, DocumentSyncTarget,
 };
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -18,6 +18,7 @@ use aruna_core::structs::PlacementRef;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -51,6 +52,7 @@ pub struct AnnounceTopicOperation {
     document_bytes: Option<Vec<u8>>,
     placement: PlacementRef,
     allow_genesis: bool,
+    require_delivery: bool,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
     current: Option<DocumentSyncTarget>,
@@ -64,6 +66,8 @@ enum AnnounceTopicState {
     ListUsers,
     WriteOutbox,
     ScheduleSync,
+    PublishDocument,
+    SyncDocument,
     Finish,
     Error,
 }
@@ -133,6 +137,7 @@ impl AnnounceTopicOperation {
             document_bytes: None,
             placement,
             allow_genesis,
+            require_delivery: false,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -156,11 +161,32 @@ impl AnnounceTopicOperation {
             document_bytes: Some(bytes),
             placement: PlacementRef::NIL,
             allow_genesis,
+            require_delivery: false,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
             output: None,
         }
+    }
+
+    pub(crate) fn new_for_document_transfer_with_peers_and_placement(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: DocumentSyncTarget,
+        peers: Vec<NodeId>,
+        placement: PlacementRef,
+        allow_genesis: bool,
+    ) -> Self {
+        let mut operation = Self::new_for_document_with_peers_and_placement(
+            topic,
+            local_node_id,
+            Some(document),
+            peers,
+            placement,
+            allow_genesis,
+        );
+        operation.require_delivery = true;
+        operation
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
@@ -212,6 +238,30 @@ impl AnnounceTopicOperation {
             document,
             DocumentSyncOutboxEvent::Upsert { bytes, change },
         )
+    }
+
+    fn publish_document_effect(&mut self, document: DocumentSyncTarget, bytes: Vec<u8>) -> Effects {
+        let change = match self.document_upsert_change(&document, &bytes) {
+            Ok(change) => change,
+            Err(error) => return self.fail(error),
+        };
+        if self.peers.is_empty() {
+            return self.finish();
+        }
+        self.current = Some(document.clone());
+        self.state = AnnounceTopicState::PublishDocument;
+        smallvec![Effect::Net(NetEffect::DocumentSync(
+            DocumentSyncEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::Upsert {
+                    event_id: Ulid::new(),
+                    target: document,
+                    bytes,
+                    change,
+                    allow_genesis: self.allow_genesis,
+                }],
+                peers: self.peers.clone(),
+            }
+        ))]
     }
 
     fn write_document_outbox_event_effect(
@@ -363,7 +413,11 @@ impl AnnounceTopicOperation {
         match self.pending.pop_front() {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
-                    self.write_document_outbox_effect(document, bytes)
+                    if self.require_delivery {
+                        self.publish_document_effect(document, bytes)
+                    } else {
+                        self.write_document_outbox_effect(document, bytes)
+                    }
                 } else {
                     self.current = Some(document.clone());
                     self.state = AnnounceTopicState::ReadDocument;
@@ -408,9 +462,18 @@ impl Operation for AnnounceTopicOperation {
                         );
                     };
                     let Some(bytes) = value else {
+                        if self.require_delivery {
+                            return self.fail(AnnounceTopicError::DocumentSync(format!(
+                                "required transfer source is missing for {document:?}"
+                            )));
+                        }
                         return self.next_effect();
                     };
-                    self.write_document_outbox_effect(document, bytes.to_vec())
+                    if self.require_delivery {
+                        self.publish_document_effect(document, bytes.to_vec())
+                    } else {
+                        self.write_document_outbox_effect(document, bytes.to_vec())
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
@@ -478,6 +541,44 @@ impl Operation for AnnounceTopicOperation {
                 other => {
                     self.unexpected_event("document sync timer schedule", format!("{other:?}"))
                 }
+            },
+            AnnounceTopicState::PublishDocument => match event {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
+                    ..
+                })) => {
+                    let Some(document) = self.current.clone() else {
+                        return self.unexpected_event(
+                            "tracked document sync target",
+                            "missing current document".to_string(),
+                        );
+                    };
+                    self.state = AnnounceTopicState::SyncDocument;
+                    smallvec![Effect::Net(NetEffect::DocumentSync(
+                        DocumentSyncEffect::SyncDocument {
+                            target: document,
+                            peers: self.peers.clone(),
+                        }
+                    ))]
+                }
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                    error, ..
+                })) => self.fail(AnnounceTopicError::DocumentSync(error)),
+                Event::Net(NetEvent::Error(error)) => {
+                    self.fail(AnnounceTopicError::DocumentSync(format!("{error:?}")))
+                }
+                other => self.unexpected_event("document publish result", format!("{other:?}")),
+            },
+            AnnounceTopicState::SyncDocument => match event {
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+                    ..
+                })) => self.finish(),
+                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                    error, ..
+                })) => self.fail(AnnounceTopicError::DocumentSync(error)),
+                Event::Net(NetEvent::Error(error)) => {
+                    self.fail(AnnounceTopicError::DocumentSync(format!("{error:?}")))
+                }
+                other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {
                 smallvec![]
@@ -620,6 +721,109 @@ mod tests {
             panic!("expected revisioned upsert");
         };
         assert_eq!(change.placement, placement);
+    }
+
+    fn document_lifecycle_fixture() -> (DocumentSyncTarget, Vec<u8>) {
+        let document_id = Ulid::from_bytes([7; 16]);
+        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+            event: aruna_core::metadata::MetadataDocumentDeleteRecord {
+                event_id: Ulid::from_bytes([8; 16]),
+                tombstone: MetadataGraphLifecycleRecord::deleted(
+                    "urn:graph:transfer".to_string(),
+                    RealmId::from_bytes([2; 32]),
+                    GroupId::from_bytes([6; 16]),
+                    document_id,
+                    42,
+                ),
+                deleted_after_event_id: Ulid::from_bytes([5; 16]),
+            },
+        };
+        (
+            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+            postcard::to_allocvec(&lifecycle).expect("lifecycle serializes"),
+        )
+    }
+
+    #[test]
+    fn required_document_transfer_fails_without_source() {
+        let (document, _) = document_lifecycle_fixture();
+        let mut operation =
+            AnnounceTopicOperation::new_for_document_transfer_with_peers_and_placement(
+                document.topic_id(),
+                local_node_id(),
+                document,
+                vec![iroh::SecretKey::from_bytes(&[2; 32]).public()],
+                PlacementRef::NIL,
+                false,
+            );
+
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AnnounceTopicError::DocumentSync(error))
+                if error.contains("required transfer source is missing")
+        ));
+    }
+
+    #[test]
+    fn required_document_transfer_waits_for_peer_reconciliation() {
+        let (document, bytes) = document_lifecycle_fixture();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation =
+            AnnounceTopicOperation::new_for_document_transfer_with_peers_and_placement(
+                document.topic_id(),
+                local_node_id(),
+                document.clone(),
+                vec![peer],
+                PlacementRef::NIL,
+                false,
+            );
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(bytes.into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::PublishDocuments { peers, .. }
+            ))] if peers == &vec![peer]
+        ));
+        let effects = operation.step(Event::Net(NetEvent::DocumentSync(
+            DocumentSyncNetEvent::DocumentsPublished {
+                targets: vec![document.clone()],
+            },
+        )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Net(NetEffect::DocumentSync(
+                DocumentSyncEffect::SyncDocument { target, peers }
+            ))] if target == &document && peers == &vec![peer]
+        ));
+        assert!(!operation.is_complete());
+
+        let effects = operation.step(Event::Net(NetEvent::DocumentSync(
+            DocumentSyncNetEvent::DocumentsReconciled {
+                applied: 0,
+                targets: Vec::new(),
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: Vec::new(),
+            },
+        )));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]

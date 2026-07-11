@@ -5,7 +5,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::storage_entries::{
+    document_placement_write_entry, metadata_registry_write_entries,
+};
+use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -13,6 +16,7 @@ use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
+use crate::metadata::repository::read_registry_by_document_effect;
 use crate::placement::{PlacementResolutionContext, plan_target_placement};
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, new_placement_with_context, placement_prefix,
@@ -52,6 +56,7 @@ enum PlacementState {
     ListPending,
     Publish,
     StorePlacement,
+    ReadMetadataRegistry,
     ScheduleRetry,
     Finish,
     Error,
@@ -62,6 +67,7 @@ struct CurrentPlacement {
     planned: PendingDocumentPlacement,
     selected_holders_after_failure: Vec<NodeId>,
     newly_required_remote_holders: Vec<NodeId>,
+    metadata_holders_changed: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -169,13 +175,25 @@ impl ProcessPlacementsOperation {
             .map(|plan| (plan.desired_count, plan.holders, plan.placement))
             .unwrap_or((record.desired_holder_count, Vec::new(), PlacementRef::NIL));
         sort_node_ids(&mut planned_holders);
+        let is_metadata_lifecycle = matches!(
+            &record.target,
+            DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+        );
+        let metadata_holders_changed =
+            is_metadata_lifecycle && planned_holders != previously_selected;
 
         let selected_holders_after_failure: Vec<NodeId> = planned_holders
             .iter()
             .copied()
             .filter(|node_id| {
-                previously_selected.contains(node_id) || *node_id == self.config.local_node_id
+                previously_selected.contains(node_id)
+                    || (*node_id == self.config.local_node_id && !is_metadata_lifecycle)
             })
+            .collect();
+        let newly_required_holders: Vec<NodeId> = planned_holders
+            .iter()
+            .copied()
+            .filter(|node_id| !previously_selected.contains(node_id))
             .collect();
         let newly_required_remote_holders: Vec<NodeId> = planned_holders
             .iter()
@@ -198,9 +216,12 @@ impl ProcessPlacementsOperation {
             planned,
             selected_holders_after_failure,
             newly_required_remote_holders: newly_required_remote_holders.clone(),
+            metadata_holders_changed,
         });
 
-        if newly_required_remote_holders.is_empty() {
+        if (newly_required_remote_holders.is_empty() && !is_metadata_lifecycle)
+            || newly_required_holders.is_empty()
+        {
             return self.emit_placement_update(false);
         }
 
@@ -209,7 +230,16 @@ impl ProcessPlacementsOperation {
         // ordinary documents retain origin-derived genesis on placement retry.
         let allow_genesis = !matches!(&record.target, DocumentSyncTarget::NodeInfo { .. })
             && record.origin_node_id == self.config.local_node_id;
-        smallvec![Effect::SubOperation(boxed_suboperation(
+        let announce = if is_metadata_lifecycle {
+            AnnounceTopicOperation::new_for_document_transfer_with_peers_and_placement(
+                record.target.topic_id(),
+                self.config.local_node_id,
+                record.target,
+                newly_required_remote_holders,
+                placement,
+                allow_genesis,
+            )
+        } else {
             AnnounceTopicOperation::new_for_document_with_peers_and_placement(
                 record.target.topic_id(),
                 self.config.local_node_id,
@@ -217,7 +247,10 @@ impl ProcessPlacementsOperation {
                 newly_required_remote_holders,
                 placement,
                 allow_genesis,
-            ),
+            )
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            announce,
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
             }),
@@ -229,7 +262,7 @@ impl ProcessPlacementsOperation {
             return self.emit_next_record();
         };
         if publication_failed {
-            current.planned.selected_holders = current.selected_holders_after_failure;
+            current.planned.selected_holders = current.selected_holders_after_failure.clone();
         }
 
         self.state = PlacementState::StorePlacement;
@@ -238,10 +271,56 @@ impl ProcessPlacementsOperation {
                 current.planned.selected_holders.len(),
                 current.planned.desired_holder_count,
             );
+        if current.metadata_holders_changed {
+            let document_id = match &current.planned.target {
+                DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => *document_id,
+                _ => unreachable!("metadata holder changes only apply to lifecycle placements"),
+            };
+            self.current = Some(current);
+            self.state = PlacementState::ReadMetadataRegistry;
+            return smallvec![read_registry_by_document_effect(document_id, None)];
+        }
         match write_placement_effect(&current.planned) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(PlacementError::Placement(error.to_string())),
         }
+    }
+
+    fn emit_metadata_placement_update(
+        &mut self,
+        registry: Option<MetadataRegistryRecord>,
+    ) -> Effects {
+        let Some(current) = self.current.take() else {
+            return self.emit_next_record();
+        };
+        let mut writes = Vec::new();
+        if let Some(mut registry) = registry {
+            let DocumentSyncTarget::MetadataDocumentLifecycle { document_id } =
+                &current.planned.target
+            else {
+                unreachable!("metadata holder changes only apply to lifecycle placements");
+            };
+            if registry.document_id != *document_id {
+                return self.fail(PlacementError::DocumentSync(format!(
+                    "metadata registry document {} does not match lifecycle placement {document_id}",
+                    registry.document_id
+                )));
+            }
+            registry.holder_node_ids = current.planned.selected_holders.clone();
+            match metadata_registry_write_entries(&registry) {
+                Ok(entries) => writes.extend(entries),
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        match document_placement_write_entry(&current.planned) {
+            Ok(entry) => writes.push(entry),
+            Err(error) => return self.fail(error.into()),
+        }
+        self.state = PlacementState::StorePlacement;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })]
     }
 }
 
@@ -314,6 +393,7 @@ impl Operation for ProcessPlacementsOperation {
             },
             PlacementState::StorePlacement => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
+                | Event::Storage(StorageEvent::BatchWriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     if self.retry_needed {
                         self.rearmed = true;
@@ -329,6 +409,24 @@ impl Operation for ProcessPlacementsOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
+            },
+            PlacementState::ReadMetadataRegistry => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let registry = match value {
+                        Some(value) => match postcard::from_bytes(&value) {
+                            Ok(record) => Some(record),
+                            Err(error) => {
+                                return self.fail(PlacementError::ConversionError(error.into()));
+                            }
+                        },
+                        None => None,
+                    };
+                    self.emit_metadata_placement_update(registry)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata registry read result", format!("{other:?}"))
+                }
             },
             PlacementState::ScheduleRetry => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -403,6 +501,32 @@ mod tests {
             config.ensure_node(*node_id, RealmNodeKind::Server);
         }
         config
+    }
+
+    fn finish_missing_metadata_registry_read(
+        operation: &mut ProcessPlacementsOperation,
+        effects: Effects,
+    ) -> Effects {
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == aruna_core::keyspaces::METADATA_DOCUMENT_INDEX_KEYSPACE
+        ));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
+        }))
+    }
+
+    fn placement_from_batch(effects: &Effects) -> PendingDocumentPlacement {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected placement batch write, got {effects:?}");
+        };
+        writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == SYNC_PLACEMENT_KEYSPACE)
+            .and_then(|(_, _, value)| decode_placement(value).ok())
+            .expect("placement update is present")
     }
 
     #[test]
@@ -529,11 +653,8 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
             result: Ok(()),
         }));
-
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected placement write");
-        };
-        let record = decode_placement(value.as_ref()).expect("placement decodes");
+        let effects = finish_missing_metadata_registry_read(&mut operation, effects);
+        let record = placement_from_batch(&effects);
         assert_eq!(record.desired_holder_count, 2);
         assert_eq!(record.selected_holders.len(), 2);
         assert!(record.selected_holders.contains(&node(3)));
@@ -541,6 +662,108 @@ mod tests {
         assert!(!record.selected_holders.contains(&node(1)));
         assert!(!record.selected_holders.contains(&node(2)));
         assert!(!operation.retry_needed);
+    }
+
+    #[test]
+    fn metadata_replan_does_not_claim_replacement_without_transfer_source() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let document_id = Ulid::from_bytes([12; 16]);
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let mut config = config_with(&[node(1), node(2), node(3)]);
+        config.strategies[0].replica_count = Some(2);
+        config.placement_map = vec![NodePlacementEntry {
+            node_id: node(1),
+            location: String::new(),
+            weight: 100,
+            full: true,
+            draining: false,
+            labels: BTreeMap::new(),
+        }];
+        let group_id = Ulid::from_bytes([11; 16]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+            retry_after: SYNC_PLACEMENT_RETRY_AFTER,
+        });
+        operation.realm_config = Some(config);
+        operation.records = vec![new_placement_with_context(
+            realm_id,
+            target,
+            node(9),
+            Some(group_id),
+            Some("datasets/replan".to_string()),
+            2,
+            vec![node(1), node(2)],
+            PlacementRef::NIL,
+        )];
+
+        let effects = operation.emit_next_record();
+        let Some(Effect::SubOperation(mut transfer)) = effects.into_iter().next() else {
+            panic!("expected required transfer sub-operation");
+        };
+        assert!(matches!(
+            transfer.start().as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        assert!(
+            transfer
+                .step(Event::Storage(StorageEvent::ReadResult {
+                    key: Key::from(Vec::new()),
+                    value: None,
+                }))
+                .is_empty()
+        );
+        assert!(transfer.is_complete());
+
+        let effects = operation.step(transfer.finalize());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == aruna_core::keyspaces::METADATA_DOCUMENT_INDEX_KEYSPACE
+        ));
+
+        let registry = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/replan".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/replan",
+                document_id,
+            ),
+            holder_node_ids: vec![node(1), node(2)],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: Ulid::from_bytes([10; 16]),
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(
+                postcard::to_allocvec(&registry)
+                    .expect("registry serializes")
+                    .into(),
+            ),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected atomic registry and placement update, got {effects:?}");
+        };
+        let registry = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == aruna_core::keyspaces::METADATA_INDEX_KEYSPACE)
+            .and_then(|(_, _, value)| postcard::from_bytes::<MetadataRegistryRecord>(value).ok())
+            .expect("registry update is present");
+        assert_eq!(registry.holder_node_ids, vec![node(2)]);
+        let placement = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == SYNC_PLACEMENT_KEYSPACE)
+            .and_then(|(_, _, value)| decode_placement(value).ok())
+            .expect("placement update is present");
+        assert_eq!(placement.selected_holders, vec![node(2)]);
+        assert!(operation.retry_needed);
     }
 
     #[test]
@@ -624,10 +847,8 @@ mod tests {
         );
 
         let effects = operation.emit_placement_update(false);
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected exact placement write");
-        };
-        let record = decode_placement(value.as_ref()).expect("placement decodes");
+        let effects = finish_missing_metadata_registry_read(&mut operation, effects);
+        let record = placement_from_batch(&effects);
         assert_eq!(record.desired_holder_count, 2);
         assert_eq!(record.selected_holders.len(), 2);
         assert_eq!(record.placement.strategy_id, path_strategy.strategy_id);
