@@ -56,6 +56,12 @@ pub const NOTIFICATION_WATCH_INTEREST_KEYSPACE: &str = "notification_watch_inter
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
 
+// Durable job framework keyspaces (#318).
+pub const JOB_KEYSPACE: &str = "jobs";
+pub const JOB_SCHEDULE_INDEX_KEYSPACE: &str = "job_schedule_index";
+pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
+pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
+
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";

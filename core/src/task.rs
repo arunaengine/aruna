@@ -20,6 +20,8 @@ pub enum TaskKey {
     DrainNotificationOutbox,
     PruneNotifications,
     PublishWatchInterest,
+    DrainJobQueue,
+    PruneJobs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
