@@ -20,6 +20,8 @@ pub const JOB_MAX_ATTEMPTS: u32 = 5;
 pub const JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Minimum spacing between throttled progress flushes.
 pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;
+/// Bounded OCC retries when a job mutation transaction conflicts.
+pub const JOB_MUTATE_MAX_ATTEMPTS: u32 = 8;
 
 pub const JOB_DRAIN_BATCH_SIZE: usize = 128;
 pub const JOB_DRAIN_RETRY_AFTER: Duration = Duration::from_secs(1);

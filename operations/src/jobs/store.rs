@@ -1,5 +1,5 @@
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
@@ -17,7 +17,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_RETENTION_MS};
+use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS, JOB_RETENTION_MS};
 use crate::queue_backoff::queue_retry_after_ms;
 
 type JobWrites = Vec<(KeySpace, Key, Value)>;
@@ -129,16 +129,7 @@ fn index_deltas(
         empty_value(),
     ));
 
-    if let Some(dedup_key) = &old.dedup_key
-        && !old.state.is_terminal()
-        && new.state.is_terminal()
-    {
-        deletes.push((
-            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-            ByteView::from(dedup_key.clone()),
-        ));
-    }
-
+    // Dedup removal is guarded by job id in cleanup_dedup_entry, not here.
     Ok((writes, deletes))
 }
 
@@ -155,39 +146,52 @@ fn guard_token(record: &JobRecord, token: Ulid) -> Result<(), JobMutationError> 
     }
 }
 
-/// Read, mutate, and persist a job with its index deltas in one transaction.
+/// Read, mutate, and persist a job with its index deltas in one transaction, with
+/// bounded OCC retry so a commit conflict re-reads and re-applies rather than losing.
 pub async fn mutate_job<F>(
     storage: &StorageHandle,
     job_id: JobId,
-    mutate: F,
+    mut mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnOnce(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
 {
-    let txn_id = start_write_txn(storage)
-        .await
-        .map_err(JobMutationError::Storage)?;
-
-    let outcome = mutate_in_txn(storage, txn_id, job_id, mutate).await;
-    match &outcome {
-        Ok(_) => {
-            if let Err(error) = commit_txn(storage, txn_id).await {
-                return Err(JobMutationError::Storage(error));
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        match mutate_in_txn(storage, txn_id, job_id, &mut mutate).await {
+            Ok(record) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(record),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+                }
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "job mutation exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
             }
         }
-        Err(_) => abort_txn(storage, txn_id).await,
     }
-    outcome
+    Err(JobMutationError::Storage(
+        "job mutation exhausted conflict retries".to_string(),
+    ))
 }
 
 async fn mutate_in_txn<F>(
     storage: &StorageHandle,
     txn_id: TxnId,
     job_id: JobId,
-    mutate: F,
+    mutate: &mut F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnOnce(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
 {
     let Some(mut record) = read_job_record(storage, job_id, Some(txn_id))
         .await
@@ -210,9 +214,36 @@ where
             batch_delete(storage, deletes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
+            cleanup_dedup_entry(storage, txn_id, &old, &record).await?;
             Ok(record)
         }
     }
+}
+
+/// Remove the dedup row only when it still references THIS job: a raced submit may
+/// have repointed it at a newer job that must survive this one going terminal.
+async fn cleanup_dedup_entry(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    old: &JobRecord,
+    new: &JobRecord,
+) -> Result<(), JobMutationError> {
+    let Some(dedup_key) = &old.dedup_key else {
+        return Ok(());
+    };
+    if old.state.is_terminal() || !new.state.is_terminal() {
+        return Ok(());
+    }
+    let key = ByteView::from(dedup_key.clone());
+    let current = read_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
+    if current.as_deref() == Some(old.job_id.to_bytes().as_slice()) {
+        delete_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
+            .await
+            .map_err(JobMutationError::Storage)?;
+    }
+    Ok(())
 }
 
 /// Read a job record, deleting and skipping a malformed row per the outbox precedent.
@@ -249,7 +280,11 @@ pub async fn claim_job(
     holder_node_id: NodeId,
     now_ms: u64,
 ) -> Result<ClaimOutcome, JobMutationError> {
+    let mut claimed_now = false;
+    let mut cancelled_fresh = false;
     let record = mutate_job(storage, job_id, |record| {
+        claimed_now = false;
+        cancelled_fresh = false;
         if record.state != JobState::Queued {
             return Ok(JobMutation::Skip);
         }
@@ -258,6 +293,7 @@ pub async fn claim_job(
             record.state = JobState::Cancelled;
             record.finished_at_ms = Some(now_ms);
             record.claim = None;
+            cancelled_fresh = true;
             return Ok(JobMutation::Persist);
         }
         record.state = JobState::Claimed;
@@ -266,14 +302,18 @@ pub async fn claim_job(
             claim_token: Ulid::new(),
             lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
+        claimed_now = true;
         Ok(JobMutation::Persist)
     })
     .await?;
 
-    Ok(match record.state {
-        JobState::Claimed => ClaimOutcome::Claimed(record),
-        JobState::Cancelled => ClaimOutcome::CancelledFresh(record),
-        _ => ClaimOutcome::NotEligible,
+    // Only a claim WE won returns a token; an already-Claimed job is NotEligible.
+    Ok(if claimed_now {
+        ClaimOutcome::Claimed(record)
+    } else if cancelled_fresh {
+        ClaimOutcome::CancelledFresh(record)
+    } else {
+        ClaimOutcome::NotEligible
     })
 }
 
@@ -312,8 +352,8 @@ pub async fn renew_lease(
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
-        if let Some(progress) = progress {
-            record.progress = progress;
+        if let Some(progress) = &progress {
+            record.progress = progress.clone();
         }
         Ok(JobMutation::Persist)
     })
@@ -333,7 +373,7 @@ pub async fn flush_progress(
 ) -> Result<RenewOutcome, JobMutationError> {
     let record = mutate_job(storage, job_id, |record| {
         guard_token(record, token)?;
-        record.progress = progress;
+        record.progress = progress.clone();
         record.updated_at_ms = now_ms;
         Ok(JobMutation::Persist)
     })
@@ -356,8 +396,8 @@ pub async fn complete_job(
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(now_ms);
         record.updated_at_ms = now_ms;
-        record.progress = final_progress;
-        record.result = Some(result);
+        record.progress = final_progress.clone();
+        record.result = Some(result.clone());
         record.claim = None;
         Ok(JobMutation::Persist)
     })
@@ -376,7 +416,7 @@ pub async fn fail_job(
         record.state = JobState::Failed;
         record.finished_at_ms = Some(now_ms);
         record.updated_at_ms = now_ms;
-        record.last_error = Some(error);
+        record.last_error = Some(error.clone());
         record.claim = None;
         Ok(JobMutation::Persist)
     })
@@ -407,12 +447,14 @@ pub enum RequeueOutcome {
 }
 
 /// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent. `token` is `None`
-/// for the lease sweep and startup recovery.
+/// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
+/// re-check, in-txn, that the lease is still expired so a revived renew is not revoked.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
     token: Option<Ulid>,
     now_ms: u64,
+    require_expired_before: Option<u64>,
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
     let record = mutate_job(storage, job_id, |record| {
@@ -422,7 +464,13 @@ pub async fn requeue_job(
         if record.state.is_terminal() {
             return Ok(JobMutation::Skip);
         }
-        if let Some(error) = error {
+        if let Some(now) = require_expired_before
+            && let Some(claim) = &record.claim
+            && claim.lease_expires_at_ms > now
+        {
+            return Ok(JobMutation::Skip);
+        }
+        if let Some(error) = error.clone() {
             record.last_error = Some(error);
         }
         record.attempts = record.attempts.saturating_add(1);
@@ -611,14 +659,23 @@ async fn start_write_txn(storage: &StorageHandle) -> Result<TxnId, String> {
     }
 }
 
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String> {
+enum CommitResult {
+    Committed,
+    Conflict,
+    Failed(String),
+}
+
+async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> CommitResult {
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => CommitResult::Committed,
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => CommitResult::Conflict,
+        Event::Storage(StorageEvent::Error { error }) => CommitResult::Failed(error.to_string()),
+        other => CommitResult::Failed(format!("unexpected storage event: {other:?}")),
     }
 }
 
@@ -869,6 +926,7 @@ mod tests {
             job_id,
             None,
             6_000,
+            None,
             Some(JobError::retryable("lease expired")),
         )
         .await
@@ -896,7 +954,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None)
+        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None, None)
             .await
             .unwrap()
         else {
@@ -1008,6 +1066,101 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    fn running_record(job_id: JobId, token: Ulid, lease_expires: u64) -> JobRecord {
+        let mut record = queued_record(job_id);
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_at_ms: lease_expires,
+        });
+        record
+    }
+
+    #[tokio::test]
+    async fn revived_lease_kept() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([2u8; 16]);
+        insert_job(&storage, &running_record(job_id, Ulid::new(), 10_000))
+            .await
+            .unwrap();
+
+        // Sweep at now=5_000 with the lease valid until 10_000 must not revoke it.
+        let outcome = requeue_job(
+            &storage,
+            job_id,
+            None,
+            5_000,
+            Some(5_000),
+            Some(JobError::retryable("lease expired")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::Skipped));
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Running);
+    }
+
+    #[tokio::test]
+    async fn reclaim_not_eligible() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([2u8; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap();
+
+        // A second claim of an already-Claimed job must not hand back a token.
+        let outcome = claim_job(&storage, job_id, node_id(4), 6_000)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ClaimOutcome::NotEligible));
+    }
+
+    #[tokio::test]
+    async fn dedup_delete_guarded() {
+        let (_dir, storage) = temp_storage();
+        let job_a = JobId::from_bytes([1u8; 16]);
+        let job_b = JobId::from_bytes([2u8; 16]);
+        let token = Ulid::new();
+        let mut record = running_record(job_a, token, 10_000);
+        record.dedup_key = Some(b"k".to_vec());
+        insert_job(&storage, &record).await.unwrap();
+
+        // A raced submit repoints the dedup row at job B.
+        batch_write(
+            &storage,
+            vec![(
+                JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+                ByteView::from(b"k".to_vec()),
+                ByteView::from(job_b.to_bytes().to_vec()),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        complete_job(
+            &storage,
+            job_a,
+            token,
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        )
+        .await
+        .unwrap();
+
+        // A going terminal must not delete B's dedup row.
+        assert_eq!(
+            find_dedup_job(&storage, b"k", None).await.unwrap(),
+            Some(job_b)
         );
     }
 }
