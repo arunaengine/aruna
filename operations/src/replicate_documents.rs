@@ -197,11 +197,12 @@ impl ReplicateDocumentsOperation {
 
         self.state = ReplicateDocumentsState::Publish;
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document_with_peers(
+            AnnounceTopicOperation::new_for_document_with_peers_and_placement(
                 document.topic_id(),
                 self.config.local_node_id,
                 Some(document),
                 selected_peers,
+                placement,
                 self.config.allow_genesis,
             ),
             |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
