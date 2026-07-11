@@ -305,7 +305,7 @@ mod test {
         };
 
         let actor = Actor {
-            user_id: UserId::local(Ulid::new(), aruna_core::structs::RealmId([0u8; 32])),
+            user_id: UserId::local(Ulid::r#gen(), aruna_core::structs::RealmId([0u8; 32])),
             realm_id: aruna_core::structs::RealmId([0u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
         };

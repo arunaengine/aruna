@@ -22,7 +22,7 @@ async fn fresh_user_creates_groups_up_to_the_cap() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let member_token = create_bearer_token(
         seed.context.as_ref(),
-        UserId::local(Ulid::new(), seed.realm_id),
+        UserId::local(Ulid::r#gen(), seed.realm_id),
         seed.realm_id,
         seed.capabilities.clone(),
     )
@@ -58,7 +58,7 @@ async fn concurrent_creates_cannot_slip_past_the_cap() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let member_token = create_bearer_token(
         seed.context.as_ref(),
-        UserId::local(Ulid::new(), seed.realm_id),
+        UserId::local(Ulid::r#gen(), seed.realm_id),
         seed.realm_id,
         seed.capabilities.clone(),
     )

@@ -49,7 +49,7 @@ pub fn new_outbox_record(
     event: DocumentSyncOutboxEvent,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event, allow_genesis)
+    new_outbox_record_with_id(Ulid::r#gen(), node_id, target, peers, event, allow_genesis)
 }
 
 pub fn new_outbox_record_with_id(

@@ -151,7 +151,7 @@ mod tests {
     fn upload_event(realm: RealmId, actor: UserId, path: &str) -> WatchEvent {
         let resource = parse_data_watch_resource_path(path).expect("canonical data watch path");
         WatchEvent {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             realm_id: realm,
             kind: WatchEventKind::DataUploaded,
             path: path.to_string(),
@@ -284,8 +284,8 @@ mod tests {
     async fn empty_table_writes_nothing() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [80u8; 32]).await;
-        let actor = UserId::new(Ulid::new(), realm);
-        let path = data_watch_resource_path(Ulid::new(), net.node_id(), "bucket", "object");
+        let actor = UserId::new(Ulid::r#gen(), realm);
+        let path = data_watch_resource_path(Ulid::r#gen(), net.node_id(), "bucket", "object");
         emit_resource_watch_event(&ctx, upload_event(realm, actor, &path)).await;
         assert!(read_inbox_rows(&ctx).await.is_empty());
     }
@@ -294,7 +294,7 @@ mod tests {
     async fn local_subscription_matches_before_interest_publish() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [84u8; 32]).await;
-        let owner = UserId::new(Ulid::new(), realm);
+        let owner = UserId::new(Ulid::r#gen(), realm);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
         install_authorization(&ctx, realm, group_id, owner).await;
@@ -308,7 +308,7 @@ mod tests {
         .await
         .expect("subscription creates");
 
-        let actor = UserId::new(Ulid::new(), realm);
+        let actor = UserId::new(Ulid::r#gen(), realm);
         let event_path = data_watch_resource_path(group_id, net.node_id(), "bucket", "object");
         emit_resource_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
 
@@ -331,7 +331,7 @@ mod tests {
     async fn nil_actor_is_skipped() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [82u8; 32]).await;
-        let path = data_watch_resource_path(Ulid::new(), net.node_id(), "bucket", "object");
+        let path = data_watch_resource_path(Ulid::r#gen(), net.node_id(), "bucket", "object");
         net.replace_watch_interest(interest_table(realm, node(9), &path));
 
         emit_resource_watch_event(&ctx, upload_event(realm, UserId::nil(realm), &path)).await;
@@ -342,11 +342,11 @@ mod tests {
     async fn local_expansion_error_is_swallowed() {
         let realm = RealmId([1u8; 32]);
         let (dir, ctx, net) = ctx_with_net(realm, [83u8; 32]).await;
-        let path = data_watch_resource_path(Ulid::new(), net.node_id(), "bucket", "object");
+        let path = data_watch_resource_path(Ulid::r#gen(), net.node_id(), "bucket", "object");
         net.replace_watch_interest(interest_table(realm, net.node_id(), &path));
         drop(dir);
 
-        let actor = UserId::new(Ulid::new(), realm);
+        let actor = UserId::new(Ulid::r#gen(), realm);
         emit_resource_watch_event(&ctx, upload_event(realm, actor, &path)).await;
     }
 }

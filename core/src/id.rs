@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_topic_id_group() {
-        let topic = TopicId::group(GroupId::new());
+        let topic = TopicId::group(GroupId::r#gen());
         let bytes = topic.to_bytes();
         assert_eq!(bytes[0], PREFIX_GROUP);
         let parsed = TopicId::from_bytes(&bytes).unwrap();

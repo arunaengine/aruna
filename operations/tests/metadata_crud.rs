@@ -58,8 +58,8 @@ struct TestContext {
 #[tokio::test]
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -233,8 +233,8 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
 async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let before = test
         .context
         .storage_handle
@@ -276,11 +276,11 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 async fn metadata_event_log_replay_repairs_wal_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let document_path = "datasets/replay-repair";
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-    let event_id = Ulid::new();
+    let event_id = Ulid::r#gen();
     let record = MetadataRegistryRecord {
         realm_id: test.actor.realm_id,
         group_id,
@@ -363,8 +363,8 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
 async fn scheduled_projection_queue_recovers_event_log_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -412,8 +412,8 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
 async fn pending_projection_marker_recovers_event_log_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -443,8 +443,8 @@ async fn pending_projection_marker_recovers_event_log_only_create()
 async fn targeted_projection_deletes_pending_projection_marker()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -475,8 +475,8 @@ async fn targeted_projection_deletes_pending_projection_marker()
 async fn projection_queue_replay_is_idempotent_for_already_projected_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -513,8 +513,8 @@ async fn projection_queue_replay_is_idempotent_for_already_projected_create()
 async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -522,8 +522,8 @@ async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
         "datasets/targeted-projection",
         "Targeted Dataset",
     );
-    let other_group_id = Ulid::new();
-    let other_document_id = Ulid::new();
+    let other_group_id = Ulid::r#gen();
+    let other_document_id = Ulid::r#gen();
     let (_, other_create_event) = build_create_event(
         &test,
         other_group_id,
@@ -572,8 +572,8 @@ async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
 async fn metadata_event_log_replay_does_not_resurrect_deleted_document()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -595,8 +595,8 @@ async fn metadata_event_log_replay_does_not_resurrect_deleted_document()
 async fn projector_skips_stale_create_when_graph_tombstone_exists()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -622,8 +622,8 @@ async fn projector_skips_stale_create_when_graph_tombstone_exists()
 async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
-    let group_id = Ulid::new();
-    let document_id = Ulid::new();
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -668,7 +668,7 @@ fn build_create_event(
     name: &str,
 ) -> (MetadataRegistryRecord, MetadataCreateEventRecord) {
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-    let event_id = Ulid::new();
+    let event_id = Ulid::r#gen();
     let record = MetadataRegistryRecord {
         realm_id: test.actor.realm_id,
         group_id,
@@ -965,7 +965,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     )?;
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::new(), RealmId([5u8; 32])),
+        user_id: aruna_core::UserId::local(Ulid::r#gen(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
     seed_realm_config(&storage_handle, &actor).await?;
@@ -1001,7 +1001,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
     )?;
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+        user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
         realm_id,
     };
     seed_realm_config(&storage_handle, &actor).await?;

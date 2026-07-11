@@ -332,7 +332,7 @@ mod tests {
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
-        let bootstrap_user = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let bootstrap_user = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: aruna_core::structs::Actor {

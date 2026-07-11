@@ -648,7 +648,7 @@ mod tests {
             )
             .await;
 
-            let realm_admin = aruna_core::UserId::local(Ulid::new(), config.realm_id);
+            let realm_admin = aruna_core::UserId::local(Ulid::r#gen(), config.realm_id);
             drive(
                 CreateRealmOperation::new(CreateRealmConfig {
                     actor: Actor {

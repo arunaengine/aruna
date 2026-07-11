@@ -990,7 +990,7 @@ mod tests {
     async fn path_restricted_token_rejected() {
         let realm_id = realm_id(5);
         let (_dir, state) = build_state(realm_id, node(5)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let mut auth = auth_for(user_id, realm_id);
         auth.path_restrictions = Some(vec![PathRestriction {
             pattern: "/bucket/**".to_string(),
@@ -1055,7 +1055,7 @@ mod tests {
     async fn mark_read_rejects_bad_ids() {
         let realm_id = realm_id(2);
         let (_dir, state) = build_state(realm_id, node(2)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let error = mark_read(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
@@ -1073,13 +1073,13 @@ mod tests {
     async fn mark_read_rejects_too_many_ids() {
         let realm_id = realm_id(6);
         let (_dir, state) = build_state(realm_id, node(6)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let error = mark_read(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
             Json(MarkReadApiRequest {
                 ids: (0..=MARK_READ_MAX_IDS)
-                    .map(|_| Ulid::new().to_string())
+                    .map(|_| Ulid::r#gen().to_string())
                     .collect(),
                 up_to_ms: None,
             }),
@@ -1096,7 +1096,7 @@ mod tests {
         let (_dir, state) = build_state(realm_id, holder).await;
         install_local_holder_config(&state, realm_id, holder).await;
 
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let records = vec![
             direct_record(user_id, 1),
             direct_record(user_id, 2),
@@ -1155,7 +1155,7 @@ mod tests {
         let realm_id = realm_id(11);
         let (_dir, state, net) = build_state_with_net(realm_id, [11u8; 32]).await;
         install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
 
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
@@ -1201,7 +1201,7 @@ mod tests {
         let realm_id = realm_id(12);
         let (_dir, state, net) = build_state_with_net(realm_id, [12u8; 32]).await;
         install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
 
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
@@ -1238,8 +1238,8 @@ mod tests {
     #[tokio::test]
     async fn expired_local_recheck_wins_over_unrelated_wake() {
         let realm_id = realm_id(15);
-        let recipient = UserId::new(Ulid::new(), realm_id);
-        let unrelated = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let unrelated = UserId::new(Ulid::r#gen(), realm_id);
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         tx.send(unrelated).expect("receiver is open");
 
@@ -1260,7 +1260,7 @@ mod tests {
         let realm_id = realm_id(13);
         let (_dir, state, _net) = build_state_with_net(realm_id, [13u8; 32]).await;
         install_local_holder_config(&state, realm_id, state.get_node_id()).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
 
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
@@ -1299,7 +1299,7 @@ mod tests {
         let (_dir, state, _net) = build_state_with_net(realm_id, [14u8; 32]).await;
         // The holder is a node that is in no mesh, so every remote poll fails.
         install_local_holder_config(&state, realm_id, node(200)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
 
         let mut events = Box::pin(unread_count_stream(
             state.get_ctx(),
@@ -1322,10 +1322,10 @@ mod tests {
     #[test]
     fn notification_response_maps_deep_link_ids() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let recipient = UserId::new(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
-        let actor = UserId::new(Ulid::new(), realm_id);
-        let member = UserId::new(Ulid::new(), realm_id);
+        let recipient = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
+        let actor = UserId::new(Ulid::r#gen(), realm_id);
+        let member = UserId::new(Ulid::r#gen(), realm_id);
         let onboarded_node = node(9);
 
         let added = notification_response(&NotificationRecord::new(
@@ -1380,7 +1380,7 @@ mod tests {
         assert_eq!(onboarded.node_id, Some(onboarded_node.to_string()));
         assert_eq!(onboarded.group_id, None);
 
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let metadata_created = notification_response(&NotificationRecord::new(
             recipient,
             NotificationClass::Transient,
@@ -1441,8 +1441,8 @@ mod tests {
         let holder = node(6);
         let (_dir, state) = build_state(realm_id, holder).await;
         install_local_holder_config(&state, realm_id, holder).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
         let path_prefix = data_watch_resource_path(group_id, node(60), "bucket", "prefix");
 
@@ -1490,9 +1490,9 @@ mod tests {
         let holder = node(15);
         let (_dir, state) = build_state(realm_id, holder).await;
         install_local_holder_config(&state, realm_id, holder).await;
-        let authorized = UserId::new(Ulid::new(), realm_id);
-        let unauthorized = UserId::new(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let authorized = UserId::new(Ulid::r#gen(), realm_id);
+        let unauthorized = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         install_group_authorization(&state, realm_id, group_id, authorized, &[]).await;
         let path_prefix = format!("meta/{group_id}/datasets/proteomics");
 
@@ -1528,9 +1528,9 @@ mod tests {
         let holder = node(16);
         let (_dir, state) = build_state(realm_id, holder).await;
         install_local_holder_config(&state, realm_id, holder).await;
-        let authorized = UserId::new(Ulid::new(), realm_id);
-        let unauthorized = UserId::new(Ulid::new(), realm_id);
-        let bucket_group_id = Ulid::new();
+        let authorized = UserId::new(Ulid::r#gen(), realm_id);
+        let unauthorized = UserId::new(Ulid::r#gen(), realm_id);
+        let bucket_group_id = Ulid::r#gen();
         install_group_authorization(&state, realm_id, bucket_group_id, authorized, &[]).await;
         let remote_bucket_node = node(99);
         let path_prefix =
@@ -1567,8 +1567,8 @@ mod tests {
         let realm_id = realm_id(17);
         let holder = node(17);
         let (_dir, state) = build_state(realm_id, holder).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
-        let metadata_group_id = Ulid::new();
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
+        let metadata_group_id = Ulid::r#gen();
         let path_prefix = format!("meta/{metadata_group_id}/datasets/shared");
         let events = vec!["metadata_created".to_string(), "data_uploaded".to_string()];
 
@@ -1589,7 +1589,7 @@ mod tests {
     async fn create_watch_validates_input() {
         let realm_id = realm_id(7);
         let (_dir, state) = build_state(realm_id, node(7)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
 
         let empty_prefix = create_watch(
             State(state.clone()),
@@ -1651,7 +1651,7 @@ mod tests {
         .expect_err("a prefix without a bucket boundary is ambiguous");
         assert!(matches!(unscoped_data, ServerError::BadRequest));
 
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let unscoped_metadata = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
@@ -1681,7 +1681,7 @@ mod tests {
     async fn delete_watch_rejects_bad_id() {
         let realm_id = realm_id(8);
         let (_dir, state) = build_state(realm_id, node(8)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let error = delete_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
@@ -1696,7 +1696,7 @@ mod tests {
     async fn watch_endpoints_reject_path_restricted_token() {
         let realm_id = realm_id(9);
         let (_dir, state) = build_state(realm_id, node(9)).await;
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let mut auth = auth_for(user_id, realm_id);
         auth.path_restrictions = Some(vec![PathRestriction {
             pattern: "/bucket/**".to_string(),
@@ -1723,7 +1723,7 @@ mod tests {
         let delete_err = delete_watch(
             State(state),
             Extension(Some(auth)),
-            Path(Ulid::new().to_string()),
+            Path(Ulid::r#gen().to_string()),
         )
         .await
         .expect_err("delegated token must be rejected");

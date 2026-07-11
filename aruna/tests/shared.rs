@@ -283,7 +283,7 @@ pub(crate) fn sign_scoped_bearer_token(
         iss: seed.realm_id.to_string(),
         iat: now,
         exp: now + 600,
-        jti: Ulid::new().to_string(),
+        jti: Ulid::r#gen().to_string(),
         restrictions: Some(path_restrictions),
         issuer_pubkey: None,
         delegation_signature: None,
@@ -526,7 +526,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     let storage = FjallStorage::open(storage_path)?;
     let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = UserId::new(Ulid::new(), realm_id);
+    let user_id = UserId::new(Ulid::r#gen(), realm_id);
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),

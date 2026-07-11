@@ -49,7 +49,7 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let node_a = &nodes[0];
     let node_b = &nodes[1];
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
 
     drive(
@@ -149,7 +149,7 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let node_a = &nodes[0];
     let node_b = &nodes[1];
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
     bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
 
     // Seed node A's live counters with a full, non-trivial usage total, then let
@@ -248,7 +248,7 @@ async fn steady_state_write_publishes_snapshot_without_restart()
     let realm_id = RealmId([53u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 1).await?;
     let node = &nodes[0];
-    let group_id = Ulid::new();
+    let group_id = Ulid::r#gen();
 
     // A normal write commit updates counters and stamps dirty markers, but never
     // schedules a publish itself and never restarts the node.

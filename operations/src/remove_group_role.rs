@@ -713,7 +713,7 @@ pub mod test {
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
         let realm_id = RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {
             node_id,
@@ -786,7 +786,7 @@ pub mod test {
 
         let effects = operation
             .emit_write_group_auth_doc_and_admin_state(
-                TxnId::new(),
+                TxnId::r#gen(),
                 group,
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 None,
@@ -842,7 +842,7 @@ pub mod test {
         let (actor, group, _auth_doc) = setup_group(&context).await;
 
         let role = Role {
-            role_id: Ulid::new(),
+            role_id: Ulid::r#gen(),
             name: "custom_role".to_string(),
             permissions: HashMap::from([(
                 format!("/{}/g/{}/meta/**", actor.realm_id, group.group_id),

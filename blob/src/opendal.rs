@@ -147,8 +147,7 @@ where
     Ok(Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
         .layer(LoggingLayer::default())
-        .layer(RetryLayer::new())
-        .finish())
+        .layer(RetryLayer::new()))
 }
 
 fn blob_operator_creation_error(error: String) -> BlobError {

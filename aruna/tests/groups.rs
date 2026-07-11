@@ -52,7 +52,7 @@ async fn membership_lifecycle_with_invite_and_leave() -> TestResult<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let member_id = UserId::local(Ulid::new(), seed.realm_id);
+    let member_id = UserId::local(Ulid::r#gen(), seed.realm_id);
     let member_token = create_bearer_token(
         seed.context.as_ref(),
         member_id,
@@ -247,7 +247,7 @@ async fn open_group_endpoints_hide_member_lists_from_non_members() -> TestResult
 
     let outsider_token = create_bearer_token(
         seed.context.as_ref(),
-        UserId::local(Ulid::new(), seed.realm_id),
+        UserId::local(Ulid::r#gen(), seed.realm_id),
         seed.realm_id,
         seed.capabilities.clone(),
     )

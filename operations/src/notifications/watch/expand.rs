@@ -211,7 +211,7 @@ mod tests {
         let realm = RealmId([1u8; 32]);
         let (local_node_id, config) = local_config(realm);
         let actor = user(realm, 2);
-        let events = vec![upload_event(realm, actor, Ulid::new(), local_node_id)];
+        let events = vec![upload_event(realm, actor, Ulid::r#gen(), local_node_id)];
         assert_eq!(
             expand_watch_events(&context, realm, &config, local_node_id, &events)
                 .await

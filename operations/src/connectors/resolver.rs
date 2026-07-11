@@ -439,7 +439,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         };
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
@@ -614,7 +614,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         };
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {

@@ -2099,7 +2099,7 @@ mod tests {
 
         let b_id = net_b.node_id();
         let recipient = loop {
-            let candidate = UserId::new(Ulid::new(), realm_id);
+            let candidate = UserId::new(Ulid::r#gen(), realm_id);
             if resolve_inbox_holder(&candidate, &config).expect("resolve holder") == Some(b_id) {
                 break candidate;
             }

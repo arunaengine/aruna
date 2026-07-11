@@ -535,7 +535,7 @@ mod tests {
 
     fn bucket_info(cors_configuration: Option<BucketCorsConfiguration>) -> BucketInfo {
         BucketInfo {
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             cors_configuration,

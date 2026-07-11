@@ -27,57 +27,142 @@ use ulid::Ulid;
 
 mod failing_close {
     use opendal::raw::oio;
-    use opendal::raw::{Access, AccessorInfo, OpWrite, RpWrite};
-    use opendal::{Buffer, Capability, Error, ErrorKind, Metadata, Operator, OperatorBuilder};
+    use opendal::raw::{
+        OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+        RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo,
+    };
+    use opendal::{
+        Buffer, Builder, Capability, Error, ErrorKind, Metadata, OperationContext, Operator,
+    };
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    #[derive(Debug)]
-    pub(super) struct CloseFailsBackend {
-        info: Arc<AccessorInfo>,
+    fn unsupported<T>() -> opendal::Result<T> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "operation is not supported",
+        ))
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct CloseFailsBuilder {
         aborts: Arc<AtomicUsize>,
     }
 
-    impl CloseFailsBackend {
-        fn new(aborts: Arc<AtomicUsize>) -> Self {
-            let info = AccessorInfo::default();
-            info.set_scheme("close_fails")
-                .set_root("/")
-                .set_native_capability(Capability {
-                    write: true,
-                    write_can_empty: true,
-                    write_can_multi: true,
-                    ..Default::default()
-                });
-            Self {
-                info: info.into(),
-                aborts,
-            }
+    impl Builder for CloseFailsBuilder {
+        type Config = ();
+
+        fn build(self) -> opendal::Result<impl Service> {
+            Ok(CloseFailsBackend {
+                aborts: self.aborts,
+            })
         }
     }
 
-    impl Access for CloseFailsBackend {
+    #[derive(Debug)]
+    pub(super) struct CloseFailsBackend {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl Service for CloseFailsBackend {
         type Reader = ();
         type Writer = CloseFailsWriter;
         type Lister = ();
         type Deleter = ();
         type Copier = ();
 
-        fn info(&self) -> Arc<AccessorInfo> {
-            self.info.clone()
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::new("close_fails", "/", "")
         }
 
-        async fn write(
+        fn capability(&self) -> Capability {
+            Capability {
+                write: true,
+                write_can_empty: true,
+                write_can_multi: true,
+                ..Default::default()
+            }
+        }
+
+        fn write(
             &self,
+            _ctx: &OperationContext,
             _path: &str,
             _args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((
-                RpWrite::new(),
-                CloseFailsWriter {
-                    aborts: self.aborts.clone(),
-                },
-            ))
+        ) -> opendal::Result<Self::Writer> {
+            Ok(CloseFailsWriter {
+                aborts: self.aborts.clone(),
+            })
+        }
+
+        async fn create_dir(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            unsupported()
+        }
+
+        async fn stat(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            unsupported()
+        }
+
+        fn read(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            unsupported()
+        }
+
+        fn delete(&self, _ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            unsupported()
+        }
+
+        fn list(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            unsupported()
+        }
+
+        fn copy(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpCopy,
+            _opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            unsupported()
+        }
+
+        async fn rename(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            unsupported()
+        }
+
+        async fn presign(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            unsupported()
         }
     }
 
@@ -106,7 +191,10 @@ mod failing_close {
 
     pub(super) fn operator_with_aborts() -> (Operator, Arc<AtomicUsize>) {
         let aborts = Arc::new(AtomicUsize::new(0));
-        let operator = OperatorBuilder::new(CloseFailsBackend::new(aborts.clone())).finish();
+        let operator = Operator::new(CloseFailsBuilder {
+            aborts: aborts.clone(),
+        })
+        .unwrap();
         (operator, aborts)
     }
 }
@@ -207,8 +295,8 @@ fn make_test_location() -> BackendLocation {
     BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "bucket".to_string(),
-        backend_path: format!("blob/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("blob/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -252,7 +340,7 @@ fn backend_config_exposes_custom_timeout_values() {
 
 #[test]
 fn replication_init_ack_accepts_matching_ack() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived);
 
     assert_eq!(validate_replication_init_ack(ack, replication_id), Ok(()));
@@ -260,7 +348,7 @@ fn replication_init_ack_accepts_matching_ack() {
 
 #[test]
 fn replication_init_ack_rejects_unexpected_message_type() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let message = ReplicationMessage::new(
         replication_id,
         MessageType::BaoTreeInfo {
@@ -279,8 +367,8 @@ fn replication_init_ack_rejects_unexpected_message_type() {
 
 #[test]
 fn replication_init_ack_rejects_wrong_replication_id() {
-    let replication_id = Ulid::new();
-    let wrong_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
+    let wrong_id = Ulid::r#gen();
     let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeInfoReceived);
 
     assert_eq!(
@@ -293,7 +381,7 @@ fn replication_init_ack_rejects_wrong_replication_id() {
 
 #[test]
 fn parse_replication_init_accepts_matching_bao_tree_info() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
     let message = ReplicationMessage::new(
@@ -312,8 +400,8 @@ fn parse_replication_init_accepts_matching_bao_tree_info() {
 
 #[test]
 fn parse_replication_init_rejects_wrong_replication_id() {
-    let replication_id = Ulid::new();
-    let wrong_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
+    let wrong_id = Ulid::r#gen();
     let message = ReplicationMessage::new(
         wrong_id,
         MessageType::BaoTreeInfo {
@@ -332,7 +420,7 @@ fn parse_replication_init_rejects_wrong_replication_id() {
 
 #[test]
 fn parse_replication_init_uses_message_id_when_unknown() {
-    let replication_id = Ulid::new();
+    let replication_id = Ulid::r#gen();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
     let message = ReplicationMessage::new(
@@ -520,7 +608,7 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
         .blob_handle
         .send_blob_effect(BlobEffect::WritePart {
-            upload_id: Ulid::new(),
+            upload_id: Ulid::r#gen(),
             part_number: 1,
             created_by: test_user_id(),
             compressed: false,
@@ -603,7 +691,7 @@ async fn add_connection_rejects_nil_and_duplicate_ids() {
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
     let peer_id = net_b.node_id();
 
-    let explicit = Ulid::new();
+    let explicit = Ulid::r#gen();
     let stream = net_a.open_stream(peer_id, Alpn::Bao).await.unwrap();
     let id = handler
         .add_connection(Some(explicit), peer_id, stream)
@@ -638,8 +726,8 @@ async fn write_finalization_failure_emits_no_success_or_load() {
     let location = BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "finalization-bucket".to_string(),
-        backend_path: format!("obj/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("obj/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -674,7 +762,7 @@ async fn failed_write_cleans() {
         root: root.path().to_str().unwrap().to_string(),
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
-        ulid: Ulid::new(),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -731,8 +819,8 @@ async fn compose_close_fails() {
     let target = BackendLocation {
         root: "/tmp".to_string(),
         storage_bucket: "compose-target".to_string(),
-        backend_path: format!("obj/{}", Ulid::new()),
-        ulid: Ulid::new(),
+        backend_path: format!("obj/{}", Ulid::r#gen()),
+        ulid: Ulid::r#gen(),
         compressed: false,
         encrypted: false,
         created_by: test_user_id(),
@@ -777,7 +865,7 @@ async fn replication_close_fails() {
 
 #[test]
 fn build_backend_path_rejects_traversal_keys() {
-    let ulid = Ulid::new();
+    let ulid = Ulid::r#gen();
     assert!(build_backend_path("bucket", "nested/object.bin", ulid).is_ok());
 
     for key in ["../escape", "../../etc/passwd", "a/../../b", "/abs/path"] {
@@ -793,7 +881,7 @@ fn build_backend_path_rejects_traversal_keys() {
 
 #[test]
 fn rebuild_backend_path_rejects_sender_supplied_traversal() {
-    let ulid = Ulid::new();
+    let ulid = Ulid::r#gen();
     assert!(rebuild_backend_path("bucket/object_0000", ulid).is_ok());
 
     for path in ["../../etc/cron.d/evil_00", "../escape_00", "/abs/object_00"] {

@@ -37,7 +37,7 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
         let credential_group =
             create_group_via_http(&seed.base_url, &bearer_token, "public-access-credentials")
                 .await?;
-        let member_id = UserId::local(Ulid::new(), seed.realm_id);
+        let member_id = UserId::local(Ulid::r#gen(), seed.realm_id);
         let member_token = create_bearer_token(
             seed.context.as_ref(),
             member_id,

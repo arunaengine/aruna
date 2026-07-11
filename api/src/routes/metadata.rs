@@ -484,7 +484,7 @@ pub async fn create_metadata_document(
                     realm_id: state.get_realm_id(),
                 },
                 group_id,
-                document_id: Ulid::new(),
+                document_id: Ulid::r#gen(),
                 document_path: path,
                 public,
                 payload,
@@ -501,7 +501,7 @@ pub async fn create_metadata_document(
     emit_resource_watch_event(
         ctx.as_ref(),
         WatchEvent {
-            event_id: Ulid::new(),
+            event_id: Ulid::r#gen(),
             realm_id: state.get_realm_id(),
             kind: WatchEventKind::MetadataCreated,
             path: format!("meta/{}/{}", result.group_id, result.document_path),
@@ -2042,7 +2042,7 @@ mod tests {
         );
         let lifecycle = MetadataDocumentLifecycleRecord::Delete {
             event: MetadataDocumentDeleteRecord {
-                event_id: Ulid::new(),
+                event_id: Ulid::r#gen(),
                 tombstone: tombstone.clone(),
                 deleted_after_event_id: record.last_event_id,
             },
@@ -2160,7 +2160,7 @@ mod tests {
             State(test.state),
             Extension(None),
             Extension(None),
-            Path(Ulid::new().to_string()),
+            Path(Ulid::r#gen().to_string()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
                 mode: None,
@@ -2251,10 +2251,10 @@ mod tests {
     fn document_replica_query_nodes_use_deduplicated_replicas() {
         let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let record = MetadataRegistryRecord {
             realm_id: RealmId([3u8; 32]),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             document_id,
             document_path: "datasets/query-targets".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
@@ -2306,7 +2306,7 @@ mod tests {
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
 
-        let result = load_metadata_record_by_document(state.as_ref(), Ulid::new()).await;
+        let result = load_metadata_record_by_document(state.as_ref(), Ulid::r#gen()).await;
 
         assert!(matches!(
             result,
@@ -2317,7 +2317,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_permission_returns_forbidden_for_nonexistent_group() {
         let test = setup_state().await;
-        let missing_group = Ulid::new();
+        let missing_group = Ulid::r#gen();
         let path = format!("/{}/g/{missing_group}/meta/**", test.state.get_realm_id());
 
         let result = ensure_permission(
@@ -2954,8 +2954,8 @@ mod tests {
     async fn setup_distributed_metadata_access_state() -> DistributedMetadataAccessState {
         let realm_signing_key = test_realm_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         let coordinator = spawn_distributed_metadata_node(realm_id).await;
         let remote = spawn_distributed_metadata_node(realm_id).await;
         let nodes = [&coordinator, &remote];
@@ -3276,7 +3276,7 @@ mod tests {
             iss: realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::new().to_string(),
+            jti: Ulid::r#gen().to_string(),
             restrictions: None,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -3300,7 +3300,7 @@ mod tests {
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let realm_id = test_realm_id(3);
-        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -3323,7 +3323,7 @@ mod tests {
             metadata_handle: Some(metadata_handle),
             task_handle: Some(task_handle),
         });
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {

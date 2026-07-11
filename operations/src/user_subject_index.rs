@@ -477,7 +477,7 @@ mod tests {
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let subject = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
         let current_bytes = user_bytes(user_id, vec![subject.clone()], HashSet::new());
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let mut operation =
             ResolveUserSubjectConflictsOperation::new(ResolveUserSubjectConflictsInput {
                 txn_id,
@@ -535,7 +535,7 @@ mod tests {
         let subject = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
         let winner_bytes = user_bytes(winner_id, vec![subject.clone()], HashSet::new());
         let loser_bytes = user_bytes(loser_id, vec![subject.clone()], HashSet::new());
-        let txn_id = Ulid::new();
+        let txn_id = Ulid::r#gen();
         let mut operation =
             ResolveUserSubjectConflictsOperation::new(ResolveUserSubjectConflictsInput {
                 txn_id,

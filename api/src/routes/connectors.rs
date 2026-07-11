@@ -631,8 +631,8 @@ mod tests {
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let user_id = UserId::local(Ulid::new(), realm_id);
-        let other_user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let other_user_id = UserId::local(Ulid::r#gen(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -645,7 +645,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         });
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {

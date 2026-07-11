@@ -84,7 +84,7 @@ impl CreateTokenOperation {
                     iss: self.config.realm_id.to_string(),
                     iat,
                     exp,
-                    jti: Ulid::new().to_string(),
+                    jti: Ulid::r#gen().to_string(),
                     restrictions: None,
                     issuer_pubkey: None,
                     delegation_signature: None,
@@ -112,7 +112,7 @@ impl CreateTokenOperation {
                     iss: self.config.realm_id.to_string(),
                     iat,
                     exp,
-                    jti: Ulid::new().to_string(),
+                    jti: Ulid::r#gen().to_string(),
                     restrictions: None,
                     issuer_pubkey,
                     delegation_signature: Some(delegation_signature.clone()),
@@ -200,7 +200,7 @@ mod test {
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,
             expiry: None,
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
             node_capabilities: capabilities,
         };

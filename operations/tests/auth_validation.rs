@@ -182,7 +182,7 @@ async fn rejects_auth_context_conversion_failure() {
 fn realm_fixture() -> (SigningKey, RealmId, UserId) {
     let signing_key = signing_key();
     let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-    let user_id = UserId::local(Ulid::new(), realm_id);
+    let user_id = UserId::local(Ulid::r#gen(), realm_id);
     (signing_key, realm_id, user_id)
 }
 
@@ -204,7 +204,7 @@ fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
         iss: realm_id.to_string(),
         iat: now,
         exp: now + 600,
-        jti: Ulid::new().to_string(),
+        jti: Ulid::r#gen().to_string(),
         restrictions: None,
         issuer_pubkey: None,
         delegation_signature: None,

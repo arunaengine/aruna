@@ -514,7 +514,7 @@ async fn register_user(
     let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
     let oidc_identity = validate_oidc_token(&state, token).await?;
 
-    let user_id = UserId::local(Ulid::new(), state.get_realm_id());
+    let user_id = UserId::local(Ulid::r#gen(), state.get_realm_id());
     let name = oidc_identity
         .display_name
         .clone()
@@ -1100,7 +1100,7 @@ mod tests {
             iss: node.realm_id.to_string(),
             iat: now,
             exp: now + 600,
-            jti: Ulid::new().to_string(),
+            jti: Ulid::r#gen().to_string(),
             restrictions,
             issuer_pubkey: None,
             delegation_signature: None,
@@ -1168,7 +1168,7 @@ mod tests {
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = net_handle.node_id();
-        let realm_admin_id = UserId::local(Ulid::new(), realm_id);
+        let realm_admin_id = UserId::local(Ulid::r#gen(), realm_id);
 
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
@@ -1317,7 +1317,7 @@ mod tests {
     async fn create_local_onboarding_secret(node: &TestNode) -> String {
         let onboarding_secret = OnboardingSecret {
             seed_url: node.base_url.clone(),
-            enrollment_id: Ulid::new(),
+            enrollment_id: Ulid::r#gen(),
             secret: [7u8; 32],
             mode: OnboardingMode::Local,
         };
@@ -1469,7 +1469,7 @@ mod tests {
         )
         .await;
 
-        let missing_user_id = UserId::local(Ulid::new(), node.realm_id);
+        let missing_user_id = UserId::local(Ulid::r#gen(), node.realm_id);
         let response = reqwest::Client::new()
             .get(format!(
                 "{}/api/v1/users/{}",
@@ -1495,7 +1495,7 @@ mod tests {
         let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
         let node = spawn_test_node(provider, true).await;
 
-        let missing_user_id = UserId::local(Ulid::new(), node.realm_id);
+        let missing_user_id = UserId::local(Ulid::r#gen(), node.realm_id);
         let response = reqwest::Client::new()
             .get(format!(
                 "{}/api/v1/users/{}",
@@ -1525,7 +1525,7 @@ mod tests {
         let foreign_realm_id =
             RealmId::from_bytes(foreign_realm_signing_key.verifying_key().to_bytes());
         node.state.add_trusted_realm(foreign_realm_id).await;
-        let foreign_user_id = UserId::local(Ulid::new(), foreign_realm_id);
+        let foreign_user_id = UserId::local(Ulid::r#gen(), foreign_realm_id);
         match node
             .context
             .storage_handle

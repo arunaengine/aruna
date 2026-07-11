@@ -545,7 +545,7 @@ fn apply_admin_reducer_operation(
 ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
-        event_id: Ulid::new(),
+        event_id: Ulid::r#gen(),
         target: state.target.clone(),
         origin_node_id: actor.node_id,
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -704,7 +704,7 @@ mod tests {
         let mut operation = ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: actor.clone(),
         });
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let effects = operation
             .emit_write_auth_doc_and_admin_state(
                 txn_id,
@@ -756,7 +756,7 @@ mod tests {
         let mut operation = ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: actor.clone(),
         });
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let effects = operation
             .emit_write_auth_doc_and_admin_state(
                 txn_id,
@@ -803,7 +803,7 @@ mod tests {
         let mut operation = ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
             actor: claiming_actor.clone(),
         });
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let effects = operation
             .emit_write_auth_doc_and_admin_state(
                 txn_id,
@@ -827,7 +827,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([31u8; 32]);
         let actor = actor(realm_id, 32, 33);
         let (auth_doc, _) = auth_doc_and_admin_role(realm_id);
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::r#gen();
         let mut operation =
             ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput { actor });
         operation.state = ClaimInitialRealmAdminState::CommitTransaction {
@@ -875,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn claims_initial_realm_admin_once() {
         let (context, net_handle, realm_id, node_id, _temp_dir) = setup_context().await;
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         let result = drive(
             ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
                 actor: Actor {
@@ -902,7 +902,7 @@ mod tests {
             ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
                 actor: Actor {
                     node_id,
-                    user_id: UserId::local(Ulid::new(), realm_id),
+                    user_id: UserId::local(Ulid::r#gen(), realm_id),
                     realm_id,
                 },
             }),

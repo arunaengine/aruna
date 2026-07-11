@@ -251,7 +251,7 @@ mod tests {
     fn onboarding_secret_roundtrip() {
         let secret = OnboardingSecret {
             seed_url: "http://127.0.0.1:3000".to_string(),
-            enrollment_id: Ulid::new(),
+            enrollment_id: Ulid::r#gen(),
             secret: [7u8; 32],
             mode: OnboardingMode::Server,
         };
@@ -265,7 +265,7 @@ mod tests {
     fn onboarding_secret_hash_matches_existing_blake3_hex() {
         let secret = OnboardingSecret {
             seed_url: "http://127.0.0.1:3000".to_string(),
-            enrollment_id: Ulid::new(),
+            enrollment_id: Ulid::r#gen(),
             secret: [7u8; 32],
             mode: OnboardingMode::Server,
         };

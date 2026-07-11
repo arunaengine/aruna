@@ -67,7 +67,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         _metadata_dir: metadata_dir,
         storage,
         handle,
-        group_id: Ulid::new(),
+        group_id: Ulid::r#gen(),
     })
 }
 
@@ -76,7 +76,7 @@ fn registry_record(
     index: usize,
     graph_iri: Option<String>,
 ) -> MetadataRegistryRecord {
-    let document_id = Ulid::new();
+    let document_id = Ulid::r#gen();
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,
@@ -286,7 +286,7 @@ async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Re
 }
 
 fn visibility_record(group_id: GroupId, path: &str, public: bool) -> MetadataRegistryRecord {
-    let document_id = Ulid::new();
+    let document_id = Ulid::r#gen();
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,
@@ -414,7 +414,7 @@ async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Res
         deleted_records.push(deleted.clone());
         records.push(deleted);
 
-        let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::new());
+        let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::r#gen());
         let unregistered_name =
             repeated_search_name(marker, &format!("unregistered-{index:02}"), 32);
         create_crate(&harness, &unregistered_iri, &unregistered_name).await?;
@@ -485,7 +485,7 @@ async fn search_honors_explicit_graph_filter_before_visible_limit() -> Result<()
 async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let group_id = harness.group_id;
-    let member = aruna_core::UserId::local(Ulid::new(), REALM);
+    let member = aruna_core::UserId::local(Ulid::r#gen(), REALM);
     let actor = Actor {
         node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         user_id: member,
@@ -526,7 +526,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
     let public_record = visibility_record(group_id, "datasets/probe-public", true);
     let private_record = visibility_record(group_id, "datasets/probe-private", false);
     let deleted_record = visibility_record(group_id, "datasets/probe-deleted", true);
-    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::new());
+    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::r#gen());
     create_crate(&harness, &public_record.graph_iri, "probe public").await?;
     create_crate(&harness, &private_record.graph_iri, "probe private").await?;
     create_crate(&harness, &deleted_record.graph_iri, "probe deleted").await?;
@@ -557,7 +557,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         path_restrictions: None,
     };
     let outsider_auth = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::new(), REALM),
+        user_id: aruna_core::UserId::local(Ulid::r#gen(), REALM),
         realm_id: REALM,
         path_restrictions: None,
     };

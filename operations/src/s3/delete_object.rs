@@ -657,7 +657,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Effects {
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         self.version_id = Some(version_id);
         self.deleted_version_created_at = Some(SystemTime::now());
         self.read_current_lookup(version_id)
@@ -852,7 +852,7 @@ mod test {
     use ulid::Ulid;
 
     fn test_user_id() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]))
+        aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
     }
 
     fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
@@ -906,7 +906,7 @@ mod test {
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             version_id: Some(target_version_id),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             realm_id: RealmId::from_bytes([1u8; 32]),
             node_id: iroh::SecretKey::generate().public(),
             deleted_by: user_id,
@@ -921,7 +921,7 @@ mod test {
         ));
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::new(),
+            txn_id: Ulid::r#gen(),
         }));
         assert!(matches!(
             effects.as_slice(),
@@ -1073,8 +1073,8 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::r#gen();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1180,7 +1180,7 @@ mod test {
                 key: "to-delete.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 user_identity: user_id,
             }),
             &context,
@@ -1224,8 +1224,8 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
-        let group_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]));
+        let group_id = Ulid::r#gen();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         let put_result = drive(
@@ -1347,7 +1347,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 user_identity: user_id,
             }),
             &context,
@@ -1396,7 +1396,7 @@ mod test {
                 key: "versioned.txt".to_string(),
                 version_id: None,
                 range: None,
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 user_identity: user_id,
             }),
             &context,

@@ -1639,7 +1639,7 @@ mod tests {
             .send_storage_effect(StorageEffect::Read {
                 key_space: "missing".to_string(),
                 key: b"key".to_vec().into(),
-                txn_id: Some(ulid::Ulid::new()),
+                txn_id: Some(ulid::Ulid::r#gen()),
             })
             .await;
 
@@ -1712,7 +1712,7 @@ mod tests {
 
     fn test_auth_context(state: &Arc<ServerState>) -> AuthContext {
         AuthContext {
-            user_id: UserId::local(Ulid::new(), state.get_realm_id()),
+            user_id: UserId::local(Ulid::r#gen(), state.get_realm_id()),
             realm_id: state.get_realm_id(),
             path_restrictions: None,
         }
@@ -1752,8 +1752,8 @@ mod tests {
 
     #[test]
     fn group_quota_status_reports_warning_and_unlimited() {
-        let group = Ulid::new();
-        let unlimited_group = Ulid::new();
+        let group = Ulid::r#gen();
+        let unlimited_group = Ulid::r#gen();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
             grace_factor_percent: 110,
@@ -1786,7 +1786,7 @@ mod tests {
 
     #[test]
     fn group_quota_status_uses_fractional_warn_threshold_without_flooring() {
-        let group = Ulid::new();
+        let group = Ulid::r#gen();
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(3),
             warn_threshold_percent: 85,
@@ -1840,7 +1840,7 @@ mod tests {
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
         let realm_signing_key = SigningKey::generate(&mut csprng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         let node_id = iroh::SecretKey::generate().public();
 
         drive(
@@ -1916,7 +1916,7 @@ mod tests {
 
         let (local_state, _tempdir) = setup_state().await;
         let local_auth = AuthContext {
-            user_id: UserId::local(Ulid::new(), local_state.get_realm_id()),
+            user_id: UserId::local(Ulid::r#gen(), local_state.get_realm_id()),
             realm_id: local_state.get_realm_id(),
             path_restrictions: None,
         };
@@ -1934,7 +1934,7 @@ mod tests {
         ));
 
         let stranger = AuthContext {
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
             path_restrictions: None,
         };
@@ -2268,7 +2268,7 @@ mod tests {
     async fn set_realm_quota_rejects_non_admin() {
         let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
         let stranger = AuthContext {
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
             path_restrictions: None,
         };

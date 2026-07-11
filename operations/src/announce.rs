@@ -387,7 +387,7 @@ impl AnnounceTopicOperation {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: record.updated_at_ms,
-                        event_id: Ulid::new(),
+                        event_id: Ulid::r#gen(),
                         actor: self.local_node_id,
                         updated_at_ms: record.updated_at_ms,
                     },
@@ -407,7 +407,7 @@ impl AnnounceTopicOperation {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: now,
-                        event_id: Ulid::new(),
+                        event_id: Ulid::r#gen(),
                         actor: self.local_node_id,
                         updated_at_ms: now,
                     },
@@ -692,8 +692,8 @@ mod tests {
             let lifecycle = MetadataGraphLifecycleRecord::deleted(
                 "urn:graph:announce".to_string(),
                 RealmId::from_bytes([2u8; 32]),
-                GroupId::new(),
-                Ulid::new(),
+                GroupId::r#gen(),
+                Ulid::r#gen(),
                 42,
             );
             let document = DocumentSyncTarget::MetadataGraphLifecycle {
@@ -732,8 +732,8 @@ mod tests {
         let lifecycle = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:placed-announce".to_string(),
             RealmId::from_bytes([2u8; 32]),
-            GroupId::new(),
-            Ulid::new(),
+            GroupId::r#gen(),
+            Ulid::r#gen(),
             42,
         );
         let document = DocumentSyncTarget::MetadataGraphLifecycle {
@@ -891,7 +891,7 @@ mod tests {
     fn every_admin_document_target_refuses_whole_document_announce() {
         let local_node_id = local_node_id();
         let realm_id = RealmId::from_bytes([2u8; 32]);
-        let group_id = GroupId::new();
+        let group_id = GroupId::r#gen();
         let (user_id, _) = user_document();
         let admin_targets = [
             DocumentSyncTarget::Group { group_id },

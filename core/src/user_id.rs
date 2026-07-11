@@ -125,13 +125,13 @@ mod tests {
 
     #[test]
     fn user_id_roundtrips_through_string() {
-        let user_id = UserId::new(Ulid::new(), RealmId([7u8; 32]));
+        let user_id = UserId::new(Ulid::r#gen(), RealmId([7u8; 32]));
         assert_eq!(UserId::from_str(&user_id.to_string()).unwrap(), user_id);
     }
 
     #[test]
     fn user_id_roundtrips_through_storage_key() {
-        let user_id = UserId::new(Ulid::new(), RealmId([9u8; 32]));
+        let user_id = UserId::new(Ulid::r#gen(), RealmId([9u8; 32]));
         assert_eq!(
             UserId::from_storage_key(&user_id.to_storage_key()).unwrap(),
             user_id
@@ -147,6 +147,6 @@ mod tests {
         assert!(user_id.is_nil());
         assert!(user_id.is_nil_in(realm_id));
         assert!(!user_id.is_nil_in(other_realm_id));
-        assert!(!UserId::local(Ulid::new(), realm_id).is_nil());
+        assert!(!UserId::local(Ulid::r#gen(), realm_id).is_nil());
     }
 }

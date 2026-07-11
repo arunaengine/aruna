@@ -838,7 +838,7 @@ mod tests {
             root: "/data".to_string(),
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by: UserId::default(),

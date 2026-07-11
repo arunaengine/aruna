@@ -1,0 +1,55 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Pre-existing transitive advisories acknowledged for deliberate follow-up
+# updates; new advisories beyond this set still fail the gate.
+ignore = [
+    "RUSTSEC-2023-0071", # rsa Marvin timing sidechannel, no fixed release
+    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (transitive)
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive)
+    "RUSTSEC-2024-0436", # paste unmaintained (transitive)
+    "RUSTSEC-2025-0052", # async-std discontinued (transitive)
+    "RUSTSEC-2026-0098", # rustls-webpki name-constraints (transitive)
+    "RUSTSEC-2026-0099", # rustls-webpki name-constraints (transitive)
+    "RUSTSEC-2026-0104", # rustls-webpki CRL parsing panic (transitive)
+    "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
+    "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
+    "RUSTSEC-2026-0204", # crossbeam-utils fmt::Pointer deref (transitive)
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "zlib-acknowledgement",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/arunaengine/craqle",
+    "https://github.com/arunaengine/irokle.git",
+    "https://github.com/intbio-ncl/ro-crate-rs.git",
+]

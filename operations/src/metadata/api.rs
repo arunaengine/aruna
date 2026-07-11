@@ -1426,10 +1426,10 @@ mod tests {
     fn document_replica_query_nodes_use_deduplicated_replicas() {
         let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
-        let document_id = Ulid::new();
+        let document_id = Ulid::r#gen();
         let record = MetadataRegistryRecord {
             realm_id: RealmId([3u8; 32]),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             document_id,
             document_path: "datasets/query-targets".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),

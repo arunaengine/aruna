@@ -318,13 +318,13 @@ mod test {
     #[test]
     pub fn test_role_conversion() {
         let role = Role {
-            role_id: Ulid::new(),
+            role_id: Ulid::r#gen(),
             name: "admin".to_string(),
             permissions: HashMap::from([(
-                format!("/{}/g/{}/**", RealmId([0u8; 32]), Ulid::new().to_string()),
+                format!("/{}/g/{}/**", RealmId([0u8; 32]), Ulid::r#gen().to_string()),
                 Permission::WRITE,
             )]),
-            assigned_users: HashSet::from([UserId::new(Ulid::new(), RealmId([1u8; 32]))]),
+            assigned_users: HashSet::from([UserId::new(Ulid::r#gen(), RealmId([1u8; 32]))]),
         };
 
         let bytes = postcard::to_allocvec(&role).unwrap();
@@ -338,7 +338,7 @@ mod test {
         let realm_id = RealmId([1u8; 32]);
         let other_realm_id = RealmId([2u8; 32]);
         let role = Role {
-            role_id: Ulid::new(),
+            role_id: Ulid::r#gen(),
             name: "public".to_string(),
             permissions: HashMap::from([("/test".to_string(), Permission::READ)]),
             assigned_users: HashSet::from([UserId::nil(realm_id)]),
@@ -357,7 +357,7 @@ mod test {
     #[test]
     pub fn test_user_attributes_roundtrip() {
         let realm_id = RealmId([2u8; 32]);
-        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user_id = UserId::new(Ulid::r#gen(), realm_id);
         let user = User {
             user_id,
             name: "alice".to_string(),

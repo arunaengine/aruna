@@ -151,11 +151,11 @@ mod test {
 
         let user_identity = Default::default();
         let access_key_id =
-            UserAccess::build_access_key(&user_identity, &Ulid::new().to_string()).unwrap();
+            UserAccess::build_access_key(&user_identity, &Ulid::r#gen().to_string()).unwrap();
         let user_access = UserAccess {
             access_key: access_key_id.clone(),
             user_identity,
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             secret: "SECRET_KEY".to_string(),
             expiry: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
             path_restrictions: None,

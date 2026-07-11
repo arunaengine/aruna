@@ -212,7 +212,7 @@ mod tests {
             recipient,
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {
-                group_id: Ulid::new(),
+                group_id: Ulid::r#gen(),
                 actor_user_id: user(recipient.realm_id.0[0], 200),
             },
             created_at_ms,

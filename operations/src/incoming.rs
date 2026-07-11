@@ -364,7 +364,7 @@ async fn reemit_evicted_documents(
     let mut written = 0usize;
     for document in documents {
         let record = new_outbox_record_with_id(
-            document.event_id.unwrap_or_else(ulid::Ulid::new),
+            document.event_id.unwrap_or_else(ulid::Ulid::r#gen),
             node_id,
             document.target,
             Vec::new(),
@@ -610,8 +610,8 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
         };
-        let document_id = ulid::Ulid::new();
-        let event_id = ulid::Ulid::new();
+        let document_id = ulid::Ulid::r#gen();
+        let event_id = ulid::Ulid::r#gen();
 
         project_inbound_metadata_create_events(
             &context,

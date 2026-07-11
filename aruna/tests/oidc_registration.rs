@@ -204,7 +204,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
     let realm_id =
         aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let bootstrap_user = UserId::local(Ulid::new(), realm_id);
+    let bootstrap_user = UserId::local(Ulid::r#gen(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {

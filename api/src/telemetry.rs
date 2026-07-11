@@ -107,7 +107,7 @@ pub fn make_request_span(
     method: &Method,
     path: &str,
 ) -> Span {
-    let request_id = Ulid::new().to_string();
+    let request_id = Ulid::r#gen().to_string();
     let span = info_span!(
         "request",
         "otel.kind" = "server",

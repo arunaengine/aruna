@@ -1,6 +1,9 @@
+# Development-only stack. Do not use in production.
 services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.6
+    labels:
+      dev-only: "true"
     command:
       - start-dev
       - --import-realm
@@ -9,6 +12,6 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_PASSWORD:-admin}
     ports:
-      - ${ARUNA_TEST_DEPLOY_KEYCLOAK_PORT:-43031}:8080
+      - 127.0.0.1:${ARUNA_TEST_DEPLOY_KEYCLOAK_PORT:-43031}:8080
     volumes:
       - ./realm-import:/opt/keycloak/data/import:ro

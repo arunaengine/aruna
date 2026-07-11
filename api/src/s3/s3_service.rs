@@ -335,7 +335,7 @@ impl ArunaS3Service {
     ) {
         let path = data_watch_resource_path(group_id, self.node_id, &bucket, &key);
         let event = WatchEvent {
-            event_id: ulid::Ulid::new(),
+            event_id: ulid::Ulid::r#gen(),
             realm_id: self.realm_id,
             kind: WatchEventKind::DataUploaded,
             path,
@@ -1507,8 +1507,8 @@ mod tests {
         let service = ArunaS3Service::new(context, realm_id, node_id).await;
         let bucket = "bucket".to_string();
         let key = "object".to_string();
-        let version_id = Ulid::new();
-        let user_id = UserId::local(Ulid::new(), realm_id);
+        let version_id = Ulid::r#gen();
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
         let auth = AuthContext {
             user_id,
             realm_id,
@@ -1548,7 +1548,7 @@ mod tests {
             .put_object_response(
                 &checksum_request,
                 auth,
-                Ulid::new(),
+                Ulid::r#gen(),
                 bucket.clone(),
                 key,
                 PutObjectResult {
@@ -1691,9 +1691,9 @@ mod tests {
         let holder = net.node_id();
 
         let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
-        let user_id = UserId::local(Ulid::new(), realm_id);
-        let watcher = UserId::local(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let watcher = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         let watch_prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
         net.replace_watch_interest(data_uploaded_interest(
             realm_id,
@@ -1730,7 +1730,7 @@ mod tests {
                 "object".to_string(),
                 PutObjectResult {
                     location: response_location(user_id),
-                    version_id: Ulid::new(),
+                    version_id: Ulid::r#gen(),
                 },
             )
             .await
@@ -1777,12 +1777,12 @@ mod tests {
         net.replace_watch_interest(data_uploaded_interest(
             realm_id,
             holder,
-            data_watch_resource_path(Ulid::new(), net.node_id(), "bucket", ""),
+            data_watch_resource_path(Ulid::r#gen(), net.node_id(), "bucket", ""),
         ));
 
         let service = ArunaS3Service::new(context.clone(), realm_id, net.node_id()).await;
         let anonymous = UserId::nil(realm_id);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let auth = AuthContext {
             user_id: anonymous,
             realm_id,
@@ -1803,7 +1803,7 @@ mod tests {
                 "object".to_string(),
                 PutObjectResult {
                     location: response_location(anonymous),
-                    version_id: Ulid::new(),
+                    version_id: Ulid::r#gen(),
                 },
             )
             .await
@@ -1832,7 +1832,7 @@ mod tests {
         let refresh = ReferenceMetadataRefresh {
             bucket: "bucket".to_string(),
             key: "reference".to_string(),
-            version_id: Ulid::new(),
+            version_id: Ulid::r#gen(),
             metadata: source_metadata(2, "etag"),
             refreshed_at: UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap(),
         };
@@ -1933,8 +1933,8 @@ mod tests {
             context,
             bucket: "bucket".to_string(),
             key: "key".to_string(),
-            version_id: Ulid::new(),
-            created_by: UserId::local(Ulid::new(), realm_id),
+            version_id: Ulid::r#gen(),
+            created_by: UserId::local(Ulid::r#gen(), realm_id),
         }
     }
 
@@ -1946,7 +1946,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: "bucket/object".to_string(),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -2154,7 +2154,7 @@ mod tests {
             root: "/tmp".to_string(),
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),
-            ulid: Ulid::new(),
+            ulid: Ulid::r#gen(),
             compressed: false,
             encrypted: false,
             created_by,
@@ -2220,7 +2220,7 @@ mod tests {
     fn test_user_access(group_id: Ulid, realm_id: RealmId) -> UserAccess {
         UserAccess {
             access_key: "test-key".to_string(),
-            user_identity: UserId::local(Ulid::new(), realm_id),
+            user_identity: UserId::local(Ulid::r#gen(), realm_id),
             group_id,
             secret: "secret".to_string(),
             expiry: SystemTime::now() + Duration::from_secs(3600),
@@ -2247,7 +2247,7 @@ mod tests {
         created_at: SystemTime,
     ) {
         for key in keys {
-            let version_id = Ulid::new();
+            let version_id = Ulid::r#gen();
             let hash = [key.len() as u8; 32];
             write_head(storage_handle, bucket, key, version_id).await;
             write_materialized_version(
@@ -2294,8 +2294,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([2u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -2372,8 +2372,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([3u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -2458,8 +2458,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([33u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -2524,8 +2524,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([34u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
 
         let service = ArunaS3Service::new(
             context.clone(),
@@ -2645,8 +2645,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([4u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(1);
 
         let service = ArunaS3Service::new(
@@ -2661,7 +2661,7 @@ mod tests {
         // through it.
         for i in 0..305 {
             let key = format!("dir/key_{:04}", i);
-            let version_id = Ulid::new();
+            let version_id = Ulid::r#gen();
             let hash = [i as u8; 32];
             write_head(&storage_handle, "bucket", &key, version_id).await;
             write_materialized_version(
@@ -2730,8 +2730,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([5u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
         let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
 
@@ -2750,7 +2750,7 @@ mod tests {
             source_version: None,
         };
 
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         write_reference_version_with_metadata(
             &storage_handle,
             "bucket",
@@ -2827,8 +2827,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([6u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH + Duration::from_secs(5);
 
         let service = ArunaS3Service::new(
@@ -2892,8 +2892,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([7u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
         let created_at = UNIX_EPOCH;
 
         let service = ArunaS3Service::new(
@@ -3004,8 +3004,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([35u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -3065,8 +3065,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
@@ -3140,8 +3140,8 @@ mod tests {
             task_handle: None,
         });
         let realm_id = RealmId([37u8; 32]);
-        let group_id = Ulid::new();
-        let created_by = UserId::local(Ulid::new(), realm_id);
+        let group_id = Ulid::r#gen();
+        let created_by = UserId::local(Ulid::r#gen(), realm_id);
 
         let service =
             ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;

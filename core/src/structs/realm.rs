@@ -116,7 +116,7 @@ impl std::fmt::Display for RealmLevelOperation {
 impl RealmAuthorizationDocument {
     pub fn new_default_realm_doc(realm_id: RealmId) -> Self {
         let mut roles = HashMap::new();
-        let admin = Ulid::new();
+        let admin = Ulid::r#gen();
         roles.insert(
             admin,
             Role {
@@ -378,14 +378,14 @@ impl RealmConfigDocument {
     /// strategy configuration.
     pub fn seed_default_placement(&mut self) {
         let default_strategy = PlacementStrategy {
-            strategy_id: Ulid::new(),
+            strategy_id: Ulid::r#gen(),
             name: "default".to_string(),
             replica_count: Some(self.metadata_replication.default_replication_factor),
             distinct_locations: false,
             affinity: Vec::new(),
         };
         let everywhere_strategy = PlacementStrategy {
-            strategy_id: Ulid::new(),
+            strategy_id: Ulid::r#gen(),
             name: "everywhere".to_string(),
             replica_count: None,
             distinct_locations: false,
@@ -576,7 +576,7 @@ mod test {
         let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(RealmId([0u8; 32]));
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-            user_id: crate::UserId::new(Ulid::new(), RealmId([0u8; 32])),
+            user_id: crate::UserId::new(Ulid::r#gen(), RealmId([0u8; 32])),
             realm_id: RealmId([0u8; 32]),
         };
         let bytes = auth_doc.to_bytes(&actor).unwrap();
@@ -592,7 +592,7 @@ mod test {
 
     #[test]
     pub fn test_realm_config_doc_roundtrip() {
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let document = RealmConfigDocument {
             realm_id: RealmId([4u8; 32]),
             metadata_replication: super::MetadataReplicationConfig {
@@ -626,7 +626,7 @@ mod test {
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
-            user_id: crate::UserId::new(Ulid::new(), RealmId([4u8; 32])),
+            user_id: crate::UserId::new(Ulid::r#gen(), RealmId([4u8; 32])),
             realm_id: RealmId([4u8; 32]),
         };
 
@@ -698,8 +698,8 @@ mod test {
 
     #[test]
     pub fn test_realm_config_replication_resolution() {
-        let group_id = Ulid::new();
-        let other_group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
+        let other_group_id = Ulid::r#gen();
         let document = RealmConfigDocument {
             realm_id: RealmId([5u8; 32]),
             metadata_replication: super::MetadataReplicationConfig {

@@ -167,7 +167,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         };
-        let group_id = ulid::Ulid::new();
+        let group_id = ulid::Ulid::r#gen();
 
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {

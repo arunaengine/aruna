@@ -378,7 +378,7 @@ mod tests {
             task_handle: None,
         };
 
-        let enrollment_id = Ulid::new();
+        let enrollment_id = Ulid::r#gen();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {
@@ -453,7 +453,7 @@ mod tests {
             task_handle: None,
         };
 
-        let enrollment_id = Ulid::new();
+        let enrollment_id = Ulid::r#gen();
         drive(
             CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
                 record: OnboardingSecretRecord {
