@@ -5,7 +5,8 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{
-    Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
+    Actor, AuthContext, EgressAllowRule, EgressConfig, GroupQuotaOverride, HostPattern, Permission,
+    QuotaConfig, UserGroupCapOverride,
 };
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
@@ -14,6 +15,9 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::set_realm_egress::{
+    SetRealmEgressConfig, SetRealmEgressError, SetRealmEgressOperation,
+};
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
@@ -34,7 +38,14 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info, get_realm_info, set_realm_quota, get_usage)
+    paths(
+        get_info,
+        get_realm_info,
+        set_realm_quota,
+        get_realm_egress,
+        set_realm_egress,
+        get_usage
+    )
 )]
 pub struct InfoApiDoc;
 
@@ -43,6 +54,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/info", get(get_info))
         .route("/info/realm", get(get_realm_info))
         .route("/info/realm/quota", put(set_realm_quota))
+        .route(
+            "/info/realm/egress",
+            get(get_realm_egress).put(set_realm_egress),
+        )
         .route("/info/usage", get(get_usage))
 }
 
@@ -476,6 +491,152 @@ fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
         SetRealmQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
         SetRealmQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+/// Realm egress allowlist. Used both as the `GET` response and the
+/// replace-semantics `PUT` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmEgressConfig {
+    pub allow: Vec<RealmEgressAllowRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmEgressAllowRule {
+    pub host: RealmEgressHostPattern,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schemes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RealmEgressHostPattern {
+    Host(String),
+    Cidr(String),
+}
+
+impl From<EgressConfig> for RealmEgressConfig {
+    fn from(config: EgressConfig) -> Self {
+        Self {
+            allow: config
+                .allow
+                .into_iter()
+                .map(|rule| RealmEgressAllowRule {
+                    host: match rule.host {
+                        HostPattern::Host(host) => RealmEgressHostPattern::Host(host),
+                        HostPattern::Cidr(cidr) => RealmEgressHostPattern::Cidr(cidr),
+                    },
+                    ports: rule.ports,
+                    schemes: rule.schemes,
+                    comment: rule.comment,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RealmEgressConfig> for EgressConfig {
+    fn from(config: RealmEgressConfig) -> Self {
+        Self {
+            allow: config
+                .allow
+                .into_iter()
+                .map(|rule| EgressAllowRule {
+                    host: match rule.host {
+                        RealmEgressHostPattern::Host(host) => HostPattern::Host(host),
+                        RealmEgressHostPattern::Cidr(cidr) => HostPattern::Cidr(cidr),
+                    },
+                    ports: rule.ports,
+                    schemes: rule.schemes,
+                    comment: rule.comment,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/info/realm/egress",
+    tag = "info",
+    responses(
+        (status = 200, description = "Realm egress allowlist", body = RealmEgressConfig),
+        (status = 401, description = "Caller is not authenticated", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm member", body = crate::error::ErrorResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_realm_egress(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<RealmEgressConfig>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let config = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+            ServerError::NotFound
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok((StatusCode::OK, Json(RealmEgressConfig::from(config.egress))))
+}
+
+#[utoipa::path(
+    put,
+    path = "/info/realm/egress",
+    tag = "info",
+    request_body = RealmEgressConfig,
+    responses(
+        (status = 200, description = "Updated realm egress allowlist", body = RealmEgressConfig),
+        (status = 400, description = "Invalid egress allowlist", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
+        (status = 409, description = "Concurrent egress update conflict", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_realm_egress(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<RealmEgressConfig>,
+) -> ServerResult<(StatusCode, Json<RealmEgressConfig>)> {
+    let auth = authorize_realm_config_admin(&state, auth).await?;
+    let egress = EgressConfig::from(request);
+    aruna_egress::validate_egress_config(&egress)
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: auth.realm_id,
+    };
+    let stored = drive(
+        SetRealmEgressOperation::new(SetRealmEgressConfig { actor, egress }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_set_realm_egress_error)?;
+    Ok((StatusCode::OK, Json(RealmEgressConfig::from(stored.egress))))
+}
+
+fn map_set_realm_egress_error(error: SetRealmEgressError) -> ServerError {
+    match error {
+        SetRealmEgressError::RealmConfigNotFound => ServerError::NotFound,
+        SetRealmEgressError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent realm egress update conflict; retry".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
     }
@@ -931,8 +1092,10 @@ mod tests {
     use super::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RealmQuotaConfig, RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus,
-        get_info, get_realm_info, get_usage, map_set_realm_quota_error, set_realm_quota,
+        RealmEgressAllowRule, RealmEgressConfig, RealmEgressHostPattern, RealmQuotaConfig,
+        RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus, get_info,
+        get_realm_egress, get_realm_info, get_usage, map_set_realm_quota_error, set_realm_egress,
+        set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -1507,5 +1670,111 @@ mod tests {
             error,
             ServerError::BadRequestReason(reason) if reason.contains("max_devices_per_user")
         ));
+    }
+
+    #[test]
+    fn openapi_has_egress() {
+        assert!(
+            ApiDoc::openapi()
+                .paths
+                .paths
+                .contains_key("/info/realm/egress")
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_requires_auth() {
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let error = set_realm_egress(
+            State(state),
+            Extension(None),
+            Json(RealmEgressConfig { allow: vec![] }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_nonadmin() {
+        let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        let error = set_realm_egress(
+            State(state),
+            Extension(Some(stranger)),
+            Json(RealmEgressConfig { allow: vec![] }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn get_requires_auth() {
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let error = get_realm_egress(State(state), Extension(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn admin_sets_egress() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let body = RealmEgressConfig {
+            allow: vec![RealmEgressAllowRule {
+                host: RealmEgressHostPattern::Cidr("10.0.0.0/8".to_string()),
+                ports: Some(vec![443]),
+                schemes: Some(vec!["https".to_string()]),
+                comment: Some("internal".to_string()),
+            }],
+        };
+
+        let (status, Json(stored)) = set_realm_egress(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(body.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored, body);
+
+        let (status, Json(read)) = get_realm_egress(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read, body);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_cidr() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+        };
+        let body = RealmEgressConfig {
+            allow: vec![RealmEgressAllowRule {
+                host: RealmEgressHostPattern::Cidr("not-a-cidr".to_string()),
+                ports: None,
+                schemes: None,
+                comment: None,
+            }],
+        };
+        let error = set_realm_egress(State(state), Extension(Some(auth)), Json(body))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::BadRequestReason(_)));
     }
 }
