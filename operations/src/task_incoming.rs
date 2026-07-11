@@ -1807,7 +1807,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_reconcile_clears_realm_usage_summary_for_requested_realm_config() {
+    // A realm-config change recomputes (refills) the summary cache rather than
+    // leaving it cold, replacing the stale value.
+    async fn reconcile_refreshes_summary() {
         use aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE;
         use aruna_core::structs::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
         use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1882,8 +1884,14 @@ mod tests {
             }))
             .await
         {
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
-            other => panic!("expected summary cache to be cleared, got {other:?}"),
+            // The stale 99 is replaced by a freshly recomputed (zero) total.
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => {
+                let refreshed = UsageCounters::from_bytes(bytes.as_ref()).unwrap();
+                assert_eq!(refreshed, UsageCounters::default());
+            }
+            other => panic!("expected summary cache to be recomputed, got {other:?}"),
         }
 
         net.shutdown().await;

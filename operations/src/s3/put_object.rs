@@ -1080,8 +1080,10 @@ mod test {
         ));
     }
 
+    // A single commit conflict re-opens a fresh metadata transaction, keeping the
+    // durable blob rather than failing the request.
     #[test]
-    fn commit_transaction_conflict_deletes_written_blob_and_returns_conflict() {
+    fn commit_conflict_retries() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::new();
         let node_id = iroh::SecretKey::generate().public();
@@ -1097,21 +1099,15 @@ mod test {
             error: StorageError::TransactionConflict,
         }));
 
-        let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
-            panic!("expected blob cleanup")
-        };
-        assert_eq!(deleted, &location);
-
-        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
-
-        assert!(effects.is_empty());
-        assert!(op.is_complete());
         assert!(matches!(
-            op.finalize(),
-            Err(crate::s3::put_object::PutObjectError::StorageError(
-                StorageError::TransactionConflict
-            ))
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
         ));
+        assert_eq!(op.state, PutObjectState::StartTransaction);
+        assert_eq!(op.txn_id, None);
+        assert_eq!(op.written_location, Some(location));
     }
 
     #[tokio::test]
