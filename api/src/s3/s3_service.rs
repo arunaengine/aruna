@@ -725,7 +725,7 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        debug!("Received CREATE BUCKET Request: {:#?}", req);
+        debug!(bucket = %req.input.bucket, "Received CREATE BUCKET Request");
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -756,7 +756,7 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        debug!("Received HEAD BUCKET Request: {:#?}", req);
+        debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -823,7 +823,7 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        debug!("Received LIST BUCKETS Request: {:#?}", req);
+        debug!("Received LIST BUCKETS Request");
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -946,7 +946,12 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        debug!("Received LIST OBJECTS V2 Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            max_keys = ?req.input.max_keys,
+            "Received LIST OBJECTS V2 Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1062,7 +1067,12 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        debug!("Received PUT Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            content_length = ?req.input.content_length,
+            "Received PUT Request"
+        );
 
         // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
@@ -1132,7 +1142,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        debug!("Received COPY OBJECT Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received COPY OBJECT Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1289,7 +1303,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        debug!("Received CREATE MULTIPART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received CREATE MULTIPART Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1342,7 +1360,13 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        debug!("Received UPLOAD PART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            part_number = req.input.part_number,
+            content_length = ?req.input.content_length,
+            "Received UPLOAD PART Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1408,7 +1432,12 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        debug!("Received UPLOAD PART COPY Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            part_number = req.input.part_number,
+            "Received UPLOAD PART COPY Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1521,7 +1550,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        debug!("Received COMPLETE MULTIPART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received COMPLETE MULTIPART Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1595,7 +1628,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        debug!("Received ABORT MULTIPART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received ABORT MULTIPART Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1623,7 +1660,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        debug!("Received GET Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received GET Request"
+        );
 
         // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
@@ -1718,7 +1759,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        debug!("Received GET OBJECT ATTRIBUTES Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received GET OBJECT ATTRIBUTES Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1891,7 +1936,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        debug!("Received HEAD Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received HEAD Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1949,7 +1998,12 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        debug!("Received LIST PARTS Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            max_parts = ?req.input.max_parts,
+            "Received LIST PARTS Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -2056,7 +2110,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        debug!("Received LIST MULTIPART UPLOADS Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            "Received LIST MULTIPART UPLOADS Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -2164,7 +2222,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        debug!("Received LIST OBJECT VERSIONS Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            "Received LIST OBJECT VERSIONS Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -2303,12 +2365,16 @@ impl S3 for ArunaS3Service {
         }))
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(self, req))]
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        debug!("Received DELETE Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received DELETE Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -2355,7 +2421,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        debug!("Received DELETE OBJECTS Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            objects = req.input.delete.objects.len(),
+            "Received DELETE OBJECTS Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -2500,12 +2570,12 @@ impl S3 for ArunaS3Service {
         }))
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(self, req))]
     async fn delete_bucket(
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        debug!("Received DELETE BUCKET Request: {:#?}", req);
+        debug!(bucket = %req.input.bucket, "Received DELETE BUCKET Request");
 
         drive(DeleteBucketOperation::new(req.input.bucket), &self.state)
             .await
