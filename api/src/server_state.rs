@@ -1,5 +1,5 @@
 use crate::auth::{OidcTokenSelector, OidcValidator};
-use crate::error::{OidcError, TokenError};
+use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
@@ -330,12 +330,6 @@ impl ServerState {
             .map_err(|_| OnboardingSecretError::InvalidSecret),
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
-    }
-
-    pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
-        <Self as ArunaBearerTokenValidationState>::decoding_key_for_issuer(self, &pubkey)
-            .await
-            .map_err(Into::into)
     }
 
     pub async fn issuer_key_cache_len(&self) -> usize {
