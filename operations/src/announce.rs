@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncPublish,
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
     DocumentSyncRevision, DocumentSyncTarget,
 };
 use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
@@ -53,6 +53,7 @@ pub struct AnnounceTopicOperation {
     placement: PlacementRef,
     allow_genesis: bool,
     require_delivery: bool,
+    transfer_outbox: Option<DocumentSyncOutboxRecord>,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
     current: Option<DocumentSyncTarget>,
@@ -68,6 +69,7 @@ enum AnnounceTopicState {
     ScheduleSync,
     PublishDocument,
     SyncDocument,
+    DeleteTransferredOutbox,
     Finish,
     Error,
 }
@@ -138,6 +140,7 @@ impl AnnounceTopicOperation {
             placement,
             allow_genesis,
             require_delivery: false,
+            transfer_outbox: None,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -162,6 +165,7 @@ impl AnnounceTopicOperation {
             placement: PlacementRef::NIL,
             allow_genesis,
             require_delivery: false,
+            transfer_outbox: None,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -206,6 +210,16 @@ impl AnnounceTopicOperation {
         smallvec![]
     }
 
+    fn fail_transfer(&mut self, error: AnnounceTopicError) -> Effects {
+        self.state = AnnounceTopicState::Error;
+        self.output = Some(Err(error));
+        if self.transfer_outbox.is_some() {
+            smallvec![schedule_outbox_drain_effect()]
+        } else {
+            smallvec![]
+        }
+    }
+
     fn finish(&mut self) -> Effects {
         self.state = AnnounceTopicState::Finish;
         self.output = Some(Ok(()));
@@ -240,25 +254,17 @@ impl AnnounceTopicOperation {
         )
     }
 
-    fn publish_document_effect(&mut self, document: DocumentSyncTarget, bytes: Vec<u8>) -> Effects {
-        let change = match self.document_upsert_change(&document, &bytes) {
-            Ok(change) => change,
-            Err(error) => return self.fail(error),
+    fn publish_persisted_outbox_effect(&mut self) -> Effects {
+        let Some(record) = self.transfer_outbox.as_ref() else {
+            return self.unexpected_event(
+                "persisted document sync outbox record",
+                "missing transfer outbox record".to_string(),
+            );
         };
-        if self.peers.is_empty() {
-            return self.finish();
-        }
-        self.current = Some(document.clone());
         self.state = AnnounceTopicState::PublishDocument;
         smallvec![Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::PublishDocuments {
-                documents: vec![DocumentSyncPublish::Upsert {
-                    event_id: Ulid::new(),
-                    target: document,
-                    bytes,
-                    change,
-                    allow_genesis: self.allow_genesis,
-                }],
+                documents: vec![crate::task_incoming::document_publish_from_outbox(record)],
                 peers: self.peers.clone(),
             }
         ))]
@@ -278,6 +284,9 @@ impl AnnounceTopicOperation {
             event,
             self.allow_genesis,
         );
+        if self.require_delivery {
+            self.transfer_outbox = Some(record.clone());
+        }
         match write_outbox_effect(&record) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
@@ -413,8 +422,11 @@ impl AnnounceTopicOperation {
         match self.pending.pop_front() {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
-                    if self.require_delivery {
-                        self.publish_document_effect(document, bytes)
+                    if self.require_delivery && self.peers.is_empty() {
+                        match self.document_upsert_change(&document, &bytes) {
+                            Ok(_) => self.finish(),
+                            Err(error) => self.fail(error),
+                        }
                     } else {
                         self.write_document_outbox_effect(document, bytes)
                     }
@@ -470,7 +482,14 @@ impl Operation for AnnounceTopicOperation {
                         return self.next_effect();
                     };
                     if self.require_delivery {
-                        self.publish_document_effect(document, bytes.to_vec())
+                        if self.peers.is_empty() {
+                            match self.document_upsert_change(&document, &bytes) {
+                                Ok(_) => self.finish(),
+                                Err(error) => self.fail(error),
+                            }
+                        } else {
+                            self.write_document_outbox_effect(document, bytes.to_vec())
+                        }
                     } else {
                         self.write_document_outbox_effect(document, bytes.to_vec())
                     }
@@ -520,6 +539,9 @@ impl Operation for AnnounceTopicOperation {
                             "missing current document".to_string(),
                         );
                     }
+                    if self.require_delivery {
+                        return self.publish_persisted_outbox_effect();
+                    }
                     self.state = AnnounceTopicState::ScheduleSync;
                     smallvec![schedule_outbox_drain_effect()]
                 }
@@ -562,23 +584,46 @@ impl Operation for AnnounceTopicOperation {
                 }
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     error, ..
-                })) => self.fail(AnnounceTopicError::DocumentSync(error)),
+                })) => self.fail_transfer(AnnounceTopicError::DocumentSync(error)),
                 Event::Net(NetEvent::Error(error)) => {
-                    self.fail(AnnounceTopicError::DocumentSync(format!("{error:?}")))
+                    self.fail_transfer(AnnounceTopicError::DocumentSync(format!("{error:?}")))
                 }
-                other => self.unexpected_event("document publish result", format!("{other:?}")),
+                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
+                    "unexpected document publish result: {other:?}"
+                ))),
             },
             AnnounceTopicState::SyncDocument => match event {
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
                     ..
-                })) => self.finish(),
+                })) => {
+                    let Some(record) = self.transfer_outbox.as_ref() else {
+                        return self.unexpected_event(
+                            "persisted document sync outbox record",
+                            "missing transfer outbox record".to_string(),
+                        );
+                    };
+                    self.state = AnnounceTopicState::DeleteTransferredOutbox;
+                    smallvec![crate::document_sync_outbox::delete_outbox_effect(record)]
+                }
                 Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
                     error, ..
-                })) => self.fail(AnnounceTopicError::DocumentSync(error)),
+                })) => self.fail_transfer(AnnounceTopicError::DocumentSync(error)),
                 Event::Net(NetEvent::Error(error)) => {
-                    self.fail(AnnounceTopicError::DocumentSync(format!("{error:?}")))
+                    self.fail_transfer(AnnounceTopicError::DocumentSync(format!("{error:?}")))
                 }
-                other => self.unexpected_event("document sync result", format!("{other:?}")),
+                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
+                    "unexpected document sync result: {other:?}"
+                ))),
+            },
+            AnnounceTopicState::DeleteTransferredOutbox => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    self.transfer_outbox = None;
+                    self.finish()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail_transfer(error.into()),
+                other => self.fail_transfer(AnnounceTopicError::DocumentSync(format!(
+                    "unexpected transfer outbox delete result: {other:?}"
+                ))),
             },
             AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {
                 smallvec![]
@@ -794,6 +839,12 @@ mod tests {
             key: Key::from(Vec::new()),
             value: Some(bytes.into()),
         }));
+        let outbox = written_outbox_record(effects.as_slice());
+        assert_eq!(outbox.target, document);
+        assert_eq!(outbox.peers, vec![peer]);
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: crate::document_sync_outbox::outbox_key(&outbox),
+        }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Net(NetEffect::DocumentSync(
@@ -821,6 +872,16 @@ mod tests {
                 metadata_graph_tombstones: Vec::new(),
             },
         )));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, key, .. })]
+                if key_space == DOCUMENT_SYNC_OUTBOX_KEYSPACE
+                    && key == &crate::document_sync_outbox::outbox_key(&outbox)
+        ));
+        assert!(!operation.is_complete());
+        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
+            key: crate::document_sync_outbox::outbox_key(&outbox),
+        }));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
         assert_eq!(operation.finalize(), Ok(()));

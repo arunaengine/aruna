@@ -117,30 +117,27 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
-fn document_publish_from_outbox(
-    event_id: ulid::Ulid,
-    target: DocumentSyncTarget,
-    event: DocumentSyncOutboxEvent,
-    allow_genesis: bool,
+pub(crate) fn document_publish_from_outbox(
+    record: &aruna_core::document::DocumentSyncOutboxRecord,
 ) -> DocumentSyncPublish {
-    match event {
+    match &record.event {
         DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
-            event_id,
-            target,
-            bytes,
-            change,
-            allow_genesis,
+            event_id: record.outbox_id,
+            target: record.target.clone(),
+            bytes: bytes.clone(),
+            change: *change,
+            allow_genesis: record.allow_genesis,
         },
         DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
-            event_id,
-            target,
-            change,
-            allow_genesis,
+            event_id: record.outbox_id,
+            target: record.target.clone(),
+            change: *change,
+            allow_genesis: record.allow_genesis,
         },
         DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
-            target,
-            event,
-            allow_genesis,
+            target: record.target.clone(),
+            event: event.clone(),
+            allow_genesis: record.allow_genesis,
         },
     }
 }
@@ -263,12 +260,7 @@ impl OperationsTaskHandler {
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record) in batch.records {
-            let document = document_publish_from_outbox(
-                record.outbox_id,
-                record.target.clone(),
-                record.event,
-                record.allow_genesis,
-            );
+            let document = document_publish_from_outbox(&record);
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();
             if subbatches
@@ -1275,7 +1267,8 @@ impl InboundTaskHandler for OperationsTaskHandler {
 mod tests {
     use super::*;
     use crate::document_sync_outbox::{
-        outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
+        new_outbox_record_with_id, outbox_key, read_outbox_record,
+        restore_document_sync_outbox_timers, write_outbox_effect,
     };
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -1377,15 +1370,18 @@ mod tests {
         let event_id = Ulid::from_parts(10, 1);
         let target = target();
         let change = change();
-        let publish = document_publish_from_outbox(
+        let record = new_outbox_record_with_id(
             event_id,
+            node(1),
             target.clone(),
+            Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![1, 2, 3],
                 change,
             },
             true,
         );
+        let publish = document_publish_from_outbox(&record);
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
