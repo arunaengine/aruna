@@ -25,6 +25,10 @@ use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
+use crate::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
+    RealmPlacementMutation,
+};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
@@ -32,9 +36,6 @@ use crate::process_placements::{PlacementConfig, PlacementError, ProcessPlacemen
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
-};
-use crate::set_node_placement::{
-    SetNodePlacementConfig, SetNodePlacementError, SetNodePlacementOperation,
 };
 
 const ONBOARDING_RESERVATION_TTL_SECS: u64 = 300;
@@ -71,7 +72,7 @@ pub enum BootstrapOnboardingFinalizeError {
     #[error(transparent)]
     EnsureRealmConfig(#[from] EnsureRealmConfigError),
     #[error(transparent)]
-    SetNodePlacement(#[from] SetNodePlacementError),
+    SetNodePlacement(#[from] MutateRealmPlacementError),
     #[error(transparent)]
     Placement(#[from] PlacementError),
     #[error(transparent)]
@@ -280,13 +281,13 @@ async fn set_joiner_placement_entry(
     context: &DriverContext,
 ) -> Result<(), BootstrapOnboardingFinalizeError> {
     drive(
-        SetNodePlacementOperation::new(SetNodePlacementConfig {
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
             actor: Actor {
                 node_id: input.local_node_id,
                 user_id: UserId::nil(input.realm_id),
                 realm_id: input.realm_id,
             },
-            entry,
+            mutation: RealmPlacementMutation::UpsertNode(entry),
         }),
         context,
     )

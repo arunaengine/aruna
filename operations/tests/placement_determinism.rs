@@ -29,7 +29,6 @@ use aruna_operations::placement::{
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::set_node_placement::{SetNodePlacementConfig, SetNodePlacementOperation};
 use aruna_operations::sync_placement::{decode_placement, placement_key};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -108,12 +107,12 @@ async fn placement_policy_converges_and_replans_completed_inventory()
         .placement_entry(obsolete)
         .expect("selected holder should have a placement entry");
     drive(
-        SetNodePlacementOperation::new(SetNodePlacementConfig {
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
             actor: actor.clone(),
-            entry: NodePlacementEntry {
+            mutation: RealmPlacementMutation::UpsertNode(NodePlacementEntry {
                 draining: true,
                 ..old_entry.clone()
-            },
+            }),
         }),
         nodes[0].context.as_ref(),
     )

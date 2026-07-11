@@ -1,3 +1,4 @@
+use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentReducerError, AdminDocumentReducerState,
     overlay_realm_config_placement_reducer_materialization,
@@ -14,7 +15,8 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingScope, PlacementOverride, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    Actor, BindingScope, NodePlacementEntry, PlacementOverride, PlacementStrategy,
+    RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -30,6 +32,8 @@ use crate::sync_placement::schedule_placement_revalidation_effect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealmPlacementMutation {
+    UpsertNode(NodePlacementEntry),
+    RemoveNode(NodeId),
     UpsertStrategy(PlacementStrategy),
     RemoveStrategy(Ulid),
     SetDefaultStrategy(Ulid),
@@ -42,6 +46,12 @@ pub enum RealmPlacementMutation {
 impl RealmPlacementMutation {
     fn admin_operation(&self) -> AdminDocumentOperation {
         match self {
+            Self::UpsertNode(entry) => AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: entry.clone(),
+            },
+            Self::RemoveNode(node_id) => {
+                AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: *node_id }
+            }
             Self::UpsertStrategy(strategy) => {
                 AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
                     strategy: strategy.clone(),
@@ -473,9 +483,11 @@ impl Operation for MutateRealmPlacementOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{DocumentClass, RealmId};
+    use aruna_core::structs::{DEFAULT_NODE_WEIGHT, DocumentClass, RealmId};
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -660,6 +672,68 @@ mod tests {
                 .iter()
                 .any(|record| record.subject == vec![0xab, 0xcd])
         );
+    }
+
+    #[tokio::test]
+    async fn node_placement_lifecycle() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([12; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+        let entry = NodePlacementEntry {
+            node_id: node(2),
+            location: "eu-west".to_string(),
+            weight: 250,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+
+        let stored = mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::UpsertNode(entry.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.placement_entry(entry.node_id), Some(&entry));
+
+        let stored = mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::RemoveNode(entry.node_id),
+        )
+        .await
+        .unwrap();
+        assert!(stored.placement_entry(entry.node_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn node_placement_rejects_reserved_kind_label() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([13; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+        let entry = NodePlacementEntry {
+            node_id: node(2),
+            location: String::new(),
+            weight: DEFAULT_NODE_WEIGHT,
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([(
+                aruna_core::structs::KIND_LABEL_KEY.to_string(),
+                "Server".to_string(),
+            )]),
+        };
+
+        assert!(matches!(
+            mutate(&context, &actor, RealmPlacementMutation::UpsertNode(entry)).await,
+            Err(MutateRealmPlacementError::AdminDocumentReducerError(
+                AdminDocumentReducerError::ReservedPlacementLabel
+            ))
+        ));
     }
 
     #[tokio::test]
