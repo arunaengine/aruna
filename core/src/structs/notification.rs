@@ -12,6 +12,33 @@ pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const NOTIFICATION_TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const NOTIFICATION_TRANSIENT_PER_USER_CAP: usize = 500;
 
+/// Dedup window for advisory quota-state notifications: two nodes both electing
+/// themselves owner during realm-config lag and emitting the same transition
+/// within one window collapse to one inbox entry (id and timestamp are bucketed).
+pub const QUOTA_STATE_NOTIFICATION_DEDUP_WINDOW_MS: u64 = 60_000;
+
+/// Content-addressed id for a quota-state notification, deterministic in the
+/// transition and its dedup window so duplicate cross-node emissions collapse.
+pub fn group_quota_notification_id(
+    group_id: GroupId,
+    previous: QuotaState,
+    state: QuotaState,
+    window: u64,
+) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-group-quota-notification-v1");
+    hasher.update(&group_id.to_bytes());
+    hasher.update(previous.as_str().as_bytes());
+    hasher.update(b"/");
+    hasher.update(state.as_str().as_bytes());
+    hasher.update(&window.to_be_bytes());
+    Ulid::from_bytes(
+        hasher.finalize().as_bytes()[..16]
+            .try_into()
+            .expect("16 bytes"),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationClass {
     Direct,
@@ -510,5 +537,33 @@ mod tests {
         assert_eq!(onboarded.name(), "node_onboarded");
         assert_eq!(metadata_created.name(), "metadata_created");
         assert_eq!(data_uploaded.name(), "data_uploaded");
+    }
+
+    #[test]
+    fn quota_id_deterministic() {
+        use crate::structs::QuotaState;
+        let g = Ulid::from_bytes([1u8; 16]);
+        let id = group_quota_notification_id(g, QuotaState::Ok, QuotaState::Warn, 5);
+        assert_eq!(
+            id,
+            group_quota_notification_id(g, QuotaState::Ok, QuotaState::Warn, 5)
+        );
+        assert_ne!(
+            id,
+            group_quota_notification_id(g, QuotaState::Ok, QuotaState::Warn, 6)
+        );
+        assert_ne!(
+            id,
+            group_quota_notification_id(g, QuotaState::Warn, QuotaState::Ok, 5)
+        );
+        assert_ne!(
+            id,
+            group_quota_notification_id(
+                Ulid::from_bytes([2u8; 16]),
+                QuotaState::Ok,
+                QuotaState::Warn,
+                5
+            )
+        );
     }
 }
