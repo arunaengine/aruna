@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn legal_transitions_are_accepted() {
+    fn legal_transitions() {
         let legal = [
             (JobState::Queued, JobState::Claimed),
             (JobState::Queued, JobState::Cancelled),
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn illegal_transitions_are_rejected() {
+    fn illegal_transitions() {
         let illegal = [
             (JobState::Queued, JobState::Running),
             (JobState::Queued, JobState::Succeeded),
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_states_absorb_everything() {
+    fn terminal_absorbs() {
         for from in [JobState::Succeeded, JobState::Failed, JobState::Cancelled] {
             for to in [
                 JobState::Queued,
@@ -490,21 +490,21 @@ mod tests {
     }
 
     #[test]
-    fn record_roundtrips_through_postcard() {
+    fn record_roundtrips() {
         let record = probe_record(JobId::from_bytes([5u8; 16]), 1_700_000_000_000);
         let bytes = record.to_bytes().unwrap();
         assert_eq!(JobRecord::from_bytes(&bytes).unwrap(), record);
     }
 
     #[test]
-    fn record_key_carries_version_prefix() {
+    fn record_key_versioned() {
         let key = job_record_key(JobId::from_bytes([9u8; 16]));
         assert!(key.starts_with(JOB_RECORD_KEY_PREFIX));
         assert_eq!(key.len(), JOB_RECORD_KEY_PREFIX.len() + 16);
     }
 
     #[test]
-    fn due_index_orders_ascending_by_timestamp() {
+    fn due_index_ordered() {
         let id = JobId::from_bytes([1u8; 16]);
         assert!(job_due_index_key(1_000, id) < job_due_index_key(2_000, id));
         let (ts, parsed) = parse_job_schedule_index_key(&job_due_index_key(1_234, id)).unwrap();
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_prefixes_do_not_overlap() {
+    fn prefixes_disjoint() {
         let id = JobId::from_bytes([1u8; 16]);
         let due = job_due_index_key(5, id);
         let lease = job_lease_index_key(5, id);
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_index_orders_newest_first_within_user() {
+    fn owner_index_newest_first() {
         let u = user(1, 2);
         let id = JobId::from_bytes([3u8; 16]);
         assert!(job_owner_index_key(u, 2_000, id) < job_owner_index_key(u, 1_000, id));
@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_index_key_roundtrips_and_matches_cursor() {
+    fn owner_key_roundtrips() {
         let u = user(5, 9);
         let ts = 1_700_000_000_000u64;
         let id = JobId::new();
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_index_is_user_scoped() {
+    fn owner_index_scoped() {
         let a = user(1, 2);
         let b = user(1, 3);
         let id = JobId::from_bytes([4u8; 16]);

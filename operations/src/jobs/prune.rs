@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_terminal_job_is_pruned() {
+    async fn expired_job_pruned() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpired_terminal_job_is_retained() {
+    async fn unexpired_job_retained() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         insert_job(
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_arms_prune_timer_when_entries_exist() {
+    async fn restore_arms_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         insert_job(

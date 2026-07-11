@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_while_running_runs_cleanup() {
+    async fn cancel_running_cleanup() {
         let (dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_requested_before_run_is_honored() {
+    async fn cancel_before_run() {
         let (dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_wins_cancel_commit_race() {
+    async fn completion_wins_race() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = probe_record(job_id, 1, 0, None);
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_stale_jobs_requeues_in_flight() {
+    async fn recover_requeues_inflight() {
         let (_dir, storage) = temp_storage();
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([5u8; 16]);
@@ -535,8 +535,38 @@ mod tests {
         assert!(recovered.claim.is_none());
     }
 
+    // Perf budget: progress is throttled, so a 10k-step job writes O(1), not O(steps).
     #[tokio::test]
-    async fn wait_for_terminal_times_out_on_pending_job() {
+    async fn progress_writes_throttled() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([7u8; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 10_000, 0, None)).await;
+
+        let before = storage.snapshot_metrics().requests_total;
+        runtime.spawn(ctx.clone(), claimed);
+        let state = runtime
+            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(state, JobState::Succeeded);
+
+        let delta = storage.snapshot_metrics().requests_total - before;
+        assert!(
+            delta < 200,
+            "10k-step run must not scale with steps, got {delta}"
+        );
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.progress.current, 10_000);
+    }
+
+    #[tokio::test]
+    async fn wait_times_out() {
         let (_dir, storage) = temp_storage();
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([6u8; 16]);

@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_creates_queued_job_with_indexes() {
+    async fn submit_creates_job() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedup_returns_existing_live_job() {
+    async fn dedup_returns_existing() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
@@ -300,8 +300,34 @@ mod tests {
         assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
     }
 
+    // Perf budget: a non-dedup submit is one atomic batch write of <=4 keys plus a
+    // non-persisted drain kick.
     #[tokio::test]
-    async fn dedup_creates_new_job_after_prior_went_terminal() {
+    async fn submit_writes_once() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+
+        let before = storage.snapshot_metrics().requests_total;
+        drive(SubmitJobOperation::new(spec(None)), &ctx)
+            .await
+            .unwrap();
+        let after = storage.snapshot_metrics().requests_total;
+        assert_eq!(
+            after - before,
+            1,
+            "submit performs exactly one storage request"
+        );
+
+        let keys = count_keyspace(&storage, JOB_KEYSPACE).await
+            + count_keyspace(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await;
+        assert!(keys <= 4, "submit writes at most four keys, got {keys}");
+    }
+
+    #[tokio::test]
+    async fn dedup_after_terminal() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
