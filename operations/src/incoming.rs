@@ -226,7 +226,7 @@ impl InboundEventHandler for OperationsInboundHandler {
             match alpn {
                 Alpn::Bao => {
                     if let Some(mut blob_handle) = self.context.blob_handle.clone() {
-                        let stream_id = blob_handle.store_connection(stream).await;
+                        let stream_id = blob_handle.store_connection(node_id, stream).await;
                         let Some(net_handle) = self.context.net_handle.as_ref() else {
                             error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
                             return;
