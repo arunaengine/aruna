@@ -236,7 +236,6 @@ pub async fn restore_usage_history_timer(_storage: &StorageHandle, task_handle: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::handle::Handle;
     use aruna_core::structs::{UsageCounters, usage_group_key};
     use ulid::Ulid;
 
