@@ -991,7 +991,7 @@ mod test {
     }
 
     #[test]
-    fn commit_conflict_retries_then_deletes_blob_and_surfaces_retryable_conflict() {
+    fn commit_conflict_exhausts() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = Ulid::new();
         let node_id = iroh::SecretKey::generate().public();

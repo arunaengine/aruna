@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_conflict_retries_then_deletes_composed_blob_and_surfaces_retryable_conflict() {
+    fn finalize_conflict_exhausts() {
         let mut op = CompleteMultipartUploadOperation::new(finalize_input());
         let composed = part_record(1, 10).location;
         op.composed_location = Some(composed.clone());

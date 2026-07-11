@@ -2753,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_realm_config_quota_applies_and_respects_conflict() {
+    fn overlay_quota_conflict() {
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(4_096),
             grace_factor_percent: 120,

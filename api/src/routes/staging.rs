@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_quota_exceeded_maps_to_quota_exceeded() {
+    fn snapshot_quota_exceeded() {
         let error = map_snapshot_error(MaterializeSnapshotError::Write(
             PutObjectError::QuotaExceeded {
                 limit: 100,
@@ -575,14 +575,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_retryable_conflict_maps_to_write_conflict_retry() {
+    fn snapshot_conflict_503() {
         let error =
             map_snapshot_error(MaterializeSnapshotError::Write(PutObjectError::RetryableConflict));
         assert!(matches!(error, ServerError::WriteConflictRetry));
     }
 
     #[test]
-    fn reference_quota_exceeded_maps_to_quota_exceeded() {
+    fn reference_quota_exceeded() {
         let error = map_reference_error(MaterializeReferenceError::QuotaExceeded {
             limit: 100,
             usage: 200,
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_retryable_conflict_maps_to_write_conflict_retry() {
+    fn reference_conflict_503() {
         let error = map_reference_error(MaterializeReferenceError::RetryableConflict);
         assert!(matches!(error, ServerError::WriteConflictRetry));
     }

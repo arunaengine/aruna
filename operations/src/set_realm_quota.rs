@@ -706,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_default_ceiling_overflow() {
+    fn default_ceiling_overflow() {
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(u64::MAX),
             grace_factor_percent: 110,
@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_quota_rejects_override_ceiling_overflow() {
+    fn override_ceiling_overflow() {
         let quota = QuotaConfig {
             default_group_quota_bytes: Some(1_000),
             grace_factor_percent: 110,
