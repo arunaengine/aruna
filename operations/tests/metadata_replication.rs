@@ -47,7 +47,9 @@ use aruna_operations::metadata::projector::{
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::placement::{PlacementResolutionContext, plan_target_placement};
+use aruna_operations::placement::{
+    PlacementResolutionContext, plan_target_placement, resolve_shard_holders,
+};
 use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
@@ -122,8 +124,7 @@ async fn metadata_creation_replicates_to_all_three_holders()
 }
 
 #[tokio::test]
-async fn metadata_replan_refreshes_replacement_holder_indexes()
--> Result<(), Box<dyn std::error::Error>> {
+async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([46u8; 32]);
     let (nodes, _config) = build_realm_nodes(&realm_id, 4).await?;
     let group_id = Ulid::r#gen();
@@ -221,9 +222,10 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
         nodes[0].context.as_ref(),
     )
     .await?;
-    let mut final_holders = plan_target_placement(&updated_config, &target, placement_context)
-        .expect("updated metadata lifecycle placement resolves")
-        .holders;
+    let plan = plan_target_placement(&updated_config, &target, placement_context)
+        .expect("updated metadata lifecycle placement resolves");
+    let placement = plan.placement;
+    let mut final_holders = plan.holders;
     sort_node_ids(&mut final_holders);
     let replacement = final_holders
         .iter()
@@ -231,24 +233,18 @@ async fn metadata_replan_refreshes_replacement_holder_indexes()
         .find(|node_id| !initial_holders.contains(node_id))
         .expect("replan selects a replacement holder");
 
-    wait_for_persisted_holder_set(
-        &nodes,
-        &final_holders,
-        group_id,
-        document_id,
-        &final_holders,
-    )
-    .await?;
+    let live_holders = resolve_shard_holders(&updated_config, &placement);
+    assert!(live_holders.contains(&replacement));
+    assert!(!live_holders.contains(&obsolete));
+
     let replacement_node = nodes
         .iter()
         .find(|node| node.net.node_id() == replacement)
         .expect("replacement fixture node exists");
-    let (registry, holders) = read_persisted_holder_set(replacement_node, group_id, document_id)
-        .await?
-        .expect("replacement persisted metadata indexes");
-    assert!(same_holder_set(&registry.holder_node_ids, &final_holders));
-    assert!(same_holder_set(&holders, &final_holders));
-    assert!(!holders.contains(&obsolete));
+    // holder_node_ids is an event-time stamp; freshness is the shard guarantee (#395).
+    let registry =
+        wait_for_persisted_update(replacement_node, group_id, document_id, latest_update_id)
+            .await?;
     assert_eq!(registry.last_event_id, latest_update_id);
     let refreshed_event =
         read_metadata_event_log_value(replacement_node, document_id, latest_update_id)
@@ -865,6 +861,31 @@ async fn read_persisted_holder_set(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(format!("unexpected metadata index read event: {other:?}").into()),
+    }
+}
+
+async fn wait_for_persisted_update(
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    expected_event_id: Ulid,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        let last = match read_persisted_holder_set(node, group_id, document_id).await? {
+            Some((registry, _)) if registry.last_event_id == expected_event_id => {
+                return Ok(registry);
+            }
+            Some((registry, _)) => format!("last_event_id={}", registry.last_event_id),
+            None => "missing".to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "replacement did not converge to update {expected_event_id}: {last}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
