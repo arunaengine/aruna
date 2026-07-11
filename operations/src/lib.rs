@@ -34,6 +34,7 @@ pub mod get_user;
 pub mod incoming;
 pub mod inspect_onboarding_secret;
 pub mod issue_onboarding_sync_ticket;
+pub mod jobs;
 pub mod list_groups;
 pub mod list_metadata_documents;
 pub mod list_onboarding_secrets;
