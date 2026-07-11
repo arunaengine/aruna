@@ -17,6 +17,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_RETENTION_MS};
+use crate::queue_backoff::queue_retry_after_ms;
 
 type JobWrites = Vec<(KeySpace, Key, Value)>;
 type JobDeletes = Vec<(KeySpace, Key)>;
@@ -392,15 +393,15 @@ pub enum RequeueOutcome {
     Skipped,
 }
 
-/// Return a claimed/running job to the queue with backoff, or move it to `Failed`
-/// once it has exhausted `JOB_MAX_ATTEMPTS`. `token` is `None` for the lease-expiry
-/// sweep and startup recovery, which reclaim whatever holder is recorded.
+/// Return a claimed/running job to the queue with `queue_retry_after_ms` backoff, or
+/// move it to `Failed` once it has exhausted `JOB_MAX_ATTEMPTS`. `token` is `None`
+/// for the lease-expiry sweep and startup recovery, which reclaim whatever holder is
+/// recorded.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
     token: Option<Ulid>,
     now_ms: u64,
-    backoff_ms: u64,
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
     let record = mutate_job(storage, job_id, |record| {
@@ -421,7 +422,7 @@ pub async fn requeue_job(
             record.finished_at_ms = Some(now_ms);
         } else {
             record.state = JobState::Queued;
-            record.due_at_ms = now_ms.saturating_add(backoff_ms);
+            record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
         }
         Ok(JobMutation::Persist)
     })
@@ -777,7 +778,6 @@ mod tests {
             job_id,
             None,
             6_000,
-            500,
             Some(JobError::retryable("lease expired")),
         )
         .await
@@ -786,6 +786,7 @@ mod tests {
         };
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(record.attempts, 1);
+        // queue_retry_after_ms(1) = 500ms.
         assert_eq!(record.due_at_ms, 6_500);
         assert!(record.claim.is_none());
     }
@@ -804,7 +805,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, 500, None)
+        let RequeueOutcome::Failed(failed) = requeue_job(&storage, job_id, None, 6_000, None)
             .await
             .unwrap()
         else {
