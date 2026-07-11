@@ -195,20 +195,13 @@ pub enum QuotaGateError {
     UnexpectedEvent(Event),
 }
 
-/// Embeddable read side of the hard per-group quota gate. Sums the group's
-/// realm-wide `logical_bytes` — the live local group counter plus every trusted
-/// remote node's replicated group snapshot. The local group counter is read
-/// inside the caller's write transaction so a concurrent same-group write
-/// conflicts on the group counter key (via `UsageCounterUpdate`) and cannot slip
-/// a second write past the ceiling. The remote-snapshot scan runs *outside* the
-/// transaction (`txn_id: None`) so hot writes no longer read-conflict with
-/// concurrent snapshot ingest; remote group totals already lag the counters that
-/// produced them, and `ceiling`'s folded-in grace factor is deliberately the
-/// budget for that staleness.
-///
-/// `active_node_ids` is the set of nodes whose per-group snapshots count toward
-/// the sum, resolved from the realm config at the request surface. `None` counts
-/// every replicated snapshot.
+/// Embeddable read side of the hard per-group quota gate: the local group counter
+/// plus every trusted remote snapshot. The local counter is read inside the
+/// caller's write transaction so a concurrent same-group write conflicts on it and
+/// cannot slip past the ceiling; the remote-snapshot scan runs outside the
+/// transaction (`txn_id: None`) so hot writes no longer conflict with snapshot
+/// ingest, and `ceiling`'s grace factor is the budget for that staleness.
+/// `active_node_ids` are the nodes whose snapshots count; `None` counts all.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,

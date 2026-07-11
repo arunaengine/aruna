@@ -6,10 +6,8 @@ use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use tokio::sync::RwLock;
 
 /// Short TTL for the realm-config read-through cache on the quota write path.
-/// Every PUT/CMU/staging write resolves the group ceiling and the active node
-/// set from the realm config; without a cache each drives a fresh
-/// `GetRealmConfigOperation`. Enforcement lag after a quota change is bounded by
-/// this TTL, well inside the snapshot-staleness budget the grace headroom covers.
+/// Enforcement lag after a quota change is bounded by this, inside the
+/// snapshot-staleness budget the grace headroom covers.
 pub const QUOTA_CONFIG_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Read-through cache of the realm config for the quota write path.
