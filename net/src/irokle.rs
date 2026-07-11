@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
-    REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
+    REALM_CONFIG_METADATA_REPLICATION_PATH, USER_NAME_PATH,
     group_role_id_from_path, group_role_path, group_role_user_assignment_from_path,
     group_role_user_assignment_path, realm_config_node_id_from_path, realm_config_node_path,
     realm_config_oidc_provider_id_from_path, realm_role_path, realm_role_user_assignment_from_path,
@@ -2417,13 +2417,7 @@ fn overlay_realm_config_reducer_materialization(
         config.description = description;
     }
 
-    if !reducer_state
-        .conflicts
-        .contains_key(REALM_CONFIG_QUOTA_PATH)
-        && let Some(quota) = reducer_state.materialized_realm_config_quota()
-    {
-        config.quota = quota;
-    }
+    reducer_state.overlay_realm_config_quota(config);
 
     for path in reducer_state.conflicts.keys() {
         if let Some(node_id) = realm_config_node_id_from_path(path) {
