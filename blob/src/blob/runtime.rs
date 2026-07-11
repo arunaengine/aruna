@@ -87,11 +87,12 @@ impl BlobHandle {
         Event::StagingSource(staging_source_event)
     }
 
-    pub async fn store_connection(&mut self, peer: NodeId, stream: BiStream) -> Ulid {
-        self.handler
-            .add_connection(None, peer, stream)
-            .await
-            .expect("auto-generated stream id never collides")
+    pub async fn store_connection(
+        &mut self,
+        peer: NodeId,
+        stream: BiStream,
+    ) -> Result<Ulid, BlobError> {
+        self.handler.add_connection(None, peer, stream).await
     }
 
     pub async fn get_status(&self) -> BlobState {
