@@ -164,7 +164,9 @@ impl ArunaS3Service {
     }
 
     /// Loads the realm config through the short-TTL quota cache so the hot write
-    /// path does not drive a fresh `GetRealmConfigOperation` per request.
+    /// path does not drive a fresh `GetRealmConfigOperation` per request. This
+    /// cache is not invalidated by the REST `set_realm_quota` handler; a quota
+    /// change is TTL-bounded-stale on the S3 path by design (#390 nit 4).
     async fn cached_realm_config(&self) -> S3Result<aruna_core::structs::RealmConfigDocument> {
         self.quota_cache
             .get(&self.state, self.realm_id)

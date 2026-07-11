@@ -470,8 +470,9 @@ pub async fn set_realm_quota(
     )
     .await
     .map_err(map_set_realm_quota_error)?;
-    // Drop the locally cached realm config so this node enforces the new quota on
-    // the next write without waiting out the cache TTL.
+    // Invalidate the REST-side quota cache immediately. The S3 write path has a
+    // separate per-service cache that is intentionally TTL-bounded-stale (up to
+    // QUOTA_CONFIG_CACHE_TTL), inside the snapshot-staleness budget.
     state.invalidate_quota_cache().await;
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
 }
