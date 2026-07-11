@@ -82,9 +82,9 @@ pub fn build_view(config: &RealmConfigDocument) -> PlacementView {
 
 /// Resolves holders for `subject` in rank order (downstream retry order).
 ///
-/// Pinned nodes lead (bypassing every check but kind eligibility), then the
-/// weighted two-level walk fills up to `strategy.replica_count` from the
-/// eligible nodes; `None` takes every eligible node.
+/// Available pinned nodes lead (bypassing affinity filters), then the weighted
+/// two-level walk fills up to `strategy.replica_count` from the eligible nodes;
+/// `None` takes every eligible node.
 pub fn resolve_holders(
     view: &PlacementView,
     strategy: &PlacementStrategy,
@@ -118,7 +118,7 @@ pub fn resolve_holders(
             let Some(node) = view.nodes.iter().find(|node| node.node_id == *pin) else {
                 continue;
             };
-            if !node.kind.is_sync_eligible() {
+            if !node.kind.is_sync_eligible() || !is_available(node, strategy) {
                 continue;
             }
             result.push(*pin);
@@ -295,11 +295,13 @@ fn is_eligible(
     excluded: &HashSet<NodeId>,
 ) -> bool {
     node.kind.is_sync_eligible()
-        && !node.full
-        && !node.draining
+        && is_available(node, strategy)
         && !excluded.contains(&node.node_id)
         && passes_filters(node, strategy)
-        && effective_weight(node, strategy) > 0
+}
+
+fn is_available(node: &ResolvedNode, strategy: &PlacementStrategy) -> bool {
+    !node.full && !node.draining && effective_weight(node, strategy) > 0
 }
 
 fn passes_filters(node: &ResolvedNode, strategy: &PlacementStrategy) -> bool {
@@ -747,20 +749,25 @@ mod tests {
     }
 
     #[test]
-    fn pinned_first_excluded_skipped_and_counts_toward_target() {
+    fn unavailable_pins_are_skipped_and_eligible_pin_counts_toward_target() {
         let mut pinned_full = resolved(3, RealmNodeKind::Server, "c", 100);
         pinned_full.full = true;
-        pinned_full.draining = true;
+        let mut pinned_draining = resolved(4, RealmNodeKind::Server, "d", 100);
+        pinned_draining.draining = true;
+        let pinned_zero_weight = resolved(5, RealmNodeKind::Server, "e", 0);
         let view = PlacementView {
             nodes: vec![
                 resolved(1, RealmNodeKind::Server, "a", 100),
                 resolved(2, RealmNodeKind::Server, "b", 100),
                 pinned_full,
+                pinned_draining,
+                pinned_zero_weight,
+                resolved(6, RealmNodeKind::Server, "f", 100),
             ],
         };
         let override_ = PlacementOverride {
             subject: Vec::new(),
-            pinned: vec![node_id(3)],
+            pinned: vec![node_id(3), node_id(4), node_id(5), node_id(6)],
             excluded: vec![node_id(2)],
             strategy_id: None,
         };
@@ -772,11 +779,7 @@ mod tests {
             0,
             Some(&override_),
         );
-        // Pinned bypasses full/draining and leads; excluded never appears; the
-        // pin counts toward the replica target of two.
-        assert_eq!(holders[0], node_id(3));
-        assert!(!holders.contains(&node_id(2)));
-        assert_eq!(holders, vec![node_id(3), node_id(1)]);
+        assert_eq!(holders, vec![node_id(6), node_id(1)]);
     }
 
     #[test]
