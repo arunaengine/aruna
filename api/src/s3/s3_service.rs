@@ -98,19 +98,19 @@ use s3s::dto::{
     DeleteMarkerEntry, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput,
     DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag,
     ETagCondition, EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
-    GetBucketReplicationInput, GetBucketReplicationOutput, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectAttributesParts, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, Initiator, LastModified, ListBucketsInput,
-    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
-    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    ListPartsInput, ListPartsOutput, MetadataDirective, MultipartUpload as S3MultipartUpload,
-    Object, ObjectAttributes, ObjectPart, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
-    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob,
-    Timestamp, TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-    UploadPartOutput,
+    GetBucketLocationInput, GetBucketLocationOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput,
+    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
+    ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
+    MultipartUpload as S3MultipartUpload, Object, ObjectAttributes, ObjectPart, ObjectVersion,
+    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, Timestamp,
+    TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -770,6 +770,31 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to head bucket"))?;
 
         Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        debug!(bucket = %req.input.bucket, "Received GET BUCKET LOCATION Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to get bucket location"))?;
+
+        // No region is configured for the node, so report the default location
+        // constraint (an empty constraint denotes the us-east-1 default region).
+        Ok(S3Response::new(GetBucketLocationOutput {
+            location_constraint: None,
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]
