@@ -1,7 +1,9 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{MultipartChecksumType, MultipartUploadChecksumHint};
+use aruna_core::structs::{
+    MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
+};
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
@@ -10,6 +12,7 @@ use s3s::dto::{
     ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use std::path::Path;
 use ulid::Ulid;
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
@@ -127,25 +130,9 @@ pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
     if key.is_empty() {
         return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
     }
-    if key.starts_with('/') {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not be an absolute path"
-        ));
-    }
-    if key.chars().any(|c| c.is_control()) {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not contain control characters"
-        ));
-    }
-    if key.split('/').any(|segment| segment == "..") {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not contain `..` path segments"
-        ));
-    }
-    Ok(())
+
+    ensure_confined_relative_path(Path::new(key))
+        .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))
 }
 
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
