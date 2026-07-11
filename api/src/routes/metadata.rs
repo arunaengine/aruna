@@ -1687,7 +1687,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_metadata_routes_support_create_list_export_and_query() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
@@ -2691,7 +2691,7 @@ mod tests {
 
     #[tokio::test]
     async fn distributed_query_executes_local_partition_in_process() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
 
         let _ = create_metadata_document(
             State(test.state.clone()),
@@ -3171,7 +3171,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_search_rejects_cursor_on_query_change_and_malformed_input() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
@@ -3262,7 +3262,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_search_cursor_suppresses_churned_hits() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
         for index in 0..5 {
             let _ = create_metadata_document(
                 State(test.state.clone()),
@@ -3369,7 +3369,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_search_clamps_page_size_to_cap() {
-        let test = setup_state().await;
+        let test = setup_state_with_net().await;
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
@@ -3934,6 +3934,126 @@ mod tests {
                 false,
                 None,
                 aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        TestState {
+            _storage_dir: storage_dir,
+            _metadata_dir: metadata_dir,
+            auth: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            },
+            group_id,
+            state,
+        }
+    }
+
+    // Net-capable variant for tests that need node discovery or cursor signing.
+    async fn setup_state_with_net() -> TestState {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_id = test_realm_id(3);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(iroh::SecretKey::from_bytes(&[11u8; 32])),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let node_id = net.node_id();
+        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let task_handle = TaskHandle::new();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle),
+            task_handle: Some(task_handle),
+        });
+        // Single-node realm config so the holder proxy serves mutations locally.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        write_doc(
+            &driver_ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            config
+                .to_bytes(&Actor {
+                    node_id,
+                    user_id: aruna_core::UserId::nil(realm_id),
+                    realm_id,
+                })
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let group_id = Ulid::new();
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
+        let group = Group {
+            display_name: "metadata-group".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner: user_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().into(),
+            group_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().into(),
+            group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
             )
             .await,
         );
