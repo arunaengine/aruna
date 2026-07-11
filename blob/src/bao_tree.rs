@@ -151,6 +151,8 @@ impl AsyncStreamReader for RecvStreamWrapper<'_> {
 // ----- FuturesAsyncReader/opendal Writer impls for bao_tree ----------
 pub struct OpenDalWriter {
     writer: opendal::Writer,
+    operator: Operator,
+    storage_path: String,
     pub hasher: Hasher,
     idle_timeout: Duration,
 }
@@ -208,6 +210,8 @@ impl OpenDalWriter {
     ) -> Result<Self, BlobLibError> {
         Ok(Self {
             writer: operator.writer(storage_path).await?,
+            operator: operator.clone(),
+            storage_path: storage_path.to_string(),
             hasher: Hasher::new(),
             idle_timeout,
         })
@@ -227,14 +231,14 @@ impl OpenDalWriter {
         )
         .await;
         if let Err(err) = close_result {
-            abort_partial_writer(&mut self.writer).await;
+            abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
             return Err(err);
         }
         Ok(())
     }
 
     pub async fn abort(mut self) {
-        abort_partial_writer(&mut self.writer).await;
+        abort_partial_writer(&mut self.writer, &self.operator, &self.storage_path).await;
     }
 }
 

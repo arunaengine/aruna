@@ -39,20 +39,20 @@ impl BlobHandler {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    abort_partial_writer(&mut writer).await;
+                    abort_partial_writer(&mut writer, &operator, &storage_path).await;
                     return BlobEvent::Error(BlobError::WriteError(err.to_string()));
                 }
             };
             hasher.update(&bytes);
             if let Err(err) = writer.write(bytes.to_vec()).await {
-                abort_partial_writer(&mut writer).await;
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
                 return BlobEvent::Error(BlobError::WriteError(err.to_string()));
             }
             bytes_written += bytes.len() as u64;
         }
 
         if let Err(err) = writer.close().await {
-            abort_partial_writer(&mut writer).await;
+            abort_partial_writer(&mut writer, &operator, &storage_path).await;
             return BlobEvent::Error(BlobError::WriteError(err.to_string()));
         }
         location.blob_size = bytes_written;
@@ -247,7 +247,7 @@ impl BlobHandler {
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
-                abort_partial_writer(&mut writer).await;
+                abort_partial_writer(&mut writer, &operator, &storage_path).await;
                 return BlobEvent::Error(err);
             }
         };

@@ -667,6 +667,50 @@ async fn write_finalization_failure_emits_no_success_or_load() {
 }
 
 #[tokio::test]
+async fn failed_write_cleans() {
+    let context = setup_blob_handle(1).await;
+    let root = tempdir().unwrap();
+    let location = BackendLocation {
+        root: root.path().to_str().unwrap().to_string(),
+        storage_bucket: "bucket".to_string(),
+        backend_path: "partial.bin".to_string(),
+        ulid: Ulid::new(),
+        compressed: false,
+        encrypted: false,
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: 0,
+        hashes: HashMap::new(),
+    };
+    let operator = crate::opendal::init_operator(
+        Backend::FileSystem,
+        HashMap::from([(
+            "root".to_string(),
+            root.path().to_str().unwrap().to_string(),
+        )]),
+    )
+    .unwrap();
+    let blob = BackendStream::new(futures::stream::iter([
+        Ok(bytes::Bytes::from_static(b"partial")),
+        Err(std::io::Error::other("injected stream failure")),
+    ]));
+
+    let event = context
+        .blob_handle
+        .handler
+        .write_stream_to_location(location.clone(), operator, blob)
+        .await;
+
+    assert!(matches!(event, BlobEvent::Error(BlobError::WriteError(_))));
+    assert!(
+        !std::path::Path::new(&location.get_full_path().unwrap()).exists(),
+        "partial filesystem target remains"
+    );
+}
+
+#[tokio::test]
 async fn compose_close_fails() {
     let context = setup_blob_handle(5).await;
     let handler = context.blob_handle.handler.clone();
