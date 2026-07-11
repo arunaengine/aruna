@@ -15,9 +15,7 @@ use tracing::warn;
 
 use super::store::job_insert_entries;
 
-/// Kick the drain so a freshly submitted job is claimed without waiting for the
-/// next poll. `DrainJobQueue` is re-armed from its own keyspace, so this timer is
-/// never persisted.
+/// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_job_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainJobQueue,
@@ -61,9 +59,7 @@ enum SubmitState {
     Error,
 }
 
-/// Effect-driven submit. Dedup follows the identity-key idempotency of
-/// `QueueBlobReplicationOperation`: a live job's presence in `job_dedup_index`
-/// (entries are removed on terminal transition) short-circuits to the existing id.
+/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the existing id.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,

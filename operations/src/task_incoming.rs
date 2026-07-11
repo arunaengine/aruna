@@ -1589,8 +1589,7 @@ impl OperationsTaskHandler {
             self.jobs_runtime.spawn(self.context.clone(), record);
         }
 
-        // When work is due but every slot is taken, wait for a completion kick
-        // rather than hot-looping on a ZERO re-arm.
+        // At capacity with work due, wait for a completion kick, not a ZERO hot-loop.
         match result.next_due_after {
             Some(after) if after.is_zero() && self.jobs_runtime.available_slots() == 0 => {
                 self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)

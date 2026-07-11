@@ -23,8 +23,7 @@ use crate::queue_backoff::queue_retry_after_ms;
 type JobWrites = Vec<(KeySpace, Key, Value)>;
 type JobDeletes = Vec<(KeySpace, Key)>;
 
-/// Single decode chokepoint for persisted job records. Wrapping the record in a
-/// version envelope later (#286) is a one-site change here.
+/// Single decode chokepoint; wrappable in a version envelope later (#286).
 pub fn decode_job_record(bytes: &[u8]) -> Result<JobRecord, ConversionError> {
     JobRecord::from_bytes(bytes)
 }
@@ -41,8 +40,7 @@ pub enum JobMutationError {
     Storage(String),
 }
 
-/// The single schedule-index entry for a record follows its state: queued jobs
-/// live under `due/`, claimed/running under `lease/`, terminal under `prune/`.
+/// Schedule-index key by state: queued -> due/, claimed/running -> lease/, terminal -> prune/.
 fn schedule_index_key_for(record: &JobRecord) -> Key {
     match record.state {
         JobState::Queued => job_due_index_key(record.due_at_ms, record.job_id),
@@ -65,9 +63,7 @@ fn empty_value() -> Value {
     ByteView::from(Vec::new())
 }
 
-/// Storage writes for creating a fresh job: record + schedule index + owner index
-/// (+ dedup index when a key is set). This is the composable primitive a producer
-/// can splice into its own transaction; the ≤4 writes of the submit budget.
+/// Writes creating a fresh job (<=4 keys); composable into a producer transaction.
 pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionError> {
     let mut writes = vec![
         (
@@ -96,8 +92,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
     Ok(writes)
 }
 
-/// Record + owner index + prune index deletes for a pruned terminal job. The
-/// dedup entry was already removed when the job first went terminal.
+/// Deletes for a pruned terminal job (its dedup entry is already gone).
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
@@ -160,9 +155,7 @@ fn guard_token(record: &JobRecord, token: Ulid) -> Result<(), JobMutationError> 
     }
 }
 
-/// Read a job under a write transaction, apply `mutate`, and persist the record
-/// plus its index deltas atomically. State changes are validated by the pure
-/// transition guard so index and record can never disagree.
+/// Read, mutate, and persist a job with its index deltas in one transaction.
 pub async fn mutate_job<F>(
     storage: &StorageHandle,
     job_id: JobId,
@@ -249,8 +242,7 @@ pub enum ClaimOutcome {
     NotEligible,
 }
 
-/// Claim a queued job for `holder_node_id`, or move a never-attempted
-/// cancel-requested job straight to `Cancelled`.
+/// Claim a queued job, or cancel it directly if it was never-attempted and cancel-requested.
 pub async fn claim_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -414,10 +406,8 @@ pub enum RequeueOutcome {
     Skipped,
 }
 
-/// Return a claimed/running job to the queue with `queue_retry_after_ms` backoff, or
-/// move it to `Failed` once it has exhausted `JOB_MAX_ATTEMPTS`. `token` is `None`
-/// for the lease-expiry sweep and startup recovery, which reclaim whatever holder is
-/// recorded.
+/// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent. `token` is `None`
+/// for the lease sweep and startup recovery.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -461,8 +451,7 @@ pub enum CancelRequestOutcome {
     AlreadyTerminal(JobRecord),
 }
 
-/// Set `cancel_requested` without changing state. Idempotent; a terminal job is a
-/// no-op returning the current record.
+/// Idempotently set `cancel_requested`; a terminal job is a no-op.
 pub async fn set_cancel_requested(
     storage: &StorageHandle,
     job_id: JobId,
@@ -485,8 +474,7 @@ pub async fn set_cancel_requested(
     })
 }
 
-/// Owner-scoped listing, newest first, with an opaque 24-byte cursor and an
-/// optional server-side state filter applied per page.
+/// Owner-scoped listing, newest first, with an opaque cursor and optional state filter.
 pub async fn list_jobs_for_user(
     storage: &StorageHandle,
     user_id: UserId,
@@ -578,8 +566,7 @@ pub async fn iter_prefix_page(
     }
 }
 
-/// Head of a schedule-index prefix, i.e. the earliest `(timestamp, job_id)` still
-/// enqueued under `due/`, `lease/`, or `prune/`.
+/// Earliest `(timestamp, job_id)` under a schedule-index prefix.
 pub async fn first_schedule_entry(
     storage: &StorageHandle,
     prefix: &[u8],

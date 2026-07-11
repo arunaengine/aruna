@@ -8,18 +8,15 @@ pub mod service;
 pub mod store;
 pub mod submit;
 
-/// Lease held by a claiming executor. A claim is fenced by its `claim_token`; a
-/// zombie executor whose lease lapsed and whose job was re-claimed has every write
-/// rejected.
+/// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;
-/// Executor heartbeat interval. Each renew piggybacks a progress flush; must stay
-/// well under `JOB_LEASE_MS`.
+/// Heartbeat interval (renew + progress flush); must stay well under the lease.
 pub const JOB_HEARTBEAT_MS: u64 = 20_000;
 /// Maximum jobs executing locally at once; excess stays queued.
 pub const JOB_CONCURRENCY_CAP: usize = 8;
-/// Attempts (inclusive) before a retryable failure becomes terminal `Failed`.
+/// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
-/// Uniform terminal-state retention before a job record is pruned.
+/// Uniform terminal-state retention before pruning.
 pub const JOB_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Minimum spacing between throttled progress flushes.
 pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;

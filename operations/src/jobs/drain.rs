@@ -27,8 +27,7 @@ pub struct JobDrainResult {
     pub next_due_after: Option<Duration>,
 }
 
-/// Claim up to `capacity` due jobs and re-queue expired leases. Never runs a job
-/// inline: claimed records are returned for the caller to hand to the runtime.
+/// Claim up to `capacity` due jobs and re-queue expired leases; claimed records are returned.
 pub async fn process_job_queue_batch(
     storage: &StorageHandle,
     holder_node_id: NodeId,
@@ -77,8 +76,7 @@ pub async fn process_job_queue_batch(
     Ok(result)
 }
 
-/// Earliest `due/` or `lease/` head as a delay from now; `ZERO` when work is
-/// already due.
+/// Earliest `due/`/`lease/` head as a delay from now; `ZERO` when work is due.
 pub async fn next_job_drain_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, String> {
@@ -94,8 +92,7 @@ pub async fn next_job_drain_timer_after(
     Ok(next.map(|ts| Duration::from_millis(ts.saturating_sub(now_ms))))
 }
 
-/// ShortenTimer restore run at startup and inside the durable-queue re-arm loop, so
-/// it must never push an existing deadline later.
+/// ShortenTimer restore (startup + re-arm loop); never pushes a deadline later.
 pub async fn restore_job_queue_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let after = match next_job_drain_timer_after(storage).await {
         Ok(Some(after)) => after,
