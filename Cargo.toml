@@ -35,15 +35,15 @@ aruna-tasks = { path = "tasks" }
 # Third-party crates
 ahash = "0.8.12"
 async-trait = "0.1.89"
-aws-config = "1.8.18"
-aws-sdk-s3 = "1.137.0"
+aws-config = "1.9.0"
+aws-sdk-s3 = "1.138.0"
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 bao-tree = "0.16.0"
 base64 = "0.22.1"
 blake3 = { version = "1.8.5", features = ["serde"] }
 byteview = "0.10.1"
-bytes = "1.12.0"
+bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 console-subscriber = "0.5.0"
@@ -51,7 +51,7 @@ craqle = { git = "https://github.com/arunaengine/craqle", rev = "5c31d358b306959
     "iroh",
 ] }
 crc-fast = "1.10.0"
-crossfire = "3.1.18"
+crossfire = "3.1.19"
 crypto_box = "0.9.1"
 data-encoding = "2.11.0"
 dotenvy = "0.15.7"
@@ -73,8 +73,8 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
-iroh = "1.0.1"
-iroh-base = "1.0.1"
+iroh = "1.0.2"
+iroh-base = "1.0.2"
 irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
     "fjall",
     "iroh",
@@ -82,8 +82,8 @@ irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", f
 iroh-io = "0.6.2"
 iroh-quinn = "0.16.1"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
-lru = "0.18.0"
-md5 = "0.8.0"
+lru = "0.18.1"
+md5 = "0.8.1"
 n0-future = "0.3.2"
 opendal = { version = "0.57", features = [
     "services-postgresql",
