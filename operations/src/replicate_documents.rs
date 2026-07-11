@@ -153,7 +153,7 @@ impl ReplicateDocumentsOperation {
         // Placement plan for the document's bound strategy. `None` means the
         // realm has no strategy for this target (skip, like the old
         // desired_peer_count == 0 case).
-        let Some(plan) = plan_target_placement(realm_config, &document, None) else {
+        let Some(plan) = plan_target_placement(realm_config, &document, Default::default()) else {
             return self.emit_next_publish();
         };
         let desired_count = plan.desired_count;
@@ -184,7 +184,9 @@ impl ReplicateDocumentsOperation {
         if selected_peers.is_empty()
             && !matches!(
                 document,
-                DocumentSyncTarget::NodeUsage { .. } | DocumentSyncTarget::WatchInterest { .. }
+                DocumentSyncTarget::NodeUsage { .. }
+                    | DocumentSyncTarget::WatchInterest { .. }
+                    | DocumentSyncTarget::NodeInfo { .. }
             )
         {
             return match self.emit_placement_update() {
@@ -383,6 +385,10 @@ mod tests {
         DocumentSyncTarget::WatchInterest { realm_id, node_id }
     }
 
+    fn node_info_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
+        DocumentSyncTarget::NodeInfo { realm_id, node_id }
+    }
+
     fn config_with(nodes: &[NodeId], replica: Option<u32>) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
         let strategy = PlacementStrategy {
@@ -499,6 +505,32 @@ mod tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let local_node_id = node(1);
         let target = watch_interest_target(realm_id, local_node_id);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+            allow_genesis: true,
+        });
+        operation.realm_config = Some(config_with(&[local_node_id], Some(3)));
+
+        let effects = operation.emit_next_publish();
+
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    // Node info rides the shared realm topic, so a single-node realm still
+    // publishes it instead of parking it behind a placement retry.
+    #[test]
+    fn node_info_publishes_peerless() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let local_node_id = node(1);
+        let target = node_info_target(realm_id, local_node_id);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
             local_node_id,
