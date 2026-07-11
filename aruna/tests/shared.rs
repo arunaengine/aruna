@@ -442,7 +442,46 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
     }
 }
 
+#[allow(dead_code)]
+pub(crate) async fn revoke_s3_credentials_via_http(
+    base_url: &str,
+    bearer_token: &str,
+    access_key_id: &str,
+) -> TestResult<()> {
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{base_url}/api/v1/users/credentials/{access_key_id}"
+        ))
+        .bearer_auth(bearer_token)
+        .send()
+        .await?;
+    if response.status() != StatusCode::NO_CONTENT {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(std::io::Error::other(format!(
+            "unexpected revoke status: {status} body={body}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
+    s3_client_with_retries(endpoint, credentials, true)
+}
+
+/// Builds a client with SDK retries disabled so deterministic rejections (for
+/// example a 501 for unsupported SSE) surface immediately instead of retrying.
+#[allow(dead_code)]
+pub(crate) fn s3_client_no_retry(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
+    s3_client_with_retries(endpoint, credentials, false)
+}
+
+fn s3_client_with_retries(
+    endpoint: &S3Endpoint,
+    credentials: &S3Credentials,
+    retries: bool,
+) -> S3Client {
     let credentials = Credentials::new(
         credentials.access_key_id.clone(),
         credentials.access_secret.clone(),
@@ -450,14 +489,16 @@ pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S
         None,
         "aruna-e2e-test",
     );
-    let config = aws_sdk_s3::config::Builder::new()
+    let mut builder = aws_sdk_s3::config::Builder::new()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(AWS_REGION))
         .credentials_provider(credentials)
         .endpoint_url(endpoint.endpoint_url.clone())
-        .force_path_style(true)
-        .build();
-    S3Client::from_conf(config)
+        .force_path_style(true);
+    if !retries {
+        builder = builder.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled());
+    }
+    S3Client::from_conf(builder.build())
 }
 
 pub(crate) fn bucket_arn(realm_id: &RealmId, node_id: iroh::PublicKey, bucket: &str) -> String {

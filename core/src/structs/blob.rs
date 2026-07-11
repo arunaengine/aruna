@@ -640,6 +640,36 @@ mod tests {
     };
     use crate::types::UserId;
     use std::collections::HashMap;
+
+    // The S3 auth layer rejects revoked/expired credentials via these predicates.
+    #[test]
+    fn access_status_predicates() {
+        use super::UserAccess;
+        use std::time::{Duration, SystemTime};
+        use ulid::Ulid;
+
+        let now = SystemTime::now();
+        let base = UserAccess {
+            access_key: "access".into(),
+            user_identity: UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::new(),
+            secret: "secret".into(),
+            expiry: now + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
+        };
+        assert!(!base.is_expired(now));
+        assert!(!base.is_revoked());
+
+        let mut expired = base.clone();
+        expired.expiry = now - Duration::from_secs(1);
+        assert!(expired.is_expired(now));
+
+        let mut revoked = base.clone();
+        revoked.revoked_at = Some(now);
+        assert!(revoked.is_revoked());
+    }
     use std::str::FromStr;
     use std::time::SystemTime;
     use ulid::Ulid;
