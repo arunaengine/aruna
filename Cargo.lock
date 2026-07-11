@@ -2094,7 +2094,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -3425,7 +3425,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tokio",
  "tower-service",
  "tracing",
@@ -4601,7 +4601,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls 0.23.41",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4644,7 +4644,7 @@ checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5225,7 +5225,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -5857,7 +5857,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.41",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5896,7 +5896,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6989,7 +6989,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.8.7",
+ "rand 0.9.5",
  "regex",
  "rustc-hash",
  "sha1 0.10.7",
@@ -7010,7 +7010,7 @@ dependencies = [
  "oxiri",
  "oxrdf",
  "peg",
- "rand 0.8.7",
+ "rand 0.9.5",
  "thiserror 2.0.18",
 ]
 
@@ -7021,7 +7021,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aed7a854b8ea67618f8ce69aabb0e904d7704226060e9d5a2930eb3136c3fa3b"
 dependencies = [
  "oxrdf",
- "rand 0.8.7",
+ "rand 0.9.5",
  "spargebra",
 ]
 
@@ -8552,7 +8552,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
