@@ -203,6 +203,8 @@ pub enum QuotaGateError {
 /// transaction (`txn_id: None`) so hot writes no longer conflict with snapshot
 /// ingest, and `ceiling`'s grace factor is the budget for that staleness.
 /// `active_node_ids` are the nodes whose snapshots count; `None` counts all.
+/// Residual trust gap (#390): any sync-eligible node can still publish counters
+/// for a group it does not serve until the `data_node_ids` bound lands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
