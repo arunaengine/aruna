@@ -89,7 +89,10 @@ where
     };
     // Only trusted realm or delegated issuers may populate the bounded cache;
     // untrusted issuers are verified with an ephemeral key that is discarded.
-    let decoding_key = if issuer_key_is_trusted(state, &unvalidated_claims.claims).await {
+    let decoding_key = if validate_issuer_trust(state, &unvalidated_claims.claims)
+        .await
+        .is_ok()
+    {
         state.decoding_key_for_issuer(issuer).await?
     } else {
         decoding_key_from_base64_public_key(issuer)?
@@ -100,22 +103,24 @@ where
     Ok(claims.claims)
 }
 
-async fn issuer_key_is_trusted<S>(state: &S, claims: &TokenClaims) -> bool
+async fn validate_issuer_trust<S>(
+    state: &S,
+    claims: &TokenClaims,
+) -> Result<(), ArunaBearerTokenError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let Ok(realm_id) = RealmId::from_base64(&claims.iss) else {
-        return false;
-    };
+    let realm_id =
+        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
     if !state.is_trusted_realm(&realm_id).await {
-        return false;
+        return Err(ArunaBearerTokenError::RealmNotTrusted);
     }
     match (&claims.delegation_signature, &claims.issuer_pubkey) {
         (Some(delegation_signature), Some(issuer_pubkey)) => {
-            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature).is_ok()
+            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature)
         }
-        (None, None) => true,
-        (_, _) => false,
+        (None, None) => Ok(()),
+        (_, _) => Err(ArunaBearerTokenError::InvalidServerToken),
     }
 }
 
@@ -131,19 +136,7 @@ where
         return Err(ArunaBearerTokenError::Expired);
     }
 
-    let realm_id =
-        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
-    if !state.is_trusted_realm(&realm_id).await {
-        return Err(ArunaBearerTokenError::RealmNotTrusted);
-    }
-
-    match (&claims.delegation_signature, &claims.issuer_pubkey) {
-        (Some(delegation_signature), Some(issuer_pubkey)) => {
-            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature)
-        }
-        (None, None) => Ok(()),
-        (_, _) => Err(ArunaBearerTokenError::InvalidServerToken),
-    }
+    validate_issuer_trust(state, claims).await
 }
 
 fn verify_realm_delegation(
