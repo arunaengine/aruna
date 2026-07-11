@@ -13,6 +13,8 @@ RUN cargo install --locked --version 0.101.0 --root target iroh-doctor
 
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 WORKDIR /run
+# .dockerignore strips local files under docker/, so the default build ships an empty portal.
+# To embed portal assets, pass --build-arg PORTAL_EMBED_DIR=<staged dir outside docker/>.
 ARG PORTAL_EMBED_DIR=docker/portal
 ARG PORTAL_MODE=disabled
 RUN apk update
