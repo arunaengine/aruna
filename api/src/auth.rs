@@ -516,7 +516,9 @@ mod test {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::OidcProviderConfig;
-    use aruna_core::structs::{Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId};
+    use aruna_core::structs::{
+        Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId, TokenClaims,
+    };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
@@ -1722,5 +1724,152 @@ mod test {
             axum::http::HeaderValue::from_str(&format!("Bearer {}", server_token)).unwrap(),
         );
         assert!(extract_auth_context(&state, &headers).await.is_none());
+    }
+
+    fn sign_untrusted_direct_token(issuer_key: &SigningKey, now: u64) -> String {
+        let issuer_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_key.verifying_key().to_bytes());
+        let claims = TokenClaims {
+            sub: format!("{}@{}", Ulid::new(), issuer_b64),
+            iss: issuer_b64,
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        };
+        let der = issuer_key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .unwrap();
+        encode(
+            &Header::new(Algorithm::EdDSA),
+            &claims,
+            &EncodingKey::from_ed_pem(der.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_token_flood_keeps_issuer_cache_bounded() {
+        let mut tempdir = temp_dir();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            blob_handle: None,
+        });
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let node_id = iroh::SecretKey::generate().public();
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id,
+            node_id,
+            capabilities,
+            false,
+            None,
+        )
+        .await;
+
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        for _ in 0..2048 {
+            let issuer_key = SigningKey::generate(&mut csprng);
+            let token = sign_untrusted_direct_token(&issuer_key, now);
+            assert!(handle_token(&state, &token).await.is_err());
+        }
+
+        assert_eq!(state.issuer_key_cache_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn valid_delegated_token_caches_single_issuer_key() {
+        let mut tempdir = temp_dir();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            blob_handle: None,
+        });
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let mut realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let node_id = iroh::SecretKey::generate().public();
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let issuer_key = SigningKey::generate(&mut csprng);
+        let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_key.verifying_key().to_bytes());
+        let delegation_signature = realm_signing_key.sign(message.as_bytes()).to_string();
+        let capabilities =
+            NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id,
+            node_id,
+            capabilities.clone(),
+            false,
+            None,
+        )
+        .await;
+
+        let token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time: chrono::Utc::now().timestamp().max(0) as u64,
+                expiry: None,
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
+                node_capabilities: capabilities,
+            })
+            .unwrap(),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        handle_token(&state, &token).await.unwrap();
+        handle_token(&state, &token).await.unwrap();
+
+        assert_eq!(state.issuer_key_cache_len().await, 1);
     }
 }
