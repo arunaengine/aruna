@@ -49,6 +49,13 @@ fn no_such_upload_error() -> S3Error {
     s3_error!(NoSuchUpload, "The specified upload does not exist.")
 }
 
+fn incomplete_body_error() -> S3Error {
+    s3_error!(
+        IncompleteBody,
+        "You did not provide the number of bytes specified by the Content-Length HTTP header."
+    )
+}
+
 fn no_such_key_error() -> S3Error {
     s3_error!(NoSuchKey, "The specified key does not exist.")
 }
@@ -158,6 +165,7 @@ impl IntoS3Error for PutObjectError {
                 missing_expected_checksum_s3_error(algorithm, "PutObject")
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
+            PutObjectError::IncompleteBody => incomplete_body_error(),
             err => internal_error(err),
         }
     }
@@ -172,12 +180,13 @@ impl IntoS3Error for CreateMultipartUploadError {
 impl IntoS3Error for UploadPartError {
     fn into_s3_error(self) -> S3Error {
         match self {
-            UploadPartError::NoSuchUpload | UploadPartError::UploadTargetMismatch => {
-                no_such_upload_error()
-            }
+            UploadPartError::NoSuchUpload
+            | UploadPartError::UploadTargetMismatch
+            | UploadPartError::UploadNotOpen => no_such_upload_error(),
             UploadPartError::ChecksumMismatch(algorithm) => {
                 checksum_mismatch_s3_error(algorithm, "UploadPart")
             }
+            UploadPartError::IncompleteBody => incomplete_body_error(),
             err => internal_error(err),
         }
     }
@@ -200,7 +209,18 @@ impl IntoS3Error for CompleteMultipartUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
             CompleteMultipartUploadError::NoSuchUpload
-            | CompleteMultipartUploadError::UploadTargetMismatch => no_such_upload_error(),
+            | CompleteMultipartUploadError::UploadTargetMismatch
+            | CompleteMultipartUploadError::UploadNotOpen => no_such_upload_error(),
+            CompleteMultipartUploadError::MissingParts => {
+                s3_error!(InvalidRequest, "You must specify at least one part.")
+            }
+            CompleteMultipartUploadError::InvalidObjectSize => s3_error!(
+                InvalidRequest,
+                "The provided object size does not match the uploaded parts."
+            ),
+            CompleteMultipartUploadError::MissingPartEtag => {
+                s3_error!(InvalidPart, "The part ETag could not be validated.")
+            }
             CompleteMultipartUploadError::InvalidPart => {
                 s3_error!(
                     InvalidPart,
@@ -238,7 +258,8 @@ impl IntoS3Error for AbortMultipartUploadError {
     fn into_s3_error(self) -> S3Error {
         match self {
             AbortMultipartUploadError::NoSuchUpload
-            | AbortMultipartUploadError::UploadTargetMismatch => no_such_upload_error(),
+            | AbortMultipartUploadError::UploadTargetMismatch
+            | AbortMultipartUploadError::UploadNotOpen => no_such_upload_error(),
             err => internal_error(err),
         }
     }
@@ -383,5 +404,55 @@ impl IntoS3Error for GetBucketReplicationError {
 impl IntoS3Error for DeleteBucketReplicationError {
     fn into_s3_error(self) -> S3Error {
         internal_error(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_incomplete_body() {
+        assert_eq!(
+            *PutObjectError::IncompleteBody.into_s3_error().code(),
+            S3ErrorCode::IncompleteBody
+        );
+        assert_eq!(
+            *UploadPartError::IncompleteBody.into_s3_error().code(),
+            S3ErrorCode::IncompleteBody
+        );
+    }
+
+    #[test]
+    fn maps_upload_not_open() {
+        for error in [
+            UploadPartError::UploadNotOpen.into_s3_error(),
+            CompleteMultipartUploadError::UploadNotOpen.into_s3_error(),
+            AbortMultipartUploadError::UploadNotOpen.into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::NoSuchUpload);
+        }
+    }
+
+    #[test]
+    fn maps_complete_errors() {
+        assert_eq!(
+            *CompleteMultipartUploadError::MissingParts
+                .into_s3_error()
+                .code(),
+            S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            *CompleteMultipartUploadError::InvalidObjectSize
+                .into_s3_error()
+                .code(),
+            S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            *CompleteMultipartUploadError::MissingPartEtag
+                .into_s3_error()
+                .code(),
+            S3ErrorCode::InvalidPart
+        );
     }
 }
