@@ -27,9 +27,10 @@ use crate::document_sync_outbox::{
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
-use crate::jobs::JOB_DRAIN_RETRY_AFTER;
 use crate::jobs::drain::{process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
+use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
     metadata_materialization_jobs_exist, process_metadata_materialization_batch,
@@ -1601,6 +1602,21 @@ impl OperationsTaskHandler {
             None => {}
         }
     }
+
+    async fn prune_jobs(&self) {
+        let after = match process_job_prune_batch(&self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => outcome
+                .next_due_after
+                .unwrap_or(JOB_PRUNE_POLL_AFTER)
+                .min(JOB_PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(error = %error, "Failed to prune jobs");
+                JOB_PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneJobs, after).await;
+    }
 }
 
 fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
@@ -1637,6 +1653,7 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
         restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
         restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+        restore_job_prune_timer(&context.storage_handle, &task_handle).await;
     }
 }
 
@@ -1678,6 +1695,7 @@ pub async fn initialize_task_incoming(
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
     restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+    restore_job_prune_timer(&context.storage_handle, &task_handle).await;
 }
 
 /// Runs one document sync outbox drain pass synchronously against `context`.
@@ -1762,7 +1780,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::DrainJobQueue => {
                 self.drain_job_queue().await;
             }
-            TaskKey::PruneJobs => {}
+            TaskKey::PruneJobs => {
+                self.prune_jobs().await;
+            }
         }
     }
 }
