@@ -4,6 +4,7 @@ members = [
     "aruna",
     "blob",
     "core",
+    "egress",
     "storage",
     "net",
     "tasks",
@@ -27,6 +28,7 @@ aruna = { path = "aruna" }
 aruna-api = { path = "api" }
 aruna-blob = { path = "blob" }
 aruna-core = { path = "core" }
+aruna-egress = { path = "egress" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
 aruna-storage = { path = "storage" }
@@ -73,6 +75,7 @@ hyper-util = { version = "0.1.20", features = [
     "tokio",
     "service",
 ] }
+ipnet = "2.12.0"
 iroh = "1.0.1"
 iroh-base = "1.0.1"
 irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [

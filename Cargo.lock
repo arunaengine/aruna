@@ -182,6 +182,7 @@ dependencies = [
  "aruna-api",
  "aruna-blob",
  "aruna-core",
+ "aruna-egress",
  "aruna-net",
  "aruna-operations",
  "aruna-storage",
@@ -224,6 +225,7 @@ version = "3.0.0-alpha.34"
 dependencies = [
  "ahash",
  "aruna-core",
+ "aruna-egress",
  "aruna-net",
  "aruna-operations",
  "aruna-storage",
@@ -270,11 +272,13 @@ name = "aruna-blob"
 version = "3.0.0-alpha.34"
 dependencies = [
  "aruna-core",
+ "aruna-egress",
  "aruna-net",
  "aruna-storage",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "axum",
  "bao-tree",
  "blake3",
  "bytes",
@@ -285,6 +289,7 @@ dependencies = [
  "md5",
  "opendal",
  "postcard",
+ "reqwest",
  "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -294,6 +299,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -360,6 +366,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ulid",
+]
+
+[[package]]
+name = "aruna-egress"
+version = "3.0.0-alpha.34"
+dependencies = [
+ "aruna-core",
+ "axum",
+ "ipnet",
+ "reqwest",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -435,6 +456,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid",
+ "url",
 ]
 
 [[package]]
