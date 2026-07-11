@@ -325,8 +325,11 @@ fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
     match error {
         MaterializeSnapshotError::Read(error) => map_read_staging_error(error),
-        MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
-            ServerError::Forbidden
+        MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { limit, usage }) => {
+            ServerError::QuotaExceeded { limit, usage }
+        }
+        MaterializeSnapshotError::Write(PutObjectError::RetryableConflict) => {
+            ServerError::WriteConflictRetry
         }
         MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.to_string()),
     }
@@ -335,7 +338,10 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
         MaterializeReferenceError::Head(error) => map_head_staging_error(error),
-        MaterializeReferenceError::QuotaExceeded { .. } => ServerError::Forbidden,
+        MaterializeReferenceError::QuotaExceeded { limit, usage } => {
+            ServerError::QuotaExceeded { limit, usage }
+        }
+        MaterializeReferenceError::RetryableConflict => ServerError::WriteConflictRetry,
         MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
         MaterializeReferenceError::Conversion(error) => {
             ServerError::InternalError(error.to_string())
@@ -552,24 +558,48 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_quota_exceeded_maps_to_forbidden() {
+    fn snapshot_quota_exceeded_maps_to_quota_exceeded() {
         let error = map_snapshot_error(MaterializeSnapshotError::Write(
             PutObjectError::QuotaExceeded {
                 limit: 100,
                 usage: 200,
             },
         ));
-        assert!(matches!(error, ServerError::Forbidden));
+        assert!(matches!(
+            error,
+            ServerError::QuotaExceeded {
+                limit: 100,
+                usage: 200
+            }
+        ));
     }
 
     #[test]
-    fn reference_quota_exceeded_maps_to_forbidden() {
+    fn snapshot_retryable_conflict_maps_to_write_conflict_retry() {
+        let error =
+            map_snapshot_error(MaterializeSnapshotError::Write(PutObjectError::RetryableConflict));
+        assert!(matches!(error, ServerError::WriteConflictRetry));
+    }
+
+    #[test]
+    fn reference_quota_exceeded_maps_to_quota_exceeded() {
         let error = map_reference_error(MaterializeReferenceError::QuotaExceeded {
             limit: 100,
             usage: 200,
         });
+        assert!(matches!(
+            error,
+            ServerError::QuotaExceeded {
+                limit: 100,
+                usage: 200
+            }
+        ));
+    }
 
-        assert!(matches!(error, ServerError::Forbidden));
+    #[test]
+    fn reference_retryable_conflict_maps_to_write_conflict_retry() {
+        let error = map_reference_error(MaterializeReferenceError::RetryableConflict);
+        assert!(matches!(error, ServerError::WriteConflictRetry));
     }
 
     #[test]

@@ -38,6 +38,15 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
     error
 }
 
+/// A transient write conflict that exhausted its retries. S3 clients back off and
+/// retry on `SlowDown` (503).
+fn slow_down_error() -> S3Error {
+    s3_error!(
+        SlowDown,
+        "The request could not be completed due to concurrent writes; retry."
+    )
+}
+
 fn no_such_upload_error() -> S3Error {
     s3_error!(NoSuchUpload, "The specified upload does not exist.")
 }
@@ -128,6 +137,7 @@ impl IntoS3Error for PutObjectError {
                 missing_expected_checksum_s3_error(algorithm, "PutObject")
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
+            PutObjectError::RetryableConflict => slow_down_error(),
             err => internal_error(err),
         }
     }
@@ -182,6 +192,7 @@ impl IntoS3Error for CompleteMultipartUploadError {
             CompleteMultipartUploadError::QuotaExceeded { limit, usage } => {
                 quota_exceeded_error(limit, usage)
             }
+            CompleteMultipartUploadError::RetryableConflict => slow_down_error(),
             err => internal_error(err),
         }
     }
