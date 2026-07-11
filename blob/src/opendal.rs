@@ -395,6 +395,49 @@ mod tests {
         })
     }
 
+    // A credential-less S3 connector must never fall back to ambient discovery;
+    // reqsign honors AWS_EC2_METADATA_SERVICE_ENDPOINT, so an IMDS lookup would
+    // land on the counting listener.
+    #[tokio::test]
+    async fn s3_skips_imds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let metadata_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("AWS_EC2_METADATA_SERVICE_ENDPOINT", &metadata_endpoint);
+            std::env::set_var("AWS_CONFIG_FILE", "/nonexistent");
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent");
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        }
+
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::from([
+                ("endpoint".to_string(), "http://127.0.0.1:9".to_string()),
+                ("bucket".to_string(), "reads".to_string()),
+                ("region".to_string(), "us-east-1".to_string()),
+            ]),
+            path: "file.txt".to_string(),
+            version: None,
+        };
+
+        let result = head_staging_source(&access, &allow_loopback_policy(), None).await;
+        assert!(result.is_err(), "expected sign failure, got {result:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "IMDS was contacted");
+    }
+
     // A rebinding hostname resolving to loopback must be denied through the real
     // opendal path even when a server is live at that address.
     #[tokio::test]
