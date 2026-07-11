@@ -913,6 +913,7 @@ mod tests {
             NodeCapabilities::local_node(realm_id).expect("capabilities"),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state))
@@ -953,6 +954,7 @@ mod tests {
             NodeCapabilities::local_node(realm_id).expect("capabilities"),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         (dir, Arc::new(state), net)

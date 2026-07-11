@@ -43,6 +43,15 @@ pub struct JobsRuntime {
     cap: usize,
 }
 
+impl std::fmt::Debug for JobsRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobsRuntime")
+            .field("cap", &self.cap)
+            .field("running", &self.running_count())
+            .finish_non_exhaustive()
+    }
+}
+
 impl JobsRuntime {
     pub fn new() -> Arc<Self> {
         Self::with_capacity(JOB_CONCURRENCY_CAP)

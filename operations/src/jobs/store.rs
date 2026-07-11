@@ -6,10 +6,11 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     JobClaim, JobError, JobId, JobProgress, JobRecord, JobResultPayload, JobState,
-    JobTransitionError, job_due_index_key, job_lease_index_key, job_owner_index_key,
-    job_prune_index_key, job_record_key, validate_transition,
+    JobTransitionError, job_due_index_key, job_lease_index_key, job_owner_cursor,
+    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
+    parse_job_owner_index_key, validate_transition,
 };
-use aruna_core::types::{Key, KeySpace, NodeId, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use thiserror::Error;
@@ -484,6 +485,46 @@ pub async fn set_cancel_requested(
     })
 }
 
+/// Owner-scoped listing, newest first, with an opaque 24-byte cursor and an
+/// optional server-side state filter applied per page.
+pub async fn list_jobs_for_user(
+    storage: &StorageHandle,
+    user_id: UserId,
+    cursor: Option<Vec<u8>>,
+    limit: usize,
+    state_filter: Option<JobState>,
+) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
+    let start_after = cursor.map(|cursor| {
+        let mut key = user_id.to_storage_key();
+        key.extend_from_slice(&cursor);
+        ByteView::from(key)
+    });
+    let (values, _) = iter_prefix_page(
+        storage,
+        JOB_OWNER_INDEX_KEYSPACE,
+        Some(job_owner_index_prefix(user_id)),
+        start_after,
+        limit.saturating_add(1),
+        None,
+    )
+    .await?;
+
+    let has_more = values.len() > limit;
+    let mut records = Vec::new();
+    let mut last_cursor = None;
+    for (key, _) in values.into_iter().take(limit) {
+        let (_, created_at_ms, job_id) =
+            parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
+        last_cursor = Some(job_owner_cursor(created_at_ms, job_id));
+        if let Some(record) = read_job_record(storage, job_id, None).await?
+            && state_filter.is_none_or(|state| record.state == state)
+        {
+            records.push(record);
+        }
+    }
+    Ok((records, if has_more { last_cursor } else { None }))
+}
+
 pub async fn find_dedup_job(
     storage: &StorageHandle,
     dedup_key: &[u8],
@@ -567,7 +608,7 @@ pub async fn first_schedule_entry(
 
 // --- low-level storage plumbing ------------------------------------------------
 
-pub(crate) async fn insert_job(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
+pub async fn insert_job(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
     let writes = job_insert_entries(record).map_err(|error| error.to_string())?;
     batch_write(storage, writes, None).await
 }

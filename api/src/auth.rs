@@ -582,6 +582,7 @@ mod test {
             NodeCapabilities::local_node(realm_id).unwrap(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -828,6 +829,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         let token = drive(
@@ -1275,6 +1277,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1316,6 +1319,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1350,6 +1354,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1451,6 +1456,7 @@ mod test {
             capabilities.clone(),
             true,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1562,6 +1568,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1642,6 +1649,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1682,6 +1690,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1715,6 +1724,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
