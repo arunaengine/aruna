@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -29,7 +29,6 @@ use aruna_operations::placement::{
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::sync_placement::{decode_placement, placement_key};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -89,20 +88,18 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     )
     .await?;
     assert_weighted_distinct_resolution(&nodes, &initial_config);
-    let mut expected_initial = plan_target_placement(
+    let initial_plan = plan_target_placement(
         &initial_config,
         &target,
         PlacementResolutionContext::default(),
     )
-    .expect("default placement strategy should plan the document")
-    .holders;
+    .expect("default placement strategy should plan the document");
+    assert_eq!(initial_plan.desired_count, 2);
+    let mut expected_initial = initial_plan.holders;
     sort_node_ids(&mut expected_initial);
-    let initial = wait_for_placement(&nodes[0], realm_id, &target, |record| {
-        record.desired_holder_count == 2 && record.selected_holders == expected_initial
-    })
-    .await?;
+    wait_for_document_on_holders(&nodes, &expected_initial, &target).await?;
 
-    let obsolete = initial.selected_holders[0];
+    let obsolete = expected_initial[0];
     let old_entry = initial_config
         .placement_entry(obsolete)
         .expect("selected holder should have a placement entry");
@@ -139,37 +136,24 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let configs = wait_for_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
     assert_placement_state_identical(&configs);
     assert_resolve_holders_identical(&configs);
-    let mut expected_final =
+    let final_plan =
         plan_target_placement(&configs[0], &target, PlacementResolutionContext::default())
-            .expect("updated placement strategy should plan the document")
-            .holders;
+            .expect("updated placement strategy should plan the document");
+    assert_eq!(
+        final_plan.placement.strategy_id,
+        expanded_strategy.strategy_id
+    );
+    let mut expected_final = final_plan.holders;
     sort_node_ids(&mut expected_final);
     assert_eq!(expected_final.len(), 3);
     assert!(!expected_final.contains(&obsolete));
-
-    let final_record = wait_for_placement(&nodes[0], realm_id, &target, |record| {
-        record.desired_holder_count == 3 && record.selected_holders == expected_final
-    })
-    .await?;
-    assert_eq!(
-        final_record.placement.strategy_id,
-        expanded_strategy.strategy_id
-    );
-    assert!(!final_record.selected_holders.contains(&obsolete));
     assert!(
-        final_record
-            .selected_holders
+        expected_final
             .iter()
-            .any(|holder| !initial.selected_holders.contains(holder)),
+            .any(|holder| !expected_initial.contains(holder)),
         "policy change should add replacement/top-up holders"
     );
-    for holder in &final_record.selected_holders {
-        let node = nodes
-            .iter()
-            .find(|node| node.net.node_id() == *holder)
-            .expect("final holder should be a fixture node");
-        wait_for_document(node, &target).await?;
-    }
+    wait_for_document_on_holders(&nodes, &expected_final, &target).await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -315,59 +299,19 @@ async fn write_metadata_create_event(
     }
 }
 
-async fn read_placement(
-    node: &TestNode,
-    realm_id: RealmId,
+async fn wait_for_document_on_holders(
+    nodes: &[TestNode],
+    holders: &[aruna_core::NodeId],
     target: &DocumentSyncTarget,
-) -> Result<Option<PendingDocumentPlacement>, Box<dyn std::error::Error>> {
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
-            key: placement_key(realm_id, target),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|value| decode_placement(value.as_ref()))
-            .transpose()?),
-        other => Err(format!("unexpected placement read event: {other:?}").into()),
+) -> Result<(), Box<dyn std::error::Error>> {
+    for holder in holders {
+        let node = nodes
+            .iter()
+            .find(|node| node.net.node_id() == *holder)
+            .expect("holder should be a fixture node");
+        wait_for_document(node, target).await?;
     }
-}
-
-async fn wait_for_placement(
-    node: &TestNode,
-    realm_id: RealmId,
-    target: &DocumentSyncTarget,
-    predicate: impl Fn(&PendingDocumentPlacement) -> bool,
-) -> Result<PendingDocumentPlacement, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last_record = None;
-    loop {
-        if let Some(record) = read_placement(node, realm_id, target).await? {
-            if predicate(&record) {
-                return Ok(record);
-            }
-            last_record = Some(record);
-        }
-        if Instant::now() >= deadline {
-            let config = drive(
-                GetRealmConfigOperation::new(realm_id),
-                node.context.as_ref(),
-            )
-            .await?;
-            let active_strategy = config
-                .default_strategy_id
-                .and_then(|strategy_id| config.strategy(&strategy_id));
-            return Err(format!(
-                "placement inventory did not reach the expected state; active strategy: {active_strategy:?}; last record: {last_record:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    Ok(())
 }
 
 async fn wait_for_document(
@@ -688,7 +632,8 @@ async fn seed_realm_config_sync_topic(
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
-    let placement = aruna_operations::placement::placement_ref_for_target(config, &target, None);
+    let placement =
+        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),

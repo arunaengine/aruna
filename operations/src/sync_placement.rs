@@ -1,18 +1,15 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingShardPlacement};
+use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
-
-use crate::placement::rank_eligible_holders;
 
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -21,36 +18,6 @@ pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// genesis. Short: the genesis is usually one gossip push away (the rank-0
 /// holder creates it eagerly on config apply).
 pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
-
-/// Monotonic top-up: keeps every `existing_holders` entry and appends
-/// resolver-ranked eligible nodes (best-first, skipping already-held ones)
-/// until `desired_holder_count` is reached. The stored set is node-id sorted so
-/// any two nodes materialise an identical holder set from an identical record.
-pub fn complete_authoritative_holders(
-    config: &RealmConfigDocument,
-    target: &DocumentSyncTarget,
-    metadata_path: Option<&str>,
-    existing_holders: &[NodeId],
-    desired_holder_count: usize,
-) -> Vec<NodeId> {
-    let mut holders = existing_holders.to_vec();
-    sort_node_ids(&mut holders);
-    if holders.len() >= desired_holder_count {
-        return holders;
-    }
-
-    let held: HashSet<NodeId> = holders.iter().copied().collect();
-    for candidate in rank_eligible_holders(config, target, metadata_path) {
-        if holders.len() >= desired_holder_count {
-            break;
-        }
-        if !held.contains(&candidate) {
-            holders.push(candidate);
-        }
-    }
-    sort_node_ids(&mut holders);
-    holders
-}
 
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
@@ -117,6 +84,10 @@ pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId)
     schedule_placement_retry_after(realm_id, local_node_id, SYNC_PLACEMENT_RETRY_AFTER)
 }
 
+pub fn schedule_placement_revalidation_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    schedule_placement_retry_after(realm_id, local_node_id, Duration::ZERO)
+}
+
 pub fn schedule_placement_retry_after(
     realm_id: RealmId,
     local_node_id: NodeId,
@@ -147,64 +118,13 @@ fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::RealmId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
-    }
-
-    fn target() -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
-            realm_id: RealmId::from_bytes([7u8; 32]),
-        }
-    }
-
-    fn config_with(nodes: &[NodeId]) -> RealmConfigDocument {
-        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
-        let strategy = aruna_core::structs::PlacementStrategy {
-            strategy_id: Ulid::from_bytes([9u8; 16]),
-            name: "test".to_string(),
-            replica_count: None,
-            distinct_locations: false,
-            affinity: Vec::new(),
-            shard_count: 64,
-        };
-        config.default_strategy_id = Some(strategy.strategy_id);
-        config.strategies = vec![strategy];
-        for node_id in nodes {
-            config.ensure_node(*node_id, RealmNodeKind::Server);
-        }
-        config
-    }
-
-    #[test]
-    fn authoritative_holder_completion_is_monotonic() {
-        let existing = vec![node(1), node(3), node(3)];
-        let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
-
-        let holders = complete_authoritative_holders(&config, &target(), None, &existing, 4);
-
-        assert!(holders.contains(&node(1)));
-        assert!(holders.contains(&node(3)));
-        assert_eq!(holders.len(), 4);
-    }
-
-    #[test]
-    fn authoritative_holder_completion_is_cross_node_identical() {
-        let config = config_with(&[node(1), node(2), node(3), node(4), node(5)]);
-        let existing = vec![node(2)];
-
-        let first = complete_authoritative_holders(&config, &target(), None, &existing, 3);
-        // A node observing the members in a different order derives the same set.
-        let reversed = config_with(&[node(5), node(4), node(3), node(2), node(1)]);
-        let second = complete_authoritative_holders(&reversed, &target(), None, &existing, 3);
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 3);
-        assert!(first.contains(&node(2)));
     }
 
     fn placement(shard: u32) -> PlacementRef {

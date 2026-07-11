@@ -37,7 +37,6 @@ use crate::metadata::repository::{
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
 use crate::placement::{PlacementResolutionContext, placement_ref_for_target};
-use crate::sync_placement::delete_placement_effect_with_txn;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -68,7 +67,6 @@ enum DeleteMetadataDocumentState {
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
-    DeletePlacementInventory,
     WriteAudit,
     WriteDocumentLifecycleOutbox,
     WriteGraphLifecycleOutbox,
@@ -189,7 +187,7 @@ impl DeleteMetadataDocumentOperation {
             },
             record.holder_node_ids.clone(),
             DocumentSyncOutboxEvent::Upsert { bytes, change },
-            self.placement_ref,
+            self.document_lifecycle_placement_ref,
             true,
         ))
     }
@@ -238,7 +236,7 @@ impl DeleteMetadataDocumentOperation {
             DocumentSyncOutboxEvent::Upsert { bytes, change },
             // First (and only) write to the per-graph lifecycle topic, so the
             // deleting holder originates and may mint its genesis.
-            self.placement_ref,
+            self.graph_lifecycle_placement_ref,
             true,
         );
         Ok(smallvec![
@@ -279,7 +277,7 @@ impl DeleteMetadataDocumentOperation {
             // Registry delete rides the document's own topic and shares the delete
             // publish batch with the tombstones above; keep it consistent so the
             // batch is not blocked mid-flight.
-            self.placement_ref,
+            self.registry_placement_ref,
             true,
         );
         Ok(smallvec![
@@ -524,26 +522,6 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::DeletePlacementInventory;
-                    smallvec![delete_placement_effect_with_txn(
-                        record.realm_id,
-                        &DocumentSyncTarget::MetadataDocumentLifecycle {
-                            document_id: record.document_id,
-                        },
-                        Some(txn_id),
-                    )]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("holders delete result", format!("{other:?}")),
-            },
-            DeleteMetadataDocumentState::DeletePlacementInventory => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
-                    };
-                    let Some(record) = self.record.as_ref() else {
-                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
-                    };
                     self.state = DeleteMetadataDocumentState::WriteAudit;
                     match write_audit_effect(
                         &self.audit_record(record),
@@ -557,9 +535,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("placement inventory delete result", format!("{other:?}"))
-                }
+                other => self.unexpected_event("holders delete result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
@@ -866,6 +842,7 @@ mod tests {
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
+                shard_count: 64,
             })
             .collect();
         config.default_strategy_id = Some(strategy_ids[0]);
@@ -904,19 +881,37 @@ mod tests {
             value: Some(postcard::to_allocvec(&config).unwrap().into()),
         }));
 
-        let expected = |strategy_id| PlacementRef {
+        let expected = |strategy_id, target: &DocumentSyncTarget| PlacementRef {
             strategy_id,
             epoch: 0,
+            shard: aruna_core::structs::shard_for_subject(
+                &crate::placement::subject_bytes(target),
+                64,
+            ),
         };
         assert_eq!(
             operation.document_lifecycle_placement_ref,
-            expected(strategy_ids[0])
+            expected(
+                strategy_ids[0],
+                &DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: record.document_id,
+                },
+            )
         );
         assert_eq!(
             operation.graph_lifecycle_placement_ref,
-            expected(strategy_ids[1])
+            expected(strategy_ids[1], &graph_target)
         );
-        assert_eq!(operation.registry_placement_ref, expected(strategy_ids[2]));
+        assert_eq!(
+            operation.registry_placement_ref,
+            expected(
+                strategy_ids[2],
+                &DocumentSyncTarget::MetadataRegistry {
+                    group_id: record.group_id,
+                    document_id: record.document_id,
+                },
+            )
+        );
 
         let document_outbox = operation
             .document_lifecycle_outbox_record(&record)
@@ -951,9 +946,29 @@ mod tests {
         else {
             panic!("expected registry delete");
         };
-        assert_eq!(document_change.placement, expected(strategy_ids[0]));
-        assert_eq!(graph_change.placement, expected(strategy_ids[1]));
-        assert_eq!(registry_change.placement, expected(strategy_ids[2]));
+        assert_eq!(
+            document_change.placement,
+            expected(
+                strategy_ids[0],
+                &DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: record.document_id,
+                },
+            )
+        );
+        assert_eq!(
+            graph_change.placement,
+            expected(strategy_ids[1], &graph_target)
+        );
+        assert_eq!(
+            registry_change.placement,
+            expected(
+                strategy_ids[2],
+                &DocumentSyncTarget::MetadataRegistry {
+                    group_id: record.group_id,
+                    document_id: record.document_id,
+                },
+            )
+        );
     }
 
     #[test]

@@ -16,7 +16,6 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
-    document_placement_delete_entry, document_placement_write_entry,
     metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
     metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
     metadata_pending_projection_delete_entry, metadata_pending_projection_key,
@@ -49,9 +48,7 @@ use crate::metadata::repository::{
 use crate::placement::{
     PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
 };
-use crate::sync_placement::{
-    new_placement_with_context, placement_satisfied, schedule_placement_retry_effect, sort_node_ids,
-};
+use crate::sync_placement::sort_node_ids;
 use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
@@ -403,7 +400,6 @@ pub async fn project_metadata_create_events(
     let mut outboxes = Vec::new();
     let mut pending_projection_delete_targets = BTreeSet::new();
     let mut pending_projection_retry_targets = BTreeSet::new();
-    let mut placement_retries = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
@@ -444,12 +440,6 @@ pub async fn project_metadata_create_events(
             repair_deletes.extend(metadata_registry_delete_entries(
                 stale_record.group_id,
                 stale_record.document_id,
-            ));
-            repair_deletes.push(document_placement_delete_entry(
-                stale_record.realm_id,
-                &DocumentSyncTarget::MetadataDocumentLifecycle {
-                    document_id: stale_record.document_id,
-                },
             ));
             repaired_records.push(stale_record.clone());
             registry_cache.insert(document_id, None);
@@ -521,34 +511,6 @@ pub async fn project_metadata_create_events(
         } else {
             None
         };
-        let lifecycle_placement = if local_node_id == Some(event.node_id) {
-            let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: event.record.document_id,
-            };
-            let context = PlacementResolutionContext {
-                group_id: Some(event.record.group_id),
-                metadata_path: Some(event.record.document_path.as_str()),
-            };
-            let plan = realm_configs
-                .get(&event.record.realm_id)
-                .and_then(|config| config.as_ref())
-                .and_then(|config| plan_target_placement(config, &target, context));
-            let (desired_count, holders, placement) = plan
-                .map(|plan| (plan.desired_count, plan.holders, plan.placement))
-                .unwrap_or((1, Vec::new(), aruna_core::structs::PlacementRef::NIL));
-            Some(new_placement_with_context(
-                event.record.realm_id,
-                target,
-                event.node_id,
-                Some(event.record.group_id),
-                Some(event.record.document_path.clone()),
-                desired_count,
-                holders,
-                placement,
-            ))
-        } else {
-            None
-        };
         let audit = audit_record(&event);
         if needs_materialization {
             let now = aruna_core::util::unix_timestamp_millis();
@@ -574,15 +536,6 @@ pub async fn project_metadata_create_events(
         }
         if let Some(outbox) = outbox {
             outboxes.push(outbox);
-        }
-        if let Some(placement) = lifecycle_placement {
-            if !placement_satisfied(
-                placement.selected_holders.len(),
-                placement.desired_holder_count,
-            ) {
-                placement_retries.insert((placement.realm_id, placement.origin_node_id));
-            }
-            writes.push(document_placement_write_entry(&placement)?);
         }
         if local_node_id == Some(event.node_id) {
             writes.push(metadata_document_lifecycle_write_entry(
@@ -647,7 +600,6 @@ pub async fn project_metadata_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
-    schedule_placement_retries(context, placement_retries).await?;
     write_pending_projection_markers(context, &pending_projection_retry_targets).await?;
     delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
 
@@ -658,35 +610,6 @@ pub async fn project_metadata_create_events(
     }
 
     Ok(projected)
-}
-
-async fn schedule_placement_retries(
-    context: &DriverContext,
-    retries: BTreeSet<(RealmId, NodeId)>,
-) -> Result<(), MetadataProjectionError> {
-    for (realm_id, node_id) in retries {
-        let Effect::Task(effect) = schedule_placement_retry_effect(realm_id, node_id) else {
-            unreachable!("placement retry helper must return a task effect");
-        };
-        persist_task_effect(&context.storage_handle, &effect)
-            .await
-            .map_err(MetadataProjectionError::UnexpectedEvent)?;
-        let Some(task_handle) = context.task_handle.as_ref() else {
-            continue;
-        };
-        match task_handle.send_effect(Effect::Task(effect)).await {
-            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
-            Event::Task(TaskEvent::Error { message, .. }) => {
-                return Err(MetadataProjectionError::UnexpectedEvent(message));
-            }
-            other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn write_pending_projection_markers(
@@ -1302,8 +1225,10 @@ mod tests {
         assert_eq!(expanded.record.last_event_id, event.event_id);
     }
 
+    // The origin's outbox record must carry the placement resolved with the
+    // full group + document-path context, not the bare default strategy.
     #[tokio::test]
-    async fn local_projection_persists_exact_contextual_placement_inventory() {
+    async fn contextual_placement_stamped() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -1333,20 +1258,6 @@ mod tests {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
         };
-        let value = match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
-                key: crate::sync_placement::placement_key(event.record.realm_id, &target),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(value), ..
-            }) => value,
-            other => panic!("expected placement inventory, got {other:?}"),
-        };
-        let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
         let expected = plan_target_placement(
             &config,
             &target,
@@ -1356,21 +1267,41 @@ mod tests {
             },
         )
         .expect("placement resolves");
-        let mut expected_holders = expected.holders;
-        sort_node_ids(&mut expected_holders);
 
-        assert_eq!(placement.group_id, Some(event.record.group_id));
-        assert_eq!(
-            placement.metadata_path.as_deref(),
-            Some(event.record.document_path.as_str())
-        );
-        assert_eq!(placement.desired_holder_count, expected.desired_count);
-        assert_eq!(placement.selected_holders, expected_holders);
-        assert_eq!(placement.placement, expected.placement);
+        let outbox = match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                assert_eq!(
+                    values.len(),
+                    1,
+                    "origin projection writes one outbox record"
+                );
+                postcard::from_bytes::<DocumentSyncOutboxRecord>(values[0].1.as_ref())
+                    .expect("outbox record decodes")
+            }
+            other => panic!("expected outbox iter result, got {other:?}"),
+        };
+
+        assert_eq!(outbox.placement, expected.placement);
+        assert_eq!(outbox.peers, expected.holders);
+        let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
+            panic!("expected lifecycle upsert outbox event");
+        };
+        assert_eq!(change.placement, expected.placement);
     }
 
+    // A locally authored event with no eligible holders must not enqueue an
+    // outbox publish; replay re-plans it once eligible holders exist.
     #[tokio::test]
-    async fn local_projection_with_no_eligible_holders_keeps_placement_pending_without_outbox() {
+    async fn holderless_projection_defers() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
@@ -1414,23 +1345,6 @@ mod tests {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
         };
-        let placement = storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
-                key: crate::sync_placement::placement_key(event.record.realm_id, &target),
-                txn_id: None,
-            })
-            .await;
-        let Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) = placement
-        else {
-            panic!("expected pending placement inventory, got {placement:?}");
-        };
-        let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
-        assert_eq!(placement.desired_holder_count, 3);
-        assert!(placement.selected_holders.is_empty());
-
         let lifecycle = storage
             .send_effect(crate::document_repository::read_effect(&target, None))
             .await;
@@ -1464,6 +1378,7 @@ mod tests {
             replica_count: Some(2),
             distinct_locations: false,
             affinity: Vec::new(),
+            shard_count: 64,
         };
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy];
