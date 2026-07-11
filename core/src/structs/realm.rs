@@ -148,7 +148,36 @@ pub struct RealmConfigDocument {
     pub discovery: RealmDiscoveryConfig,
     pub nodes: Vec<RealmNode>,
     pub quota: QuotaConfig,
+    pub egress: EgressConfig,
     pub description: String,
+}
+
+/// Realm egress allowlist. Class-1 realm config, replicated everywhere so the
+/// deny/allow decision is local on every node. Empty by default: the built-in
+/// SSRF deny table applies and no internal destination is reachable until a
+/// realm admin adds an explicit rule.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+pub struct EgressConfig {
+    pub allow: Vec<EgressAllowRule>,
+}
+
+/// A single allowlist entry that relaxes the built-in deny table for a
+/// deliberate internal destination. A `Host` pattern exempts the resolved
+/// addresses of that exact hostname at lookup time; a `Cidr` pattern exempts
+/// the addresses it contains directly.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct EgressAllowRule {
+    pub host: HostPattern,
+    pub ports: Option<Vec<u16>>,
+    pub schemes: Option<Vec<String>>,
+    pub comment: Option<String>,
+}
+
+/// Either an exact hostname or a CIDR block for an allowlist rule.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum HostPattern {
+    Host(String),
+    Cidr(String),
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -346,6 +375,7 @@ impl RealmConfigDocument {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: QuotaConfig::default(),
+            egress: EgressConfig::default(),
             description: String::new(),
         }
     }
@@ -548,6 +578,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            egress: super::EgressConfig::default(),
             description: "Example Realm".to_string(),
         };
         let actor = Actor {
@@ -560,6 +591,43 @@ mod test {
         let restored = RealmConfigDocument::from_bytes(&bytes).expect("from bytes");
 
         assert_eq!(document, restored);
+    }
+
+    #[test]
+    fn egress_round_trips() {
+        let egress = super::EgressConfig {
+            allow: vec![
+                super::EgressAllowRule {
+                    host: super::HostPattern::Host("internal.registry".to_string()),
+                    ports: None,
+                    schemes: Some(vec!["https".to_string()]),
+                    comment: Some("registry".to_string()),
+                },
+                super::EgressAllowRule {
+                    host: super::HostPattern::Cidr("10.0.0.0/8".to_string()),
+                    ports: Some(vec![8080, 8443]),
+                    schemes: None,
+                    comment: None,
+                },
+            ],
+        };
+
+        // The reducer stores egress as a JSON string; it must round-trip.
+        let json = serde_json::to_string(&egress).unwrap();
+        let restored: super::EgressConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(egress, restored);
+
+        // Postcard round-trip inside the realm config document (Class-1 sync).
+        let mut document = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
+        document.egress = egress.clone();
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: crate::UserId::new(Ulid::new(), RealmId([7u8; 32])),
+            realm_id: RealmId([7u8; 32]),
+        };
+        let bytes = document.to_bytes(&actor).unwrap();
+        let restored_document = RealmConfigDocument::from_bytes(&bytes).unwrap();
+        assert_eq!(restored_document.egress, egress);
     }
 
     #[test]
@@ -651,6 +719,7 @@ mod test {
             discovery: default_realm_discovery_config(),
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
+            egress: super::EgressConfig::default(),
             description: String::new(),
         };
 

@@ -5,7 +5,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
+    Actor, EgressConfig, MetadataReplicationConfig, OidcProviderConfig, Permission, QuotaConfig,
     RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
 };
 use crate::types::{GroupId, RoleId, UserId};
@@ -154,6 +154,9 @@ pub enum AdminDocumentOperation {
     RealmConfigQuotaSet {
         quota: QuotaConfig,
     },
+    RealmConfigEgressSet {
+        egress: EgressConfig,
+    },
 }
 
 #[cfg(test)]
@@ -282,6 +285,16 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigQuotaSet {
                 quota: QuotaConfig::default(),
+            },
+            AdminDocumentOperation::RealmConfigEgressSet {
+                egress: crate::structs::EgressConfig {
+                    allow: vec![crate::structs::EgressAllowRule {
+                        host: crate::structs::HostPattern::Cidr("10.0.0.0/8".to_string()),
+                        ports: Some(vec![443]),
+                        schemes: Some(vec!["https".to_string()]),
+                        comment: Some("internal".to_string()),
+                    }],
+                },
             },
         ];
 

@@ -11,8 +11,8 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind,
+    Actor, EgressConfig, MetadataReplicationConfig, OidcProviderConfig, QuotaConfig,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -265,6 +265,16 @@ impl AdminDocumentReducerState {
             ) => {
                 self.apply_realm_config_setting(event, REALM_CONFIG_QUOTA_PATH, quota_value(quota));
             }
+            (
+                AdminDocumentTarget::RealmConfig { .. },
+                AdminDocumentOperation::RealmConfigEgressSet { egress },
+            ) => {
+                self.apply_realm_config_setting(
+                    event,
+                    REALM_CONFIG_EGRESS_PATH,
+                    egress_value(egress),
+                );
+            }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
 
@@ -504,6 +514,17 @@ impl AdminDocumentReducerState {
             .get(REALM_CONFIG_QUOTA_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(quota_from_value)
+    }
+
+    pub fn materialized_realm_config_egress(&self) -> Option<EgressConfig> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(REALM_CONFIG_EGRESS_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(egress_from_value)
     }
 
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
@@ -862,6 +883,7 @@ pub const REALM_CONFIG_METADATA_REPLICATION_PATH: &str =
 pub const REALM_CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const REALM_CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const REALM_CONFIG_QUOTA_PATH: &str = "realm_config.quota";
+pub const REALM_CONFIG_EGRESS_PATH: &str = "realm_config.egress";
 
 fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -1014,6 +1036,14 @@ fn quota_from_value(value: &str) -> Option<QuotaConfig> {
     serde_json::from_str(value)
         .ok()
         .map(|quota| supported_quota(&quota))
+}
+
+fn egress_value(egress: &EgressConfig) -> String {
+    serde_json::to_string(egress).expect("admin document egress config serializes")
+}
+
+fn egress_from_value(value: &str) -> Option<EgressConfig> {
+    serde_json::from_str(value).ok()
 }
 
 fn realm_node_kind_from_value(value: &str) -> Option<RealmNodeKind> {

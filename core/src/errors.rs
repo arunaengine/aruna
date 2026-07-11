@@ -82,6 +82,13 @@ pub enum StagingSourceError {
     StatError(String),
     #[error("Read error: {0}")]
     ReadError(String),
+    #[error("Egress denied: {reason}")]
+    EgressDenied {
+        host: Option<String>,
+        port: Option<u16>,
+        scheme: Option<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Error, PartialEq)]
