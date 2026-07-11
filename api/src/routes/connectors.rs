@@ -509,10 +509,10 @@ mod tests {
                     ("bucket".to_string(), "reads".to_string()),
                     ("endpoint".to_string(), "https://s3.example.org".to_string()),
                 ]),
-                secret_config: HashMap::from([(
-                    "access_key_id".to_string(),
-                    "super-secret".to_string(),
-                )]),
+                secret_config: HashMap::from([
+                    ("access_key_id".to_string(), "super-secret".to_string()),
+                    ("secret_access_key".to_string(), "super-secret".to_string()),
+                ]),
             }),
         )
         .await
@@ -549,11 +549,12 @@ mod tests {
             Path((test.group_id.to_string(), created.connector_id.clone())),
             Json(ReplaceSourceConnectorRequest {
                 name: "refdata-updated".to_string(),
-                kind: ApiSourceConnectorKind::S3,
-                public_config: HashMap::from([
-                    ("bucket".to_string(), "reads-v2".to_string()),
-                    ("endpoint".to_string(), "https://s3.example.org".to_string()),
-                ]),
+                // S3 requires credentials, so secret removal swaps to HTTP.
+                kind: ApiSourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://s3.example.org".to_string(),
+                )]),
                 secret_config: HashMap::new(),
             }),
         )

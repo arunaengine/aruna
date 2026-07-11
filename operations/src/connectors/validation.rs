@@ -7,6 +7,7 @@ use thiserror::Error;
 pub struct SourceConnectorValidationRules {
     pub required_public_keys: &'static [&'static str],
     pub allowed_public_keys: &'static [&'static str],
+    pub required_secret_keys: &'static [&'static str],
     pub allowed_secret_keys: &'static [&'static str],
 }
 
@@ -23,6 +24,11 @@ pub enum ValidationError {
     },
     #[error("public config key `{key}` is not allowed for connector kind `{kind}`")]
     UnknownPublicKey {
+        kind: SourceConnectorKind,
+        key: String,
+    },
+    #[error("missing required secret config key `{key}` for connector kind `{kind}`")]
+    MissingRequiredSecretKey {
         kind: SourceConnectorKind,
         key: String,
     },
@@ -103,6 +109,15 @@ pub fn validate_connector_input(
         }
     }
 
+    for key in rules.required_secret_keys {
+        if !secret_config.contains_key(*key) {
+            return Err(ValidationError::MissingRequiredSecretKey {
+                kind,
+                key: (*key).to_string(),
+            });
+        }
+    }
+
     if let Some(endpoint) = public_config.get("endpoint") {
         validate_endpoint(kind, endpoint)?;
     }
@@ -145,26 +160,33 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
         SourceConnectorKind::Http => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
+            required_secret_keys: &[],
             allowed_secret_keys: &["username", "password", "token"],
         },
+        // Static credentials are mandatory: a credential-less S3 client would
+        // fall back to ambient discovery (env/profile/IMDS), an SSRF vector.
         SourceConnectorKind::S3 => SourceConnectorValidationRules {
             required_public_keys: &["bucket", "endpoint"],
             allowed_public_keys: &["bucket", "endpoint", "region", "root"],
+            required_secret_keys: &["access_key_id", "secret_access_key"],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
         SourceConnectorKind::Webdav => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
+            required_secret_keys: &[],
             allowed_secret_keys: &["username", "password", "token"],
         },
         SourceConnectorKind::Ftp => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
+            required_secret_keys: &[],
             allowed_secret_keys: &["user", "password"],
         },
         SourceConnectorKind::ArunaNative => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
+            required_secret_keys: &[],
             allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
         },
     }
@@ -226,6 +248,50 @@ mod tests {
                 key: "endpoint".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn requires_s3_credentials() {
+        let public = HashMap::from([
+            ("bucket".to_string(), "reads".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+        ]);
+
+        let err = validate_connector_input("s3", SourceConnectorKind::S3, &public, &HashMap::new())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::MissingRequiredSecretKey {
+                kind: SourceConnectorKind::S3,
+                key: "access_key_id".to_string(),
+            }
+        );
+
+        let err = validate_connector_input(
+            "s3",
+            SourceConnectorKind::S3,
+            &public,
+            &HashMap::from([("access_key_id".to_string(), "ak".to_string())]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::MissingRequiredSecretKey {
+                kind: SourceConnectorKind::S3,
+                key: "secret_access_key".to_string(),
+            }
+        );
+
+        validate_connector_input(
+            "s3",
+            SourceConnectorKind::S3,
+            &public,
+            &HashMap::from([
+                ("access_key_id".to_string(), "ak".to_string()),
+                ("secret_access_key".to_string(), "sk".to_string()),
+            ]),
+        )
+        .unwrap();
     }
 
     #[test]
