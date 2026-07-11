@@ -330,6 +330,26 @@ pub async fn renew_lease(
     })
 }
 
+/// Persist an in-memory progress snapshot without touching the lease or state.
+pub async fn flush_progress(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    progress: JobProgress,
+    now_ms: u64,
+) -> Result<RenewOutcome, JobMutationError> {
+    let record = mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.progress = progress;
+        record.updated_at_ms = now_ms;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+    Ok(RenewOutcome {
+        cancel_requested: record.cancel_requested,
+    })
+}
+
 pub async fn complete_job(
     storage: &StorageHandle,
     job_id: JobId,

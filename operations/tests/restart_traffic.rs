@@ -417,7 +417,12 @@ async fn spawn_node_with(
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle.clone()).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle.clone(),
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     Ok(TestNode {
         _temp_dir: None,

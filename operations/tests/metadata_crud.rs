@@ -465,7 +465,12 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
     assert!(before_recovery.is_empty());
 
     schedule_pending_metadata_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
-    initialize_task_incoming(test.context.clone(), TaskHandle::new()).await;
+    initialize_task_incoming(
+        test.context.clone(),
+        TaskHandle::new(),
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     wait_for_projected_record(&test, group_id, &record).await?;
     // The restored background timer may materialize the job before this manual batch runs.
