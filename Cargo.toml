@@ -47,7 +47,7 @@ bytes = "1.12.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 console-subscriber = "0.5.0"
-craqle = { git = "https://github.com/arunaengine/craqle", branch = "main", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "5c31d358b3069595fe663724a92974efb02f73a0", features = [
     "iroh",
 ] }
 crc-fast = "1.10.0"
