@@ -185,6 +185,20 @@ async fn sse_headers_rejected() -> TestResult<()> {
             service_error_code(&copy_sse).as_deref(),
             Some("NotImplemented")
         );
+
+        // SSE-C on a read path (GetObject) is rejected, not silently ignored.
+        let get_ssec = sse_client
+            .get_object()
+            .bucket(bucket)
+            .key("source.txt")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key("01234567890123456789012345678901")
+            .send()
+            .await;
+        assert_eq!(
+            service_error_code(&get_ssec).as_deref(),
+            Some("NotImplemented")
+        );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;

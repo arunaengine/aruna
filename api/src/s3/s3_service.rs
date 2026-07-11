@@ -1587,6 +1587,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let group_id = bucket_info
@@ -1698,6 +1703,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let requested_range = req.input.range;
         let version_id = parse_version_id(req.input.version_id)?;
@@ -1796,6 +1806,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
 
         let mut want_etag = false;
         let mut want_checksum = false;
@@ -1973,6 +1988,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         let version_id = parse_version_id(req.input.version_id)?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: req.input.bucket,
@@ -2036,6 +2056,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let part_number_marker = match req.input.part_number_marker {
             None => None,
