@@ -1008,7 +1008,9 @@ mod test {
             }));
             assert!(matches!(
                 effects.as_slice(),
-                [Effect::Storage(StorageEffect::StartTransaction { read: false })]
+                [Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
             ));
             assert_eq!(op.state, PutObjectState::StartTransaction);
             assert_eq!(op.txn_id, None);

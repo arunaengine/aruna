@@ -4,6 +4,7 @@ use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
+use aruna_core::structs::UsageHistorySample;
 use aruna_core::structs::{
     Actor, AuthContext, GroupQuotaOverride, Permission, QuotaConfig, UserGroupCapOverride,
 };
@@ -20,7 +21,6 @@ use aruna_operations::set_realm_quota::{
 use aruna_operations::status::load_node_observability_status;
 use aruna_operations::usage_history::{USAGE_HISTORY_QUERY_LIMIT, read_usage_history};
 use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
-use aruna_core::structs::UsageHistorySample;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, put};
@@ -1328,9 +1328,18 @@ mod tests {
         assert_eq!(below.state, "ok");
 
         // At the threshold the state escalates through warn, grace, and blocked.
-        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 850).state, "warn");
-        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 1_050).state, "grace");
-        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 1_100).state, "blocked");
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&quota, &group, 850).state,
+            "warn"
+        );
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&quota, &group, 1_050).state,
+            "grace"
+        );
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&quota, &group, 1_100).state,
+            "blocked"
+        );
 
         // An override with quota_bytes: None is unlimited.
         let unlimited = super::GroupQuotaStatus::resolve(&quota, &unlimited_group, u64::MAX);
@@ -1348,15 +1357,24 @@ mod tests {
             ..QuotaConfig::default()
         };
 
-        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 2).state, "ok");
-        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 3).state, "warn");
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&quota, &group, 2).state,
+            "ok"
+        );
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&quota, &group, 3).state,
+            "warn"
+        );
 
         let tiny_quota = QuotaConfig {
             default_group_quota_bytes: Some(1),
             warn_threshold_percent: 85,
             ..QuotaConfig::default()
         };
-        assert_eq!(super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0).state, "ok");
+        assert_eq!(
+            super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0).state,
+            "ok"
+        );
     }
 
     #[test]

@@ -103,137 +103,138 @@ pub async fn materialize_reference(
 
     let mut attempt = 1;
     loop {
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(StorageError::WriteError.into()),
-    };
-
-    let result: Result<(), MaterializeReferenceError> = async {
-        guard_resolved_connector_unchanged(
-            context,
-            txn_id,
-            &head_result.connector,
-            head_result.secret_fingerprint,
-        )
-        .await?;
-
-        let existing_pointer =
-            read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
-        let was_live = match existing_pointer.as_ref() {
-            Some(pointer) => read_blob_version(
-                context,
-                txn_id,
-                &input.bucket,
-                &input.key,
-                pointer.version_id,
-            )
-            .await?
-            .is_some_and(|version| !version.is_deleted()),
-            None => false,
-        };
-        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
-
-        for effect in build_head_transition_effects(
-            &HeadAliasContext::new(
-                input.realm_id,
-                input.group_id,
-                input.node_id,
-                &input.bucket,
-                &input.key,
-            ),
-            Some(next_pointer),
-            None,
-            Some(txn_id),
-        )? {
-            apply_storage_effect(context, effect).await?;
-        }
-
-        let version_key = VersionKey::new(&input.bucket, &input.key, version_id);
-        apply_storage_effect(
-            context,
-            write_blob_version_effect(
-                &version_key,
-                &BlobVersion::reference(
-                    version_source.clone(),
-                    head_result.metadata.clone(),
-                    now,
-                    input.user_id,
-                    now,
-                ),
-                Some(txn_id),
-            )?,
-        )
-        .await?;
-
-        let logical_bytes = head_result.metadata.content_length;
-        if let Some(ceiling) = input.quota_ceiling
-            && logical_bytes > 0
-        {
-            enforce_quota(
-                context,
-                txn_id,
-                ceiling,
-                logical_bytes,
-                input.group_id,
-                input.node_id,
-                input.active_node_ids.clone(),
-            )
-            .await?;
-        }
-
-        let mut usage_update = UsageCounterUpdate::for_group(
-            input.group_id,
-            UsageDelta {
-                objects: if was_live { 0 } else { 1 },
-                logical_bytes: i128::from(logical_bytes),
-                ..Default::default()
-            },
-        );
-        if !usage_update.is_noop() {
-            run_usage_update(context, txn_id, &mut usage_update).await?;
-        }
-
-        match context
+        let txn_id = match context
             .storage_handle
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(MaterializeReferenceError::Storage(error))
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            _ => return Err(StorageError::WriteError.into()),
+        };
+
+        let result: Result<(), MaterializeReferenceError> = async {
+            guard_resolved_connector_unchanged(
+                context,
+                txn_id,
+                &head_result.connector,
+                head_result.secret_fingerprint,
+            )
+            .await?;
+
+            let existing_pointer =
+                read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
+            let was_live = match existing_pointer.as_ref() {
+                Some(pointer) => read_blob_version(
+                    context,
+                    txn_id,
+                    &input.bucket,
+                    &input.key,
+                    pointer.version_id,
+                )
+                .await?
+                .is_some_and(|version| !version.is_deleted()),
+                None => false,
+            };
+            let next_pointer =
+                CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
+
+            for effect in build_head_transition_effects(
+                &HeadAliasContext::new(
+                    input.realm_id,
+                    input.group_id,
+                    input.node_id,
+                    &input.bucket,
+                    &input.key,
+                ),
+                Some(next_pointer),
+                None,
+                Some(txn_id),
+            )? {
+                apply_storage_effect(context, effect).await?;
             }
-            _ => Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
-        }
-    }
-    .await;
 
-    if result.is_err() {
-        let _ = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-    }
+            let version_key = VersionKey::new(&input.bucket, &input.key, version_id);
+            apply_storage_effect(
+                context,
+                write_blob_version_effect(
+                    &version_key,
+                    &BlobVersion::reference(
+                        version_source.clone(),
+                        head_result.metadata.clone(),
+                        now,
+                        input.user_id,
+                        now,
+                    ),
+                    Some(txn_id),
+                )?,
+            )
+            .await?;
 
-    match result {
-        Ok(()) => break,
-        // The blob-free reference txn only conflicts on same-group counters or a
-        // racing connector change; re-run a fresh txn a bounded number of times.
-        Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict))
-            if attempt < MAX_METADATA_TXN_ATTEMPTS =>
-        {
-            attempt += 1;
-            continue;
+            let logical_bytes = head_result.metadata.content_length;
+            if let Some(ceiling) = input.quota_ceiling
+                && logical_bytes > 0
+            {
+                enforce_quota(
+                    context,
+                    txn_id,
+                    ceiling,
+                    logical_bytes,
+                    input.group_id,
+                    input.node_id,
+                    input.active_node_ids.clone(),
+                )
+                .await?;
+            }
+
+            let mut usage_update = UsageCounterUpdate::for_group(
+                input.group_id,
+                UsageDelta {
+                    objects: if was_live { 0 } else { 1 },
+                    logical_bytes: i128::from(logical_bytes),
+                    ..Default::default()
+                },
+            );
+            if !usage_update.is_noop() {
+                run_usage_update(context, txn_id, &mut usage_update).await?;
+            }
+
+            match context
+                .storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await
+            {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    Err(MaterializeReferenceError::Storage(error))
+                }
+                _ => Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
+            }
         }
-        Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict)) => {
-            return Err(MaterializeReferenceError::RetryableConflict);
+        .await;
+
+        if result.is_err() {
+            let _ = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
         }
-        Err(error) => return Err(error),
-    }
+
+        match result {
+            Ok(()) => break,
+            // The blob-free reference txn only conflicts on same-group counters or a
+            // racing connector change; re-run a fresh txn a bounded number of times.
+            Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict))
+                if attempt < MAX_METADATA_TXN_ATTEMPTS =>
+            {
+                attempt += 1;
+                continue;
+            }
+            Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict)) => {
+                return Err(MaterializeReferenceError::RetryableConflict);
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     schedule_usage_snapshot_publish(context).await;

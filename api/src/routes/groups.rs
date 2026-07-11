@@ -61,10 +61,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/groups", get(list_groups))
         .route("/groups/{id}", get(get_group))
         .route("/groups/{id}/usage", get(get_group_usage))
-        .route(
-            "/groups/{id}/usage/history",
-            get(get_group_usage_history),
-        )
+        .route("/groups/{id}/usage/history", get(get_group_usage_history))
         .route(
             "/groups/{id}/members",
             get(list_group_members).post(add_group_member),

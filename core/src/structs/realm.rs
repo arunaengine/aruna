@@ -261,9 +261,7 @@ pub const QUOTA_STATE_HYSTERESIS_PERCENT_POINTS: u32 = 5;
 /// Lifecycle of a group's realm-wide usage against its quota. Ordered so
 /// `Ok < Warn < Grace < Blocked`; `Unlimited` is the no-quota sentinel and sorts
 /// below the enforced states.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum QuotaState {
     Unlimited,
     Ok,
@@ -356,7 +354,12 @@ pub fn next_notified_state(
     ceiling_bytes: Option<u64>,
     warn_threshold_percent: u32,
 ) -> QuotaState {
-    let current = classify_quota_state(usage_bytes, quota_bytes, ceiling_bytes, warn_threshold_percent);
+    let current = classify_quota_state(
+        usage_bytes,
+        quota_bytes,
+        ceiling_bytes,
+        warn_threshold_percent,
+    );
     if quota_bytes.is_none() {
         return QuotaState::Unlimited;
     }
@@ -846,7 +849,10 @@ mod test {
         let c = Some(1_100u64);
         let w = 85;
         // Immediate upgrade all the way to blocked.
-        assert_eq!(next_notified_state(QuotaState::Ok, 1_100, q, c, w), QuotaState::Blocked);
+        assert_eq!(
+            next_notified_state(QuotaState::Ok, 1_100, q, c, w),
+            QuotaState::Blocked
+        );
         // Just under the ceiling stays blocked (1100 - 50 margin = 1050 re-arm).
         assert_eq!(
             next_notified_state(QuotaState::Blocked, 1_051, q, c, w),

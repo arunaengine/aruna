@@ -13,8 +13,8 @@ use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
     GroupAuthorizationDocument, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
     NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
-    NODE_USAGE_SUMMARY_GROUP_PREFIX, NotificationClass, NotificationKind, NotificationRecord,
-    NodeUsageSnapshot, QuotaStateRecord, RealmConfigDocument, RealmId, RecountReport,
+    NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, NotificationClass, NotificationKind,
+    NotificationRecord, QuotaStateRecord, RealmConfigDocument, RealmId, RecountReport,
     USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, USAGE_RECOUNT_REPORT_KEY, UsageCounterError,
     UsageCounters, UsageDelta, VersionKey, next_notified_state, node_usage_dirty_group_id,
     node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
@@ -22,9 +22,9 @@ use aruna_core::structs::{
     node_usage_quota_state_key, node_usage_summary_group_key, usage_global_key_for_group,
     usage_global_shard_index, usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
-use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -1973,7 +1973,8 @@ pub async fn reconcile_usage_stats(
         let obs = observed.get(key).copied().unwrap_or_default();
         if *exp != obs {
             let drift = i128::from(exp.logical_bytes) - i128::from(obs.logical_bytes);
-            max_abs_drift = max_abs_drift.max(u64::try_from(drift.unsigned_abs()).unwrap_or(u64::MAX));
+            max_abs_drift =
+                max_abs_drift.max(u64::try_from(drift.unsigned_abs()).unwrap_or(u64::MAX));
             warn!(
                 target: "quota_recount",
                 observed_logical = obs.logical_bytes,
@@ -2149,7 +2150,10 @@ pub async fn restore_reconcile_usage_timer(_storage: &StorageHandle, task_handle
     }
 }
 
-async fn write_recount_report(storage: &StorageHandle, report: &RecountReport) -> Result<(), String> {
+async fn write_recount_report(
+    storage: &StorageHandle,
+    report: &RecountReport,
+) -> Result<(), String> {
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: USAGE_STATS_KEYSPACE.to_string(),

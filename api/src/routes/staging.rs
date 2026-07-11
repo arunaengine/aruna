@@ -239,7 +239,10 @@ async fn reference_blob(
 async fn resolve_group_quota_ceiling(
     state: &ServerState,
     group_id: ulid::Ulid,
-) -> ServerResult<(Option<u64>, Option<std::collections::HashSet<aruna_core::NodeId>>)> {
+) -> ServerResult<(
+    Option<u64>,
+    Option<std::collections::HashSet<aruna_core::NodeId>>,
+)> {
     let config = state
         .cached_realm_config()
         .await
@@ -576,8 +579,9 @@ mod tests {
 
     #[test]
     fn snapshot_conflict_503() {
-        let error =
-            map_snapshot_error(MaterializeSnapshotError::Write(PutObjectError::RetryableConflict));
+        let error = map_snapshot_error(MaterializeSnapshotError::Write(
+            PutObjectError::RetryableConflict,
+        ));
         assert!(matches!(error, ServerError::WriteConflictRetry));
     }
 

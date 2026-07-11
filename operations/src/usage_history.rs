@@ -34,7 +34,10 @@ fn key_at_ms(key: &[u8]) -> Option<u64> {
 /// Samples the realm-wide usage for the global scope and every group with a local
 /// counter, writing a history point when the reading changed, and prunes points
 /// older than the retention window.
-pub async fn record_usage_history(ctx: &DriverContext, local_node_id: NodeId) -> Result<(), String> {
+pub async fn record_usage_history(
+    ctx: &DriverContext,
+    local_node_id: NodeId,
+) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let cutoff = now.saturating_sub(USAGE_HISTORY_RETENTION.as_millis() as u64);
     let realm_config = read_realm_config(ctx).await?;
@@ -56,12 +59,15 @@ pub async fn record_usage_history(ctx: &DriverContext, local_node_id: NodeId) ->
     .await?;
 
     for group_id in local_group_counter_ids(ctx).await? {
-        let counters = load_realm_usage(ctx, local_node_id, RealmUsageScope::Group(group_id)).await?;
+        let counters =
+            load_realm_usage(ctx, local_node_id, RealmUsageScope::Group(group_id)).await?;
         let (quota_bytes, ceiling_bytes, state) = match realm_config.as_ref() {
             Some(config) => (
                 config.quota.effective_group_quota_bytes(&group_id),
                 config.quota.effective_group_ceiling(&group_id),
-                config.quota.group_quota_state(&group_id, counters.logical_bytes),
+                config
+                    .quota
+                    .group_quota_state(&group_id, counters.logical_bytes),
             ),
             None => (None, None, QuotaState::Unlimited),
         };
@@ -92,7 +98,12 @@ async fn sample_scope(
     sample: UsageHistorySample,
     cutoff: u64,
 ) -> Result<(), String> {
-    let points = iter_all(&ctx.storage_handle, USAGE_HISTORY_KEYSPACE, Some(Key::from(prefix))).await?;
+    let points = iter_all(
+        &ctx.storage_handle,
+        USAGE_HISTORY_KEYSPACE,
+        Some(Key::from(prefix)),
+    )
+    .await?;
     let mut deletes: Vec<(String, Key)> = Vec::new();
     let mut latest: Option<UsageHistorySample> = None;
     for (point_key, value) in &points {
@@ -102,12 +113,18 @@ async fn sample_scope(
         latest = Some(UsageHistorySample::from_bytes(value.as_ref()).map_err(|e| e.to_string())?);
     }
 
-    let changed = latest.map(|last| !sample.same_reading(&last)).unwrap_or(true);
+    let changed = latest
+        .map(|last| !sample.same_reading(&last))
+        .unwrap_or(true);
     if changed {
         let bytes = sample.to_bytes().map_err(|e| e.to_string())?;
         write_batch(
             &ctx.storage_handle,
-            vec![(USAGE_HISTORY_KEYSPACE.to_string(), Key::from(key), Value::from(bytes))],
+            vec![(
+                USAGE_HISTORY_KEYSPACE.to_string(),
+                Key::from(key),
+                Value::from(bytes),
+            )],
         )
         .await?;
     }
@@ -131,7 +148,12 @@ pub async fn read_usage_history(
         RealmUsageScope::Group(group_id) => usage_history_group_prefix(group_id),
     };
     let limit = limit.min(USAGE_HISTORY_QUERY_LIMIT);
-    let points = iter_all(&ctx.storage_handle, USAGE_HISTORY_KEYSPACE, Some(Key::from(prefix))).await?;
+    let points = iter_all(
+        &ctx.storage_handle,
+        USAGE_HISTORY_KEYSPACE,
+        Some(Key::from(prefix)),
+    )
+    .await?;
     let mut out = Vec::new();
     for (point_key, value) in points {
         let Some(at_ms) = key_at_ms(point_key.as_ref()) else {
@@ -183,10 +205,7 @@ async fn write_batch(
     }
 }
 
-async fn delete_batch(
-    storage: &StorageHandle,
-    deletes: Vec<(String, Key)>,
-) -> Result<(), String> {
+async fn delete_batch(storage: &StorageHandle, deletes: Vec<(String, Key)>) -> Result<(), String> {
     match storage
         .send_storage_effect(StorageEffect::BatchDelete {
             deletes,
@@ -251,9 +270,15 @@ mod tests {
     }
 
     async fn group_points(ctx: &DriverContext, group: GroupId) -> Vec<UsageHistorySample> {
-        read_usage_history(ctx, RealmUsageScope::Group(group), 0, u64::MAX, USAGE_HISTORY_QUERY_LIMIT)
-            .await
-            .unwrap()
+        read_usage_history(
+            ctx,
+            RealmUsageScope::Group(group),
+            0,
+            u64::MAX,
+            USAGE_HISTORY_QUERY_LIMIT,
+        )
+        .await
+        .unwrap()
     }
 
     // Unchanged readings dedup; a changed reading appends a point; queries filter.

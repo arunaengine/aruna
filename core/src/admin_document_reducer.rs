@@ -2773,8 +2773,7 @@ mod tests {
             ))
             .unwrap();
 
-        let mut config =
-            crate::structs::RealmConfigDocument::new(realm_id(), Vec::new(), 3);
+        let mut config = crate::structs::RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         state.overlay_realm_config_quota(&mut config);
         assert_eq!(config.quota, quota);
 
