@@ -636,7 +636,12 @@ mod tests {
                 task_handle: Some(task_handle.clone()),
             });
             initialize_net_incoming(context.clone());
-            initialize_task_incoming(context.clone(), task_handle.clone()).await;
+            initialize_task_incoming(
+                context.clone(),
+                task_handle.clone(),
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
+            )
+            .await;
 
             let server_state = ServerState::new(
                 context.clone(),
@@ -645,6 +650,7 @@ mod tests {
                 config.node_capabilities.clone(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await;
 

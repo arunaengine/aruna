@@ -839,7 +839,12 @@ async fn initialize_context(
         task_handle: Some(task_handle.clone()),
     });
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
     Ok(context)
 }
 
@@ -872,8 +877,18 @@ async fn spawn_rest_server(
     node_id: iroh::PublicKey,
     capabilities: NodeCapabilities,
 ) -> TestResult<(String, Arc<ServerState>, JoinHandle<()>)> {
-    let state =
-        Arc::new(ServerState::new(context, realm_id, node_id, capabilities, false, None).await);
+    let state = Arc::new(
+        ServerState::new(
+            context,
+            realm_id,
+            node_id,
+            capabilities,
+            false,
+            None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await,
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = Server::new(
