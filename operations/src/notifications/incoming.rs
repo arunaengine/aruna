@@ -489,6 +489,11 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             }
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
+        NotificationKind::GroupQuotaStateChanged { group_id, .. } => {
+            if group_id.is_nil() {
+                return Err("notification record has empty group_id".to_string());
+            }
+        }
     }
     Ok(())
 }

@@ -11,15 +11,18 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
-    NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
-    UsageCounterError, UsageCounters, UsageDelta, VersionKey, node_usage_dirty_group_id,
-    node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
-    node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
+    GroupAuthorizationDocument, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
+    NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
+    NODE_USAGE_SUMMARY_GROUP_PREFIX, NotificationClass, NotificationKind, NotificationRecord,
+    NodeUsageSnapshot, QuotaStateRecord, RealmConfigDocument, RealmId, USAGE_GLOBAL_KEY,
+    USAGE_GLOBAL_SHARD_COUNT, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
+    next_notified_state, node_usage_dirty_group_id, node_usage_dirty_group_key,
+    node_usage_global_key, node_usage_group_key, node_usage_group_key_group_id,
+    node_usage_group_prefix, node_usage_key_node_id, node_usage_quota_state_key,
     node_usage_summary_group_key, usage_global_key_for_group, usage_global_shard_index,
     usage_global_shard_key, usage_global_shard_keys, usage_group_key,
 };
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -32,6 +35,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
+use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
+use crate::notifications::placement::resolve_quota_state_owner;
+use crate::notifications::routing::group_admin_user_ids;
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 #[derive(Debug, Error, PartialEq)]
@@ -1422,7 +1428,7 @@ async fn clear_consumed_markers(
     }
 }
 
-async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<NodeId>>, String> {
+async fn read_realm_config(ctx: &DriverContext) -> Result<Option<RealmConfigDocument>, String> {
     let Some(net_handle) = ctx.net_handle.as_ref() else {
         return Ok(None);
     };
@@ -1439,21 +1445,28 @@ async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<Nod
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
-        }) => {
-            let document = RealmConfigDocument::from_bytes(bytes.as_ref())
-                .map_err(|error| error.to_string())?;
-            Ok(Some(
-                document
-                    .sync_eligible_node_ids()
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .collect(),
-            ))
-        }
+        }) => Ok(Some(
+            RealmConfigDocument::from_bytes(bytes.as_ref()).map_err(|error| error.to_string())?,
+        )),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected realm config read event: {other:?}")),
     }
+}
+
+fn config_active_node_ids(config: &RealmConfigDocument) -> Result<HashSet<NodeId>, String> {
+    Ok(config
+        .sync_eligible_node_ids()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect())
+}
+
+async fn active_usage_node_ids(ctx: &DriverContext) -> Result<Option<HashSet<NodeId>>, String> {
+    read_realm_config(ctx)
+        .await?
+        .map(|config| config_active_node_ids(&config))
+        .transpose()
 }
 
 async fn clear_realm_usage_summary_cache(ctx: &DriverContext) -> Result<(), String> {
@@ -1493,7 +1506,11 @@ pub async fn recompute_realm_usage_summary(
     groups: Vec<GroupId>,
 ) -> Result<(), String> {
     let storage = &ctx.storage_handle;
-    let active_node_ids = active_usage_node_ids(ctx).await?;
+    let realm_config = read_realm_config(ctx).await?;
+    let active_node_ids = realm_config
+        .as_ref()
+        .map(config_active_node_ids)
+        .transpose()?;
     let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
 
     if include_global {
@@ -1504,6 +1521,7 @@ pub async fn recompute_realm_usage_summary(
             Value::from(total.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
+    let mut group_usage: Vec<(GroupId, u64)> = Vec::with_capacity(groups.len());
     for group_id in groups {
         let total =
             realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await?;
@@ -1512,22 +1530,202 @@ pub async fn recompute_realm_usage_summary(
             Key::from(node_usage_summary_group_key(group_id)),
             Value::from(total.to_bytes().map_err(|e| e.to_string())?),
         ));
+        group_usage.push((group_id, total.logical_bytes));
     }
 
-    if writes.is_empty() {
+    if !writes.is_empty() {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected summary write event: {other:?}")),
+        }
+    }
+
+    // The elected owner evaluates each recomputed group's quota state and emits
+    // one deduped notification per transition.
+    if let Some(config) = realm_config.as_ref() {
+        for (group_id, usage_bytes) in group_usage {
+            if let Err(error) =
+                evaluate_group_quota_state(ctx, local_node_id, config, group_id, usage_bytes).await
+            {
+                warn!(group_id = %group_id, error = %error, "Failed to evaluate group quota state");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn evaluate_group_quota_state(
+    ctx: &DriverContext,
+    local_node_id: NodeId,
+    realm_config: &RealmConfigDocument,
+    group_id: GroupId,
+    usage_bytes: u64,
+) -> Result<(), String> {
+    if resolve_quota_state_owner(&group_id, realm_config).map_err(|e| e.to_string())?
+        != Some(local_node_id)
+    {
         return Ok(());
     }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
+    let quota = &realm_config.quota;
+    let quota_bytes = quota.effective_group_quota_bytes(&group_id);
+    let ceiling_bytes = quota.effective_group_ceiling(&group_id);
+    let state = quota.group_quota_state(&group_id, usage_bytes);
+    let key = Key::from(node_usage_quota_state_key(group_id));
+    let now = unix_timestamp_millis();
+
+    let record = match read_quota_state_record(ctx, key.clone()).await? {
+        // First evaluation or owner handover: adopt the current state silently.
+        None => QuotaStateRecord {
+            state,
+            last_notified_state: state,
+            since_ms: now,
+            updated_ms: now,
+        },
+        Some(existing) => {
+            let next = next_notified_state(
+                existing.last_notified_state,
+                usage_bytes,
+                quota_bytes,
+                ceiling_bytes,
+                quota.warn_threshold_percent,
+            );
+            if next != existing.last_notified_state {
+                emit_quota_state_notification(
+                    ctx,
+                    group_id,
+                    next,
+                    existing.last_notified_state,
+                    usage_bytes,
+                    quota_bytes,
+                    ceiling_bytes,
+                    now,
+                )
+                .await?;
+            }
+            QuotaStateRecord {
+                state,
+                last_notified_state: next,
+                since_ms: if existing.state == state {
+                    existing.since_ms
+                } else {
+                    now
+                },
+                updated_ms: now,
+            }
+        }
+    };
+    write_quota_state_record(ctx, key, &record).await
+}
+
+async fn read_quota_state_record(
+    ctx: &DriverContext,
+    key: Key,
+) -> Result<Option<QuotaStateRecord>, String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key,
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => Ok(Some(
+            QuotaStateRecord::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?,
+        )),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected summary write event: {other:?}")),
+        other => Err(format!("unexpected quota state read event: {other:?}")),
     }
+}
+
+async fn write_quota_state_record(
+    ctx: &DriverContext,
+    key: Key,
+    record: &QuotaStateRecord,
+) -> Result<(), String> {
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key,
+            value: Value::from(record.to_bytes().map_err(|e| e.to_string())?),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected quota state write event: {other:?}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_quota_state_notification(
+    ctx: &DriverContext,
+    group_id: GroupId,
+    state: aruna_core::structs::QuotaState,
+    previous: aruna_core::structs::QuotaState,
+    usage_bytes: u64,
+    quota_bytes: Option<u64>,
+    ceiling_bytes: Option<u64>,
+    now_ms: u64,
+) -> Result<(), String> {
+    let key = DocumentSyncTarget::GroupAuthorization { group_id }.storage_key();
+    let key_space = DocumentSyncTarget::GroupAuthorization { group_id }.storage_keyspace();
+    let auth = match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => GroupAuthorizationDocument::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected group auth read event: {other:?}")),
+    };
+    let records: Vec<NotificationRecord> = group_admin_user_ids(&auth)
+        .into_iter()
+        .map(|admin| {
+            NotificationRecord::new(
+                admin,
+                NotificationClass::Direct,
+                NotificationKind::GroupQuotaStateChanged {
+                    group_id,
+                    state,
+                    previous,
+                    usage_bytes,
+                    quota_bytes,
+                    ceiling_bytes,
+                },
+                now_ms,
+            )
+        })
+        .collect();
+    if records.is_empty() {
+        return Ok(());
+    }
+    drive(
+        EmitNotificationsOperation::new(EmitNotificationsInput { records }),
+        ctx,
+    )
+    .await
+    .unwrap_or_else(|never| match never {});
+    Ok(())
 }
 
 /// Refreshes the persisted realm usage summed cache for exactly the `NodeUsage`
@@ -1556,8 +1754,21 @@ pub async fn refresh_realm_usage_summary_for_targets(
             _ => {}
         }
     }
-    if realm_config_changed && let Err(error) = clear_realm_usage_summary_cache(ctx).await {
-        warn!(error = %error, "Failed to clear realm usage summary after realm config change");
+    if realm_config_changed {
+        if let Err(error) = clear_realm_usage_summary_cache(ctx).await {
+            warn!(error = %error, "Failed to clear realm usage summary after realm config change");
+        }
+        // Recompute every known group so the new quota re-arms state notifications
+        // rather than leaving the summary cache cold.
+        match all_known_group_ids(ctx).await {
+            Ok(known) => {
+                include_global = true;
+                groups.extend(known);
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to enumerate groups after realm config change");
+            }
+        }
     }
     if !include_global && groups.is_empty() {
         return;
@@ -1572,6 +1783,36 @@ pub async fn refresh_realm_usage_summary_for_targets(
     {
         warn!(error = %error, "Failed to refresh realm usage summary after document sync reconciliation");
     }
+}
+
+/// Every group this node has a local counter or a replicated snapshot row for.
+async fn all_known_group_ids(ctx: &DriverContext) -> Result<BTreeSet<GroupId>, String> {
+    let mut groups = BTreeSet::new();
+    for (key, _) in iter_all(
+        &ctx.storage_handle,
+        USAGE_STATS_KEYSPACE,
+        Some(Key::from(b"group/".to_vec())),
+    )
+    .await?
+    {
+        if let Some(rest) = key.as_ref().strip_prefix(b"group/")
+            && let Ok(bytes) = <[u8; 16]>::try_from(rest)
+        {
+            groups.insert(GroupId::from_bytes(bytes));
+        }
+    }
+    for (key, _) in iter_all(
+        &ctx.storage_handle,
+        USAGE_NODE_STATS_KEYSPACE,
+        Some(Key::from(NODE_USAGE_GROUP_PREFIX.to_vec())),
+    )
+    .await?
+    {
+        if let Some(group_id) = node_usage_group_key_group_id(key.as_ref()) {
+            groups.insert(group_id);
+        }
+    }
+    Ok(groups)
 }
 
 async fn realm_global_usage(

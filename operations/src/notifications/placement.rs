@@ -1,11 +1,34 @@
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{RealmConfigDocument, WatchSubscription};
-use aruna_core::types::UserId;
+use aruna_core::types::{GroupId, UserId};
 
 use crate::sync_placement::select_topic_peers;
 
 pub const NOTIFICATION_INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
+pub const QUOTA_STATE_OWNER_TOPIC_DOMAIN: &[u8] = b"aruna-quota-state-owner-v1";
+
+pub fn quota_state_topic_id(group_id: &GroupId) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(QUOTA_STATE_OWNER_TOPIC_DOMAIN);
+    hasher.update(&group_id.to_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Elects the single node responsible for evaluating a group's quota-state
+/// transitions and emitting notifications, so cross-node sums do not duplicate
+/// them. Mirrors [`resolve_inbox_holder`]; R stays 1 until the placement map.
+pub fn resolve_quota_state_owner(
+    group_id: &GroupId,
+    realm_config: &RealmConfigDocument,
+) -> Result<Option<NodeId>, ConversionError> {
+    let candidates = realm_config.sync_eligible_node_ids()?;
+    Ok(
+        select_topic_peers(&quota_state_topic_id(group_id), &candidates, &[], 1)
+            .into_iter()
+            .next(),
+    )
+}
 
 pub fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
