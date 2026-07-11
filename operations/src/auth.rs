@@ -264,15 +264,39 @@ mod tests {
         assert_eq!(cache.len().await, 2);
     }
 
+    async fn backdate_entry(cache: &IssuerKeyCache, pubkey: &str, age: Duration) -> Instant {
+        let inserted_at = Instant::now().checked_sub(age).unwrap();
+        cache
+            .entries
+            .lock()
+            .await
+            .peek_mut(pubkey)
+            .unwrap()
+            .inserted_at = inserted_at;
+        inserted_at
+    }
+
+    async fn entry_inserted_at(cache: &IssuerKeyCache, pubkey: &str) -> Instant {
+        cache.entries.lock().await.peek(pubkey).unwrap().inserted_at
+    }
+
     #[tokio::test]
     async fn issuer_key_cache_refreshes_expired_entries() {
-        let cache = IssuerKeyCache::with_capacity_and_ttl(4, Duration::ZERO);
+        let ttl = Duration::from_secs(3600);
+        let cache = IssuerKeyCache::with_capacity_and_ttl(4, ttl);
         let key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
         let pubkey = pubkey_b64(&key);
         cache.get_or_insert(&pubkey).await.unwrap();
-        assert_eq!(cache.len().await, 1);
-        // A zero TTL forces every lookup to expire and refresh instead of accumulating.
+
+        // Just inside the TTL: served from cache, entry untouched.
+        let inside = backdate_entry(&cache, &pubkey, ttl - Duration::from_secs(60)).await;
         cache.get_or_insert(&pubkey).await.unwrap();
+        assert_eq!(entry_inserted_at(&cache, &pubkey).await, inside);
+
+        // Just past the TTL: refreshed in place without accumulating.
+        let expired = backdate_entry(&cache, &pubkey, ttl + Duration::from_secs(1)).await;
+        cache.get_or_insert(&pubkey).await.unwrap();
+        assert!(entry_inserted_at(&cache, &pubkey).await > expired);
         assert_eq!(cache.len().await, 1);
     }
 
