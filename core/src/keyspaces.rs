@@ -25,6 +25,7 @@ pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
+pub const USER_SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
@@ -42,6 +43,7 @@ pub const BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replicati
 pub const REFERENCE_METADATA_REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
 pub const USAGE_NODE_STATS_KEYSPACE: &str = "usage_node_stats";
+pub const NODE_INFO_KEYSPACE: &str = "node_info";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";

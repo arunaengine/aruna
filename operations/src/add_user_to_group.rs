@@ -265,8 +265,10 @@ impl AddUserToGroupOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
-                    .map_err(ConversionError::from)
+                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
+                    value.as_ref(),
+                )
+                .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -871,6 +873,7 @@ pub mod test {
                     dot: role_dot,
                 },
             )]),
+            equivalent_value_dots: BTreeMap::new(),
         }
     }
 
@@ -902,6 +905,7 @@ pub mod test {
             )]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         }
     }
 
@@ -1283,6 +1287,9 @@ pub mod test {
             },
             realm_description: "Test realm".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config);
         let _ = drive(realm_operation, &context).await.unwrap();
@@ -1377,6 +1384,9 @@ pub mod test {
                 actor: actor.clone(),
                 realm_description: "Test realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             context,
         )

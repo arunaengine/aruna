@@ -800,6 +800,9 @@ mod test {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -1219,6 +1222,9 @@ mod test {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -1398,6 +1404,9 @@ mod test {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -1413,6 +1422,9 @@ mod test {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -1495,6 +1507,9 @@ mod test {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )

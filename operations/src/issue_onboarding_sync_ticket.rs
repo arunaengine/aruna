@@ -76,6 +76,10 @@ impl IssueOnboardingSyncTicketOperation {
                 node_id: input.issuer_node_id,
                 group_id: None,
             },
+            DocumentSyncTarget::NodeInfo {
+                realm_id: input.realm_id,
+                node_id: input.issuer_node_id,
+            },
             DocumentSyncTarget::WatchInterest {
                 realm_id: input.realm_id,
                 node_id: input.issuer_node_id,
@@ -247,12 +251,26 @@ mod tests {
                     node_id: issuer_node_id,
                     group_id: None,
                 },
+                DocumentSyncTarget::NodeInfo {
+                    realm_id,
+                    node_id: issuer_node_id,
+                },
                 DocumentSyncTarget::WatchInterest {
                     realm_id,
                     node_id: issuer_node_id,
                 },
             ]
         );
+        ticket
+            .verify(
+                joiner_node_id,
+                &DocumentSyncTarget::NodeInfo {
+                    realm_id,
+                    node_id: issuer_node_id,
+                },
+                100,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -328,11 +346,20 @@ mod tests {
             ticket
                 .payload
                 .documents
+                .contains(&DocumentSyncTarget::NodeInfo {
+                    realm_id,
+                    node_id: issuer_node_id,
+                })
+        );
+        assert!(
+            ticket
+                .payload
+                .documents
                 .contains(&DocumentSyncTarget::WatchInterest {
                     realm_id,
                     node_id: issuer_node_id,
                 })
         );
-        assert_eq!(ticket.payload.documents.len(), user_count + 4);
+        assert_eq!(ticket.payload.documents.len(), user_count + 5);
     }
 }

@@ -1,13 +1,19 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
+    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::storage_entries::{
+    document_sync_revision_write_entry, metadata_document_lifecycle_write_entry,
+};
+use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
+use byteview::ByteView;
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -53,6 +59,7 @@ pub struct UpdateMetadataDocumentOperation {
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
     update_event: Option<MetadataCreateEventRecord>,
+    realm_config: Option<RealmConfigDocument>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -61,6 +68,7 @@ pub struct UpdateMetadataDocumentOperation {
 enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
+    ReadRealmConfig,
     ValidateMutation,
     StartTransaction,
     WriteUpdateBatch,
@@ -100,6 +108,7 @@ impl UpdateMetadataDocumentOperation {
             txn_id: None,
             record: None,
             update_event: None,
+            realm_config: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -214,11 +223,27 @@ impl UpdateMetadataDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let outbox = create_event_outbox_record(event, false);
+        let lifecycle_outbox = create_event_outbox_record(event, self.realm_config.as_ref(), false);
+        let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
         let status = new_pending_materialization_status(event, now);
         let job = new_materialization_job(event, now);
-        let writes =
-            metadata_event_projection_write_entries(event, &audit, Some(&outbox), &status, &job)?;
+        let mut writes =
+            metadata_event_projection_write_entries(event, &audit, outbox, &status, &job)?;
+        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(event.clone()),
+        };
+        writes.push(metadata_document_lifecycle_write_entry(&lifecycle)?);
+        if outbox.is_none() {
+            let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } =
+                lifecycle_outbox.event
+            else {
+                unreachable!("metadata lifecycle update outbox must be an upsert");
+            };
+            writes.push(document_sync_revision_write_entry(
+                &lifecycle_outbox.target,
+                &change,
+            )?);
+        }
         Ok(Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: Some(txn_id),
@@ -329,6 +354,28 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let update_event = self.update_event_record(&record);
                     self.update_event = Some(update_event);
                     self.record = Some(record.clone());
+                    self.state = UpdateMetadataDocumentState::ReadRealmConfig;
+                    smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                        key: ByteView::from(*record.realm_id.as_bytes()),
+                        txn_id: None,
+                    })]
+                }
+                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            UpdateMetadataDocumentState::ReadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    if let Some(bytes) = value {
+                        match RealmConfigDocument::from_bytes(&bytes) {
+                            Ok(config) => self.realm_config = Some(config),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                    }
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
                     match self.validation_effect(&record) {
                         Ok(Some(effect)) => {
                             self.state = UpdateMetadataDocumentState::ValidateMutation;
@@ -338,9 +385,8 @@ impl Operation for UpdateMetadataDocumentOperation {
                         Err(error) => self.fail(error.into()),
                     }
                 }
-                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::ValidateMutation => match event {
                 Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
@@ -457,7 +503,8 @@ mod tests {
     };
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
         METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
         METADATA_MATERIALIZATION_STATUS_KEYSPACE,
     };
@@ -542,6 +589,13 @@ mod tests {
         })
     }
 
+    fn realm_config_read(record: &MetadataRegistryRecord) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*record.realm_id.as_bytes()),
+            value: None,
+        })
+    }
+
     fn assert_no_graph_mutation_or_sync(effects: &[Effect]) {
         for effect in effects {
             match effect {
@@ -584,6 +638,7 @@ mod tests {
             METADATA_AUDIT_KEYSPACE,
             DOCUMENT_SYNC_OUTBOX_KEYSPACE,
             DOCUMENT_SYNC_REVISION_KEYSPACE,
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             METADATA_MATERIALIZATION_STATUS_KEYSPACE,
             METADATA_MATERIALIZATION_JOB_KEYSPACE,
             METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
@@ -632,6 +687,20 @@ mod tests {
         assert_eq!(revision.current.actor, event.node_id);
         assert_eq!(revision.current.generation, event.record.updated_at_ms);
         assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+        let lifecycle = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                    .expect("lifecycle source decodes")
+            })
+            .expect("lifecycle source write exists");
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(event.clone())
+            }
+        );
         event
     }
 
@@ -650,6 +719,8 @@ mod tests {
 
         assert_no_graph_mutation_or_sync(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
         let [Effect::Metadata(MetadataEffect::ValidateRoCrate { request })] = effects.as_slice()
         else {
             panic!("expected RO-Crate validation before transaction, got {effects:?}");
@@ -684,6 +755,8 @@ mod tests {
         operation.start();
         let effects = operation.step(registry_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
         assert_start_transaction(effects.as_slice());
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -691,6 +764,94 @@ mod tests {
             matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
         });
         assert_eq!(event.record.last_event_id, event.event_id);
+    }
+
+    #[test]
+    fn update_with_no_holders_persists_projection_without_lifecycle_outbox() {
+        let actor = actor();
+        let mut record = record(&actor);
+        record.holder_node_ids.clear();
+        let txn_id = Ulid::new();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        let effects = operation.step(realm_config_read(&record));
+        assert_start_transaction(effects.as_slice());
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected update batch write, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        for keyspace in [
+            METADATA_EVENT_LOG_KEYSPACE,
+            METADATA_INDEX_KEYSPACE,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            METADATA_AUDIT_KEYSPACE,
+            METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
+        ] {
+            assert!(
+                writes
+                    .iter()
+                    .any(|(entry_keyspace, _, _)| entry_keyspace == keyspace),
+                "missing keyspace {keyspace} in update batch: {writes:?}"
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .all(|(keyspace, _, _)| keyspace != DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        );
+        let event = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataCreateEventRecord>(value)
+                    .expect("update event decodes")
+            })
+            .expect("event log write exists");
+        assert!(event.record.holder_node_ids.is_empty());
+        let lifecycle = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                    .expect("lifecycle source decodes")
+            })
+            .expect("lifecycle source write exists");
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(event.clone())
+            }
+        );
+        let revision = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<DocumentSyncChange>(value)
+                    .expect("lifecycle revision decodes")
+            })
+            .expect("lifecycle revision write exists");
+        assert_eq!(revision.current.event_id, event.event_id);
+        assert_eq!(revision.current.generation, event.record.updated_at_ms);
     }
 
     #[test]
@@ -708,6 +869,8 @@ mod tests {
 
         assert_no_graph_mutation_or_sync(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(realm_config_read(&record));
         assert_no_graph_mutation_or_sync(effects.as_slice());
         let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: record.graph_iri.clone(),

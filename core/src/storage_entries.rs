@@ -6,7 +6,7 @@ use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerS
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncConflict, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentSyncTarget, PendingDocumentPlacement,
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
@@ -19,7 +19,7 @@ use crate::keyspaces::{
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    SYNC_PLACEMENT_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -27,9 +27,9 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, User, WatchSubscription,
-    notification_inbox_key, notification_outbox_key, notification_prune_index_key,
-    watch_subscription_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, RealmId,
+    User, WatchSubscription, notification_inbox_key, notification_outbox_key,
+    notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
@@ -110,6 +110,32 @@ pub fn metadata_event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
     ByteView::from(bytes)
+}
+
+pub fn document_placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
+    let mut bytes = realm_id.as_bytes().to_vec();
+    bytes.extend_from_slice(target.sync_topic_id().to_string().as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn document_placement_write_entry(
+    record: &PendingDocumentPlacement,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        SYNC_PLACEMENT_KEYSPACE.to_string(),
+        document_placement_key(record.realm_id, &record.target),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn document_placement_delete_entry(
+    realm_id: RealmId,
+    target: &DocumentSyncTarget,
+) -> (KeySpace, Key) {
+    (
+        SYNC_PLACEMENT_KEYSPACE.to_string(),
+        document_placement_key(realm_id, target),
+    )
 }
 
 pub fn metadata_pending_projection_key(document_id: Ulid, event_id: Ulid) -> Key {
@@ -306,6 +332,7 @@ pub fn document_sync_conflict_write_entry(
 pub fn metadata_document_lifecycle_revision_change(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> DocumentSyncChange {
     match record {
         MetadataDocumentLifecycleRecord::Upsert { event } => DocumentSyncChange {
@@ -317,6 +344,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.occurred_at_ms,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement,
         },
         MetadataDocumentLifecycleRecord::Delete { event } => DocumentSyncChange {
             base: None,
@@ -327,6 +355,7 @@ pub fn metadata_document_lifecycle_revision_change(
                 updated_at_ms: event.tombstone.updated_at_ms,
             },
             kind: DocumentSyncChangeKind::Delete,
+            placement,
         },
     }
 }
@@ -334,11 +363,12 @@ pub fn metadata_document_lifecycle_revision_change(
 pub fn metadata_document_lifecycle_revision_write_entry(
     record: &MetadataDocumentLifecycleRecord,
     delete_actor: NodeId,
+    placement: PlacementRef,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    let change = metadata_document_lifecycle_revision_change(record, delete_actor);
+    let change = metadata_document_lifecycle_revision_change(record, delete_actor, placement);
     document_sync_revision_write_entry(&target, &change)
 }
 
@@ -600,7 +630,7 @@ mod tests {
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
     };
-    use crate::structs::RealmId;
+    use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
     fn node(seed: u8) -> NodeId {
@@ -687,6 +717,7 @@ mod tests {
             )]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -716,6 +747,7 @@ mod tests {
                     dot: attr_dot,
                 },
             )]),
+            equivalent_value_dots: BTreeMap::new(),
         };
 
         let (keyspace, key, value) = admin_document_reducer_state_write_entry(&state).unwrap();
@@ -736,6 +768,7 @@ mod tests {
             base: Some(base),
             current: revision(2, 2),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
 
         let (keyspace, key, value) = document_sync_revision_write_entry(&target, &change).unwrap();
@@ -755,11 +788,13 @@ mod tests {
             base: None,
             current: revision(1, 1),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
         let incoming_change = DocumentSyncChange {
             base: None,
             current: revision(2, 2),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
         let conflict = DocumentSyncConflict {
             target: target.clone(),
@@ -811,6 +846,7 @@ mod tests {
             ]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         };
 
         let entries = admin_document_conflict_write_entries(&state).unwrap();
@@ -876,6 +912,7 @@ mod tests {
             ]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         };
         let current = AdminDocumentReducerState {
             conflicts: BTreeMap::from([(

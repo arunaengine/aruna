@@ -10,8 +10,8 @@ use aruna_core::onboarding::{
     bootstrap_node_proof_message,
 };
 use aruna_core::structs::{
-    BlobTimeoutConfig, DynamicDiscoveryMethod, NodeCapabilities, OidcProviderConfig,
-    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+    BlobTimeoutConfig, DynamicDiscoveryMethod, KIND_LABEL_KEY, NodeCapabilities,
+    OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
@@ -32,6 +32,7 @@ use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::path::PathBuf;
@@ -74,6 +75,7 @@ pub struct Config {
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
     pub s3_host: String,
+    pub api_public_url: Option<String>,
     pub s3_public_url: Option<String>,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
@@ -82,6 +84,9 @@ pub struct Config {
     pub portal: PortalConfig,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
+    pub node_labels: BTreeMap<String, String>,
+    pub node_location: Option<String>,
+    pub node_weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,12 +284,20 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .unwrap_or(3)
         .max(1);
     let s3_host = dotenvy::var("S3_HOST")?;
-    let s3_public_url = optional_nonempty_env("S3_PUBLIC_URL")?;
-    if let Some(url) = &s3_public_url {
-        validate_s3_public_url(url)?;
-    }
+    let api_public_url = optional_public_url_env("API_PUBLIC_URL")?;
+    let s3_public_url = optional_public_url_env("S3_PUBLIC_URL")?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
     SocketAddr::from_str(&s3_address)?;
+    let node_labels = parse_node_labels_env()?;
+    let node_location = dotenvy::var("ARUNA_NODE_LOCATION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let node_weight = dotenvy::var("ARUNA_NODE_WEIGHT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().parse::<u32>())
+        .transpose()?;
     let realm_description = dotenvy::var("REALM_DESCRIPTION")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -303,7 +316,13 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         None => {
             let state = match onboarding_secret.as_deref() {
                 Some(onboarding_secret) => {
-                    let bootstrapped = bootstrap_onboarded_node_state(onboarding_secret).await?;
+                    let bootstrapped = bootstrap_onboarded_node_state(
+                        onboarding_secret,
+                        node_location.clone(),
+                        node_weight,
+                        node_labels.clone(),
+                    )
+                    .await?;
                     temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
                     bootstrapped.node_state
                 }
@@ -333,7 +352,14 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
                         .to_string(),
                 )
             })?;
-            let response = refresh_onboarding_bootstrap(onboarding_secret, &node_state).await?;
+            let response = refresh_onboarding_bootstrap(
+                onboarding_secret,
+                &node_state,
+                node_location.clone(),
+                node_weight,
+                node_labels.clone(),
+            )
+            .await?;
             temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
             node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
             persist_node_state(&storage_handle, &node_state).await?;
@@ -393,6 +419,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             relay_method,
             default_metadata_replication_factor,
             s3_host,
+            api_public_url,
             s3_public_url,
             s3_address,
             onboarding_secret,
@@ -401,6 +428,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             portal,
             startup_mode,
             node_state,
+            node_labels,
+            node_location,
+            node_weight,
         },
         storage_handle,
     ))
@@ -500,12 +530,20 @@ fn required_nonempty_env(key: &'static str) -> Result<String, SetupError> {
     }
 }
 
-fn validate_s3_public_url(value: &str) -> Result<(), SetupError> {
-    let url = reqwest::Url::parse(value)
-        .map_err(|error| invalid_config_value("S3_PUBLIC_URL", value, error))?;
+fn optional_public_url_env(key: &'static str) -> Result<Option<String>, SetupError> {
+    let value = optional_nonempty_env(key)?;
+    if let Some(url) = &value {
+        validate_public_url(key, url)?;
+    }
+    Ok(value)
+}
+
+fn validate_public_url(key: &'static str, value: &str) -> Result<(), SetupError> {
+    let url =
+        reqwest::Url::parse(value).map_err(|error| invalid_config_value(key, value, error))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(invalid_config_value(
-            "S3_PUBLIC_URL",
+            key,
             value,
             "expected an absolute HTTP or HTTPS URL with a host",
         ));
@@ -533,6 +571,38 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+/// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
+/// in `k=v,k2=v2` form. Rejects malformed pairs and the derived-only
+/// [`KIND_LABEL_KEY`], which is stamped from `RealmNode.kind`.
+fn parse_node_labels_env() -> Result<BTreeMap<String, String>, SetupError> {
+    const KEY: &str = "ARUNA_NODE_LABELS";
+    let raw = dotenvy::var(KEY).unwrap_or_default();
+    let mut labels = BTreeMap::new();
+    for pair in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        let (label_key, label_value) = pair
+            .split_once('=')
+            .ok_or_else(|| invalid_config_value(KEY, pair, "expected key=value"))?;
+        let label_key = label_key.trim();
+        let label_value = label_value.trim();
+        if label_key.is_empty() {
+            return Err(invalid_config_value(KEY, pair, "empty label key"));
+        }
+        if label_key == KIND_LABEL_KEY {
+            return Err(invalid_config_value(
+                KEY,
+                pair,
+                format!("{KIND_LABEL_KEY} is a reserved derived label"),
+            ));
+        }
+        labels.insert(label_key.to_string(), label_value.to_string());
+    }
+    Ok(labels)
 }
 
 fn load_document_sync_runtime_config() -> Result<IrohRuntimeConfig, SetupError> {
@@ -698,6 +768,9 @@ struct BootstrappedNodeState {
 
 async fn bootstrap_onboarded_node_state(
     onboarding_secret: &str,
+    node_location: Option<String>,
+    node_weight: Option<u32>,
+    node_labels: BTreeMap<String, String>,
 ) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -756,6 +829,9 @@ async fn bootstrap_onboarded_node_state(
             transport_public_key,
             issuer_public_key,
             issuer_proof,
+            node_location,
+            node_weight,
+            node_labels,
         })
         .send()
         .await?;
@@ -850,6 +926,9 @@ async fn bootstrap_onboarded_node_state(
 async fn refresh_onboarding_bootstrap(
     onboarding_secret: &str,
     node_state: &PersistedNodeState,
+    node_location: Option<String>,
+    node_weight: Option<u32>,
+    node_labels: BTreeMap<String, String>,
 ) -> Result<BootstrapOnboardingResponse, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
@@ -918,6 +997,9 @@ async fn refresh_onboarding_bootstrap(
             transport_public_key,
             issuer_public_key,
             issuer_proof,
+            node_location,
+            node_weight,
+            node_labels,
         })
         .send()
         .await?;
@@ -1216,8 +1298,8 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, PortalConfig,
-        fjall_persist_policy_env, load, load_oidc_providers_from_env, persist_node_state,
-        portal_config_env, validate_s3_public_url,
+        fjall_persist_policy_env, load, load_oidc_providers_from_env, parse_node_labels_env,
+        persist_node_state, portal_config_env, validate_public_url,
     };
     use aruna_core::structs::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
@@ -1260,32 +1342,34 @@ mod tests {
     }
 
     #[test]
-    fn s3_public_url_accepts_absolute_http_and_https_urls() {
+    fn public_url_accepts_absolute_http_and_https_urls() {
         for value in [
             "http://localhost:1337",
             "https://s3.example.test/base/path/",
         ] {
-            validate_s3_public_url(value).unwrap();
+            validate_public_url("API_PUBLIC_URL", value).unwrap();
         }
     }
 
     #[test]
-    fn s3_public_url_rejects_invalid_schemes_and_hostless_values() {
-        for value in [
-            "file:///tmp/s3",
-            "mailto:admin@example.test",
-            "ftp://s3.example.test",
-            "https://",
-            "/relative/path",
-        ] {
-            let error = validate_s3_public_url(value).expect_err("invalid URL should fail");
-            assert!(matches!(
-                error,
-                super::SetupError::InvalidConfigValue {
-                    key: "S3_PUBLIC_URL",
-                    ..
-                }
-            ));
+    fn public_url_rejects_invalid_values_with_the_requested_env_key() {
+        for key in ["API_PUBLIC_URL", "S3_PUBLIC_URL"] {
+            for value in [
+                "file:///tmp/s3",
+                "mailto:admin@example.test",
+                "ftp://s3.example.test",
+                "https://",
+                "/relative/path",
+            ] {
+                let error = validate_public_url(key, value).expect_err("invalid URL should fail");
+                assert!(matches!(
+                    error,
+                    super::SetupError::InvalidConfigValue {
+                        key: error_key,
+                        ..
+                    } if error_key == key
+                ));
+            }
         }
     }
 
@@ -1331,6 +1415,71 @@ mod tests {
             error,
             super::SetupError::InvalidConfigValue {
                 key: "ARUNA_FJALL_PERSIST_MODE",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_defaults_to_empty() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::remove_var(key) };
+
+        assert!(parse_node_labels_env().unwrap().is_empty());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_parses_comma_separated_pairs() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "tier=hot, zone = eu-west ") };
+
+        let labels = parse_node_labels_env().unwrap();
+        assert_eq!(labels.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(labels.get("zone"), Some(&"eu-west".to_string()));
+        assert_eq!(labels.len(), 2);
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_rejects_reserved_kind_key() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "aruna.io/kind=Server") };
+
+        let error = parse_node_labels_env().expect_err("reserved key should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
+                ..
+            }
+        ));
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn node_labels_env_rejects_malformed_pair() {
+        let _guard = env_lock().lock().await;
+        let key = "ARUNA_NODE_LABELS";
+        let previous = vec![(key.to_string(), std::env::var(key).ok())];
+        unsafe { std::env::set_var(key, "tier") };
+
+        let error = parse_node_labels_env().expect_err("missing '=' should fail");
+        assert!(matches!(
+            error,
+            super::SetupError::InvalidConfigValue {
+                key: "ARUNA_NODE_LABELS",
                 ..
             }
         ));
@@ -1416,6 +1565,8 @@ mod tests {
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
             ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("API_PUBLIC_URL", "https://api.example.test".to_string()),
+            ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
             ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             ("ARUNA_FJALL_PERSIST_MODE", "sync_all".to_string()),
             ("OIDC_PROVIDER_IDS", "main".to_string()),
@@ -1432,6 +1583,8 @@ mod tests {
             "SOCKET_ADDRESS",
             "P2P_SOCKET_ADDRESS",
             "S3_HOST",
+            "API_PUBLIC_URL",
+            "S3_PUBLIC_URL",
             "S3_ADDRESS",
             "ARUNA_FJALL_PERSIST_MODE",
             "OIDC_PROVIDER_IDS",
@@ -1459,6 +1612,14 @@ mod tests {
         assert_eq!(config.relay_method, RelayMethod::N0);
         assert_eq!(config.fjall_persist_policy, FjallPersistPolicy::SyncAll);
         assert!(matches!(config.portal, PortalConfig::Disabled));
+        assert_eq!(
+            config.api_public_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            config.s3_public_url.as_deref(),
+            Some("https://s3.example.test")
+        );
 
         restore_env(previous);
     }

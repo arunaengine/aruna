@@ -117,30 +117,27 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
-fn document_publish_from_outbox(
-    event_id: ulid::Ulid,
-    target: DocumentSyncTarget,
-    event: DocumentSyncOutboxEvent,
-    allow_genesis: bool,
+pub(crate) fn document_publish_from_outbox(
+    record: &aruna_core::document::DocumentSyncOutboxRecord,
 ) -> DocumentSyncPublish {
-    match event {
+    match &record.event {
         DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
-            event_id,
-            target,
-            bytes,
-            change,
-            allow_genesis,
+            event_id: record.outbox_id,
+            target: record.target.clone(),
+            bytes: bytes.clone(),
+            change: *change,
+            allow_genesis: record.allow_genesis,
         },
         DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
-            event_id,
-            target,
-            change,
-            allow_genesis,
+            event_id: record.outbox_id,
+            target: record.target.clone(),
+            change: *change,
+            allow_genesis: record.allow_genesis,
         },
         DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
-            target,
-            event,
-            allow_genesis,
+            target: record.target.clone(),
+            event: event.clone(),
+            allow_genesis: record.allow_genesis,
         },
     }
 }
@@ -263,12 +260,7 @@ impl OperationsTaskHandler {
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record) in batch.records {
-            let document = document_publish_from_outbox(
-                record.outbox_id,
-                record.target.clone(),
-                record.event,
-                record.allow_genesis,
-            );
+            let document = document_publish_from_outbox(&record);
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();
             if subbatches
@@ -558,6 +550,28 @@ impl OperationsTaskHandler {
                 .await;
             }
         }
+    }
+
+    async fn publish_node_info(&self) {
+        if let Some(net_handle) = self.context.net_handle.as_ref() {
+            let node_id = net_handle.node_id();
+            let realm_id = *net_handle.realm_id();
+            if let Err(error) =
+                crate::node_info::refresh_node_info_heartbeat(&self.context, node_id, realm_id)
+                    .await
+            {
+                warn!(error = %error, "Failed to publish node info heartbeat");
+            }
+        } else {
+            warn!("Cannot publish node info without net handle");
+        }
+        // Periodic heartbeat: always re-arm for the next interval regardless of
+        // outcome so a transient failure never stops the heartbeat.
+        self.reschedule_timer(
+            TaskKey::PublishNodeInfo,
+            crate::node_info::NODE_INFO_PUBLISH_INTERVAL,
+        )
+        .await;
     }
 
     async fn publish_watch_interest(&self) {
@@ -1051,6 +1065,8 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
+        crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle)
+            .await;
         restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
             &task_handle,
@@ -1081,6 +1097,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
     restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
+    crate::node_info::restore_node_info_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
@@ -1215,6 +1232,9 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::PublishUsageSnapshots => {
                 self.publish_usage_snapshots().await;
             }
+            TaskKey::PublishNodeInfo => {
+                self.publish_node_info().await;
+            }
             TaskKey::DrainMetadataProjectionQueue => {
                 self.drain_metadata_projection_queue().await;
             }
@@ -1247,7 +1267,8 @@ impl InboundTaskHandler for OperationsTaskHandler {
 mod tests {
     use super::*;
     use crate::document_sync_outbox::{
-        outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
+        new_outbox_record_with_id, outbox_key, read_outbox_record,
+        restore_document_sync_outbox_timers, write_outbox_effect,
     };
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -1306,6 +1327,7 @@ mod tests {
                 updated_at_ms: 9,
             },
             kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef::NIL,
         }
     }
 
@@ -1348,15 +1370,18 @@ mod tests {
         let event_id = Ulid::from_parts(10, 1);
         let target = target();
         let change = change();
-        let publish = document_publish_from_outbox(
+        let record = new_outbox_record_with_id(
             event_id,
+            node(1),
             target.clone(),
+            Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![1, 2, 3],
                 change,
             },
             true,
         );
+        let publish = document_publish_from_outbox(&record);
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);

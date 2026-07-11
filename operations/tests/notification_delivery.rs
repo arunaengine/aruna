@@ -358,6 +358,7 @@ fn added_to_group_record(
 
 fn realm_config_for(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }

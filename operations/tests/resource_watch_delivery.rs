@@ -6,8 +6,8 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::{
     Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
@@ -425,6 +425,12 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
             .is_ok_and(|rows| rows.contains(&subscription))
     })
     .await?;
+    // The row and outbox record commit atomically; wait until the record has
+    // published into topic history before changing which node holds the inbox.
+    wait_for(POLL_TIMEOUT, || async {
+        iter_len(old_holder_node, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await == 0
+    })
+    .await?;
 
     install_config_document(&nodes, realm_id, &full_config).await?;
     let new_holder_node = node_by_id(&nodes, new_holder);
@@ -626,6 +632,7 @@ async fn iter_len(node: &TestNode, key_space: &str) -> usize {
 
 fn realm_config_for(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
@@ -816,7 +823,6 @@ async fn bootstrap_watch_interest_topic(
     nodes: &[TestNode],
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut keys = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.net.node_id();
         ensure_local_watch_interest_digest(&node.context.storage_handle, realm_id, node_id).await?;
@@ -831,13 +837,13 @@ async fn bootstrap_watch_interest_topic(
             node.context.as_ref(),
         )
         .await?;
-        keys.push(watch_interest_node_key(realm_id, node_id));
-    }
 
-    for node in nodes {
-        for key in &keys {
+        // All digests share one realm topic. Reconcile each append before the
+        // next node writes so concurrent outbox drains cannot race topic setup.
+        let key = watch_interest_node_key(realm_id, node_id);
+        for peer in nodes {
             wait_for(POLL_TIMEOUT, || async {
-                read_watch_interest_digest(node, key.clone())
+                read_watch_interest_digest(peer, key.clone())
                     .await
                     .is_some()
             })

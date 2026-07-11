@@ -1,7 +1,9 @@
-use std::str::FromStr;
-
 use aruna_core::NodeId;
-use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::admin_document_reducer::{
+    AdminDocumentReducerError, AdminDocumentReducerState,
+    overlay_realm_config_placement_reducer_materialization, realm_config_node_id_from_path,
+    realm_config_node_path,
+};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -152,6 +154,9 @@ impl EnsureRealmConfigOperation {
                     self.config.default_metadata_replication_factor,
                 );
                 document.description = self.config.realm_description.clone();
+                // Seed default placement so no production path ever constructs a
+                // strategy-less config (placement resolution needs strategies).
+                document.seed_default_placement();
                 document
             }
             None => return Err(EnsureRealmConfigError::RealmConfigNotFound),
@@ -172,8 +177,10 @@ impl EnsureRealmConfigOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
-                    .map_err(ConversionError::from)
+                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
+                    value.as_ref(),
+                )
+                .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -438,7 +445,7 @@ fn overlay_realm_config_reducer_materialization(
     reducer_state: &AdminDocumentReducerState,
 ) {
     for path in reducer_state.conflicts.keys() {
-        if let Some(node_id) = realm_config_node_from_path(path) {
+        if let Some(node_id) = realm_config_node_id_from_path(path) {
             remove_realm_config_node(config, &node_id);
         }
     }
@@ -451,6 +458,8 @@ fn overlay_realm_config_reducer_materialization(
         }
         config.ensure_node(node_id, kind);
     }
+
+    overlay_realm_config_placement_reducer_materialization(config, reducer_state);
 }
 
 fn realm_config_node_ensure_is_noop(
@@ -483,19 +492,11 @@ fn remove_realm_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) 
     config.nodes.retain(|node| node.node_id != node_id);
 }
 
-fn realm_config_node_path(node_id: &NodeId) -> String {
-    format!("realm_config.nodes.{node_id}")
-}
-
-fn realm_config_node_from_path(path: &str) -> Option<NodeId> {
-    let node_id = path.strip_prefix("realm_config.nodes.")?;
-    NodeId::from_str(node_id).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use aruna_core::admin_document_reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
+        REALM_CONFIG_DEFAULT_STRATEGY_PATH,
     };
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
@@ -512,14 +513,19 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::admin_document_reducer_conflict_key;
-    use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        Actor, BindingScope, DocumentClass, NodePlacementEntry, PlacementOverride,
+        PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind, StrategyBinding,
+    };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId, Value};
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
     use super::{
         EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
-        EnsureRealmConfigState, realm_config_node_path,
+        EnsureRealmConfigState, overlay_realm_config_reducer_materialization,
+        realm_config_node_path,
     };
 
     fn node(seed: u8) -> aruna_core::NodeId {
@@ -615,6 +621,11 @@ mod tests {
         assert_eq!(stored.metadata_replication.default_replication_factor, 7);
         assert_eq!(stored.description, "Ensured Realm");
         assert!(stored.has_node(actor.node_id));
+        let default_strategy = stored
+            .default_strategy_id
+            .and_then(|strategy_id| stored.strategy(&strategy_id))
+            .expect("create-if-missing seeds a default placement strategy");
+        assert_eq!(default_strategy.replica_count, Some(7));
         assert_eq!(
             state.materialized_realm_config_nodes()[&actor.node_id],
             RealmNodeKind::Management
@@ -736,6 +747,118 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(operation.state, EnsureRealmConfigState::Finish);
+    }
+
+    #[test]
+    fn overlay_materializes_placement_fields_from_reducer_state() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let actor = actor(21, realm_id);
+        let mut state =
+            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+
+        let entry = NodePlacementEntry {
+            node_id: actor.node_id,
+            location: "eu-west".to_string(),
+            weight: 250,
+            full: false,
+            draining: false,
+            labels: BTreeMap::new(),
+        };
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([4; 16]),
+            name: "default".to_string(),
+            replica_count: Some(3),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let binding = StrategyBinding {
+            scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+            strategy_id: strategy.strategy_id,
+        };
+        let record = PlacementOverride {
+            subject: b"document-subject".to_vec(),
+            pinned: vec![actor.node_id],
+            excluded: Vec::new(),
+            strategy_id: Some(strategy.strategy_id),
+        };
+        for op in [
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: entry.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                strategy_id: strategy.strategy_id,
+            },
+            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                binding: binding.clone(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+                record: record.clone(),
+            },
+        ] {
+            state.apply_operation(&actor, op).unwrap();
+        }
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+
+        assert_eq!(config.placement_map, vec![entry]);
+        assert_eq!(config.strategies, vec![strategy.clone()]);
+        assert_eq!(config.default_strategy_id, Some(strategy.strategy_id));
+        assert_eq!(config.strategy_bindings, vec![binding]);
+        assert_eq!(config.placement_overrides, vec![record]);
+    }
+
+    #[test]
+    fn overlay_clears_prior_default_strategy_on_reducer_conflict() {
+        let realm_id = RealmId::from_bytes([22; 32]);
+        let actor_a = actor(22, realm_id);
+        let actor_b = actor(23, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut state = AdminDocumentReducerState::new(target.clone());
+        let prior_default = Ulid::from_bytes([5; 16]);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.default_strategy_id = Some(prior_default);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, None);
+
+        for (event_id, actor, strategy_id) in [
+            (
+                Ulid::from_bytes([6; 16]),
+                &actor_a,
+                Ulid::from_bytes([7; 16]),
+            ),
+            (
+                Ulid::from_bytes([8; 16]),
+                &actor_b,
+                Ulid::from_bytes([9; 16]),
+            ),
+        ] {
+            state
+                .apply(&AdminDocumentEvent {
+                    event_id,
+                    target: target.clone(),
+                    origin_node_id: actor.node_id,
+                    origin_seq: 1,
+                    observed: AdminDocumentClock::default(),
+                    actor: actor.clone(),
+                    op: AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                })
+                .unwrap();
+        }
+
+        assert!(
+            state
+                .conflicts
+                .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+        );
+        assert_eq!(state.materialized_realm_config_default_strategy(), None);
+
+        overlay_realm_config_reducer_materialization(&mut config, &state);
+        assert_eq!(config.default_strategy_id, None);
     }
 
     #[test]

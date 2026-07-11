@@ -10,7 +10,8 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::admin_document_reducer_state_write_entry;
 use aruna_core::structs::{
-    Actor, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    Actor, NodePlacementEntry, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmNodeKind, normalize_node_placement_input,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
@@ -27,6 +28,13 @@ pub struct CreateRealmConfig {
     pub actor: Actor,
     pub realm_description: String,
     pub oidc_providers: Vec<OidcProviderConfig>,
+    /// Creating node's placement location (`None` ⇒ realm default).
+    pub node_location: Option<String>,
+    /// Creating node's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
+    /// Creating node's placement labels (config-sourced, reserved key rejected
+    /// at parse time). Flow into the node's placement-map entry.
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(PartialEq)]
@@ -94,6 +102,10 @@ impl CreateRealmOperation {
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         config_doc.description = self.config.realm_description.clone();
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
+        seed_placement_defaults(&mut config_doc);
+        config_doc
+            .placement_map
+            .push(self.creating_node_placement_entry()?);
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -105,6 +117,22 @@ impl CreateRealmOperation {
             writes,
             txn_id: self.txn_id,
         })])
+    }
+
+    fn creating_node_placement_entry(&self) -> Result<NodePlacementEntry, CreateRealmError> {
+        let (location, weight) = normalize_node_placement_input(
+            self.config.node_location.as_deref(),
+            self.config.node_weight,
+        )
+        .map_err(|_| CreateRealmError::NodeLocationTooLong)?;
+        Ok(NodePlacementEntry {
+            node_id: self.config.actor.node_id,
+            location,
+            weight,
+            full: false,
+            draining: false,
+            labels: self.config.node_labels.clone(),
+        })
     }
 
     fn admin_reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
@@ -161,6 +189,36 @@ impl CreateRealmOperation {
             &self.config.actor,
             AdminDocumentOperation::RealmConfigDescriptionSet {
                 description: config_doc.description.clone(),
+            },
+        )?);
+        for strategy in &config_doc.strategies {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: strategy.clone(),
+                },
+            )?);
+        }
+        if let Some(default_strategy_id) = config_doc.default_strategy_id {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                    strategy_id: default_strategy_id,
+                },
+            )?);
+        }
+        for binding in &config_doc.strategy_bindings {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    binding: binding.clone(),
+                },
+            )?);
+        }
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::RealmConfigNodePlacementSet {
+                entry: self.creating_node_placement_entry()?,
             },
         )?);
 
@@ -357,6 +415,8 @@ pub enum CreateRealmError {
     RealmConfigDocNotFound,
     #[error("realm_admin role not found")]
     RealmAdminRoleNotFound,
+    #[error("placement location must be at most 64 characters")]
+    NodeLocationTooLong,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("creating realm did not finish")]
@@ -421,6 +481,10 @@ impl Operation for CreateRealmOperation {
     }
 }
 
+fn seed_placement_defaults(config: &mut RealmConfigDocument) {
+    config.seed_default_placement();
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -440,7 +504,8 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Actor, OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
         RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -468,7 +533,32 @@ mod test {
             actor,
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
         }
+    }
+
+    #[test]
+    fn creating_node_placement_entry_clamps_and_rejects() {
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let actor = actor(realm_id, 1, 2);
+
+        let mut clamped = config(actor.clone());
+        clamped.node_weight = Some(50_000);
+        clamped.node_location = Some("  eu-west  ".to_string());
+        let entry = CreateRealmOperation::new(clamped)
+            .creating_node_placement_entry()
+            .unwrap();
+        assert_eq!(entry.weight, aruna_core::structs::MAX_NODE_WEIGHT);
+        assert_eq!(entry.location, "eu-west");
+
+        let mut too_long = config(actor);
+        too_long.node_location = Some("x".repeat(65));
+        assert_eq!(
+            CreateRealmOperation::new(too_long).creating_node_placement_entry(),
+            Err(super::CreateRealmError::NodeLocationTooLong)
+        );
     }
 
     fn oidc_provider(id: &str) -> OidcProviderConfig {
@@ -595,11 +685,41 @@ mod test {
             Some(config_doc.description.as_str())
         );
 
+        let seeded_strategies = config_doc.strategies.clone();
+        let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
+        let seeded_bindings = config_doc.strategy_bindings.clone();
+        assert_eq!(seeded_strategies.len(), 2);
+        assert_eq!(seeded_strategies[0].name, "default");
+        assert_eq!(seeded_strategies[0].replica_count, Some(3));
+        assert_eq!(seeded_strategies[1].name, "everywhere");
+        assert_eq!(seeded_strategies[1].replica_count, None);
+        assert_eq!(
+            config_doc.default_strategy_id,
+            Some(seeded_strategies[0].strategy_id)
+        );
+        assert_eq!(seeded_bindings.len(), 2);
+        assert_eq!(
+            config_state.materialized_realm_config_default_strategy(),
+            Some(seeded_default_strategy_id)
+        );
+        assert_eq!(
+            config_state
+                .materialized_realm_config_placement_strategies()
+                .len(),
+            2
+        );
+        assert_eq!(
+            config_state
+                .materialized_realm_config_strategy_bindings()
+                .len(),
+            2
+        );
+
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 6);
+        assert_eq!(outbox_records.len(), 12);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -666,8 +786,96 @@ mod test {
                         description: config_doc.description,
                     },
                 ),
+                (
+                    6,
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: seeded_strategies[0].clone(),
+                    },
+                ),
+                (
+                    7,
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                        strategy: seeded_strategies[1].clone(),
+                    },
+                ),
+                (
+                    8,
+                    AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                        strategy_id: seeded_default_strategy_id,
+                    },
+                ),
+                (
+                    9,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[0].clone(),
+                    },
+                ),
+                (
+                    10,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[1].clone(),
+                    },
+                ),
+                (
+                    11,
+                    AdminDocumentOperation::RealmConfigNodePlacementSet {
+                        entry: NodePlacementEntry {
+                            node_id: actor.node_id,
+                            location: String::new(),
+                            weight: DEFAULT_NODE_WEIGHT,
+                            full: false,
+                            draining: false,
+                            labels: std::collections::BTreeMap::new(),
+                        },
+                    },
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn seeds_default_and_everywhere_strategies_with_class_bindings() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let txn_id = TxnId::new();
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.txn_id = Some(txn_id);
+        operation.auth_doc = Some(RealmAuthorizationDocument::new_default_realm_doc(realm_id));
+
+        let effects = operation.emit_create_config_doc().unwrap();
+        let writes = batch_writes(&effects, txn_id);
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+
+        let default = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "default")
+            .unwrap();
+        let everywhere = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "everywhere")
+            .unwrap();
+        assert_eq!(config_doc.default_strategy_id, Some(default.strategy_id));
+        assert_eq!(default.replica_count, Some(3));
+        assert!(!default.distinct_locations);
+        assert_eq!(everywhere.replica_count, None);
+
+        let bound_scopes = config_doc
+            .strategy_bindings
+            .iter()
+            .filter(|binding| binding.strategy_id == everywhere.strategy_id)
+            .map(|binding| binding.scope.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(config_doc.strategy_bindings.len(), 2);
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
     }
 
     #[test]
@@ -742,6 +950,9 @@ mod test {
             },
             realm_description: "A realm description".to_string(),
             oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

@@ -1179,6 +1179,9 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             driver_ctx.as_ref(),
         )

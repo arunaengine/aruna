@@ -95,6 +95,9 @@ pub struct BootstrapOnboardingRequestDoc {
     pub transport_public_key: Option<String>,
     pub issuer_public_key: Option<String>,
     pub issuer_proof: Option<String>,
+    pub node_location: Option<String>,
+    pub node_weight: Option<u32>,
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -402,6 +405,9 @@ pub async fn bootstrap_onboarding(
             local_node_id: state.get_node_id(),
             realm_signing_key,
             now: now_timestamp(),
+            node_location: request.node_location.clone(),
+            node_weight: request.node_weight,
+            node_labels: request.node_labels.clone(),
         },
         state.get_ctx(),
     )
@@ -472,6 +478,8 @@ fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
         BootstrapOnboardingFinalizeError::EnsureRealmConfig(
             EnsureRealmConfigError::NodeKindMismatch { .. },
         ) => ServerError::BadRequest,
+        BootstrapOnboardingFinalizeError::ReservedNodeLabel
+        | BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -578,7 +586,7 @@ fn wrap_realm_private_key(
 mod tests {
     use super::{
         ServerError, bootstrap_onboarding, create_onboarding_secret, list_onboarding_secrets,
-        revoke_onboarding_secret,
+        map_finalize_error, revoke_onboarding_secret,
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
@@ -597,6 +605,7 @@ mod tests {
         Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::bootstrap_onboarding_finalize::BootstrapOnboardingFinalizeError;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -668,6 +677,9 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -700,6 +712,18 @@ mod tests {
         );
 
         (state, realm_id, node_id, user_id, net_handle, tempdir)
+    }
+
+    #[test]
+    fn placement_validation_errors_map_to_bad_request() {
+        assert!(matches!(
+            map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel),
+            ServerError::BadRequest
+        ));
+        assert!(matches!(
+            map_finalize_error(BootstrapOnboardingFinalizeError::NodeLocationTooLong),
+            ServerError::BadRequest
+        ));
     }
 
     #[tokio::test]
@@ -755,6 +779,9 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some(issuer_signature),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await
@@ -982,6 +1009,9 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some("invalid-signature".to_string()),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await;
@@ -1009,6 +1039,9 @@ mod tests {
                 transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key),
                 issuer_proof: Some(issuer_signature),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await;
@@ -1062,6 +1095,9 @@ mod tests {
                 transport_public_key: Some(transport_public_key),
                 issuer_public_key: None,
                 issuer_proof: None,
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
         )
         .await

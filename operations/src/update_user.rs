@@ -9,13 +9,16 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, document_sync_revision_key,
     document_sync_revision_write_entry, stale_admin_document_conflict_delete_entries,
 };
-use aruna_core::structs::{Actor, AuthContext, Permission, RealmId, User};
+use aruna_core::structs::{
+    Actor, AuthContext, Permission, PlacementRef, RealmConfigDocument, RealmId, User,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, UserId};
 use aruna_core::user_update_validation::{
@@ -34,6 +37,7 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::placement::placement_ref_for_target;
 use crate::replicate_documents::replicate_documents_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
@@ -254,6 +258,10 @@ impl UpdateUserOperation {
                     DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
                     document_sync_revision_key(&document_target),
                 ),
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    ByteView::from(*self.input.actor.realm_id.as_bytes()),
+                ),
             ],
             txn_id: Some(txn_id),
         })]
@@ -272,10 +280,11 @@ impl UpdateUserOperation {
             (_, user_value),
             (_, reducer_state_value),
             (_, revision_value),
+            (_, realm_config_value),
         ] = values.as_slice()
         else {
             return self.unexpected_event(
-                "Event::Storage(StorageEvent::BatchReadResult) with user, admin state, and document revision values",
+                "Event::Storage(StorageEvent::BatchReadResult) with user, admin state, document revision, and realm config values",
                 got,
             );
         };
@@ -285,6 +294,7 @@ impl UpdateUserOperation {
             user_value.clone(),
             reducer_state_value.clone(),
             revision_value.clone(),
+            realm_config_value.clone(),
         ) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
@@ -297,6 +307,7 @@ impl UpdateUserOperation {
         user_value: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         revision_value: Option<ByteView>,
+        realm_config_value: Option<ByteView>,
     ) -> Result<Effects, UpdateUserError> {
         let current = user_value.ok_or(UpdateUserError::UserNotFound)?;
         let mut user = User::from_bytes(&current)?;
@@ -311,8 +322,10 @@ impl UpdateUserOperation {
         let previous_reducer_state = reducer_state_value
             .as_ref()
             .map(|value| {
-                postcard::from_bytes::<AdminDocumentReducerState>(value.as_ref())
-                    .map_err(ConversionError::from)
+                aruna_core::admin_document_reducer::decode_admin_document_reducer_state(
+                    value.as_ref(),
+                )
+                .map_err(ConversionError::from)
             })
             .transpose()?;
         if previous_reducer_state
@@ -335,8 +348,17 @@ impl UpdateUserOperation {
         let document_target = DocumentSyncTarget::User {
             user_id: user.user_id,
         };
-        let document_revision =
-            local_user_document_sync_change(previous_document_revision.as_ref(), &self.input.actor);
+        let placement = realm_config_value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()?
+            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .unwrap_or(PlacementRef::NIL);
+        let document_revision = local_user_document_sync_change(
+            previous_document_revision.as_ref(),
+            &self.input.actor,
+            placement,
+        );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
@@ -588,6 +610,7 @@ fn current_timestamp_ms() -> u64 {
 fn local_user_document_sync_change(
     previous_change: Option<&DocumentSyncChange>,
     actor: &Actor,
+    placement: PlacementRef,
 ) -> DocumentSyncChange {
     let updated_at_ms = current_timestamp_ms();
     let minimum_generation = previous_change
@@ -602,6 +625,7 @@ fn local_user_document_sync_change(
             updated_at_ms,
         },
         kind: DocumentSyncChangeKind::Upsert,
+        placement,
     }
 }
 
@@ -689,18 +713,20 @@ mod tests {
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
         document_sync_revision_key,
     };
-    use aruna_core::structs::{Actor, AuthContext, RealmId, User};
+    use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{TxnId, UserId};
     use aruna_core::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
     };
+    use byteview::ByteView;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use ulid::Ulid;
 
@@ -814,6 +840,7 @@ mod tests {
             ]),
             user_name: None,
             user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
         }
     }
 
@@ -838,13 +865,14 @@ mod tests {
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchRead { reads, txn_id: id }) => {
                 assert_eq!(*id, Some(txn_id));
-                assert_eq!(reads.len(), 3);
+                assert_eq!(reads.len(), 4);
                 assert_eq!(reads[0].0, USER_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
                 assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
                 assert_eq!(reads[1].1, admin_document_reducer_state_key(&target));
                 assert_eq!(reads[2].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
                 assert_eq!(reads[2].1, document_sync_revision_key(&document));
+                assert_eq!(reads[3].0, REALM_CONFIG_KEYSPACE);
             }
             other => panic!("unexpected read effect: {other:?}"),
         }
@@ -857,6 +885,7 @@ mod tests {
                 ),
                 (admin_document_reducer_state_key(&target), None),
                 (document_sync_revision_key(&document), None),
+                (ByteView::from(*realm_id.as_bytes()), None),
             ],
         }));
         let (updated, reducer_state) = match effects.first().unwrap() {
@@ -962,6 +991,7 @@ mod tests {
             base: None,
             current: document_revision(21, 42),
             kind: DocumentSyncChangeKind::Upsert,
+            placement: PlacementRef::NIL,
         };
 
         operation.start();
@@ -979,6 +1009,7 @@ mod tests {
                     document_sync_revision_key(&document_target),
                     Some(postcard::to_allocvec(&previous_revision).unwrap().into()),
                 ),
+                (ByteView::from(*realm_id.as_bytes()), None),
             ],
         }));
 
@@ -1042,6 +1073,7 @@ mod tests {
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
                 ),
                 (document_sync_revision_key(&document), None),
+                (ByteView::from(*realm_id.as_bytes()), None),
             ],
         }));
 

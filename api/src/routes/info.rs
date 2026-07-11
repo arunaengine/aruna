@@ -14,18 +14,23 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
+    RealmPlacementMutation,
+};
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
 use aruna_operations::status::load_node_observability_status;
 use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
@@ -34,7 +39,14 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info, get_realm_info, set_realm_quota, get_usage)
+    paths(
+        get_info,
+        get_realm_info,
+        get_realm_placement,
+        mutate_realm_placement,
+        set_realm_quota,
+        get_usage
+    )
 )]
 pub struct InfoApiDoc;
 
@@ -42,6 +54,10 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/info", get(get_info))
         .route("/info/realm", get(get_realm_info))
+        .route(
+            "/info/realm/placement",
+            get(get_realm_placement).patch(mutate_realm_placement),
+        )
         .route("/info/realm/quota", put(set_realm_quota))
         .route("/info/usage", get(get_usage))
 }
@@ -323,8 +339,335 @@ impl RealmQuotaConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementConfigResponse {
+    pub strategies: Vec<RealmPlacementStrategy>,
+    pub default_strategy_id: Option<String>,
+    pub bindings: Vec<RealmPlacementBinding>,
+    pub overrides: Vec<RealmPlacementOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementStrategy {
+    pub strategy_id: String,
+    pub name: String,
+    pub replica_count: Option<u32>,
+    pub distinct_locations: bool,
+    pub affinity: Vec<RealmPlacementAffinityRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementAffinityRule {
+    pub key: String,
+    pub value: String,
+    pub effect: RealmPlacementAffinityEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RealmPlacementAffinityEffect {
+    Filter,
+    Multiply { permille: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementBinding {
+    pub scope: RealmPlacementBindingScope,
+    pub strategy_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RealmPlacementBindingScope {
+    Realm,
+    Group {
+        group_id: String,
+    },
+    Class {
+        document_class: RealmPlacementDocumentClass,
+    },
+    MetadataPathPrefix {
+        prefix: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RealmPlacementDocumentClass {
+    Admin,
+    Group,
+    User,
+    Metadata,
+    MetadataRegistry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmPlacementOverride {
+    pub subject: String,
+    pub pinned: Vec<String>,
+    pub excluded: Vec<String>,
+    pub strategy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RealmPlacementMutationRequest {
+    UpsertStrategy {
+        strategy: RealmPlacementStrategy,
+    },
+    RemoveStrategy {
+        strategy_id: String,
+    },
+    SetDefaultStrategy {
+        strategy_id: String,
+    },
+    SetBinding {
+        binding: RealmPlacementBinding,
+    },
+    RemoveBinding {
+        scope: RealmPlacementBindingScope,
+    },
+    SetOverride {
+        placement_override: RealmPlacementOverride,
+    },
+    RemoveOverride {
+        subject: String,
+    },
+}
+
+impl RealmPlacementConfigResponse {
+    fn from_document(document: &RealmConfigDocument) -> Self {
+        Self {
+            strategies: document
+                .strategies
+                .iter()
+                .map(RealmPlacementStrategy::from)
+                .collect(),
+            default_strategy_id: document.default_strategy_id.map(|id| id.to_string()),
+            bindings: document
+                .strategy_bindings
+                .iter()
+                .map(RealmPlacementBinding::from)
+                .collect(),
+            overrides: document
+                .placement_overrides
+                .iter()
+                .map(RealmPlacementOverride::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&aruna_core::structs::PlacementStrategy> for RealmPlacementStrategy {
+    fn from(strategy: &aruna_core::structs::PlacementStrategy) -> Self {
+        Self {
+            strategy_id: strategy.strategy_id.to_string(),
+            name: strategy.name.clone(),
+            replica_count: strategy.replica_count,
+            distinct_locations: strategy.distinct_locations,
+            affinity: strategy
+                .affinity
+                .iter()
+                .map(|rule| RealmPlacementAffinityRule {
+                    key: rule.matcher.key.clone(),
+                    value: rule.matcher.value.clone(),
+                    effect: match rule.effect {
+                        aruna_core::structs::AffinityEffect::Filter => {
+                            RealmPlacementAffinityEffect::Filter
+                        }
+                        aruna_core::structs::AffinityEffect::Multiply { permille } => {
+                            RealmPlacementAffinityEffect::Multiply { permille }
+                        }
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RealmPlacementStrategy {
+    fn into_core(self) -> ServerResult<aruna_core::structs::PlacementStrategy> {
+        Ok(aruna_core::structs::PlacementStrategy {
+            strategy_id: parse_ulid(&self.strategy_id, "strategy_id")?,
+            name: self.name,
+            replica_count: self.replica_count,
+            distinct_locations: self.distinct_locations,
+            affinity: self
+                .affinity
+                .into_iter()
+                .map(|rule| aruna_core::structs::AffinityRule {
+                    matcher: aruna_core::structs::LabelMatch {
+                        key: rule.key,
+                        value: rule.value,
+                    },
+                    effect: match rule.effect {
+                        RealmPlacementAffinityEffect::Filter => {
+                            aruna_core::structs::AffinityEffect::Filter
+                        }
+                        RealmPlacementAffinityEffect::Multiply { permille } => {
+                            aruna_core::structs::AffinityEffect::Multiply { permille }
+                        }
+                    },
+                })
+                .collect(),
+        })
+    }
+}
+
+impl From<&aruna_core::structs::StrategyBinding> for RealmPlacementBinding {
+    fn from(binding: &aruna_core::structs::StrategyBinding) -> Self {
+        Self {
+            scope: RealmPlacementBindingScope::from(&binding.scope),
+            strategy_id: binding.strategy_id.to_string(),
+        }
+    }
+}
+
+impl RealmPlacementBinding {
+    fn into_core(self) -> ServerResult<aruna_core::structs::StrategyBinding> {
+        Ok(aruna_core::structs::StrategyBinding {
+            scope: self.scope.into_core()?,
+            strategy_id: parse_ulid(&self.strategy_id, "strategy_id")?,
+        })
+    }
+}
+
+impl From<&aruna_core::structs::BindingScope> for RealmPlacementBindingScope {
+    fn from(scope: &aruna_core::structs::BindingScope) -> Self {
+        match scope {
+            aruna_core::structs::BindingScope::Realm => Self::Realm,
+            aruna_core::structs::BindingScope::Group(group_id) => Self::Group {
+                group_id: group_id.to_string(),
+            },
+            aruna_core::structs::BindingScope::Class(document_class) => Self::Class {
+                document_class: RealmPlacementDocumentClass::from(*document_class),
+            },
+            aruna_core::structs::BindingScope::MetadataPathPrefix(prefix) => {
+                Self::MetadataPathPrefix {
+                    prefix: prefix.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl RealmPlacementBindingScope {
+    fn into_core(self) -> ServerResult<aruna_core::structs::BindingScope> {
+        Ok(match self {
+            Self::Realm => aruna_core::structs::BindingScope::Realm,
+            Self::Group { group_id } => {
+                aruna_core::structs::BindingScope::Group(parse_ulid(&group_id, "group_id")?)
+            }
+            Self::Class { document_class } => {
+                aruna_core::structs::BindingScope::Class(document_class.into())
+            }
+            Self::MetadataPathPrefix { prefix } => {
+                aruna_core::structs::BindingScope::MetadataPathPrefix(prefix)
+            }
+        })
+    }
+}
+
+impl From<aruna_core::structs::DocumentClass> for RealmPlacementDocumentClass {
+    fn from(document_class: aruna_core::structs::DocumentClass) -> Self {
+        match document_class {
+            aruna_core::structs::DocumentClass::Admin => Self::Admin,
+            aruna_core::structs::DocumentClass::Group => Self::Group,
+            aruna_core::structs::DocumentClass::User => Self::User,
+            aruna_core::structs::DocumentClass::Metadata => Self::Metadata,
+            aruna_core::structs::DocumentClass::MetadataRegistry => Self::MetadataRegistry,
+        }
+    }
+}
+
+impl From<RealmPlacementDocumentClass> for aruna_core::structs::DocumentClass {
+    fn from(document_class: RealmPlacementDocumentClass) -> Self {
+        match document_class {
+            RealmPlacementDocumentClass::Admin => Self::Admin,
+            RealmPlacementDocumentClass::Group => Self::Group,
+            RealmPlacementDocumentClass::User => Self::User,
+            RealmPlacementDocumentClass::Metadata => Self::Metadata,
+            RealmPlacementDocumentClass::MetadataRegistry => Self::MetadataRegistry,
+        }
+    }
+}
+
+impl From<&aruna_core::structs::PlacementOverride> for RealmPlacementOverride {
+    fn from(record: &aruna_core::structs::PlacementOverride) -> Self {
+        Self {
+            subject: hex::encode(&record.subject),
+            pinned: record.pinned.iter().map(ToString::to_string).collect(),
+            excluded: record.excluded.iter().map(ToString::to_string).collect(),
+            strategy_id: record.strategy_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+impl RealmPlacementOverride {
+    fn into_core(self) -> ServerResult<aruna_core::structs::PlacementOverride> {
+        Ok(aruna_core::structs::PlacementOverride {
+            subject: parse_subject(&self.subject)?,
+            pinned: parse_node_ids(self.pinned, "pinned")?,
+            excluded: parse_node_ids(self.excluded, "excluded")?,
+            strategy_id: self
+                .strategy_id
+                .map(|id| parse_ulid(&id, "strategy_id"))
+                .transpose()?,
+        })
+    }
+}
+
+impl RealmPlacementMutationRequest {
+    fn into_core(self) -> ServerResult<RealmPlacementMutation> {
+        Ok(match self {
+            Self::UpsertStrategy { strategy } => {
+                RealmPlacementMutation::UpsertStrategy(strategy.into_core()?)
+            }
+            Self::RemoveStrategy { strategy_id } => {
+                RealmPlacementMutation::RemoveStrategy(parse_ulid(&strategy_id, "strategy_id")?)
+            }
+            Self::SetDefaultStrategy { strategy_id } => {
+                RealmPlacementMutation::SetDefaultStrategy(parse_ulid(&strategy_id, "strategy_id")?)
+            }
+            Self::SetBinding { binding } => {
+                RealmPlacementMutation::SetBinding(binding.into_core()?)
+            }
+            Self::RemoveBinding { scope } => {
+                RealmPlacementMutation::RemoveBinding(scope.into_core()?)
+            }
+            Self::SetOverride { placement_override } => {
+                RealmPlacementMutation::SetOverride(placement_override.into_core()?)
+            }
+            Self::RemoveOverride { subject } => {
+                RealmPlacementMutation::RemoveOverride(parse_subject(&subject)?)
+            }
+        })
+    }
+}
+
+fn parse_ulid(value: &str, field: &str) -> ServerResult<Ulid> {
+    Ulid::from_string(value)
+        .map_err(|_| ServerError::BadRequestReason(format!("invalid {field}: {value}")))
+}
+
+fn parse_subject(value: &str) -> ServerResult<Vec<u8>> {
+    hex::decode(value)
+        .map_err(|_| ServerError::BadRequestReason("subject must be valid hex".to_string()))
+}
+
+fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::NodeId>> {
+    values
+        .into_iter()
+        .map(|value| {
+            value.parse::<aruna_core::NodeId>().map_err(|_| {
+                ServerError::BadRequestReason(format!("invalid node id in {field}: {value}"))
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmMetadataReplicationResponse {
-    pub default_replication_factor: u32,
+    pub default_replication_factor: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -342,6 +685,44 @@ pub struct RealmNodeInfoResponse {
     pub configured: bool,
     pub present: bool,
     pub connection_status: RealmNodeConnectionStatus,
+    /// Placement map entry (location/weight/status) when the node is mapped.
+    pub placement: Option<RealmNodePlacementResponse>,
+    /// Latest published node info document (labels/urls/utilization) if received.
+    pub info: Option<RealmNodeInfoDocumentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodePlacementResponse {
+    pub location: String,
+    pub weight: u32,
+    pub full: bool,
+    pub draining: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeInfoDocumentResponse {
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub urls: RealmNodeUrlsResponse,
+    pub utilization: RealmNodeUtilizationResponse,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeUrlsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RealmNodeUtilizationResponse {
+    pub storage_bytes_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents_held: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_permille: Option<u32>,
+    pub heartbeat_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -397,15 +778,54 @@ pub async fn get_realm_info(
         other => ServerError::InternalError(other.to_string()),
     })?;
     let present_nodes = load_realm_presence_best_effort(&state).await;
+    let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
     let response = map_realm_info_response(
         &state,
         config,
         present_nodes,
         interface_services_status(&state).await,
+        node_info_docs,
         auth.as_ref()
             .is_some_and(|auth| auth.realm_id == state.get_realm_id()),
     )?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+async fn load_node_info_documents_best_effort(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument> {
+    let node_ids: Vec<aruna_core::NodeId> = config
+        .nodes
+        .iter()
+        .filter_map(|node| node.node_id.parse().ok())
+        .collect();
+    match aruna_operations::node_info::read_node_info_documents(&state.get_ctx(), &node_ids).await {
+        Ok(documents) => documents,
+        Err(error) => {
+            warn!(error = %error, "Failed to load node info documents for realm info");
+            BTreeMap::new()
+        }
+    }
+}
+
+fn map_node_info_document(
+    document: &aruna_core::structs::NodeInfoDocument,
+) -> RealmNodeInfoDocumentResponse {
+    RealmNodeInfoDocumentResponse {
+        labels: document.labels.clone(),
+        urls: RealmNodeUrlsResponse {
+            api: document.urls.api.clone(),
+            s3: document.urls.s3.clone(),
+        },
+        utilization: RealmNodeUtilizationResponse {
+            storage_bytes_used: document.utilization.storage_bytes_used,
+            documents_held: document.utilization.documents_held,
+            load_permille: document.utilization.load_permille,
+            heartbeat_at_ms: document.utilization.heartbeat_at_ms,
+        },
+        updated_at_ms: document.updated_at_ms,
+    }
 }
 
 async fn authorize_realm_config_admin(
@@ -433,6 +853,97 @@ async fn authorize_realm_config_admin(
     }
 
     Ok(auth)
+}
+
+#[utoipa::path(
+    get,
+    path = "/info/realm/placement",
+    tag = "info",
+    responses(
+        (status = 200, description = "Realm placement configuration", body = RealmPlacementConfigResponse),
+        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
+        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_realm_placement(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
+    authorize_realm_config_admin(&state, auth).await?;
+    let document = drive(
+        GetRealmConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        aruna_operations::get_realm_config::GetRealmConfigError::DocumentNotFound => {
+            ServerError::NotFound
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok((
+        StatusCode::OK,
+        Json(RealmPlacementConfigResponse::from_document(&document)),
+    ))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/info/realm/placement",
+    tag = "info",
+    request_body = RealmPlacementMutationRequest,
+    responses(
+        (status = 200, description = "Updated realm placement configuration", body = RealmPlacementConfigResponse),
+        (status = 400, description = "Invalid placement mutation", body = crate::error::ErrorResponse),
+        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin or this is not a management node", body = crate::error::ErrorResponse),
+        (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse),
+        (status = 409, description = "Referenced strategy or concurrent transaction conflict", body = crate::error::ErrorResponse),
+        (status = 500, description = "Unexpected server error", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn mutate_realm_placement(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    request: Result<Json<RealmPlacementMutationRequest>, JsonRejection>,
+) -> ServerResult<(StatusCode, Json<RealmPlacementConfigResponse>)> {
+    let auth = authorize_realm_config_admin(&state, auth).await?;
+    let Json(request) =
+        request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
+    let mutation = request.into_core()?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: auth.realm_id,
+    };
+    let document = drive(
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig { actor, mutation }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_mutate_realm_placement_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(RealmPlacementConfigResponse::from_document(&document)),
+    ))
+}
+
+fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerError {
+    match error {
+        MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
+        MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
+        MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
+            format!("placement strategy {strategy_id} is currently referenced"),
+        ),
+        MutateRealmPlacementError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 #[utoipa::path(
@@ -630,6 +1141,7 @@ fn map_realm_info_response(
     config: RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
     interfaces: InterfaceServicesStatus,
+    node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
     include_user_quota_overrides: bool,
 ) -> ServerResult<RealmInfoResponse> {
     let discovery = serde_json::to_value(&config.discovery)
@@ -639,13 +1151,21 @@ fn map_realm_info_response(
         .nodes
         .iter()
         .map(|node| {
+            let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
-            let present = is_current
-                || node
-                    .node_id
-                    .parse::<aruna_core::NodeId>()
-                    .ok()
-                    .is_some_and(|node_id| present_nodes.contains(&node_id));
+            let present =
+                is_current || parsed.is_some_and(|node_id| present_nodes.contains(&node_id));
+            let placement = parsed
+                .and_then(|node_id| config.placement_entry(node_id))
+                .map(|entry| RealmNodePlacementResponse {
+                    location: entry.effective_location().to_string(),
+                    weight: entry.weight,
+                    full: entry.full,
+                    draining: entry.draining,
+                });
+            let info = parsed
+                .and_then(|node_id| node_info_docs.get(&node_id))
+                .map(map_node_info_document);
             RealmNodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind: RealmNodeKindInfo::from(&node.kind),
@@ -656,10 +1176,13 @@ fn map_realm_info_response(
                 } else {
                     RealmNodeConnectionStatus::Configured
                 },
+                placement,
+                info,
             }
         })
         .collect();
 
+    let default_replication_factor = config.effective_default_metadata_replication_factor();
     let mut quota = RealmQuotaConfig::from(config.quota);
     if !include_user_quota_overrides {
         quota.user_group_cap_overrides.clear();
@@ -669,7 +1192,7 @@ fn map_realm_info_response(
         realm_id: config.realm_id.to_string(),
         description: config.description,
         metadata_replication: RealmMetadataReplicationResponse {
-            default_replication_factor: config.metadata_replication.default_replication_factor,
+            default_replication_factor,
         },
         oidc_providers: config
             .oidc_providers
@@ -931,8 +1454,11 @@ mod tests {
     use super::{
         BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
         InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RealmQuotaConfig, RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus,
-        get_info, get_realm_info, get_usage, map_set_realm_quota_error, set_realm_quota,
+        RealmPlacementBinding, RealmPlacementBindingScope, RealmPlacementMutationRequest,
+        RealmPlacementOverride, RealmPlacementStrategy, RealmQuotaConfig,
+        RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus, get_info,
+        get_realm_info, get_realm_placement, get_usage, map_mutate_realm_placement_error,
+        map_set_realm_quota_error, mutate_realm_placement, set_realm_quota,
     };
     use crate::error::ServerError;
     use crate::openapi::ApiDoc;
@@ -946,15 +1472,18 @@ mod tests {
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::mutate_realm_placement::MutateRealmPlacementError;
     use aruna_operations::set_realm_quota::SetRealmQuotaError;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use axum::extract::State;
+    use axum::body::Body;
+    use axum::extract::{FromRequest, State};
     use axum::http::StatusCode;
     use axum::{Extension, Json};
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
+    use tower::ServiceExt;
     use ulid::Ulid;
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
@@ -1323,6 +1852,9 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: vec![],
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             &driver_ctx,
         )
@@ -1354,6 +1886,370 @@ mod tests {
         );
 
         (state, realm_id, user_id, tempdir)
+    }
+
+    fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    fn placement_strategy(strategy_id: Ulid) -> RealmPlacementStrategy {
+        RealmPlacementStrategy {
+            strategy_id: strategy_id.to_string(),
+            name: "hot".to_string(),
+            replica_count: Some(2),
+            distinct_locations: true,
+            affinity: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn realm_placement_admin_endpoints_require_auth_and_management_node() {
+        let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+        assert!(matches!(
+            get_realm_placement(State(state.clone()), Extension(None)).await,
+            Err(ServerError::Unauthorized)
+        ));
+
+        let (local_state, _tempdir) = setup_state().await;
+        let local_auth = AuthContext {
+            user_id: UserId::local(Ulid::new(), local_state.get_realm_id()),
+            realm_id: local_state.get_realm_id(),
+            path_restrictions: None,
+        };
+        assert!(matches!(
+            get_realm_placement(State(local_state), Extension(Some(local_auth))).await,
+            Err(ServerError::Forbidden)
+        ));
+
+        let request = RealmPlacementMutationRequest::RemoveOverride {
+            subject: "00".to_string(),
+        };
+        assert!(matches!(
+            mutate_realm_placement(State(state.clone()), Extension(None), Ok(Json(request))).await,
+            Err(ServerError::Unauthorized)
+        ));
+
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+        assert!(matches!(
+            get_realm_placement(State(state), Extension(Some(stranger))).await,
+            Err(ServerError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn realm_placement_strategy_default_binding_and_override_lifecycle() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = admin_auth(realm_id, admin);
+        let (_, Json(initial)) =
+            get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
+                .await
+                .unwrap();
+        let initial_default = initial.default_strategy_id.unwrap();
+        let strategy_id = Ulid::from_bytes([21; 16]);
+        let scope = RealmPlacementBindingScope::Realm;
+        let node_id = state.get_node_id().to_string();
+
+        for request in [
+            RealmPlacementMutationRequest::UpsertStrategy {
+                strategy: placement_strategy(strategy_id),
+            },
+            RealmPlacementMutationRequest::SetDefaultStrategy {
+                strategy_id: strategy_id.to_string(),
+            },
+            RealmPlacementMutationRequest::SetBinding {
+                binding: RealmPlacementBinding {
+                    scope: scope.clone(),
+                    strategy_id: strategy_id.to_string(),
+                },
+            },
+            RealmPlacementMutationRequest::SetOverride {
+                placement_override: RealmPlacementOverride {
+                    subject: "abcd".to_string(),
+                    pinned: vec![node_id],
+                    excluded: Vec::new(),
+                    strategy_id: Some(strategy_id.to_string()),
+                },
+            },
+        ] {
+            let (status, _) = mutate_realm_placement(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Ok(Json(request)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (_, Json(stored)) =
+            get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
+                .await
+                .unwrap();
+        assert_eq!(stored.default_strategy_id, Some(strategy_id.to_string()));
+        assert!(stored.strategies.iter().any(|strategy| {
+            strategy.strategy_id == strategy_id.to_string() && strategy.replica_count == Some(2)
+        }));
+        assert!(stored.bindings.iter().any(|binding| {
+            binding.scope == scope && binding.strategy_id == strategy_id.to_string()
+        }));
+        assert!(stored.overrides.iter().any(|record| {
+            record.subject == "abcd" && record.strategy_id == Some(strategy_id.to_string())
+        }));
+
+        let error = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
+                strategy_id: strategy_id.to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::Conflict(message) if message.contains("referenced")));
+
+        for request in [
+            RealmPlacementMutationRequest::RemoveOverride {
+                subject: "abcd".to_string(),
+            },
+            RealmPlacementMutationRequest::RemoveBinding {
+                scope: scope.clone(),
+            },
+            RealmPlacementMutationRequest::SetDefaultStrategy {
+                strategy_id: initial_default,
+            },
+            RealmPlacementMutationRequest::RemoveStrategy {
+                strategy_id: strategy_id.to_string(),
+            },
+        ] {
+            let (_status, _body) = mutate_realm_placement(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Ok(Json(request)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, Json(stored)) = get_realm_placement(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        assert!(
+            !stored
+                .strategies
+                .iter()
+                .any(|strategy| strategy.strategy_id == strategy_id.to_string())
+        );
+        assert!(!stored.bindings.iter().any(|binding| binding.scope == scope));
+        assert!(
+            !stored
+                .overrides
+                .iter()
+                .any(|record| record.subject == "abcd")
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_info_reports_finite_and_unbounded_default_strategy_replication() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = admin_auth(realm_id, admin);
+        let strategy_id = Ulid::from_bytes([24; 16]);
+
+        for request in [
+            RealmPlacementMutationRequest::UpsertStrategy {
+                strategy: placement_strategy(strategy_id),
+            },
+            RealmPlacementMutationRequest::SetDefaultStrategy {
+                strategy_id: strategy_id.to_string(),
+            },
+        ] {
+            let _ = mutate_realm_placement(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Ok(Json(request)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            info.metadata_replication.default_replication_factor,
+            Some(2)
+        );
+
+        let mut unbounded = placement_strategy(strategy_id);
+        unbounded.replica_count = None;
+        let _ = mutate_realm_placement(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
+                strategy: unbounded,
+            })),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert_eq!(info.metadata_replication.default_replication_factor, None);
+        assert_eq!(
+            serde_json::to_value(info.metadata_replication).unwrap()["default_replication_factor"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn realm_metadata_replication_schema_allows_unbounded_default() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let factor = &openapi["components"]["schemas"]["RealmMetadataReplicationResponse"]["properties"]
+            ["default_replication_factor"];
+        assert_eq!(
+            factor["type"],
+            serde_json::json!(["integer", "null"]),
+            "default_replication_factor schema must represent finite and unbounded defaults"
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_placement_rejects_zero_replicas_dangling_refs_and_invalid_strings() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let auth = admin_auth(realm_id, admin);
+        let missing = Ulid::from_bytes([22; 16]);
+        let mut zero = placement_strategy(missing);
+        zero.replica_count = Some(0);
+
+        for request in [
+            RealmPlacementMutationRequest::UpsertStrategy { strategy: zero },
+            RealmPlacementMutationRequest::SetDefaultStrategy {
+                strategy_id: missing.to_string(),
+            },
+            RealmPlacementMutationRequest::SetBinding {
+                binding: RealmPlacementBinding {
+                    scope: RealmPlacementBindingScope::Realm,
+                    strategy_id: missing.to_string(),
+                },
+            },
+            RealmPlacementMutationRequest::SetOverride {
+                placement_override: RealmPlacementOverride {
+                    subject: "00".to_string(),
+                    pinned: Vec::new(),
+                    excluded: Vec::new(),
+                    strategy_id: Some(missing.to_string()),
+                },
+            },
+        ] {
+            assert!(matches!(
+                mutate_realm_placement(
+                    State(state.clone()),
+                    Extension(Some(auth.clone())),
+                    Ok(Json(request))
+                )
+                .await,
+                Err(ServerError::BadRequestReason(_))
+            ));
+        }
+
+        for request in [
+            RealmPlacementMutationRequest::RemoveStrategy {
+                strategy_id: "not-a-ulid".to_string(),
+            },
+            RealmPlacementMutationRequest::RemoveOverride {
+                subject: "not-hex".to_string(),
+            },
+            RealmPlacementMutationRequest::SetOverride {
+                placement_override: RealmPlacementOverride {
+                    subject: "00".to_string(),
+                    pinned: vec!["not-a-node".to_string()],
+                    excluded: Vec::new(),
+                    strategy_id: None,
+                },
+            },
+        ] {
+            assert!(matches!(
+                mutate_realm_placement(
+                    State(state.clone()),
+                    Extension(Some(auth.clone())),
+                    Ok(Json(request))
+                )
+                .await,
+                Err(ServerError::BadRequestReason(_))
+            ));
+        }
+
+        let request = axum::http::Request::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"mutation":"remove_override","subject":"00","extra":true}"#,
+            ))
+            .unwrap();
+        let rejection = Json::<RealmPlacementMutationRequest>::from_request(request, &())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            mutate_realm_placement(State(state), Extension(Some(auth)), Err(rejection)).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn realm_placement_route_is_registered() {
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let response = crate::routes::rest_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/info/realm/placement")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn openapi_registers_realm_placement_get_patch_and_schemas() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let path = &openapi["paths"]["/info/realm/placement"];
+        assert!(path.get("get").is_some());
+        assert!(path.get("patch").is_some());
+        assert!(
+            openapi["components"]["schemas"]
+                .get("RealmPlacementMutationRequest")
+                .is_some()
+        );
+        assert!(
+            openapi["components"]["schemas"]
+                .get("RealmPlacementConfigResponse")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn realm_placement_transaction_conflict_maps_to_http_conflict() {
+        let error = map_mutate_realm_placement_error(MutateRealmPlacementError::StorageError(
+            StorageError::TransactionConflict,
+        ));
+        assert!(matches!(
+            error,
+            ServerError::Conflict(message) if message.contains("retry")
+        ));
+    }
+
+    #[test]
+    fn realm_placement_missing_config_maps_to_not_found() {
+        assert!(matches!(
+            map_mutate_realm_placement_error(MutateRealmPlacementError::RealmConfigNotFound),
+            ServerError::NotFound
+        ));
     }
 
     #[tokio::test]
@@ -1450,6 +2346,90 @@ mod tests {
             authenticated.quota.user_group_cap_overrides[0].user_id,
             admin.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn get_realm_info_includes_placement_and_node_info() {
+        use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+        use aruna_core::structs::{
+            NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
+        };
+
+        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let node_id = state.get_node_id();
+
+        // The creating node's placement entry is seeded at realm creation with
+        // the default location/weight. Publish a node info document for it too.
+        let document = NodeInfoDocument {
+            node_id,
+            labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
+            urls: NodeUrls {
+                api: None,
+                s3: Some("s3.example".to_string()),
+            },
+            utilization: NodeUtilization {
+                storage_bytes_used: 4_096,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 1_700_000_000_000,
+            },
+            updated_at_ms: 1_700_000_000_500,
+        };
+        state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: NODE_INFO_KEYSPACE.to_string(),
+                key: node_info_storage_key(node_id).into(),
+                value: document.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let node = info
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id.to_string())
+            .expect("creating node present in realm info");
+
+        let placement = node.placement.as_ref().expect("placement entry present");
+        assert_eq!(placement.location, "default");
+        assert_eq!(placement.weight, 100);
+        assert!(!placement.full);
+        assert!(!placement.draining);
+
+        let node_info = node.info.as_ref().expect("node info document present");
+        assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
+        assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
+        assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
+        let serialized = serde_json::to_value(node_info).unwrap();
+        assert!(serialized["urls"].get("api").is_none());
+        assert!(serialized["utilization"].get("documents_held").is_none());
+        assert!(serialized["utilization"].get("load_permille").is_none());
+    }
+
+    #[test]
+    fn node_info_openapi_marks_optional_fields_as_not_required() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (schema, optional_fields) in [
+            ("RealmNodeUrlsResponse", &["api", "s3"][..]),
+            (
+                "RealmNodeUtilizationResponse",
+                &["documents_held", "load_permille"][..],
+            ),
+        ] {
+            let schema = &openapi["components"]["schemas"][schema];
+            for field in optional_fields {
+                assert!(schema["properties"].get(field).is_some());
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .is_some_and(|required| required.iter().any(|value| value == field))
+                );
+            }
+        }
     }
 
     #[tokio::test]

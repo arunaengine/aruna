@@ -3066,6 +3066,7 @@ mod tests {
         realm_id: RealmId,
     ) {
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
         for node in nodes {
             config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
         }

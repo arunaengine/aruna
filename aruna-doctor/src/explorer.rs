@@ -86,9 +86,9 @@ struct TopicListEntry {
     topic_id: String,
     target: JsonDocumentSyncTarget,
     status: &'static str,
-    desired_peer_count: usize,
-    selected_peer_count: usize,
-    missing_peer_count: usize,
+    desired_holder_count: usize,
+    selected_holder_count: usize,
+    missing_holder_count: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -97,7 +97,7 @@ struct TopicStatusOutput {
     topic_id: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pending_placement: Option<JsonPendingDocumentPlacement>,
+    placement: Option<JsonPendingDocumentPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -496,26 +496,32 @@ impl Serialize for JsonPendingDocumentPlacement {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingDocumentPlacement", 8)?;
+        let mut state = serializer.serialize_struct("PendingDocumentPlacement", 11)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
+        state.serialize_field("origin_node_id", &self.0.origin_node_id.to_string())?;
         state.serialize_field(
-            "authoritative_node_id",
-            &self.0.authoritative_node_id.to_string(),
+            "group_id",
+            &self.0.group_id.map(|group_id| group_id.to_string()),
         )?;
-        state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
+        state.serialize_field("metadata_path", &self.0.metadata_path)?;
+        state.serialize_field("desired_holder_count", &self.0.desired_holder_count)?;
         state.serialize_field(
-            "selected_peers",
+            "selected_holders",
             &self
                 .0
-                .selected_peers
+                .selected_holders
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
         )?;
-        state.serialize_field("missing_peer_count", &placement_missing_peer_count(&self.0))?;
+        state.serialize_field(
+            "missing_holder_count",
+            &placement_missing_holder_count(&self.0),
+        )?;
         state.serialize_field("updated_at", &self.0.updated_at)?;
+        state.serialize_field("placement", &self.0.placement)?;
         state.end()
     }
 }
@@ -524,14 +530,21 @@ fn placement_topic_id(placement: &PendingDocumentPlacement) -> String {
     placement.target.sync_topic_id().to_string()
 }
 
-fn placement_missing_peer_count(placement: &PendingDocumentPlacement) -> usize {
-    let mut selected_peers = placement.selected_peers.clone();
-    selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
-    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    selected_peers.dedup();
+fn placement_missing_holder_count(placement: &PendingDocumentPlacement) -> usize {
+    let mut selected_holders = placement.selected_holders.clone();
+    selected_holders.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    selected_holders.dedup();
     placement
-        .desired_peer_count
-        .saturating_sub(selected_peers.len().saturating_add(1))
+        .desired_holder_count
+        .saturating_sub(selected_holders.len())
+}
+
+fn placement_status(placement: &PendingDocumentPlacement) -> &'static str {
+    if placement_missing_holder_count(placement) == 0 {
+        "satisfied"
+    } else {
+        "under_replicated"
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -578,6 +591,10 @@ enum JsonDocumentSyncTarget {
     WatchSubscription {
         owner: String,
         watch_id: String,
+    },
+    NodeInfo {
+        realm_id: String,
+        node_id: String,
     },
 }
 
@@ -647,6 +664,10 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
                 watch_id: watch_id.to_string(),
             }
         }
+        DocumentSyncTarget::NodeInfo { realm_id, node_id } => JsonDocumentSyncTarget::NodeInfo {
+            realm_id: realm_id.to_string(),
+            node_id: node_id.to_string(),
+        },
     }
 }
 
@@ -1130,10 +1151,10 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
         .map(|placement| TopicListEntry {
             topic_id: placement_topic_id(&placement),
             target: json_document_sync_target(&placement.target),
-            status: "under_replicated",
-            desired_peer_count: placement.desired_peer_count,
-            selected_peer_count: placement.selected_peers.len(),
-            missing_peer_count: placement_missing_peer_count(&placement),
+            status: placement_status(&placement),
+            desired_holder_count: placement.desired_holder_count,
+            selected_holder_count: placement.selected_holders.len(),
+            missing_holder_count: placement_missing_holder_count(&placement),
         })
         .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
@@ -1148,21 +1169,20 @@ fn topic_status_output(
     database_path: &str,
     topic_id: &str,
 ) -> Result<TopicStatusOutput, ExplorerError> {
-    let pending_placement = load_pending_placements(database_path)?
+    let placement = load_pending_placements(database_path)?
         .into_iter()
         .find(|placement| placement_topic_id(placement) == topic_id)
         .map(JsonPendingDocumentPlacement);
-    let status = if pending_placement.is_some() {
-        "under_replicated"
-    } else {
-        "not_pending"
-    };
+    let status = placement
+        .as_ref()
+        .map(|placement| placement_status(&placement.0))
+        .unwrap_or("untracked");
 
     Ok(TopicStatusOutput {
         database_path: database_path.to_string(),
         topic_id: topic_id.to_string(),
         status,
-        pending_placement,
+        placement,
     })
 }
 
@@ -1497,7 +1517,7 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        placement_missing_peer_count, raw_field,
+        placement_missing_holder_count, placement_status, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1802,15 +1822,35 @@ mod tests {
             realm_id: RealmId::from_bytes([4_u8; 32]),
         };
         let realm_id = RealmId::from_bytes([4_u8; 32]);
-        let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
-        let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
-        let placement = aruna_operations::sync_placement::new_placement(
+        let selected_holder = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
+        let origin_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
+        let group_id = Ulid::from_bytes([8_u8; 16]);
+        let placement = aruna_operations::sync_placement::new_placement_with_context(
             realm_id,
             target.clone(),
-            authoritative_node_id,
+            origin_node_id,
+            Some(group_id),
+            Some("datasets/doctor".to_string()),
             3,
-            vec![selected_peer],
+            vec![selected_holder],
+            aruna_core::structs::PlacementRef::NIL,
         );
+        let json = serde_json::to_value(super::JsonPendingDocumentPlacement(placement.clone()))
+            .expect("placement serializes as JSON");
+        assert_eq!(json["origin_node_id"], origin_node_id.to_string());
+        assert_eq!(json["desired_holder_count"], 3);
+        assert_eq!(json["missing_holder_count"], 2);
+        assert_eq!(placement_status(&placement), "under_replicated");
+        assert_eq!(json["group_id"], group_id.to_string());
+        assert_eq!(json["metadata_path"], "datasets/doctor");
+        assert!(json.get("authoritative_node_id").is_none());
+        let mut completed = placement.clone();
+        completed.selected_holders = vec![
+            selected_holder,
+            origin_node_id,
+            iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
+        ];
+        assert_eq!(placement_status(&completed), "satisfied");
         let value = postcard::to_allocvec(&placement).unwrap();
         let key = aruna_operations::sync_placement::placement_key(realm_id, &target);
 
@@ -1825,10 +1865,12 @@ mod tests {
             DecodedValue::PendingDocumentPlacement { data } => {
                 assert_eq!(data.0.realm_id, realm_id);
                 assert_eq!(data.0.target, target);
-                assert_eq!(data.0.authoritative_node_id, authoritative_node_id);
-                assert_eq!(data.0.desired_peer_count, 3);
-                assert_eq!(data.0.selected_peers, vec![selected_peer]);
-                assert_eq!(placement_missing_peer_count(&data.0), 1);
+                assert_eq!(data.0.origin_node_id, origin_node_id);
+                assert_eq!(data.0.desired_holder_count, 3);
+                assert_eq!(data.0.selected_holders, vec![selected_holder]);
+                assert_eq!(data.0.group_id, Some(group_id));
+                assert_eq!(data.0.metadata_path.as_deref(), Some("datasets/doctor"));
+                assert_eq!(placement_missing_holder_count(&data.0), 2);
             }
             other => panic!("expected pending topic placement, got {other:?}"),
         }

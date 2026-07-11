@@ -658,6 +658,9 @@ mod tests {
                     },
                     realm_description: "Snapshot Test Realm".to_string(),
                     oidc_providers: Vec::new(),
+                    node_location: None,
+                    node_weight: None,
+                    node_labels: Default::default(),
                 }),
                 context.as_ref(),
             )

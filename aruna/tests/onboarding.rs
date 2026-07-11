@@ -8,6 +8,9 @@ use aruna_core::handle::Handle;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
 use aruna_core::structs::{Actor, User};
 use aruna_operations::driver::drive;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::node_info::read_node_info_document;
+use aruna_operations::placement::build_view;
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
@@ -77,6 +80,46 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
+    let issuer_info = read_node_info_document(&joiner.context.storage_handle, seed.net.node_id())
+        .await?
+        .expect("issuer node info should be fetched from the onboarding ticket");
+    let seed_info = read_node_info_document(&seed.context.storage_handle, seed.net.node_id())
+        .await?
+        .expect("seed fixture should publish issuer node info");
+    assert_eq!(issuer_info, seed_info);
+    assert_eq!(issuer_info.node_id, seed.net.node_id());
+    assert_eq!(issuer_info.urls.api, None);
+    assert_eq!(issuer_info.urls.s3, None);
+    assert_eq!(issuer_info.utilization.documents_held, None);
+    assert_eq!(issuer_info.utilization.load_permille, None);
+    let realm_config = drive(
+        GetRealmConfigOperation::new(joiner.config.realm_id),
+        joiner.context.as_ref(),
+    )
+    .await?;
+    let selector_labels = build_view(&realm_config)
+        .nodes
+        .into_iter()
+        .find(|node| node.node_id == joiner.config.node_id)
+        .expect("joiner should be in the placement view")
+        .labels;
+    let joiner_info =
+        read_node_info_document(&joiner.context.storage_handle, joiner.config.node_id)
+            .await?
+            .expect("joiner startup should seed its node info after fetching realm config");
+    assert_eq!(joiner_info.node_id, joiner.config.node_id);
+    assert_eq!(joiner_info.labels, selector_labels);
+    assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");
+    assert_eq!(
+        joiner_info.urls.api.as_deref(),
+        Some("https://api.joiner.example.test")
+    );
+    assert_eq!(
+        joiner_info.urls.s3.as_deref(),
+        Some("https://s3.joiner.example.test")
+    );
+    assert_eq!(joiner_info.utilization.documents_held, None);
+    assert_eq!(joiner_info.utilization.load_permille, None);
 
     wait_for_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],

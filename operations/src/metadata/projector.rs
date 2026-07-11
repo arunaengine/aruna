@@ -16,8 +16,9 @@ use aruna_core::metadata::{
     MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_document_lifecycle_revision_change, metadata_event_log_key,
-    metadata_graph_lifecycle_key, metadata_materialization_status_key,
+    document_placement_delete_entry, document_placement_write_entry,
+    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
+    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
     metadata_pending_projection_delete_entry, metadata_pending_projection_key,
     metadata_pending_projection_target, metadata_registry_delete_entries,
 };
@@ -45,7 +46,12 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
-use crate::sync_placement::{complete_authoritative_holders, sort_node_ids};
+use crate::placement::{
+    PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
+};
+use crate::sync_placement::{
+    new_placement_with_context, placement_satisfied, schedule_placement_retry_effect, sort_node_ids,
+};
 use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
@@ -397,6 +403,7 @@ pub async fn project_metadata_create_events(
     let mut outboxes = Vec::new();
     let mut pending_projection_delete_targets = BTreeSet::new();
     let mut pending_projection_retry_targets = BTreeSet::new();
+    let mut placement_retries = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
@@ -437,6 +444,12 @@ pub async fn project_metadata_create_events(
             repair_deletes.extend(metadata_registry_delete_entries(
                 stale_record.group_id,
                 stale_record.document_id,
+            ));
+            repair_deletes.push(document_placement_delete_entry(
+                stale_record.realm_id,
+                &DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: stale_record.document_id,
+                },
             ));
             repaired_records.push(stale_record.clone());
             registry_cache.insert(document_id, None);
@@ -494,10 +507,45 @@ pub async fn project_metadata_create_events(
 
         let outbox = if local_node_id == Some(event.node_id)
             && (!registry_exists || needs_materialization || holders_changed)
+            && !event.record.holder_node_ids.is_empty()
         {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
-            Some(create_event_outbox_record(&event, true))
+            Some(create_event_outbox_record(
+                &event,
+                realm_configs
+                    .get(&event.record.realm_id)
+                    .and_then(|config| config.as_ref()),
+                true,
+            ))
+        } else {
+            None
+        };
+        let lifecycle_placement = if local_node_id == Some(event.node_id) {
+            let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: event.record.document_id,
+            };
+            let context = PlacementResolutionContext {
+                group_id: Some(event.record.group_id),
+                metadata_path: Some(event.record.document_path.as_str()),
+            };
+            let plan = realm_configs
+                .get(&event.record.realm_id)
+                .and_then(|config| config.as_ref())
+                .and_then(|config| plan_target_placement(config, &target, context));
+            let (desired_count, holders, placement) = plan
+                .map(|plan| (plan.desired_count, plan.holders, plan.placement))
+                .unwrap_or((1, Vec::new(), aruna_core::structs::PlacementRef::NIL));
+            Some(new_placement_with_context(
+                event.record.realm_id,
+                target,
+                event.node_id,
+                Some(event.record.group_id),
+                Some(event.record.document_path.clone()),
+                desired_count,
+                holders,
+                placement,
+            ))
         } else {
             None
         };
@@ -526,6 +574,22 @@ pub async fn project_metadata_create_events(
         }
         if let Some(outbox) = outbox {
             outboxes.push(outbox);
+        }
+        if let Some(placement) = lifecycle_placement {
+            if !placement_satisfied(
+                placement.selected_holders.len(),
+                placement.desired_holder_count,
+            ) {
+                placement_retries.insert((placement.realm_id, placement.origin_node_id));
+            }
+            writes.push(document_placement_write_entry(&placement)?);
+        }
+        if local_node_id == Some(event.node_id) {
+            writes.push(metadata_document_lifecycle_write_entry(
+                &MetadataDocumentLifecycleRecord::Upsert {
+                    event: Box::new(event.clone()),
+                },
+            )?);
         }
         registry_cache.insert(document_id, Some(event.record.clone()));
         projected_records.push(event.record);
@@ -583,6 +647,7 @@ pub async fn project_metadata_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
+    schedule_placement_retries(context, placement_retries).await?;
     write_pending_projection_markers(context, &pending_projection_retry_targets).await?;
     delete_pending_projection_markers(context, pending_projection_delete_targets).await?;
 
@@ -593,6 +658,35 @@ pub async fn project_metadata_create_events(
     }
 
     Ok(projected)
+}
+
+async fn schedule_placement_retries(
+    context: &DriverContext,
+    retries: BTreeSet<(RealmId, NodeId)>,
+) -> Result<(), MetadataProjectionError> {
+    for (realm_id, node_id) in retries {
+        let Effect::Task(effect) = schedule_placement_retry_effect(realm_id, node_id) else {
+            unreachable!("placement retry helper must return a task effect");
+        };
+        persist_task_effect(&context.storage_handle, &effect)
+            .await
+            .map_err(MetadataProjectionError::UnexpectedEvent)?;
+        let Some(task_handle) = context.task_handle.as_ref() else {
+            continue;
+        };
+        match task_handle.send_effect(Effect::Task(effect)).await {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                return Err(MetadataProjectionError::UnexpectedEvent(message));
+            }
+            other => {
+                return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn write_pending_projection_markers(
@@ -719,21 +813,6 @@ fn expand_create_event_holders(
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
-
-    let Some(realm_config) = realm_config else {
-        if !holders.contains(&event.node_id) {
-            holders.push(event.node_id);
-        }
-        sort_node_ids(&mut holders);
-        event.record.holder_node_ids = holders;
-        return Ok(event);
-    };
-
-    let candidates = realm_config.sync_eligible_node_ids()?;
-    holders.retain(|node_id| candidates.contains(node_id));
-    if candidates.contains(&event.node_id) && !holders.contains(&event.node_id) {
-        holders.push(event.node_id);
-    }
     sort_node_ids(&mut holders);
 
     if local_node_id != Some(event.node_id) {
@@ -744,13 +823,14 @@ fn expand_create_event_holders(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let desired_holder_count = realm_config.metadata_replication_factor_for(
-        event.record.group_id,
-        Some(event.record.document_path.as_str()),
-    );
-
-    event.record.holder_node_ids =
-        complete_authoritative_holders(&target, &candidates, &holders, desired_holder_count);
+    let context = PlacementResolutionContext {
+        group_id: Some(event.record.group_id),
+        metadata_path: Some(event.record.document_path.as_str()),
+    };
+    event.record.holder_node_ids = realm_config
+        .and_then(|config| plan_target_placement(config, &target, context))
+        .map(|plan| plan.holders)
+        .unwrap_or_default();
     Ok(event)
 }
 
@@ -777,18 +857,34 @@ async fn read_realm_config(
 
 pub fn create_event_outbox_record(
     event: &MetadataCreateEventRecord,
+    realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
-    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id);
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: event.record.document_id,
+    };
+    // The origin knows the governing strategy: stamp the real reference so the
+    // metadata create/lifecycle envelope carries it (else the nil fallback).
+    let placement = realm_config
+        .map(|config| {
+            placement_ref_for_target(
+                config,
+                &target,
+                PlacementResolutionContext {
+                    group_id: Some(event.record.group_id),
+                    metadata_path: Some(event.record.document_path.as_str()),
+                },
+            )
+        })
+        .unwrap_or(aruna_core::structs::PlacementRef::NIL);
+    let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
-        target: DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: event.record.document_id,
-        },
+        target,
         peers: event.record.holder_node_ids.clone(),
         event: DocumentSyncOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(&lifecycle)
@@ -948,7 +1044,7 @@ mod tests {
     use aruna_core::storage_entries::{
         metadata_create_event_write_entry, metadata_pending_projection_key,
     };
-    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -1013,6 +1109,7 @@ mod tests {
 
     fn realm_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.seed_default_placement();
         for node in nodes {
             config.ensure_node(*node, RealmNodeKind::Server);
         }
@@ -1201,8 +1298,198 @@ mod tests {
                 .expect("holders expand");
 
         assert_eq!(expanded.record.holder_node_ids.len(), 3);
-        assert!(expanded.record.holder_node_ids.contains(&event.node_id));
         assert_eq!(expanded.record.last_event_id, event.event_id);
+    }
+
+    #[tokio::test]
+    async fn local_projection_persists_exact_contextual_placement_inventory() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let event = create_event();
+        let config = realm_config(event.record.realm_id, &[event.node_id, node(2), node(3)]);
+        write_entries(
+            &storage,
+            vec![(
+                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*event.record.realm_id.as_bytes()),
+                ByteView::from(postcard::to_allocvec(&config).expect("config serializes")),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        project_metadata_create_event(&context, event.clone(), Some(event.node_id))
+            .await
+            .expect("projection succeeds");
+
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let value = match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
+                key: crate::sync_placement::placement_key(event.record.realm_id, &target),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(value), ..
+            }) => value,
+            other => panic!("expected placement inventory, got {other:?}"),
+        };
+        let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
+        let expected = plan_target_placement(
+            &config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(event.record.group_id),
+                metadata_path: Some(event.record.document_path.as_str()),
+            },
+        )
+        .expect("placement resolves");
+        let mut expected_holders = expected.holders;
+        sort_node_ids(&mut expected_holders);
+
+        assert_eq!(placement.group_id, Some(event.record.group_id));
+        assert_eq!(
+            placement.metadata_path.as_deref(),
+            Some(event.record.document_path.as_str())
+        );
+        assert_eq!(placement.desired_holder_count, expected.desired_count);
+        assert_eq!(placement.selected_holders, expected_holders);
+        assert_eq!(placement.placement, expected.placement);
+    }
+
+    #[tokio::test]
+    async fn local_projection_with_no_eligible_holders_keeps_placement_pending_without_outbox() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let event = create_event();
+        let config = realm_config(event.record.realm_id, &[]);
+        write_entries(
+            &storage,
+            vec![(
+                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*event.record.realm_id.as_bytes()),
+                ByteView::from(postcard::to_allocvec(&config).expect("config serializes")),
+            )],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        project_metadata_create_event(&context, event.clone(), Some(event.node_id))
+            .await
+            .expect("projection succeeds");
+
+        let outboxes = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            outboxes,
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
+        ));
+
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let placement = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
+                key: crate::sync_placement::placement_key(event.record.realm_id, &target),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = placement
+        else {
+            panic!("expected pending placement inventory, got {placement:?}");
+        };
+        let placement = crate::sync_placement::decode_placement(&value).expect("placement decodes");
+        assert_eq!(placement.desired_holder_count, 3);
+        assert!(placement.selected_holders.is_empty());
+
+        let lifecycle = storage
+            .send_effect(crate::document_repository::read_effect(&target, None))
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = lifecycle
+        else {
+            panic!("origin must retain lifecycle transfer source, got {lifecycle:?}");
+        };
+        let lifecycle: MetadataDocumentLifecycleRecord =
+            postcard::from_bytes(&value).expect("lifecycle decodes");
+        let mut expected_event = event;
+        expected_event.record.holder_node_ids.clear();
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(expected_event)
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_strategy_replica_count_overrides_legacy_factor() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids = vec![node(1), node(4)];
+        let mut config = RealmConfigDocument::new(event.record.realm_id, Vec::new(), 4);
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            name: "metadata-two".to_string(),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        config.default_strategy_id = Some(strategy.strategy_id);
+        config.strategies = vec![strategy];
+        for candidate in [node(1), node(2), node(3), node(4)] {
+            config.ensure_node(candidate, RealmNodeKind::Server);
+        }
+
+        let expanded =
+            expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
+                .expect("holders resolve");
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let expected = plan_target_placement(
+            &config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(event.record.group_id),
+                metadata_path: Some(event.record.document_path.as_str()),
+            },
+        )
+        .expect("strategy resolves")
+        .holders;
+
+        assert_eq!(config.metadata_replication.default_replication_factor, 4);
+        assert_eq!(expanded.record.holder_node_ids, expected);
+        assert_eq!(expanded.record.holder_node_ids.len(), 2);
     }
 
     #[test]
@@ -1211,6 +1498,7 @@ mod tests {
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
         let mut config = RealmConfigDocument::new(event.record.realm_id, Vec::new(), 3);
+        config.seed_default_placement();
         config.ensure_node(node(1), RealmNodeKind::User);
         config.ensure_node(node(2), RealmNodeKind::Server);
         config.ensure_node(node(3), RealmNodeKind::Server);
@@ -1219,9 +1507,11 @@ mod tests {
         let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
             .expect("holders expand");
 
+        let mut actual = expanded.record.holder_node_ids;
+        sort_node_ids(&mut actual);
         let mut expected = vec![node(2), node(3), node(4)];
         sort_node_ids(&mut expected);
-        assert_eq!(expanded.record.holder_node_ids, expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1238,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_recipient_preserves_single_authoritative_holder() {
+    fn metadata_recipient_does_not_synthesize_origin_holder() {
         let mut event = create_event();
         event.node_id = node(1);
         event.record.holder_node_ids.clear();
@@ -1247,13 +1537,13 @@ mod tests {
         let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
             .expect("holders normalize");
 
-        assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
+        assert!(expanded.record.holder_node_ids.is_empty());
     }
 
     #[test]
     fn create_event_outbox_record_uses_document_lifecycle_stream() {
         let event = create_event();
-        let outbox = create_event_outbox_record(&event, true);
+        let outbox = create_event_outbox_record(&event, None, true);
 
         assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
@@ -1280,6 +1570,33 @@ mod tests {
             aruna_core::document::DocumentSyncChangeKind::Upsert
         );
         assert_eq!(change.current.event_id, event.event_id);
+    }
+
+    #[test]
+    fn create_and_update_stamp_equal_placement_refs() {
+        let create = create_event();
+        let config = realm_config(create.record.realm_id, &[node(1), node(2)]);
+
+        // An update of the same document reuses its id and path; only the event
+        // identity/timestamps advance.
+        let mut update = create.clone();
+        update.event_id = Ulid::new();
+        update.record.last_event_id = update.event_id;
+        update.record.updated_at_ms = create.record.updated_at_ms + 1;
+        update.occurred_at_ms = create.occurred_at_ms + 1;
+
+        let placement_of = |event: &MetadataCreateEventRecord| {
+            let DocumentSyncOutboxEvent::Upsert { change, .. } =
+                create_event_outbox_record(event, Some(&config), true).event
+            else {
+                panic!("expected upsert outbox event");
+            };
+            change.placement
+        };
+
+        let create_ref = placement_of(&create);
+        assert_ne!(create_ref, aruna_core::structs::PlacementRef::NIL);
+        assert_eq!(create_ref, placement_of(&update));
     }
 
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {

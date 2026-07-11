@@ -1,22 +1,26 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
-    metadata_document_key, metadata_event_log_prefix, metadata_graph_lifecycle_write_entry,
-    metadata_pending_projection_key, metadata_registry_key, metadata_registry_write_entries,
+    document_placement_key, metadata_create_event_and_pending_projection_write_entries,
+    metadata_create_event_write_entry, metadata_document_key, metadata_event_log_prefix,
+    metadata_graph_lifecycle_write_entry, metadata_pending_projection_key, metadata_registry_key,
+    metadata_registry_write_entries,
 };
-use aruna_core::structs::{Actor, MetadataRegistryRecord, RealmId};
+use aruna_core::structs::{
+    Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -40,6 +44,7 @@ use aruna_operations::update_metadata_document::{
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -103,6 +108,17 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
 
     let replayed = replay_metadata_event_log(test.context.as_ref()).await?;
     assert_eq!(replayed, 1);
+    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    assert!(
+        read_storage_value(
+            &test,
+            SYNC_PLACEMENT_KEYSPACE,
+            document_placement_key(test.actor.realm_id, &lifecycle_target),
+        )
+        .await?
+        .is_some(),
+        "local projection must retain lifecycle placement inventory"
+    );
     let materialized = process_metadata_materialization_batch(test.context.as_ref()).await?;
     assert_eq!(materialized.processed, 1);
 
@@ -184,6 +200,17 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
         test.context.as_ref(),
     )
     .await?;
+
+    assert!(
+        read_storage_value(
+            &test,
+            SYNC_PLACEMENT_KEYSPACE,
+            document_placement_key(test.actor.realm_id, &lifecycle_target),
+        )
+        .await?
+        .is_none(),
+        "metadata deletion must remove lifecycle placement inventory"
+    );
 
     let deleted = drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
@@ -941,6 +968,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         user_id: aruna_core::UserId::local(Ulid::new(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
+    seed_realm_config(&storage_handle, &actor).await?;
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net_handle),
@@ -976,6 +1004,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
         user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
         realm_id,
     };
+    seed_realm_config(&storage_handle, &actor).await?;
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -989,4 +1018,26 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
         actor,
         context,
     })
+}
+
+async fn seed_realm_config(
+    storage: &aruna_storage::StorageHandle,
+    actor: &Actor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*actor.realm_id.as_bytes()),
+            value: ByteView::from(config.to_bytes(actor)?),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected realm config write event: {other:?}").into()),
+    }
 }

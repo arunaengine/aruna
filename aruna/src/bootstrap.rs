@@ -13,6 +13,7 @@ use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::interest::{
     ensure_local_watch_interest_digest, mark_watch_interest_dirty,
 };
@@ -25,6 +26,7 @@ use std::time::Duration;
 use tracing::warn;
 
 const ONBOARDING_DOCUMENT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const ONBOARDING_PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,
@@ -111,6 +113,10 @@ async fn core_document_targets(
             node_id,
             group_id: None,
         },
+        // Announce the shared realm-scoped node-info topic so every realm node
+        // subscribes at bootstrap and sees late joiners' info within the sync
+        // window (closes the <=60s late-joiner visibility gap).
+        DocumentSyncTarget::NodeInfo { realm_id, node_id },
         // Announce the shared realm-scoped watch-interest topic so every realm
         // node subscribes to it and receives all peers' watch-interest digests.
         DocumentSyncTarget::WatchInterest { realm_id, node_id },
@@ -162,6 +168,50 @@ pub async fn fetch_core_onboarding_documents(
     }
 
     Ok(())
+}
+
+pub async fn wait_for_onboarding_placement(
+    driver_ctx: &DriverContext,
+    realm_id: aruna_core::structs::RealmId,
+    node_id: NodeId,
+    bootstrap_peer: Option<NodeId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+
+    tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, async {
+        loop {
+            let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
+            if realm_config_has_node_placement(&config, node_id) {
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+
+            sync_document_from_peer(
+                driver_ctx
+                    .net_handle
+                    .as_ref()
+                    .ok_or("net handle unavailable")?,
+                target.clone(),
+                bootstrap_peer,
+            )
+            .await?;
+            tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out after {:?} waiting for onboarding placement for node {}",
+            ONBOARDING_DOCUMENT_SYNC_TIMEOUT, node_id
+        )
+    })?
+}
+
+fn realm_config_has_node_placement(
+    config: &aruna_core::structs::RealmConfigDocument,
+    node_id: NodeId,
+) -> bool {
+    config.has_node(node_id) && config.placement_entry(node_id).is_some()
 }
 
 async fn sync_document_from_peer(
@@ -240,14 +290,14 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::core_document_targets;
+    use super::{core_document_targets, realm_config_has_node_placement};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NOTIFICATION_WATCH_INTEREST_KEYSPACE;
     use aruna_core::structs::{
-        RealmId, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
-        watch_interest_node_key,
+        NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind, WatchEventKind,
+        WatchEventMask, WatchInterestDigest, WatchInterestEntry, watch_interest_node_key,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::FjallStorage;
@@ -262,6 +312,26 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         }
+    }
+
+    #[test]
+    fn onboarding_readiness_requires_node_and_placement() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+
+        assert!(!realm_config_has_node_placement(&config, node_id));
+        config.ensure_node(node_id, RealmNodeKind::Server);
+        assert!(!realm_config_has_node_placement(&config, node_id));
+        config.placement_map.push(NodePlacementEntry {
+            node_id,
+            location: String::new(),
+            weight: 100,
+            full: false,
+            draining: false,
+            labels: Default::default(),
+        });
+        assert!(realm_config_has_node_placement(&config, node_id));
     }
 
     async fn read_digest(

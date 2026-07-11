@@ -4,7 +4,8 @@ use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::{
-    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind, ResourceEvent,
+    Actor, DEFAULT_METADATA_REPLICATION_FACTOR, KIND_LABEL_KEY, NodePlacementEntry, RealmId,
+    RealmNodeKind, ResourceEvent, normalize_node_placement_input,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -23,6 +24,10 @@ use crate::ensure_realm_config::{
 use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
+};
+use crate::mutate_realm_placement::{
+    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
+    RealmPlacementMutation,
 };
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
@@ -45,6 +50,13 @@ pub struct BootstrapOnboardingFinalizeInput {
     pub local_node_id: NodeId,
     pub realm_signing_key: SigningKey,
     pub now: u64,
+    /// Joiner's placement location (`None` ⇒ realm default).
+    pub node_location: Option<String>,
+    /// Joiner's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
+    /// Joiner's placement labels. Payload-sourced, so the reserved kind label is
+    /// rejected here (bypasses the config-parse rejection).
+    pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +72,8 @@ pub enum BootstrapOnboardingFinalizeError {
     #[error(transparent)]
     EnsureRealmConfig(#[from] EnsureRealmConfigError),
     #[error(transparent)]
+    SetNodePlacement(#[from] MutateRealmPlacementError),
+    #[error(transparent)]
     Placement(#[from] PlacementError),
     #[error(transparent)]
     IssueTicket(#[from] IssueOnboardingSyncTicketError),
@@ -71,12 +85,18 @@ pub enum BootstrapOnboardingFinalizeError {
     NetHandleUnavailable,
     #[error("document sync peer admission failed: {0}")]
     PeerAdmission(String),
+    #[error("placement labels must not set the reserved kind label")]
+    ReservedNodeLabel,
+    #[error("placement location must be at most 64 characters")]
+    NodeLocationTooLong,
 }
 
 pub async fn bootstrap_onboarding_finalize(
     input: BootstrapOnboardingFinalizeInput,
     context: Arc<DriverContext>,
 ) -> Result<BootstrapOnboardingFinalizeOutput, BootstrapOnboardingFinalizeError> {
+    let placement_entry = build_joiner_placement_entry(&input)?;
+
     let reserved = drive(
         ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
             enrollment_id: input.enrollment_id,
@@ -91,6 +111,7 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
 
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
+    set_joiner_placement_entry(&input, placement_entry, context.as_ref()).await?;
     process_pending_placements(&input, context.as_ref()).await?;
 
     let ticket = drive(
@@ -234,6 +255,46 @@ async fn ensure_realm_node_once(
     Ok(())
 }
 
+fn build_joiner_placement_entry(
+    input: &BootstrapOnboardingFinalizeInput,
+) -> Result<NodePlacementEntry, BootstrapOnboardingFinalizeError> {
+    if input.node_labels.contains_key(KIND_LABEL_KEY) {
+        return Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel);
+    }
+    let (location, weight) =
+        normalize_node_placement_input(input.node_location.as_deref(), input.node_weight)
+            .map_err(|_| BootstrapOnboardingFinalizeError::NodeLocationTooLong)?;
+
+    Ok(NodePlacementEntry {
+        node_id: input.node_id,
+        location,
+        weight,
+        full: false,
+        draining: false,
+        labels: input.node_labels.clone(),
+    })
+}
+
+async fn set_joiner_placement_entry(
+    input: &BootstrapOnboardingFinalizeInput,
+    entry: NodePlacementEntry,
+    context: &DriverContext,
+) -> Result<(), BootstrapOnboardingFinalizeError> {
+    drive(
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+            actor: Actor {
+                node_id: input.local_node_id,
+                user_id: UserId::nil(input.realm_id),
+                realm_id: input.realm_id,
+            },
+            mutation: RealmPlacementMutation::UpsertNode(entry),
+        }),
+        context,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
     context: &DriverContext,
@@ -271,19 +332,23 @@ mod tests {
     use crate::onboarding_secret_state::secret_state_key;
     use crate::reserve_onboarding_secret::ReserveOnboardingSecretError;
     use aruna_core::NodeId;
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, ONBOARDING_KEYSPACE};
     use aruna_core::onboarding::{
         OnboardingMode, OnboardingSecretRecord, OnboardingSecretState, OnboardingSecretStateRecord,
+        OnboardingSyncTicket,
     };
     use aruna_core::structs::{
-        Actor, NotificationKind, NotificationOutboxRecord, RealmAuthorizationDocument, RealmId,
+        Actor, KIND_LABEL_KEY, NotificationKind, NotificationOutboxRecord,
+        RealmAuthorizationDocument, RealmId,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
+    use irokle::Storage;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -327,6 +392,9 @@ mod tests {
                 },
                 realm_description: "Realm".to_string(),
                 oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
             }),
             context.as_ref(),
         )
@@ -374,6 +442,9 @@ mod tests {
             local_node_id: fixture.local_node_id,
             realm_signing_key: fixture.realm_signing_key.clone(),
             now,
+            node_location: Some("eu-central".to_string()),
+            node_weight: Some(250),
+            node_labels: Default::default(),
         }
     }
 
@@ -408,6 +479,35 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id == node_id.to_string())
         );
+    }
+
+    async fn assert_realm_placement_entry(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        location: &str,
+        weight: u32,
+    ) {
+        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+            .await
+            .unwrap();
+        let entry = document
+            .placement_entry(node_id)
+            .expect("joiner placement entry set during finalize");
+        assert_eq!(entry.location, location);
+        assert_eq!(entry.weight, weight);
+    }
+
+    async fn assert_realm_excludes_node_and_placement(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+    ) {
+        let document = drive(GetRealmConfigOperation::new(realm_id), context)
+            .await
+            .unwrap();
+        assert!(!document.has_node(node_id));
+        assert!(document.placement_entry(node_id).is_none());
     }
 
     async fn context_with_net(fixture: &FinalizeFixture) -> (Arc<DriverContext>, NetHandle) {
@@ -501,6 +601,16 @@ mod tests {
             fixture.joiner_node_id,
         )
         .await;
+        // The joiner's location/weight from finalize_input landed in the
+        // placement map next to its RealmConfigNodeEnsured membership.
+        assert_realm_placement_entry(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+            "eu-central",
+            250,
+        )
+        .await;
 
         assert_eq!(
             read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
@@ -543,6 +653,37 @@ mod tests {
                 node_id: fixture.joiner_node_id.to_string(),
             }
         );
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_ticket_signs_and_admits_issuer_node_info_target() {
+        let fixture = setup_finalize_fixture().await;
+        let (context, net_handle) = context_with_net(&fixture).await;
+
+        let result = bootstrap_onboarding_finalize(
+            finalize_input(&fixture, fixture.joiner_node_id, 10),
+            context,
+        )
+        .await
+        .unwrap();
+        let target = DocumentSyncTarget::NodeInfo {
+            realm_id: fixture.realm_id,
+            node_id: fixture.local_node_id,
+        };
+        let ticket = OnboardingSyncTicket::decode(&result.onboarding_sync_ticket).unwrap();
+
+        ticket.verify(fixture.joiner_node_id, &target, 10).unwrap();
+        let state = net_handle
+            .document_sync_node()
+            .storage()
+            .topic_state(&target.sync_topic_id())
+            .unwrap()
+            .expect("issuer node-info topic admitted during finalize");
+        assert!(state.members.contains(&irokle::PeerId::from_bytes(
+            *fixture.joiner_node_id.as_bytes()
+        )));
+
         net_handle.shutdown().await;
     }
 
@@ -724,5 +865,53 @@ mod tests {
         );
 
         assert!(read_outbox_rows(&fixture.storage_handle).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_reserved_node_label() {
+        let fixture = setup_finalize_fixture().await;
+        let mut input = finalize_input(&fixture, fixture.joiner_node_id, 10);
+        input
+            .node_labels
+            .insert(KIND_LABEL_KEY.to_string(), "Server".to_string());
+
+        let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
+        assert_eq!(
+            result,
+            Err(BootstrapOnboardingFinalizeError::ReservedNodeLabel)
+        );
+        assert_eq!(
+            read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
+            OnboardingSecretState::Available
+        );
+        assert_realm_excludes_node_and_placement(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_overlong_location() {
+        let fixture = setup_finalize_fixture().await;
+        let mut input = finalize_input(&fixture, fixture.joiner_node_id, 10);
+        input.node_location = Some("x".repeat(65));
+
+        let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
+        assert_eq!(
+            result,
+            Err(BootstrapOnboardingFinalizeError::NodeLocationTooLong)
+        );
+        assert_eq!(
+            read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
+            OnboardingSecretState::Available
+        );
+        assert_realm_excludes_node_and_placement(
+            fixture.context.as_ref(),
+            fixture.realm_id,
+            fixture.joiner_node_id,
+        )
+        .await;
     }
 }

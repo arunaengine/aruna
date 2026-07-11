@@ -1,7 +1,10 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::Actor;
 use crate::structs::structs::{Permission, Role};
+use crate::structs::{
+    Actor, BindingScope, DocumentClass, NodePlacementEntry, PlacementOverride, PlacementStrategy,
+    StrategyBinding,
+};
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -149,6 +152,11 @@ pub struct RealmConfigDocument {
     pub nodes: Vec<RealmNode>,
     pub quota: QuotaConfig,
     pub description: String,
+    pub placement_map: Vec<NodePlacementEntry>,
+    pub strategies: Vec<PlacementStrategy>,
+    pub default_strategy_id: Option<Ulid>,
+    pub strategy_bindings: Vec<StrategyBinding>,
+    pub placement_overrides: Vec<PlacementOverride>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -347,6 +355,11 @@ impl RealmConfigDocument {
             nodes: Vec::new(),
             quota: QuotaConfig::default(),
             description: String::new(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         }
     }
 
@@ -358,8 +371,52 @@ impl RealmConfigDocument {
         )
     }
 
+    /// Seeds the default placement strategies realm creation installs: a
+    /// `default` strategy using the configured metadata replication factor (the
+    /// realm default) plus an `everywhere` strategy bound to the
+    /// `MetadataRegistry` and `Admin` document classes. Replaces any existing
+    /// strategy configuration.
+    pub fn seed_default_placement(&mut self) {
+        let default_strategy = PlacementStrategy {
+            strategy_id: Ulid::new(),
+            name: "default".to_string(),
+            replica_count: Some(self.metadata_replication.default_replication_factor),
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        let everywhere_strategy = PlacementStrategy {
+            strategy_id: Ulid::new(),
+            name: "everywhere".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+        };
+        self.default_strategy_id = Some(default_strategy.strategy_id);
+        self.strategy_bindings = vec![
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                strategy_id: everywhere_strategy.strategy_id,
+            },
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::Admin),
+                strategy_id: everywhere_strategy.strategy_id,
+            },
+        ];
+        self.strategies = vec![default_strategy, everywhere_strategy];
+    }
+
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
         self.metadata_replication.factor_for(group_id, path)
+    }
+
+    pub fn effective_default_metadata_replication_factor(&self) -> Option<u32> {
+        let strategy = match self.default_strategy_id {
+            Some(strategy_id) => self.strategy(&strategy_id),
+            None => self.strategies.first(),
+        };
+        strategy
+            .map(|strategy| strategy.replica_count)
+            .unwrap_or(Some(self.metadata_replication.default_replication_factor))
     }
 
     pub fn ensure_node(&mut self, node_id: NodeId, kind: RealmNodeKind) {
@@ -398,6 +455,18 @@ impl RealmConfigDocument {
                     .map_err(|error| ConversionError::FromStrError(error.to_string()))
             })
             .collect()
+    }
+
+    pub fn placement_entry(&self, node_id: NodeId) -> Option<&NodePlacementEntry> {
+        self.placement_map
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+    }
+
+    pub fn strategy(&self, strategy_id: &Ulid) -> Option<&PlacementStrategy> {
+        self.strategies
+            .iter()
+            .find(|strategy| strategy.strategy_id == *strategy_id)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -549,6 +618,11 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             description: "Example Realm".to_string(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -652,6 +726,11 @@ mod test {
             nodes: Vec::new(),
             quota: super::QuotaConfig::default(),
             description: String::new(),
+            placement_map: Vec::new(),
+            strategies: Vec::new(),
+            default_strategy_id: None,
+            strategy_bindings: Vec::new(),
+            placement_overrides: Vec::new(),
         };
 
         assert_eq!(
@@ -666,6 +745,59 @@ mod test {
         assert_eq!(
             document.metadata_replication_factor_for(group_id, Some("/datasets/important/item")),
             7
+        );
+    }
+
+    #[test]
+    fn effective_default_replication_uses_placement_strategy_with_legacy_fallback() {
+        let mut document = RealmConfigDocument::new(RealmId([6u8; 32]), Vec::new(), 5);
+        document.seed_default_placement();
+
+        let default_strategy_id = document.default_strategy_id.unwrap();
+        assert_eq!(
+            document
+                .strategy(&default_strategy_id)
+                .unwrap()
+                .replica_count,
+            Some(5)
+        );
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(5)
+        );
+
+        document
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == default_strategy_id)
+            .unwrap()
+            .replica_count = Some(2);
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(2)
+        );
+
+        document
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == default_strategy_id)
+            .unwrap()
+            .replica_count = None;
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            None
+        );
+
+        document.default_strategy_id = None;
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            None
+        );
+
+        document.strategies.clear();
+        assert_eq!(
+            document.effective_default_metadata_replication_factor(),
+            Some(5)
         );
     }
 
