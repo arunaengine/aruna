@@ -235,6 +235,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                         };
                         let Some(net_handle) = self.context.net_handle.as_ref() else {
                             error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+                            close_failed_bao(&blob_handle, stream_id).await;
                             return;
                         };
                         let first_event = blob_handle
@@ -270,20 +271,17 @@ impl InboundEventHandler for OperationsInboundHandler {
                                             stream_id = %stream_id,
                                             "Unsupported inbound bao payload"
                                         );
-                                        let close_event = blob_handle
-                                            .send_blob_effect(BlobEffect::CloseConnection { stream_id })
-                                            .await;
-                                        if let Event::Blob(BlobEvent::Error(err)) = close_event {
-                                            error!(error = ?err, "Failed to close unsupported inbound bao stream");
-                                        }
+                                        close_failed_bao(&blob_handle, stream_id).await;
                                     }
                                 }
                             }
                             Event::Blob(BlobEvent::Error(err)) => {
                                 error!(error = ?err, "Failed to read initial inbound bao payload");
+                                close_failed_bao(&blob_handle, stream_id).await;
                             }
                             other => {
                                 error!(event = ?other, "Unexpected first event for inbound bao stream");
+                                close_failed_bao(&blob_handle, stream_id).await;
                             }
                         }
                     } else {
@@ -334,6 +332,15 @@ impl InboundEventHandler for OperationsInboundHandler {
 
     async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) {
         reemit_evicted_documents(self.context.as_ref(), documents).await;
+    }
+}
+
+async fn close_failed_bao(blob_handle: &aruna_blob::blob::BlobHandle, stream_id: ulid::Ulid) {
+    let close_event = blob_handle
+        .send_blob_effect(BlobEffect::CloseConnection { stream_id })
+        .await;
+    if let Event::Blob(BlobEvent::Error(err)) = close_event {
+        error!(error = ?err, "Failed to close rejected inbound bao stream");
     }
 }
 
@@ -498,12 +505,98 @@ async fn run_metadata_document_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_blob::blob::BlobHandler;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+    use aruna_core::structs::{Backend, BackendConfig};
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
+    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use std::collections::HashMap;
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct StreamCapture(mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>);
+
+    #[async_trait]
+    impl InboundEventHandler for StreamCapture {
+        async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+            self.0.send((alpn, stream, node_id)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_bao_closes() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let storage_a = FjallStorage::open(dir_a.path().to_str().unwrap()).unwrap();
+        let storage_b = FjallStorage::open(dir_b.path().to_str().unwrap()).unwrap();
+        let config = || NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        };
+        let net_a = aruna_net::NetHandle::new(config(), storage_a)
+            .await
+            .unwrap();
+        let net_b = aruna_net::NetHandle::new(config(), storage_b.clone())
+            .await
+            .unwrap();
+        net_a.add_peer_addr(net_b.endpoint_addr()).await;
+        net_b.add_peer_addr(net_a.endpoint_addr()).await;
+
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        net_b.set_inbound_handler(Arc::new(StreamCapture(stream_tx)));
+        let blob_root = dir_b.path().join("blobs");
+        std::fs::create_dir(&blob_root).unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root.to_str().unwrap().to_string(),
+                service_config: HashMap::new(),
+                bucket_prefix: None,
+                max_bucket_size: None,
+                multipart_bucket: None,
+                timeouts: Default::default(),
+            },
+            storage_b.clone(),
+            net_b.clone(),
+        )
+        .await
+        .unwrap();
+        let handler = OperationsInboundHandler::new(Arc::new(DriverContext {
+            storage_handle: storage_b,
+            net_handle: Some(net_b.clone()),
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+        }));
+
+        let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();
+        outbound.0.write_u32(8).await.unwrap();
+        outbound.0.write_all(b"x").await.unwrap();
+        outbound.0.finish().unwrap();
+        let (alpn, inbound, peer) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        handler.handle_incoming_stream(alpn, inbound, peer).await;
+
+        let closed =
+            tokio::time::timeout(Duration::from_millis(250), outbound.1.read_to_end(1)).await;
+        assert!(
+            matches!(closed, Ok(Ok(ref bytes)) if bytes.is_empty()),
+            "BR-003_EXPECT_CLOSE: failed initial Bao stream remained open: {closed:?}"
+        );
+
+        net_a.shutdown().await;
+        net_b.shutdown().await;
+    }
 
     #[tokio::test]
     async fn inbound_projection_failure_schedules_durable_projection_retry() {
