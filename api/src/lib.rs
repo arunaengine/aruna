@@ -5,6 +5,7 @@ pub mod cors;
 pub mod error;
 pub mod openapi;
 mod portal;
+pub mod quota_cache;
 pub mod routes;
 pub mod s3;
 pub mod server;

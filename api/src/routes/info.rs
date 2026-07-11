@@ -467,6 +467,9 @@ pub async fn set_realm_quota(
     )
     .await
     .map_err(map_set_realm_quota_error)?;
+    // Drop the locally cached realm config so this node enforces the new quota on
+    // the next write without waiting out the cache TTL.
+    state.invalidate_quota_cache().await;
     Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
 }
 

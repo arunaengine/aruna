@@ -9,7 +9,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
-use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_core::structs::{
+    Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId,
+};
 use aruna_operations::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
 };
@@ -64,6 +66,8 @@ pub struct ServerState {
     oidc_validator: Option<Arc<OidcValidator>>,
     interface_state: Arc<RwLock<InterfaceRuntimeState>>,
     portal: Arc<RwLock<PortalRuntimeState>>,
+    // Read-through cache of the realm config for the quota write path.
+    quota_cache: Arc<crate::quota_cache::QuotaConfigCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -163,6 +167,7 @@ impl ServerState {
             initial_admin_claim,
             interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
             portal: Arc::new(RwLock::new(PortalRuntimeState::default())),
+            quota_cache: Arc::new(crate::quota_cache::QuotaConfigCache::new()),
         };
         state.persist_trusted_realms().await;
         state
@@ -170,6 +175,18 @@ impl ServerState {
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
+    }
+
+    /// Loads the realm config through the short-TTL quota cache so the staging
+    /// write path does not drive a fresh `GetRealmConfigOperation` per request.
+    pub async fn cached_realm_config(&self) -> Result<RealmConfigDocument, String> {
+        self.quota_cache.get(&self.driver_ctx, self.realm_id).await
+    }
+
+    /// Drops the cached realm config so a local quota change takes effect on the
+    /// next staging write without waiting out the TTL.
+    pub async fn invalidate_quota_cache(&self) {
+        self.quota_cache.invalidate().await;
     }
     pub fn get_pubkey(&self) -> [u8; 113] {
         match self.node_capabilities {
