@@ -550,8 +550,8 @@ pub async fn preflight_resolve(
 // --- Redirect policy -------------------------------------------------------
 
 /// A redirect policy that re-validates each hop (scheme + IP literal) and caps
-/// the chain at reqwest's default of 10 hops. Hostname hops are still forced
-/// through [`ValidatingResolver`] at connect time.
+/// the chain at 10 URLs total (`previous()` includes the initial URL). Hostname
+/// hops are still forced through [`ValidatingResolver`] at connect time.
 pub fn redirect_policy(
     policy: Arc<EgressPolicy>,
     allowed_schemes: &'static [&'static str],
@@ -564,7 +564,7 @@ pub fn redirect_policy(
                 hop_url: url.to_string(),
             },
         );
-        if attempt.previous().len() > 10 {
+        if attempt.previous().len() >= 10 {
             return attempt.error(denial);
         }
         match validate_url(&policy, allowed_schemes, &url) {
