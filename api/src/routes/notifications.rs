@@ -112,6 +112,16 @@ pub struct NotificationResponse {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -258,6 +268,11 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         bucket: None,
         key: None,
         size_bytes: None,
+        state: None,
+        previous_state: None,
+        usage_bytes: None,
+        quota_bytes: None,
+        ceiling_bytes: None,
     };
     match &record.kind {
         NotificationKind::AddedToGroup {
@@ -311,6 +326,21 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.key = Some(key.clone());
             response.size_bytes = Some(*size_bytes);
             response.actor_user_id = Some(actor_user_id.to_string());
+        }
+        NotificationKind::GroupQuotaStateChanged {
+            group_id,
+            state,
+            previous,
+            usage_bytes,
+            quota_bytes,
+            ceiling_bytes,
+        } => {
+            response.group_id = Some(group_id.to_string());
+            response.state = Some(state.as_str().to_string());
+            response.previous_state = Some(previous.as_str().to_string());
+            response.usage_bytes = Some(*usage_bytes);
+            response.quota_bytes = *quota_bytes;
+            response.ceiling_bytes = *ceiling_bytes;
         }
     }
     response

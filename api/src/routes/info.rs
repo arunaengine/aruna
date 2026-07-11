@@ -511,10 +511,10 @@ pub struct GroupQuotaStatus {
     /// Enforced hard cap (quota x grace). `None` = unlimited.
     pub ceiling_bytes: Option<u64>,
     pub warn_threshold_percent: u32,
-    /// True when the group's realm-wide `logical_bytes` has reached the
-    /// fractional `quota_bytes * warn_threshold_percent / 100` threshold; always
-    /// false when unlimited.
-    pub warning: bool,
+    /// Group's realm-wide `logical_bytes` — the counter the gate enforces.
+    pub usage_bytes: u64,
+    /// Lifecycle state: `unlimited` | `ok` | `warn` | `grace` | `blocked`.
+    pub state: String,
 }
 
 impl GroupQuotaStatus {
@@ -525,19 +525,15 @@ impl GroupQuotaStatus {
         group_id: &aruna_core::types::GroupId,
         realm_group_logical_bytes: u64,
     ) -> Self {
-        let quota_bytes = quota.effective_group_quota_bytes(group_id);
-        let warning = match quota_bytes {
-            Some(limit) => {
-                u128::from(realm_group_logical_bytes) * 100
-                    >= u128::from(limit) * u128::from(quota.warn_threshold_percent)
-            }
-            None => false,
-        };
         Self {
-            quota_bytes,
+            quota_bytes: quota.effective_group_quota_bytes(group_id),
             ceiling_bytes: quota.effective_group_ceiling(group_id),
             warn_threshold_percent: quota.warn_threshold_percent,
-            warning,
+            usage_bytes: realm_group_logical_bytes,
+            state: quota
+                .group_quota_state(group_id, realm_group_logical_bytes)
+                .as_str()
+                .to_string(),
         }
     }
 }
@@ -1225,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn group_quota_status_reports_warning_and_unlimited() {
+    fn quota_status_state() {
         let group = Ulid::new();
         let unlimited_group = Ulid::new();
         let quota = QuotaConfig {
@@ -1245,17 +1241,19 @@ mod tests {
         assert_eq!(below.quota_bytes, Some(1_000));
         assert_eq!(below.ceiling_bytes, Some(1_100));
         assert_eq!(below.warn_threshold_percent, 85);
-        assert!(!below.warning);
+        assert_eq!(below.usage_bytes, 800);
+        assert_eq!(below.state, "ok");
 
-        // At the threshold the warning fires.
-        let at = super::GroupQuotaStatus::resolve(&quota, &group, 850);
-        assert!(at.warning);
+        // At the threshold the state escalates through warn, grace, and blocked.
+        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 850).state, "warn");
+        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 1_050).state, "grace");
+        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 1_100).state, "blocked");
 
-        // An override with quota_bytes: None is unlimited and never warns.
+        // An override with quota_bytes: None is unlimited.
         let unlimited = super::GroupQuotaStatus::resolve(&quota, &unlimited_group, u64::MAX);
         assert_eq!(unlimited.quota_bytes, None);
         assert_eq!(unlimited.ceiling_bytes, None);
-        assert!(!unlimited.warning);
+        assert_eq!(unlimited.state, "unlimited");
     }
 
     #[test]
@@ -1267,18 +1265,15 @@ mod tests {
             ..QuotaConfig::default()
         };
 
-        let below = super::GroupQuotaStatus::resolve(&quota, &group, 2);
-        assert!(!below.warning);
-        let at = super::GroupQuotaStatus::resolve(&quota, &group, 3);
-        assert!(at.warning);
+        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 2).state, "ok");
+        assert_eq!(super::GroupQuotaStatus::resolve(&quota, &group, 3).state, "warn");
 
         let tiny_quota = QuotaConfig {
             default_group_quota_bytes: Some(1),
             warn_threshold_percent: 85,
             ..QuotaConfig::default()
         };
-        let zero = super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0);
-        assert!(!zero.warning);
+        assert_eq!(super::GroupQuotaStatus::resolve(&tiny_quota, &group, 0).state, "ok");
     }
 
     #[test]
