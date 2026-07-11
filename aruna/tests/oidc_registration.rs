@@ -199,7 +199,12 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         task_handle: Some(task_handle.clone()),
     });
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
     let realm_id =
@@ -253,6 +258,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             Some(Arc::new(OidcValidator::new().unwrap())),
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

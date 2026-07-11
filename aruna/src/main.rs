@@ -30,6 +30,7 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::startup::restore_shard_subscriptions;
@@ -132,8 +133,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
+    let jobs_runtime = JobsRuntime::new();
     initialize_net_incoming(driver_ctx.clone());
-    initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+    initialize_task_incoming(driver_ctx.clone(), task_handle, jobs_runtime.clone()).await;
 
     // Republish a full set of node usage snapshots at startup so realm peers see
     // this node's totals again after a restart, dirty-marker loss, or a counter
@@ -341,6 +343,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_capabilities,
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
+            jobs_runtime.clone(),
         )
         .await
         .with_metrics(metrics.clone()),
