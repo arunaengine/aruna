@@ -69,7 +69,12 @@ pub enum MaterializeReferenceError {
     QuotaGate(#[from] QuotaGateError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
+    #[error("write conflicted after {MAX_METADATA_TXN_ATTEMPTS} attempts; retry the request")]
+    RetryableConflict,
 }
+
+/// Bounded re-runs of the reference metadata transaction on commit conflict.
+const MAX_METADATA_TXN_ATTEMPTS: u32 = 3;
 
 pub async fn materialize_reference(
     context: &DriverContext,
@@ -96,6 +101,8 @@ pub async fn materialize_reference(
     let version_id = Ulid::new();
     let now = SystemTime::now();
 
+    let mut attempt = 1;
+    loop {
     let txn_id = match context
         .storage_handle
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -212,7 +219,23 @@ pub async fn materialize_reference(
             .await;
     }
 
-    result?;
+    match result {
+        Ok(()) => break,
+        // The blob-free reference txn only conflicts on same-group counters or a
+        // racing connector change; re-run a fresh txn a bounded number of times.
+        Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict))
+            if attempt < MAX_METADATA_TXN_ATTEMPTS =>
+        {
+            attempt += 1;
+            continue;
+        }
+        Err(MaterializeReferenceError::Storage(StorageError::TransactionConflict)) => {
+            return Err(MaterializeReferenceError::RetryableConflict);
+        }
+        Err(error) => return Err(error),
+    }
+    }
+
     schedule_usage_snapshot_publish(context).await;
 
     Ok(MaterializeReferenceResult {

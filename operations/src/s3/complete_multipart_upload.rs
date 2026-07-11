@@ -105,9 +105,16 @@ pub enum CompleteMultipartUploadError {
     QuotaGateError(#[from] QuotaGateError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
+    #[error("write conflicted after {MAX_FINALIZE_TXN_ATTEMPTS} attempts; retry the request")]
+    RetryableConflict,
     #[error("CompleteMultipartUpload failed")]
     CompleteMultipartUploadFailed,
 }
+
+/// Bounded re-runs of the finalize transaction on commit conflict. The composed
+/// blob is already durable, so a conflict re-runs only the finalize writes and
+/// the gate in a fresh transaction without recomposing.
+const MAX_FINALIZE_TXN_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompleteMultipartPart {
@@ -163,6 +170,7 @@ pub struct CompleteMultipartUploadOperation {
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
+    finalize_attempts: u32,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -187,6 +195,7 @@ impl CompleteMultipartUploadOperation {
             was_live: false,
             usage_update: None,
             quota_gate: None,
+            finalize_attempts: 1,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -943,11 +952,41 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn handle_finalize_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
-        };
-        self.txn_id = None;
-        self.register_blob_in_dht_or_continue()
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.txn_id = None;
+                self.register_blob_in_dht_or_continue()
+            }
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => {
+                self.txn_id = None;
+                if self.finalize_attempts < MAX_FINALIZE_TXN_ATTEMPTS {
+                    self.finalize_attempts += 1;
+                    self.retry_finalize_txn()
+                } else {
+                    self.schedule_error(CompleteMultipartUploadError::RetryableConflict)
+                }
+            }
+            _ => self.schedule_error(CompleteMultipartUploadError::InvalidOperationState),
+        }
+    }
+
+    /// Re-runs the finalize transaction against current state, keeping the durable
+    /// composed blob. Per-attempt finalize state is reset.
+    fn retry_finalize_txn(&mut self) -> Effects {
+        self.final_location = None;
+        self.version_id = None;
+        self.version_created_at = None;
+        self.existing_pointer = None;
+        self.new_blob = false;
+        self.was_live = false;
+        self.usage_update = None;
+        self.quota_gate = None;
+        self.state = CompleteMultipartUploadState::StartFinalizeTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
+        })]
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
@@ -1369,6 +1408,50 @@ mod tests {
             },
             created_at: SystemTime::now(),
         }
+    }
+
+    #[test]
+    fn finalize_conflict_retries_then_deletes_composed_blob_and_surfaces_retryable_conflict() {
+        let mut op = CompleteMultipartUploadOperation::new(finalize_input());
+        let composed = part_record(1, 10).location;
+        op.composed_location = Some(composed.clone());
+
+        for _ in 0..(MAX_FINALIZE_TXN_ATTEMPTS - 1) {
+            op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+            op.txn_id = Some(Ulid::new());
+            let effects = op.handle_finalize_committed(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            ));
+            assert_eq!(
+                op.state,
+                CompleteMultipartUploadState::StartFinalizeTransaction
+            );
+            assert_eq!(op.txn_id, None);
+        }
+
+        // No upload_record, so exhaustion deletes the composed blob directly.
+        op.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+        op.txn_id = Some(Ulid::new());
+        let effects = op.handle_finalize_committed(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        let [Effect::Blob(BlobEffect::Delete { location })] = effects.as_slice() else {
+            panic!("expected composed blob cleanup on retry exhaustion")
+        };
+        assert_eq!(location, &composed);
+        assert_eq!(op.state, CompleteMultipartUploadState::CleanupFailedCompose);
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert_eq!(
+            op.finalize(),
+            Err(CompleteMultipartUploadError::RetryableConflict)
+        );
     }
 
     #[test]

@@ -76,9 +76,16 @@ pub enum PutObjectError {
     QuotaGateError(#[from] QuotaGateError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
+    #[error("write conflicted after {MAX_METADATA_TXN_ATTEMPTS} attempts; retry the request")]
+    RetryableConflict,
     #[error("Something went wrong ...")]
     PutObjectFailed,
 }
+
+/// Bounded re-runs of the metadata transaction on commit conflict. The blob is
+/// already durable, so a conflict re-runs only location/version/head/gate/counter
+/// writes in a fresh transaction without re-streaming the body.
+const MAX_METADATA_TXN_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, PartialEq)]
 pub struct PutObjectInput {
@@ -127,6 +134,7 @@ pub struct PutObjectOperation {
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
+    metadata_attempts: u32,
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
 }
@@ -145,6 +153,7 @@ impl PutObjectOperation {
             was_live: false,
             usage_update: None,
             quota_gate: None,
+            metadata_attempts: 1,
             pending_error: None,
             output: None,
         }
@@ -625,9 +634,12 @@ impl PutObjectOperation {
                 error: StorageError::TransactionConflict,
             }) => {
                 self.txn_id = None;
-                self.cleanup_failed_write(PutObjectError::StorageError(
-                    StorageError::TransactionConflict,
-                ))
+                if self.metadata_attempts < MAX_METADATA_TXN_ATTEMPTS {
+                    self.metadata_attempts += 1;
+                    self.retry_metadata_txn()
+                } else {
+                    self.cleanup_failed_write(PutObjectError::RetryableConflict)
+                }
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.txn_id = None;
@@ -635,6 +647,23 @@ impl PutObjectOperation {
             }
             _ => self.emit_error(PutObjectError::InvalidOperationState),
         }
+    }
+
+    /// Re-runs the metadata transaction against current state, keeping the durable
+    /// blob. Per-attempt state is reset; the fresh hash lookup re-derives dedup.
+    fn retry_metadata_txn(&mut self) -> Effects {
+        self.version_id = None;
+        self.cleanup_location = None;
+        self.existing_pointer = None;
+        self.new_blob = false;
+        self.was_live = false;
+        self.usage_update = None;
+        self.quota_gate = None;
+        self.output = None;
+        self.state = PutObjectState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn register_blob_in_dht_or_continue(&mut self) -> Effects {
@@ -959,6 +988,48 @@ mod test {
             op.finalize(),
             Err(crate::s3::put_object::PutObjectError::QuotaGateError(_))
         ));
+    }
+
+    #[test]
+    fn commit_conflict_retries_then_deletes_blob_and_surfaces_retryable_conflict() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::new();
+        let node_id = iroh::SecretKey::generate().public();
+        let mut op = PutObjectOperation::new(put_config(realm_id, group_id, node_id));
+        let location = test_location(op.config.user_id);
+        op.written_location = Some(location.clone());
+
+        // Every conflict but the last re-opens a fresh metadata transaction.
+        for _ in 0..(super::MAX_METADATA_TXN_ATTEMPTS - 1) {
+            op.state = PutObjectState::CommitTransaction;
+            op.txn_id = Some(Ulid::new());
+            let effects = op.handle_transaction_committed(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction { read: false })]
+            ));
+            assert_eq!(op.state, PutObjectState::StartTransaction);
+            assert_eq!(op.txn_id, None);
+        }
+
+        // Exhausted retries delete the durable blob, then surface RetryableConflict.
+        op.state = PutObjectState::CommitTransaction;
+        op.txn_id = Some(Ulid::new());
+        let effects = op.handle_transaction_committed(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        let [Effect::Blob(BlobEffect::Delete { location: deleted })] = effects.as_slice() else {
+            panic!("expected blob cleanup on retry exhaustion")
+        };
+        assert_eq!(deleted, &location);
+        assert_eq!(op.state, PutObjectState::CleanupFailedWrite);
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert_eq!(op.finalize(), Err(super::PutObjectError::RetryableConflict));
     }
 
     #[test]
