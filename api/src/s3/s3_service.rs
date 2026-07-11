@@ -11,7 +11,8 @@ use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
     parse_completed_part, parse_copy_source, parse_copy_source_range,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart, validate_object_key,
+    reject_sse, s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart,
+    validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -1068,6 +1069,15 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
@@ -1128,6 +1138,18 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some()
+                || req.input.copy_source_sse_customer_algorithm.is_some()
+                || req.input.copy_source_sse_customer_key.is_some()
+                || req.input.copy_source_sse_customer_key_md5.is_some(),
+        )?;
         let dest_bucket_info = req.extensions.get::<BucketInfo>().cloned();
 
         let (source_bucket, source_key, source_version_id) =
@@ -1273,6 +1295,15 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_hint = parse_multipart_checksum_hint(&req.input)?;
@@ -1317,6 +1348,11 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
@@ -1338,9 +1374,7 @@ impl S3 for ArunaS3Service {
             body: Some(body),
             created_by: user_access.user_identity,
             compressed: false,
-            encrypted: req.input.sse_customer_algorithm.is_some()
-                || req.input.sse_customer_key.is_some()
-                || req.input.sse_customer_key_md5.is_some(),
+            encrypted: false,
             expected_checksums: checksum_request.expected.clone(),
         });
 
@@ -1380,6 +1414,14 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some()
+                || req.input.copy_source_sse_customer_algorithm.is_some()
+                || req.input.copy_source_sse_customer_key.is_some()
+                || req.input.copy_source_sse_customer_key_md5.is_some(),
+        )?;
 
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let part_number =

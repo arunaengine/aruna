@@ -156,6 +156,19 @@ pub(crate) fn checked_size(value: i64) -> S3Result<u64> {
     u64::try_from(value).map_err(|_| s3_error!(InvalidArgument, "Size must not be negative"))
 }
 
+/// Server-side encryption is not implemented; SSE/SSE-C request headers must be
+/// rejected rather than silently ignored so a client is never told its data is
+/// encrypted while it is stored as plaintext (real SSE-C support is tracked in #387).
+pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
+    if requested {
+        return Err(s3_error!(
+            NotImplemented,
+            "Server-side encryption is not supported"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_multipart_checksum_hint(
     input: &CreateMultipartUploadInput,
 ) -> S3Result<Option<MultipartUploadChecksumHint>> {
