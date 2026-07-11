@@ -44,6 +44,7 @@ use utoipa::{OpenApi, ToSchema};
         list_groups,
         get_group,
         get_group_usage,
+        get_group_usage_history,
         list_group_members,
         add_group_member,
         remove_group_member,
@@ -60,6 +61,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/groups", get(list_groups))
         .route("/groups/{id}", get(get_group))
         .route("/groups/{id}/usage", get(get_group_usage))
+        .route(
+            "/groups/{id}/usage/history",
+            get(get_group_usage_history),
+        )
         .route(
             "/groups/{id}/members",
             get(list_group_members).post(add_group_member),
@@ -657,6 +662,45 @@ pub async fn get_group_usage(
             realm_group_logical_bytes,
         ));
     }
+    Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/groups/{id}/usage/history",
+    tag = "groups",
+    params(
+        ("id" = String, Path, description = "Group id"),
+        ("from_ms" = Option<u64>, Query, description = "Inclusive lower bound (ms)"),
+        ("to_ms" = Option<u64>, Query, description = "Inclusive upper bound (ms)"),
+        ("limit" = Option<usize>, Query, description = "Max points (capped at 2000)")
+    ),
+    responses(
+        (status = 200, description = "Group usage history", body = crate::routes::info::UsageHistoryResponse),
+        (status = 400, description = "Invalid group id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_group_usage_history(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<crate::routes::info::UsageHistoryQuery>,
+) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageHistoryResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let group_id = parse_group_id(&group_id)?;
+    let (_, auth_doc) = load_group(&state, group_id).await?;
+    if !is_group_member(&auth_doc, auth.user_id) {
+        return Err(ServerError::Forbidden);
+    }
+    let response = crate::routes::info::load_usage_history(
+        &state,
+        aruna_operations::usage_stats::RealmUsageScope::Group(group_id),
+        query,
+    )
+    .await?;
     Ok((StatusCode::OK, Json(response)))
 }
 

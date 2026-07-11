@@ -1,4 +1,4 @@
-use crate::error::{ServerError, ServerResult};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -18,8 +18,10 @@ use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
 };
 use aruna_operations::status::load_node_observability_status;
+use aruna_operations::usage_history::{USAGE_HISTORY_QUERY_LIMIT, read_usage_history};
 use aruna_operations::usage_stats::{LoadUsageCountersOperation, RealmUsageScope};
-use axum::extract::State;
+use aruna_core::structs::UsageHistorySample;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Extension, Json, Router};
@@ -34,7 +36,7 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info, get_realm_info, set_realm_quota, get_usage)
+    paths(get_info, get_realm_info, set_realm_quota, get_usage, get_usage_history)
 )]
 pub struct InfoApiDoc;
 
@@ -44,6 +46,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/info/realm", get(get_realm_info))
         .route("/info/realm/quota", put(set_realm_quota))
         .route("/info/usage", get(get_usage))
+        .route("/info/usage/history", get(get_usage_history))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -547,6 +550,60 @@ pub struct UsageTotals {
     pub logical_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct UsageHistoryQuery {
+    pub from_ms: Option<u64>,
+    pub to_ms: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageHistoryPoint {
+    pub at_ms: u64,
+    pub logical_bytes: u64,
+    pub objects: u64,
+    pub buckets: u64,
+    pub quota_bytes: Option<u64>,
+    pub ceiling_bytes: Option<u64>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UsageHistoryResponse {
+    pub points: Vec<UsageHistoryPoint>,
+}
+
+impl From<UsageHistorySample> for UsageHistoryPoint {
+    fn from(sample: UsageHistorySample) -> Self {
+        Self {
+            at_ms: sample.at_ms,
+            logical_bytes: sample.counters.logical_bytes,
+            objects: sample.counters.objects,
+            buckets: sample.counters.buckets,
+            quota_bytes: sample.quota_bytes,
+            ceiling_bytes: sample.ceiling_bytes,
+            state: sample.state.as_str().to_string(),
+        }
+    }
+}
+
+/// Reads an ascending history slice for `scope`, clamping `limit` to the cap.
+pub async fn load_usage_history(
+    state: &ServerState,
+    scope: RealmUsageScope,
+    query: UsageHistoryQuery,
+) -> ServerResult<UsageHistoryResponse> {
+    let from_ms = query.from_ms.unwrap_or(0);
+    let to_ms = query.to_ms.unwrap_or(u64::MAX);
+    let limit = query.limit.unwrap_or(USAGE_HISTORY_QUERY_LIMIT);
+    let samples = read_usage_history(&state.get_ctx(), scope, from_ms, to_ms, limit)
+        .await
+        .map_err(ServerError::InternalError)?;
+    Ok(UsageHistoryResponse {
+        points: samples.into_iter().map(UsageHistoryPoint::from).collect(),
+    })
+}
+
 impl From<UsageCounters> for UsageTotals {
     fn from(counters: UsageCounters) -> Self {
         Self {
@@ -622,6 +679,32 @@ pub async fn get_usage(
         StatusCode::OK,
         Json(UsageResponse::with_realm(local, realm)),
     ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/info/usage/history",
+    tag = "info",
+    params(
+        ("from_ms" = Option<u64>, Query, description = "Inclusive lower bound (ms)"),
+        ("to_ms" = Option<u64>, Query, description = "Inclusive upper bound (ms)"),
+        ("limit" = Option<usize>, Query, description = "Max points (capped at 2000)")
+    ),
+    responses(
+        (status = 200, description = "Global usage history", body = UsageHistoryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_usage_history(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<UsageHistoryQuery>,
+) -> ServerResult<(StatusCode, Json<UsageHistoryResponse>)> {
+    // Global history mirrors the realm-rollup gating: authenticated callers only.
+    auth.ok_or(ServerError::Unauthorized)?;
+    let response = load_usage_history(&state, RealmUsageScope::Global, query).await?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 fn map_realm_info_response(
