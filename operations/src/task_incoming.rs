@@ -70,8 +70,10 @@ use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
+use crate::usage_history::restore_usage_history_timer;
 use crate::usage_stats::{
-    refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
+    refresh_realm_usage_summary_for_targets, restore_reconcile_usage_timer,
+    restore_usage_snapshot_publish_timer,
 };
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
@@ -1013,6 +1015,48 @@ impl OperationsTaskHandler {
         }
     }
 
+    async fn record_usage_history(&self) {
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            warn!("Cannot record usage history without net handle");
+            return;
+        };
+        if let Err(error) =
+            crate::usage_history::record_usage_history(&self.context, net_handle.node_id()).await
+        {
+            warn!(error = %error, "Failed to record usage history");
+        }
+        self.reschedule_timer(
+            TaskKey::RecordUsageHistory,
+            crate::usage_history::USAGE_HISTORY_SAMPLE_INTERVAL,
+        )
+        .await;
+    }
+
+    async fn reconcile_usage_stats(&self) {
+        match crate::usage_stats::reconcile_usage_stats(
+            &self.context,
+            self.context.task_handle.as_ref(),
+        )
+        .await
+        {
+            Ok(report) if report.keys_corrected > 0 || report.conflict_aborted => {
+                warn!(
+                    keys_checked = report.keys_checked,
+                    keys_corrected = report.keys_corrected,
+                    conflict_aborted = report.conflict_aborted,
+                    "Reconciliation recount corrected usage counter drift"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => warn!(error = %error, "Failed to reconcile usage stats"),
+        }
+        self.reschedule_timer(
+            TaskKey::ReconcileUsageStats,
+            crate::usage_stats::USAGE_RECONCILE_PERIOD,
+        )
+        .await;
+    }
+
     async fn prune_notifications(&self) {
         let after = match process_notification_prune_batch(&self.context).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
@@ -1050,6 +1094,8 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
         restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
         restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_usage_history_timer(&context.storage_handle, &task_handle).await;
+        restore_reconcile_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
         restore_notification_outbox_timer_if_idle(
             &context.storage_handle,
@@ -1080,6 +1126,8 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
+    restore_usage_history_timer(&context.storage_handle, &task_handle).await;
+    restore_reconcile_usage_timer(&context.storage_handle, &task_handle).await;
     restore_watch_interest_publish_timer(&context.storage_handle, &task_handle).await;
     restore_notification_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
     restore_pending_metadata_projection_timer(&context.storage_handle, &task_handle).await;
@@ -1238,6 +1286,12 @@ impl InboundTaskHandler for OperationsTaskHandler {
             }
             TaskKey::PublishWatchInterest => {
                 self.publish_watch_interest().await;
+            }
+            TaskKey::RecordUsageHistory => {
+                self.record_usage_history().await;
+            }
+            TaskKey::ReconcileUsageStats => {
+                self.reconcile_usage_stats().await;
             }
         }
     }
