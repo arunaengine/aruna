@@ -7,12 +7,39 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
+
+pub fn ensure_confined_relative_path(path: &Path) -> Result<(), ConversionError> {
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or(ConversionError::OsStringError)?;
+                if part.chars().any(|c| c.is_control()) {
+                    return Err(ConversionError::UnsafePath(
+                        "path component contains control characters".to_string(),
+                    ));
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ConversionError::UnsafePath(
+                    "path must not contain parent-directory (`..`) components".to_string(),
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ConversionError::UnsafePath(
+                    "path must be relative to the backend root".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Backend {
@@ -136,18 +163,23 @@ impl Display for BackendLocation {
 }
 
 impl BackendLocation {
+    fn confined_relative_path(&self) -> Result<PathBuf, ConversionError> {
+        let path = PathBuf::from(&self.storage_bucket).join(&self.backend_path);
+        ensure_confined_relative_path(&path)?;
+        Ok(path)
+    }
+
     pub fn get_full_path(&self) -> Result<String, ConversionError> {
         PathBuf::from(&self.root)
-            .join(&self.storage_bucket)
-            .join(&self.backend_path)
+            .join(self.confined_relative_path()?)
             .into_os_string()
             .into_string()
             .map_err(|_| ConversionError::OsStringError)
     }
 
     pub fn get_storage_path(&self) -> Result<String, BlobError> {
-        Ok(PathBuf::from(&self.storage_bucket)
-            .join(&self.backend_path)
+        Ok(self
+            .confined_relative_path()?
             .into_os_string()
             .into_string()
             .map_err(|_| ConversionError::OsStringError)?)
@@ -769,6 +801,65 @@ mod tests {
         assert!(deleted.blob_hash().is_none());
         assert!(!deleted.is_materialized());
         assert!(deleted.is_deleted());
+    }
+
+    #[test]
+    fn ensure_confined_relative_path_matrix() {
+        use super::ensure_confined_relative_path;
+        use crate::errors::ConversionError;
+        use std::path::Path;
+
+        for ok in [
+            "bucket/object",
+            "bucket/nested/object.bin",
+            "bucket/./object",
+        ] {
+            assert!(ensure_confined_relative_path(Path::new(ok)).is_ok());
+        }
+        for bad in [
+            "../escape",
+            "bucket/../../escape",
+            "/absolute/path",
+            "bucket/../../../etc/passwd",
+        ] {
+            assert!(matches!(
+                ensure_confined_relative_path(Path::new(bad)),
+                Err(ConversionError::UnsafePath(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn get_storage_path_rejects_traversal_in_backend_path() {
+        use crate::errors::{BlobError, ConversionError};
+        use crate::structs::BackendLocation;
+
+        let mut location = BackendLocation {
+            root: "/data".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "object.bin".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: UserId::default(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        assert!(location.get_storage_path().is_ok());
+        assert!(location.get_full_path().is_ok());
+
+        location.backend_path = "../../etc/passwd".to_string();
+        assert!(matches!(
+            location.get_storage_path(),
+            Err(BlobError::ConversionError(ConversionError::UnsafePath(_)))
+        ));
+        assert!(matches!(
+            location.get_full_path(),
+            Err(ConversionError::UnsafePath(_))
+        ));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::BUCKET_STATS_DB;
-use aruna_core::structs::{Backend, BackendBucket, BackendLocation};
+use aruna_core::structs::{Backend, BackendBucket, BackendLocation, ensure_confined_relative_path};
 use opendal::Operator;
 use std::path::PathBuf;
 use ulid::Ulid;
@@ -198,9 +198,9 @@ pub(super) fn build_backend_path(
     key: &str,
     ulid: Ulid,
 ) -> Result<String, ConversionError> {
-    PathBuf::from(bucket)
-        .join(format!("{}_{}", key, ulid))
-        .into_os_string()
+    let path = PathBuf::from(bucket).join(format!("{}_{}", key, ulid));
+    ensure_confined_relative_path(&path)?;
+    path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
 }
@@ -227,9 +227,9 @@ pub(super) fn rebuild_backend_path(
         .rsplit_once('_')
         .map_or(file_name, |(base, _)| base);
 
-    parent
-        .join(format!("{}_{}", base_name, ulid))
-        .into_os_string()
+    let path = parent.join(format!("{}_{}", base_name, ulid));
+    ensure_confined_relative_path(&path)?;
+    path.into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
 }

@@ -123,6 +123,31 @@ pub(crate) fn is_anonymous_object_read_operation(operation_name: &str) -> bool {
     matches!(operation_name, "GetObject")
 }
 
+pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
+    if key.is_empty() {
+        return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
+    }
+    if key.starts_with('/') {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Object key must not be an absolute path"
+        ));
+    }
+    if key.chars().any(|c| c.is_control()) {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Object key must not contain control characters"
+        ));
+    }
+    if key.split('/').any(|segment| segment == "..") {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Object key must not contain `..` path segments"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
     match input.body.take() {
         None => Err(s3_error!(InvalidRequest, "Missing body")),
@@ -264,10 +289,42 @@ pub(crate) fn checksum_algorithm_from_s3(
 mod tests {
     use super::{
         get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_multipart_part_number,
+        parse_multipart_part_number, validate_object_key,
     };
     use crate::s3::auth::Action;
     use s3s::S3ErrorCode;
+
+    #[test]
+    fn validate_object_key_accepts_ordinary_keys() {
+        for key in ["object.bin", "nested/path/object.bin", "a.b..c/keep..dots"] {
+            assert!(
+                validate_object_key(key).is_ok(),
+                "key {key:?} must be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_object_key_rejects_traversal_and_control_keys() {
+        let cases = [
+            "",
+            "/absolute/key",
+            "../escape",
+            "../../etc/passwd",
+            "nested/../../escape",
+            "trailing/..",
+            "with\u{0000}null",
+            "with\u{007f}delete",
+            "with\nnewline",
+        ];
+        for key in cases {
+            assert_eq!(
+                *validate_object_key(key).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "key {key:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn anonymous_public_access_only_allows_get_object() {
