@@ -2,6 +2,7 @@
 
 use aruna::bootstrap::{
     announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
+    wait_for_onboarding_placement,
 };
 use aruna::config::{Config, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::cors::CorsConfig;
@@ -653,6 +654,13 @@ async fn spawn_joiner_node_with_mode(
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
+    wait_for_onboarding_placement(
+        joiner_context.as_ref(),
+        config.realm_id,
+        config.node_id,
+        config.peer_endpoints.first().map(|endpoint| endpoint.id),
+    )
+    .await?;
     mark_onboarding_phase(
         &joiner_context.storage_handle,
         &config.node_state,

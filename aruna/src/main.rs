@@ -2,7 +2,7 @@
 
 use aruna::bootstrap::{
     announce_core_documents, ensure_initial_local_onboarding_secret,
-    fetch_core_onboarding_documents, realm_bootstrap_exists,
+    fetch_core_onboarding_documents, realm_bootstrap_exists, wait_for_onboarding_placement,
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
@@ -192,14 +192,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::JoinRealm { phase } => {
+            let bootstrap_peer = config
+                .peer_endpoints
+                .first()
+                .map(|endpoint| endpoint.id)
+                .or_else(|| config.peer_nodes.first().copied());
             if matches!(phase, OnboardingPhase::Bootstrapped) {
                 fetch_core_onboarding_documents(
                     driver_ctx.as_ref(),
                     &config.node_state,
                     &config.realm_id,
-                    config.peer_endpoints.first().map(|endpoint| endpoint.id),
+                    bootstrap_peer,
                 )
                 .await?;
+            }
+            wait_for_onboarding_placement(
+                driver_ctx.as_ref(),
+                config.realm_id,
+                config.node_id,
+                bootstrap_peer,
+            )
+            .await?;
+            if matches!(phase, OnboardingPhase::Bootstrapped) {
                 mark_onboarding_phase(
                     &driver_ctx.storage_handle,
                     &config.node_state,
