@@ -743,6 +743,7 @@ mod tests {
                     checksum_type: None,
                     version_source: None,
                     quota_ceiling: None,
+                    active_node_ids: None,
                     exists: false,
                 }),
                 context.as_ref(),
