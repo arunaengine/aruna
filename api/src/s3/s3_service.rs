@@ -8,9 +8,9 @@ use crate::s3::checksum::{
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
-    checksum_response_hashes, convert_input, multipart_checksum_type_from_s3, parse_completed_part,
-    parse_copy_source, parse_copy_source_range, parse_multipart_checksum_hint,
-    parse_multipart_part_number, parse_upload_id, parse_version_id,
+    checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
+    parse_completed_part, parse_copy_source, parse_copy_source_range,
+    parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
@@ -1334,7 +1334,7 @@ impl S3 for ArunaS3Service {
                 req.input.part_number,
                 S3ErrorCode::InvalidArgument,
             )?,
-            content_length: req.input.content_length.map(|length| length as u64),
+            content_length: req.input.content_length.map(checked_size).transpose()?,
             body: Some(body),
             created_by: user_access.user_identity,
             compressed: false,
@@ -1525,7 +1525,7 @@ impl S3 for ArunaS3Service {
             checksum_algorithm: checksum_request.response_algorithm,
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
             checksum_type_explicit: checksum_request.checksum_type_declared,
-            object_size: req.input.mpu_object_size.map(|size| size as u64),
+            object_size: req.input.mpu_object_size.map(checked_size).transpose()?,
             created_by: user_access.user_identity,
             quota_ceiling,
         });

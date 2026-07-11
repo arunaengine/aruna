@@ -139,13 +139,21 @@ pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
     match input.body.take() {
         None => Err(s3_error!(InvalidRequest, "Missing body")),
-        Some(stream) => Ok(BlobPutObjectInput {
-            bucket: input.bucket,
-            key: input.key,
-            content_length: input.content_length.map(|l| l as u64),
-            body: Some(BackendStream::new_from_boxed(stream)),
-        }),
+        Some(stream) => {
+            let content_length = input.content_length.map(checked_size).transpose()?;
+            Ok(BlobPutObjectInput {
+                bucket: input.bucket,
+                key: input.key,
+                content_length,
+                body: Some(BackendStream::new_from_boxed(stream)),
+            })
+        }
     }
+}
+
+/// Rejects negative S3 size headers before an `i64 -> u64` cast can wrap them.
+pub(crate) fn checked_size(value: i64) -> S3Result<u64> {
+    u64::try_from(value).map_err(|_| s3_error!(InvalidArgument, "Size must not be negative"))
 }
 
 pub(crate) fn parse_multipart_checksum_hint(
@@ -545,6 +553,16 @@ mod tests {
             get_s3_operation_permission("ListObjectsV2"),
             Some(Action::Read)
         );
+    }
+
+    #[test]
+    fn rejects_negative_size() {
+        assert_eq!(
+            *super::checked_size(-1).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+        assert_eq!(super::checked_size(0).unwrap(), 0);
+        assert_eq!(super::checked_size(i64::MAX).unwrap(), i64::MAX as u64);
     }
 
     #[test]
