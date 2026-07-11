@@ -16,16 +16,22 @@ impl BlobHandler {
                 key_space: REALM_CONFIG_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
-                limit: 1,
+                limit: 2,
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values
-                .first()
-                .and_then(|(_, value)| RealmConfigDocument::from_bytes(value).ok())
-                .map(|document| EgressPolicy::from_config(&document.egress))
-                .unwrap_or_default(),
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                debug_assert!(values.len() <= 1, "multiple realm config documents");
+                if values.len() > 1 {
+                    tracing::warn!("multiple realm config documents; using lowest key");
+                }
+                values
+                    .first()
+                    .and_then(|(_, value)| RealmConfigDocument::from_bytes(value).ok())
+                    .map(|document| EgressPolicy::from_config(&document.egress))
+                    .unwrap_or_default()
+            }
             _ => EgressPolicy::deny_all(),
         }
     }
