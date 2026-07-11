@@ -8,6 +8,12 @@ use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, Operator, services};
 use std::collections::HashMap;
 
+pub(crate) async fn abort_partial_writer(writer: &mut opendal::Writer) {
+    if let Err(err) = writer.abort().await {
+        tracing::warn!(error = %err, "failed to abort partial blob writer");
+    }
+}
+
 pub(crate) fn init_backend_operator(
     mut config: BackendConfig,
     bucket: String,

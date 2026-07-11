@@ -1,7 +1,7 @@
 use super::BlobHandler;
 use super::backend::{build_backend_path, build_multipart_part_path};
 use crate::hash::Hasher;
-use crate::opendal::init_backend_operator;
+use crate::opendal::{abort_partial_writer, init_backend_operator};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
@@ -38,18 +38,21 @@ impl BlobHandler {
         while let Some(chunk) = blob.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
-                Err(err) => return BlobEvent::Error(BlobError::WriteError(err.to_string())),
+                Err(err) => {
+                    abort_partial_writer(&mut writer).await;
+                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                }
             };
             hasher.update(&bytes);
             if let Err(err) = writer.write(bytes.to_vec()).await {
-                let _ = operator.delete(&storage_path).await;
+                abort_partial_writer(&mut writer).await;
                 return BlobEvent::Error(BlobError::WriteError(err.to_string()));
             }
             bytes_written += bytes.len() as u64;
         }
 
         if let Err(err) = writer.close().await {
-            let _ = operator.delete(&storage_path).await;
+            abort_partial_writer(&mut writer).await;
             return BlobEvent::Error(BlobError::WriteError(err.to_string()));
         }
         location.blob_size = bytes_written;
@@ -173,13 +176,34 @@ impl BlobHandler {
             blob_size: 0,
             hashes: HashMap::new(),
         };
-        let storage_path = match location.get_storage_path() {
-            Ok(storage_path) => storage_path,
-            Err(e) => return BlobEvent::Error(e),
-        };
         let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
+        };
+        match self
+            .compose_parts_to_location(location, operator, parts)
+            .await
+        {
+            BlobEvent::WriteFinished { location } => {
+                if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+                    BlobEvent::Error(err)
+                } else {
+                    BlobEvent::WriteFinished { location }
+                }
+            }
+            other => other,
+        }
+    }
+
+    pub(super) async fn compose_parts_to_location(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        parts: Vec<BackendLocation>,
+    ) -> BlobEvent {
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
         };
         let Ok(mut writer) = operator.writer(&storage_path).await else {
             return BlobEvent::Error(BlobError::OperatorCreationFailed(
@@ -223,19 +247,14 @@ impl BlobHandler {
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
-                let _ = operator.delete(&storage_path).await;
+                abort_partial_writer(&mut writer).await;
                 return BlobEvent::Error(err);
             }
         };
 
-        let mut location = location;
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
-        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
-            BlobEvent::Error(err)
-        } else {
-            BlobEvent::WriteFinished { location }
-        }
+        BlobEvent::WriteFinished { location }
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
