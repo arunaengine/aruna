@@ -35,6 +35,15 @@ pub enum ValidationError {
     EmptyPublicValue { key: String },
     #[error("secret config key `{key}` must not be empty")]
     EmptySecretValue { key: String },
+    #[error("connector endpoint `{endpoint}` is not a valid URL")]
+    InvalidEndpointUrl { endpoint: String },
+    #[error("connector endpoint scheme `{scheme}` is not allowed for connector kind `{kind}`")]
+    InvalidEndpointScheme {
+        kind: SourceConnectorKind,
+        scheme: String,
+    },
+    #[error("connector endpoint port must not be `0`")]
+    InvalidEndpointPort,
 }
 
 pub fn validate_connector_input(
@@ -92,6 +101,40 @@ pub fn validate_connector_input(
                 key: (*key).to_string(),
             });
         }
+    }
+
+    if let Some(endpoint) = public_config.get("endpoint") {
+        validate_endpoint(kind, endpoint)?;
+    }
+
+    Ok(())
+}
+
+/// Static endpoint validation for create/replace: scheme per kind and explicit
+/// port `0`. Fast UX feedback only — the egress enforcement layer (which is
+/// allowlist-aware) is the SSRF security boundary, so denied IP literals are not
+/// rejected here to keep allowlisted internal endpoints creatable.
+fn validate_endpoint(kind: SourceConnectorKind, endpoint: &str) -> Result<(), ValidationError> {
+    let url = url::Url::parse(endpoint).map_err(|_| ValidationError::InvalidEndpointUrl {
+        endpoint: endpoint.to_string(),
+    })?;
+
+    let allowed_schemes: &[&str] = match kind {
+        SourceConnectorKind::Ftp => &["ftp"],
+        _ => &["http", "https"],
+    };
+    if !allowed_schemes
+        .iter()
+        .any(|scheme| scheme.eq_ignore_ascii_case(url.scheme()))
+    {
+        return Err(ValidationError::InvalidEndpointScheme {
+            kind,
+            scheme: url.scheme().to_string(),
+        });
+    }
+
+    if url.port() == Some(0) {
+        return Err(ValidationError::InvalidEndpointPort);
     }
 
     Ok(())
@@ -223,6 +266,54 @@ mod tests {
                 ("user".to_string(), "alice".to_string()),
                 ("password".to_string(), "secret".to_string()),
             ]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_scheme() {
+        let err = validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([("endpoint".to_string(), "ftp://example.org".to_string())]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidEndpointScheme { .. }));
+    }
+
+    #[test]
+    fn rejects_zero_port() {
+        let err = validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([("endpoint".to_string(), "http://example.org:0".to_string())]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ValidationError::InvalidEndpointPort);
+    }
+
+    #[test]
+    fn accepts_loopback_endpoint() {
+        // Denied IP literals are enforced by the egress layer, not create-time
+        // validation, so allowlisted internal endpoints stay creatable.
+        validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([("endpoint".to_string(), "http://127.0.0.1:9000".to_string())]),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_http_endpoint() {
+        validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
+            &HashMap::new(),
         )
         .unwrap();
     }

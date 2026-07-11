@@ -38,6 +38,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 
