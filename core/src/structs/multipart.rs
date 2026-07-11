@@ -214,8 +214,9 @@ mod test {
     use super::MultipartObjectMetadataKey;
     use ulid::Ulid;
 
+    // Prefix keeps the whole version id, spans all part numbers, excludes the summary.
     #[test]
-    fn part_prefix_covers_full_version_id_and_excludes_summary() {
+    fn prefix_covers_version() {
         let version_id = Ulid::new();
         let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
 
