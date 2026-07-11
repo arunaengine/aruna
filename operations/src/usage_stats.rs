@@ -14,9 +14,10 @@ use aruna_core::structs::{
     GroupAuthorizationDocument, NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX,
     NODE_USAGE_GLOBAL_PREFIX, NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY,
     NODE_USAGE_SUMMARY_GROUP_PREFIX, NodeUsageSnapshot, NotificationClass, NotificationKind,
-    NotificationRecord, QuotaStateRecord, RealmConfigDocument, RealmId, RecountReport,
-    USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, USAGE_RECOUNT_REPORT_KEY, UsageCounterError,
-    UsageCounters, UsageDelta, VersionKey, next_notified_state, node_usage_dirty_group_id,
+    NotificationRecord, QUOTA_STATE_NOTIFICATION_DEDUP_WINDOW_MS, QuotaStateRecord,
+    RealmConfigDocument, RealmId, RecountReport, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT,
+    USAGE_RECOUNT_REPORT_KEY, UsageCounterError, UsageCounters, UsageDelta, VersionKey,
+    group_quota_notification_id, next_notified_state, node_usage_dirty_group_id,
     node_usage_dirty_group_key, node_usage_global_key, node_usage_group_key,
     node_usage_group_key_group_id, node_usage_group_prefix, node_usage_key_node_id,
     node_usage_quota_state_key, node_usage_summary_group_key, usage_global_key_for_group,
@@ -1730,22 +1731,27 @@ async fn emit_quota_state_notification(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
         other => return Err(format!("unexpected group auth read event: {other:?}")),
     };
+    // Content-address the id and bucket the timestamp so two nodes that both
+    // elect themselves owner during config lag collapse to one inbox entry.
+    let window = now_ms / QUOTA_STATE_NOTIFICATION_DEDUP_WINDOW_MS;
+    let notification_id = group_quota_notification_id(group_id, previous, state, window);
+    let created_at_ms = window * QUOTA_STATE_NOTIFICATION_DEDUP_WINDOW_MS;
     let records: Vec<NotificationRecord> = group_admin_user_ids(&auth)
         .into_iter()
-        .map(|admin| {
-            NotificationRecord::new(
-                admin,
-                NotificationClass::Direct,
-                NotificationKind::GroupQuotaStateChanged {
-                    group_id,
-                    state,
-                    previous,
-                    usage_bytes,
-                    quota_bytes,
-                    ceiling_bytes,
-                },
-                now_ms,
-            )
+        .map(|admin| NotificationRecord {
+            notification_id,
+            recipient: admin,
+            class: NotificationClass::Direct,
+            kind: NotificationKind::GroupQuotaStateChanged {
+                group_id,
+                state,
+                previous,
+                usage_bytes,
+                quota_bytes,
+                ceiling_bytes,
+            },
+            created_at_ms,
+            read_at_ms: None,
         })
         .collect();
     if records.is_empty() {
