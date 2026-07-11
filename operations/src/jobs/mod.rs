@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub mod store;
+pub mod submit;
 
 /// Lease held by a claiming executor. A claim is fenced by its `claim_token`; a
 /// zombie executor whose lease lapsed and whose job was re-claimed has every write
