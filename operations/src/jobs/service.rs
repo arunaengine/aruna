@@ -8,7 +8,8 @@ use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::store::{
-    CancelRequestOutcome, list_jobs_for_user, read_job_record, set_cancel_requested,
+    CancelRequestOutcome, JobMutationError, list_jobs_for_user, read_job_record,
+    set_cancel_requested,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
@@ -59,9 +60,19 @@ pub async fn cancel_owned_job(
     if read_owned_job(context, user_id, job_id).await?.is_none() {
         return Ok(CancelJobOutcome::NotFound);
     }
-    let outcome = set_cancel_requested(&context.storage_handle, job_id, unix_timestamp_millis())
-        .await
-        .map_err(|error| error.to_string())?;
+    // The job may be pruned between the ownership read and here; treat that as a 404
+    // rather than a 500.
+    let outcome = match set_cancel_requested(
+        &context.storage_handle,
+        job_id,
+        unix_timestamp_millis(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(JobMutationError::NotFound) => return Ok(CancelJobOutcome::NotFound),
+        Err(error) => return Err(error.to_string()),
+    };
     Ok(match outcome {
         CancelRequestOutcome::AlreadyTerminal(record) => CancelJobOutcome::AlreadyTerminal(record),
         CancelRequestOutcome::Flagged(record) => {
