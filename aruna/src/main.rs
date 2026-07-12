@@ -9,11 +9,13 @@ use aruna::portal;
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
+use aruna_api::ops::{OpsState, Readiness, serve_ops};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
@@ -111,6 +113,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
+
+    // Start the ops listener before realm bootstrap so `/readyz` reports 503
+    // (startup) and `/metrics` is scrapable while the node is still coming up.
+    let metrics = Arc::new(NodeMetrics::new());
+    let readiness = Readiness::new();
+    {
+        let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
+        let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
+        let bound = ops_listener.local_addr()?;
+        tokio::spawn(async move {
+            if let Err(error) = serve_ops(ops_listener, ops_state).await {
+                error!(error = %error, "Ops server stopped");
+            }
+        });
+        info!(ops_address = %bound, "Ops server listening");
+    }
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
@@ -322,7 +340,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             is_initial_node,
             Some(Arc::new(OidcValidator::new()?)),
         )
-        .await,
+        .await
+        .with_metrics(metrics.clone()),
     );
     portal::initialize(config.portal.clone(), state.clone()).await;
 
@@ -342,6 +361,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.realm_id,
         config.node_id,
         cors,
+        metrics.clone(),
     )
     .await
     .unwrap();
@@ -357,6 +377,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+
+    // Both request listeners are bound and bootstrap has completed: the node is
+    // ready to serve, so `/readyz` may now return 200.
+    readiness.set_ready();
 
     tokio::select! {
         res = server_handle => {
@@ -378,6 +402,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     shutdown_runtime(
+        &readiness,
         driver_ctx.net_handle.as_ref(),
         driver_ctx.metadata_handle.as_ref(),
         &driver_ctx.storage_handle,
@@ -401,10 +426,13 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
 }
 
 async fn shutdown_runtime(
+    readiness: &Readiness,
     net_handle: Option<&NetHandle>,
     metadata_handle: Option<&MetadataHandle>,
     storage_handle: &StorageHandle,
 ) {
+    readiness.begin_drain();
+
     if let Some(net_handle) = net_handle {
         info!("Shutting down network services");
         net_handle.shutdown().await;
@@ -490,18 +518,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_runtime_syncs_storage_without_net() {
+    async fn shutdown_drains_syncs() {
+        let readiness = Readiness::new();
+        readiness.set_ready();
+        let observed_readiness = readiness.clone();
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("shutdown should request storage sync_all");
+            assert!(
+                observed_readiness.is_draining(),
+                "readiness should drain before storage sync"
+            );
             assert!(matches!(effect, StorageEffect::SyncAll));
             response_tx.send(StorageEvent::SyncAllFinished);
         });
 
-        shutdown_runtime(None, None, &storage_handle).await;
+        shutdown_runtime(&readiness, None, None, &storage_handle).await;
 
+        assert!(readiness.is_draining());
         worker.join().expect("storage responder should finish");
     }
 
@@ -541,7 +577,7 @@ mod tests {
     async fn ensure_usage_counters_returns_probe_errors() {
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("usage counter ensure should probe storage");
             assert!(matches!(effect, StorageEffect::BatchRead { .. }));
@@ -564,7 +600,7 @@ mod tests {
     async fn ensure_usage_counters_rejects_unexpected_probe_events() {
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("usage counter ensure should probe storage");
             assert!(matches!(effect, StorageEffect::BatchRead { .. }));

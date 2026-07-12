@@ -29,6 +29,7 @@ NODE_BASE_URLS=()
 NODE_HTTP_PORTS=()
 NODE_P2P_PORTS=()
 NODE_S3_PORTS=()
+NODE_OPS_PORTS=()
 STARTED_PID=""
 
 log() {
@@ -139,7 +140,8 @@ write_node_env() {
   local http_port=$2
   local p2p_port=$3
   local s3_port=$4
-  local onboarding_secret=${5:-}
+  local ops_port=$5
+  local onboarding_secret=${6:-}
   local max_concurrent_uni_streams="${MAX_CONCURRENT_UNI_STREAMS:-}"
   local max_concurrent_bidi_streams="${MAX_CONCURRENT_BIDI_STREAMS:-}"
 
@@ -151,6 +153,7 @@ write_node_env() {
     printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
+    printf 'OPS_SOCKET_ADDRESS=127.0.0.1:%s\n' "$ops_port"
     printf 'API_PUBLIC_URL=http://127.0.0.1:%s\n' "$http_port"
     printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
     printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
@@ -320,11 +323,12 @@ onboard_server_node() {
   local http_port=$3
   local p2p_port=$4
   local s3_port=$5
-  local base_url=$6
+  local ops_port=$6
+  local base_url=$7
   local secret
 
   secret="$(create_server_onboarding_secret)"
-  write_node_env "$node_dir" "$http_port" "$p2p_port" "$s3_port" "$secret"
+  write_node_env "$node_dir" "$http_port" "$p2p_port" "$s3_port" "$ops_port" "$secret"
   start_node "$name" "$node_dir"
   wait_for_http "$name" "$base_url" "$STARTED_PID"
 }
@@ -358,6 +362,7 @@ prepare_nodes() {
   local http_port
   local p2p_port
   local s3_port
+  local ops_port
 
   for ((node_index = 1; node_index <= NODE_COUNT; node_index++)); do
     offset=$(((node_index - 1) * 10))
@@ -366,6 +371,7 @@ prepare_nodes() {
     http_port=$((BASE_PORT + offset + 1))
     p2p_port=$((BASE_PORT + offset + 2))
     s3_port=$((BASE_PORT + offset + 3))
+    ops_port=$((BASE_PORT + offset + 4))
 
     mkdir -p "$node_dir"
     NODE_NAMES+=("$node_name")
@@ -374,6 +380,7 @@ prepare_nodes() {
     NODE_HTTP_PORTS+=("$http_port")
     NODE_P2P_PORTS+=("$p2p_port")
     NODE_S3_PORTS+=("$s3_port")
+    NODE_OPS_PORTS+=("$ops_port")
   done
 }
 
@@ -384,6 +391,7 @@ assert_node_ports_free() {
     assert_port_free "${NODE_HTTP_PORTS[$node_index]}"
     assert_port_free "${NODE_P2P_PORTS[$node_index]}"
     assert_port_free "${NODE_S3_PORTS[$node_index]}"
+    assert_port_free "${NODE_OPS_PORTS[$node_index]}"
   done
 }
 
@@ -542,7 +550,7 @@ if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   start_keycloak
 fi
 
-write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" "${NODE_S3_PORTS[0]}"
+write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" "${NODE_S3_PORTS[0]}" "${NODE_OPS_PORTS[0]}"
 
 start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
 NODE_1_PID="$STARTED_PID"
@@ -580,6 +588,7 @@ for node_index in "${!NODE_NAMES[@]}"; do
     "${NODE_HTTP_PORTS[$node_index]}" \
     "${NODE_P2P_PORTS[$node_index]}" \
     "${NODE_S3_PORTS[$node_index]}" \
+    "${NODE_OPS_PORTS[$node_index]}" \
     "${NODE_BASE_URLS[$node_index]}"
 done
 

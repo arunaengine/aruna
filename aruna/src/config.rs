@@ -33,7 +33,7 @@ use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -41,6 +41,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
+/// Default ops listener bind. Loopback so liveness/readiness probes and the
+/// Prometheus scrape exist out of the box without being publicly reachable.
+const DEFAULT_OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
 const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -58,6 +61,7 @@ pub struct Config {
     pub blob_control_plane_io_timeout_secs: u64,
     pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
+    pub ops_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors_allowed_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
@@ -266,6 +270,12 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .transpose()?
         .unwrap_or(30 * 60);
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
+    let ops_socket_addr = dotenvy::var("OPS_SOCKET_ADDRESS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| SocketAddr::from_str(value.trim()))
+        .transpose()?
+        .unwrap_or(DEFAULT_OPS_SOCKET_ADDR);
     let max_http_body_size = dotenvy::var("MAX_HTTP_BODY_SIZE")
         .ok()
         .map(|value| value.parse::<usize>())
@@ -402,6 +412,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_control_plane_io_timeout_secs,
             blob_transfer_idle_timeout_secs,
             http_socket_addr,
+            ops_socket_addr,
             max_http_body_size,
             cors_allowed_origins,
             p2p_socket_addr,

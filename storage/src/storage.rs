@@ -26,6 +26,7 @@ pub type EffectHandle = (
     oneshot::TxOneshot<StorageEvent>,
     Span,
     Instant,
+    InFlightGuard,
 );
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
@@ -173,8 +174,33 @@ struct StorageMetrics {
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
     in_flight: AtomicU64,
-    channel_closed: AtomicBool,
+    channel_closed: Arc<AtomicBool>,
     last_error: Mutex<Option<String>>,
+}
+
+/// Decrements `in_flight` when an accepted effect completes or is discarded.
+#[doc(hidden)]
+pub struct InFlightGuard(Arc<StorageMetrics>);
+
+impl InFlightGuard {
+    fn acquire(metrics: &Arc<StorageMetrics>) -> Self {
+        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(metrics.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct WorkerLifecycleGuard(Arc<AtomicBool>);
+
+impl Drop for WorkerLifecycleGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -212,6 +238,12 @@ impl StorageHandle {
     /// Number of storage effects currently enqueued or being processed.
     pub fn in_flight(&self) -> u64 {
         self.metrics.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// True once the effect channel has permanently closed because the worker
+    /// died. Latched and unrecoverable in-process; a cheap, lock-free read.
+    pub fn channel_closed(&self) -> bool {
+        self.metrics.channel_closed.load(Ordering::Relaxed)
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
@@ -268,9 +300,10 @@ impl StorageHandle {
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
+        let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
             .write_channel
-            .try_send((effect, response_tx, span, Instant::now()))
+            .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -288,8 +321,7 @@ impl StorageHandle {
             }
         }
 
-        self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
-        let event = match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(event)) => self.observe_storage_event(event),
             Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
                 error: StorageError::ChannelClosed,
@@ -309,18 +341,17 @@ impl StorageHandle {
                     error: StorageError::Timeout,
                 })
             }
-        };
-        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
-        event
+        }
     }
 
     fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
         let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
+        let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
             .write_channel
-            .try_send((effect, response_tx, span, Instant::now()))
+            .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => warn!(
@@ -460,8 +491,10 @@ impl FjallStorage {
         let (sender, receiver) = StorageHandle::new();
         let store = Store::new(db);
         let read_pool = spawn_read_pool(store.clone(), READ_POOL_THREADS);
+        let channel_closed = sender.metrics.channel_closed.clone();
 
         thread::spawn(move || {
+            let _lifecycle = WorkerLifecycleGuard(channel_closed);
             let mut storage = FjallStorage {
                 store,
                 persist_policy: policy,
@@ -570,7 +603,7 @@ impl FjallStorage {
     }
 
     fn process_single(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
-        let (effect, response_tx, span, enqueued_at) = item;
+        let (effect, response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
         let key_space = storage_effect_key_space(&effect).map(str::to_string);
@@ -637,6 +670,7 @@ impl FjallStorage {
                 "Dropping storage response for abandoned request"
             );
         } else {
+            drop(in_flight);
             response_tx.send(event);
         }
     }
@@ -710,7 +744,7 @@ impl FjallStorage {
         };
 
         let service_elapsed = service_started.elapsed();
-        for ((effect, response_tx, span, enqueued_at), outcome) in prepared {
+        for ((effect, response_tx, span, enqueued_at, in_flight), outcome) in prepared {
             let _guard = span.enter();
             let queue_wait = enqueued_at.elapsed().saturating_sub(service_elapsed);
             let event = match outcome {
@@ -734,6 +768,7 @@ impl FjallStorage {
                 service_elapsed,
                 result,
             );
+            drop(in_flight);
             if !response_tx.is_disconnected() {
                 response_tx.send(event);
             }
@@ -1343,7 +1378,7 @@ impl PendingWriteIndex {
             keys: Vec::with_capacity(group.len()),
             sorted: true,
         };
-        for (effect, _, _, _) in group {
+        for (effect, _, _, _, _) in group {
             index.insert(effect);
         }
         index
@@ -1519,7 +1554,7 @@ fn spawn_read_pool(store: Store, threads: usize) -> Vec<EffectSender> {
 }
 
 fn read_pool_loop(store: Store, receiver: EffectReceiver) {
-    while let Ok((effect, response_tx, span, enqueued_at)) = receiver.recv() {
+    while let Ok((effect, response_tx, span, enqueued_at, in_flight)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_disconnected() {
             continue;
@@ -1579,6 +1614,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 "Slow storage read"
             );
         }
+        drop(in_flight);
         if !response_tx.is_disconnected() {
             response_tx.send(event);
         }
@@ -1853,6 +1889,8 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
     use std::{env, process::Command, thread};
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1972,10 +2010,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_stays_counted() {
+        let (handle, receiver) = StorageHandle::new();
+        let mut probe = Box::pin(handle.send_storage_effect(StorageEffect::Read {
+            key_space: "node_state".to_string(),
+            key: b"node_state".to_vec().into(),
+            txn_id: None,
+        }));
+
+        // No worker consumes the effect, so the external timeout fires and the
+        // probe future is dropped mid-await, as in a readiness probe timeout.
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(50), probe.as_mut()).await;
+        assert!(timed_out.is_err());
+        assert_eq!(handle.in_flight(), 1);
+
+        drop(probe);
+        assert_eq!(handle.in_flight(), 1);
+
+        let queued = receiver.recv().expect("cancelled effect remains queued");
+        assert_eq!(handle.in_flight(), 1);
+        drop(queued);
+        assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_enqueue_balances() {
+        let (handle, receiver) = StorageHandle::new();
+        drop(receiver);
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "node_state".to_string(),
+                key: b"node_state".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::ChannelClosed
+            })
+        ));
+        assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[test]
+    fn worker_exit_latches() {
+        let dir = tempdir().expect("temp dir");
+        let handle =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let StorageHandle {
+            write_channel,
+            metrics,
+        } = handle;
+
+        assert!(!metrics.channel_closed.load(Ordering::Relaxed));
+        drop(write_channel);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !metrics.channel_closed.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        assert!(metrics.channel_closed.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
     async fn sync_all_handle_surfaces_persist_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("sync_all effect should arrive");
             assert!(matches!(effect, StorageEffect::SyncAll));
             response_tx.send(StorageEvent::Error {
@@ -2615,14 +2721,14 @@ mod tests {
     async fn send_effect_counts_conflicts_separately_from_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("first effect should arrive");
             assert!(matches!(effect, StorageEffect::CommitTransaction { .. }));
             response_tx.send(StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             });
 
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("second effect should arrive");
             assert!(matches!(
                 effect,

@@ -42,3 +42,30 @@ services:
       - ${ARUNA_COMPOSE_DATA_DIR:-../target/node/storage}:/data
       - ./compose.aruna.env:/run/.env:ro
     restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=127.0.0.1:9090
+    network_mode: host
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:12.1.0@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: 3003
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    network_mode: host
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -1,9 +1,11 @@
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::server_state::ServerState;
+use aruna_core::metrics::{RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::AuthContext;
 use aruna_core::telemetry::{LatencyAggregator, RequestStages, duration_ms};
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{MatchedPath, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use http::{HeaderMap, Method};
@@ -50,17 +52,23 @@ impl Extractor for HeaderExtractor<'_> {
     }
 }
 
-pub async fn request_tracing_middleware(request: Request, next: Next) -> Response {
+pub async fn request_tracing_middleware(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
     // Router::layer middleware runs after route matching, so the matched
     // route template is available and keeps the latency key cardinality low.
-    let route = request
+    let matched_route = request
         .extensions()
         .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_string())
-        .unwrap_or_else(|| path.clone());
+        .map(|matched| matched.as_str().to_string());
+    let route = matched_route.clone().unwrap_or_else(|| path.clone());
+    // Prometheus label must never carry a raw path; unmatched requests collapse.
+    let metric_op = matched_route.unwrap_or_else(|| "unmatched".to_string());
     let span = make_request_span("http", request.headers(), &method, &path);
     let started = Instant::now();
 
@@ -82,9 +90,26 @@ pub async fn request_tracing_middleware(request: Request, next: Next) -> Respons
         .scope(next.run(request).instrument(span.clone()))
         .await;
     let elapsed = started.elapsed();
-    emit_request_completed(&span, "http", response.status().as_u16(), started);
+    let status_code = response.status().as_u16();
+    emit_request_completed(&span, "http", status_code, started);
     let route_key = format!("{method} {route}");
     HTTP_LATENCY.record(&route_key, elapsed);
+    let metrics = state.metrics();
+    metrics
+        .http_requests
+        .get_or_create(&RequestLabels {
+            interface: "rest",
+            method: method_label(method.as_str()),
+            code: status_code,
+        })
+        .inc();
+    metrics
+        .http_request_duration
+        .get_or_create(&RouteLabels {
+            interface: "rest",
+            op: metric_op,
+        })
+        .observe(elapsed.as_secs_f64());
     if is_slow_request(elapsed, slow_request_threshold()) {
         let _guard = span.enter();
         warn!(
