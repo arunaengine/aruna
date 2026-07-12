@@ -141,6 +141,22 @@ pub fn resolve_shard_holders(
     resolve_shard_holders_with(config, strategy, placement)
 }
 
+/// Whether `node_id` holds `placement`, and may therefore publish onto its
+/// topic. An empty holder set means no strategy governs the bucket (early
+/// bootstrap, [`PlacementRef::NIL`]): nobody shards it, so it is nobody's to
+/// withhold and the local node counts as a holder.
+///
+/// The presence of a local copy of a document is never evidence of holdership:
+/// a rebalance leaves a stale copy behind on a node that is no longer a holder.
+pub fn holds_placement(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    node_id: NodeId,
+) -> bool {
+    let holders = resolve_shard_holders(config, placement);
+    holders.is_empty() || holders.contains(&node_id)
+}
+
 /// Buckets of `strategy` that `node_id` is a holder of. Empty when the node is
 /// not sync-eligible, is unknown to the config, or is filtered out everywhere.
 pub fn held_buckets(

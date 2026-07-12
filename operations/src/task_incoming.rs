@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncPublish, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -76,6 +78,9 @@ use crate::usage_stats::{
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+/// How long a record may wait for its shard topic's genesis before the drain
+/// stops treating the wait as normal and says so at error level.
+const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
 
 /// One drained outbox record with its resolved publish topic.
 type DrainRecord = (
@@ -214,45 +219,113 @@ impl DrainSyncOutcome {
 struct DrainDeferState {
     topic_exists: HashMap<irokle::TopicId, bool>,
     deferred_topics: HashSet<irokle::TopicId>,
+    undeliverable_topics: HashSet<irokle::TopicId>,
 }
 
-/// Splits FIFO-ordered drain records into those to publish now and a count of
-/// those deferred because their shard topic has no local genesis yet. Each
-/// topic's availability is evaluated once per run (state persists in `defer`);
-/// once a topic defers, every later record of that topic defers too. Splitting
-/// FIFO-adjacent records of one topic across a defer/publish boundary would let
-/// the newer op publish first, invert its origin sequence on receivers, and drop
-/// the older op forever as StaleOriginSequence — so a topic never straddles that
-/// boundary within a run, across pages included.
+/// What a record whose shard topic has no local genesis is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferOutcome {
+    /// The local node holds the bucket, so the genesis is on its way (rank-0
+    /// creates it, every other holder pulls it): keep the record and retry.
+    Retry,
+    /// The local node holds none of the record's bucket. Topic membership is the
+    /// holder set, so it may neither mint the genesis nor join the topic: this
+    /// record can never publish from here, however long it waits.
+    Undeliverable,
+}
+
+/// Splits FIFO-ordered drain records into those to publish now, those deferred
+/// because their shard topic has no local genesis yet, and those that can never
+/// publish from this node at all. Each topic's availability is evaluated once
+/// per run (state persists in `defer`); once a topic defers, every later record
+/// of that topic defers too. Splitting FIFO-adjacent records of one topic across
+/// a defer/publish boundary would let the newer op publish first, invert its
+/// origin sequence on receivers, and drop the older op forever as
+/// StaleOriginSequence — so a topic never straddles that boundary within a run,
+/// across pages included. A shard topic's holder set is a function of its
+/// placement, so undeliverability is likewise decided once per topic.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
     mut topic_available: impl FnMut(irokle::TopicId) -> bool,
-) -> (Vec<DrainRecord>, usize) {
+    mut classify_defer: impl FnMut(&DocumentSyncOutboxRecord) -> DeferOutcome,
+) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
     let mut to_publish = Vec::with_capacity(records.len());
-    let mut deferred = 0usize;
+    let mut deferred = Vec::new();
+    let mut undeliverable = Vec::new();
     for (record_key, record, topic) in records {
-        if record.target.uses_shard_topic() {
-            let available = !defer.deferred_topics.contains(&topic)
-                && *defer
-                    .topic_exists
-                    .entry(topic)
-                    .or_insert_with(|| topic_available(topic));
-            if !available {
-                defer.deferred_topics.insert(topic);
-                debug!(
-                    event = "pipeline.drain.deferred",
-                    target = ?record.target,
-                    %topic,
-                    "Deferring outbox record: shard topic genesis not yet known"
-                );
-                deferred += 1;
-                continue;
-            }
+        if !record.target.uses_shard_topic() {
+            to_publish.push((record_key, record, topic));
+            continue;
         }
-        to_publish.push((record_key, record, topic));
+        if defer.undeliverable_topics.contains(&topic) {
+            undeliverable.push((record_key, record, topic));
+            continue;
+        }
+        let already_deferred = defer.deferred_topics.contains(&topic);
+        let available = !already_deferred
+            && *defer
+                .topic_exists
+                .entry(topic)
+                .or_insert_with(|| topic_available(topic));
+        if available {
+            to_publish.push((record_key, record, topic));
+            continue;
+        }
+        if !already_deferred && classify_defer(&record) == DeferOutcome::Undeliverable {
+            defer.undeliverable_topics.insert(topic);
+            undeliverable.push((record_key, record, topic));
+            continue;
+        }
+        defer.deferred_topics.insert(topic);
+        debug!(
+            event = "pipeline.drain.deferred",
+            target = ?record.target,
+            %topic,
+            "Deferring outbox record: shard topic genesis not yet known"
+        );
+        deferred.push((record_key, record, topic));
     }
-    (to_publish, deferred)
+    (to_publish, deferred, undeliverable)
+}
+
+/// Whether a record whose shard topic is missing locally can ever publish from
+/// here. Holdership is read from the live realm config, never from the presence
+/// of a local copy: a rebalance leaves a stale copy on a node that has lost the
+/// bucket. Without a readable config nothing is decided and the record retries.
+fn classify_deferred_record(
+    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    net_handle: &aruna_net::NetHandle,
+    record: &DocumentSyncOutboxRecord,
+) -> DeferOutcome {
+    let Some(config) = config else {
+        return DeferOutcome::Retry;
+    };
+    if crate::placement::holds_placement(config, &record.placement, net_handle.node_id()) {
+        DeferOutcome::Retry
+    } else {
+        DeferOutcome::Undeliverable
+    }
+}
+
+/// Escalates a record that has been waiting for its shard topic far longer than
+/// a genesis takes to arrive. It is still retried, but it stops being silent.
+fn report_stuck_records(deferred: &[DrainRecord]) {
+    let now_ms = unix_timestamp_millis();
+    for (_, record, topic) in deferred {
+        let age_ms = now_ms.saturating_sub(record.outbox_id.timestamp_ms());
+        if age_ms >= OUTBOX_STUCK_AFTER.as_millis() as u64 {
+            error!(
+                event = "pipeline.drain.stuck",
+                target = ?record.target,
+                %topic,
+                age_ms,
+                strategy = %record.placement.strategy_id,
+                shard = record.placement.shard,
+                "Document sync outbox record is stuck: this node holds the bucket but its shard topic genesis has never arrived"
+            );
+        }
+    }
 }
 
 impl OperationsTaskHandler {
@@ -261,6 +334,34 @@ impl OperationsTaskHandler {
             context,
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drops records that can never publish from this node, loudly. Leaving them
+    /// in the outbox would retry them forever against a topic this node may not
+    /// join: a deferred record that can never drain is silent data loss, so the
+    /// operator is told instead.
+    async fn drop_undeliverable_records(&self, undeliverable: Vec<DrainRecord>) -> usize {
+        if undeliverable.is_empty() {
+            return 0;
+        }
+        let mut keys = Vec::with_capacity(undeliverable.len());
+        for (record_key, record, topic) in undeliverable {
+            error!(
+                event = "pipeline.drain.undeliverable",
+                target = ?record.target,
+                %topic,
+                strategy = %record.placement.strategy_id,
+                shard = record.placement.shard,
+                age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
+                "Dropping undeliverable document sync outbox record: this node holds none of its bucket, so it can neither mint nor join the shard topic"
+            );
+            keys.push(record_key);
+        }
+        let dropped = keys.len();
+        if let Err(error) = delete_outbox_records(&self.context.storage_handle, keys).await {
+            error!(error = %error, "Failed to delete undeliverable document sync outbox records");
+        }
+        dropped
     }
 
     /// Backoff interval for the next re-arm of `key`, derived from the in-memory
@@ -367,6 +468,7 @@ impl OperationsTaskHandler {
         let mut publish_elapsed = Duration::ZERO;
         let mut record_count = 0usize;
         let mut deferred_total = 0usize;
+        let mut undeliverable_total = 0usize;
         let mut group_count = 0usize;
         let mut subbatch_count = 0usize;
         let mut pages = 0usize;
@@ -483,13 +585,19 @@ impl OperationsTaskHandler {
                 totals.merge(outcome);
             }
 
-            let (to_publish, deferred) =
-                partition_drain_records(records, &mut defer_state, |topic| {
+            let (to_publish, deferred, undeliverable) = partition_drain_records(
+                records,
+                &mut defer_state,
+                |topic| {
                     net_handle
                         .document_sync_topic_exists(topic)
                         .unwrap_or(false)
-                });
-            deferred_total += deferred;
+                },
+                |record| classify_deferred_record(realm_config.as_ref(), net_handle, record),
+            );
+            deferred_total += deferred.len();
+            report_stuck_records(&deferred);
+            undeliverable_total += self.drop_undeliverable_records(undeliverable).await;
 
             let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
                 BTreeMap::new();
@@ -632,6 +740,7 @@ impl OperationsTaskHandler {
             event = "pipeline.drain.summary",
             records = record_count,
             deferred = deferred_total,
+            undeliverable = undeliverable_total,
             groups = group_count,
             subbatches = subbatch_count,
             pages,
@@ -1628,17 +1737,23 @@ mod tests {
 
         let mut calls = 0usize;
         let mut defer = DrainDeferState::default();
-        let (to_publish, deferred) = partition_drain_records(records, &mut defer, |_| {
-            calls += 1;
-            calls > 1
-        });
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut defer,
+            |_| {
+                calls += 1;
+                calls > 1
+            },
+            |_| DeferOutcome::Retry,
+        );
 
         assert_eq!(calls, 1, "topic availability is evaluated once per run");
         assert!(
             to_publish.is_empty(),
             "no record of a deferred topic may publish"
         );
-        assert_eq!(deferred, 2);
+        assert_eq!(deferred.len(), 2);
+        assert!(undeliverable.is_empty());
     }
 
     #[test]
@@ -1650,10 +1765,42 @@ mod tests {
         ];
 
         let mut defer = DrainDeferState::default();
-        let (to_publish, deferred) = partition_drain_records(records, &mut defer, |_| true);
+        let (to_publish, deferred, undeliverable) =
+            partition_drain_records(records, &mut defer, |_| true, |_| DeferOutcome::Retry);
 
-        assert_eq!(deferred, 0);
+        assert!(deferred.is_empty());
+        assert!(undeliverable.is_empty());
         let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
+        assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
+    }
+
+    // A record for a bucket this node does not hold can never publish: it may
+    // neither mint the topic's genesis nor join the topic. Deferring it forever
+    // would be silent data loss, so it is separated out to be dropped loudly.
+    #[test]
+    fn unheld_bucket_records_are_undeliverable() {
+        let topic = irokle::TopicId::hash(b"unheld-bucket");
+        let records = vec![
+            (b"older".to_vec(), shard_topic_record(1), topic),
+            (b"newer".to_vec(), shard_topic_record(2), topic),
+        ];
+
+        let mut classified = 0usize;
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut defer,
+            |_| false,
+            |_| {
+                classified += 1;
+                DeferOutcome::Undeliverable
+            },
+        );
+
+        assert_eq!(classified, 1, "holdership is decided once per topic");
+        assert!(to_publish.is_empty());
+        assert!(deferred.is_empty());
+        let keys: Vec<Vec<u8>> = undeliverable.into_iter().map(|(key, _, _)| key).collect();
         assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
     }
 

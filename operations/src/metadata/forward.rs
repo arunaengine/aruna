@@ -21,7 +21,9 @@ use crate::delete_metadata_document::{
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
-use crate::placement::{PlacementResolutionContext, plan_target_placement, resolve_shard_holders};
+use crate::placement::{
+    PlacementResolutionContext, holds_placement, plan_target_placement, resolve_shard_holders,
+};
 use crate::process_placements::load_realm_config;
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -69,11 +71,10 @@ pub fn write_route(
     let Some(config) = config else {
         return MetadataWriteRoute::Local;
     };
-    let holders = resolve_shard_holders(config, placement);
-    if holders.is_empty() || holders.contains(&local_node_id) {
+    if holds_placement(config, placement, local_node_id) {
         return MetadataWriteRoute::Local;
     }
-    MetadataWriteRoute::Forward(holders)
+    MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
 /// Route resolved against the live realm config. The presence of a local
