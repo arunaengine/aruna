@@ -2,12 +2,12 @@ use crate::server_state::ServerState;
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, error};
 use url::{Host, Url};
 
 /// The portal loads its webfont stylesheet from Google Fonts and the font files
@@ -91,12 +91,17 @@ pub(crate) async fn portal_security_headers(
     next: Next,
 ) -> Response {
     let policy = content_security_policy(&security.connect_origins().await);
+    let policy = match HeaderValue::from_str(&policy) {
+        Ok(policy) => policy,
+        Err(error) => {
+            error!(error = %error, policy, "Portal CSP rejected; refusing to serve");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-
-    if let Ok(policy) = HeaderValue::from_str(&policy) {
-        headers.insert(header::CONTENT_SECURITY_POLICY, policy);
-    }
+    headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
