@@ -509,6 +509,44 @@ pub async fn requeue_job(
     })
 }
 
+#[derive(Debug)]
+pub enum ReleaseOutcome {
+    Released(JobRecord),
+    Skipped,
+}
+
+/// Hand a lease back without spending an attempt: clear the claim, re-queue, make it
+/// due now. Guarded by `token`, so a job another node already took over is left alone.
+/// Distinct from `requeue_job`, whose attempt increment is unconditional.
+pub async fn release_job(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    let mut released = false;
+    let record = mutate_job(storage, job_id, |record| {
+        released = false;
+        guard_token(record, token)?;
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Queued;
+        record.claim = None;
+        record.due_at_ms = now_ms;
+        record.updated_at_ms = now_ms;
+        released = true;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+
+    Ok(if released {
+        ReleaseOutcome::Released(record)
+    } else {
+        ReleaseOutcome::Skipped
+    })
+}
+
 pub enum CancelRequestOutcome {
     Flagged(JobRecord),
     AlreadyTerminal(JobRecord),
@@ -1033,6 +1071,47 @@ mod tests {
         };
         assert_eq!(failed.state, JobState::Failed);
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+    }
+
+    // A hand-back is not a failure: attempts stay put and the job is due immediately.
+    #[tokio::test]
+    async fn release_keeps_attempts() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA1; 16]);
+        let token = Ulid::r#gen();
+        let mut record = running_record(job_id, token, 60_000);
+        record.attempts = 2;
+        insert_job(&storage, &record).await.unwrap();
+
+        let ReleaseOutcome::Released(released) =
+            release_job(&storage, job_id, token, 6_000).await.unwrap()
+        else {
+            panic!("expected release");
+        };
+        assert_eq!(released.state, JobState::Queued);
+        assert_eq!(released.attempts, 2);
+        assert_eq!(released.due_at_ms, 6_000);
+        assert!(released.claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn release_guards_token() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xB2; 16]);
+        insert_job(&storage, &running_record(job_id, Ulid::r#gen(), 60_000))
+            .await
+            .unwrap();
+
+        let error = release_job(&storage, job_id, Ulid::r#gen(), 6_000)
+            .await
+            .expect_err("a foreign token must not release the lease");
+        assert!(matches!(error, JobMutationError::TokenMismatch));
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Running);
+        assert!(record.claim.is_some());
     }
 
     #[tokio::test]
