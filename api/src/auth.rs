@@ -470,6 +470,20 @@ pub(crate) fn require_realm_auth(
     Ok(auth)
 }
 
+/// Realm auth that additionally rejects path-restricted (delegated) tokens. User-scoped
+/// surfaces cannot honour a token's path confinement, so a delegated token must not reach
+/// them even when a per-resource permission check would otherwise pass.
+pub(crate) fn require_unrestricted_realm_auth(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = require_realm_auth(state, auth)?;
+    if auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(auth)
+}
+
 pub(crate) async fn ensure_permission(
     state: &ServerState,
     auth: &AuthContext,
