@@ -968,7 +968,9 @@ mod tests {
     use aruna_core::storage_entries::{
         metadata_create_event_write_entry, metadata_pending_projection_key,
     };
-    use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -1011,6 +1013,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node(2)],
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
@@ -1528,6 +1531,7 @@ mod tests {
                 graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
                 public: false,
                 permission_path: String::new(),
+                placement: PlacementRef::NIL,
                 holder_node_ids: Vec::new(),
                 created_at_ms: updated_at_ms,
                 updated_at_ms,

@@ -12,7 +12,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
 use aruna_core::structs::{
     Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
-    NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
+    NodeUrls, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -268,6 +268,7 @@ async fn write_metadata_create_event(
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node.net.node_id()],
             created_at_ms: 1,
             updated_at_ms: 1,

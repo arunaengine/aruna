@@ -770,6 +770,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![actor.node_id],
             created_at_ms: 1,
             updated_at_ms: 2,

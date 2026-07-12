@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
@@ -8,16 +9,22 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Actor, MetadataRegistryRecord};
+use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument};
 use aruna_core::types::{Effects, GroupId};
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::read_effect;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
+use crate::placement::{
+    PlacementResolutionContext, choose_origin_bucket, placement_ref_for_target,
+    strategy_for_target, subject_bytes,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
@@ -74,6 +81,7 @@ enum CreateMetadataDocumentState {
     Init,
     ValidateGraph,
     CheckExisting,
+    ReadRealmConfig,
     AppendCreateEvent,
     Finish,
     Error,
@@ -140,7 +148,53 @@ impl CreateMetadataDocumentOperation {
         vec![self.config.actor.node_id]
     }
 
-    fn build_record(&self, holder_node_ids: Vec<NodeId>) -> MetadataRegistryRecord {
+    fn lifecycle_target(&self) -> DocumentSyncTarget {
+        DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: self.config.document_id,
+        }
+    }
+
+    /// The document's bucket, chosen once here by the receiving node from the
+    /// buckets it holds. Stamped at event-append time only: the projector
+    /// re-runs on replay, and re-choosing under a changed config would fork the
+    /// document across two topics.
+    fn choose_placement(&self, config: Option<&RealmConfigDocument>) -> PlacementRef {
+        let Some(config) = config else {
+            return PlacementRef::NIL;
+        };
+        let target = self.lifecycle_target();
+        let document_path =
+            MetadataRegistryRecord::normalize_document_path(&self.config.document_path);
+        let context = PlacementResolutionContext {
+            group_id: Some(self.config.group_id),
+            metadata_path: Some(document_path.as_str()),
+        };
+        let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
+            return PlacementRef::NIL;
+        };
+        match choose_origin_bucket(
+            config,
+            strategy,
+            self.config.actor.node_id,
+            &subject_bytes(&target),
+        ) {
+            Some(placement) => placement,
+            None => {
+                warn!(
+                    document_id = %self.config.document_id,
+                    node_id = %self.config.actor.node_id,
+                    "Create-receiving node holds no bucket of the governing strategy; falling back to the hashed bucket"
+                );
+                placement_ref_for_target(config, &target, context)
+            }
+        }
+    }
+
+    fn build_record(
+        &self,
+        holder_node_ids: Vec<NodeId>,
+        placement: PlacementRef,
+    ) -> MetadataRegistryRecord {
         let now = Self::current_timestamp_ms();
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
@@ -152,6 +206,7 @@ impl CreateMetadataDocumentOperation {
             graph_iri: self.graph_iri(),
             public: self.config.public,
             permission_path: self.permission_path(),
+            placement,
             holder_node_ids,
             created_at_ms: now,
             updated_at_ms: now,
@@ -243,8 +298,18 @@ impl CreateMetadataDocumentOperation {
         smallvec![self.graph_validation_effect()]
     }
 
-    fn append_create_event_effect(&mut self) -> Effects {
-        let record = self.build_record(self.holder_node_ids());
+    fn read_realm_config_effect(&mut self) -> Effects {
+        self.state = CreateMetadataDocumentState::ReadRealmConfig;
+        smallvec![read_effect(
+            &DocumentSyncTarget::RealmConfig {
+                realm_id: self.config.actor.realm_id,
+            },
+            None,
+        )]
+    }
+
+    fn append_create_event_effect(&mut self, placement: PlacementRef) -> Effects {
+        let record = self.build_record(self.holder_node_ids(), placement);
         let create_event = self.create_event_record(&record);
         self.create_event = Some(create_event.clone());
         self.record = Some(create_event.record.clone());
@@ -301,7 +366,7 @@ impl Operation for CreateMetadataDocumentOperation {
             CreateMetadataDocumentState::ValidateGraph => match event {
                 Event::Metadata(MetadataEvent::ValidationResult { .. }) => {
                     if self.skip_existing_check {
-                        return self.append_create_event_effect();
+                        return self.read_realm_config_effect();
                     }
                     self.state = CreateMetadataDocumentState::CheckExisting;
                     smallvec![read_registry_by_document_effect(
@@ -318,7 +383,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 match crate::metadata::repository::parse_registry_read(event) {
                     Ok(Some(_)) => self
                         .fail_without_cleanup(CreateMetadataDocumentError::DocumentAlreadyExists),
-                    Ok(None) => self.append_create_event_effect(),
+                    Ok(None) => self.read_realm_config_effect(),
                     Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
                         self.fail_without_cleanup(error.into())
                     }
@@ -327,6 +392,23 @@ impl Operation for CreateMetadataDocumentOperation {
                     }
                 }
             }
+            CreateMetadataDocumentState::ReadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let config = match value {
+                        Some(bytes) => match RealmConfigDocument::from_bytes(&bytes) {
+                            Ok(config) => Some(config),
+                            Err(error) => return self.fail_without_cleanup(error.into()),
+                        },
+                        None => None,
+                    };
+                    let placement = self.choose_placement(config.as_ref());
+                    self.append_create_event_effect(placement)
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail_without_cleanup(error.into())
+                }
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
+            },
             CreateMetadataDocumentState::AppendCreateEvent => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(record) = self.record.clone() else {
@@ -385,7 +467,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_PENDING_PROJECTION_KEYSPACE,
+        METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
@@ -393,9 +475,11 @@ mod tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::{metadata_event_log_prefix, metadata_pending_projection_key};
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::{GroupId, Key};
     use ulid::Ulid;
+
+    use crate::placement::resolve_shard_holders;
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
@@ -403,6 +487,41 @@ mod tests {
             user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
             realm_id,
         }
+    }
+
+    // Four servers at the default replication factor: no node holds every
+    // bucket, so a stamped bucket the origin holds is a real assertion.
+    fn realm_config(actor: &Actor) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::default_for_realm(actor.realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(actor.node_id, RealmNodeKind::Server);
+        for seed in 20..23u8 {
+            config.ensure_node(
+                iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                RealmNodeKind::Server,
+            );
+        }
+        config
+    }
+
+    fn realm_config_read(config: Option<&RealmConfigDocument>, actor: &Actor) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: actor.realm_id.as_bytes().to_vec().into(),
+            value: config.map(|config| {
+                config
+                    .to_bytes(actor)
+                    .expect("realm config encodes")
+                    .to_vec()
+                    .into()
+            }),
+        })
+    }
+
+    fn assert_realm_config_read(effects: &[Effect]) {
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects else {
+            panic!("expected realm config read");
+        };
+        assert_eq!(key_space, REALM_CONFIG_KEYSPACE);
     }
 
     fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateMetadataDocumentConfig {
@@ -508,7 +627,36 @@ mod tests {
         let effects = operation.start();
         assert_validation_effect(effects.as_slice(), document_id);
         let effects = operation.step(validation_result(document_id));
+        assert_realm_config_read(effects.as_slice());
+        let effects = operation.step(realm_config_read(None, &actor));
         assert_create_event_append(effects.as_slice(), document_id, &actor);
+    }
+
+    #[test]
+    fn stamped_bucket_is_held() {
+        // Topic membership is the holder set, so the origin can only publish a
+        // create onto a bucket it holds: the stamp must land in its held set.
+        let realm_id = RealmId([21u8; 32]);
+        let actor = actor(realm_id, 4);
+        let realm_config = realm_config(&actor);
+        let document_id = Ulid::r#gen();
+        let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
+            actor.clone(),
+            GroupId::r#gen(),
+            document_id,
+        ));
+
+        operation.start();
+        operation.step(validation_result(document_id));
+        operation.step(realm_config_read(Some(&realm_config), &actor));
+
+        let placement = operation
+            .record
+            .as_ref()
+            .expect("create record is built")
+            .placement;
+        assert_ne!(placement, PlacementRef::NIL);
+        assert!(resolve_shard_holders(&realm_config, &placement).contains(&actor.node_id));
     }
 
     #[test]
@@ -528,6 +676,8 @@ mod tests {
             key: document_id.to_bytes().to_vec().into(),
             value: None,
         }));
+        assert_realm_config_read(effects.as_slice());
+        let effects = operation.step(realm_config_read(None, &actor));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert_eq!(
             operation
@@ -566,6 +716,8 @@ mod tests {
 
         assert_validation_effect(operation.start().as_slice(), document_id);
         let effects = operation.step(validation_result(document_id));
+        assert_realm_config_read(effects.as_slice());
+        let effects = operation.step(realm_config_read(None, &actor));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
@@ -620,10 +772,12 @@ mod tests {
 
         assert_validation_effect(operation.start().as_slice(), document_id);
         assert_existing_read(operation.step(validation_result(document_id)).as_slice());
-        let append = operation.step(Event::Storage(StorageEvent::ReadResult {
+        let config_read = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: document_id.to_bytes().to_vec().into(),
             value: None,
         }));
+        assert_realm_config_read(config_read.as_slice());
+        let append = operation.step(realm_config_read(None, &actor));
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {

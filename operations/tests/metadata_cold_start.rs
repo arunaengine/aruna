@@ -9,7 +9,7 @@ use aruna_core::metadata::{
     MetadataQueryResults, MetadataRequestDurability,
 };
 use aruna_core::storage_entries::metadata_registry_key;
-use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
 use aruna_core::types::GroupId;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 use aruna_storage::FjallStorage;
@@ -56,6 +56,7 @@ fn registry_record(group_id: GroupId, index: usize) -> MetadataRegistryRecord {
         graph_iri: graph_iri(index),
         public: true,
         permission_path: format!("/realm/g/{group_id}/meta/datasets/doc-{index:05}@{document_id}"),
+        placement: PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,

@@ -17,7 +17,7 @@ use aruna_core::storage_entries::{
     metadata_pending_projection_key, metadata_registry_key, metadata_registry_write_entries,
 };
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
+    Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
@@ -244,7 +244,9 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
         .requests_total;
 
     assert_eq!(created.record.document_id, document_id);
-    assert_eq!(after - before, 1);
+    // Realm config read (bucket choice) plus the event append; a generated id
+    // still skips the existing-document read a client-supplied id needs.
+    assert_eq!(after - before, 2);
     Ok(())
 }
 
@@ -270,6 +272,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
             document_path,
             document_id,
         ),
+        placement: PlacementRef::NIL,
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -658,6 +661,7 @@ fn build_create_event(
             document_path,
             document_id,
         ),
+        placement: PlacementRef::NIL,
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,

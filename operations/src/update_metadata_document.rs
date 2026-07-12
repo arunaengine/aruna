@@ -509,7 +509,7 @@ mod tests {
         METADATA_MATERIALIZATION_STATUS_KEYSPACE,
     };
     use aruna_core::storage_entries::{document_sync_revision_key, metadata_registry_key};
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{Actor, PlacementRef, RealmId};
 
     fn actor() -> Actor {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -537,6 +537,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![actor.node_id],
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -702,6 +703,40 @@ mod tests {
             }
         );
         event
+    }
+
+    // The bucket is chosen once, by the create-receiving node; re-choosing it on
+    // an update under a changed config would fork the document across topics.
+    #[test]
+    fn update_keeps_placement() {
+        let actor = actor();
+        let mut record = record(&actor);
+        record.placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([5u8; 16]),
+            epoch: 0,
+            shard: 11,
+        };
+        let txn_id = Ulid::r#gen();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Placement Preserved"),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Metadata(MetadataEvent::ValidationResult {
+            graph_iri: record.graph_iri.clone(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
+            matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
+        });
+        assert_eq!(event.record.placement, record.placement);
     }
 
     #[test]

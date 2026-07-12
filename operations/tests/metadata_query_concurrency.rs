@@ -13,7 +13,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{metadata_graph_lifecycle_write_entry, metadata_registry_key};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, MetadataRegistryRecord,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, MetadataRegistryRecord, PlacementRef,
     RealmAuthorizationDocument, RealmId,
 };
 use aruna_core::types::{GroupId, Key, Value};
@@ -85,6 +85,7 @@ fn registry_record(
         graph_iri: graph_iri.unwrap_or_else(|| MetadataRegistryRecord::graph_iri_for(document_id)),
         public: true,
         permission_path: format!("/realm/g/{group_id}/meta/datasets/doc-{index:05}@{document_id}"),
+        placement: PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,
@@ -300,6 +301,7 @@ fn visibility_record(group_id: GroupId, path: &str, public: bool) -> MetadataReg
             path,
             document_id,
         ),
+        placement: PlacementRef::NIL,
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,

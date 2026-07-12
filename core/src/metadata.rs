@@ -550,7 +550,7 @@ mod tests {
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
         MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
     };
-    use crate::structs::{MetadataRegistryRecord, RealmId};
+    use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
@@ -612,6 +612,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms: 1,

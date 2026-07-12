@@ -23,7 +23,8 @@ use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_registry_key,
 };
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind,
+    Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
+    RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
@@ -412,6 +413,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
                 &document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node.net.node_id()],
             created_at_ms: now,
             updated_at_ms: now,
@@ -487,6 +489,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
             document_path,
             document_id,
         ),
+        placement: PlacementRef::NIL,
         holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
         created_at_ms: 1,
         updated_at_ms: 1,

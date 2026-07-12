@@ -1338,6 +1338,7 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
 mod tests {
     use super::*;
 
+    use aruna_core::structs::PlacementRef;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1435,6 +1436,7 @@ mod tests {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: "/metadata/query-targets".to_string(),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
             created_at_ms: 0,
             updated_at_ms: 0,

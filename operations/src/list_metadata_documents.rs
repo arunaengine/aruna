@@ -171,7 +171,7 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
     use aruna_core::metadata::MetadataGraphLifecycleRecord;
-    use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use tempfile::tempdir;
@@ -202,6 +202,7 @@ mod tests {
                     &format!("docs/{idx}"),
                     document_id,
                 ),
+                placement: PlacementRef::NIL,
                 holder_node_ids: Vec::new(),
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -365,6 +366,7 @@ mod tests {
                 path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,

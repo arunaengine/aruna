@@ -4223,7 +4223,7 @@ mod tests {
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::{
-        PathRestriction, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        PathRestriction, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
@@ -4645,6 +4645,7 @@ mod tests {
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: format!("/metadata/{document_path}"),
+            placement: PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,

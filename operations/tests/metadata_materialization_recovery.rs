@@ -14,7 +14,7 @@ use aruna_core::storage_entries::{
     metadata_create_event_write_entry, metadata_materialization_job_write_entry,
     metadata_materialization_status_key, metadata_materialization_status_write_entry,
 };
-use aruna_core::structs::{Actor, MetadataRegistryRecord, RealmId};
+use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmId};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::{
@@ -236,6 +236,7 @@ fn create_event_with_payload(
             &document_path,
             document_id,
         ),
+        placement: PlacementRef::NIL,
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,

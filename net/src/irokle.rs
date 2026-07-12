@@ -5599,9 +5599,9 @@ mod tests {
     use aruna_core::structs::{
         Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
         MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementOverride, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
-        StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
@@ -5756,6 +5756,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms,
