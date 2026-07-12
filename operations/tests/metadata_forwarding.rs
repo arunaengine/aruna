@@ -2,20 +2,29 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+    DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, TokenClaims,
+    Actor, MetadataRegistryRecord, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmId, RealmNodeKind, TokenClaims,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+};
+use aruna_operations::document_sync_outbox::{
+    new_outbox_record, outbox_key, read_outbox_record, schedule_outbox_drain_effect,
+    write_outbox_effect,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
@@ -100,14 +109,13 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
 /// A group created on a User-kind node is never silently lost.
 ///
 /// A User node holds no bucket of any group, so its admin-operation outbox
-/// records can never publish from here. They also cannot be relayed: receivers
-/// authenticate an admin event by requiring its signed publisher to be its
-/// `origin_node_id`, so a holder publishing on the emitter's behalf is rejected
-/// realm-wide (`validate_replicated_admin_event`). The record therefore stays in
-/// the outbox, retried and loud, instead of being deleted after the caller was
-/// told the group exists. Creating groups from a User node needs a signed-origin
-/// admin relay in the net layer; until then this test pins the invariant that
-/// matters — the write is never thrown away.
+/// records can never publish from here. There is no outbox relay to hand them to
+/// a holder either: a peer-relayed publish carries no proof it was
+/// permission-checked, so the tokenless relay was removed. The record therefore
+/// stays in the outbox, retried and loud, instead of being deleted after the
+/// caller was told the group exists. Creating groups from a User node needs a
+/// signed-origin admin path in the net layer; until then this test pins the
+/// invariant that matters — the write is never thrown away.
 #[tokio::test]
 async fn user_node_group_survives() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
@@ -158,22 +166,41 @@ async fn outbox_len(node: &TestNode) -> Result<usize, Box<dyn std::error::Error>
     }
 }
 
-/// Re-forwarding a create that already applied returns the existing record.
+/// Re-forwarding a create that already applied returns the existing record,
+/// even when the retry lands on a different holder.
 ///
-/// A forward whose response is lost is retried, possibly against a different
-/// holder. Every holder of the document's blind-hashed bucket stamps that same
-/// bucket, and a holder that already has the document replays it instead of
-/// creating a second one, so a retry cannot fork one document across two topics.
+/// The forward always offers the create to the bucket's rank-0 holder first, so
+/// a plain second attempt would just hit that same holder again. Taking rank-0
+/// down after the first create forces the retry onto a co-holder that never
+/// created the document itself but received it by sync; it must replay the record
+/// rather than fork a second one onto another topic. Node count is beside the
+/// point — skipping rank-0 is what makes the holder differ — so this stays at the
+/// minimum realm that leaves a holder to fail over to.
 #[tokio::test]
 async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
-    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
     let document_id = Ulid::r#gen();
 
     let first = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
+    let holders = resolve_shard_holders(&config, &first.placement);
+    assert_eq!(holders.len(), 3);
+
+    // Every holder must carry the row before the retry, so a co-holder that never
+    // created the document can still replay it.
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    // Rank-0 answered the first forward; taking it down routes the retry to a
+    // different holder.
+    let rank0 = nodes
+        .iter()
+        .find(|node| node.net.node_id() == holders[0])
+        .expect("rank-0 holder is a node");
+    rank0.net.shutdown().await;
+
     let second = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
 
     assert_eq!(second.document_id, first.document_id);
@@ -185,14 +212,57 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// A node holding no bucket of a document can still resolve it.
+fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncChange {
+    DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::r#gen(),
+            actor,
+            updated_at_ms: 1,
+        },
+        kind: DocumentSyncChangeKind::Delete,
+        placement,
+    }
+}
+
+async fn wait_for_record_on_holders(
+    nodes: &[TestNode],
+    holders: &[NodeId],
+    document_id: Ulid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        let mut pending = false;
+        for node in nodes
+            .iter()
+            .filter(|node| holders.contains(&node.net.node_id()))
+        {
+            if registry_record(node, document_id).await?.is_none() {
+                pending = true;
+            }
+        }
+        if !pending {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("the create never reached every holder".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A node holding no bucket of a document can resolve it, and cannot be tricked
+/// into relaying a forged delete for it.
 ///
 /// Five nodes at replication factor three leaves two nodes outside every
 /// document's bucket. Registry rows are the only thing that tells such a node the
 /// document exists at all, and they ride the registry class's own everywhere-bound
 /// topic rather than the document's capped bucket. Without them a read through a
 /// non-holder 404s forever and an update through it cannot even load the record it
-/// needs in order to forward.
+/// needs in order to forward. The same non-holder must never publish a delete for
+/// that bucket: the tokenless outbox relay is gone, so a forged delete it plants
+/// in its own outbox stays there, unpublished, and the document survives.
 #[tokio::test]
 async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>> {
     let realm = Realm::new();
@@ -245,6 +315,56 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
             }
             None => sleep(Duration::from_millis(50)).await,
         }
+    }
+
+    // Plant a delete for the document's bucket into the non-holder's outbox: a
+    // record it can never publish and that the removed relay used to hand to a
+    // holder to publish under the holder's signature.
+    let forged = new_outbox_record(
+        outsider.net.node_id(),
+        DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+        Vec::new(),
+        DocumentSyncOutboxEvent::Delete {
+            change: forged_delete_change(created.placement, outsider.net.node_id()),
+        },
+        created.placement,
+        false,
+    );
+    let key = outbox_key(&forged).to_vec();
+    match outsider
+        .context
+        .storage_handle
+        .send_effect(write_outbox_effect(&forged)?)
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected forged outbox write event: {other:?}").into()),
+    }
+    outsider
+        .context
+        .task_handle
+        .as_ref()
+        .expect("task handle")
+        .send_effect(schedule_outbox_drain_effect())
+        .await;
+    sleep(Duration::from_secs(2)).await;
+
+    // Neither relayed nor deleted: the forged record is still in the outbox.
+    assert_eq!(
+        read_outbox_record(&outsider.context.storage_handle, &key).await?,
+        Some(forged),
+        "the forged delete must stay in the non-holder's outbox, unpublished"
+    );
+    // And the document survives on every holder: the forged delete never reached a
+    // topic.
+    for node in nodes
+        .iter()
+        .filter(|node| holders.contains(&node.net.node_id()))
+    {
+        assert!(
+            registry_record(node, document_id).await?.is_some(),
+            "a forged delete from a non-holder must not remove the document"
+        );
     }
 
     shutdown(nodes).await;
