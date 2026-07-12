@@ -28,6 +28,9 @@ pub struct JobDrainResult {
     pub cancelled_fresh: usize,
     pub swept: usize,
     pub next_due_after: Option<Duration>,
+    /// A per-job error stopped the batch early; the caller should re-drive after a
+    /// backoff. Set so `claimed` is never discarded by a later failure.
+    pub retry_after_error: bool,
 }
 
 /// Claim up to `capacity` due jobs and re-queue expired leases; claimed records are returned.
@@ -50,39 +53,77 @@ pub async fn process_job_queue_batch(
             // Orphaned index row (record gone/quarantined): drop it so it cannot
             // pin the drain timer at zero forever.
             Err(JobMutationError::NotFound) => {
-                delete_schedule_row(storage, job_due_index_key(ts, job_id)).await?
+                if let Err(error) =
+                    delete_schedule_row(storage, job_due_index_key(ts, job_id)).await
+                {
+                    warn!(error = %error, "Failed to drop orphaned job due index row");
+                    result.retry_after_error = true;
+                    break;
+                }
             }
-            Err(error) => return Err(error.to_string()),
+            // Never discard jobs already claimed in this batch: stop here, hand them off,
+            // and let the caller re-drive the remainder after a backoff.
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Failed to claim due job");
+                result.retry_after_error = true;
+                break;
+            }
         }
     }
 
-    let (expired_leases, _) = scan_ready(
-        storage,
-        JOB_LEASE_INDEX_PREFIX,
-        now_ms,
-        JOB_DRAIN_BATCH_SIZE,
-    )
-    .await?;
-    for (ts, job_id) in expired_leases {
-        match requeue_job(
+    if !result.retry_after_error {
+        match scan_ready(
             storage,
-            job_id,
-            None,
+            JOB_LEASE_INDEX_PREFIX,
             now_ms,
-            Some(now_ms),
-            Some(JobError::retryable("lease expired")),
+            JOB_DRAIN_BATCH_SIZE,
         )
         .await
         {
-            Ok(_) => result.swept = result.swept.saturating_add(1),
-            Err(JobMutationError::NotFound) => {
-                delete_schedule_row(storage, job_lease_index_key(ts, job_id)).await?
+            Ok((expired_leases, _)) => {
+                for (ts, job_id) in expired_leases {
+                    match requeue_job(
+                        storage,
+                        job_id,
+                        None,
+                        now_ms,
+                        Some(now_ms),
+                        Some(JobError::retryable("lease expired")),
+                    )
+                    .await
+                    {
+                        Ok(_) => result.swept = result.swept.saturating_add(1),
+                        Err(JobMutationError::NotFound) => {
+                            if let Err(error) =
+                                delete_schedule_row(storage, job_lease_index_key(ts, job_id)).await
+                            {
+                                warn!(error = %error, "Failed to drop orphaned job lease index row");
+                                result.retry_after_error = true;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(job_id = %job_id, error = %error, "Failed to requeue expired lease");
+                            result.retry_after_error = true;
+                            break;
+                        }
+                    }
+                }
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                warn!(error = %error, "Failed to scan expired job leases");
+                result.retry_after_error = true;
+            }
         }
     }
 
-    result.next_due_after = next_job_drain_timer_after(storage).await?;
+    match next_job_drain_timer_after(storage).await {
+        Ok(next) => result.next_due_after = next,
+        Err(error) => {
+            warn!(error = %error, "Failed to compute next job drain timer");
+            result.retry_after_error = true;
+        }
+    }
     Ok(result)
 }
 
@@ -196,6 +237,7 @@ mod tests {
                 steps: 1,
                 step_sleep_ms: 0,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: None,
             },
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),

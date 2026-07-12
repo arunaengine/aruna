@@ -1589,6 +1589,14 @@ impl OperationsTaskHandler {
             self.jobs_runtime.spawn(self.context.clone(), record);
         }
 
+        // A per-job error stopped the batch after handing off what was claimed; back off
+        // and re-drive the remainder rather than hot-looping on the failure.
+        if result.retry_after_error {
+            self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                .await;
+            return;
+        }
+
         // At capacity with work due, wait for a completion kick, not a ZERO hot-loop.
         match result.next_due_after {
             Some(after) if after.is_zero() && self.jobs_runtime.available_slots() == 0 => {
