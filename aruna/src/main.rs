@@ -6,15 +6,18 @@ use aruna::bootstrap::{
 };
 use aruna::config::{Config, StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::portal;
+use aruna::shutdown::{NodeShutdown, shutdown_grace_from_env, wait_for_signal};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
+use aruna_api::ops::Readiness;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::onboarding::OnboardingPhase;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
@@ -32,7 +35,6 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_me
 use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,10 +114,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         task_handle: Some(task_handle.clone()),
     });
 
+    // Every background child registers here, so shutdown can cancel and join
+    // them instead of racing them to the final storage sync.
+    let shutdown = Shutdown::new();
+    let readiness = Readiness::new();
+
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
-    initialize_net_incoming(driver_ctx.clone());
-    initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+    initialize_net_incoming(driver_ctx.clone(), &shutdown);
+    initialize_task_incoming(driver_ctx.clone(), task_handle.clone(), &shutdown).await;
 
     // Republish a full set of node usage snapshots at startup so realm peers see
     // this node's totals again after a restart, dirty-marker loss, or a counter
@@ -138,7 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Replayed metadata event log during startup"
         );
     }
-    spawn_metadata_warmup(driver_ctx.clone());
+    spawn_metadata_warmup(driver_ctx.clone(), &shutdown);
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -354,37 +361,62 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.s3_public_url.as_deref().unwrap_or(&config.s3_host),
         )
         .await;
-    let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
+    let (_s3_addr, s3_handle) = s3_server
+        .run_with_listener(s3_listener, shutdown.token())
+        .unwrap();
+    let mut s3_handle = Some(s3_handle);
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+    let rest_token = shutdown.token();
+    let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, rest_token));
+    let mut rest_handle = Some(rest_handle);
 
+    readiness.set_ready();
+
+    // A server that returns before shutdown was requested has failed: the node
+    // is no longer serving, so it must not exit as success.
+    let mut failure: Option<String> = None;
     tokio::select! {
-        res = server_handle => {
-            match res {
-                Ok(_) => info!("S3 Server stopped normally"),
-                Err(e) => error!("S3 Server panicked: {:?}", e),
-            }
+        result = s3_handle.as_mut().expect("s3 server handle is present") => {
+            s3_handle = None;
+            failure = Some(match result {
+                Ok(()) => "S3 server stopped unexpectedly".to_string(),
+                Err(error) => format!("S3 server panicked: {error}"),
+            });
         }
-        res = server.run_with_listener(rest_listener) => {
-            match res {
-                Ok(_) => info!("REST Server stopped normally"),
-                Err(e) => error!("REST Server panicked: {:?}", e),
-            }
+        result = rest_handle.as_mut().expect("rest server handle is present") => {
+            rest_handle = None;
+            failure = Some(match result {
+                Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
+                Ok(Err(error)) => format!("REST server failed: {error}"),
+                Err(error) => format!("REST server panicked: {error}"),
+            });
         }
-        // You can add other signals here, e.g., Ctrl+C
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down S3 interface");
-        }
+        _ = wait_for_signal() => {}
     }
 
-    shutdown_runtime(
-        driver_ctx.net_handle.as_ref(),
-        driver_ctx.metadata_handle.as_ref(),
-        &driver_ctx.storage_handle,
-    )
+    if let Some(failure) = failure.as_ref() {
+        error!(error = %failure, "Shutting down after a server failure");
+    }
+
+    NodeShutdown {
+        shutdown,
+        readiness,
+        rest: rest_handle,
+        s3: s3_handle,
+        task_handle,
+        net_handle: driver_ctx.net_handle.clone(),
+        metadata_handle: driver_ctx.metadata_handle.clone(),
+        storage_handle: driver_ctx.storage_handle.clone(),
+        grace: shutdown_grace_from_env(),
+    }
+    .run()
     .await;
 
-    Ok(())
+    match failure {
+        Some(failure) => Err(failure.into()),
+        None => Ok(()),
+    }
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
@@ -398,28 +430,6 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
         },
     )
     .await
-}
-
-async fn shutdown_runtime(
-    net_handle: Option<&NetHandle>,
-    metadata_handle: Option<&MetadataHandle>,
-    storage_handle: &StorageHandle,
-) {
-    if let Some(net_handle) = net_handle {
-        info!("Shutting down network services");
-        net_handle.shutdown().await;
-    }
-
-    if let Some(metadata_handle) = metadata_handle {
-        info!("Flushing metadata persistence");
-        if let Err(error) = metadata_handle.flush_persistence().await {
-            error!(error = %error, "Failed to flush metadata persistence during shutdown");
-        }
-    }
-
-    if let Err(error) = storage_handle.sync_all().await {
-        error!(error = %error, "Failed to sync storage during shutdown");
-    }
 }
 
 /// Ensures the maintained usage counter shards exist before background writes start.
@@ -476,6 +486,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::{UsageCounters, usage_global_shard_keys};
+    use aruna_storage::StorageHandle;
     use std::thread;
     use tempfile::tempdir;
 
@@ -487,22 +498,6 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         }
-    }
-
-    #[tokio::test]
-    async fn shutdown_runtime_syncs_storage_without_net() {
-        let (storage_handle, receiver) = StorageHandle::new();
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
-                .recv()
-                .expect("shutdown should request storage sync_all");
-            assert!(matches!(effect, StorageEffect::SyncAll));
-            response_tx.send(StorageEvent::SyncAllFinished);
-        });
-
-        shutdown_runtime(None, None, &storage_handle).await;
-
-        worker.join().expect("storage responder should finish");
     }
 
     #[tokio::test]
