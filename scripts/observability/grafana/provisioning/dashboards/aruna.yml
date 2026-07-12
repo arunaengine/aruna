@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Aruna
+    orgId: 1
+    folder: Aruna
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards
