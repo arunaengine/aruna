@@ -795,15 +795,34 @@ async fn install_realm_config(
         }
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
-    // Config apply hook: the shard's rank-0 holder eagerly creates each
-    // shard topic genesis (mirrors the production realm-config apply path).
-    for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
+    // Startup hook, exactly as the binary runs it after loading the config: it
+    // joins the shared realm topics (RealmConfig among them, so a later placement
+    // change actually reaches the other nodes) and reconciles the held shard
+    // topics. A node whose rank-0 co-holder has not created a genesis yet leaves
+    // it for the next pass, so run until quiescent instead of waiting out the
+    // production retry timer.
+    for _ in 0..3 {
+        for node in nodes {
+            aruna_operations::startup::restore_shard_subscriptions(
+                &node.context,
+                node.net.node_id(),
+                *realm_id,
+            )
+            .await;
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_operations::process_placements::process_shard_placements(
+                &node.context,
+                *realm_id,
+                node.net.node_id(),
+            )
+            .await
+            .retry_scheduled;
+        }
+        if !retry {
+            break;
+        }
     }
 
     Ok(config)
