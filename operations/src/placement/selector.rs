@@ -6,6 +6,7 @@
 pub const PLACEMENT_DOMAIN: &[u8] = b"aruna-placement-rendezvous-v3";
 pub const ROLE_LOCATION: u8 = b'L';
 pub const ROLE_NODE: u8 = b'N';
+pub const ROLE_SHARD: u8 = b'S';
 
 /// Rendezvous hash of `(role, epoch, subject, id)`, forced nonzero via `| 1`.
 pub fn selector_hash(role: u8, epoch: u64, subject: &[u8], id: &[u8]) -> u64 {

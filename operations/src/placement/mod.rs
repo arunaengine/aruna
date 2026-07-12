@@ -9,6 +9,8 @@ use aruna_core::structs::{
     PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument, shard_for_subject,
 };
 
+use crate::placement::selector::{ROLE_SHARD, rank_weighted};
+
 pub use resolver::{
     PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
     resolve_holders, strategy_for_target, subject_bytes,
@@ -139,6 +141,47 @@ pub fn resolve_shard_holders(
     resolve_shard_holders_with(config, strategy, placement)
 }
 
+/// Buckets of `strategy` that `node_id` is a holder of. Empty when the node is
+/// not sync-eligible, is unknown to the config, or is filtered out everywhere.
+pub fn held_buckets(
+    config: &RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    node_id: NodeId,
+) -> Vec<u32> {
+    (0..strategy.shard_count)
+        .filter(|shard| {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                shard: *shard,
+            };
+            resolve_shard_holders_with(config, strategy, &placement).contains(&node_id)
+        })
+        .collect()
+}
+
+/// Bucket the create-receiving node picks for `subject`: the best-ranked of the
+/// buckets it already holds, so the origin is always a holder of the bucket it
+/// stamps and can always publish onto that bucket's topic. Weighted rendezvous
+/// on the subject spreads one node's documents across all its held buckets.
+/// `None` when the origin holds no bucket of the strategy.
+pub fn choose_origin_bucket(
+    config: &RealmConfigDocument,
+    strategy: &PlacementStrategy,
+    origin: NodeId,
+    subject: &[u8],
+) -> Option<PlacementRef> {
+    let held = held_buckets(config, strategy, origin);
+    let candidates: Vec<([u8; 4], u64)> =
+        held.iter().map(|shard| (shard.to_be_bytes(), 1)).collect();
+    let best = *rank_weighted(ROLE_SHARD, 0, subject, &candidates).first()?;
+    Some(PlacementRef {
+        strategy_id: strategy.strategy_id,
+        epoch: 0,
+        shard: held[best],
+    })
+}
+
 fn resolve_shard_holders_with(
     config: &RealmConfigDocument,
     strategy: &PlacementStrategy,
@@ -187,6 +230,85 @@ mod tests {
                 shard: 7,
             },
         )
+    }
+
+    fn strategy_of(config: &RealmConfigDocument) -> &PlacementStrategy {
+        config
+            .strategy(&config.default_strategy_id.expect("default strategy"))
+            .expect("default strategy resolves")
+    }
+
+    fn subject(seed: u64) -> [u8; 32] {
+        *blake3::hash(&seed.to_le_bytes()).as_bytes()
+    }
+
+    #[test]
+    fn origin_bucket_is_deterministic() {
+        let (config, _) = config_and_placement();
+        let strategy = strategy_of(&config);
+        let first = choose_origin_bucket(&config, strategy, node(1), &subject(1));
+        let second = choose_origin_bucket(&config, strategy, node(1), &subject(1));
+        assert_eq!(first, second);
+        assert_eq!(
+            first.expect("origin holds buckets").strategy_id,
+            strategy.strategy_id
+        );
+    }
+
+    #[test]
+    fn origin_holds_chosen_bucket() {
+        let (config, _) = config_and_placement();
+        let strategy = strategy_of(&config);
+        // Replica 2 of 4 nodes: no node holds every bucket, so a blind hash
+        // would land outside the origin's held set for some subjects.
+        let held = held_buckets(&config, strategy, node(1));
+        assert!(!held.is_empty() && held.len() < strategy.shard_count as usize);
+        for seed in 0..256u64 {
+            let placement = choose_origin_bucket(&config, strategy, node(1), &subject(seed))
+                .expect("origin holds buckets");
+            assert!(held.contains(&placement.shard));
+            assert!(resolve_shard_holders(&config, &placement).contains(&node(1)));
+        }
+    }
+
+    #[test]
+    fn origin_buckets_spread() {
+        let (config, _) = config_and_placement();
+        let strategy = strategy_of(&config);
+        let held = held_buckets(&config, strategy, node(1));
+        let chosen: std::collections::HashSet<u32> = (0..1_000u64)
+            .filter_map(|seed| choose_origin_bucket(&config, strategy, node(1), &subject(seed)))
+            .map(|placement| placement.shard)
+            .collect();
+        assert!(
+            chosen.len() * 2 > held.len(),
+            "chosen {} of {} held buckets",
+            chosen.len(),
+            held.len()
+        );
+    }
+
+    #[test]
+    fn unknown_origin_holds_nothing() {
+        let (config, _) = config_and_placement();
+        let strategy = strategy_of(&config);
+        assert!(held_buckets(&config, strategy, node(9)).is_empty());
+        assert_eq!(
+            choose_origin_bucket(&config, strategy, node(9), &subject(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn user_origin_holds_nothing() {
+        let (mut config, _) = config_and_placement();
+        config.ensure_node(node(5), RealmNodeKind::User);
+        let strategy = strategy_of(&config);
+        assert!(held_buckets(&config, strategy, node(5)).is_empty());
+        assert_eq!(
+            choose_origin_bucket(&config, strategy, node(5), &subject(1)),
+            None
+        );
     }
 
     #[test]
