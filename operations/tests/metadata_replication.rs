@@ -601,20 +601,11 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
         },
     };
     // All records of this document ride the bucket stamped on the record, so
-    // one shard topic. Its genesis exists (created eagerly by its rank-0 holder
-    // during install); the publisher below only joins it, never creates it.
+    // one shard topic. Its genesis exists on both nodes after install with no
+    // manual bootstrap: rank-0 created it, and the other holder pulled it in
+    // its own placement pass. The publisher below only joins it, never creates.
     assert_ne!(placement, PlacementRef::NIL);
     let shard_topic_of = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
-    // Make sure the publisher knows the shard topic before publishing onto it:
-    // sync_document_topics bootstraps the genesis from the co-holder when
-    // rank-0 was the other node (the singular sync never bootstraps).
-    nodes[0]
-        .net
-        .sync_document_topics(
-            vec![shard_topic_of(&lifecycle_target)],
-            vec![nodes[1].net.node_id()],
-        )
-        .await;
     assert!(
         nodes[0]
             .net
