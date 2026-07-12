@@ -97,6 +97,67 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A group created on a User-kind node is never silently lost.
+///
+/// A User node holds no bucket of any group, so its admin-operation outbox
+/// records can never publish from here. They also cannot be relayed: receivers
+/// authenticate an admin event by requiring its signed publisher to be its
+/// `origin_node_id`, so a holder publishing on the emitter's behalf is rejected
+/// realm-wide (`validate_replicated_admin_event`). The record therefore stays in
+/// the outbox, retried and loud, instead of being deleted after the caller was
+/// told the group exists. Creating groups from a User node needs a signed-origin
+/// admin relay in the net layer; until then this test pins the invariant that
+/// matters — the write is never thrown away.
+#[tokio::test]
+async fn user_node_group_survives() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+
+    let (group, _auth) = drive(
+        CreateGroupOperation::new(CreateGroupConfig {
+            actor: Actor {
+                node_id: user_node.net.node_id(),
+                user_id: realm.user_id,
+                realm_id: realm.realm_id,
+            },
+            display_name: "group from a user node".to_string(),
+            owner_cap: None,
+        }),
+        user_node.context.as_ref(),
+    )
+    .await?;
+
+    // Give the drain time to run: it must not have deleted the records.
+    sleep(Duration::from_secs(2)).await;
+    assert!(read_group_auth(user_node, group.group_id).await?.is_some());
+    assert!(
+        outbox_len(user_node).await? > 0,
+        "the user node's unpublishable admin records must be retained, not dropped"
+    );
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+async fn outbox_len(node: &TestNode) -> Result<usize, Box<dyn std::error::Error>> {
+    match node
+        .context
+        .storage_handle
+        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 64,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values.len()),
+        other => Err(format!("unexpected outbox iter event: {other:?}").into()),
+    }
+}
+
 /// Re-forwarding a create that already applied returns the existing record.
 ///
 /// A forward whose response is lost is retried, possibly against a different
@@ -253,20 +314,27 @@ async fn seed_group(realm: &Realm, nodes: &[TestNode]) -> Result<Ulid, Box<dyn s
     )
     .await?;
 
+    wait_for_group(nodes, group.group_id).await?;
+    Ok(group.group_id)
+}
+
+/// Waits for the group's authorization document — what the permission check
+/// reads — on every sync-eligible node. A User node is never a sync target, so it
+/// never receives the group it may itself have created.
+async fn wait_for_group(
+    nodes: &[TestNode],
+    group_id: Ulid,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let mut pending = false;
-        for node in nodes {
-            // A user node is not a sync target, so it never receives the group.
-            if !node.sync_eligible {
-                continue;
-            }
-            if read_group_auth(node, group.group_id).await?.is_none() {
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            if read_group_auth(node, group_id).await?.is_none() {
                 pending = true;
             }
         }
         if !pending {
-            return Ok(group.group_id);
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err("the group's authorization document never reached every holder".into());

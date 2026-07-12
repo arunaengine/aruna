@@ -423,10 +423,15 @@ pub(crate) async fn forward_outbox_record(
 ///
 /// The peer is a configured node of this realm and the record's bucket is one
 /// this node holds, so the record is queued into the local outbox verbatim and
-/// drains onto the bucket's topic like any locally-emitted record. Verbatim
-/// matters for admin operations: they are ordered by `(origin_node_id,
-/// origin_seq)` on every receiver, so re-stamping the relay as the origin would
-/// break that ordering and drop the emitter's earlier operations as stale.
+/// drains onto the bucket's topic like any locally-emitted record.
+///
+/// Document upserts and deletes only: an admin operation cannot be relayed at
+/// all. Receivers authenticate an admin event by requiring its signed publisher
+/// on the topic to *be* its `origin_node_id` (`validate_replicated_admin_event`),
+/// and a relay is by construction a different node signing for another origin, so
+/// every receiver would reject it. Accepting one here would report success while
+/// the operation was silently dropped realm-wide — worse than refusing it, which
+/// leaves the record in the emitter's outbox, retried and loud.
 async fn apply_forwarded_outbox_record(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -445,6 +450,14 @@ async fn apply_forwarded_outbox_record(
     match metadata_handle.authorize_remote_peer(peer, None).await {
         Ok(_) => {}
         Err(error) => return reject(error.to_string()),
+    }
+    if matches!(
+        record.event,
+        aruna_core::document::DocumentSyncOutboxEvent::AdminOperation { .. }
+    ) {
+        return reject(
+            "an admin operation cannot be relayed: receivers require its signed publisher to be its origin node",
+        );
     }
     if !holds_placement(&config, &record.placement, net_handle.node_id()) {
         return reject(format!(

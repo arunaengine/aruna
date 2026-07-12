@@ -214,19 +214,20 @@ impl DrainSyncOutcome {
 
 /// Per-run defer state, carried across the drain's pages so a topic deferred on
 /// one page keeps deferring on later pages (preserving FIFO within a topic) and
-/// each topic's genesis presence is probed at most once per run.
+/// each topic's holdership and genesis presence are decided at most once per run.
 #[derive(Default)]
 struct DrainDeferState {
     topic_exists: HashMap<irokle::TopicId, bool>,
+    topic_held: HashMap<irokle::TopicId, bool>,
     deferred_topics: HashSet<irokle::TopicId>,
     undeliverable_topics: HashSet<irokle::TopicId>,
 }
 
-/// What a record whose shard topic has no local genesis is waiting for.
+/// Whether a shard-classed record can ever publish from this node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferOutcome {
-    /// The local node holds the bucket, so the genesis is on its way (rank-0
-    /// creates it, every other holder pulls it): keep the record and retry.
+    /// The local node holds the bucket, so it may publish onto the bucket's topic
+    /// once the genesis is there (rank-0 creates it, every other holder pulls it).
     Retry,
     /// The local node holds none of the record's bucket. Topic membership is the
     /// holder set, so it may neither mint the genesis nor join the topic: this
@@ -236,14 +237,22 @@ enum DeferOutcome {
 
 /// Splits FIFO-ordered drain records into those to publish now, those deferred
 /// because their shard topic has no local genesis yet, and those that can never
-/// publish from this node at all. Each topic's availability is evaluated once
-/// per run (state persists in `defer`); once a topic defers, every later record
-/// of that topic defers too. Splitting FIFO-adjacent records of one topic across
-/// a defer/publish boundary would let the newer op publish first, invert its
-/// origin sequence on receivers, and drop the older op forever as
-/// StaleOriginSequence — so a topic never straddles that boundary within a run,
-/// across pages included. A shard topic's holder set is a function of its
-/// placement, so undeliverability is likewise decided once per topic.
+/// publish from this node at all.
+///
+/// Holdership is checked *before* topic availability, and it is the only thing
+/// that decides publishability. Joining a shard topic is not holder-gated — a
+/// non-holder can adopt a co-holder's genesis, and the drain's own bootstrap pass
+/// will happily pull one — but its publishes onto that topic are not accepted. So
+/// "the topic exists locally" is not evidence this node may publish onto it, and
+/// classifying on that first would route a non-holder's records into a publish
+/// that silently goes nowhere instead of into the forwarding path.
+///
+/// Each topic's holdership and genesis presence are decided once per run (state
+/// persists in `defer`); once a topic defers, every later record of that topic
+/// defers too. Splitting FIFO-adjacent records of one topic across a
+/// defer/publish boundary would let the newer op publish first, invert its origin
+/// sequence on receivers, and drop the older op forever as StaleOriginSequence —
+/// so a topic never straddles that boundary within a run, across pages included.
 fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
@@ -262,6 +271,15 @@ fn partition_drain_records(
             undeliverable.push((record_key, record, topic));
             continue;
         }
+        let held = *defer
+            .topic_held
+            .entry(topic)
+            .or_insert_with(|| classify_defer(&record) == DeferOutcome::Retry);
+        if !held {
+            defer.undeliverable_topics.insert(topic);
+            undeliverable.push((record_key, record, topic));
+            continue;
+        }
         let already_deferred = defer.deferred_topics.contains(&topic);
         let available = !already_deferred
             && *defer
@@ -270,11 +288,6 @@ fn partition_drain_records(
                 .or_insert_with(|| topic_available(topic));
         if available {
             to_publish.push((record_key, record, topic));
-            continue;
-        }
-        if !already_deferred && classify_defer(&record) == DeferOutcome::Undeliverable {
-            defer.undeliverable_topics.insert(topic);
-            undeliverable.push((record_key, record, topic));
             continue;
         }
         defer.deferred_topics.insert(topic);
@@ -557,11 +570,23 @@ impl OperationsTaskHandler {
             // short retry — the genesis arrives via gossip or the next pass. A
             // topic already deferred earlier this run is skipped: its records
             // stay deferred regardless, and re-probing would only waste RPCs.
+            //
+            // Only buckets this node holds are pulled. Joining is not holder-gated,
+            // so a non-holder could adopt the genesis here — and would then look
+            // publishable while its publishes went nowhere. Its records belong in
+            // the forwarding path instead.
             let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
                 BTreeMap::new();
             for (_, record, topic) in &records {
                 if !record.target.uses_shard_topic()
                     || defer_state.deferred_topics.contains(topic)
+                    || !realm_config.as_ref().is_none_or(|config| {
+                        crate::placement::holds_placement(
+                            config,
+                            &record.placement,
+                            net_handle.node_id(),
+                        )
+                    })
                     || net_handle
                         .document_sync_topic_exists(*topic)
                         .unwrap_or(false)
