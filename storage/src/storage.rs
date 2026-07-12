@@ -231,6 +231,12 @@ impl StorageHandle {
         self.metrics.in_flight.load(Ordering::Relaxed)
     }
 
+    /// True once the effect channel has permanently closed because the worker
+    /// died. Latched and unrecoverable in-process; a cheap, lock-free read.
+    pub fn channel_closed(&self) -> bool {
+        self.metrics.channel_closed.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
         let errors_total = self.metrics.errors_total.load(Ordering::Relaxed);
         StorageMetricsSnapshot {
