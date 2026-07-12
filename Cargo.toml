@@ -35,8 +35,15 @@ aruna-tasks = { path = "tasks" }
 # Third-party crates
 ahash = "0.8.12"
 async-trait = "0.1.89"
-aws-config = "1.9.0"
-aws-sdk-s3 = "1.138.0"
+aws-config = { version = "1.9.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-s3 = { version = "1.138.0", default-features = false, features = [
+    "default-https-client",
+    "http-1x",
+    "rt-tokio",
+] }
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["query"] }
 bao-tree = "0.16.0"
