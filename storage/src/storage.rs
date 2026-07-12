@@ -174,6 +174,8 @@ struct StorageMetrics {
     conflicts_total: AtomicU64,
     in_flight: AtomicU64,
     channel_closed: AtomicBool,
+    sealed: AtomicBool,
+    rejected_writes: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -184,6 +186,8 @@ pub struct StorageMetricsSnapshot {
     pub conflicts_total: u64,
     pub failed_total: u64,
     pub channel_closed: bool,
+    pub sealed: bool,
+    pub rejected_writes: u64,
     pub last_error: Option<String>,
 }
 
@@ -222,6 +226,8 @@ impl StorageHandle {
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
             failed_total: errors_total,
             channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
+            sealed: self.is_sealed(),
+            rejected_writes: self.rejected_writes(),
             last_error: self
                 .metrics
                 .last_error
@@ -229,6 +235,22 @@ impl StorageHandle {
                 .expect("storage metrics mutex poisoned")
                 .clone(),
         }
+    }
+
+    /// Closes the write path before the final sync. Every mutating effect that
+    /// arrives afterwards is rejected and counted, so a leaked child task can
+    /// never commit behind a completed `sync_all`.
+    pub fn seal(&self) {
+        self.metrics.sealed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.metrics.sealed.load(Ordering::SeqCst)
+    }
+
+    /// Mutating effects rejected because storage was already sealed.
+    pub fn rejected_writes(&self) -> u64 {
+        self.metrics.rejected_writes.load(Ordering::Relaxed)
     }
 
     #[tracing::instrument(
@@ -264,6 +286,18 @@ impl StorageHandle {
     }
 
     async fn dispatch_queued_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
+        if self.is_sealed() && storage_effect_mutates(&effect) {
+            self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                event = "storage.write.after_seal",
+                operation = storage_effect_kind(&effect),
+                "Rejected a storage write issued after the shutdown seal"
+            );
+            return self.observe_storage_event(StorageEvent::Error {
+                error: StorageError::Sealed,
+            });
+        }
+
         let (response_tx, response_rx) = crossfire::oneshot::oneshot();
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
@@ -368,6 +402,24 @@ impl StorageHandle {
         if matches!(error, StorageError::ChannelClosed) {
             self.metrics.channel_closed.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// Effects that can commit durable state. Reads, iterations, transaction aborts
+/// and `SyncAll` stay open after the seal.
+fn storage_effect_mutates(effect: &StorageEffect) -> bool {
+    match effect {
+        StorageEffect::Write { .. }
+        | StorageEffect::BatchWrite { .. }
+        | StorageEffect::Delete { .. }
+        | StorageEffect::BatchDelete { .. }
+        | StorageEffect::CommitTransaction { .. } => true,
+        StorageEffect::StartTransaction { read } => !read,
+        StorageEffect::Read { .. }
+        | StorageEffect::BatchRead { .. }
+        | StorageEffect::Iter { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll => false,
     }
 }
 
@@ -1971,6 +2023,89 @@ mod tests {
         ));
     }
 
+    // The seal is the write-after-sync barrier: a leaked child that survives the
+    // drain gets an error instead of committing behind the final sync.
+    #[tokio::test]
+    async fn seal_rejects_writes() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert_eq!(handle.rejected_writes(), 1);
+        assert!(handle.snapshot_metrics().sealed);
+    }
+
+    // Shutdown still has to read and fsync after the barrier is up.
+    #[tokio::test]
+    async fn seal_allows_reads_and_sync() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        handle.seal();
+
+        let read = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "sealed".to_string(),
+                key: b"key".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            read,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert!(handle.sync_all().await.is_ok());
+        assert_eq!(handle.rejected_writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_write_transactions() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        handle.seal();
+
+        let write_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await;
+        let read_txn = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await;
+
+        assert!(matches!(
+            write_txn,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Sealed
+            })
+        ));
+        assert!(matches!(
+            read_txn,
+            Event::Storage(StorageEvent::TransactionStarted { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn sync_all_handle_surfaces_persist_errors() {
         let (handle, receiver) = StorageHandle::new();
@@ -2606,6 +2741,8 @@ mod tests {
                 conflicts_total: 0,
                 failed_total: 1,
                 channel_closed: false,
+                sealed: false,
+                rejected_writes: 0,
                 last_error: Some("Transaction not found".to_string()),
             }
         );

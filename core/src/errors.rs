@@ -126,6 +126,8 @@ pub enum StorageError {
     Timeout,
     #[error("Invalid effect type")]
     InvalidEffect,
+    #[error("Storage is sealed for shutdown")]
+    Sealed,
 }
 
 #[derive(Debug, Error, PartialEq)]
