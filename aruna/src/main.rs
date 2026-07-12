@@ -352,7 +352,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
         cors: cors.clone(),
-        portal_csp: PortalCspConfig::default(),
+        portal_csp: PortalCspConfig::new(config.portal_csp_extra_origins.clone()),
     };
     let server = Server::new(state.clone(), server_config);
 
