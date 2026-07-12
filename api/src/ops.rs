@@ -4,24 +4,18 @@
 //! is never reachable through the public REST/portal port and so Kubernetes
 //! probes hit a container port that is not exposed via Service/Ingress.
 
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_REPLICATION_JOB_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE,
-    REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
-};
+use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::queue_lag::{
-    QueueLagSnapshot, probe_materialization_lag, probe_outbox_lag, probe_queue_depth,
-};
+use aruna_operations::queue_lag::{QueueLagReporter, QueueLagSnapshot};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -45,7 +39,6 @@ use tower_http::timeout::TimeoutLayer;
 /// readiness quickly instead of blocking on the much longer request timeout.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const QUEUE_METRICS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_STATE_PROBE_KEY: &[u8] = b"node_state";
 
 /// Whole-request timeout for the ops listener so a slow or stalled probe caller
@@ -401,44 +394,18 @@ impl QueueMetrics {
             .set((unix_timestamp_millis() / 1_000) as i64);
     }
 
-    async fn refresh(&self, ctx: &DriverContext) {
-        let storage = &ctx.storage_handle;
-        self.apply(
-            DOCUMENT_SYNC_OUTBOX_QUEUE,
-            probe_queue_with_timeout(probe_outbox_lag(storage, false)).await,
-        );
+    async fn refresh(&self, ctx: &DriverContext, reporter: &mut QueueLagReporter) {
+        let sample = reporter.sample(&ctx.storage_handle).await;
+        self.apply(DOCUMENT_SYNC_OUTBOX_QUEUE, sample.document_sync_outbox);
         self.apply(
             METADATA_MATERIALIZATION_QUEUE,
-            probe_queue_with_timeout(probe_materialization_lag(storage, false)).await,
+            sample.metadata_materialization,
         );
-        self.apply(
-            BLOB_REPLICATION_QUEUE,
-            probe_queue_with_timeout(probe_queue_depth(
-                storage,
-                BLOB_REPLICATION_JOB_KEYSPACE,
-                false,
-            ))
-            .await,
-        );
+        self.apply(BLOB_REPLICATION_QUEUE, sample.blob_replication);
         self.apply(
             REFERENCE_METADATA_REFRESH_QUEUE,
-            probe_queue_with_timeout(probe_queue_depth(
-                storage,
-                REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
-                false,
-            ))
-            .await,
+            sample.reference_metadata_refresh,
         );
-    }
-}
-
-async fn probe_queue_with_timeout<F>(probe: F) -> Result<QueueLagSnapshot, String>
-where
-    F: Future<Output = Result<QueueLagSnapshot, String>>,
-{
-    match tokio::time::timeout(QUEUE_METRICS_PROBE_TIMEOUT, probe).await {
-        Ok(result) => result,
-        Err(_) => Err("queue probe timed out".to_string()),
     }
 }
 
@@ -446,12 +413,13 @@ fn spawn_queue_metrics_refresher(ctx: Weak<DriverContext>, queue_metrics: Arc<Qu
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(QUEUE_LAG_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut reporter = QueueLagReporter::default();
         loop {
             interval.tick().await;
             let Some(ctx) = ctx.upgrade() else {
                 return;
             };
-            queue_metrics.refresh(ctx.as_ref()).await;
+            queue_metrics.refresh(ctx.as_ref(), &mut reporter).await;
         }
     });
 }

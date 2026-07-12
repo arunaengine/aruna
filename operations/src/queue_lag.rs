@@ -1,26 +1,26 @@
-//! Periodic `queue.lag` gauges: depth and oldest-record age for the durable
-//! work queues, emitted only while a queue is non-empty plus one final line
-//! when it drains. Idle cost is one limit-1 storage probe per queue per tick.
-//!
-//! The probe bodies are also exposed as [`probe_outbox_lag`],
-//! [`probe_materialization_lag`] and [`probe_queue_depth`] so the metrics
-//! endpoint can compute the same depths at scrape time.
+//! Shared durable-queue lag sampling for tracing and Prometheus metrics.
+//! `queue.lag` lines are emitted only while a traced queue is non-empty plus
+//! one final line when it drains. Idle cost is one limit-1 storage probe per
+//! durable queue per tick.
 
-use std::sync::{Arc, Weak};
+use std::future::Future;
+use std::time::Duration;
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE};
-use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
+use aruna_core::keyspaces::{
+    BLOB_REPLICATION_JOB_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+    METADATA_MATERIALIZATION_JOB_KEYSPACE, REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-use tokio::time::sleep;
 use tracing::{info, warn};
 use ulid::Ulid;
 
 const QUEUE_SCAN_PAGE_SIZE: usize = 1_024;
 const QUEUE_SCAN_PAGE_LIMIT: usize = 8;
+const QUEUE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Depth and age of a durable work queue at one probe instant.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -35,42 +35,77 @@ pub struct QueueLagSnapshot {
     pub due: usize,
 }
 
-pub fn spawn_queue_lag_monitor(context: &Arc<crate::driver::DriverContext>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    runtime.spawn(queue_lag_loop(Arc::downgrade(context)));
+/// One cadence's independently-fallible durable-queue probe results.
+pub struct DurableQueueLagSample {
+    pub document_sync_outbox: Result<QueueLagSnapshot, String>,
+    pub metadata_materialization: Result<QueueLagSnapshot, String>,
+    pub blob_replication: Result<QueueLagSnapshot, String>,
+    pub reference_metadata_refresh: Result<QueueLagSnapshot, String>,
 }
 
-async fn queue_lag_loop(context: Weak<crate::driver::DriverContext>) {
-    let mut outbox_active = false;
-    let mut materialization_active = false;
-    let mut storage_active = false;
-    loop {
-        sleep(QUEUE_LAG_INTERVAL).await;
-        let Some(context) = context.upgrade() else {
-            return;
+/// Tracks active queues so tracing includes one final sample after each drain.
+#[derive(Default)]
+pub struct QueueLagReporter {
+    outbox_active: bool,
+    materialization_active: bool,
+    storage_active: bool,
+}
+
+impl QueueLagReporter {
+    /// Probes every durable queue once, emits the tracing projection, and
+    /// returns the same sample for the Prometheus projection.
+    pub async fn sample(&mut self, storage: &StorageHandle) -> DurableQueueLagSample {
+        let document_sync_outbox =
+            probe_with_timeout(probe_outbox_lag(storage, self.outbox_active)).await;
+        let metadata_materialization = probe_with_timeout(probe_materialization_lag(
+            storage,
+            self.materialization_active,
+        ))
+        .await;
+        // Preserve the tracing gauge's position immediately after its two
+        // durable scans rather than including the remaining metric probes.
+        let storage_in_flight = storage.in_flight();
+        let blob_replication = probe_with_timeout(probe_queue_depth(
+            storage,
+            BLOB_REPLICATION_JOB_KEYSPACE,
+            false,
+        ))
+        .await;
+        let reference_metadata_refresh = probe_with_timeout(probe_queue_depth(
+            storage,
+            REFERENCE_METADATA_REFRESH_JOB_KEYSPACE,
+            false,
+        ))
+        .await;
+        let sample = DurableQueueLagSample {
+            document_sync_outbox,
+            metadata_materialization,
+            blob_replication,
+            reference_metadata_refresh,
         };
-        outbox_active = report_outbox_lag(&context.storage_handle, outbox_active).await;
-        materialization_active =
-            report_materialization_lag(&context.storage_handle, materialization_active).await;
-        storage_active = report_storage_lag(&context.storage_handle, storage_active);
+        self.outbox_active = report_outbox_lag(&sample.document_sync_outbox, self.outbox_active);
+        self.materialization_active = report_materialization_lag(
+            &sample.metadata_materialization,
+            self.materialization_active,
+        );
+        self.storage_active = report_storage_lag(storage_in_flight, self.storage_active);
+        sample
     }
 }
 
-async fn report_outbox_lag(storage: &StorageHandle, was_active: bool) -> bool {
-    let snapshot = match probe_outbox_lag(storage, was_active).await {
+fn report_outbox_lag(probe: &Result<QueueLagSnapshot, String>, was_active: bool) -> bool {
+    let snapshot = match probe {
         Ok(snapshot) => snapshot,
         Err(error) => {
             warn!(error = %error, "Failed to probe document sync outbox lag");
             return was_active;
         }
     };
-    emit_queue_depth("document_sync_outbox", &snapshot, was_active)
+    emit_queue_depth("document_sync_outbox", snapshot, was_active)
 }
 
-async fn report_materialization_lag(storage: &StorageHandle, was_active: bool) -> bool {
-    let snapshot = match probe_materialization_lag(storage, was_active).await {
+fn report_materialization_lag(probe: &Result<QueueLagSnapshot, String>, was_active: bool) -> bool {
+    let snapshot = match probe {
         Ok(snapshot) => snapshot,
         Err(error) => {
             warn!(error = %error, "Failed to probe metadata materialization queue lag");
@@ -93,8 +128,7 @@ async fn report_materialization_lag(storage: &StorageHandle, was_active: bool) -
     active
 }
 
-fn report_storage_lag(storage: &StorageHandle, was_active: bool) -> bool {
-    let in_flight = storage.in_flight();
+fn report_storage_lag(in_flight: u64, was_active: bool) -> bool {
     let active = in_flight > 0;
     if active || was_active {
         info!(
@@ -105,6 +139,16 @@ fn report_storage_lag(storage: &StorageHandle, was_active: bool) -> bool {
         );
     }
     active
+}
+
+async fn probe_with_timeout<F>(probe: F) -> Result<QueueLagSnapshot, String>
+where
+    F: Future<Output = Result<QueueLagSnapshot, String>>,
+{
+    match tokio::time::timeout(QUEUE_PROBE_TIMEOUT, probe).await {
+        Ok(result) => result,
+        Err(_) => Err("queue probe timed out".to_string()),
+    }
 }
 
 fn emit_queue_depth(queue: &'static str, snapshot: &QueueLagSnapshot, was_active: bool) -> bool {

@@ -1085,7 +1085,6 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
-    crate::queue_lag::spawn_queue_lag_monitor(&context);
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
