@@ -9,7 +9,9 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, shard_for_subject,
+};
 use aruna_core::types::{Effects, GroupId};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
 use crate::placement::{
-    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
+    PlacementResolutionContext, choose_origin_bucket, holds_placement, strategy_for_target,
+    subject_bytes,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +72,8 @@ pub struct CreateMetadataDocumentResult {
 pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
     skip_existing_check: bool,
+    /// Set when a non-holder forwarded this create; see [`Self::choose_placement`].
+    forwarded: bool,
     state: CreateMetadataDocumentState,
     record: Option<MetadataRegistryRecord>,
     create_event: Option<MetadataCreateEventRecord>,
@@ -117,6 +122,7 @@ impl CreateMetadataDocumentOperation {
         Self {
             config,
             skip_existing_check: false,
+            forwarded: false,
             state: CreateMetadataDocumentState::Init,
             record: None,
             create_event: None,
@@ -127,6 +133,15 @@ impl CreateMetadataDocumentOperation {
     pub fn new_for_generated_document_id(config: CreateMetadataDocumentConfig) -> Self {
         let mut operation = Self::new(config);
         operation.skip_existing_check = true;
+        operation
+    }
+
+    /// A create a non-holder forwarded here. The document's bucket is its blind
+    /// hash rather than this node's pick, so every holder the forwarder may try
+    /// stamps the same bucket.
+    pub fn new_forwarded(config: CreateMetadataDocumentConfig) -> Self {
+        let mut operation = Self::new(config);
+        operation.forwarded = true;
         operation
     }
 
@@ -161,15 +176,21 @@ impl CreateMetadataDocumentOperation {
         }
     }
 
-    /// The document's bucket, chosen once here by the receiving node from the
-    /// buckets it holds. Stamped at event-append time only: the projector
-    /// re-runs on replay, and re-choosing under a changed config would fork the
-    /// document across two topics.
+    /// The document's bucket, chosen once here by the receiving node. Stamped at
+    /// event-append time only: the projector re-runs on replay, and re-choosing
+    /// under a changed config would fork the document across two topics.
     ///
-    /// `Err` when a strategy governs the target but the receiving node holds
-    /// none of its buckets: it could never publish this document onto the
-    /// bucket's topic, so the create must be forwarded to a holder rather than
-    /// accepted onto a bucket it cannot replicate.
+    /// A locally-originated create picks the best-ranked of the buckets this node
+    /// already holds, so the origin can always publish onto the bucket it stamps.
+    /// A *forwarded* create instead takes the document's blind-hashed bucket: the
+    /// forwarder only ever offers the create to holders of that one bucket, so
+    /// every candidate holder stamps the same bucket and a retry after a timed-out
+    /// response can never fork the document onto a second topic.
+    ///
+    /// `Err` when a strategy governs the target but this node holds no usable
+    /// bucket for it: it could never publish the document onto the bucket's
+    /// topic, so the create must go to a holder rather than be accepted onto a
+    /// bucket it cannot replicate.
     fn choose_placement(
         &self,
         config: Option<&RealmConfigDocument>,
@@ -187,6 +208,17 @@ impl CreateMetadataDocumentOperation {
         let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
             return Ok(PlacementRef::NIL);
         };
+        if self.forwarded {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
+            };
+            if !holds_placement(config, &placement, self.config.actor.node_id) {
+                return Err(CreateMetadataDocumentError::OriginHoldsNoBucket);
+            }
+            return Ok(placement);
+        }
         choose_origin_bucket(
             config,
             strategy,
