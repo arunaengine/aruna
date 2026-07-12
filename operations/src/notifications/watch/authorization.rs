@@ -176,29 +176,80 @@ pub async fn filter_authorized_watch_subscriptions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{WatchEventKind, data_watch_resource_path};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, WatchEventKind,
+        data_watch_resource_path,
+    };
     use aruna_storage::FjallStorage;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    // Anonymous callers carry a nil user id and own no inbox to deliver into, so
-    // a watch stays a user-plane feature even where the watched resource is
-    // publicly readable. The nil owner is refused before any role is evaluated.
+    // A public (Everyone) role granting READ on the watched bucket would let a
+    // nil caller through on the permission path alone. Anonymous callers own no
+    // inbox to deliver into, so the nil-owner guard must still refuse the watch
+    // before any role is evaluated, even where the resource is publicly readable.
     #[tokio::test]
     async fn anonymous_owner_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let realm_id = RealmId([9u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let node_id = node(3);
+
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        group_auth
+            .roles
+            .values_mut()
+            .find(|role| role.name == "viewer")
+            .expect("viewer role")
+            .assigned_users
+            .insert(UserId::nil(realm_id));
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            match storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected auth write event: {other:?}"),
+            }
+        }
+
         let context = DriverContext {
-            storage_handle: FjallStorage::open(dir.path().to_str().expect("temp path"))
-                .expect("storage opens"),
+            storage_handle: storage,
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
-        let realm_id = RealmId([9u8; 32]);
-        let prefix = data_watch_resource_path(Ulid::from_bytes([4u8; 16]), node(3), "bucket", "");
+        let prefix = data_watch_resource_path(group_id, node_id, "bucket", "");
 
         assert_eq!(
             is_watch_authorized(
