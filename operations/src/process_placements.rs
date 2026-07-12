@@ -36,13 +36,21 @@ const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 /// Returns whether any genesis was withheld (a co-holder was unreachable or
 /// refused a probe) or a held topic could not be pulled, so the caller can
 /// schedule a placement retry.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeldTopicOutcome {
+    /// A rank-0 genesis was withheld (co-holder unreachable or refusing).
+    withheld: bool,
+    /// A held topic could not be pulled from any co-holder yet.
+    pull_pending: bool,
+}
+
 async fn ensure_held_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     config: &RealmConfigDocument,
     realm_id: RealmId,
     local_node_id: NodeId,
-) -> bool {
+) -> HeldTopicOutcome {
     let mut rank0_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
@@ -73,7 +81,7 @@ async fn ensure_held_shard_topics(
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
-    let mut withheld = false;
+    let mut outcome = HeldTopicOutcome::default();
     for (co_holders, topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
@@ -81,7 +89,7 @@ async fn ensure_held_shard_topics(
             co_holders = co_holders.len(),
             "Ensuring rank-0 shard topic geneses"
         );
-        withheld |=
+        outcome.withheld |=
             ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
     }
     // Non-rank-0 held shards. A topic not known locally is pulled from a
@@ -122,7 +130,7 @@ async fn ensure_held_shard_topics(
                 } else {
                     // No co-holder served a genesis (unreachable, or rank-0 has
                     // not created it yet); retry rather than stay passive.
-                    withheld = true;
+                    outcome.pull_pending = true;
                 }
             }
         }
@@ -131,10 +139,10 @@ async fn ensure_held_shard_topics(
         }
         if let Err(error) = net_handle.allow_document_sync_peers(&known, co_holders) {
             debug!(error = %error, "Could not complete held shard topic membership");
-            withheld = true;
+            outcome.withheld = true;
         }
     }
-    withheld
+    outcome
 }
 
 /// Ensures the shard topics of one rank-0 co-holder group, creating a fresh
@@ -274,8 +282,9 @@ pub async fn process_shard_placements(
     // A withheld genesis or an unpulled held topic leaves no placement record,
     // so it alone must still arm the retry below (otherwise writes defer at 1s
     // forever).
-    let mut retry_needed =
+    let held =
         ensure_held_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
+    let mut retry_needed = held.withheld || held.pull_pending;
 
     let mut start_after: Option<Key> = None;
     loop {
@@ -406,8 +415,16 @@ pub async fn process_shard_placements(
     }
 
     if retry_needed && let Some(task_handle) = context.task_handle.as_ref() {
+        // A pending pull is join-only and usually one gossip push away, so it
+        // retries on the short cadence; a withheld genesis waits out the full
+        // interval (re-probing a down co-holder is expensive).
+        let after = if held.pull_pending {
+            crate::sync_placement::SHARD_TOPIC_PULL_RETRY_AFTER
+        } else {
+            crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER
+        };
         let effect =
-            crate::sync_placement::schedule_placement_retry_effect(realm_id, local_node_id);
+            crate::sync_placement::schedule_placement_retry_after(realm_id, local_node_id, after);
         let _ = task_handle.send_effect(effect).await;
         outcome.retry_scheduled = true;
     }

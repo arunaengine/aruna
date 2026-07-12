@@ -19,6 +19,14 @@ pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// holder creates it eagerly on config apply).
 pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
 
+/// Retry interval for a held shard topic the local node could not pull yet
+/// (its rank-0 holder has not created the genesis, or no co-holder served it).
+/// Short, for the same reason as [`DOCUMENT_SYNC_DEFER_RETRY_AFTER`]: the pull
+/// is join-only and cannot fork, so retrying it eagerly is free, and a holder
+/// must not sit idle for a whole [`SYNC_PLACEMENT_RETRY_AFTER`] waiting to be
+/// pushed to. Passes are serialized by the task timer, so this cannot spin.
+pub const SHARD_TOPIC_PULL_RETRY_AFTER: Duration = Duration::from_secs(1);
+
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
 }
