@@ -53,3 +53,38 @@ pub async fn make_bucket(bucket: &str, config: &HashMap<String, String>) -> Resu
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::error::SdkError;
+    use tokio::net::TcpListener;
+
+    // The AWS SDK ships no HTTPS connector unless `default-https-client` is on, and
+    // its absence only shows up at runtime. A TLS handshake against a socket that
+    // hangs up must fail while dispatching, not while constructing the request:
+    // a ConstructionFailure here means the connector was dropped from the build.
+    #[tokio::test]
+    async fn https_connector_present() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let client = create_s3_client(&format!("https://{addr}"), None, "key", "secret", true)
+            .await
+            .unwrap();
+
+        let err = client
+            .get_bucket_location()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect_err("handshake against a closed socket must fail");
+
+        assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
+    }
+}
