@@ -402,6 +402,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     shutdown_runtime(
+        &readiness,
         driver_ctx.net_handle.as_ref(),
         driver_ctx.metadata_handle.as_ref(),
         &driver_ctx.storage_handle,
@@ -425,10 +426,13 @@ async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<()
 }
 
 async fn shutdown_runtime(
+    readiness: &Readiness,
     net_handle: Option<&NetHandle>,
     metadata_handle: Option<&MetadataHandle>,
     storage_handle: &StorageHandle,
 ) {
+    readiness.begin_drain();
+
     if let Some(net_handle) = net_handle {
         info!("Shutting down network services");
         net_handle.shutdown().await;
@@ -514,18 +518,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_runtime_syncs_storage_without_net() {
+    async fn shutdown_drains_syncs() {
+        let readiness = Readiness::new();
+        readiness.set_ready();
+        let observed_readiness = readiness.clone();
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
             let (effect, response_tx, _span, _queued_at) = receiver
                 .recv()
                 .expect("shutdown should request storage sync_all");
+            assert!(
+                observed_readiness.is_draining(),
+                "readiness should drain before storage sync"
+            );
             assert!(matches!(effect, StorageEffect::SyncAll));
             response_tx.send(StorageEvent::SyncAllFinished);
         });
 
-        shutdown_runtime(None, None, &storage_handle).await;
+        shutdown_runtime(&readiness, None, None, &storage_handle).await;
 
+        assert!(readiness.is_draining());
         worker.join().expect("storage responder should finish");
     }
 
