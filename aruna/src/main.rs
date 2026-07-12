@@ -118,9 +118,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // (startup) and `/metrics` is scrapable while the node is still coming up.
     let metrics = Arc::new(NodeMetrics::new());
     let readiness = Readiness::new();
-    if let Some(ops_addr) = config.ops_socket_addr {
+    {
         let ops_state = OpsState::new(driver_ctx.clone(), metrics.clone(), readiness.clone()).await;
-        let ops_listener = TcpListener::bind(ops_addr).await?;
+        let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
         let bound = ops_listener.local_addr()?;
         tokio::spawn(async move {
             if let Err(error) = serve_ops(ops_listener, ops_state).await {
