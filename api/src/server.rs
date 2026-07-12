@@ -1,4 +1,5 @@
 use crate::cors::CorsConfig;
+use crate::csp::PortalCspConfig;
 use crate::error::ServerSetupError;
 use crate::portal;
 use crate::routes::rest_router;
@@ -22,6 +23,7 @@ pub struct ServerConfig {
     pub http_addr: SocketAddr,
     pub max_http_body_size: usize,
     pub cors: CorsConfig,
+    pub portal_csp: PortalCspConfig,
 }
 
 impl Server {
@@ -38,7 +40,10 @@ impl Server {
             .nest("/api/v1", api_v1)
             .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
             .merge(swagger_ui())
-            .merge(portal::router(self.state.clone()));
+            .merge(portal::router(
+                self.state.clone(),
+                self.config.portal_csp.clone(),
+            ));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }

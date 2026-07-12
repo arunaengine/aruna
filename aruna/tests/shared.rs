@@ -841,6 +841,7 @@ async fn spawn_rest_server(
             http_addr: addr,
             max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
             cors: test_cors_config(),
+            portal_csp: aruna_api::csp::PortalCspConfig::default(),
         },
     );
     let router = server.build_router();

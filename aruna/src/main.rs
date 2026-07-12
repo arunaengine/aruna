@@ -9,6 +9,7 @@ use aruna::portal;
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
+use aruna_api::csp::PortalCspConfig;
 use aruna_api::ops::{OpsState, Readiness, serve_ops};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
@@ -351,6 +352,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
         cors: cors.clone(),
+        portal_csp: PortalCspConfig::default(),
     };
     let server = Server::new(state.clone(), server_config);
 
