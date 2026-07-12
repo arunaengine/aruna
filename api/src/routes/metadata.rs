@@ -55,8 +55,8 @@ use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    deduplicate_search_hits, document_replica_query_nodes, load_metadata_realm_nodes,
-    metadata_auth_token_from_bearer, query_select_limit,
+    deduplicate_search_hits, load_metadata_realm_nodes, metadata_auth_token_from_bearer,
+    query_select_limit,
 };
 #[cfg(test)]
 use std::time::Duration;
@@ -1596,8 +1596,8 @@ mod tests {
     };
     use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, PlacementRef,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
     };
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -2245,39 +2245,6 @@ mod tests {
 
         coordinator.net.shutdown().await;
         remote.net.shutdown().await;
-    }
-
-    #[test]
-    fn document_replica_query_nodes_use_deduplicated_replicas() {
-        let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
-        let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
-        let document_id = Ulid::r#gen();
-        let record = MetadataRegistryRecord {
-            realm_id: RealmId([3u8; 32]),
-            group_id: Ulid::r#gen(),
-            document_id,
-            document_path: "datasets/query-targets".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: true,
-            permission_path: "/metadata/query-targets".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            last_event_id: Ulid::nil(),
-        };
-
-        assert_eq!(
-            document_replica_query_nodes(&record, local_node_id),
-            vec![remote_node_id, local_node_id]
-        );
-
-        let mut empty_replicas = record;
-        empty_replicas.holder_node_ids.clear();
-        assert_eq!(
-            document_replica_query_nodes(&empty_replicas, local_node_id),
-            vec![local_node_id]
-        );
     }
 
     #[test]

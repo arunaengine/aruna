@@ -19,7 +19,9 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     metadata_event_log_key, metadata_graph_lifecycle_key, metadata_pending_projection_target,
 };
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission, RealmId};
+use aruna_core::structs::{
+    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+};
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
@@ -35,10 +37,12 @@ use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::{
     is_metadata_record_materialized_for_graph_read, load_metadata_record_by_document,
 };
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::get_realm_nodes::GetRealmNodesOperation;
 use crate::list_groups::ListGroupOperation;
 use crate::list_metadata_documents::ListMetadataDocumentsOperation;
 use crate::metadata::repository::{LIST_METADATA_PAGE_SIZE, StorageReadError};
+use crate::placement::resolve_shard_holders;
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
@@ -332,6 +336,7 @@ pub async fn query_metadata_document(
     let record = load_record_by_document(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
     ensure_record_materialized_for_graph_read(context, &record).await?;
+    let config = load_realm_config(context, realm_id).await;
 
     query_metadata(
         context,
@@ -343,7 +348,11 @@ pub async fn query_metadata_document(
             graph_iris: Some(vec![record.graph_iri.clone()]),
             query: request.query,
             mode: request.mode,
-            target_nodes: Some(document_replica_query_nodes(&record, local_node_id)),
+            target_nodes: Some(document_replica_query_nodes(
+                config.as_ref(),
+                &record,
+                local_node_id,
+            )),
         },
     )
     .await
@@ -396,6 +405,19 @@ pub async fn search_metadata(
     )
     .await?;
     Ok(MetadataSearchExecution { hits, fanout_stats })
+}
+
+pub async fn load_realm_config(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> Option<RealmConfigDocument> {
+    match drive(GetRealmConfigOperation::new(realm_id), context).await {
+        Ok(config) => Some(config),
+        Err(error) => {
+            warn!(error = %error, "realm config unavailable; querying the local replica only");
+            None
+        }
+    }
 }
 
 pub async fn load_metadata_realm_nodes(
@@ -815,11 +837,18 @@ fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApiError> {
     }
 }
 
+/// Nodes a document query fans out to: the live holders of the bucket the
+/// document was created into, not the holder set stamped at event time (which a
+/// rebalance leaves stale).
 pub fn document_replica_query_nodes(
+    config: Option<&RealmConfigDocument>,
     record: &MetadataRegistryRecord,
     local_node_id: NodeId,
 ) -> Vec<NodeId> {
-    let nodes = deduplicate_fanout_nodes(record.holder_node_ids.clone());
+    let holders = config
+        .map(|config| resolve_shard_holders(config, &record.placement))
+        .unwrap_or_default();
+    let nodes = deduplicate_fanout_nodes(holders);
     if nodes.is_empty() {
         vec![local_node_id]
     } else {
@@ -1338,7 +1367,6 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
 mod tests {
     use super::*;
 
-    use aruna_core::structs::PlacementRef;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1423,35 +1451,52 @@ mod tests {
         assert_eq!(query_form("CONSTRUCT WHERE { ?s ?p ?o }"), None);
     }
 
+    // Fan-out follows the live holders of the stored bucket; the event-time
+    // holder stamp on the record is ignored, and no config means local only.
     #[test]
-    fn document_replica_query_nodes_use_deduplicated_replicas() {
+    fn query_fans_out_to_holders() {
         let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+        let realm_id = RealmId([3u8; 32]);
         let document_id = Ulid::r#gen();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        config.ensure_node(local_node_id, aruna_core::structs::RealmNodeKind::Server);
+        config.ensure_node(remote_node_id, aruna_core::structs::RealmNodeKind::Server);
+        let strategy = config
+            .strategy(&config.default_strategy_id.expect("default strategy"))
+            .expect("default strategy resolves");
+        let placement = crate::placement::choose_origin_bucket(
+            &config,
+            strategy,
+            local_node_id,
+            &document_id.to_bytes(),
+        )
+        .expect("origin holds a bucket");
+
         let record = MetadataRegistryRecord {
-            realm_id: RealmId([3u8; 32]),
+            realm_id,
             group_id: Ulid::r#gen(),
             document_id,
             document_path: "datasets/query-targets".to_string(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
             public: true,
             permission_path: "/metadata/query-targets".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
+            placement,
+            holder_node_ids: vec![stale_node_id],
             created_at_ms: 0,
             updated_at_ms: 0,
             last_event_id: Ulid::nil(),
         };
 
-        assert_eq!(
-            document_replica_query_nodes(&record, local_node_id),
-            vec![remote_node_id, local_node_id]
-        );
+        let nodes = document_replica_query_nodes(Some(&config), &record, local_node_id);
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.contains(&local_node_id) && nodes.contains(&remote_node_id));
+        assert!(!nodes.contains(&stale_node_id));
 
-        let mut empty_replicas = record;
-        empty_replicas.holder_node_ids.clear();
         assert_eq!(
-            document_replica_query_nodes(&empty_replicas, local_node_id),
+            document_replica_query_nodes(None, &record, local_node_id),
             vec![local_node_id]
         );
     }

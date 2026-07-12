@@ -45,9 +45,7 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
-use crate::placement::{
-    PlacementResolutionContext, placement_ref_for_target, plan_target_placement,
-};
+use crate::placement::resolve_shard_holders;
 use crate::sync_placement::sort_node_ids;
 use crate::task_persistence::persist_task_effect;
 
@@ -743,16 +741,11 @@ fn expand_create_event_holders(
         return Ok(event);
     };
 
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: event.record.document_id,
-    };
-    let context = PlacementResolutionContext {
-        group_id: Some(event.record.group_id),
-        metadata_path: Some(event.record.document_path.as_str()),
-    };
+    // Holders are derived from the bucket the create stamped, never re-chosen:
+    // this runs again on replay, and a config change between runs would move the
+    // document to a different topic.
     event.record.holder_node_ids = realm_config
-        .and_then(|config| plan_target_placement(config, &target, context))
-        .map(|plan| plan.holders)
+        .map(|config| resolve_shard_holders(config, &event.record.placement))
         .unwrap_or_default();
     Ok(event)
 }
@@ -789,26 +782,19 @@ pub fn create_event_outbox_record(
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    // The origin knows the governing strategy: stamp the real reference so the
-    // metadata create/lifecycle envelope carries it (else the nil fallback).
-    let placement = realm_config
-        .map(|config| {
-            placement_ref_for_target(
-                config,
-                &target,
-                PlacementResolutionContext {
-                    group_id: Some(event.record.group_id),
-                    metadata_path: Some(event.record.document_path.as_str()),
-                },
-            )
-        })
-        .unwrap_or(aruna_core::structs::PlacementRef::NIL);
+    // The bucket is the one the create stamped; peers are its live holders, so a
+    // publish after a rebalance targets the current holder set and not the
+    // event-time one.
+    let placement = event.record.placement;
+    let peers = realm_config
+        .map(|config| resolve_shard_holders(config, &placement))
+        .unwrap_or_default();
     let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
         target,
-        peers: event.record.holder_node_ids.clone(),
+        peers,
         event: DocumentSyncOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(&lifecycle)
                 .expect("metadata document lifecycle event serializes"),
@@ -1034,6 +1020,31 @@ mod tests {
         }
     }
 
+    // Stands in for the create operation: stamps the bucket its origin would
+    // have chosen from the buckets it holds.
+    fn stamped(
+        mut event: MetadataCreateEventRecord,
+        config: &RealmConfigDocument,
+    ) -> MetadataCreateEventRecord {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+            document_id: event.record.document_id,
+        };
+        let context = crate::placement::PlacementResolutionContext {
+            group_id: Some(event.record.group_id),
+            metadata_path: Some(event.record.document_path.as_str()),
+        };
+        let (strategy, _) = crate::placement::strategy_for_target(config, &target, context)
+            .expect("strategy resolves");
+        event.record.placement = crate::placement::choose_origin_bucket(
+            config,
+            strategy,
+            event.node_id,
+            &crate::placement::subject_bytes(&target),
+        )
+        .expect("origin holds a bucket");
+        event
+    }
+
     fn realm_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.seed_default_placement();
@@ -1219,24 +1230,31 @@ mod tests {
         event.node_id = node(1);
         event.record.holder_node_ids = vec![node(1)];
         let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
+        let event = stamped(event, &config);
 
         let expanded =
             expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
                 .expect("holders expand");
 
+        assert_eq!(
+            expanded.record.holder_node_ids,
+            resolve_shard_holders(&config, &event.record.placement)
+        );
         assert_eq!(expanded.record.holder_node_ids.len(), 3);
+        assert!(expanded.record.holder_node_ids.contains(&event.node_id));
         assert_eq!(expanded.record.last_event_id, event.event_id);
     }
 
-    // The origin's outbox record must carry the placement resolved with the
-    // full group + document-path context, not the bare default strategy.
+    // The origin's outbox record rides the bucket stored on the record, and its
+    // peers are that bucket's live holders.
     #[tokio::test]
-    async fn contextual_placement_stamped() {
+    async fn outbox_rides_stored_bucket() {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let event = create_event();
         let config = realm_config(event.record.realm_id, &[event.node_id, node(2), node(3)]);
+        let event = stamped(event, &config);
         write_entries(
             &storage,
             vec![(
@@ -1258,18 +1276,7 @@ mod tests {
             .await
             .expect("projection succeeds");
 
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: event.record.document_id,
-        };
-        let expected = plan_target_placement(
-            &config,
-            &target,
-            PlacementResolutionContext {
-                group_id: Some(event.record.group_id),
-                metadata_path: Some(event.record.document_path.as_str()),
-            },
-        )
-        .expect("placement resolves");
+        let expected_holders = resolve_shard_holders(&config, &event.record.placement);
 
         let outbox = match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -1293,12 +1300,12 @@ mod tests {
             other => panic!("expected outbox iter result, got {other:?}"),
         };
 
-        assert_eq!(outbox.placement, expected.placement);
-        assert_eq!(outbox.peers, expected.holders);
+        assert_eq!(outbox.placement, event.record.placement);
+        assert_eq!(outbox.peers, expected_holders);
         let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
-        assert_eq!(change.placement, expected.placement);
+        assert_eq!(change.placement, event.record.placement);
     }
 
     // A locally authored event with no eligible holders must not enqueue an
@@ -1389,22 +1396,11 @@ mod tests {
             config.ensure_node(candidate, RealmNodeKind::Server);
         }
 
+        let event = stamped(event, &config);
         let expanded =
             expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
                 .expect("holders resolve");
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: event.record.document_id,
-        };
-        let expected = plan_target_placement(
-            &config,
-            &target,
-            PlacementResolutionContext {
-                group_id: Some(event.record.group_id),
-                metadata_path: Some(event.record.document_path.as_str()),
-            },
-        )
-        .expect("strategy resolves")
-        .holders;
+        let expected = resolve_shard_holders(&config, &event.record.placement);
 
         assert_eq!(config.metadata_replication.default_replication_factor, 4);
         assert_eq!(expanded.record.holder_node_ids, expected);
@@ -1422,6 +1418,15 @@ mod tests {
         config.ensure_node(node(2), RealmNodeKind::Server);
         config.ensure_node(node(3), RealmNodeKind::Server);
         config.ensure_node(node(4), RealmNodeKind::Server);
+        // A user node holds no bucket, so its create fell back to the hashed
+        // one (stage 1); it still never becomes a holder of it.
+        event.record.placement = crate::placement::placement_ref_for_target(
+            &config,
+            &DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: event.record.document_id,
+            },
+            Default::default(),
+        );
 
         let expanded = expand_create_event_holders(event, Some(node(1)), Some(&config))
             .expect("holders expand");
@@ -1466,7 +1471,9 @@ mod tests {
 
         assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
-        assert_eq!(outbox.peers, event.record.holder_node_ids);
+        // Without a realm config the holders are unresolvable here; the outbox
+        // drain resolves them from the bucket before publishing.
+        assert!(outbox.peers.is_empty());
         assert_eq!(
             outbox.target,
             DocumentSyncTarget::MetadataDocumentLifecycle {
@@ -1495,6 +1502,7 @@ mod tests {
     fn create_and_update_stamp_equal_placement_refs() {
         let create = create_event();
         let config = realm_config(create.record.realm_id, &[node(1), node(2)]);
+        let create = stamped(create, &config);
 
         // An update of the same document reuses its id and path; only the event
         // identity/timestamps advance.

@@ -19,7 +19,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::placement::placement_ref_for_target;
+use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -69,12 +69,13 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
     let document_id = created.record.document_id;
 
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let placement = placement_ref_for_target(&config, &target, Default::default());
+    let placement = created.record.placement;
     assert_ne!(
         placement,
         PlacementRef::NIL,
         "document must resolve a shard"
     );
+    assert!(resolve_shard_holders(&config, &placement).contains(&nodes[0].net.node_id()));
 
     // The receiver only writes its manifest row once the lifecycle syncs and
     // applies, so poll node B until the document appears.

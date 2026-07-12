@@ -9,23 +9,24 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
 use aruna_core::structs::{
     Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
-    NodeUrls, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+    NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::create_metadata_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::node_info::{read_node_info_document, seed_node_info_document};
-use aruna_operations::placement::{
-    PlacementResolutionContext, build_view, plan_target_placement, resolve_holders,
-};
+use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -55,32 +56,6 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let actor = test_actor(&nodes[0], realm_id);
     let group_id = Ulid::from_bytes([71; 16]);
     let document_id = Ulid::from_bytes([72; 16]);
-    let event_id = Ulid::from_bytes([73; 16]);
-    let target = DocumentSyncTarget::MetadataCreateEvent {
-        document_id,
-        event_id,
-    };
-    write_metadata_create_event(
-        &nodes[0],
-        realm_id,
-        group_id,
-        document_id,
-        event_id,
-        &target,
-    )
-    .await?;
-
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: nodes[0].net.node_id(),
-            excluded_peers: Vec::new(),
-            documents: vec![target.clone()],
-            allow_genesis: true,
-        }),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
 
     let initial_config = drive(
         GetRealmConfigOperation::new(realm_id),
@@ -88,15 +63,20 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     )
     .await?;
     assert_weighted_distinct_resolution(&nodes, &initial_config);
-    let initial_plan = plan_target_placement(
-        &initial_config,
-        &target,
-        PlacementResolutionContext::default(),
-    )
-    .expect("default placement strategy should plan the document");
-    assert_eq!(initial_plan.desired_count, 2);
-    let mut expected_initial = initial_plan.holders;
+
+    // The create-receiving node chooses the document's bucket out of the ones
+    // it holds; every record of the document rides that bucket.
+    let created = create_metadata_document(&nodes[0], realm_id, group_id, document_id).await?;
+    let placement = created.placement;
+    let target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id: created.last_event_id,
+    };
+
+    let mut expected_initial = resolve_shard_holders(&initial_config, &placement);
     sort_node_ids(&mut expected_initial);
+    assert_eq!(expected_initial.len(), 2);
+    assert!(expected_initial.contains(&nodes[0].net.node_id()));
     wait_for_document_on_holders(&nodes, &expected_initial, &target).await?;
 
     let obsolete = expected_initial[0];
@@ -136,14 +116,8 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let configs = wait_for_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
     assert_placement_state_identical(&configs);
     assert_resolve_holders_identical(&configs);
-    let final_plan =
-        plan_target_placement(&configs[0], &target, PlacementResolutionContext::default())
-            .expect("updated placement strategy should plan the document");
-    assert_eq!(
-        final_plan.placement.strategy_id,
-        expanded_strategy.strategy_id
-    );
-    let mut expected_final = final_plan.holders;
+    assert_eq!(placement.strategy_id, expanded_strategy.strategy_id);
+    let mut expected_final = resolve_shard_holders(&configs[0], &placement);
     sort_node_ids(&mut expected_final);
     assert_eq!(expected_final.len(), 3);
     assert!(!expected_final.contains(&obsolete));
@@ -244,60 +218,34 @@ fn test_actor(node: &TestNode, realm_id: RealmId) -> Actor {
     }
 }
 
-async fn write_metadata_create_event(
+async fn create_metadata_document(
     node: &TestNode,
     realm_id: RealmId,
     group_id: Ulid,
     document_id: Ulid,
-    event_id: Ulid,
-    target: &DocumentSyncTarget,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let document_path = "datasets/issue-261";
-    let record = MetadataCreateEventRecord {
-        event_id,
-        record: MetadataRegistryRecord {
-            realm_id,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    Ok(drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: node.net.node_id(),
+                user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
+                realm_id,
+            },
             group_id,
             document_id,
-            document_path: document_path.to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            document_path: "datasets/issue-261".to_string(),
             public: false,
-            permission_path: MetadataRegistryRecord::permission_path_for(
-                &realm_id,
-                group_id,
-                document_path,
-                document_id,
-            ),
-            placement: PlacementRef::NIL,
-            holder_node_ids: vec![node.net.node_id()],
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            last_event_id: event_id,
-        },
-        user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
-        node_id: node.net.node_id(),
-        payload: MetadataCreateEventPayload::Scaffold {
-            name: "Issue 261 placement".to_string(),
-            description: "Integration placement fixture".to_string(),
-            date_published: "2026-07-10".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
-        },
-        occurred_at_ms: 1,
-    };
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            value: postcard::to_allocvec(&record)?.into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("unexpected metadata create-event write: {other:?}").into()),
-    }
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Issue 261 placement".to_string(),
+                description: "Integration placement fixture".to_string(),
+                date_published: "2026-07-10".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        }),
+        node.context.as_ref(),
+    )
+    .await?
+    .record)
 }
 
 async fn wait_for_document_on_holders(
@@ -524,12 +472,20 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     )
     .await?;
     let task_handle = TaskHandle::new();
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
+        net.node_id(),
+        storage.clone(),
+        Some(net.clone()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+    )?;
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: None,
+        metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
 

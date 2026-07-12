@@ -21,7 +21,6 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::placement::placement_ref_for_target;
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::shard::client::fetch_shard_manifest;
 use aruna_operations::shard::verify::{is_shard_verified, verify_held_shards};
@@ -126,7 +125,7 @@ async fn manifest_request_rejected_from_sync_eligible_non_holder()
 #[tokio::test]
 async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([124u8; 32]);
-    let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
+    let (nodes, _config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::r#gen();
 
     let created = drive(
@@ -153,7 +152,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
         document_id: created.record.document_id,
     };
-    let placement = placement_ref_for_target(&config, &target, Default::default());
+    let placement = created.record.placement;
 
     // Wait until node B (the co-holder) has synced the document into its shard.
     wait_for_manifest_entry(&nodes[1], realm_id, placement, &target).await?;

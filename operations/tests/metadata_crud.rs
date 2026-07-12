@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -36,6 +37,9 @@ use aruna_operations::metadata::projector::{
     project_metadata_create_events, replay_metadata_event_log,
     schedule_pending_metadata_projection_drain,
 };
+use aruna_operations::placement::{
+    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
@@ -50,7 +54,31 @@ struct TestContext {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
     actor: Actor,
+    config: RealmConfigDocument,
     context: Arc<DriverContext>,
+}
+
+impl TestContext {
+    // The bucket the create operation would have chosen on this node.
+    fn placement(&self, group_id: Ulid, document_id: Ulid, document_path: &str) -> PlacementRef {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let (strategy, _) = strategy_for_target(
+            &self.config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(group_id),
+                metadata_path: Some(document_path),
+            },
+        )
+        .expect("metadata strategy resolves");
+        choose_origin_bucket(
+            &self.config,
+            strategy,
+            self.actor.node_id,
+            &subject_bytes(&target),
+        )
+        .expect("origin holds a bucket")
+    }
 }
 
 #[tokio::test]
@@ -259,6 +287,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
     let document_path = "datasets/replay-repair";
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let event_id = Ulid::r#gen();
+    let placement = test.placement(group_id, document_id, document_path);
     let record = MetadataRegistryRecord {
         realm_id: test.actor.realm_id,
         group_id,
@@ -272,7 +301,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
             document_path,
             document_id,
         ),
-        placement: PlacementRef::NIL,
+        placement,
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -648,6 +677,7 @@ fn build_create_event(
 ) -> (MetadataRegistryRecord, MetadataCreateEventRecord) {
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let event_id = Ulid::r#gen();
+    let placement = test.placement(group_id, document_id, document_path);
     let record = MetadataRegistryRecord {
         realm_id: test.actor.realm_id,
         group_id,
@@ -661,7 +691,7 @@ fn build_create_event(
             document_path,
             document_id,
         ),
-        placement: PlacementRef::NIL,
+        placement,
         holder_node_ids: vec![test.actor.node_id],
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -948,7 +978,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         user_id: aruna_core::UserId::local(Ulid::r#gen(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
-    seed_realm_config(&storage_handle, &actor).await?;
+    let config = seed_realm_config(&storage_handle, &actor).await?;
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net_handle),
@@ -960,6 +990,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
+        config,
         context,
     })
 }
@@ -984,7 +1015,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
         user_id: aruna_core::UserId::local(Ulid::r#gen(), realm_id),
         realm_id,
     };
-    seed_realm_config(&storage_handle, &actor).await?;
+    let config = seed_realm_config(&storage_handle, &actor).await?;
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -996,6 +1027,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
+        config,
         context,
     })
 }
@@ -1003,7 +1035,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
 async fn seed_realm_config(
     storage: &aruna_storage::StorageHandle,
     actor: &Actor,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
@@ -1016,7 +1048,7 @@ async fn seed_realm_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(config),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(format!("unexpected realm config write event: {other:?}").into()),
     }

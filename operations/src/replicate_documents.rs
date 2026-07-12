@@ -4,7 +4,7 @@ use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::{DocumentClass, PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
-use crate::placement::plan_target_placement;
+use crate::placement::{document_class, plan_target_placement};
 use crate::sync_placement::{
     delete_placement_effect, new_placement, placement_satisfied, schedule_placement_retry_effect,
     write_placement_effect,
@@ -144,6 +144,20 @@ impl ReplicateDocumentsOperation {
         // Admin documents replicate as operations over their shared topic; they never
         // take placements, so skip them without a placement write or publish attempt.
         if document.is_admin_document() {
+            return self.emit_next_publish();
+        }
+
+        // A metadata document's bucket is the one its create stamped on the
+        // registry record; deriving it from the target here would hash it onto a
+        // second topic. Metadata replicates through its own outbox, never here.
+        if matches!(
+            document_class(&document),
+            DocumentClass::Metadata | DocumentClass::MetadataRegistry
+        ) {
+            debug_assert!(
+                false,
+                "metadata target {document:?} must publish from its stored placement"
+            );
             return self.emit_next_publish();
         }
 
@@ -368,12 +382,6 @@ mod tests {
         }
     }
 
-    fn metadata_target(seed: u8) -> DocumentSyncTarget {
-        DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([seed; 16]),
-        }
-    }
-
     fn node_usage_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
         DocumentSyncTarget::NodeUsage {
             realm_id,
@@ -433,9 +441,10 @@ mod tests {
 
     #[test]
     fn two_remote_peers_satisfy_default_document_placement() {
-        let target = metadata_target(4);
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = node_usage_target(realm_id, node(4));
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id: RealmId::from_bytes([7u8; 32]),
+            realm_id,
             local_node_id: node(1),
             excluded_peers: Vec::new(),
             documents: vec![target.clone()],
@@ -455,7 +464,7 @@ mod tests {
     #[test]
     fn pending_placement_records_authoritative_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = metadata_target(5);
+        let target = node_usage_target(realm_id, node(5));
         let local_node_id = node(1);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -554,7 +563,7 @@ mod tests {
     #[test]
     fn publish_failure_keeps_authoritative_origin() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = metadata_target(6);
+        let target = node_usage_target(realm_id, node(6));
         let local_node_id = node(1);
         let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,
@@ -589,7 +598,7 @@ mod tests {
     #[test]
     fn replicate_documents_selection_uses_rendezvous_not_local_salt() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let target = metadata_target(7);
+        let target = node_usage_target(realm_id, node(7));
 
         let mut first = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id,

@@ -24,7 +24,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind,
+    RealmNodeKind, shard_for_subject,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
@@ -49,7 +49,8 @@ use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::placement::{
-    PlacementResolutionContext, plan_target_placement, resolve_shard_holders,
+    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
+    strategy_for_target, subject_bytes,
 };
 use aruna_operations::sync_placement::sort_node_ids;
 use aruna_operations::task_incoming::initialize_task_incoming;
@@ -131,7 +132,6 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     let group_id = Ulid::r#gen();
     let document_id = Ulid::r#gen();
     let document_path = "datasets/replan-holder-refresh";
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -169,14 +169,11 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         nodes[0].context.as_ref(),
     )
     .await?;
-    let placement_context = PlacementResolutionContext {
-        group_id: Some(group_id),
-        metadata_path: Some(document_path),
-    };
-    let mut initial_holders = plan_target_placement(&initial_config, &target, placement_context)
-        .expect("metadata lifecycle placement resolves")
-        .holders;
+    // The bucket was chosen by the origin at create; holders derive from it.
+    let placement = created.placement;
+    let mut initial_holders = resolve_shard_holders(&initial_config, &placement);
     sort_node_ids(&mut initial_holders);
+    assert!(initial_holders.contains(&nodes[0].net.node_id()));
     wait_for_persisted_holder_set(
         &nodes,
         &initial_holders,
@@ -228,10 +225,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         nodes[0].context.as_ref(),
     )
     .await?;
-    let plan = plan_target_placement(&updated_config, &target, placement_context)
-        .expect("updated metadata lifecycle placement resolves");
-    let placement = plan.placement;
-    let mut final_holders = plan.holders;
+    let mut final_holders = resolve_shard_holders(&updated_config, &placement);
     sort_node_ids(&mut final_holders);
     let replacement = final_holders
         .iter()
@@ -261,6 +255,71 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         refreshed_event.payload,
         MetadataCreateEventPayload::UpsertDataEntity { .. }
     ));
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// The document id hashes into a bucket the origin does not hold: before the
+// bucket was chosen at create, the origin could never join that bucket's topic
+// and the create never replicated.
+#[tokio::test]
+async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([47u8; 32]);
+    let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
+    let group_id = Ulid::r#gen();
+    let document_path = "datasets/off-hash-origin";
+    let origin = nodes[0].net.node_id();
+
+    let context = PlacementResolutionContext {
+        group_id: Some(group_id),
+        metadata_path: Some(document_path),
+    };
+    let sample = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: Ulid::r#gen(),
+    };
+    let (strategy, _) =
+        strategy_for_target(&config, &sample, context).expect("metadata strategy resolves");
+    let held = held_buckets(&config, strategy, origin);
+    assert!(!held.is_empty() && held.len() < strategy.shard_count as usize);
+
+    let hashed_shard =
+        |document_id: Ulid| shard_for_subject(&document_id.to_bytes(), strategy.shard_count);
+    let mut document_id = Ulid::r#gen();
+    while held.contains(&hashed_shard(document_id)) {
+        document_id = Ulid::r#gen();
+    }
+
+    let created = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: origin,
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            public: true,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Off Hash Origin".to_string(),
+                description: "Created on a node outside the hashed bucket".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?
+    .record;
+
+    assert!(!held.contains(&hashed_shard(document_id)));
+    assert!(held.contains(&created.placement.shard));
+
+    let mut holders = resolve_shard_holders(&config, &created.placement);
+    sort_node_ids(&mut holders);
+    assert!(holders.contains(&origin));
+    wait_for_persisted_holder_set(&nodes, &holders, group_id, document_id, &holders).await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -390,7 +449,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([43u8; 32]);
     let nodes = vec![spawn_node(realm_id).await?];
-    install_realm_config(&nodes, &realm_id).await?;
+    let config = install_realm_config(&nodes, &realm_id).await?;
     let node = &nodes[0];
     let group_id = Ulid::r#gen();
     let mut events = Vec::new();
@@ -400,6 +459,23 @@ async fn batched_metadata_create_projection_materializes_many_documents()
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let (strategy, _) = strategy_for_target(
+            &config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(group_id),
+                metadata_path: Some(document_path.as_str()),
+            },
+        )
+        .expect("metadata strategy resolves");
+        let placement = choose_origin_bucket(
+            &config,
+            strategy,
+            node.net.node_id(),
+            &subject_bytes(&target),
+        )
+        .expect("origin holds a bucket");
         let record = MetadataRegistryRecord {
             realm_id,
             group_id,
@@ -413,7 +489,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
                 &document_path,
                 document_id,
             ),
-            placement: PlacementRef::NIL,
+            placement,
             holder_node_ids: vec![node.net.node_id()],
             created_at_ms: now,
             updated_at_ms: now,
@@ -476,6 +552,12 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     let document_path = "datasets/reordered-delete";
     let event_id = Ulid::r#gen();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let placement = aruna_operations::placement::placement_ref_for_target(
+        &realm_config,
+        &lifecycle_target,
+        Default::default(),
+    );
     let record = MetadataRegistryRecord {
         realm_id,
         group_id,
@@ -489,7 +571,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
             document_path,
             document_id,
         ),
-        placement: PlacementRef::NIL,
+        placement,
         holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -518,17 +600,10 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
             deleted_after_event_id: event_id,
         },
     };
-    // All records of this document share a subject and so one shard topic.
-    // The placement comes from the installed realm config, so the shard
-    // topic's genesis exists (created eagerly by its rank-0 holder during
-    // install); the publisher below only joins it, never creates it.
-    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let placement = aruna_operations::placement::placement_ref_for_target(
-        &realm_config,
-        &lifecycle_target,
-        Default::default(),
-    );
-    assert_ne!(placement, aruna_core::structs::PlacementRef::NIL);
+    // All records of this document ride the bucket stamped on the record, so
+    // one shard topic. Its genesis exists (created eagerly by its rank-0 holder
+    // during install); the publisher below only joins it, never creates it.
+    assert_ne!(placement, PlacementRef::NIL);
     let shard_topic_of = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
     // Make sure the publisher knows the shard topic before publishing onto it:
     // sync_document_topics bootstraps the genesis from the co-holder when

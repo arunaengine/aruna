@@ -20,7 +20,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::placement::placement_ref_for_target;
+use aruna_operations::placement::{choose_origin_bucket, strategy_for_target, subject_bytes};
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -45,15 +45,16 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::r#gen();
 
-    // Pick one shard and gather several document ids that all hash into it.
+    // Pick one shard and gather several document ids both holders choose it for.
     let strategy = config.strategies.first().expect("a strategy").clone();
-    let target_shard = shard_of(&config, Ulid::r#gen());
+    let holders = [nodes[0].net.node_id(), nodes[1].net.node_id()];
+    let target_shard = shard_of(&config, holders[0], Ulid::r#gen());
     let placement = PlacementRef {
         strategy_id: strategy.strategy_id,
         epoch: 0,
         shard: target_shard,
     };
-    let document_ids = document_ids_in_shard(&config, target_shard, 6);
+    let document_ids = document_ids_in_shard(&config, &holders, target_shard, 6);
 
     // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {
@@ -138,16 +139,28 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     Ok(())
 }
 
-fn shard_of(config: &RealmConfigDocument, document_id: Ulid) -> u32 {
+fn shard_of(config: &RealmConfigDocument, origin: NodeId, document_id: Ulid) -> u32 {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    placement_ref_for_target(config, &target, Default::default()).shard
+    let (strategy, _) =
+        strategy_for_target(config, &target, Default::default()).expect("strategy resolves");
+    choose_origin_bucket(config, strategy, origin, &subject_bytes(&target))
+        .expect("origin holds a bucket")
+        .shard
 }
 
-fn document_ids_in_shard(config: &RealmConfigDocument, shard: u32, count: usize) -> Vec<Ulid> {
+fn document_ids_in_shard(
+    config: &RealmConfigDocument,
+    origins: &[NodeId],
+    shard: u32,
+    count: usize,
+) -> Vec<Ulid> {
     let mut ids = Vec::with_capacity(count);
     while ids.len() < count {
         let candidate = Ulid::r#gen();
-        if shard_of(config, candidate) == shard {
+        if origins
+            .iter()
+            .all(|origin| shard_of(config, *origin, candidate) == shard)
+        {
             ids.push(candidate);
         }
     }
