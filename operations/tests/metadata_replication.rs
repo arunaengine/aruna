@@ -132,7 +132,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     let document_path = "datasets/replan-holder-refresh";
     let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
 
-    drive(
+    let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
@@ -152,10 +152,15 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         }),
         nodes[0].context.as_ref(),
     )
-    .await?;
-    assert_eq!(
-        replay_metadata_event_log(nodes[0].context.as_ref()).await?,
-        1
+    .await?
+    .record;
+    // See metadata_creation_replicates_to_all_three_holders: the projection
+    // count races the async drain, the logged event is the stable invariant.
+    assert!(replay_metadata_event_log(nodes[0].context.as_ref()).await? <= 1);
+    assert!(
+        read_metadata_event_log_value(&nodes[0], document_id, created.last_event_id)
+            .await?
+            .is_some()
     );
 
     let initial_config = drive(
