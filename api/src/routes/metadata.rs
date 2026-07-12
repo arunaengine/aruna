@@ -1594,6 +1594,7 @@ mod tests {
     use aruna_core::metadata::{
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
     };
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
         Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
@@ -3041,7 +3042,7 @@ mod tests {
             metadata_handle: Some(metadata_handle),
             task_handle: Some(TaskHandle::new()),
         });
-        initialize_net_incoming(context.clone());
+        initialize_net_incoming(context.clone(), &Shutdown::new());
         let state = Arc::new(
             ServerState::new(
                 context,

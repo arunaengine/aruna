@@ -510,6 +510,7 @@ mod tests {
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -635,8 +636,8 @@ mod tests {
                 metadata_handle: None,
                 task_handle: Some(task_handle.clone()),
             });
-            initialize_net_incoming(context.clone());
-            initialize_task_incoming(context.clone(), task_handle.clone()).await;
+            initialize_net_incoming(context.clone(), &Shutdown::new());
+            initialize_task_incoming(context.clone(), task_handle.clone(), &Shutdown::new()).await;
 
             let server_state = ServerState::new(
                 context.clone(),

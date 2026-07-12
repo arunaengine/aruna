@@ -449,6 +449,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId, TokenClaims,
         User,
@@ -725,8 +726,8 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
         });
-        initialize_net_incoming(context.clone());
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_net_incoming(context.clone(), &Shutdown::new());
+        initialize_task_incoming(context.clone(), task_handle, &Shutdown::new()).await;
 
         let realm_signing_key =
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);

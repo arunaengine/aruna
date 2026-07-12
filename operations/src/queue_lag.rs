@@ -7,30 +7,35 @@ use std::sync::{Arc, Weak};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE};
+use aruna_core::shutdown::Shutdown;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
 const QUEUE_SCAN_PAGE_SIZE: usize = 1_024;
 const QUEUE_SCAN_PAGE_LIMIT: usize = 8;
 
-pub fn spawn_queue_lag_monitor(context: &Arc<crate::driver::DriverContext>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+pub fn spawn_queue_lag_monitor(context: &Arc<crate::driver::DriverContext>, shutdown: &Shutdown) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(queue_lag_loop(Arc::downgrade(context)));
+    }
+    shutdown.spawn(queue_lag_loop(Arc::downgrade(context), shutdown.token()));
 }
 
-async fn queue_lag_loop(context: Weak<crate::driver::DriverContext>) {
+async fn queue_lag_loop(context: Weak<crate::driver::DriverContext>, cancelled: CancellationToken) {
     let mut outbox_active = false;
     let mut materialization_active = false;
     let mut storage_active = false;
     loop {
-        sleep(QUEUE_LAG_INTERVAL).await;
+        tokio::select! {
+            _ = cancelled.cancelled() => return,
+            _ = sleep(QUEUE_LAG_INTERVAL) => {}
+        }
         let Some(context) = context.upgrade() else {
             return;
         };

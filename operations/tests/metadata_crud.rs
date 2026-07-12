@@ -12,6 +12,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
 };
+use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::{
     document_placement_key, metadata_create_event_and_pending_projection_write_entries,
     metadata_create_event_write_entry, metadata_document_key, metadata_event_log_prefix,
@@ -382,7 +383,7 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
     assert!(before_recovery.is_empty());
 
     schedule_pending_metadata_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
-    initialize_task_incoming(test.context.clone(), TaskHandle::new()).await;
+    initialize_task_incoming(test.context.clone(), TaskHandle::new(), &Shutdown::new()).await;
 
     wait_for_projected_record(&test, group_id, &record).await?;
     // The restored background timer may materialize the job before this manual batch runs.

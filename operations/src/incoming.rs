@@ -25,6 +25,7 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::task::TaskEvent;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
@@ -43,9 +44,10 @@ struct OperationsInboundHandler {
 }
 
 impl OperationsInboundHandler {
-    fn new(context: Arc<DriverContext>) -> Self {
-        let document_sync_reconcile = Arc::new(DocumentSyncReconcileCoalescer::default());
-        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile));
+    fn new(context: Arc<DriverContext>, shutdown: Shutdown) -> Self {
+        let document_sync_reconcile =
+            Arc::new(DocumentSyncReconcileCoalescer::new(shutdown.clone()));
+        spawn_reconcile_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
             document_sync_reconcile,
@@ -58,6 +60,7 @@ impl OperationsInboundHandler {
 #[derive(Debug, Default)]
 struct DocumentSyncReconcileCoalescer {
     state: Mutex<DocumentSyncReconcileQueue>,
+    shutdown: Shutdown,
 }
 
 #[derive(Debug, Default)]
@@ -68,7 +71,19 @@ struct DocumentSyncReconcileQueue {
 }
 
 impl DocumentSyncReconcileCoalescer {
+    fn new(shutdown: Shutdown) -> Self {
+        Self {
+            state: Mutex::default(),
+            shutdown,
+        }
+    }
+
     fn trigger(self: &Arc<Self>, context: Arc<DriverContext>, topics: Vec<irokle::TopicId>) {
+        // Reconcile runs write metadata and storage: none may start once
+        // shutdown has begun draining.
+        if self.shutdown.is_triggered() {
+            return;
+        }
         {
             let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
             state.queued.extend(topics);
@@ -81,7 +96,7 @@ impl DocumentSyncReconcileCoalescer {
             state.running = true;
         }
         let coalescer = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn(async move {
             loop {
                 let batch: Vec<irokle::TopicId> = {
                     let mut state = coalescer
@@ -113,14 +128,21 @@ impl DocumentSyncReconcileCoalescer {
 
 // Emits a `queue.lag` line every tick while the coalescer holds queued topics
 // or a reconcile run is in flight, plus one final line once it drains.
-fn spawn_reconcile_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+fn spawn_reconcile_queue_gauge(
+    coalescer: Weak<DocumentSyncReconcileCoalescer>,
+    shutdown: &Shutdown,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(async move {
+    }
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut was_active = false;
         loop {
-            sleep(QUEUE_LAG_INTERVAL).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(QUEUE_LAG_INTERVAL) => {}
+            }
             let Some(coalescer) = coalescer.upgrade() else {
                 return;
             };
@@ -197,16 +219,19 @@ async fn reconcile_inbound_document_sync_topics(
     );
 }
 
-pub fn initialize_net_incoming(context: Arc<DriverContext>) {
+pub fn initialize_net_incoming(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let Some(net_handle) = context.net_handle.clone() else {
         warn!("Cannot initialize inbound handling without net handle");
         return;
     };
     let metadata_handle = context.metadata_handle.clone();
 
-    net_handle.set_inbound_handler(Arc::new(OperationsInboundHandler::new(context)));
+    net_handle.set_inbound_handler(Arc::new(OperationsInboundHandler::new(
+        context,
+        shutdown.clone(),
+    )));
     if let Some(metadata_handle) = metadata_handle {
-        schedule_periodic_metadata_document_sync_maintenance(metadata_handle);
+        schedule_periodic_metadata_document_sync_maintenance(metadata_handle, shutdown);
     }
 }
 
@@ -458,17 +483,26 @@ async fn schedule_projection_retry(context: &DriverContext) {
     }
 }
 
-fn schedule_periodic_metadata_document_sync_maintenance(metadata_handle: MetadataHandle) {
+fn schedule_periodic_metadata_document_sync_maintenance(
+    metadata_handle: MetadataHandle,
+    shutdown: &Shutdown,
+) {
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|now| now.subsec_nanos() as u64 % METADATA_DOCUMENT_SYNC_MAINTENANCE_JITTER_SECS)
             .unwrap_or(0),
     );
-    tokio::spawn(async move {
+    // This loop writes the metadata store, so it has to stop before the
+    // shutdown flushes it.
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
         let mut cycle = 0usize;
         loop {
-            sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter).await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter) => {}
+            }
             cycle = cycle.saturating_add(1);
             run_metadata_document_sync_maintenance(&metadata_handle, "periodic", cycle).await;
         }
@@ -568,13 +602,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let handler = OperationsInboundHandler::new(Arc::new(DriverContext {
-            storage_handle: storage_b,
-            net_handle: Some(net_b.clone()),
-            blob_handle: Some(blob_handle),
-            metadata_handle: None,
-            task_handle: None,
-        }));
+        let handler = OperationsInboundHandler::new(
+            Arc::new(DriverContext {
+                storage_handle: storage_b,
+                net_handle: Some(net_b.clone()),
+                blob_handle: Some(blob_handle),
+                metadata_handle: None,
+                task_handle: None,
+            }),
+            Shutdown::new(),
+        );
 
         let mut outbound = net_a.open_stream(net_b.node_id(), Alpn::Bao).await.unwrap();
         outbound.0.write_u32(8).await.unwrap();

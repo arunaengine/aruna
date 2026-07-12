@@ -5,6 +5,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
@@ -104,8 +105,8 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         task_handle: Some(task_handle.clone()),
     });
 
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_net_incoming(context.clone(), &Shutdown::new());
+    initialize_task_incoming(context.clone(), task_handle, &Shutdown::new()).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,

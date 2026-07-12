@@ -9,6 +9,7 @@ pub mod repository;
 
 use std::sync::Arc;
 
+use aruna_core::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::driver::DriverContext;
@@ -18,8 +19,8 @@ pub use protocol::{MetadataAuthToken, MetadataAuthTokenError};
 
 /// Primes the metadata caches off the boot path so the first user query
 /// finds them warm. Never blocks startup.
-pub fn spawn_metadata_warmup(context: Arc<DriverContext>) {
-    tokio::spawn(async move {
+pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
+    shutdown.spawn(async move {
         if let Some(handle) = context.metadata_handle.clone()
             && let Err(error) = handle.warm_caches().await
         {

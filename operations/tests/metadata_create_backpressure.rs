@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::UserId;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{Actor, RealmId};
 use aruna_core::types::GroupId;
 use aruna_operations::create_metadata_document::{
@@ -59,7 +60,7 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         task_handle: task_handle.clone(),
     });
     if let Some(task_handle) = task_handle {
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_task_incoming(context.clone(), task_handle, &Shutdown::new()).await;
     }
     Ok(ProbeNode {
         _temp_dir: temp_dir,

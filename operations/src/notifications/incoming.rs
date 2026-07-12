@@ -657,6 +657,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
         RealmAuthorizationDocument, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
@@ -701,7 +702,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         });
-        initialize_net_incoming(context.clone());
+        initialize_net_incoming(context.clone(), &Shutdown::new());
         Node {
             _dir: dir,
             net,

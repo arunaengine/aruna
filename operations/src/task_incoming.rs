@@ -7,6 +7,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -15,6 +16,7 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::announce_realm_presence::{
@@ -1044,19 +1046,31 @@ impl OperationsTaskHandler {
     }
 }
 
-fn spawn_durable_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+fn spawn_durable_queue_rearm(
+    context: &Arc<DriverContext>,
+    task_handle: &TaskHandle,
+    shutdown: &Shutdown,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    runtime.spawn(durable_queue_rearm_loop(
+    }
+    shutdown.spawn(durable_queue_rearm_loop(
         Arc::downgrade(context),
         task_handle.clone(),
+        shutdown.token(),
     ));
 }
 
-async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: TaskHandle) {
+async fn durable_queue_rearm_loop(
+    context: Weak<DriverContext>,
+    task_handle: TaskHandle,
+    cancelled: CancellationToken,
+) {
     loop {
-        tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER).await;
+        tokio::select! {
+            _ = cancelled.cancelled() => return,
+            _ = tokio::time::sleep(DURABLE_QUEUE_REARM_AFTER) => {}
+        }
         let Some(context) = context.upgrade() else {
             return;
         };
@@ -1080,19 +1094,23 @@ async fn durable_queue_rearm_loop(context: Weak<DriverContext>, task_handle: Tas
     }
 }
 
-pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: TaskHandle) {
+pub async fn initialize_task_incoming(
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    shutdown: &Shutdown,
+) {
     let handler_context = context.clone();
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
-    crate::queue_lag::spawn_queue_lag_monitor(&context);
+    crate::queue_lag::spawn_queue_lag_monitor(&context, shutdown);
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
         let table = rebuild_watch_interest_table(&context.storage_handle).await;
         net_handle.replace_watch_interest(table);
     }
-    spawn_durable_queue_rearm(&context, &task_handle);
+    spawn_durable_queue_rearm(&context, &task_handle, shutdown);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_usage_snapshot_publish_timer(&context.storage_handle, &task_handle).await;
@@ -2124,7 +2142,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
         });
-        crate::incoming::initialize_net_incoming(context_b.clone());
+        crate::incoming::initialize_net_incoming(context_b.clone(), &Shutdown::new());
 
         let context_a = Arc::new(DriverContext {
             storage_handle: storage_a.clone(),

@@ -932,6 +932,7 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
         RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
@@ -1161,8 +1162,8 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
         });
-        initialize_net_incoming(driver_ctx.clone());
-        initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+        initialize_net_incoming(driver_ctx.clone(), &Shutdown::new());
+        initialize_task_incoming(driver_ctx.clone(), task_handle, &Shutdown::new()).await;
 
         let realm_signing_key =
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
