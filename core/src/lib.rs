@@ -15,6 +15,7 @@ pub mod keyspaces;
 pub mod metadata;
 pub mod onboarding;
 pub mod operation;
+pub mod shutdown;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;
