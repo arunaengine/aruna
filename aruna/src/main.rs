@@ -524,7 +524,7 @@ mod tests {
         let observed_readiness = readiness.clone();
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("shutdown should request storage sync_all");
             assert!(
@@ -577,7 +577,7 @@ mod tests {
     async fn ensure_usage_counters_returns_probe_errors() {
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("usage counter ensure should probe storage");
             assert!(matches!(effect, StorageEffect::BatchRead { .. }));
@@ -600,7 +600,7 @@ mod tests {
     async fn ensure_usage_counters_rejects_unexpected_probe_events() {
         let (storage_handle, receiver) = StorageHandle::new();
         let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at) = receiver
+            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
                 .recv()
                 .expect("usage counter ensure should probe storage");
             assert!(matches!(effect, StorageEffect::BatchRead { .. }));

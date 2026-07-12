@@ -3155,7 +3155,7 @@ mod tests {
         let document_id = Ulid::from_bytes([11u8; 16]);
         let event_id = Ulid::from_parts(11, 2);
         let scripted = thread::spawn(move || {
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("status read request");
             let status_key = match effect {
                 StorageEffect::Read {
@@ -3174,7 +3174,7 @@ mod tests {
                 value: None,
             });
 
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("document-local predecessor scan");
             match effect {
                 StorageEffect::Iter {
@@ -3199,7 +3199,7 @@ mod tests {
                 next_start_after: None,
             });
 
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("global predecessor scan");
             match effect {
                 StorageEffect::Iter {
@@ -3305,12 +3305,12 @@ mod tests {
         let scripted = thread::spawn({
             let old_job_key = old_job_key.clone();
             move || {
-                let (effect, response_tx, _span, _enqueued_at) =
+                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                     receiver.recv().expect("start transaction request");
                 assert_eq!(effect, StorageEffect::StartTransaction { read: false });
                 response_tx.send(StorageEvent::TransactionStarted { txn_id });
 
-                let (effect, response_tx, _span, _enqueued_at) =
+                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                     receiver.recv().expect("status read request");
                 let status_key = match effect {
                     StorageEffect::Read {
@@ -3329,7 +3329,7 @@ mod tests {
                     value: None,
                 });
 
-                let (effect, response_tx, _span, _enqueued_at) =
+                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                     receiver.recv().expect("retry writes request");
                 let write_entries = match effect {
                     StorageEffect::BatchWrite {
@@ -3355,7 +3355,7 @@ mod tests {
                         .collect(),
                 });
 
-                let (effect, response_tx, _span, _enqueued_at) =
+                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                     receiver.recv().expect("old job delete request");
                 let deletes = match effect {
                     StorageEffect::BatchDelete {
@@ -3376,7 +3376,7 @@ mod tests {
                 );
                 response_tx.send(StorageEvent::BatchDeleteResult { entries: deletes });
 
-                let (effect, response_tx, _span, _enqueued_at) =
+                let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                     receiver.recv().expect("commit request");
                 assert_eq!(effect, StorageEffect::CommitTransaction { txn_id });
                 response_tx.send(StorageEvent::TransactionCommitted { txn_id });

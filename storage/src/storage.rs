@@ -26,6 +26,7 @@ pub type EffectHandle = (
     oneshot::TxOneshot<StorageEvent>,
     Span,
     Instant,
+    InFlightGuard,
 );
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
@@ -177,9 +178,9 @@ struct StorageMetrics {
     last_error: Mutex<Option<String>>,
 }
 
-/// Decrements `in_flight` on drop so cancelled callers (probe timeouts,
-/// client disconnects) stay balanced.
-struct InFlightGuard(Arc<StorageMetrics>);
+/// Decrements `in_flight` when an accepted effect completes or is discarded.
+#[doc(hidden)]
+pub struct InFlightGuard(Arc<StorageMetrics>);
 
 impl InFlightGuard {
     fn acquire(metrics: &Arc<StorageMetrics>) -> Self {
@@ -299,9 +300,10 @@ impl StorageHandle {
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
+        let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
             .write_channel
-            .try_send((effect, response_tx, span, Instant::now()))
+            .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -319,7 +321,6 @@ impl StorageHandle {
             }
         }
 
-        let _in_flight = InFlightGuard::acquire(&self.metrics);
         match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(event)) => self.observe_storage_event(event),
             Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
@@ -347,9 +348,10 @@ impl StorageHandle {
         let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
+        let in_flight = InFlightGuard::acquire(&self.metrics);
         match self
             .write_channel
-            .try_send((effect, response_tx, span, Instant::now()))
+            .try_send((effect, response_tx, span, Instant::now(), in_flight))
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => warn!(
@@ -601,7 +603,7 @@ impl FjallStorage {
     }
 
     fn process_single(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
-        let (effect, response_tx, span, enqueued_at) = item;
+        let (effect, response_tx, span, enqueued_at, in_flight) = item;
         let _guard = span.enter();
         let operation = storage_effect_kind(&effect);
         let key_space = storage_effect_key_space(&effect).map(str::to_string);
@@ -668,6 +670,7 @@ impl FjallStorage {
                 "Dropping storage response for abandoned request"
             );
         } else {
+            drop(in_flight);
             response_tx.send(event);
         }
     }
@@ -741,7 +744,7 @@ impl FjallStorage {
         };
 
         let service_elapsed = service_started.elapsed();
-        for ((effect, response_tx, span, enqueued_at), outcome) in prepared {
+        for ((effect, response_tx, span, enqueued_at, in_flight), outcome) in prepared {
             let _guard = span.enter();
             let queue_wait = enqueued_at.elapsed().saturating_sub(service_elapsed);
             let event = match outcome {
@@ -765,6 +768,7 @@ impl FjallStorage {
                 service_elapsed,
                 result,
             );
+            drop(in_flight);
             if !response_tx.is_disconnected() {
                 response_tx.send(event);
             }
@@ -1374,7 +1378,7 @@ impl PendingWriteIndex {
             keys: Vec::with_capacity(group.len()),
             sorted: true,
         };
-        for (effect, _, _, _) in group {
+        for (effect, _, _, _, _) in group {
             index.insert(effect);
         }
         index
@@ -1550,7 +1554,7 @@ fn spawn_read_pool(store: Store, threads: usize) -> Vec<EffectSender> {
 }
 
 fn read_pool_loop(store: Store, receiver: EffectReceiver) {
-    while let Ok((effect, response_tx, span, enqueued_at)) = receiver.recv() {
+    while let Ok((effect, response_tx, span, enqueued_at, in_flight)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_disconnected() {
             continue;
@@ -1610,6 +1614,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 "Slow storage read"
             );
         }
+        drop(in_flight);
         if !response_tx.is_disconnected() {
             response_tx.send(event);
         }
@@ -2005,8 +2010,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_dispatch_returns_in_flight_to_zero() {
-        let (handle, _receiver) = StorageHandle::new();
+    async fn cancelled_stays_counted() {
+        let (handle, receiver) = StorageHandle::new();
         let mut probe = Box::pin(handle.send_storage_effect(StorageEffect::Read {
             key_space: "node_state".to_string(),
             key: b"node_state".to_vec().into(),
@@ -2021,6 +2026,33 @@ mod tests {
         assert_eq!(handle.in_flight(), 1);
 
         drop(probe);
+        assert_eq!(handle.in_flight(), 1);
+
+        let queued = receiver.recv().expect("cancelled effect remains queued");
+        assert_eq!(handle.in_flight(), 1);
+        drop(queued);
+        assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_enqueue_balances() {
+        let (handle, receiver) = StorageHandle::new();
+        drop(receiver);
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "node_state".to_string(),
+                key: b"node_state".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::ChannelClosed
+            })
+        ));
         assert_eq!(handle.in_flight(), 0);
     }
 
@@ -2049,7 +2081,7 @@ mod tests {
     async fn sync_all_handle_surfaces_persist_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("sync_all effect should arrive");
             assert!(matches!(effect, StorageEffect::SyncAll));
             response_tx.send(StorageEvent::Error {
@@ -2689,14 +2721,14 @@ mod tests {
     async fn send_effect_counts_conflicts_separately_from_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("first effect should arrive");
             assert!(matches!(effect, StorageEffect::CommitTransaction { .. }));
             response_tx.send(StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             });
 
-            let (effect, response_tx, _span, _enqueued_at) =
+            let (effect, response_tx, _span, _enqueued_at, _in_flight) =
                 receiver.recv().expect("second effect should arrive");
             assert!(matches!(
                 effect,
