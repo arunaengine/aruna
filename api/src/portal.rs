@@ -463,6 +463,7 @@ mod tests {
                 "nosniff"
             );
             assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+            assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
             assert_eq!(
                 headers.get("cross-origin-opener-policy").unwrap(),
                 "same-origin"
@@ -506,7 +507,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_routes_skip_headers() {
+    async fn api_routes_baseline() {
+        // API and swagger get the anti-clickjacking baseline, but not the strict portal CSP.
         let tempdir = tempdir().unwrap();
         let (router, _state_dir) = setup_serving_node(&tempdir.path().join("portal")).await;
 
@@ -517,13 +519,27 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(
-                response
-                    .headers()
-                    .get(header::CONTENT_SECURITY_POLICY)
-                    .is_none(),
+            let headers = response.headers();
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
                 "{path}"
             );
+            assert_eq!(
+                headers.get(header::X_FRAME_OPTIONS).unwrap(),
+                "DENY",
+                "{path}"
+            );
+            let policy = headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("{path} has no policy"))
+                .to_str()
+                .unwrap();
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path}: {policy}"
+            );
+            assert!(!policy.contains("script-src"), "{path}: {policy}");
         }
     }
 }

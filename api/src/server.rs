@@ -1,11 +1,12 @@
 use crate::cors::CorsConfig;
-use crate::csp::PortalCspConfig;
+use crate::csp::{PortalCspConfig, baseline_security_headers};
 use crate::error::ServerSetupError;
 use crate::portal;
 use crate::routes::rest_router;
 pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::middleware::from_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -43,7 +44,8 @@ impl Server {
             .merge(portal::router(
                 self.state.clone(),
                 self.config.portal_csp.clone(),
-            ));
+            ))
+            .layer(from_fn(baseline_security_headers));
         if let Some(cors_layer) = self.config.cors.rest_layer() {
             router = router.layer(cors_layer);
         }

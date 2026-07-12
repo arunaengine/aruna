@@ -17,6 +17,9 @@ use url::{Host, Url};
 const FONT_STYLE_ORIGIN: &str = "https://fonts.googleapis.com";
 const FONT_FILE_ORIGIN: &str = "https://fonts.gstatic.com";
 
+/// Anti-clickjacking policy every response carries when it has no stricter one.
+const BASELINE_CSP: &str = "frame-ancestors 'none'";
+
 /// OIDC origins change rarely; a point-read behind this window keeps the common
 /// portal response off the storage path.
 const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
@@ -148,6 +151,19 @@ pub(crate) async fn portal_security_headers(
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     headers.insert(
+        CROSS_ORIGIN_OPENER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
+/// Headers every response carries, regardless of route: swagger and api-docs
+/// serve inline-script HTML on this origin and still need nosniff and the
+/// anti-clickjacking baseline. The strict portal policy stays portal-only.
+pub(crate) async fn baseline_security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
@@ -155,10 +171,13 @@ pub(crate) async fn portal_security_headers(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(
-        CROSS_ORIGIN_OPENER_POLICY,
-        HeaderValue::from_static("same-origin"),
-    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(BASELINE_CSP),
+        );
+    }
     response
 }
 
