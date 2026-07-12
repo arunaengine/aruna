@@ -47,6 +47,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{Instrument, Span, debug, warn};
 
 pub use ::irokle::net::IrohRuntimeConfig;
@@ -57,6 +58,10 @@ pub use error::{NetError, Result};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
+/// Drain budget for inbound stream handlers when `shutdown` is called without one.
+const DEFAULT_INBOUND_DRAIN: Duration = Duration::from_secs(5);
+/// Grace for the same handlers once the endpoint is closed under them.
+const FORCED_INBOUND_DRAIN: Duration = Duration::from_secs(5);
 const NOTIFICATION_WAKE_CAPACITY: usize = 256;
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
@@ -405,7 +410,9 @@ struct NetInner {
     peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     inbound_handler_registered: Arc<Notify>,
+    inbound_tasks: TaskTracker,
     eviction_shutdown: CancellationToken,
+    accept_shutdown: CancellationToken,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -636,6 +643,10 @@ impl NetHandle {
         let dht_for_streams = dht.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
+        // Inbound handlers write to storage, so shutdown has to be able to join
+        // them instead of leaving them detached behind the final sync.
+        let inbound_tasks = TaskTracker::new();
+        let inbound_tasks_for_streams = inbound_tasks.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
                 if let Err(err) = dht_for_streams.add_peer(peer_id) {
@@ -655,7 +666,7 @@ impl NetHandle {
                         );
                         continue;
                     };
-                    tokio::spawn(async move {
+                    inbound_tasks_for_streams.spawn(async move {
                         let _permit = permit;
                         handler.handle_incoming_stream(alpn, stream, peer_id).await;
                     });
@@ -667,7 +678,10 @@ impl NetHandle {
 
         let endpoint_for_accept = endpoint.clone();
         let document_sync_for_accept = document_sync.clone();
-        let shutdown_for_accept = shutdown.child_token();
+        // Admission has its own token so shutdown can stop accepting new peers
+        // while the handlers already running still have a working network.
+        let accept_shutdown = CancellationToken::new();
+        let shutdown_for_accept = accept_shutdown.clone();
         let accept_task = tokio::spawn(async move {
             streams::run_accept_loop(
                 endpoint_for_accept,
@@ -799,7 +813,9 @@ impl NetHandle {
             peer_connectivity_tx,
             inbound_handler,
             inbound_handler_registered,
+            inbound_tasks,
             eviction_shutdown,
+            accept_shutdown,
             shutdown,
             tasks: Mutex::new(tasks),
         });
@@ -1198,8 +1214,28 @@ impl NetHandle {
     }
 
     pub async fn shutdown(&self) {
+        self.shutdown_with_drain(DEFAULT_INBOUND_DRAIN).await;
+    }
+
+    /// Stops inbound admission, gives handlers that are already running up to
+    /// `drain` to finish while the endpoint is still usable, then tears the
+    /// network down and joins every child.
+    pub async fn shutdown_with_drain(&self, drain: Duration) {
         if self.inner.shutdown.is_cancelled() {
             return;
+        }
+
+        self.inner.accept_shutdown.cancel();
+        self.inner.inbound_tasks.close();
+        if tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                pending = self.inner.inbound_tasks.len(),
+                drain_ms = drain.as_millis(),
+                "Inbound stream handlers outlived the drain deadline; closing the endpoint under them"
+            );
         }
 
         self.inner.shutdown.cancel();
@@ -1216,6 +1252,19 @@ impl NetHandle {
         let mut tasks = self.inner.tasks.lock().await;
         while let Some(handle) = tasks.pop() {
             let _ = handle.await;
+        }
+        drop(tasks);
+
+        // The endpoint is closed, so surviving handlers now fail their stream IO
+        // instead of blocking; join them before the caller seals storage.
+        if tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                pending = self.inner.inbound_tasks.len(),
+                "Gave up joining inbound stream handlers during shutdown"
+            );
         }
     }
 
