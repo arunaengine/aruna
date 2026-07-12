@@ -1,11 +1,11 @@
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, Permission, WatchEventKind, WatchEventMask, WatchSubscription,
+    NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
@@ -15,7 +15,9 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
-use aruna_operations::notifications::watch::authorization::watch_permission_path;
+use aruna_operations::notifications::watch::authorization::{
+    is_watch_authorized, watch_permission_path,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -319,15 +321,32 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
     response
 }
 
+/// Creation shares the exact authorization result delivery and enumeration use,
+/// so a watch cannot be created on anything they would later refuse. A prefix
+/// with no canonical resource identity is a malformed request; everything else a
+/// caller may not read answers Forbidden, whether or not it exists.
 async fn authorize_watch(
     state: &ServerState,
     auth: &AuthContext,
     path_prefix: &str,
     event_mask: WatchEventMask,
 ) -> ServerResult<()> {
-    let permission_path = watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
-        .ok_or(ServerError::BadRequest)?;
-    ensure_permission(state, auth, permission_path, Permission::READ).await
+    if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
+        return Err(ServerError::BadRequest);
+    }
+    match is_watch_authorized(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        auth.user_id,
+        path_prefix,
+        event_mask,
+    )
+    .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ServerError::Forbidden),
+        Err(error) => Err(ServerError::InternalError(error)),
+    }
 }
 
 #[utoipa::path(
@@ -1570,6 +1589,50 @@ mod tests {
         .expect("bucket reader may create a watch");
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created.path_prefix, path_prefix);
+    }
+
+    // A group that does not exist and a group the caller may not read answer
+    // identically, so creating a watch is never an existence oracle.
+    #[tokio::test]
+    async fn missing_group_forbidden() {
+        let realm_id = realm_id(18);
+        let holder = node(18);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let caller = UserId::new(Ulid::r#gen(), realm_id);
+        let existing_group = Ulid::r#gen();
+        install_group_authorization(
+            &state,
+            realm_id,
+            existing_group,
+            UserId::new(Ulid::r#gen(), realm_id),
+            &[],
+        )
+        .await;
+
+        let missing = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(caller, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{}/datasets", Ulid::r#gen()),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a watch on a group that does not exist must be refused");
+        assert!(matches!(missing, ServerError::Forbidden));
+
+        let unreadable = create_watch(
+            State(state),
+            Extension(Some(auth_for(caller, realm_id))),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{existing_group}/datasets"),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a watch on an existing unreadable group must be refused");
+        assert!(matches!(unreadable, ServerError::Forbidden));
     }
 
     #[tokio::test]
