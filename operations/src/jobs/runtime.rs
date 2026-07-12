@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,7 @@ use aruna_core::task::TaskEvent;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
+use futures_util::future::FutureExt;
 use tokio::sync::watch;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +35,9 @@ use crate::driver::DriverContext;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct RunningJob {
+    /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
+    /// zombie's `finish` cannot evict the newer execution that replaced it.
+    nonce: u64,
     cancel: CancellationToken,
     completion: watch::Sender<bool>,
 }
@@ -39,6 +45,7 @@ struct RunningJob {
 /// Registry of locally executing jobs, their cancellation tokens, and the concurrency cap.
 pub struct JobsRuntime {
     running: Mutex<HashMap<JobId, RunningJob>>,
+    next_nonce: AtomicU64,
     cap: usize,
 }
 
@@ -59,6 +66,7 @@ impl JobsRuntime {
     pub fn with_capacity(cap: usize) -> Arc<Self> {
         Arc::new(Self {
             running: Mutex::new(HashMap::new()),
+            next_nonce: AtomicU64::new(0),
             cap,
         })
     }
@@ -89,28 +97,37 @@ impl JobsRuntime {
 
     pub fn spawn(self: &Arc<Self>, context: Arc<DriverContext>, record: JobRecord) {
         let job_id = record.job_id;
+        let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let (completion, _) = watch::channel(false);
         self.running.lock().expect("runtime mutex poisoned").insert(
             job_id,
             RunningJob {
+                nonce,
                 cancel: cancel.clone(),
                 completion,
             },
         );
         let runtime = self.clone();
         tokio::spawn(async move {
-            run_job(context.clone(), record, cancel).await;
-            runtime.finish(&context, job_id).await;
+            // A panicking payload is turned into a job failure inside `supervise`; this
+            // guard still runs `finish` if anything else unwinds, so a panic can never
+            // leak the concurrency slot and wedge the runtime.
+            let _ = AssertUnwindSafe(run_job(context.clone(), record, cancel))
+                .catch_unwind()
+                .await;
+            runtime.finish(&context, job_id, nonce).await;
         });
     }
 
-    async fn finish(&self, context: &DriverContext, job_id: JobId) {
-        let removed = self
-            .running
-            .lock()
-            .expect("runtime mutex poisoned")
-            .remove(&job_id);
+    async fn finish(&self, context: &DriverContext, job_id: JobId, nonce: u64) {
+        let removed = {
+            let mut running = self.running.lock().expect("runtime mutex poisoned");
+            match running.get(&job_id) {
+                Some(job) if job.nonce == nonce => running.remove(&job_id),
+                _ => None,
+            }
+        };
         if let Some(job) = removed {
             let _ = job.completion.send(true);
         }
@@ -120,6 +137,21 @@ impl JobsRuntime {
         {
             warn!(message = %message, "Failed to kick job drain after completion");
         }
+    }
+
+    #[cfg(test)]
+    fn register_test_execution(&self, job_id: JobId) -> u64 {
+        let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let (completion, _) = watch::channel(false);
+        self.running.lock().expect("runtime mutex poisoned").insert(
+            job_id,
+            RunningJob {
+                nonce,
+                cancel: CancellationToken::new(),
+                completion,
+            },
+        );
+        nonce
     }
 
     /// Block until the job is terminal or `timeout` elapses (local signal, else 250ms poll).
@@ -224,7 +256,8 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
     if record.cancel_requested {
         run_cleanup(&record.payload);
         terminal_or_none(
-            cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await,
+            retry_terminal(|| cancel_running_job(storage, job_id, token, unix_timestamp_millis()))
+                .await,
             job_id,
         );
         return;
@@ -255,14 +288,16 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
         SuperviseResult::Zombie => {}
         SuperviseResult::Outcome(JobRunOutcome::Succeeded(result)) => {
             terminal_or_none(
-                complete_job(
-                    storage,
-                    job_id,
-                    token,
-                    result,
-                    progress.snapshot(),
-                    unix_timestamp_millis(),
-                )
+                retry_terminal(|| {
+                    complete_job(
+                        storage,
+                        job_id,
+                        token,
+                        result.clone(),
+                        progress.snapshot(),
+                        unix_timestamp_millis(),
+                    )
+                })
                 .await,
                 job_id,
             );
@@ -284,7 +319,16 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
                 }
             } else {
                 terminal_or_none(
-                    fail_job(storage, job_id, token, error, unix_timestamp_millis()).await,
+                    retry_terminal(|| {
+                        fail_job(
+                            storage,
+                            job_id,
+                            token,
+                            error.clone(),
+                            unix_timestamp_millis(),
+                        )
+                    })
+                    .await,
                     job_id,
                 );
             }
@@ -292,7 +336,10 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {
             run_cleanup(&record.payload);
             terminal_or_none(
-                cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await,
+                retry_terminal(|| {
+                    cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                })
+                .await,
                 job_id,
             );
         }
@@ -312,6 +359,30 @@ fn terminal_or_none(result: Result<JobRecord, JobMutationError>, job_id: JobId) 
     }
 }
 
+const TERMINAL_WRITE_MAX_ATTEMPTS: u32 = 5;
+
+/// Retry a terminal write past transient storage failures. The execution already
+/// finished, so a bare storage error would otherwise leave the job `Running` until the
+/// sweep re-runs it and can flip a succeeded job to `Failed`; token/transition races are
+/// legitimate outcomes and are returned unretried.
+async fn retry_terminal<F, Fut>(mut op: F) -> Result<JobRecord, JobMutationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<JobRecord, JobMutationError>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Err(JobMutationError::Storage(error)) if attempt + 1 < TERMINAL_WRITE_MAX_ATTEMPTS => {
+                warn!(error = %error, "Retrying job terminal write after storage failure");
+                tokio::time::sleep(Duration::from_millis(20u64 << attempt)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn supervise(
     storage: &StorageHandle,
     job_id: JobId,
@@ -319,9 +390,53 @@ async fn supervise(
     record: &JobRecord,
     ctx: &JobContext,
 ) -> SuperviseResult {
-    let payload_future = dispatch_payload(ctx, &record.payload);
-    tokio::pin!(payload_future);
+    // Renew the lease and flush progress on a SEPARATE task so a payload stuck in a
+    // non-yielding section cannot starve its own renewals and be swept out from under
+    // itself into a second concurrent execution.
+    let stop = CancellationToken::new();
+    let heartbeat = tokio::spawn(heartbeat_loop(
+        storage.clone(),
+        job_id,
+        token,
+        ctx.progress.clone(),
+        ctx.cancel.clone(),
+        stop.clone(),
+    ));
+    tokio::pin!(heartbeat);
 
+    let payload = AssertUnwindSafe(dispatch_payload(ctx, &record.payload)).catch_unwind();
+    tokio::pin!(payload);
+
+    tokio::select! {
+        outcome = &mut payload => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            match outcome {
+                Ok(outcome) => SuperviseResult::Outcome(outcome),
+                Err(_panic) => {
+                    warn!(job_id = %job_id, "Job payload panicked; failing the attempt");
+                    SuperviseResult::Outcome(JobRunOutcome::Failed(JobError::retryable(
+                        "job payload panicked",
+                    )))
+                }
+            }
+        }
+        // The heartbeat only returns before the payload when it loses the claim: another
+        // execution has taken over, so abandon this one without writing a terminal state.
+        _ = &mut heartbeat => SuperviseResult::Zombie,
+    }
+}
+
+/// Returns only when `stop` fires (payload finished) or the claim is lost. A lost claim
+/// ends the task, which `supervise` reads as this execution having been superseded.
+async fn heartbeat_loop(
+    storage: StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    progress: ProgressReporter,
+    cancel: CancellationToken,
+    stop: CancellationToken,
+) {
     let mut heartbeat = interval(Duration::from_millis(JOB_HEARTBEAT_MS));
     heartbeat.tick().await;
     let mut flush = interval(Duration::from_millis(JOB_PROGRESS_FLUSH_INTERVAL_MS));
@@ -329,18 +444,18 @@ async fn supervise(
 
     loop {
         tokio::select! {
-            outcome = &mut payload_future => return SuperviseResult::Outcome(outcome),
+            _ = stop.cancelled() => return,
             _ = heartbeat.tick() => {
-                match renew_lease(storage, job_id, token, unix_timestamp_millis(), Some(ctx.progress.snapshot())).await {
-                    Ok(renew) => if renew.cancel_requested { ctx.cancel.cancel(); }
-                    Err(JobMutationError::TokenMismatch) => return SuperviseResult::Zombie,
+                match renew_lease(&storage, job_id, token, unix_timestamp_millis(), Some(progress.snapshot())).await {
+                    Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
+                    Err(JobMutationError::TokenMismatch) => return,
                     Err(error) => warn!(job_id = %job_id, error = %error, "Lease renew failed"),
                 }
             }
             _ = flush.tick() => {
-                match flush_progress(storage, job_id, token, ctx.progress.snapshot(), unix_timestamp_millis()).await {
-                    Ok(renew) => if renew.cancel_requested { ctx.cancel.cancel(); }
-                    Err(JobMutationError::TokenMismatch) => return SuperviseResult::Zombie,
+                match flush_progress(&storage, job_id, token, progress.snapshot(), unix_timestamp_millis()).await {
+                    Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
+                    Err(JobMutationError::TokenMismatch) => return,
                     Err(error) => warn!(job_id = %job_id, error = %error, "Progress flush failed"),
                 }
             }
@@ -382,6 +497,7 @@ mod tests {
                 steps,
                 step_sleep_ms: sleep_ms,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: marker,
             },
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
@@ -617,5 +733,62 @@ mod tests {
             .wait_for_terminal(&storage, job_id, Duration::from_millis(100))
             .await;
         assert_eq!(result, None);
+    }
+
+    // A panicking payload must free its slot, not wedge the runtime forever.
+    #[tokio::test]
+    async fn panic_frees_slot() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::with_capacity(1);
+        let boom = JobId::from_bytes([0xEE; 16]);
+        let mut record = probe_record(boom, 5, 0, None);
+        let JobPayload::Probe { panic_at, .. } = &mut record.payload;
+        *panic_at = Some(0);
+        let claimed = claim(&storage, record).await;
+
+        runtime.spawn(ctx.clone(), claimed);
+        let mut freed = false;
+        for _ in 0..400 {
+            if runtime.available_slots() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(freed, "panic must release the concurrency slot");
+
+        let ok = JobId::from_bytes([0xAB; 16]);
+        let claimed = claim(&storage, probe_record(ok, 2, 0, None)).await;
+        runtime.spawn(ctx.clone(), claimed);
+        let state = runtime
+            .wait_for_terminal(&storage, ok, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            JobState::Succeeded,
+            "runtime still drains after a panic"
+        );
+    }
+
+    // A zombie execution's finish must not evict the newer execution that replaced it.
+    #[tokio::test]
+    async fn zombie_keeps_survivor() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x5A; 16]);
+
+        let zombie = runtime.register_test_execution(job_id);
+        let survivor = runtime.register_test_execution(job_id);
+        assert_ne!(zombie, survivor);
+
+        runtime.finish(&ctx, job_id, zombie).await;
+        assert_eq!(runtime.running_count(), 1, "zombie must not evict survivor");
+        assert!(runtime.request_cancel(job_id), "survivor still registered");
+
+        runtime.finish(&ctx, job_id, survivor).await;
+        assert_eq!(runtime.running_count(), 0);
     }
 }

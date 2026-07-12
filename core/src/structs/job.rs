@@ -111,6 +111,7 @@ pub enum JobPayload {
         steps: u32,
         step_sleep_ms: u64,
         fail_at: Option<u32>,
+        panic_at: Option<u32>,
         cleanup_marker: Option<String>,
     },
 }
@@ -414,6 +415,7 @@ mod tests {
                 steps: 3,
                 step_sleep_ms: 0,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: Some("/tmp/probe-marker".to_string()),
             },
             user(1, 2),
