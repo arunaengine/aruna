@@ -1814,6 +1814,7 @@ mod test {
             capabilities,
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1876,6 +1877,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
