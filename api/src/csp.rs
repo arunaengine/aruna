@@ -40,6 +40,13 @@ impl PortalCspConfig {
     }
 }
 
+/// Origins the served policy allows, resolved per response.
+#[derive(Clone, Debug, Default)]
+struct ResolvedOrigins {
+    connect: BTreeSet<String>,
+    img: BTreeSet<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PortalSecurity {
     state: Arc<ServerState>,
@@ -54,15 +61,24 @@ impl PortalSecurity {
         }
     }
 
-    async fn connect_origins(&self) -> BTreeSet<String> {
-        let mut origins = BTreeSet::new();
-
-        if let Some(s3) = self.state.interface_state().await.s3
-            && let Some(origin) = normalize_origin(&s3.base_url)
-        {
-            origins.insert(origin);
+    async fn resolve(&self) -> ResolvedOrigins {
+        let s3 = self.s3_origin().await;
+        let mut connect = BTreeSet::new();
+        connect.extend(s3.iter().cloned());
+        connect.extend(self.oidc_origins().await);
+        connect.extend(self.config.extra_connect_origins.iter().cloned());
+        ResolvedOrigins {
+            connect,
+            img: s3.into_iter().collect(),
         }
+    }
 
+    async fn s3_origin(&self) -> Option<String> {
+        let s3 = self.state.interface_state().await.s3?;
+        normalize_origin(&s3.base_url)
+    }
+
+    async fn oidc_origins(&self) -> BTreeSet<String> {
         match drive(
             GetRealmConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
@@ -70,18 +86,20 @@ impl PortalSecurity {
         .await
         {
             Ok(config) => {
+                let mut origins = BTreeSet::new();
                 for provider in config.oidc_providers {
                     origins.extend(normalize_origin(&provider.issuer));
                     origins.extend(normalize_origin(&provider.discovery_url));
                 }
+                origins
             }
             // The realm config is unavailable until it syncs; sign-in needs it
             // anyway, so the portal keeps booting with the baseline policy.
-            Err(error) => debug!(error = %error, "Portal CSP omits realm OIDC origins"),
+            Err(error) => {
+                debug!(error = %error, "Portal CSP omits realm OIDC origins");
+                BTreeSet::new()
+            }
         }
-
-        origins.extend(self.config.extra_connect_origins.iter().cloned());
-        origins
     }
 }
 
@@ -90,7 +108,7 @@ pub(crate) async fn portal_security_headers(
     request: Request,
     next: Next,
 ) -> Response {
-    let policy = content_security_policy(&security.connect_origins().await);
+    let policy = content_security_policy(&security.resolve().await);
     let policy = match HeaderValue::from_str(&policy) {
         Ok(policy) => policy,
         Err(error) => {
@@ -120,12 +138,9 @@ pub(crate) async fn portal_security_headers(
 /// `script-src` carries `'wasm-unsafe-eval'` because the portal hashes profile
 /// artifacts with hash-wasm, which compiles a WebAssembly module; it permits no
 /// JavaScript eval. Inline scripts and styles are not allowed.
-fn content_security_policy(connect_origins: &BTreeSet<String>) -> String {
-    let mut connect_src = String::from("connect-src 'self'");
-    for origin in connect_origins {
-        connect_src.push(' ');
-        connect_src.push_str(origin);
-    }
+fn content_security_policy(origins: &ResolvedOrigins) -> String {
+    let connect_src = directive("connect-src 'self'", &origins.connect);
+    let img_src = directive("img-src 'self' data: blob:", &origins.img);
 
     [
         "default-src 'self'",
@@ -136,15 +151,24 @@ fn content_security_policy(connect_origins: &BTreeSet<String>) -> String {
         "form-action 'self'",
         "script-src 'self' 'wasm-unsafe-eval'",
         &format!("style-src 'self' {FONT_STYLE_ORIGIN}"),
-        "img-src 'self' data:",
+        &img_src,
         &format!("font-src 'self' data: {FONT_FILE_ORIGIN}"),
         &connect_src,
     ]
     .join("; ")
 }
 
-/// Origins may broaden `connect-src`, so only https (or http on a loopback
-/// host, for local development) is accepted; anything else is dropped.
+fn directive(base: &str, origins: &BTreeSet<String>) -> String {
+    let mut directive = String::from(base);
+    for origin in origins {
+        directive.push(' ');
+        directive.push_str(origin);
+    }
+    directive
+}
+
+/// Origins may broaden `connect-src`/`img-src`, so only https (or http on a
+/// loopback host, for local development) is accepted; anything else is dropped.
 fn normalize_origin(value: &str) -> Option<String> {
     let url = Url::parse(value.trim()).ok()?;
     if !is_secure_origin(&url) {
@@ -173,8 +197,14 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_security_policy, normalize_origin};
-    use std::collections::BTreeSet;
+    use super::{ResolvedOrigins, content_security_policy, normalize_origin};
+
+    fn origins(connect: &[&str], img: &[&str]) -> ResolvedOrigins {
+        ResolvedOrigins {
+            connect: connect.iter().map(|s| s.to_string()).collect(),
+            img: img.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     #[test]
     fn origins_drop_noise() {
@@ -211,14 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn policy_pins_portal_needs() {
-        let policy = content_security_policy(&BTreeSet::new());
+    fn policy_pins_needs() {
+        let policy = content_security_policy(&ResolvedOrigins::default());
 
         assert!(policy.contains("default-src 'self'"));
         assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval'"));
         assert!(policy.contains("style-src 'self' https://fonts.googleapis.com"));
         assert!(policy.contains("font-src 'self' data: https://fonts.gstatic.com"));
-        assert!(policy.contains("img-src 'self' data:"));
+        assert!(policy.contains("img-src 'self' data: blob:"));
         assert!(policy.contains("connect-src 'self'"));
         assert!(policy.contains("frame-ancestors 'none'"));
         assert!(policy.contains("object-src 'none'"));
@@ -229,14 +259,19 @@ mod tests {
     }
 
     #[test]
-    fn connect_src_lists_origins() {
-        let origins = BTreeSet::from([
-            "https://issuer.test".to_string(),
-            "http://127.0.0.1:9000".to_string(),
-        ]);
-
-        let policy = content_security_policy(&origins);
+    fn connect_src_lists() {
+        let policy = content_security_policy(&origins(
+            &["https://issuer.test", "http://127.0.0.1:9000"],
+            &[],
+        ));
 
         assert!(policy.ends_with("connect-src 'self' http://127.0.0.1:9000 https://issuer.test"));
+    }
+
+    #[test]
+    fn img_src_allows_s3() {
+        let policy = content_security_policy(&origins(&["https://s3.test"], &["https://s3.test"]));
+
+        assert!(policy.contains("img-src 'self' data: blob: https://s3.test"));
     }
 }

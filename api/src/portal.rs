@@ -496,6 +496,13 @@ mod tests {
             "{connect_src}"
         );
         assert!(connect_src.contains("https://peer.test"), "{connect_src}");
+
+        let img_src = policy
+            .split("; ")
+            .find(|directive| directive.starts_with("img-src "))
+            .unwrap();
+        assert!(img_src.contains("blob:"), "{img_src}");
+        assert!(img_src.contains("https://s3.test"), "{img_src}");
     }
 
     #[tokio::test]
