@@ -25,7 +25,7 @@ pub struct JobId(pub Ulid);
 impl JobId {
     #[inline]
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::r#gen())
     }
 
     #[inline]

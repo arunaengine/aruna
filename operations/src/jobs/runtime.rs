@@ -494,7 +494,7 @@ mod tests {
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = probe_record(job_id, 1, 0, None);
         record.state = JobState::Running;
-        let token = Ulid::new();
+        let token = Ulid::r#gen();
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
@@ -532,7 +532,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::new(),
+            claim_token: Ulid::r#gen(),
             lease_expires_at_ms: unix_timestamp_millis() + 60_000,
         });
         insert_job(&storage, &record).await.unwrap();

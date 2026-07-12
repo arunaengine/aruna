@@ -299,7 +299,7 @@ pub async fn claim_job(
         record.state = JobState::Claimed;
         record.claim = Some(JobClaim {
             holder_node_id,
-            claim_token: Ulid::new(),
+            claim_token: Ulid::r#gen(),
             lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
         claimed_now = true;
@@ -892,7 +892,7 @@ mod tests {
         let err = complete_job(
             &storage,
             job_id,
-            Ulid::new(),
+            Ulid::r#gen(),
             JobResultPayload::Probe { completed_steps: 1 },
             JobProgress::new("steps"),
             6_000,
@@ -949,7 +949,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::new(),
+            claim_token: Ulid::r#gen(),
             lease_expires_at_ms: 5_000,
         });
         insert_job(&storage, &record).await.unwrap();
@@ -1007,7 +1007,7 @@ mod tests {
         let mut record = queued_record(job_id);
         record.dedup_key = Some(b"dedup".to_vec());
         record.state = JobState::Running;
-        let token = Ulid::new();
+        let token = Ulid::r#gen();
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
@@ -1084,7 +1084,7 @@ mod tests {
     async fn revived_lease_kept() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([2u8; 16]);
-        insert_job(&storage, &running_record(job_id, Ulid::new(), 10_000))
+        insert_job(&storage, &running_record(job_id, Ulid::r#gen(), 10_000))
             .await
             .unwrap();
 
@@ -1128,7 +1128,7 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let job_a = JobId::from_bytes([1u8; 16]);
         let job_b = JobId::from_bytes([2u8; 16]);
-        let token = Ulid::new();
+        let token = Ulid::r#gen();
         let mut record = running_record(job_a, token, 10_000);
         record.dedup_key = Some(b"k".to_vec());
         insert_job(&storage, &record).await.unwrap();
