@@ -173,7 +173,7 @@ struct StorageMetrics {
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
     in_flight: AtomicU64,
-    channel_closed: AtomicBool,
+    channel_closed: Arc<AtomicBool>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -191,6 +191,14 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct WorkerLifecycleGuard(Arc<AtomicBool>);
+
+impl Drop for WorkerLifecycleGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -481,8 +489,10 @@ impl FjallStorage {
         let (sender, receiver) = StorageHandle::new();
         let store = Store::new(db);
         let read_pool = spawn_read_pool(store.clone(), READ_POOL_THREADS);
+        let channel_closed = sender.metrics.channel_closed.clone();
 
         thread::spawn(move || {
+            let _lifecycle = WorkerLifecycleGuard(channel_closed);
             let mut storage = FjallStorage {
                 store,
                 persist_policy: policy,
@@ -1874,6 +1884,8 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
     use std::{env, process::Command, thread};
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -2010,6 +2022,27 @@ mod tests {
 
         drop(probe);
         assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[test]
+    fn worker_exit_latches() {
+        let dir = tempdir().expect("temp dir");
+        let handle =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let StorageHandle {
+            write_channel,
+            metrics,
+        } = handle;
+
+        assert!(!metrics.channel_closed.load(Ordering::Relaxed));
+        drop(write_channel);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !metrics.channel_closed.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        assert!(metrics.channel_closed.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
