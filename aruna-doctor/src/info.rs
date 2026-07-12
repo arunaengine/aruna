@@ -466,7 +466,8 @@ mod tests {
         );
     }
 
-    /// Without a token the node reports health and version only.
+    /// Without a token the node reports health, version and public interface
+    /// urls, but no node identity or backend topology.
     #[tokio::test]
     async fn live_info() {
         let _guard = env_lock().lock().await;
@@ -475,12 +476,21 @@ mod tests {
         let info = fetch_info(node.http_addr, None).await.unwrap();
 
         assert_eq!(
-            info.status,
+            info.node.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
         assert!(!info.api_version.is_empty());
-        assert!(info.topology.is_none());
-        assert!(info.operations.is_none());
+        assert_eq!(
+            info.services.interfaces.rest.status,
+            aruna_api::routes::info::ServiceStatus::Available
+        );
+        let api_url = format!("http://{}/api/v1", node.http_addr);
+        assert_eq!(
+            info.services.interfaces.rest.url.as_deref(),
+            Some(api_url.as_str())
+        );
+        assert!(info.node.peer_id.is_none());
+        assert!(info.services.network.is_none());
         node.shutdown().await;
     }
 }

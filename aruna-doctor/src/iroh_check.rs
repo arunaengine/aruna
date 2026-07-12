@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use crate::info::{default_info_url_from_env, fetch_info_url_with_timeout, resolve_token};
 use aruna_api::routes::info::{
-    NetworkServiceStatus, NodeOperationsInfo, NodeTopologyInfo, PeerConnectionInfo, ServiceStatus,
+    InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
 };
 use aruna_core::alpn::Alpn;
 use aruna_core::telemetry::duration_ms;
@@ -100,21 +100,21 @@ async fn run_iroh_check(
     let endpoint_info = fetch_info_url_with_timeout(&info_url, timeout, token.as_deref()).await?;
     checks.push(ok_step("info", info_started.elapsed()));
 
-    let topology = endpoint_info.topology.as_ref().ok_or_else(|| {
+    let network = endpoint_info.services.network.as_ref().ok_or_else(|| {
         iroh_check_error(
             "info",
             "node reports no topology: pass a realm token via --token or ARUNA_TOKEN",
         )
     })?;
-    if topology.network.status != ServiceStatus::Available {
+    if network.status != ServiceStatus::Available {
         return Err(iroh_check_error(
             "info",
-            format!("network state is {:?}", topology.network.status),
+            format!("network state is {:?}", network.status),
         ));
     }
 
     let endpoint_started = Instant::now();
-    let endpoint_addr = endpoint_addr_from_info(topology)?;
+    let endpoint_addr = endpoint_addr_from_info(&endpoint_info)?;
     let endpoint_addr = normalize_endpoint_addr(endpoint_addr, &info_url)?;
     checks.push(ok_step("endpoint_addr", endpoint_started.elapsed()));
 
@@ -123,20 +123,27 @@ async fn run_iroh_check(
     Ok(IrohCheckOutput {
         status: "ok",
         info_url,
-        target: target_output(endpoint_info.realm_id.clone(), topology, &endpoint_addr),
-        reported: reported_diagnostics(topology, endpoint_info.operations.as_ref()),
+        target: target_output(&endpoint_info, &endpoint_addr),
+        reported: reported_diagnostics(network, &endpoint_info),
         active,
         checks,
     })
 }
 
-fn endpoint_addr_from_info(topology: &NodeTopologyInfo) -> Result<EndpointAddr, CliError> {
-    let peer_id = topology
+fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr, CliError> {
+    let peer_id = endpoint_info
         .node
         .peer_id
+        .as_deref()
+        .ok_or_else(|| {
+            iroh_check_error(
+                "endpoint_addr",
+                "node reports no peer id: pass a realm token via --token or ARUNA_TOKEN",
+            )
+        })?
         .parse::<iroh::PublicKey>()
         .map_err(|error| iroh_check_error("endpoint_addr", error))?;
-    let addresses = topology
+    let addresses = endpoint_info
         .my_addresses
         .iter()
         .map(|address| transport_addr_from_info(address))
@@ -305,14 +312,10 @@ where
     }
 }
 
-fn target_output(
-    realm_id: String,
-    topology: &NodeTopologyInfo,
-    endpoint_addr: &EndpointAddr,
-) -> IrohCheckTarget {
+fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> IrohCheckTarget {
     IrohCheckTarget {
-        realm_id: Some(realm_id),
-        node_id: Some(topology.node.peer_id.clone()),
+        realm_id: Some(endpoint_info.node.realm_id.clone()),
+        node_id: endpoint_info.node.peer_id.clone(),
         endpoint_addr: serde_json::to_value(endpoint_addr).unwrap_or(serde_json::Value::Null),
         addresses: endpoint_addr
             .addrs
@@ -325,15 +328,13 @@ fn target_output(
 }
 
 fn reported_diagnostics(
-    topology: &NodeTopologyInfo,
-    operations: Option<&NodeOperationsInfo>,
+    network: &NetworkServiceStatus,
+    endpoint_info: &InfoResponse,
 ) -> ReportedNetDiagnostics {
     ReportedNetDiagnostics {
-        network: topology.network.clone(),
-        connections: topology.connections.clone(),
-        warnings: operations
-            .map(|operations| operations.warnings.clone())
-            .unwrap_or_default(),
+        network: network.clone(),
+        connections: endpoint_info.connections.clone(),
+        warnings: endpoint_info.warnings.clone(),
     }
 }
 
@@ -410,14 +411,14 @@ fn iroh_check_error(step: &'static str, message: impl std::fmt::Display) -> CliE
 mod tests {
     use super::*;
     use aruna_api::routes::info::{
-        InterfaceServicesStatus, InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind,
-        NodeStatus,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };
+    use aruna_core::structs::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
 
-    fn test_topology(endpoint_addr: Option<EndpointAddr>) -> NodeTopologyInfo {
+    fn test_info_response(endpoint_addr: Option<EndpointAddr>) -> InfoResponse {
         let node_id = endpoint_addr
             .as_ref()
             .map(|addr| addr.id)
@@ -427,32 +428,42 @@ mod tests {
             .map(|addr| addr.addrs.iter().map(transport_addr_to_string).collect())
             .unwrap_or_default();
 
-        NodeTopologyInfo {
+        InfoResponse {
             node: NodeStatus {
-                peer_id: node_id.to_string(),
-                capabilities: NodeCapabilityKind::Management,
+                status: ServiceStatus::Available,
+                realm_id: RealmId::from_bytes([1u8; 32]).to_string(),
+                peer_id: Some(node_id.to_string()),
+                capabilities: Some(NodeCapabilityKind::Management),
             },
+            api_version: "test".to_string(),
+            portal: None,
             my_addresses,
             connections: Vec::new(),
-            network: NetworkServiceStatus {
-                status: ServiceStatus::Available,
-                discovery: Vec::new(),
-                relay: Some("none".to_string()),
-                relay_urls: Vec::new(),
-                routing_table_size: None,
-            },
-            interfaces: InterfaceServicesStatus {
-                rest: InterfaceStatus {
+            services: ServicesStatus {
+                network: Some(NetworkServiceStatus {
                     status: ServiceStatus::Available,
-                    bind: None,
-                    url: None,
-                },
-                s3: InterfaceStatus {
-                    status: ServiceStatus::Unavailable,
-                    bind: None,
-                    url: None,
+                    discovery: Vec::new(),
+                    relay: Some("none".to_string()),
+                    relay_urls: Vec::new(),
+                    routing_table_size: None,
+                    requests: None,
+                }),
+                blob: None,
+                database: None,
+                interfaces: InterfaceServicesStatus {
+                    rest: InterfaceStatus {
+                        status: ServiceStatus::Available,
+                        bind: None,
+                        url: None,
+                    },
+                    s3: InterfaceStatus {
+                        status: ServiceStatus::Unavailable,
+                        bind: None,
+                        url: None,
+                    },
                 },
             },
+            warnings: Vec::new(),
         }
     }
 
@@ -476,7 +487,7 @@ mod tests {
 
     #[test]
     fn endpoint_addr_from_info_requires_endpoint_addr() {
-        let error = endpoint_addr_from_info(&test_topology(None)).unwrap_err();
+        let error = endpoint_addr_from_info(&test_info_response(None)).unwrap_err();
 
         assert!(matches!(
             error,
@@ -556,7 +567,7 @@ mod tests {
     async fn run_iroh_check_builds_output_from_info() {
         let (target, _dir) = test_net_handle().await;
         let output_endpoint =
-            endpoint_addr_from_info(&test_topology(Some(target.endpoint_addr()))).unwrap();
+            endpoint_addr_from_info(&test_info_response(Some(target.endpoint_addr()))).unwrap();
         let mut checks = Vec::new();
 
         let active = active_iroh_check(output_endpoint, Duration::from_secs(5), &mut checks)
