@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
     RealmId,
@@ -18,6 +20,7 @@ use crate::create_metadata_document::{
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
+use crate::document_sync_outbox::{schedule_outbox_drain_effect, write_outbox_effect};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
@@ -91,10 +94,12 @@ pub async fn resolve_write_route(
     write_route(config.as_ref(), placement, net_handle.node_id())
 }
 
-/// Creates locally when the origin holds a bucket of the governing strategy,
-/// and forwards to a holder when it holds none (a User-kind node, or one
-/// filtered out by affinity/`weight = 0`/`full`/`draining`). The receiving
-/// holder chooses the bucket from the buckets *it* holds.
+/// Creates locally when the origin holds a bucket of the governing strategy, and
+/// forwards to a holder when it holds none (a User-kind node, or one filtered out
+/// by affinity/`weight = 0`/`full`/`draining`). A forwarded create is offered to
+/// the holders of the document's blind-hashed bucket, each of which stamps that
+/// same bucket, so retrying the next holder after a lost response cannot fork the
+/// document onto a second topic.
 pub async fn create_metadata_document_routed(
     operation: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
@@ -211,13 +216,27 @@ pub async fn delete_metadata_document_routed(
 ///
 /// The forwarded bearer token is re-validated and the same permission checks the
 /// origin's HTTP handler runs are re-run here: forwarding is a routing hop, not
-/// an internal trust bypass. The forwarding peer must additionally be a
-/// sync-eligible node of this realm, as on every other inbound path.
+/// an internal trust bypass.
+///
+/// The peer gate is realm membership (`authorize_remote_peer` confirms the peer
+/// is a configured node of the token's realm), deliberately *not*
+/// sync-eligibility. User-kind nodes are never sync-eligible and therefore hold
+/// no bucket at all, which makes them precisely the nodes that must forward every
+/// write; gating the forward on sync-eligibility would reject exactly the case it
+/// exists to serve. This grants nothing: a forward can do nothing the peer could
+/// not do by calling this node's HTTP API directly, under the same token and the
+/// same permission check. Sync-eligibility keeps guarding who may *hold* and sync
+/// documents — that is a separate question from who may ask a holder to write.
 pub(crate) async fn apply_forwarded_write(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
+    // A relayed outbox record carries an already-authorized change rather than a
+    // caller request, so it gates on realm membership and holdership alone.
+    if let MetadataTransportMessage::ForwardOutboxRecord { record } = message {
+        return apply_forwarded_outbox_record(context, peer, *record).await;
+    }
     let Some(net_handle) = context.net_handle.as_ref() else {
         return reject("forwarded metadata write needs a net handle");
     };
@@ -225,15 +244,6 @@ pub(crate) async fn apply_forwarded_write(
     let Some(config) = load_realm_config(context, realm_id).await else {
         return reject(format!("realm `{realm_id}` config unavailable"));
     };
-    match config.sync_eligible_node_ids() {
-        Ok(eligible) if eligible.contains(&peer) => {}
-        Ok(_) => {
-            return reject(format!(
-                "metadata peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
-            ));
-        }
-        Err(error) => return reject(error.to_string()),
-    }
 
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
         Ok(auth) => auth,
@@ -256,22 +266,49 @@ pub(crate) async fn apply_forwarded_write(
             if let Err(error) = authorize_write(context, auth.clone(), path).await {
                 return reject(error);
             }
-            let operation = CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-                actor: Actor {
-                    node_id: net_handle.node_id(),
-                    user_id: auth.user_id,
-                    realm_id,
-                },
-                group_id,
-                document_id,
-                document_path,
-                public,
-                payload,
-            });
+            // Idempotent on the document's identity, never on its bucket: a
+            // forward whose response was lost is retried, possibly against a
+            // different holder, and a second create under the same document id
+            // would fork one document into two. Replay the record instead.
+            match existing_record(context, document_id).await {
+                Ok(Some(record)) => {
+                    return MetadataTransportMessage::ForwardedRecord {
+                        record: Box::new(record),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return reject(error),
+            }
+            let operation =
+                CreateMetadataDocumentOperation::new_forwarded(CreateMetadataDocumentConfig {
+                    actor: Actor {
+                        node_id: net_handle.node_id(),
+                        user_id: auth.user_id,
+                        realm_id,
+                    },
+                    group_id,
+                    document_id,
+                    document_path,
+                    public,
+                    payload,
+                });
             match create_metadata_document(operation, context.clone()).await {
                 Ok(created) => MetadataTransportMessage::ForwardedRecord {
                     record: Box::new(created.record),
                 },
+                // Lost the race against a concurrent delivery of the same
+                // forward: the winner's record is the answer, not an error.
+                Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
+                    match existing_record(context, document_id).await {
+                        Ok(Some(record)) => MetadataTransportMessage::ForwardedRecord {
+                            record: Box::new(record),
+                        },
+                        Ok(None) => reject(format!(
+                            "forwarded metadata create for `{document_id}` raced a delete"
+                        )),
+                        Err(error) => reject(error),
+                    }
+                }
                 Err(error) => reject(format!("forwarded metadata create failed: {error}")),
             }
         }
@@ -341,6 +378,107 @@ pub(crate) async fn apply_forwarded_write(
     }
 }
 
+/// Relays a queued sync publish this node can never make to a holder of its
+/// bucket, which publishes it instead.
+///
+/// A record reaches here only when the local node holds none of the record's
+/// bucket: it may neither mint that bucket's topic genesis nor join the topic, so
+/// no amount of retrying would ever drain it. Deleting it would be silent data
+/// loss — the caller already has its 200 — and there is no replay source for an
+/// admin-operation outbox record. The two ways in are a User-kind node (never
+/// sync-eligible, so it holds no bucket at all) and a rebalance race, where the
+/// node held the bucket when it accepted the write and lost it before the topic
+/// arrived.
+pub(crate) async fn forward_outbox_record(
+    context: &Arc<DriverContext>,
+    record: &DocumentSyncOutboxRecord,
+) -> Result<(), MetadataWriteError> {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return Err(MetadataWriteError::Undeliverable(
+            "no net handle to forward an outbox record with".to_string(),
+        ));
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return Err(MetadataWriteError::Undeliverable(format!(
+            "realm `{realm_id}` config unavailable"
+        )));
+    };
+    let holders = resolve_shard_holders(&config, &record.placement);
+    forward_to_holders(
+        context,
+        &holders,
+        MetadataTransportMessage::ForwardOutboxRecord {
+            record: Box::new(record.clone()),
+        },
+    )
+    .await
+    .and_then(|response| match response {
+        MetadataTransportMessage::ForwardedOutboxRecord => Ok(()),
+        other => Err(unexpected_response(other)),
+    })
+}
+
+/// Publishes a relayed outbox record on the emitter's behalf.
+///
+/// The peer is a configured node of this realm and the record's bucket is one
+/// this node holds, so the record is queued into the local outbox verbatim and
+/// drains onto the bucket's topic like any locally-emitted record. Verbatim
+/// matters for admin operations: they are ordered by `(origin_node_id,
+/// origin_seq)` on every receiver, so re-stamping the relay as the origin would
+/// break that ordering and drop the emitter's earlier operations as stale.
+async fn apply_forwarded_outbox_record(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    record: DocumentSyncOutboxRecord,
+) -> MetadataTransportMessage {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return reject("relayed outbox record needs a net handle");
+    };
+    let realm_id = *net_handle.realm_id();
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return reject(format!("realm `{realm_id}` config unavailable"));
+    };
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return reject("relayed outbox record needs a metadata handle");
+    };
+    match metadata_handle.authorize_remote_peer(peer, None).await {
+        Ok(_) => {}
+        Err(error) => return reject(error.to_string()),
+    }
+    if !holds_placement(&config, &record.placement, net_handle.node_id()) {
+        return reject(format!(
+            "node holds none of bucket {}/{} of the relayed outbox record",
+            record.placement.strategy_id, record.placement.shard
+        ));
+    }
+
+    let effect = match write_outbox_effect(&record) {
+        Ok(effect) => effect,
+        Err(error) => return reject(format!("relayed outbox record is malformed: {error}")),
+    };
+    match context.storage_handle.send_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return reject(format!("relayed outbox record write failed: {other:?}")),
+    }
+    if let Some(task_handle) = context.task_handle.as_ref() {
+        task_handle
+            .send_effect(schedule_outbox_drain_effect())
+            .await;
+    }
+    MetadataTransportMessage::ForwardedOutboxRecord
+}
+
+/// The document's registry record, whatever this node's holdership of it.
+async fn existing_record(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, String> {
+    load_metadata_record_by_document(context.as_ref(), document_id)
+        .await
+        .map_err(|error| format!("metadata registry read failed: {error:?}"))
+}
+
 /// The document as this node holds it. A forward is never chained: a node that
 /// is not a holder rejects, so the origin tries the next holder in rank order.
 async fn held_record(
@@ -349,11 +487,9 @@ async fn held_record(
     local_node_id: NodeId,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, String> {
-    let record = match load_metadata_record_by_document(context.as_ref(), document_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return Err(format!("metadata document `{document_id}` not found")),
-        Err(error) => return Err(format!("metadata registry read failed: {error:?}")),
-    };
+    let record = existing_record(context, document_id)
+        .await?
+        .ok_or_else(|| format!("metadata document `{document_id}` not found"))?;
     match write_route(Some(config), &record.placement, local_node_id) {
         MetadataWriteRoute::Local => Ok(record),
         MetadataWriteRoute::Forward(_) => Err(format!(
@@ -415,9 +551,10 @@ async fn authorize_write(
     }
 }
 
-/// Holders of the document's hashed bucket, used only to pick where to forward a
-/// create the origin cannot place. The receiving holder re-chooses the bucket
-/// from its own held set, so this never becomes the stored placement.
+/// Holders of the document's blind-hashed bucket: the candidates for a create the
+/// origin cannot place. Every candidate holds that one bucket, and a forwarded
+/// create stamps exactly it (see `CreateMetadataDocumentOperation::new_forwarded`),
+/// so which candidate answers cannot change where the document lands.
 async fn create_forward_holders(
     context: &Arc<DriverContext>,
     config: &CreateMetadataDocumentConfig,
@@ -566,7 +703,11 @@ mod tests {
     #[test]
     fn user_node_writes_forward() {
         // A User-kind node is never sync-eligible, so it holds no bucket at all:
-        // locality is unattainable for it and every write must be forwarded.
+        // locality is unattainable for it and every write must be forwarded. The
+        // receiving half — a holder accepting that forward from a User peer, and
+        // applying it under the caller's token — is
+        // `metadata_forwarding::user_node_forwards_create`, which needs a real
+        // node and a real token and so cannot live here.
         let (mut config, placement) = config_and_placement();
         config.ensure_node(node(9), RealmNodeKind::User);
 

@@ -336,32 +336,48 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Drops records that can never publish from this node, loudly. Leaving them
-    /// in the outbox would retry them forever against a topic this node may not
-    /// join: a deferred record that can never drain is silent data loss, so the
-    /// operator is told instead.
-    async fn drop_undeliverable_records(&self, undeliverable: Vec<DrainRecord>) -> usize {
-        if undeliverable.is_empty() {
-            return 0;
-        }
+    /// Relays records this node can never publish to a holder of their bucket.
+    ///
+    /// This node holds none of the record's bucket, so it may neither mint that
+    /// bucket's topic genesis nor join the topic: retrying locally would never
+    /// drain it. Deleting it would be silent data loss instead — the caller
+    /// already holds a 200, and an admin-operation outbox record has no replay
+    /// source — so the record goes to a holder, which publishes it. Only a
+    /// successfully relayed record is deleted; one that cannot be relayed (no
+    /// reachable holder) is left in the outbox to be retried on the next drain,
+    /// loudly, rather than thrown away because a peer was briefly down.
+    async fn forward_undeliverable_records(&self, undeliverable: Vec<DrainRecord>) -> usize {
         let mut keys = Vec::with_capacity(undeliverable.len());
         for (record_key, record, topic) in undeliverable {
-            error!(
-                event = "pipeline.drain.undeliverable",
-                target = ?record.target,
-                %topic,
-                strategy = %record.placement.strategy_id,
-                shard = record.placement.shard,
-                age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
-                "Dropping undeliverable document sync outbox record: this node holds none of its bucket, so it can neither mint nor join the shard topic"
-            );
-            keys.push(record_key);
+            match crate::metadata::forward::forward_outbox_record(&self.context, &record).await {
+                Ok(()) => {
+                    debug!(
+                        event = "pipeline.drain.forwarded",
+                        target = ?record.target,
+                        %topic,
+                        "Relayed an unpublishable document sync outbox record to a bucket holder"
+                    );
+                    keys.push(record_key);
+                }
+                Err(error) => error!(
+                    event = "pipeline.drain.undeliverable",
+                    target = ?record.target,
+                    %topic,
+                    strategy = %record.placement.strategy_id,
+                    shard = record.placement.shard,
+                    age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
+                    error = %error,
+                    "Cannot publish a document sync outbox record from this node and no holder accepted the relay; retrying"
+                ),
+            }
         }
-        let dropped = keys.len();
-        if let Err(error) = delete_outbox_records(&self.context.storage_handle, keys).await {
-            error!(error = %error, "Failed to delete undeliverable document sync outbox records");
+        let forwarded = keys.len();
+        if !keys.is_empty()
+            && let Err(error) = delete_outbox_records(&self.context.storage_handle, keys).await
+        {
+            error!(error = %error, "Failed to delete relayed document sync outbox records");
         }
-        dropped
+        forwarded
     }
 
     /// Backoff interval for the next re-arm of `key`, derived from the in-memory
@@ -468,7 +484,7 @@ impl OperationsTaskHandler {
         let mut publish_elapsed = Duration::ZERO;
         let mut record_count = 0usize;
         let mut deferred_total = 0usize;
-        let mut undeliverable_total = 0usize;
+        let mut forwarded_total = 0usize;
         let mut group_count = 0usize;
         let mut subbatch_count = 0usize;
         let mut pages = 0usize;
@@ -597,7 +613,7 @@ impl OperationsTaskHandler {
             );
             deferred_total += deferred.len();
             report_stuck_records(&deferred);
-            undeliverable_total += self.drop_undeliverable_records(undeliverable).await;
+            forwarded_total += self.forward_undeliverable_records(undeliverable).await;
 
             let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
                 BTreeMap::new();
@@ -740,7 +756,7 @@ impl OperationsTaskHandler {
             event = "pipeline.drain.summary",
             records = record_count,
             deferred = deferred_total,
-            undeliverable = undeliverable_total,
+            forwarded = forwarded_total,
             groups = group_count,
             subbatches = subbatch_count,
             pages,
