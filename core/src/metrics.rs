@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -153,6 +154,15 @@ impl NodeMetrics {
 
     pub async fn register_source(&self, source: Arc<dyn MetricsSource>) {
         self.sources.write().await.push(source);
+    }
+
+    /// Register a scrape-time [`Collector`] that emits its metrics synchronously
+    /// on each encode (used for const counters read from a live snapshot).
+    pub async fn register_collector(&self, collector: impl Collector) {
+        self.registry
+            .write()
+            .await
+            .register_collector(Box::new(collector));
     }
 
     /// Refresh every scrape-time source, then encode the registry as text.
