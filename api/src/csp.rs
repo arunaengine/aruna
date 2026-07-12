@@ -8,7 +8,7 @@ use axum::response::Response;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::debug;
-use url::Url;
+use url::{Host, Url};
 
 /// The portal loads its webfont stylesheet from Google Fonts and the font files
 /// from the matching static origin.
@@ -138,12 +138,32 @@ fn content_security_policy(connect_origins: &BTreeSet<String>) -> String {
     .join("; ")
 }
 
+/// Origins may broaden `connect-src`, so only https (or http on a loopback
+/// host, for local development) is accepted; anything else is dropped.
 fn normalize_origin(value: &str) -> Option<String> {
-    let origin = Url::parse(value.trim())
-        .ok()?
-        .origin()
-        .ascii_serialization();
+    let url = Url::parse(value.trim()).ok()?;
+    if !is_secure_origin(&url) {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
     (origin != "null").then_some(origin)
+}
+
+fn is_secure_origin(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(url.host()),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -152,7 +172,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn origins_drop_path_and_scheme_noise() {
+    fn origins_drop_noise() {
         assert_eq!(
             normalize_origin("https://issuer.test/realms/aruna/.well-known"),
             Some("https://issuer.test".to_string())
@@ -163,6 +183,26 @@ mod tests {
         );
         assert_eq!(normalize_origin("not-a-url"), None);
         assert_eq!(normalize_origin("data:text/html,x"), None);
+    }
+
+    #[test]
+    fn rejects_insecure_origins() {
+        // Only https, or http on a loopback host, may broaden the policy.
+        assert_eq!(normalize_origin("http://issuer.test"), None);
+        assert_eq!(normalize_origin("ws://issuer.test"), None);
+        assert_eq!(normalize_origin("ftp://issuer.test"), None);
+        assert_eq!(
+            normalize_origin("https://issuer.test"),
+            Some("https://issuer.test".to_string())
+        );
+        assert_eq!(
+            normalize_origin("http://localhost:8080"),
+            Some("http://localhost:8080".to_string())
+        );
+        assert_eq!(
+            normalize_origin("http://[::1]:9000"),
+            Some("http://[::1]:9000".to_string())
+        );
     }
 
     #[test]
