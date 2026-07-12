@@ -1,3 +1,4 @@
+use crate::auth::require_realm_auth;
 use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
@@ -62,21 +63,43 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/info/usage", get(get_usage))
 }
 
+/// Node information. `status`, `api_version` and `realm_id` are public: they are
+/// what a client needs to health check the node and to learn which realm it must
+/// authenticate against. Everything else is gated: `topology` needs a token of
+/// this realm, `operations` needs a realm config admin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
-    pub node: NodeStatus,
+    pub status: ServiceStatus,
     pub api_version: String,
-    pub portal: PortalStatus,
+    pub realm_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<NodeTopologyInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations: Option<NodeOperationsInfo>,
+}
+
+/// Node identity, addresses and peer topology. Realm-authenticated callers only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct NodeTopologyInfo {
+    pub node: NodeStatus,
     pub my_addresses: Vec<String>,
     pub connections: Vec<PeerConnectionInfo>,
-    pub services: ServicesStatus,
+    pub network: NetworkServiceStatus,
+    pub interfaces: InterfaceServicesStatus,
+}
+
+/// Backend detail, request metrics and errors. Realm config admins only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct NodeOperationsInfo {
+    pub portal: PortalStatus,
+    pub network_requests: RequestSummary,
+    pub blob: BlobServiceStatus,
+    pub database: DatabaseServiceStatus,
     pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NodeStatus {
-    pub status: ServiceStatus,
-    pub realm_id: String,
     pub peer_id: String,
     pub capabilities: NodeCapabilityKind,
 }
@@ -122,6 +145,7 @@ pub struct PeerConnectionInfo {
     pub peer_id: String,
     pub status: PeerStatus,
     pub active_addresses: Vec<ConnectionAddressInfo>,
+    /// Populated for realm config admins only.
     pub last_error: Option<String>,
     pub next_retry_secs: Option<u64>,
 }
@@ -164,22 +188,13 @@ pub enum ProtocolConnectionStatus {
     Open,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ServicesStatus {
-    pub network: NetworkServiceStatus,
-    pub blob: BlobServiceStatus,
-    pub database: DatabaseServiceStatus,
-    pub interfaces: InterfaceServicesStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NetworkServiceStatus {
     pub status: ServiceStatus,
     pub discovery: Vec<String>,
     pub relay: Option<String>,
     pub relay_urls: Vec<String>,
     pub routing_table_size: Option<usize>,
-    pub requests: RequestSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -220,21 +235,32 @@ pub struct InterfaceServicesStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InterfaceStatus {
     pub status: ServiceStatus,
+    /// Local listen address. Realm-authenticated callers only.
     pub bind: Option<String>,
     pub url: Option<String>,
 }
 
+/// Realm information. `realm_id`, `description`, `oidc_providers` and the public
+/// interface urls are what a client needs to reach the realm and obtain a token,
+/// so they stay public. Realm topology, discovery and quota policy live in
+/// `detail`, which needs a token of this realm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RealmInfoResponse {
     pub realm_id: String,
     pub description: String,
-    pub metadata_replication: RealmMetadataReplicationResponse,
     pub oidc_providers: Vec<RealmOidcProviderResponse>,
+    pub interfaces: InterfaceServicesStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<RealmDetailResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RealmDetailResponse {
+    pub metadata_replication: RealmMetadataReplicationResponse,
     #[schema(value_type = Object)]
     pub discovery: Value,
     pub nodes: Vec<RealmNodeInfoResponse>,
     pub quota: RealmQuotaConfig,
-    pub interfaces: InterfaceServicesStatus,
 }
 
 /// Realm-wide quota policy. Used both as the response for the current settings
@@ -246,7 +272,6 @@ pub struct RealmQuotaConfig {
     pub warn_threshold_percent: u32,
     pub group_overrides: Vec<RealmGroupQuotaOverride>,
     pub max_groups_per_user: Option<u32>,
-    /// Redacted from unauthenticated `/info/realm` responses.
     pub user_group_cap_overrides: Vec<RealmUserGroupCapOverride>,
     pub max_devices_per_user: Option<u32>,
 }
@@ -760,7 +785,7 @@ impl From<&RealmNodeKind> for RealmNodeKindInfo {
     path = "/info/realm",
     tag = "info",
     responses(
-        (status = 200, description = "Realm information", body = RealmInfoResponse),
+        (status = 200, description = "Realm information; `detail` only for realm-authenticated callers", body = RealmInfoResponse),
         (status = 404, description = "Realm config not found", body = crate::error::ErrorResponse)
     ),
     security((), ("bearer_auth" = []))
@@ -780,18 +805,46 @@ pub async fn get_realm_info(
         }
         other => ServerError::InternalError(other.to_string()),
     })?;
-    let present_nodes = load_realm_presence_best_effort(&state).await;
-    let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
-    let response = map_realm_info_response(
-        &state,
-        config,
-        present_nodes,
-        interface_services_status(&state).await,
-        node_info_docs,
-        auth.as_ref()
-            .is_some_and(|auth| auth.realm_id == state.get_realm_id()),
-    )?;
-    Ok((StatusCode::OK, Json(response)))
+    let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
+
+    let mut interfaces = interface_services_status(&state).await;
+    if !realm_authenticated {
+        interfaces.rest.bind = None;
+        interfaces.s3.bind = None;
+    }
+
+    let detail = if realm_authenticated {
+        let present_nodes = load_realm_presence_best_effort(&state).await;
+        let node_info_docs = load_node_info_documents_best_effort(&state, &config).await;
+        Some(map_realm_detail(
+            &state,
+            &config,
+            present_nodes,
+            node_info_docs,
+        )?)
+    } else {
+        None
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(RealmInfoResponse {
+            realm_id: config.realm_id.to_string(),
+            description: config.description,
+            oidc_providers: config
+                .oidc_providers
+                .into_iter()
+                .map(|provider| RealmOidcProviderResponse {
+                    id: provider.id,
+                    issuer: provider.issuer,
+                    audience: provider.audience,
+                    discovery_url: provider.discovery_url,
+                })
+                .collect(),
+            interfaces,
+            detail,
+        }),
+    ))
 }
 
 async fn load_node_info_documents_best_effort(
@@ -831,17 +884,9 @@ fn map_node_info_document(
     }
 }
 
-async fn authorize_realm_config_admin(
-    state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
-) -> ServerResult<AuthContext> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+async fn is_realm_config_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id || !state.is_management_node() {
-        return Err(ServerError::Forbidden);
-    }
-
-    let allowed = drive(
+    drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth.clone(),
             path: format!("/{realm_id}/admin/config"),
@@ -850,12 +895,48 @@ async fn authorize_realm_config_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    if !allowed {
+    .map_err(|err| ServerError::InternalError(err.to_string()))
+}
+
+async fn authorize_realm_config_admin(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() || !state.is_management_node() {
+        return Err(ServerError::Forbidden);
+    }
+    if !is_realm_config_admin(state, &auth).await? {
         return Err(ServerError::Forbidden);
     }
 
     Ok(auth)
+}
+
+/// How much of `/info` a caller may see. Foreign-realm tokens are treated like
+/// anonymous callers: `/info` answers every caller, it just answers with less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfoAccess {
+    Public,
+    Realm,
+    Admin,
+}
+
+async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAccess {
+    let Some(auth) = auth else {
+        return InfoAccess::Public;
+    };
+    if auth.realm_id != state.get_realm_id() {
+        return InfoAccess::Public;
+    }
+    match is_realm_config_admin(state, auth).await {
+        Ok(true) => InfoAccess::Admin,
+        Ok(false) => InfoAccess::Realm,
+        Err(error) => {
+            warn!(error = %error, "realm admin check failed for info response");
+            InfoAccess::Realm
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1000,10 +1081,8 @@ fn map_set_realm_quota_error(error: SetRealmQuotaError) -> ServerError {
     }
 }
 
-/// Storage usage. The flat fields report this node's local counters (kept for
-/// backward compatibility) and are always present. `realm` reports the
-/// realm-wide total summed across every node and is only included for
-/// authenticated callers, so unauthenticated requests never disclose it.
+/// Storage usage. The flat fields report this node's local counters, `realm` the
+/// realm-wide total summed across every node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UsageResponse {
     pub buckets: u64,
@@ -1011,8 +1090,7 @@ pub struct UsageResponse {
     pub stored_blobs: u64,
     pub stored_bytes: u64,
     pub logical_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub realm: Option<UsageTotals>,
+    pub realm: UsageTotals,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<GroupQuotaStatus>,
 }
@@ -1081,17 +1159,13 @@ impl From<UsageCounters> for UsageTotals {
 
 impl UsageResponse {
     pub fn new(local: UsageCounters, realm: UsageCounters) -> Self {
-        Self::with_realm(local, Some(realm.into()))
-    }
-
-    pub fn with_realm(local: UsageCounters, realm: Option<UsageTotals>) -> Self {
         Self {
             buckets: local.buckets,
             objects: local.objects,
             stored_blobs: local.stored_blobs,
             stored_bytes: local.stored_bytes,
             logical_bytes: local.logical_bytes,
-            realm,
+            realm: realm.into(),
             quota: None,
         }
     }
@@ -1117,41 +1191,28 @@ pub async fn load_realm_usage(
     path = "/info/usage",
     tag = "info",
     responses(
-        (
-            status = 200,
-            description = "Local storage usage always; realm-wide totals only for authenticated callers",
-            body = UsageResponse
-        )
+        (status = 200, description = "Local and realm-wide storage usage", body = UsageResponse),
+        (status = 401, description = "Authentication required", body = crate::error::ErrorResponse),
+        (status = 403, description = "Caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
-    security((), ("bearer_auth" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
+    require_realm_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
-    let realm = match auth {
-        Some(_) => Some(
-            load_realm_usage(&state, RealmUsageScope::Global)
-                .await?
-                .into(),
-        ),
-        None => None,
-    };
-    Ok((
-        StatusCode::OK,
-        Json(UsageResponse::with_realm(local, realm)),
-    ))
+    let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
+    Ok((StatusCode::OK, Json(UsageResponse::new(local, realm))))
 }
 
-fn map_realm_info_response(
+fn map_realm_detail(
     state: &ServerState,
-    config: RealmConfigDocument,
+    config: &RealmConfigDocument,
     present_nodes: HashSet<aruna_core::NodeId>,
-    interfaces: InterfaceServicesStatus,
     node_info_docs: BTreeMap<aruna_core::NodeId, aruna_core::structs::NodeInfoDocument>,
-    include_user_quota_overrides: bool,
-) -> ServerResult<RealmInfoResponse> {
+) -> ServerResult<RealmDetailResponse> {
     let discovery = serde_json::to_value(&config.discovery)
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let current_node = state.get_node_id();
@@ -1190,32 +1251,13 @@ fn map_realm_info_response(
         })
         .collect();
 
-    let default_replication_factor = config.effective_default_metadata_replication_factor();
-    let mut quota = RealmQuotaConfig::from(config.quota);
-    if !include_user_quota_overrides {
-        quota.user_group_cap_overrides.clear();
-    }
-
-    Ok(RealmInfoResponse {
-        realm_id: config.realm_id.to_string(),
-        description: config.description,
+    Ok(RealmDetailResponse {
         metadata_replication: RealmMetadataReplicationResponse {
-            default_replication_factor,
+            default_replication_factor: config.effective_default_metadata_replication_factor(),
         },
-        oidc_providers: config
-            .oidc_providers
-            .into_iter()
-            .map(|provider| RealmOidcProviderResponse {
-                id: provider.id,
-                issuer: provider.issuer,
-                audience: provider.audience,
-                discovery_url: provider.discovery_url,
-            })
-            .collect(),
         discovery,
         nodes,
-        quota,
-        interfaces,
+        quota: RealmQuotaConfig::from(config.quota.clone()),
     })
 }
 
@@ -1272,123 +1314,141 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
     path = "/info",
     tag = "info",
     responses(
-        (status = 200, description = "Node information", body = InfoResponse)
-    )
+        (
+            status = 200,
+            description = "Node health and version; `topology` for realm-authenticated callers, `operations` for realm admins",
+            body = InfoResponse
+        )
+    ),
+    security((), ("bearer_auth" = []))
 )]
-pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<InfoResponse>) {
+pub async fn get_info(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> (StatusCode, Json<InfoResponse>) {
+    let mut response = InfoResponse {
+        status: ServiceStatus::Available,
+        api_version: env!("CARGO_PKG_VERSION").to_string(),
+        realm_id: state.get_realm_id().to_string(),
+        topology: None,
+        operations: None,
+    };
+
+    let access = info_access(&state, auth.as_ref()).await;
+    if access == InfoAccess::Public {
+        return (StatusCode::OK, Json(response));
+    }
+    let admin = access == InfoAccess::Admin;
+
     let ctx = state.get_ctx();
     let observability = load_node_observability_status(ctx.as_ref()).await;
 
-    let (network, my_addresses, connections, warnings) = match observability.network {
-        Some(info) => (
-            NetworkServiceStatus {
-                status: ServiceStatus::Available,
-                discovery: info.discovery_methods,
-                relay: Some(info.relay_method),
-                relay_urls: info.relay_urls,
-                routing_table_size: info.routing_table_size,
-                requests: RequestSummary::from_state(&info.requests),
-            },
-            info.endpoint_addr
-                .addrs
-                .iter()
-                .map(transport_addr_to_string)
-                .collect(),
-            info.connections
-                .iter()
-                .map(|peer| PeerConnectionInfo {
-                    peer_id: peer.node_id.to_string(),
-                    status: PeerStatus::from(peer.status),
-                    active_addresses: peer
-                        .active_addresses
-                        .iter()
-                        .map(|address| ConnectionAddressInfo {
-                            status: AddressStatus::from(address.status),
-                            address: address.address.clone(),
-                            rtt_ms: address.rtt_ms,
-                            protocol_connections: address
-                                .protocol_connections
-                                .iter()
-                                .map(|connection| ProtocolConnectionInfo {
-                                    connection_id: connection.connection_id,
-                                    protocol: protocol_name(connection.alpn),
-                                    side: side_name(connection.side),
-                                    status: ProtocolConnectionStatus::Open,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                    last_error: peer.last_error.clone(),
-                    next_retry_secs: peer.next_retry_in_secs,
-                })
-                .collect(),
-            info.warnings,
-        ),
-        None => (
-            NetworkServiceStatus {
-                status: ServiceStatus::Unavailable,
-                discovery: Vec::new(),
-                relay: None,
-                relay_urls: Vec::new(),
-                routing_table_size: None,
-                requests: RequestSummary::default(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
+    let (network, my_addresses, connections, network_requests, warnings) =
+        match observability.network {
+            Some(info) => (
+                NetworkServiceStatus {
+                    status: ServiceStatus::Available,
+                    discovery: info.discovery_methods,
+                    relay: Some(info.relay_method),
+                    relay_urls: info.relay_urls,
+                    routing_table_size: info.routing_table_size,
+                },
+                info.endpoint_addr
+                    .addrs
+                    .iter()
+                    .map(transport_addr_to_string)
+                    .collect(),
+                info.connections
+                    .iter()
+                    .map(|peer| PeerConnectionInfo {
+                        peer_id: peer.node_id.to_string(),
+                        status: PeerStatus::from(peer.status),
+                        active_addresses: peer
+                            .active_addresses
+                            .iter()
+                            .map(|address| ConnectionAddressInfo {
+                                status: AddressStatus::from(address.status),
+                                address: address.address.clone(),
+                                rtt_ms: address.rtt_ms,
+                                protocol_connections: address
+                                    .protocol_connections
+                                    .iter()
+                                    .map(|connection| ProtocolConnectionInfo {
+                                        connection_id: connection.connection_id,
+                                        protocol: protocol_name(connection.alpn),
+                                        side: side_name(connection.side),
+                                        status: ProtocolConnectionStatus::Open,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                        last_error: admin.then(|| peer.last_error.clone()).flatten(),
+                        next_retry_secs: peer.next_retry_in_secs,
+                    })
+                    .collect(),
+                RequestSummary::from_state(&info.requests),
+                info.warnings,
+            ),
+            None => (
+                NetworkServiceStatus {
+                    status: ServiceStatus::Unavailable,
+                    discovery: Vec::new(),
+                    relay: None,
+                    relay_urls: Vec::new(),
+                    routing_table_size: None,
+                },
+                Vec::new(),
+                Vec::new(),
+                RequestSummary::default(),
+                Vec::new(),
+            ),
+        };
 
-    let blob = match observability.blob {
-        Some(info) => BlobServiceStatus {
-            status: ServiceStatus::from(info.status),
-            backend: Some(info.backend_type.to_string()),
-            max_bucket_size: info.max_bucket_size,
-            multipart_bucket: info.multipart_bucket,
-            timeouts_secs: Some(TimeoutConfigSecs {
-                connect: info.timeouts.control_plane_connect_timeout.as_secs(),
-                io: info.timeouts.control_plane_io_timeout.as_secs(),
-                transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
-            }),
+    response.topology = Some(NodeTopologyInfo {
+        node: NodeStatus {
+            peer_id: state.get_node_id().to_string(),
+            capabilities: NodeCapabilityKind::from(state.node_capabilities()),
         },
-        None => BlobServiceStatus {
-            status: ServiceStatus::NotConfigured,
-            backend: None,
-            max_bucket_size: None,
-            multipart_bucket: None,
-            timeouts_secs: None,
-        },
-    };
+        my_addresses,
+        connections,
+        network,
+        interfaces: interface_services_status(&state).await,
+    });
 
-    let interfaces = interface_services_status(&state).await;
-
-    let database = DatabaseServiceStatus {
-        status: ServiceStatus::from(observability.database.status),
-        requests: RequestSummary::from_state(&observability.database.requests),
-    };
-
-    (
-        StatusCode::OK,
-        Json(InfoResponse {
-            node: NodeStatus {
-                status: ServiceStatus::Available,
-                realm_id: state.get_realm_id().to_string(),
-                peer_id: state.get_node_id().to_string(),
-                capabilities: NodeCapabilityKind::from(state.node_capabilities()),
+    if admin {
+        let blob = match observability.blob {
+            Some(info) => BlobServiceStatus {
+                status: ServiceStatus::from(info.status),
+                backend: Some(info.backend_type.to_string()),
+                max_bucket_size: info.max_bucket_size,
+                multipart_bucket: info.multipart_bucket,
+                timeouts_secs: Some(TimeoutConfigSecs {
+                    connect: info.timeouts.control_plane_connect_timeout.as_secs(),
+                    io: info.timeouts.control_plane_io_timeout.as_secs(),
+                    transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
+                }),
             },
-            api_version: env!("CARGO_PKG_VERSION").to_string(),
+            None => BlobServiceStatus {
+                status: ServiceStatus::NotConfigured,
+                backend: None,
+                max_bucket_size: None,
+                multipart_bucket: None,
+                timeouts_secs: None,
+            },
+        };
+        response.operations = Some(NodeOperationsInfo {
             portal: state.portal_status().await,
-            my_addresses,
-            connections,
-            services: ServicesStatus {
-                network,
-                blob,
-                database,
-                interfaces,
+            network_requests,
+            blob,
+            database: DatabaseServiceStatus {
+                status: ServiceStatus::from(observability.database.status),
+                requests: RequestSummary::from_state(&observability.database.requests),
             },
             warnings,
-        }),
-    )
+        });
+    }
+
+    (StatusCode::OK, Json(response))
 }
 
 impl RequestSummary {
@@ -1461,12 +1521,10 @@ fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
-        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RealmPlacementBinding, RealmPlacementBindingScope, RealmPlacementMutationRequest,
-        RealmPlacementOverride, RealmPlacementStrategy, RealmQuotaConfig,
-        RealmUserGroupCapOverride, RequestSummary, ServiceStatus, ServicesStatus, get_info,
-        get_realm_info, get_realm_placement, get_usage, map_mutate_realm_placement_error,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, RealmPlacementBinding,
+        RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
+        RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
+        get_info, get_realm_info, get_realm_placement, get_usage, map_mutate_realm_placement_error,
         map_set_realm_quota_error, mutate_realm_placement, set_realm_quota,
     };
     use crate::error::ServerError;
@@ -1526,89 +1584,45 @@ mod tests {
         (state, tempdir)
     }
 
-    #[tokio::test]
-    async fn get_info_returns_unavailable_optional_statuses_when_handles_are_missing() {
-        let (state, _tempdir) = setup_state().await;
-        let baseline = state.get_ctx().storage_handle.snapshot_metrics();
-        let expected_node = NodeStatus {
-            status: ServiceStatus::Available,
-            realm_id: state.get_realm_id().to_string(),
-            peer_id: state.get_node_id().to_string(),
-            capabilities: NodeCapabilityKind::Local,
-        };
-
-        let (status, Json(response)) = get_info(State(state)).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            response,
-            InfoResponse {
-                node: expected_node,
-                api_version: env!("CARGO_PKG_VERSION").to_string(),
-                portal: PortalStatus {
-                    installed: false,
-                    mode: "disabled".to_string(),
-                    version: None,
-                    source: None,
-                    url: None,
-                    checksum: None,
-                    fetched_at: None,
-                    last_error: None,
-                },
-                my_addresses: Vec::new(),
-                connections: Vec::new(),
-                services: ServicesStatus {
-                    network: NetworkServiceStatus {
-                        status: ServiceStatus::Unavailable,
-                        discovery: Vec::new(),
-                        relay: None,
-                        relay_urls: Vec::new(),
-                        routing_table_size: None,
-                        requests: RequestSummary {
-                            total: 0,
-                            failure_rate: 0.0,
-                            last_error: None,
-                        },
-                    },
-                    blob: BlobServiceStatus {
-                        status: ServiceStatus::NotConfigured,
-                        backend: None,
-                        max_bucket_size: None,
-                        multipart_bucket: None,
-                        timeouts_secs: None,
-                    },
-                    database: DatabaseServiceStatus {
-                        status: ServiceStatus::Available,
-                        requests: RequestSummary {
-                            total: baseline.requests_total,
-                            failure_rate: if baseline.requests_total == 0 {
-                                0.0
-                            } else {
-                                baseline.failed_total as f64 / baseline.requests_total as f64
-                            },
-                            last_error: baseline.last_error,
-                        },
-                    },
-                    interfaces: InterfaceServicesStatus {
-                        rest: InterfaceStatus {
-                            status: ServiceStatus::Unavailable,
-                            bind: None,
-                            url: None,
-                        },
-                        s3: InterfaceStatus {
-                            status: ServiceStatus::Unavailable,
-                            bind: None,
-                            url: None,
-                        },
-                    },
-                },
-                warnings: Vec::new(),
-            }
-        );
+    fn foreign_auth() -> AuthContext {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        AuthContext {
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        }
     }
 
+    /// Anonymous and foreign-realm callers see health and version only.
     #[tokio::test]
-    async fn get_info_reports_registered_interface_paths() {
+    async fn anonymous_info_hides_detail() {
+        let (state, _tempdir) = setup_state().await;
+
+        for auth in [None, Some(foreign_auth())] {
+            let (status, Json(response)) = get_info(State(state.clone()), Extension(auth)).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert!(response.topology.is_none());
+            assert!(response.operations.is_none());
+            let body = serde_json::to_value(&response).unwrap();
+            let fields = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                fields,
+                std::collections::HashSet::from(["status", "api_version", "realm_id"])
+            );
+            assert_eq!(body["api_version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(body["realm_id"], state.get_realm_id().to_string());
+        }
+    }
+
+    /// A realm token unlocks node identity, addresses and peers, nothing else.
+    #[tokio::test]
+    async fn realm_token_sees_topology() {
         let (state, _tempdir) = setup_state().await;
         state
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
@@ -1616,12 +1630,17 @@ mod tests {
         state
             .register_s3_interface("0.0.0.0:1337".parse().unwrap(), "127.0.0.1:1337")
             .await;
+        let auth = test_auth_context(&state);
 
-        let (status, Json(response)) = get_info(State(state)).await;
+        let (status, Json(response)) = get_info(State(state.clone()), Extension(Some(auth))).await;
 
         assert_eq!(status, StatusCode::OK);
+        let topology = response.topology.expect("realm token sees topology");
+        assert_eq!(topology.node.peer_id, state.get_node_id().to_string());
+        assert_eq!(topology.node.capabilities, NodeCapabilityKind::Local);
+        assert_eq!(topology.network.status, ServiceStatus::Unavailable);
         assert_eq!(
-            response.services.interfaces,
+            topology.interfaces,
             InterfaceServicesStatus {
                 rest: InterfaceStatus {
                     status: ServiceStatus::Available,
@@ -1635,15 +1654,46 @@ mod tests {
                 },
             }
         );
+        assert!(
+            response.operations.is_none(),
+            "backend detail stays admin-only"
+        );
+    }
+
+    /// Backend detail and errors need a realm config admin.
+    #[tokio::test]
+    async fn admin_sees_operations() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+        let member = AuthContext {
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+
+        let (_, Json(response)) = get_info(State(state.clone()), Extension(Some(member))).await;
+        assert!(response.topology.is_some());
+        assert!(
+            response.operations.is_none(),
+            "plain realm member is not an admin"
+        );
+
+        let (status, Json(response)) =
+            get_info(State(state), Extension(Some(admin_auth(realm_id, admin)))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.topology.is_some());
+        let operations = response.operations.expect("admin sees operations");
+        assert_eq!(operations.blob.status, ServiceStatus::NotConfigured);
+        assert_eq!(operations.database.status, ServiceStatus::Available);
+        assert_eq!(operations.portal.mode, "disabled");
     }
 
     #[tokio::test]
-    async fn get_info_reports_storage_error_metrics() {
-        let (state, _tempdir) = setup_state().await;
-        let ctx = state.get_ctx();
-        let baseline = ctx.storage_handle.snapshot_metrics();
+    async fn admin_info_reports_storage_errors() {
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
 
-        let _ = ctx
+        let _ = state
+            .get_ctx()
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: "missing".to_string(),
@@ -1652,21 +1702,17 @@ mod tests {
             })
             .await;
 
-        let (status, Json(response)) = get_info(State(state)).await;
+        let (status, Json(response)) =
+            get_info(State(state), Extension(Some(admin_auth(realm_id, admin)))).await;
 
         assert_eq!(status, StatusCode::OK);
+        let database = response.operations.expect("admin sees operations").database;
+        assert_eq!(database.status, ServiceStatus::Available);
         assert_eq!(
-            response.services.database,
-            DatabaseServiceStatus {
-                status: ServiceStatus::Available,
-                requests: RequestSummary {
-                    total: baseline.requests_total + 1,
-                    failure_rate: (baseline.failed_total + 1) as f64
-                        / (baseline.requests_total + 1) as f64,
-                    last_error: Some("Transaction not found".to_string()),
-                },
-            }
+            database.requests.last_error.as_deref(),
+            Some("Transaction not found")
         );
+        assert!(database.requests.failure_rate > 0.0);
     }
 
     #[test]
@@ -1727,10 +1773,20 @@ mod tests {
         }
     }
 
+    /// The usage directory is closed to anonymous and foreign-realm callers.
     #[tokio::test]
-    async fn get_usage_reports_realm_totals_for_authenticated_callers() {
+    async fn usage_requires_realm_auth() {
         let (state, _tempdir) = setup_state().await;
         seed_usage_state(&state).await;
+
+        assert!(matches!(
+            get_usage(State(state.clone()), Extension(None)).await,
+            Err(ServerError::Unauthorized)
+        ));
+        assert!(matches!(
+            get_usage(State(state.clone()), Extension(Some(foreign_auth()))).await,
+            Err(ServerError::Forbidden)
+        ));
 
         let auth = test_auth_context(&state);
         let (status, Json(response)) = get_usage(State(state), Extension(Some(auth)))
@@ -1738,25 +1794,7 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.buckets, 2, "flat fields report local total");
-        let realm = response.realm.expect("authenticated caller sees realm");
-        assert_eq!(realm.buckets, 5, "realm sums local and remote");
-    }
-
-    #[tokio::test]
-    async fn get_usage_omits_realm_totals_for_unauthenticated_callers() {
-        let (state, _tempdir) = setup_state().await;
-        seed_usage_state(&state).await;
-
-        let (status, Json(response)) = get_usage(State(state), Extension(None)).await.unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            response.buckets, 2,
-            "flat local fields stay unauthenticated"
-        );
-        assert!(
-            response.realm.is_none(),
-            "unauthenticated callers must not see realm-wide totals"
-        );
+        assert_eq!(response.realm.buckets, 5, "realm sums local and remote");
     }
 
     #[test]
@@ -2089,11 +2127,12 @@ mod tests {
             .unwrap();
         }
 
-        let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(None))
+        let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(Some(auth.clone())))
             .await
             .unwrap();
+        let detail = info.detail.expect("realm token sees detail");
         assert_eq!(
-            info.metadata_replication.default_replication_factor,
+            detail.metadata_replication.default_replication_factor,
             Some(2)
         );
 
@@ -2101,7 +2140,7 @@ mod tests {
         unbounded.replica_count = None;
         let _ = mutate_realm_placement(
             State(state.clone()),
-            Extension(Some(auth)),
+            Extension(Some(auth.clone())),
             Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
                 strategy: unbounded,
             })),
@@ -2109,10 +2148,13 @@ mod tests {
         .await
         .unwrap();
 
-        let (_, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
-        assert_eq!(info.metadata_replication.default_replication_factor, None);
+        let (_, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
+            .await
+            .unwrap();
+        let detail = info.detail.expect("realm token sees detail");
+        assert_eq!(detail.metadata_replication.default_replication_factor, None);
         assert_eq!(
-            serde_json::to_value(info.metadata_replication).unwrap()["default_replication_factor"],
+            serde_json::to_value(detail.metadata_replication).unwrap()["default_replication_factor"],
             serde_json::Value::Null
         );
     }
@@ -2317,25 +2359,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(info.quota.default_group_quota_bytes, Some(4096));
-        assert_eq!(info.quota.max_devices_per_user, None);
+        let quota = info.detail.expect("realm token sees detail").quota;
+        assert_eq!(quota.default_group_quota_bytes, Some(4096));
+        assert_eq!(quota.max_devices_per_user, None);
     }
 
+    /// Anonymous callers keep what they need to authenticate; realm topology,
+    /// discovery and quota policy need a token of this realm.
     #[tokio::test]
-    async fn get_realm_info_redacts_user_quota_overrides_for_anonymous_callers() {
+    async fn realm_info_gates_detail() {
         let (state, realm_id, admin, _tempdir) = setup_management_state().await;
-        let auth = AuthContext {
-            user_id: admin,
-            realm_id,
-            path_restrictions: None,
-        };
+        state
+            .register_rest_interface("0.0.0.0:3000".parse().unwrap())
+            .await;
+        let auth = admin_auth(realm_id, admin);
         let mut body = RealmQuotaConfig::from(QuotaConfig::default());
         body.user_group_cap_overrides = vec![RealmUserGroupCapOverride {
             user_id: admin.to_string(),
             max_groups: Some(1),
         }];
-
-        let (_status, Json(_stored)) = set_realm_quota(
+        let _ = set_realm_quota(
             State(state.clone()),
             Extension(Some(auth.clone())),
             Json(body),
@@ -2343,17 +2386,33 @@ mod tests {
         .await
         .unwrap();
 
-        let (_status, Json(anonymous)) = get_realm_info(State(state.clone()), Extension(None))
-            .await
-            .unwrap();
-        assert!(anonymous.quota.user_group_cap_overrides.is_empty());
+        for anonymous in [None, Some(foreign_auth())] {
+            let (_status, Json(info)) = get_realm_info(State(state.clone()), Extension(anonymous))
+                .await
+                .unwrap();
+            assert_eq!(info.realm_id, realm_id.to_string());
+            assert_eq!(info.description, "Realm");
+            assert!(info.detail.is_none());
+            assert_eq!(
+                info.interfaces.rest.url.as_deref(),
+                Some("http://127.0.0.1:3000/api/v1"),
+                "clients still learn the public api url"
+            );
+            assert!(
+                info.interfaces.rest.bind.is_none(),
+                "listen address is not public"
+            );
+        }
 
-        let (_status, Json(authenticated)) = get_realm_info(State(state), Extension(Some(auth)))
+        let (_status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
             .await
             .unwrap();
-        assert_eq!(authenticated.quota.user_group_cap_overrides.len(), 1);
+        assert_eq!(info.interfaces.rest.bind.as_deref(), Some("0.0.0.0:3000"));
+        let detail = info.detail.expect("realm token sees detail");
+        assert!(!detail.nodes.is_empty());
+        assert_eq!(detail.quota.user_group_cap_overrides.len(), 1);
         assert_eq!(
-            authenticated.quota.user_group_cap_overrides[0].user_id,
+            detail.quota.user_group_cap_overrides[0].user_id,
             admin.to_string()
         );
     }
@@ -2365,7 +2424,7 @@ mod tests {
             NodeInfoDocument, NodeUrls, NodeUtilization, node_info_storage_key,
         };
 
-        let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
+        let (state, realm_id, admin, _tempdir) = setup_management_state().await;
         let node_id = state.get_node_id();
 
         // The creating node's placement entry is seeded at realm creation with
@@ -2396,8 +2455,12 @@ mod tests {
             })
             .await;
 
-        let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+        let (status, Json(info)) =
+            get_realm_info(State(state), Extension(Some(admin_auth(realm_id, admin))))
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::OK);
+        let info = info.detail.expect("realm token sees detail");
         let node = info
             .nodes
             .iter()
