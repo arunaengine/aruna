@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
     RealmId,
@@ -20,7 +18,6 @@ use crate::create_metadata_document::{
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
 };
-use crate::document_sync_outbox::{schedule_outbox_drain_effect, write_outbox_effect};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
@@ -232,11 +229,6 @@ pub(crate) async fn apply_forwarded_write(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
-    // A relayed outbox record carries an already-authorized change rather than a
-    // caller request, so it gates on realm membership and holdership alone.
-    if let MetadataTransportMessage::ForwardOutboxRecord { record } = message {
-        return apply_forwarded_outbox_record(context, peer, *record).await;
-    }
     let Some(net_handle) = context.net_handle.as_ref() else {
         return reject("forwarded metadata write needs a net handle");
     };
@@ -376,110 +368,6 @@ pub(crate) async fn apply_forwarded_write(
             super::handle::transport_message_kind(&other)
         )),
     }
-}
-
-/// Relays a queued sync publish this node can never make to a holder of its
-/// bucket, which publishes it instead.
-///
-/// A record reaches here only when the local node holds none of the record's
-/// bucket: it may neither mint that bucket's topic genesis nor join the topic, so
-/// no amount of retrying would ever drain it. Deleting it would be silent data
-/// loss — the caller already has its 200 — and there is no replay source for an
-/// admin-operation outbox record. The two ways in are a User-kind node (never
-/// sync-eligible, so it holds no bucket at all) and a rebalance race, where the
-/// node held the bucket when it accepted the write and lost it before the topic
-/// arrived.
-pub(crate) async fn forward_outbox_record(
-    context: &Arc<DriverContext>,
-    record: &DocumentSyncOutboxRecord,
-) -> Result<(), MetadataWriteError> {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return Err(MetadataWriteError::Undeliverable(
-            "no net handle to forward an outbox record with".to_string(),
-        ));
-    };
-    let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        return Err(MetadataWriteError::Undeliverable(format!(
-            "realm `{realm_id}` config unavailable"
-        )));
-    };
-    let holders = resolve_shard_holders(&config, &record.placement);
-    forward_to_holders(
-        context,
-        &holders,
-        MetadataTransportMessage::ForwardOutboxRecord {
-            record: Box::new(record.clone()),
-        },
-    )
-    .await
-    .and_then(|response| match response {
-        MetadataTransportMessage::ForwardedOutboxRecord => Ok(()),
-        other => Err(unexpected_response(other)),
-    })
-}
-
-/// Publishes a relayed outbox record on the emitter's behalf.
-///
-/// The peer is a configured node of this realm and the record's bucket is one
-/// this node holds, so the record is queued into the local outbox verbatim and
-/// drains onto the bucket's topic like any locally-emitted record.
-///
-/// Document upserts and deletes only: an admin operation cannot be relayed at
-/// all. Receivers authenticate an admin event by requiring its signed publisher
-/// on the topic to *be* its `origin_node_id` (`validate_replicated_admin_event`),
-/// and a relay is by construction a different node signing for another origin, so
-/// every receiver would reject it. Accepting one here would report success while
-/// the operation was silently dropped realm-wide — worse than refusing it, which
-/// leaves the record in the emitter's outbox, retried and loud.
-async fn apply_forwarded_outbox_record(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    record: DocumentSyncOutboxRecord,
-) -> MetadataTransportMessage {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return reject("relayed outbox record needs a net handle");
-    };
-    let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        return reject(format!("realm `{realm_id}` config unavailable"));
-    };
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return reject("relayed outbox record needs a metadata handle");
-    };
-    match metadata_handle.authorize_remote_peer(peer, None).await {
-        Ok(_) => {}
-        Err(error) => return reject(error.to_string()),
-    }
-    if matches!(
-        record.event,
-        aruna_core::document::DocumentSyncOutboxEvent::AdminOperation { .. }
-    ) {
-        return reject(
-            "an admin operation cannot be relayed: receivers require its signed publisher to be its origin node",
-        );
-    }
-    if !holds_placement(&config, &record.placement, net_handle.node_id()) {
-        return reject(format!(
-            "node holds none of bucket {}/{} of the relayed outbox record",
-            record.placement.strategy_id, record.placement.shard
-        ));
-    }
-
-    let effect = match write_outbox_effect(&record) {
-        Ok(effect) => effect,
-        Err(error) => return reject(format!("relayed outbox record is malformed: {error}")),
-    };
-    match context.storage_handle.send_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => return reject(format!("relayed outbox record write failed: {other:?}")),
-    }
-    if let Some(task_handle) = context.task_handle.as_ref() {
-        task_handle
-            .send_effect(schedule_outbox_drain_effect())
-            .await;
-    }
-    MetadataTransportMessage::ForwardedOutboxRecord
 }
 
 /// The document's registry record, whatever this node's holdership of it.

@@ -1007,14 +1007,12 @@ impl MetadataHandle {
             },
             forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardOutboxRecord { .. }) => {
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }) => {
                 super::forward::apply_forwarded_write(context, peer, forward).await
             }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::ForwardedRecord { .. }
-            | MetadataTransportMessage::ForwardedOutboxRecord
             | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
@@ -3173,8 +3171,6 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
         MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
         MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
-        MetadataTransportMessage::ForwardOutboxRecord { .. } => "forward_outbox_record",
-        MetadataTransportMessage::ForwardedOutboxRecord => "forwarded_outbox_record",
         MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::Reject(_) => "reject",

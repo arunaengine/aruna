@@ -1,4 +1,3 @@
-use aruna_core::document::DocumentSyncOutboxRecord;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
@@ -114,16 +113,6 @@ pub enum MetadataTransportMessage {
         auth_token: Option<MetadataAuthToken>,
         document_id: Ulid,
     },
-    /// A queued sync publish whose bucket the emitting node holds none of, so it
-    /// can neither mint nor join that bucket's topic and could never publish the
-    /// record itself. Relayed to a holder, which publishes it on the emitter's
-    /// behalf rather than letting the write be dropped. Carries no `auth_token`:
-    /// the payload is an already-authorized local change, and the holder gates on
-    /// the peer being a configured node of the realm.
-    ForwardOutboxRecord {
-        record: Box<DocumentSyncOutboxRecord>,
-    },
-    ForwardedOutboxRecord,
     ForwardedRecord {
         record: Box<MetadataRegistryRecord>,
     },
