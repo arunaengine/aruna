@@ -7,13 +7,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, PlacementOverride, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::placement::resolve_shard_holders;
+use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_operations::process_placements::process_shard_placements;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -206,6 +208,124 @@ async fn never_member_rank0_adopts_existing_genesis_after_top_up()
     Ok(())
 }
 
+// A node admitted to the realm after the buckets already exist becomes a holder
+// of buckets whose genesis lives on a co-holder, and it cannot add itself to a
+// topic it does not have. An incumbent that can reach it pushes the genesis, but
+// nothing guarantees one does: the incumbents here have no route to the newcomer
+// when they admit it (which is what a partitioned member, or the shard's origin
+// drained out of the holder set, looks like), so their pushes never land. The
+// newcomer's own config-apply pass must then pull its held-but-unknown topics,
+// or it stays passive forever and the buckets it now holds never reach it.
+//
+// Rank-0 is pinned away from the newcomer on every bucket, so a pass that skips
+// its missing member topics dials nobody at all: the incumbents then never learn
+// its address and can never push, which is what makes the pull the only path.
+#[tokio::test]
+async fn new_holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([154u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let (incumbents, newcomer_nodes) = nodes.split_at(2);
+    let newcomer_node = &newcomer_nodes[0];
+    mesh_nodes(incumbents).await;
+
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    for node in incumbents {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+    config.placement_overrides = pin_rank0_everywhere(&config, incumbents[0].net.node_id());
+    write_realm_config(&nodes, realm_id, &config).await?;
+    for node in incumbents {
+        process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
+    }
+
+    let newcomer = newcomer_node.net.node_id();
+    config.ensure_node(newcomer, RealmNodeKind::Management);
+    write_realm_config(&nodes, realm_id, &config).await?;
+    // The incumbents' own config-apply pass: it admits the newcomer to every
+    // bucket's membership (a local control op), which is all a holder can do for
+    // another. They have no address for it, so nothing is pushed.
+    for node in incumbents {
+        process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
+    }
+
+    let held = member_shard_topics(&config, realm_id, newcomer);
+    assert!(
+        !held.is_empty(),
+        "the newcomer must hold non-rank-0 buckets"
+    );
+    for node in incumbents {
+        newcomer_node
+            .net
+            .add_peer_addr(node.net.endpoint_addr())
+            .await;
+    }
+    for topic in &held {
+        assert!(
+            !newcomer_node.net.document_sync_topic_exists(*topic)?,
+            "the newcomer must start without the genesis of {topic}"
+        );
+    }
+
+    process_shard_placements(&newcomer_node.context, realm_id, newcomer).await;
+
+    for topic in &held {
+        assert!(
+            newcomer_node.net.document_sync_topic_exists(*topic)?,
+            "newly held bucket topic {topic} was not pulled from a co-holder"
+        );
+    }
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+/// Pins `rank0` first on every bucket of every strategy, so no other holder is
+/// ever a bucket's rank-0 and none of them probes a co-holder for a genesis.
+fn pin_rank0_everywhere(config: &RealmConfigDocument, rank0: NodeId) -> Vec<PlacementOverride> {
+    let mut overrides = Vec::new();
+    for strategy in &config.strategies {
+        for shard in 0..strategy.shard_count {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                shard,
+            };
+            overrides.push(PlacementOverride {
+                subject: shard_subject_bytes(&placement),
+                pinned: vec![rank0],
+                excluded: Vec::new(),
+                strategy_id: None,
+            });
+        }
+    }
+    overrides
+}
+
+/// Shard topics `node_id` holds without being their rank-0 holder: the genesis
+/// is a co-holder's to create, so these are the topics a holder can only pull.
+fn member_shard_topics(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Vec<::irokle::TopicId> {
+    let mut topics = Vec::new();
+    for strategy in &config.strategies {
+        for shard in 0..strategy.shard_count {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                shard,
+            };
+            let holders = resolve_shard_holders(config, &placement);
+            if holders.contains(&node_id) && holders.first() != Some(&node_id) {
+                topics.push(shard_topic_id(realm_id, &placement));
+            }
+        }
+    }
+    topics
+}
+
 fn rank0_shard_of(config: &RealmConfigDocument, rank0: NodeId, co_holder: NodeId) -> PlacementRef {
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {
@@ -305,8 +425,17 @@ async fn install_realm_config(
     for node in nodes {
         config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
     }
-    // Installs the config without running the placement reconciler, so each test
-    // drives genesis creation explicitly.
+    write_realm_config(nodes, realm_id, &config).await?;
+    Ok(config)
+}
+
+/// Installs `config` on every node without running the placement reconciler, so
+/// each test drives genesis creation explicitly.
+async fn write_realm_config(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
@@ -328,9 +457,9 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_realm_peers_from_document(config).await?;
     }
-    Ok(config)
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
