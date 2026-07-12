@@ -83,17 +83,21 @@ async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
             .await?;
 
         let body = scrape(&seed.ops_url).await?;
-        assert!(
-            body.contains("aruna_http_requests_total"),
-            "missing request counter: {body}"
+        assert_eq!(
+            gauge_value(
+                &body,
+                "aruna_http_requests_total{interface=\"rest\",method=\"GET\",code=\"200\"}"
+            ),
+            Some(1.0),
+            "expected exactly one rest GET 200 request: {body}"
         );
         assert!(
-            body.contains("interface=\"rest\""),
-            "missing rest interface sample: {body}"
+            body.contains("aruna_storage_requests_total"),
+            "missing storage counter: {body}"
         );
         assert!(
-            body.contains("aruna_storage_requests "),
-            "missing storage gauge: {body}"
+            body.contains("# TYPE aruna_storage_requests counter"),
+            "storage requests not typed as a counter: {body}"
         );
         assert!(
             gauge_value(&body, "aruna_queue_depth{queue=\"document_sync_outbox\"}")
@@ -115,6 +119,26 @@ async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
         assert!(
             body.contains("aruna_build_info{version=\""),
             "missing build info: {body}"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn metrics_absent_public() -> TestResult<()> {
+    let seed = spawn_seed_node().await?;
+    let result = async {
+        // The Prometheus scrape must never be reachable on the public REST port.
+        let response = reqwest::get(format!("{}/metrics", seed.base_url)).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.text().await?;
+        assert!(
+            !body.contains("aruna_build_info") && !body.contains("aruna_http_requests_total"),
+            "public port leaked metrics: {body}"
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
