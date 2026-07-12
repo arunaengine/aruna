@@ -6,7 +6,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
+};
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -20,7 +22,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::placement::{choose_origin_bucket, strategy_for_target, subject_bytes};
+use aruna_operations::placement::{
+    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
+};
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
@@ -44,17 +48,14 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     let realm_id = RealmId([125u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::r#gen();
-
-    // Pick one shard and gather several document ids both holders choose it for.
-    let strategy = config.strategies.first().expect("a strategy").clone();
     let holders = [nodes[0].net.node_id(), nodes[1].net.node_id()];
-    let target_shard = shard_of(&config, holders[0], Ulid::r#gen());
-    let placement = PlacementRef {
-        strategy_id: strategy.strategy_id,
-        epoch: 0,
-        shard: target_shard,
-    };
-    let document_ids = document_ids_in_shard(&config, &holders, target_shard, 6);
+
+    // The bucket is chosen from the canonical path (6.3.6), so documents sharing
+    // one path land in one bucket. Both holders hold every bucket over two nodes
+    // and choose from the same subject, so their choice is the shared shard this
+    // test needs.
+    let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
+    let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::r#gen()).collect();
 
     // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {
@@ -139,32 +140,41 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     Ok(())
 }
 
-fn shard_of(config: &RealmConfigDocument, origin: NodeId, document_id: Ulid) -> u32 {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let (strategy, _) =
-        strategy_for_target(config, &target, Default::default()).expect("strategy resolves");
-    choose_origin_bucket(config, strategy, origin, &subject_bytes(&target))
-        .expect("origin holds a bucket")
-        .shard
-}
+const CONVERGE_PATH: &str = "datasets/converge";
 
-fn document_ids_in_shard(
+/// The bucket every document on [`CONVERGE_PATH`] lands in. The subject is the
+/// canonical `(realm, group, path)` (6.3.6), and both holders hold every bucket
+/// (RF over two nodes), so their origin-bucket choice is identical.
+fn shared_path_bucket(
     config: &RealmConfigDocument,
-    origins: &[NodeId],
-    shard: u32,
-    count: usize,
-) -> Vec<Ulid> {
-    let mut ids = Vec::with_capacity(count);
-    while ids.len() < count {
-        let candidate = Ulid::r#gen();
-        if origins
-            .iter()
-            .all(|origin| shard_of(config, *origin, candidate) == shard)
-        {
-            ids.push(candidate);
-        }
+    holders: &[NodeId],
+    realm_id: RealmId,
+    group_id: Ulid,
+) -> PlacementRef {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: Ulid::nil(),
+    };
+    let path = MetadataRegistryRecord::normalize_document_path(CONVERGE_PATH);
+    let (strategy, _) = strategy_for_target(
+        config,
+        &target,
+        PlacementResolutionContext {
+            group_id: Some(group_id),
+            metadata_path: Some(&path),
+        },
+    )
+    .expect("strategy resolves");
+    let subject = meta_bucket_subject(realm_id, group_id, &path);
+    let placement = choose_origin_bucket(config, strategy, holders[0], &subject)
+        .expect("origin holds a bucket");
+    for holder in holders {
+        assert_eq!(
+            choose_origin_bucket(config, strategy, *holder, &subject).map(|bucket| bucket.shard),
+            Some(placement.shard),
+            "both holders choose the same bucket for the shared path"
+        );
     }
-    ids
+    placement
 }
 
 fn sorted_entries(manifest: &ShardManifest) -> Vec<ShardManifestEntry> {
@@ -189,7 +199,7 @@ async fn create_document(
             },
             group_id,
             document_id,
-            document_path: format!("datasets/converge-{index}"),
+            document_path: CONVERGE_PATH.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
                 name: format!("Converge {index}"),
