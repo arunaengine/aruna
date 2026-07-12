@@ -32,7 +32,11 @@ use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+// Realm-node and document convergence poll to a condition; the ceilings only
+// bound a genuine hang, so they carry generous headroom for a loaded CI runner
+// where anti-entropy across three nodes is thread-starved and slow.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 500;
 
@@ -59,10 +63,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     let node2_dir = tempfile::tempdir()?;
     let secret = iroh::SecretKey::from_bytes(&[7u8; 32]);
 
-    let aux = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    let aux = AuxRuntime::new()?;
 
     let mut nodes = Vec::with_capacity(3);
     nodes.push(spawn_node(realm_id).await?);
@@ -114,7 +115,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
         std::slice::from_ref(&nodes[2].context),
         &sample,
         Duration::from_millis(200),
-        Duration::from_secs(60),
+        CONVERGENCE_TIMEOUT,
     )
     .await?;
     println!("seeded {} docs, node 2 caught up", created.len());
@@ -125,7 +126,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     node2.task_handle.clear_inbound_handler().await;
     node2.net.shutdown().await;
     drop(node2);
-    tokio::task::spawn_blocking(move || aux.shutdown_timeout(Duration::from_secs(10))).await?;
+    aux.shutdown().await;
     println!("node 2 shut down");
 
     let node2 = respawn_with_retry(realm_id, secret, node2_dir.path()).await?;
@@ -178,7 +179,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
         &contexts,
         &fresh,
         Duration::from_millis(200),
-        Duration::from_secs(60),
+        CONVERGENCE_TIMEOUT,
     )
     .await?;
     println!("fresh write converged to all nodes after restart");
@@ -191,6 +192,48 @@ fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
+}
+
+// Owns the auxiliary node-2 runtime and always tears it down off the async
+// context. Shutting a runtime down by dropping it inside an async task panics;
+// routing every drop through `spawn_blocking` means an early `?` return yields
+// the real error instead of that masking panic.
+struct AuxRuntime(Option<tokio::runtime::Runtime>);
+
+impl AuxRuntime {
+    fn new() -> Result<Self, BoxError> {
+        Ok(Self(Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?,
+        )))
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("aux runtime present")
+            .handle()
+            .clone()
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(runtime) = self.0.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                runtime.shutdown_timeout(Duration::from_secs(10))
+            })
+            .await;
+        }
+    }
+}
+
+impl Drop for AuxRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            tokio::task::spawn_blocking(move || runtime.shutdown_timeout(Duration::from_secs(10)));
+        }
+    }
 }
 
 async fn run_writer(
