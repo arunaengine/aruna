@@ -43,6 +43,7 @@ fn probe(job_id: JobId, steps: u32, sleep_ms: u64, marker: &str) -> JobRecord {
             steps,
             step_sleep_ms: sleep_ms,
             fail_at: None,
+            panic_at: None,
             cleanup_marker: Some(marker.to_string()),
         },
         owner(),

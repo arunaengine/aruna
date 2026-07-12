@@ -66,6 +66,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             steps,
             step_sleep_ms,
             fail_at,
+            panic_at,
             cleanup_marker,
         } => {
             run_probe(
@@ -73,6 +74,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
                 *steps,
                 *step_sleep_ms,
                 *fail_at,
+                *panic_at,
                 cleanup_marker.as_deref(),
             )
             .await
@@ -96,6 +98,7 @@ async fn run_probe(
     steps: u32,
     step_sleep_ms: u64,
     fail_at: Option<u32>,
+    panic_at: Option<u32>,
     cleanup_marker: Option<&str>,
 ) -> JobRunOutcome {
     ctx.progress.set_total(steps as u64);
@@ -105,6 +108,9 @@ async fn run_probe(
     for step in 0..steps {
         if ctx.cancel.is_cancelled() {
             return JobRunOutcome::Cancelled;
+        }
+        if panic_at == Some(step) {
+            panic!("probe panic at step {step}");
         }
         if fail_at == Some(step) {
             return JobRunOutcome::Failed(JobError::retryable(format!(

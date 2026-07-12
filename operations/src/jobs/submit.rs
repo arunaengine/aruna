@@ -237,6 +237,7 @@ mod tests {
                 steps: 2,
                 step_sleep_ms: 0,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: None,
             },
             created_by: UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
