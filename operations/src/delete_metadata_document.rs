@@ -37,7 +37,7 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_lifecycle_with_revision_effect, write_graph_lifecycle_effect,
 };
-use crate::placement::resolve_shard_holders;
+use crate::placement::{registry_placement, resolve_shard_holders};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -52,6 +52,7 @@ pub struct DeleteMetadataDocumentOperation {
     graph_lifecycle_placement_ref: PlacementRef,
     registry_placement_ref: PlacementRef,
     holder_peers: Vec<NodeId>,
+    registry_peers: Vec<NodeId>,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -118,6 +119,7 @@ impl DeleteMetadataDocumentOperation {
             graph_lifecycle_placement_ref: PlacementRef::NIL,
             registry_placement_ref: PlacementRef::NIL,
             holder_peers: Vec::new(),
+            registry_peers: Vec::new(),
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -285,11 +287,8 @@ impl DeleteMetadataDocumentOperation {
                 group_id: record.group_id,
                 document_id: record.document_id,
             },
-            self.peers(record),
+            self.registry_peers.clone(),
             DocumentSyncOutboxEvent::Delete { change },
-            // Registry delete rides the document's own topic and shares the delete
-            // publish batch with the tombstones above; keep it consistent so the
-            // batch is not blocked mid-flight.
             self.registry_placement_ref,
             true,
         );
@@ -386,7 +385,12 @@ impl Operation for DeleteMetadataDocumentOperation {
                         self.holder_peers = resolve_shard_holders(&config, &record.placement);
                         self.document_lifecycle_placement_ref = record.placement;
                         self.graph_lifecycle_placement_ref = record.placement;
-                        self.registry_placement_ref = record.placement;
+                        // The registry row rides the registry class's own topic,
+                        // not the document's capped bucket, so its tombstone must
+                        // go where the row went: to every node that has one.
+                        self.registry_placement_ref = registry_placement(&config, record);
+                        self.registry_peers =
+                            resolve_shard_holders(&config, &self.registry_placement_ref);
                     }
                     self.state = DeleteMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {

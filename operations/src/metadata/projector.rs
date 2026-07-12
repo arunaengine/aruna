@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
+    DocumentSyncRevision, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -22,7 +25,7 @@ use aruna_core::storage_entries::{
     metadata_pending_projection_target, metadata_registry_delete_entries,
 };
 use aruna_core::structs::{
-    MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument, RealmId,
+    MetadataAuditRecord, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
@@ -45,7 +48,7 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
-use crate::placement::resolve_shard_holders;
+use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync_placement::sort_node_ids;
 use crate::task_persistence::persist_task_effect;
 
@@ -493,22 +496,22 @@ pub async fn project_metadata_create_events(
             continue;
         }
 
-        let outbox = if local_node_id == Some(event.node_id)
-            && (!registry_exists || needs_materialization || holders_changed)
-            && !event.record.holder_node_ids.is_empty()
-        {
+        let realm_config = realm_configs
+            .get(&event.record.realm_id)
+            .and_then(|config| config.as_ref());
+        let authored_here = local_node_id == Some(event.node_id)
+            && (!registry_exists || needs_materialization || holders_changed);
+        let outbox = if authored_here && !event.record.holder_node_ids.is_empty() {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
-            Some(create_event_outbox_record(
-                &event,
-                realm_configs
-                    .get(&event.record.realm_id)
-                    .and_then(|config| config.as_ref()),
-                true,
-            ))
+            Some(create_event_outbox_record(&event, realm_config, true))
         } else {
             None
         };
+        // The registry row rides its own everywhere-bound topic, so it goes out
+        // even when the document's own bucket has no holders to publish to.
+        let registry_outbox =
+            authored_here.then(|| registry_outbox_record(&event, realm_config, true));
         let audit = audit_record(&event);
         if needs_materialization {
             let now = aruna_core::util::unix_timestamp_millis();
@@ -534,6 +537,13 @@ pub async fn project_metadata_create_events(
         }
         if let Some(outbox) = outbox {
             outboxes.push(outbox);
+        }
+        if let Some(registry_outbox) = registry_outbox.flatten() {
+            writes.push(
+                crate::document_sync_outbox::outbox_write_entry(&registry_outbox)
+                    .map_err(ConversionError::from)?,
+            );
+            outboxes.push(registry_outbox);
         }
         if local_node_id == Some(event.node_id) {
             writes.push(metadata_document_lifecycle_write_entry(
@@ -769,6 +779,62 @@ async fn read_realm_config(
             "{other:?}"
         ))),
     }
+}
+
+/// The document's registry row, published on the registry class's own topic
+/// rather than the document's bucket topic.
+///
+/// The bucket is replica-capped, so on a realm larger than the replication factor
+/// most nodes never see the document's bucket topic at all — and every registry
+/// row a node has today arrives as a side effect of that topic's lifecycle
+/// events. Those nodes would therefore never learn the document exists: a GET
+/// through them 404s forever, and update/delete could not even load the record
+/// they need in order to decide to forward it to a holder. The registry class is
+/// bound "everywhere", so this row reaches every node and gives each one the
+/// `document_id -> placement -> holders` mapping the routing layer runs on.
+///
+/// `None` without a readable realm config: there is no strategy to resolve, and a
+/// NIL-placed shard record would derive a NIL topic.
+pub fn registry_outbox_record(
+    event: &MetadataCreateEventRecord,
+    realm_config: Option<&RealmConfigDocument>,
+    allow_genesis: bool,
+) -> Option<DocumentSyncOutboxRecord> {
+    let record = &event.record;
+    let config = realm_config?;
+    let placement = registry_placement(config, record);
+    if placement == PlacementRef::NIL {
+        return None;
+    }
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id: record.group_id,
+        document_id: record.document_id,
+    };
+    let peers = resolve_shard_holders(config, &placement);
+    let change = DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id: event.event_id,
+            actor: event.node_id,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
+        placement,
+    };
+    Some(DocumentSyncOutboxRecord {
+        outbox_id: event.event_id,
+        node_id: event.node_id,
+        target,
+        peers,
+        event: DocumentSyncOutboxEvent::Upsert {
+            bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
+            change,
+        },
+        placement,
+        updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
+    })
 }
 
 pub fn create_event_outbox_record(

@@ -21,13 +21,13 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::schedule_outbox_drain_effect;
+use crate::document_sync_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
     schedule_metadata_materialization_drain_effect,
 };
-use crate::metadata::projector::create_event_outbox_record;
+use crate::metadata::projector::{create_event_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
     read_registry_effect,
@@ -230,6 +230,16 @@ impl UpdateMetadataDocumentOperation {
         let job = new_materialization_job(event, now);
         let mut writes =
             metadata_event_projection_write_entries(event, &audit, outbox, &status, &job)?;
+        // Refresh the everywhere-bound registry row so non-holders see the new
+        // revision, not just the bucket's holders.
+        if let Some(registry_outbox) =
+            registry_outbox_record(event, self.realm_config.as_ref(), false)
+        {
+            writes.push(
+                outbox_write_entry(&registry_outbox)
+                    .map_err(aruna_core::errors::ConversionError::from)?,
+            );
+        }
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
             event: Box::new(event.clone()),
         };

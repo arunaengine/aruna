@@ -65,6 +65,31 @@ pub fn placement_ref_for_target(
     }
 }
 
+/// Bucket the document's registry row rides.
+///
+/// Resolved for the registry target itself, not for the document's own bucket:
+/// the registry class is bound "everywhere" so every node carries the row, while
+/// the document's bucket is replica-capped and reaches only its holders. The
+/// document path is deliberately not passed — a path-prefix binding steers where
+/// the *document* lives, and letting it cap the registry row too would put the
+/// row back out of reach of the nodes that need it to route.
+pub fn registry_placement(
+    config: &RealmConfigDocument,
+    record: &aruna_core::structs::MetadataRegistryRecord,
+) -> PlacementRef {
+    placement_ref_for_target(
+        config,
+        &DocumentSyncTarget::MetadataRegistry {
+            group_id: record.group_id,
+            document_id: record.document_id,
+        },
+        PlacementResolutionContext {
+            group_id: Some(record.group_id),
+            metadata_path: None,
+        },
+    )
+}
+
 /// Placement plan for a document `target`: its shard's rank-ordered holder set
 /// (the same set every document in the shard resolves), the nominal replica
 /// target the pending machinery tops up toward, and the envelope reference.
