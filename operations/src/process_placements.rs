@@ -20,19 +20,23 @@ use crate::sync_placement::{
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 
-/// Eagerly creates the genesis of every shard topic whose rank-0 holder is the
-/// local node, so genesis creation has exactly one origin per shard (race-free
-/// by rank uniqueness). Every other node is join-only: it receives the genesis
-/// via gossip from the rank-0 holder or bootstraps it during anti-entropy.
-/// Runs on realm-config apply/change and at startup.
+/// Reconciles every shard topic the local node holds, whatever its rank.
+///
+/// Rank-0 is a politeness device for who acts first, never a precondition for
+/// the work happening: the rank-0 holder eagerly creates the genesis (so
+/// creation has exactly one origin per shard, race-free by rank uniqueness),
+/// while every other holder independently pulls the topic from a co-holder and
+/// tops up co-holder membership. A freshly added holder therefore converges on
+/// its own instead of waiting to be pushed to.
 ///
 /// Join-before-create: a config change can move rank-0 (e.g. a new node ranks
 /// first for a shard whose genesis the previous rank-0 already created), so a
 /// missing topic is first adopted from a co-holder; only what no co-holder
 /// knows either is created fresh.
-/// Returns whether any rank-0 genesis was withheld (a co-holder was unreachable
-/// or refused a probe), so the caller can schedule a placement retry.
-async fn ensure_rank0_shard_topics(
+/// Returns whether any genesis was withheld (a co-holder was unreachable or
+/// refused a probe) or a held topic could not be pulled, so the caller can
+/// schedule a placement retry.
+async fn ensure_held_shard_topics(
     context: &Arc<DriverContext>,
     net_handle: &aruna_net::NetHandle,
     config: &RealmConfigDocument,
@@ -80,28 +84,54 @@ async fn ensure_rank0_shard_topics(
         withheld |=
             ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
     }
-    // Non-rank-0 held shards: a holder that is already a member (e.g. the
-    // previous rank-0 after a config change moved the rank) completes the
-    // membership of freshly added co-holders — a new holder cannot add itself.
-    // Topics not known locally are skipped: their rank-0 creates them with the
-    // full holder set as initial peers.
+    // Non-rank-0 held shards. A topic not known locally is pulled from a
+    // co-holder: `sync_document_topics` is join-only (it adopts an existing
+    // genesis, it can never mint one), so this is safe at any rank and cannot
+    // fork. Without it a freshly added holder would stay passive forever,
+    // depending on an existing member pushing to it — and when the shard's
+    // origin is drained out of the holder set, nobody does.
+    // Topics already known are topped up with the current co-holder set, which
+    // is what admits a freshly added holder on the pushing side.
     for (co_holders, topics) in member_groups {
         if co_holders.is_empty() {
             continue;
         }
-        let known: Vec<::irokle::TopicId> = topics
-            .into_iter()
-            .filter(|topic| {
+        let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
+            topics.into_iter().partition(|topic| {
                 net_handle
                     .document_sync_topic_exists(*topic)
                     .unwrap_or(false)
-            })
-            .collect();
+            });
+        if !missing.is_empty() {
+            debug!(
+                event = "placement.topic.pull",
+                topics = missing.len(),
+                co_holders = co_holders.len(),
+                "Pulling newly held shard topics from co-holders"
+            );
+            let event = net_handle
+                .sync_document_topics(missing.clone(), co_holders.clone())
+                .await;
+            crate::startup::apply_restored_reconcile(context, local_node_id, event).await;
+            for topic in missing {
+                if net_handle
+                    .document_sync_topic_exists(topic)
+                    .unwrap_or(false)
+                {
+                    known.push(topic);
+                } else {
+                    // No co-holder served a genesis (unreachable, or rank-0 has
+                    // not created it yet); retry rather than stay passive.
+                    withheld = true;
+                }
+            }
+        }
         if known.is_empty() {
             continue;
         }
         if let Err(error) = net_handle.allow_document_sync_peers(&known, co_holders) {
             debug!(error = %error, "Could not complete held shard topic membership");
+            withheld = true;
         }
     }
     withheld
@@ -211,8 +241,9 @@ pub struct PlacementReconcileOutcome {
 
 /// Reconciles the local node's held shard topics with their co-holders.
 ///
-/// First creates the genesis of every shard the local node is rank-0 holder
-/// of (see [`ensure_rank0_shard_topics`]). Then iterates the
+/// First reconciles every held shard topic (see [`ensure_held_shard_topics`]):
+/// rank-0 shards get their genesis created, every other held shard is pulled
+/// from a co-holder. Then iterates the
 /// [`SYNC_PLACEMENT_KEYSPACE`] records the write path left behind (one per
 /// shard that was not fully replicated at write time), re-resolves each
 /// shard's holder set from the current realm config, and adds every co-holder
@@ -240,10 +271,11 @@ pub async fn process_shard_placements(
         return outcome;
     };
 
-    // A withheld rank-0 genesis leaves no placement record, so it alone must
-    // still arm the retry below (otherwise writes defer at 1s forever).
+    // A withheld genesis or an unpulled held topic leaves no placement record,
+    // so it alone must still arm the retry below (otherwise writes defer at 1s
+    // forever).
     let mut retry_needed =
-        ensure_rank0_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
+        ensure_held_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
 
     let mut start_after: Option<Key> = None;
     loop {
