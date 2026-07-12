@@ -351,7 +351,7 @@ fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigD
     let mut baseline_hot_wins = 0usize;
     for counter in 0u64..2_000 {
         let subject = blake3::hash(&counter.to_le_bytes());
-        let holders = resolve_holders(&view, strategy, subject.as_bytes(), 0, None);
+        let holders = resolve_holders(&view, strategy, subject.as_bytes(), None);
         let locations: std::collections::HashSet<_> = holders
             .iter()
             .map(|holder| {
@@ -366,9 +366,8 @@ fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigD
         assert_eq!(holders.len(), 2);
         assert_eq!(locations.len(), 2);
         hot_wins += usize::from(holders[0] == hot_node);
-        baseline_hot_wins += usize::from(
-            resolve_holders(&view, &baseline, subject.as_bytes(), 0, None)[0] == hot_node,
-        );
+        baseline_hot_wins +=
+            usize::from(resolve_holders(&view, &baseline, subject.as_bytes(), None)[0] == hot_node);
     }
     assert!(
         hot_wins > baseline_hot_wins + 400,
@@ -414,13 +413,13 @@ fn assert_resolve_holders_identical(configs: &[RealmConfigDocument]) {
 
     for counter in 0u64..100 {
         let subject = *blake3::hash(&counter.to_le_bytes()).as_bytes();
-        let reference = resolve_holders(&views[0], &strategy, &subject, 0, None);
+        let reference = resolve_holders(&views[0], &strategy, &subject, None);
         assert!(
             !reference.is_empty(),
             "empty holder set for subject {counter}"
         );
         for view in &views[1..] {
-            let holders = resolve_holders(view, &strategy, &subject, 0, None);
+            let holders = resolve_holders(view, &strategy, &subject, None);
             assert_eq!(
                 holders, reference,
                 "holder set diverged for subject {counter}"

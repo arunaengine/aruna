@@ -8,12 +8,13 @@ pub const ROLE_LOCATION: u8 = b'L';
 pub const ROLE_NODE: u8 = b'N';
 pub const ROLE_SHARD: u8 = b'S';
 
-/// Rendezvous hash of `(role, epoch, subject, id)`, forced nonzero via `| 1`.
-pub fn selector_hash(role: u8, epoch: u64, subject: &[u8], id: &[u8]) -> u64 {
+/// Rendezvous hash of `(role, subject, id)`, forced nonzero via `| 1`. The seed
+/// excludes the epoch: the selector is a pure function of the bucket alone
+/// (spec 6.3.1), so a rebalance never rewrites it.
+pub fn selector_hash(role: u8, subject: &[u8], id: &[u8]) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(PLACEMENT_DOMAIN);
     hasher.update(&[role]);
-    hasher.update(&epoch.to_le_bytes());
     hasher.update(subject);
     hasher.update(id);
     let digest = hasher.finalize();
@@ -51,13 +52,12 @@ pub fn neg_log2_q48(h: u64) -> u64 {
 /// so zero-weight candidates (never a numerator advantage) sort after all positive ones.
 pub fn rank_weighted<I: AsRef<[u8]>>(
     role: u8,
-    epoch: u64,
     subject: &[u8],
     candidates: &[(I, u64)],
 ) -> Vec<usize> {
     let scores: Vec<u64> = candidates
         .iter()
-        .map(|(id, _)| neg_log2_q48(selector_hash(role, epoch, subject, id.as_ref())))
+        .map(|(id, _)| neg_log2_q48(selector_hash(role, subject, id.as_ref())))
         .collect();
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_unstable_by(|&i, &j| {
@@ -132,8 +132,8 @@ mod tests {
         let weights = [100u64, 100, 100, 300, 50, 200];
         let candidates: Vec<([u8; 32], u64)> =
             ids.iter().zip(weights).map(|(id, w)| (*id, w)).collect();
-        let order = rank_weighted(ROLE_NODE, 0, b"golden-subject", &candidates);
-        assert_eq!(order, vec![2, 5, 3, 1, 4, 0]);
+        let order = rank_weighted(ROLE_NODE, b"golden-subject", &candidates);
+        assert_eq!(order, vec![0, 5, 3, 4, 2, 1]);
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
         let mut heavy_wins = 0u32;
         for counter in 0..total {
             let subject = blake3::hash(&counter.to_le_bytes());
-            let order = rank_weighted(ROLE_NODE, 0, subject.as_bytes(), &candidates);
+            let order = rank_weighted(ROLE_NODE, subject.as_bytes(), &candidates);
             if order[0] == 1 {
                 heavy_wins += 1;
             }
@@ -165,8 +165,8 @@ mod tests {
 
         #[test]
         fn rank_is_permutation_and_deterministic(candidates in candidate_strategy()) {
-            let first = rank_weighted(ROLE_NODE, 0, b"subject", &candidates);
-            let second = rank_weighted(ROLE_NODE, 0, b"subject", &candidates);
+            let first = rank_weighted(ROLE_NODE, b"subject", &candidates);
+            let second = rank_weighted(ROLE_NODE, b"subject", &candidates);
             prop_assert_eq!(&first, &second);
             let mut sorted = first;
             sorted.sort_unstable();
@@ -178,7 +178,7 @@ mod tests {
             candidates in candidate_strategy(),
             keys in prop::collection::vec(any::<u64>(), 0..12),
         ) {
-            let base_ids = ids_of(&rank_weighted(ROLE_NODE, 7, b"subject", &candidates), &candidates);
+            let base_ids = ids_of(&rank_weighted(ROLE_NODE, b"subject", &candidates), &candidates);
             let mut paired: Vec<(u64, ([u8; 6], u64))> = candidates
                 .iter()
                 .enumerate()
@@ -186,7 +186,7 @@ mod tests {
                 .collect();
             paired.sort_by_key(|(k, _)| *k);
             let permuted: Vec<([u8; 6], u64)> = paired.into_iter().map(|(_, c)| c).collect();
-            let permuted_ids = ids_of(&rank_weighted(ROLE_NODE, 7, b"subject", &permuted), &permuted);
+            let permuted_ids = ids_of(&rank_weighted(ROLE_NODE, b"subject", &permuted), &permuted);
             prop_assert_eq!(base_ids, permuted_ids);
         }
 
@@ -195,10 +195,10 @@ mod tests {
             candidates in candidate_strategy(),
             k in 1u64..1_048_576,
         ) {
-            let base = ids_of(&rank_weighted(ROLE_NODE, 0, b"s", &candidates), &candidates);
+            let base = ids_of(&rank_weighted(ROLE_NODE, b"s", &candidates), &candidates);
             let scaled: Vec<([u8; 6], u64)> =
                 candidates.iter().map(|(id, w)| (*id, w * k)).collect();
-            let scaled_rank = ids_of(&rank_weighted(ROLE_NODE, 0, b"s", &scaled), &scaled);
+            let scaled_rank = ids_of(&rank_weighted(ROLE_NODE, b"s", &scaled), &scaled);
             prop_assert_eq!(base, scaled_rank);
         }
 
@@ -208,7 +208,7 @@ mod tests {
             let mut candidates = candidates;
             candidates[0].1 = 0;
             candidates[1].1 = candidates[1].1.max(1);
-            let order = rank_weighted(ROLE_NODE, 0, b"s", &candidates);
+            let order = rank_weighted(ROLE_NODE, b"s", &candidates);
             let mut seen_zero = false;
             for &i in &order {
                 if candidates[i].1 == 0 {
@@ -225,12 +225,12 @@ mod tests {
             victim in any::<u64>(),
         ) {
             prop_assume!(candidates.len() >= 2);
-            let full = ids_of(&rank_weighted(ROLE_NODE, 3, b"s", &candidates), &candidates);
+            let full = ids_of(&rank_weighted(ROLE_NODE, b"s", &candidates), &candidates);
             let idx = (victim % candidates.len() as u64) as usize;
             let removed_id = candidates[idx].0;
             let mut reduced = candidates.clone();
             reduced.remove(idx);
-            let reduced_ids = ids_of(&rank_weighted(ROLE_NODE, 3, b"s", &reduced), &reduced);
+            let reduced_ids = ids_of(&rank_weighted(ROLE_NODE, b"s", &reduced), &reduced);
             let expected: Vec<[u8; 6]> = full.into_iter().filter(|id| *id != removed_id).collect();
             prop_assert_eq!(reduced_ids, expected);
         }

@@ -13,18 +13,18 @@ use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
 pub use resolver::{
     PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    resolve_holders, strategy_for_target, subject_bytes,
+    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:
-/// `strategy_id(16) ‖ epoch(8, little-endian) ‖ shard(4, big-endian)`. Every
-/// document hashing into the shard resolves the same holder set from this, so
-/// one sync topic per shard has one authoritative holder set (unlike stage 1,
-/// where the rendezvous subject was the individual document).
+/// `strategy_id(16) ‖ shard(4, big-endian)`. The epoch is deliberately excluded
+/// (spec 6.3.1): the holder set is a pure function of the bucket, so a rebalance
+/// stays a map change and never a per-document rewrite. Every document hashing
+/// into the shard resolves the same holder set from this, so one sync topic per
+/// shard has one authoritative holder set.
 pub fn shard_subject_bytes(placement: &PlacementRef) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(28);
+    let mut bytes = Vec::with_capacity(20);
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
-    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
     bytes.extend_from_slice(&placement.shard.to_be_bytes());
     bytes
 }
@@ -146,7 +146,6 @@ pub fn rank_eligible_holders(
         &view,
         &uncapped,
         &shard_subject_bytes(&placement),
-        placement.epoch,
         shard_override(config, &placement),
     )
 }
@@ -215,7 +214,7 @@ pub fn choose_origin_bucket(
     let held = held_buckets(config, strategy, origin);
     let candidates: Vec<([u8; 4], u64)> =
         held.iter().map(|shard| (shard.to_be_bytes(), 1)).collect();
-    let best = *rank_weighted(ROLE_SHARD, 0, subject, &candidates).first()?;
+    let best = *rank_weighted(ROLE_SHARD, subject, &candidates).first()?;
     Some(PlacementRef {
         strategy_id: strategy.strategy_id,
         epoch: 0,
@@ -233,7 +232,6 @@ fn resolve_shard_holders_with(
         &view,
         strategy,
         &shard_subject_bytes(placement),
-        placement.epoch,
         shard_override(config, placement),
     )
 }

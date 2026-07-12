@@ -9,7 +9,7 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
     AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
     KIND_LABEL_KEY, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
-    RealmConfigDocument, RealmNodeKind,
+    RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::types::GroupId;
 
@@ -89,7 +89,6 @@ pub fn resolve_holders(
     view: &PlacementView,
     strategy: &PlacementStrategy,
     subject: &[u8],
-    epoch: u64,
     override_: Option<&PlacementOverride>,
 ) -> Vec<NodeId> {
     let target = strategy.replica_count.map(|count| count as usize);
@@ -127,7 +126,7 @@ pub fn resolve_holders(
         }
     }
 
-    let ranked = ranked_locations(view, strategy, subject, epoch);
+    let ranked = ranked_locations(view, strategy, subject);
     'outer: for location in &ranked {
         if reached(&result) {
             break;
@@ -138,7 +137,7 @@ pub fn resolve_holders(
         if strategy.distinct_locations && seen_locations.contains(location.name) {
             continue;
         }
-        for node_index in ranked_nodes(view, &location.members, strategy, subject, epoch) {
+        for node_index in ranked_nodes(view, &location.members, strategy, subject) {
             let node = &view.nodes[node_index];
             if used_nodes.contains(&node.node_id) {
                 continue;
@@ -223,6 +222,19 @@ pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
     }
 }
 
+/// Canonical bucket-choice subject for a Meta Resource (spec 6.3.6): the byte
+/// serialization of `(realm_id, group_id, normalized_canonical_path)`. It is
+/// known before the MetaResourceId is generated, so bucket choice never
+/// substitutes the id and becomes circular. The fixed-width `realm_id ‖ group_id`
+/// prefix keeps the trailing path unambiguous.
+pub fn meta_bucket_subject(realm_id: RealmId, group_id: GroupId, normalized_path: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32 + 16 + normalized_path.len());
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes.extend_from_slice(normalized_path.as_bytes());
+    bytes
+}
+
 struct RankedLocation<'a> {
     name: &'a str,
     w_loc: u64,
@@ -233,7 +245,6 @@ fn ranked_locations<'a>(
     view: &'a PlacementView,
     strategy: &PlacementStrategy,
     subject: &[u8],
-    epoch: u64,
 ) -> Vec<RankedLocation<'a>> {
     let mut groups: BTreeMap<&'a str, (u64, Vec<usize>)> = BTreeMap::new();
     for (index, node) in view.nodes.iter().enumerate() {
@@ -260,7 +271,7 @@ fn ranked_locations<'a>(
         .iter()
         .map(|location| (location.name.as_bytes(), location.w_loc))
         .collect();
-    let order = rank_weighted(ROLE_LOCATION, epoch, subject, &candidates);
+    let order = rank_weighted(ROLE_LOCATION, subject, &candidates);
 
     let mut slots: Vec<Option<RankedLocation<'a>>> = locations.into_iter().map(Some).collect();
     order
@@ -274,7 +285,6 @@ fn ranked_nodes(
     members: &[usize],
     strategy: &PlacementStrategy,
     subject: &[u8],
-    epoch: u64,
 ) -> Vec<usize> {
     let candidates: Vec<([u8; 32], u64)> = members
         .iter()
@@ -283,7 +293,7 @@ fn ranked_nodes(
             (*node.node_id.as_bytes(), effective_weight(node, strategy))
         })
         .collect();
-    rank_weighted(ROLE_NODE, epoch, subject, &candidates)
+    rank_weighted(ROLE_NODE, subject, &candidates)
         .into_iter()
         .map(|position| members[position])
         .collect()
@@ -585,7 +595,7 @@ mod tests {
         let mut strategy = strategy(None, false);
         strategy.affinity = vec![filter_rule("tier", "hot")];
 
-        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(holders, vec![labeled]);
     }
 
@@ -603,14 +613,14 @@ mod tests {
         };
         let strategy = strategy(Some(3), true);
 
-        let first = resolve_holders(&view, &strategy, b"subject", 0, None);
-        let second = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let first = resolve_holders(&view, &strategy, b"subject", None);
+        let second = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(first, second);
 
         let mut reversed = nodes;
         reversed.reverse();
         let reversed_view = PlacementView { nodes: reversed };
-        let third = resolve_holders(&reversed_view, &strategy, b"subject", 0, None);
+        let third = resolve_holders(&reversed_view, &strategy, b"subject", None);
         assert_eq!(first, third);
     }
 
@@ -627,7 +637,7 @@ mod tests {
         let view = PlacementView { nodes };
         let strategy = strategy(Some(3), true);
 
-        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(holders.len(), 3);
         let locations: HashSet<&str> = holders
             .iter()
@@ -645,10 +655,10 @@ mod tests {
             nodes: nodes.clone(),
         };
 
-        let full_order = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        let full_order = resolve_holders(&view, &strategy(None, false), b"subject", None);
         assert_eq!(full_order.len(), 5);
 
-        let baseline = resolve_holders(&view, &strategy(Some(3), false), b"subject", 0, None);
+        let baseline = resolve_holders(&view, &strategy(Some(3), false), b"subject", None);
         assert_eq!(baseline, full_order[..3].to_vec());
 
         let mut mutated = nodes;
@@ -658,13 +668,7 @@ mod tests {
             }
         }
         let mutated_view = PlacementView { nodes: mutated };
-        let after = resolve_holders(
-            &mutated_view,
-            &strategy(Some(3), false),
-            b"subject",
-            0,
-            None,
-        );
+        let after = resolve_holders(&mutated_view, &strategy(Some(3), false), b"subject", None);
         // Only the rejected node changes: the next candidate slots in, order held.
         assert_eq!(after, full_order[1..4].to_vec());
     }
@@ -677,7 +681,7 @@ mod tests {
             resolved(3, RealmNodeKind::Server, "x", 100),
         ];
         let view = PlacementView { nodes };
-        let holders = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy(None, false), b"subject", None);
         assert_eq!(holders, vec![node_id(3)]);
     }
 
@@ -692,7 +696,7 @@ mod tests {
         let mut strategy = strategy(None, false);
         strategy.affinity = vec![multiply_rule("tier", "cold", 0)];
 
-        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(holders, vec![node_id(2)]);
     }
 
@@ -721,7 +725,7 @@ mod tests {
         let mut strategy = strategy(None, false);
         strategy.affinity = vec![filter_rule("tier", "hot"), filter_rule("region", "eu")];
 
-        let holders = resolve_holders(&view, &strategy, b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy, b"subject", None);
         assert_eq!(holders, vec![node_id(1)]);
     }
 
@@ -739,7 +743,7 @@ mod tests {
         let mut strategy = strategy(Some(1), false);
         strategy.affinity = vec![filter_rule("tier", "hot")];
 
-        let weights: BTreeMap<String, u64> = ranked_locations(&view, &strategy, b"subject", 0)
+        let weights: BTreeMap<String, u64> = ranked_locations(&view, &strategy, b"subject")
             .into_iter()
             .map(|location| (location.name.to_string(), location.w_loc))
             .collect();
@@ -778,7 +782,6 @@ mod tests {
             &view,
             &strategy(Some(2), true),
             b"subject",
-            0,
             Some(&override_),
         );
         assert_eq!(holders, vec![node_id(6), node_id(1)]);
@@ -800,13 +803,7 @@ mod tests {
             strategy_id: None,
         };
 
-        let holders = resolve_holders(
-            &view,
-            &strategy(None, false),
-            b"subject",
-            0,
-            Some(&override_),
-        );
+        let holders = resolve_holders(&view, &strategy(None, false), b"subject", Some(&override_));
         assert!(!holders.contains(&node_id(1)));
         assert_eq!(holders, vec![node_id(2)]);
     }
@@ -825,7 +822,7 @@ mod tests {
             ],
         };
 
-        let holders = resolve_holders(&view, &strategy(None, false), b"subject", 0, None);
+        let holders = resolve_holders(&view, &strategy(None, false), b"subject", None);
         let selected: HashSet<NodeId> = holders.iter().copied().collect();
         assert_eq!(holders.len(), 3);
         assert_eq!(
@@ -1006,9 +1003,7 @@ mod tests {
             strategy_for_target(&config, &target, PlacementResolutionContext::default())
                 .expect("repaired placement remains resolvable");
         assert_eq!(strategy.strategy_id, live);
-        assert!(
-            !resolve_holders(&build_view(&config), strategy, &subject, 0, override_).is_empty()
-        );
+        assert!(!resolve_holders(&build_view(&config), strategy, &subject, override_).is_empty());
     }
 
     #[test]
@@ -1113,6 +1108,20 @@ mod tests {
             document_id: sid(7),
         };
         assert_ne!(subject_bytes(&other), expected);
+    }
+
+    #[test]
+    fn meta_bucket_subject_vector() {
+        // Portable 6.3.6 vector: fixed-width realm_id ‖ group_id, then the path.
+        let subject = meta_bucket_subject(
+            RealmId::from_bytes([1u8; 32]),
+            Ulid::from_bytes([2u8; 16]),
+            "datasets/x",
+        );
+        let mut expected = vec![1u8; 32];
+        expected.extend_from_slice(&[2u8; 16]);
+        expected.extend_from_slice(b"datasets/x");
+        assert_eq!(subject, expected);
     }
 
     #[test]
@@ -1244,11 +1253,11 @@ mod tests {
             };
 
             let strategy = strategy(None, false);
-            let baseline: Vec<String> = ranked_locations(&build(false), &strategy, b"subject", 0)
+            let baseline: Vec<String> = ranked_locations(&build(false), &strategy, b"subject")
                 .iter()
                 .map(|location| location.name.to_string())
                 .collect();
-            let flipped: Vec<String> = ranked_locations(&build(true), &strategy, b"subject", 0)
+            let flipped: Vec<String> = ranked_locations(&build(true), &strategy, b"subject")
                 .iter()
                 .map(|location| location.name.to_string())
                 .collect();
@@ -1281,7 +1290,7 @@ mod tests {
 
             // W_loc counts only sync-eligible node weights; User weights never
             // contribute to a location's rendezvous weight.
-            for location in ranked_locations(&view, &strategy, b"subject", 0) {
+            for location in ranked_locations(&view, &strategy, b"subject") {
                 let expected: u64 = nodes
                     .iter()
                     .filter(|node| {
