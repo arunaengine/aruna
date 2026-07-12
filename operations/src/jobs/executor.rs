@@ -49,7 +49,10 @@ impl ProgressReporter {
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
+    /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
+    /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
+    pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
 }
 
@@ -57,6 +60,7 @@ pub enum JobRunOutcome {
     Succeeded(JobResultPayload),
     Failed(JobError),
     Cancelled,
+    Interrupted,
 }
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`.
@@ -109,6 +113,9 @@ async fn run_probe(
         if ctx.cancel.is_cancelled() {
             return JobRunOutcome::Cancelled;
         }
+        if ctx.shutdown.is_cancelled() {
+            return JobRunOutcome::Interrupted;
+        }
         if panic_at == Some(step) {
             panic!("probe panic at step {step}");
         }
@@ -119,8 +126,10 @@ async fn run_probe(
         }
         if step_sleep_ms > 0 {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(step_sleep_ms)) => {}
+                biased;
                 _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
+                _ = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
+                _ = tokio::time::sleep(Duration::from_millis(step_sleep_ms)) => {}
             }
         }
         ctx.progress.advance(1);

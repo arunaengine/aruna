@@ -23,8 +23,9 @@ use tracing::{info, warn};
 
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
 use super::store::{
-    JobMutationError, cancel_running_job, complete_job, fail_job, flush_progress, iter_prefix_page,
-    read_job_record, renew_lease, requeue_job, transition_to_running,
+    JobMutationError, ReleaseOutcome, cancel_running_job, complete_job, fail_job, flush_progress,
+    iter_prefix_page, read_job_record, release_job, renew_lease, requeue_job,
+    transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
@@ -40,13 +41,38 @@ struct RunningJob {
     nonce: u64,
     cancel: CancellationToken,
     completion: watch::Sender<bool>,
+    claim_token: ulid::Ulid,
+}
+
+#[derive(Default)]
+struct RuntimeState {
+    running: HashMap<JobId, RunningJob>,
+    /// A claim that raced the drain stop is released by a detached task; `shutdown` must
+    /// be able to await it, or the process can exit before the lease is handed back.
+    pending_releases: Vec<tokio::task::JoinHandle<()>>,
+    draining: bool,
+}
+
+/// What a shutdown did with the jobs that were in flight.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct JobShutdownReport {
+    /// Wound down inside the grace period and wrote their own state.
+    pub finished: usize,
+    /// Still running at grace expiry: lease handed back, no attempt spent.
+    pub released: usize,
+    /// Claim was no longer ours, so the lease was left alone.
+    pub skipped: usize,
 }
 
 /// Registry of locally executing jobs, their cancellation tokens, and the concurrency cap.
 pub struct JobsRuntime {
-    running: Mutex<HashMap<JobId, RunningJob>>,
+    state: Mutex<RuntimeState>,
     next_nonce: AtomicU64,
     cap: usize,
+    /// Node shutdown. Deliberately not the per-job cancel token: that one means the
+    /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
+    /// means "stop here, the lease goes back to the queue and the job runs again".
+    shutdown: CancellationToken,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -65,28 +91,33 @@ impl JobsRuntime {
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
         Arc::new(Self {
-            running: Mutex::new(HashMap::new()),
+            state: Mutex::new(RuntimeState::default()),
             next_nonce: AtomicU64::new(0),
             cap,
+            shutdown: CancellationToken::new(),
         })
     }
 
-    pub fn running_count(&self) -> usize {
-        self.running.lock().expect("runtime mutex poisoned").len()
+    fn state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
+        self.state.lock().expect("runtime mutex poisoned")
     }
 
+    pub fn running_count(&self) -> usize {
+        self.state().running.len()
+    }
+
+    /// Zero once draining, so the drain claims nothing more.
     pub fn available_slots(&self) -> usize {
-        self.cap.saturating_sub(self.running_count())
+        let state = self.state();
+        if state.draining {
+            return 0;
+        }
+        self.cap.saturating_sub(state.running.len())
     }
 
     /// Poke a locally running job's cancel token; `false` if it is not running here.
     pub fn request_cancel(&self, job_id: JobId) -> bool {
-        match self
-            .running
-            .lock()
-            .expect("runtime mutex poisoned")
-            .get(&job_id)
-        {
+        match self.state().running.get(&job_id) {
             Some(job) => {
                 job.cancel.cancel();
                 true
@@ -97,34 +128,113 @@ impl JobsRuntime {
 
     pub fn spawn(self: &Arc<Self>, context: Arc<DriverContext>, record: JobRecord) {
         let job_id = record.job_id;
+        let Some(claim_token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+            warn!(job_id = %job_id, "Spawned job has no claim token; skipping");
+            return;
+        };
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let (completion, _) = watch::channel(false);
-        self.running.lock().expect("runtime mutex poisoned").insert(
-            job_id,
-            RunningJob {
-                nonce,
-                cancel: cancel.clone(),
-                completion,
-            },
-        );
+        {
+            let mut state = self.state();
+            // Claimed just as the drain was stopping: hand the lease straight back
+            // rather than let it rot until the sweep spends an attempt on it.
+            if state.draining {
+                let storage = context.storage_handle.clone();
+                let release = tokio::spawn(async move {
+                    let _ =
+                        release_job(&storage, job_id, claim_token, unix_timestamp_millis()).await;
+                });
+                state.pending_releases.push(release);
+                return;
+            }
+            state.running.insert(
+                job_id,
+                RunningJob {
+                    nonce,
+                    cancel: cancel.clone(),
+                    completion,
+                    claim_token,
+                },
+            );
+        }
         let runtime = self.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             // A panicking payload is turned into a job failure inside `supervise`; this
             // guard still runs `finish` if anything else unwinds, so a panic can never
             // leak the concurrency slot and wedge the runtime.
-            let _ = AssertUnwindSafe(run_job(context.clone(), record, cancel))
+            let _ = AssertUnwindSafe(run_job(context.clone(), record, claim_token, cancel, shutdown))
                 .catch_unwind()
                 .await;
             runtime.finish(&context, job_id, nonce).await;
         });
     }
 
+    /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
+    /// Whatever is still running then has its lease handed back, so a restart costs a
+    /// job no attempt. Storage must outlive this call: releasing a lease writes.
+    pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
+        let waiters: Vec<_> = {
+            let mut state = self.state();
+            state.draining = true;
+            state
+                .running
+                .iter()
+                .map(|(job_id, job)| (*job_id, job.claim_token, job.completion.subscribe()))
+                .collect()
+        };
+        self.shutdown.cancel();
+
+        let deadline = Instant::now() + grace;
+        let mut report = JobShutdownReport::default();
+        for (job_id, claim_token, mut completion) in waiters {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = tokio::time::timeout(remaining, completion.changed()).await;
+            }
+            if !self.state().running.contains_key(&job_id) {
+                report.finished += 1;
+                continue;
+            }
+            match release_job(storage, job_id, claim_token, unix_timestamp_millis()).await {
+                Ok(ReleaseOutcome::Released(_)) => report.released += 1,
+                Ok(ReleaseOutcome::Skipped) => report.skipped += 1,
+                Err(JobMutationError::TokenMismatch) => {
+                    info!(job_id = %job_id, "Job was taken over elsewhere; leaving its lease");
+                    report.skipped += 1;
+                }
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Failed to hand back job lease");
+                    report.skipped += 1;
+                }
+            }
+        }
+        // A claim that raced the drain stop released itself on a detached task; wait for
+        // those too, or the process can exit with the lease still held.
+        loop {
+            let pending_releases = std::mem::take(&mut self.state().pending_releases);
+            if pending_releases.is_empty() {
+                break;
+            }
+            for release in pending_releases {
+                let _ = release.await;
+            }
+        }
+        info!(
+            finished = report.finished,
+            released = report.released,
+            skipped = report.skipped,
+            "Jobs runtime shut down"
+        );
+        report
+    }
+
     async fn finish(&self, context: &DriverContext, job_id: JobId, nonce: u64) {
         let removed = {
-            let mut running = self.running.lock().expect("runtime mutex poisoned");
-            match running.get(&job_id) {
-                Some(job) if job.nonce == nonce => running.remove(&job_id),
+            let mut state = self.state();
+            match state.running.get(&job_id) {
+                Some(job) if job.nonce == nonce => state.running.remove(&job_id),
                 _ => None,
             }
         };
@@ -143,12 +253,13 @@ impl JobsRuntime {
     fn register_test_execution(&self, job_id: JobId) -> u64 {
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let (completion, _) = watch::channel(false);
-        self.running.lock().expect("runtime mutex poisoned").insert(
+        self.state().running.insert(
             job_id,
             RunningJob {
                 nonce,
                 cancel: CancellationToken::new(),
                 completion,
+                claim_token: ulid::Ulid::r#gen(),
             },
         );
         nonce
@@ -163,9 +274,8 @@ impl JobsRuntime {
     ) -> Option<JobState> {
         let deadline = Instant::now() + timeout;
         let mut receiver = self
+            .state()
             .running
-            .lock()
-            .expect("runtime mutex poisoned")
             .get(&job_id)
             .map(|job| job.completion.subscribe());
         loop {
@@ -245,13 +355,15 @@ enum SuperviseResult {
     Zombie,
 }
 
-async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: CancellationToken) {
+async fn run_job(
+    context: Arc<DriverContext>,
+    record: JobRecord,
+    token: ulid::Ulid,
+    cancel: CancellationToken,
+    shutdown: CancellationToken,
+) {
     let storage = &context.storage_handle;
     let job_id = record.job_id;
-    let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
-        warn!(job_id = %job_id, "Spawned job has no claim token; skipping");
-        return;
-    };
 
     if record.cancel_requested {
         run_cleanup(&record.payload);
@@ -290,6 +402,7 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
     let ctx = JobContext {
         driver: context.clone(),
         cancel: cancel.clone(),
+        shutdown,
         progress: progress.clone(),
     };
 
@@ -353,6 +466,18 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
                 run_cleanup(&record.payload);
             }
             terminal_or_none(terminal, job_id);
+        }
+        // Shutdown, not cancellation: no cleanup handler, no attempt spent.
+        SuperviseResult::Outcome(JobRunOutcome::Interrupted) => {
+            match release_job(storage, job_id, token, unix_timestamp_millis()).await {
+                Ok(_) => {}
+                Err(JobMutationError::TokenMismatch) => {
+                    info!(job_id = %job_id, "Lease already handed back or re-claimed")
+                }
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Failed to hand back job lease")
+                }
+            }
         }
     }
 }
@@ -477,6 +602,7 @@ async fn heartbeat_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, set_cancel_requested,
     };
@@ -530,6 +656,28 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn reclaim(storage: &StorageHandle, job_id: JobId) -> JobRecord {
+        claim_job(storage, job_id, node_id(3), unix_timestamp_millis())
+            .await
+            .unwrap();
+        read_job_record(storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn wait_running(storage: &StorageHandle, job_id: JobId) {
+        for _ in 0..400 {
+            if let Ok(Some(record)) = read_job_record(storage, job_id, None).await
+                && record.state == JobState::Running
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("job never reached Running");
     }
 
     fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
@@ -629,11 +777,19 @@ mod tests {
         let JobPayload::Probe { fail_at, .. } = &mut record.payload;
         *fail_at = Some(0);
         let claimed = claim(&storage, record).await;
+        let token = claimed.claim.as_ref().unwrap().claim_token;
         set_cancel_requested(&storage, job_id, unix_timestamp_millis())
             .await
             .unwrap();
 
-        run_job(ctx, claimed, CancellationToken::new()).await;
+        run_job(
+            ctx,
+            claimed,
+            token,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let stored = read_job_record(&storage, job_id, None)
             .await
@@ -654,7 +810,13 @@ mod tests {
         let claimed = claim(&storage, probe_record(job_id, 1, 60_000, Some(marker_str))).await;
         let stale_token = claimed.claim.as_ref().unwrap().claim_token;
         let cancel = CancellationToken::new();
-        let execution = tokio::spawn(run_job(ctx, claimed, cancel.clone()));
+        let execution = tokio::spawn(run_job(
+            ctx,
+            claimed,
+            stale_token,
+            cancel.clone(),
+            CancellationToken::new(),
+        ));
         for _ in 0..100 {
             if marker.exists() {
                 break;
@@ -803,6 +965,139 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.progress.current, 10_000);
+    }
+
+    // A job interrupted by a shutdown is queued again, and the restart costs it nothing.
+    #[tokio::test]
+    async fn shutdown_releases_lease() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x11; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 100, 20, None)).await;
+
+        let runtime = JobsRuntime::new();
+        runtime.spawn(ctx.clone(), claimed);
+        wait_running(&storage, job_id).await;
+        let report = runtime.shutdown(&storage, Duration::ZERO).await;
+        assert_eq!(report.released, 1);
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Queued);
+        assert_eq!(record.attempts, 0, "a shutdown is not a spent attempt");
+        assert!(record.claim.is_none());
+        assert!(
+            record.due_at_ms <= unix_timestamp_millis(),
+            "due immediately"
+        );
+
+        // The next node picks it straight back up and drives it to success.
+        let restarted = JobsRuntime::new();
+        let reclaimed = reclaim(&storage, job_id).await;
+        restarted.spawn(ctx.clone(), reclaimed);
+        let state = restarted
+            .wait_for_terminal(&storage, job_id, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert_eq!(state, JobState::Succeeded);
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.attempts, 0);
+    }
+
+    // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on a job that never failed.
+    #[tokio::test]
+    async fn restarts_keep_attempts() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x12; 16]);
+        insert_job(&storage, &probe_record(job_id, 10_000, 5, None))
+            .await
+            .unwrap();
+
+        for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
+            let runtime = JobsRuntime::new();
+            let claimed = reclaim(&storage, job_id).await;
+            runtime.spawn(ctx.clone(), claimed);
+            wait_running(&storage, job_id).await;
+            runtime.shutdown(&storage, Duration::ZERO).await;
+
+            let record = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, JobState::Queued, "restart {restart}");
+            assert_eq!(record.attempts, 0, "restart {restart}");
+        }
+    }
+
+    // Shutdown is not cancellation: no Cancelled state and no cleanup handler.
+    #[tokio::test]
+    async fn shutdown_skips_cleanup() {
+        let (dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x13; 16]);
+        let marker = dir.path().join("probe-marker");
+        let marker_str = marker.to_str().unwrap().to_string();
+        let claimed = claim(&storage, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
+
+        let runtime = JobsRuntime::new();
+        runtime.spawn(ctx.clone(), claimed);
+        wait_running(&storage, job_id).await;
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(marker.exists(), "probe should create its marker");
+
+        let report = runtime.shutdown(&storage, Duration::from_secs(10)).await;
+        assert_eq!(report.finished, 1, "the probe winds down inside the grace");
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Queued);
+        assert_eq!(record.attempts, 0);
+        assert!(marker.exists(), "cleanup must not run for an interruption");
+    }
+
+    // Releasing a lease another node holds would double-run the job.
+    #[tokio::test]
+    async fn shutdown_spares_takeover() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x14; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 10_000, 5, None)).await;
+
+        let runtime = JobsRuntime::new();
+        runtime.spawn(ctx.clone(), claimed);
+        wait_running(&storage, job_id).await;
+
+        // The lease lapses and a peer takes the job over while we still hold it locally.
+        requeue_job(&storage, job_id, None, unix_timestamp_millis(), None, None)
+            .await
+            .unwrap();
+        claim_job(&storage, job_id, node_id(4), unix_timestamp_millis())
+            .await
+            .unwrap();
+
+        let report = runtime.shutdown(&storage, Duration::ZERO).await;
+        assert_eq!(report.released, 0);
+        assert_eq!(report.skipped, 1);
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Claimed);
+        assert_eq!(record.claim.unwrap().holder_node_id, node_id(4));
     }
 
     #[tokio::test]
