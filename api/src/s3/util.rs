@@ -169,34 +169,6 @@ pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
     Ok(())
 }
 
-/// Boundary check for S3 object keys that could otherwise escape their bucket
-/// namespace. Mirrors the blob-hardening `validate_object_key` so copy
-/// destinations fail as 4xx at the surface, not deep in the blob layer.
-pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
-    if key.is_empty() {
-        return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
-    }
-    if key.starts_with('/') {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not be absolute"
-        ));
-    }
-    if key.split('/').any(|segment| segment == "..") {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not contain '..' path segments"
-        ));
-    }
-    if key.chars().any(char::is_control) {
-        return Err(s3_error!(
-            InvalidArgument,
-            "Object key must not contain control characters"
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn parse_multipart_checksum_hint(
     input: &CreateMultipartUploadInput,
 ) -> S3Result<Option<MultipartUploadChecksumHint>> {
@@ -485,7 +457,7 @@ mod tests {
 
     #[test]
     fn parses_bucket_copy_source_with_version() {
-        let version = Ulid::new();
+        let version = Ulid::r#gen();
         let source = CopySource::Bucket {
             bucket: "src-bucket".into(),
             key: "object.txt".into(),
@@ -594,19 +566,6 @@ mod tests {
             get_s3_operation_permission("ListObjectsV2"),
             Some(Action::Read)
         );
-    }
-
-    #[test]
-    fn rejects_traversal_keys() {
-        for key in ["", "/abs", "../up", "a/../b", "a/..", "ctrl\u{0}\u{1}"] {
-            assert_eq!(
-                *super::validate_object_key(key).unwrap_err().code(),
-                S3ErrorCode::InvalidArgument,
-                "expected rejection for {key:?}"
-            );
-        }
-        super::validate_object_key("folder/object.txt").unwrap();
-        super::validate_object_key("a..b/c").unwrap();
     }
 
     #[test]
