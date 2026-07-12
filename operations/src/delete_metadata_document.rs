@@ -862,7 +862,11 @@ mod tests {
 
         assert_eq!(operation.document_lifecycle_placement_ref, record.placement);
         assert_eq!(operation.graph_lifecycle_placement_ref, record.placement);
-        assert_eq!(operation.registry_placement_ref, record.placement);
+        // The registry tombstone follows the registry row, which rides the
+        // everywhere-bound registry class rather than the document's capped bucket.
+        let registry_ref = registry_placement(&config, &record);
+        assert_eq!(operation.registry_placement_ref, registry_ref);
+        assert_ne!(registry_ref, record.placement);
 
         let document_outbox = operation
             .document_lifecycle_outbox_record(&record)
@@ -899,7 +903,7 @@ mod tests {
         };
         assert_eq!(document_change.placement, record.placement);
         assert_eq!(graph_change.placement, record.placement);
-        assert_eq!(registry_change.placement, record.placement);
+        assert_eq!(registry_change.placement, registry_ref);
         assert_eq!(document_outbox.peers, vec![actor.node_id]);
     }
 

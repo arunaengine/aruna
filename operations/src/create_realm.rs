@@ -704,7 +704,7 @@ mod test {
             config_doc.default_strategy_id,
             Some(seeded_strategies[0].strategy_id)
         );
-        assert_eq!(seeded_bindings.len(), 2);
+        assert_eq!(seeded_bindings.len(), 4);
         assert_eq!(
             config_state.materialized_realm_config_default_strategy(),
             Some(seeded_default_strategy_id)
@@ -719,14 +719,15 @@ mod test {
             config_state
                 .materialized_realm_config_strategy_bindings()
                 .len(),
-            2
+            4
         );
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 12);
+        // Two more than the strategies alone: the group and user class bindings.
+        assert_eq!(outbox_records.len(), 14);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -825,6 +826,18 @@ mod test {
                 ),
                 (
                     11,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[2].clone(),
+                    },
+                ),
+                (
+                    12,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[3].clone(),
+                    },
+                ),
+                (
+                    13,
                     AdminDocumentOperation::RealmConfigNodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,

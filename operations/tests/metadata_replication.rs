@@ -246,10 +246,11 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         wait_for_persisted_update(replacement_node, group_id, document_id, latest_update_id)
             .await?;
     assert_eq!(registry.last_event_id, latest_update_id);
+    // The registry row rides the everywhere-bound registry class, so it can land
+    // on the replacement before the document's own bucket topic delivers the
+    // event: the row is a routing pointer, not evidence the content arrived.
     let refreshed_event =
-        read_metadata_event_log_value(replacement_node, document_id, latest_update_id)
-            .await?
-            .expect("replacement persisted refreshed lifecycle event");
+        wait_for_event_log_value(replacement_node, document_id, latest_update_id).await?;
     let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
     assert!(matches!(
         refreshed_event.payload,
@@ -954,6 +955,27 @@ async fn read_persisted_holder_set(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(format!("unexpected metadata index read event: {other:?}").into()),
+    }
+}
+
+async fn wait_for_event_log_value(
+    node: &TestNode,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<aruna_core::types::Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        if let Some(value) = read_metadata_event_log_value(node, document_id, event_id).await? {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "node={} never persisted metadata event {event_id} of document {document_id}",
+                node.net.node_id()
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 

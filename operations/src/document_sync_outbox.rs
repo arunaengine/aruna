@@ -40,6 +40,12 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
+    // One event can enqueue several publishes under its own id — a metadata
+    // create emits both the document's lifecycle event and its registry row, each
+    // onto a different topic. Without the target in the key the second would
+    // silently overwrite the first and that publish would simply never happen.
+    // Ordering is untouched: the id still compares first, so this only breaks ties.
+    bytes.extend_from_slice(record.target.storage_key().as_ref());
     ByteView::from(bytes)
 }
 

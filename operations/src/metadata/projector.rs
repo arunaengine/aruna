@@ -793,8 +793,10 @@ async fn read_realm_config(
 /// bound "everywhere", so this row reaches every node and gives each one the
 /// `document_id -> placement -> holders` mapping the routing layer runs on.
 ///
-/// `None` without a readable realm config: there is no strategy to resolve, and a
-/// NIL-placed shard record would derive a NIL topic.
+/// `None` without a readable realm config (no strategy to resolve, and a
+/// NIL-placed shard record would derive a NIL topic) and `None` when the registry
+/// bucket has no holder at all: the realm has no eligible node, so there is nobody
+/// to publish to, and replay re-plans the row once there is.
 pub fn registry_outbox_record(
     event: &MetadataCreateEventRecord,
     realm_config: Option<&RealmConfigDocument>,
@@ -811,6 +813,9 @@ pub fn registry_outbox_record(
         document_id: record.document_id,
     };
     let peers = resolve_shard_holders(config, &placement);
+    if peers.is_empty() {
+        return None;
+    }
     let change = DocumentSyncChange {
         base: None,
         current: DocumentSyncRevision {
@@ -1344,34 +1349,53 @@ mod tests {
 
         let expected_holders = resolve_shard_holders(&config, &event.record.placement);
 
-        let outbox = match storage
+        // Two publishes, on two topics: the lifecycle event onto the document's
+        // own capped bucket, the registry row onto the everywhere-bound registry
+        // class. They share the event id, so they must not share an outbox key.
+        let records = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
-                limit: 2,
+                limit: 4,
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                assert_eq!(
-                    values.len(),
-                    1,
-                    "origin projection writes one outbox record"
-                );
-                postcard::from_bytes::<DocumentSyncOutboxRecord>(values[0].1.as_ref())
-                    .expect("outbox record decodes")
-            }
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .iter()
+                .map(|(_, value)| {
+                    postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref())
+                        .expect("outbox record decodes")
+                })
+                .collect::<Vec<_>>(),
             other => panic!("expected outbox iter result, got {other:?}"),
         };
+        assert_eq!(records.len(), 2);
 
+        let outbox = records
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.target,
+                    DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+                )
+            })
+            .expect("origin projection writes a lifecycle outbox record");
         assert_eq!(outbox.placement, event.record.placement);
         assert_eq!(outbox.peers, expected_holders);
         let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
         assert_eq!(change.placement, event.record.placement);
+
+        let registry = records
+            .iter()
+            .find(|record| matches!(record.target, DocumentSyncTarget::MetadataRegistry { .. }))
+            .expect("origin projection writes a registry outbox record");
+        let registry_ref = registry_placement(&config, &event.record);
+        assert_eq!(registry.placement, registry_ref);
+        assert_ne!(registry_ref, event.record.placement);
     }
 
     // A locally authored event with no eligible holders must not enqueue an
