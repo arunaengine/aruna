@@ -7,6 +7,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::{debug, error};
 use url::{Host, Url};
 
@@ -14,6 +16,10 @@ use url::{Host, Url};
 /// from the matching static origin.
 const FONT_STYLE_ORIGIN: &str = "https://fonts.googleapis.com";
 const FONT_FILE_ORIGIN: &str = "https://fonts.gstatic.com";
+
+/// OIDC origins change rarely; a point-read behind this window keeps the common
+/// portal response off the storage path.
+const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
 
 const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-opener-policy");
@@ -47,10 +53,17 @@ struct ResolvedOrigins {
     img: BTreeSet<String>,
 }
 
+#[derive(Default)]
+struct OidcOriginCache {
+    origins: BTreeSet<String>,
+    refreshed_at: Option<Instant>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PortalSecurity {
     state: Arc<ServerState>,
     config: Arc<PortalCspConfig>,
+    oidc_cache: Arc<RwLock<OidcOriginCache>>,
 }
 
 impl PortalSecurity {
@@ -58,6 +71,7 @@ impl PortalSecurity {
         Self {
             state,
             config: Arc::new(config),
+            oidc_cache: Arc::new(RwLock::new(OidcOriginCache::default())),
         }
     }
 
@@ -78,7 +92,13 @@ impl PortalSecurity {
         normalize_origin(&s3.base_url)
     }
 
+    /// Cached OIDC origins; a stale window triggers a point-read, and a failed
+    /// read reuses the last-known-good set so a loaded portal keeps its IdP.
     async fn oidc_origins(&self) -> BTreeSet<String> {
+        if let Some(cached) = self.fresh_oidc().await {
+            return cached;
+        }
+
         match drive(
             GetRealmConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
@@ -91,15 +111,22 @@ impl PortalSecurity {
                     origins.extend(normalize_origin(&provider.issuer));
                     origins.extend(normalize_origin(&provider.discovery_url));
                 }
+                let mut cache = self.oidc_cache.write().await;
+                cache.origins = origins.clone();
+                cache.refreshed_at = Some(Instant::now());
                 origins
             }
-            // The realm config is unavailable until it syncs; sign-in needs it
-            // anyway, so the portal keeps booting with the baseline policy.
             Err(error) => {
-                debug!(error = %error, "Portal CSP omits realm OIDC origins");
-                BTreeSet::new()
+                debug!(error = %error, "Portal CSP reuses cached OIDC origins");
+                self.oidc_cache.read().await.origins.clone()
             }
         }
+    }
+
+    async fn fresh_oidc(&self) -> Option<BTreeSet<String>> {
+        let cache = self.oidc_cache.read().await;
+        let refreshed_at = cache.refreshed_at?;
+        (refreshed_at.elapsed() < OIDC_ORIGIN_TTL).then(|| cache.origins.clone())
     }
 }
 
