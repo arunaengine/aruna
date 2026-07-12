@@ -29,6 +29,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{Instrument, error, info, trace};
 
 pub struct S3Server {
@@ -84,9 +86,12 @@ impl S3Server {
         })
     }
 
+    /// Accepts until `shutdown` is cancelled. Connection tasks are tracked, so
+    /// the returned handle only resolves once every request has finished.
     pub fn run_with_listener(
         self,
         listener: TcpListener,
+        shutdown: CancellationToken,
     ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let service = WrappingService {
@@ -96,22 +101,46 @@ impl S3Server {
             driver_ctx: self.driver_ctx,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
+        let connections = TaskTracker::new();
 
         let server = async move {
             loop {
-                let (socket, _) = match listener.accept().await {
-                    Ok(ok) => ok,
-                    Err(err) => {
-                        error!("error accepting connection: {err}");
-                        continue;
-                    }
+                let (socket, _) = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            error!("error accepting connection: {err}");
+                            continue;
+                        }
+                    },
                 };
                 let service = service.clone();
-                let conn = connection.clone();
-                tokio::spawn(async move {
-                    let _ = conn.serve_connection(TokioIo::new(socket), service).await;
+                let builder = connection.clone();
+                let connection_shutdown = shutdown.clone();
+                connections.spawn(async move {
+                    let conn = builder.serve_connection(TokioIo::new(socket), service);
+                    let mut conn = std::pin::pin!(conn);
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            let _ = result;
+                        }
+                        _ = connection_shutdown.cancelled() => {
+                            // Finish the request being served, then close the
+                            // connection instead of waiting out its keep-alive.
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
                 });
             }
+
+            connections.close();
+            let in_flight = connections.len();
+            if in_flight > 0 {
+                info!(in_flight, "Draining in-flight S3 connections");
+            }
+            connections.wait().await;
         };
 
         let task = tokio::spawn(server);
@@ -120,10 +149,10 @@ impl S3Server {
         Ok((local_addr, task))
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn run(self) -> Result<JoinHandle<()>, S3ServerError> {
+    #[tracing::instrument(level = "trace", skip(self, shutdown))]
+    pub async fn run(self, shutdown: CancellationToken) -> Result<JoinHandle<()>, S3ServerError> {
         let listener = TcpListener::bind(&self.address).await?;
-        let (_, task) = self.run_with_listener(listener)?;
+        let (_, task) = self.run_with_listener(listener, shutdown)?;
         Ok(task)
     }
 }

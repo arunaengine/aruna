@@ -225,6 +225,7 @@ mod tests {
     use aruna::config::load;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;
+    use aruna_core::shutdown::Shutdown;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::announce_realm_presence::{
@@ -239,6 +240,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
     struct TestEnvGuard {
@@ -325,8 +327,8 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
         });
-        initialize_net_incoming(context.clone());
-        initialize_task_incoming(context.clone(), task_handle).await;
+        initialize_net_incoming(context.clone(), &Shutdown::new());
+        initialize_task_incoming(context.clone(), task_handle, &Shutdown::new()).await;
 
         let realm_signing_key =
             SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
@@ -376,7 +378,10 @@ mod tests {
             },
         );
         let server_task = tokio::spawn(async move {
-            server.run_with_listener(listener).await.unwrap();
+            server
+                .run_with_listener(listener, CancellationToken::new())
+                .await
+                .unwrap();
         });
 
         TestNode {

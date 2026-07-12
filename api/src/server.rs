@@ -8,6 +8,7 @@ use axum::extract::DefaultBodyLimit;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
 
@@ -45,12 +46,18 @@ impl Server {
         router
     }
 
-    pub async fn run(self) -> Result<(), ServerSetupError> {
+    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ServerSetupError> {
         let listener = TcpListener::bind(self.config.http_addr).await?;
-        self.run_with_listener(listener).await
+        self.run_with_listener(listener, shutdown).await
     }
 
-    pub async fn run_with_listener(self, listener: TcpListener) -> Result<(), ServerSetupError> {
+    /// Serves until `shutdown` is cancelled: the listener stops accepting and
+    /// requests already in flight run to completion before this returns.
+    pub async fn run_with_listener(
+        self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<(), ServerSetupError> {
         let bound_addr = listener.local_addr()?;
         self.state.register_rest_interface(bound_addr).await;
         let router = self.build_router();
@@ -59,6 +66,7 @@ impl Server {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
 

@@ -18,6 +18,7 @@ use aruna_core::UserId;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::{
     Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, NodeUrls,
     PathRestriction, RealmId, TokenClaims, UserAccess,
@@ -55,6 +56,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -753,8 +755,8 @@ async fn initialize_context(
         metadata_handle,
         task_handle: Some(task_handle.clone()),
     });
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_net_incoming(context.clone(), &Shutdown::new());
+    initialize_task_incoming(context.clone(), task_handle, &Shutdown::new()).await;
     Ok(context)
 }
 
@@ -843,7 +845,7 @@ async fn spawn_s3_server(
         test_cors_config(),
     )
     .await?;
-    let (_addr, task) = s3_server.run_with_listener(listener)?;
+    let (_addr, task) = s3_server.run_with_listener(listener, CancellationToken::new())?;
     Ok((
         S3Endpoint {
             endpoint_url: format!("http://{host}"),
