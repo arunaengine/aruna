@@ -1,3 +1,4 @@
+use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::UserId;
@@ -463,7 +464,7 @@ pub async fn list_groups(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_realm_auth(&state, auth)?;
     let include_roles = parse_list_groups_include(query.include.as_deref())?;
     let limit = query.limit_or(100).clamp(1, 1_000);
     let offset = query.offset_or(0);
@@ -552,7 +553,7 @@ pub async fn get_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (group, auth_doc) = load_group(&state, group_id).await?;
     let is_member = is_group_member(&auth_doc, auth.user_id);
@@ -625,7 +626,7 @@ pub async fn get_group_usage(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (_, auth_doc) = load_group(&state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
@@ -677,7 +678,7 @@ pub async fn list_group_members(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupMembersResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (_, auth_doc) = load_group(&state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
@@ -1001,4 +1002,122 @@ pub async fn delete_group_role(
     })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListGroupsQuery, get_group, get_group_usage, list_group_members, list_groups};
+    use crate::error::ServerError;
+    use crate::server_state::ServerState;
+    use aruna_core::UserId;
+    use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::storage;
+    use axum::Extension;
+    use axum::extract::{Path, Query, State};
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+    use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
+
+    async fn setup_state() -> (Arc<ServerState>, TempDir) {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_signing_key =
+            SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                iroh::SecretKey::generate().public(),
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        );
+
+        (state, tempdir)
+    }
+
+    fn foreign_auth() -> AuthContext {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        AuthContext {
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        }
+    }
+
+    /// Anonymous callers get 401, foreign-realm tokens 403: neither may
+    /// enumerate the local group or usage directory.
+    #[tokio::test]
+    async fn group_directory_requires_realm() {
+        let (state, _tempdir) = setup_state().await;
+        let group_id = Ulid::r#gen().to_string();
+
+        assert!(matches!(
+            list_groups(
+                State(state.clone()),
+                Extension(None),
+                Query(ListGroupsQuery::default())
+            )
+            .await,
+            Err(ServerError::Unauthorized)
+        ));
+        assert!(matches!(
+            list_groups(
+                State(state.clone()),
+                Extension(Some(foreign_auth())),
+                Query(ListGroupsQuery::default())
+            )
+            .await,
+            Err(ServerError::Forbidden)
+        ));
+
+        for auth in [None, Some(foreign_auth())] {
+            let expected = if auth.is_none() {
+                ServerError::Unauthorized
+            } else {
+                ServerError::Forbidden
+            };
+            for result in [
+                get_group(
+                    State(state.clone()),
+                    Extension(auth.clone()),
+                    Path(group_id.clone()),
+                )
+                .await
+                .map(|_| ()),
+                get_group_usage(
+                    State(state.clone()),
+                    Extension(auth.clone()),
+                    Path(group_id.clone()),
+                )
+                .await
+                .map(|_| ()),
+                list_group_members(
+                    State(state.clone()),
+                    Extension(auth.clone()),
+                    Path(group_id.clone()),
+                )
+                .await
+                .map(|_| ()),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    expected.to_string(),
+                    "group route leaked to {auth:?}"
+                );
+            }
+        }
+    }
 }
