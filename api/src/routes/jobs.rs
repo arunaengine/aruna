@@ -14,7 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::auth::require_realm_auth;
+use crate::auth::require_unrestricted_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -166,7 +166,7 @@ pub async fn list_jobs(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListJobsQuery>,
 ) -> ServerResult<(StatusCode, Json<JobListResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -205,7 +205,7 @@ pub async fn get_job(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
     let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
         .await
@@ -231,7 +231,7 @@ pub async fn cancel_job(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
     let job_id = parse_job_id(&job_id)?;
 
     let outcome = cancel_owned_job(
@@ -257,7 +257,7 @@ pub async fn cancel_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{JobPayload, NodeCapabilities, RealmId};
+    use aruna_core::structs::{JobPayload, NodeCapabilities, PathRestriction, Permission, RealmId};
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -283,6 +283,17 @@ mod tests {
             user_id,
             realm_id: realm(),
             path_restrictions: None,
+        })
+    }
+
+    fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
+        Some(AuthContext {
+            user_id,
+            realm_id: realm(),
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: "/realm/g/group/data/**".to_string(),
+                permission: Permission::READ,
+            }]),
         })
     }
 
@@ -316,6 +327,7 @@ mod tests {
                 steps: 1,
                 step_sleep_ms: 0,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: None,
             },
             owner,
@@ -457,6 +469,44 @@ mod tests {
         assert!(openapi.paths.paths.contains_key("/jobs/"));
         assert!(openapi.paths.paths.contains_key("/jobs/{job_id}"));
         assert!(openapi.paths.paths.contains_key("/jobs/{job_id}/cancel"));
+    }
+
+    // A path-restricted (delegated) token must not reach any user-scoped job surface.
+    #[tokio::test]
+    async fn restricted_token_rejected() {
+        let (_dir, state) = build_state().await;
+        let owner = user(2);
+        let job_id = JobId::from_bytes([9u8; 16]);
+        insert_job(
+            &state.get_ctx().storage_handle,
+            &job_for(job_id, owner, 1000),
+        )
+        .await
+        .unwrap();
+
+        let list = list_jobs(
+            State(state.clone()),
+            Extension(restricted_auth_for(owner)),
+            Query(ListJobsQuery::default()),
+        )
+        .await;
+        assert!(matches!(list, Err(ServerError::Forbidden)));
+
+        let get = get_job(
+            State(state.clone()),
+            Extension(restricted_auth_for(owner)),
+            Path(job_id.to_string()),
+        )
+        .await;
+        assert!(matches!(get, Err(ServerError::Forbidden)));
+
+        let cancel = cancel_job(
+            State(state.clone()),
+            Extension(restricted_auth_for(owner)),
+            Path(job_id.to_string()),
+        )
+        .await;
+        assert!(matches!(cancel, Err(ServerError::Forbidden)));
     }
 
     #[tokio::test]
