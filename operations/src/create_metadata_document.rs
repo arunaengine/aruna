@@ -24,8 +24,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
 use crate::placement::{
-    PlacementResolutionContext, choose_origin_bucket, holds_placement, strategy_for_target,
-    subject_bytes,
+    PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
+    strategy_for_target, subject_bytes,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -219,11 +219,18 @@ impl CreateMetadataDocumentOperation {
             }
             return Ok(placement);
         }
+        // Bucket-choice subject is the canonical `(realm_id, group_id, path)`
+        // tuple (spec 6.3.6), never the document id: the id must not steer the
+        // bucket it embeds.
         choose_origin_bucket(
             config,
             strategy,
             self.config.actor.node_id,
-            &subject_bytes(&target),
+            &meta_bucket_subject(
+                self.config.actor.realm_id,
+                self.config.group_id,
+                &document_path,
+            ),
         )
         .ok_or(CreateMetadataDocumentError::OriginHoldsNoBucket)
     }
