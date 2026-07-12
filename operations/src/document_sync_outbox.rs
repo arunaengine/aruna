@@ -125,48 +125,6 @@ pub fn write_outbox_effect_with_txn(
     }))
 }
 
-fn decode_outbox_record(bytes: &[u8]) -> Result<DocumentSyncOutboxRecord, postcard::Error> {
-    match postcard::from_bytes::<DocumentSyncOutboxRecord>(bytes) {
-        Ok(record) => Ok(record),
-        Err(_) => postcard::from_bytes::<LegacyDocumentSyncOutboxRecord>(bytes).map(Into::into),
-    }
-}
-
-/// Pre-`allow_genesis` mirror of [`DocumentSyncOutboxRecord`], used only to
-/// decode outbox rows persisted before that field existed. Keep field order
-/// identical to the historical layout.
-#[derive(serde::Deserialize)]
-struct LegacyDocumentSyncOutboxRecord {
-    outbox_id: Ulid,
-    node_id: NodeId,
-    target: DocumentSyncTarget,
-    peers: Vec<NodeId>,
-    event: DocumentSyncOutboxEvent,
-    updated_at: u64,
-}
-
-impl From<LegacyDocumentSyncOutboxRecord> for DocumentSyncOutboxRecord {
-    fn from(legacy: LegacyDocumentSyncOutboxRecord) -> Self {
-        let placement = match &legacy.event {
-            DocumentSyncOutboxEvent::Upsert { change, .. }
-            | DocumentSyncOutboxEvent::Delete { change } => change.placement,
-            DocumentSyncOutboxEvent::AdminOperation { .. } => PlacementRef::NIL,
-        };
-        Self {
-            outbox_id: legacy.outbox_id,
-            node_id: legacy.node_id,
-            target: legacy.target,
-            peers: legacy.peers,
-            event: legacy.event,
-            placement,
-            updated_at: legacy.updated_at,
-            // Before `allow_genesis` existed, outbox publishes could mint missing
-            // sync topic genesis. Preserve that behavior for already-queued work.
-            allow_genesis: true,
-        }
-    }
-}
-
 pub fn schedule_outbox_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainDocumentSyncOutbox,
@@ -187,7 +145,10 @@ pub async fn read_outbox_record(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| decode_outbox_record(&bytes).map_err(|error| error.to_string()))
+            .map(|bytes| {
+                postcard::from_bytes::<DocumentSyncOutboxRecord>(&bytes)
+                    .map_err(|error| error.to_string())
+            })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
@@ -220,7 +181,7 @@ pub async fn read_outbox_records(
             let has_more = values.len() > limit;
             let mut records = Vec::with_capacity(values.len().min(limit));
             for (key, value) in values.into_iter().take(limit) {
-                match decode_outbox_record(&value) {
+                match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();
@@ -388,70 +349,6 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected outbox write event: {other:?}"),
         }
-    }
-
-    fn legacy_pre_allow_genesis_bytes(record: &DocumentSyncOutboxRecord) -> Vec<u8> {
-        #[derive(serde::Serialize)]
-        struct LegacyRecord {
-            outbox_id: Ulid,
-            node_id: NodeId,
-            target: DocumentSyncTarget,
-            peers: Vec<NodeId>,
-            event: DocumentSyncOutboxEvent,
-            updated_at: u64,
-        }
-
-        postcard::to_allocvec(&LegacyRecord {
-            outbox_id: record.outbox_id,
-            node_id: record.node_id,
-            target: record.target.clone(),
-            peers: record.peers.clone(),
-            event: record.event.clone(),
-            updated_at: record.updated_at,
-        })
-        .expect("legacy record serializes")
-    }
-
-    #[tokio::test]
-    async fn legacy_pre_allow_genesis_outbox_record_is_preserved() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let mut legacy = new_outbox_record(
-            node(1),
-            target(),
-            vec![node(2)],
-            DocumentSyncOutboxEvent::Upsert {
-                bytes: vec![4, 5],
-                change: change(),
-            },
-            PlacementRef::NIL,
-            false,
-        );
-        legacy.outbox_id = Ulid::from_parts(3, 4);
-        legacy.updated_at = 42;
-        let key = outbox_key(&legacy).to_vec();
-        write_raw_outbox_record(
-            &storage,
-            key.clone(),
-            legacy_pre_allow_genesis_bytes(&legacy),
-        )
-        .await;
-
-        let mut expected = legacy;
-        expected.allow_genesis = true;
-        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
-            .await
-            .expect("outbox read succeeds");
-
-        assert_eq!(batch.records, vec![(key.clone(), expected.clone())]);
-        assert!(!batch.has_more);
-        assert_eq!(
-            read_outbox_record(&storage, &key)
-                .await
-                .expect("legacy record was preserved"),
-            Some(expected)
-        );
     }
 
     #[tokio::test]
