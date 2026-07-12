@@ -150,8 +150,8 @@ mod test {
     async fn delete_objects_processes_mixed_batch() {
         let (_temp, context) = test_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let user_id = UserId::local(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         seed_object(
             &context,
@@ -164,7 +164,7 @@ mod test {
         )
         .await;
 
-        let missing_version = Ulid::new();
+        let missing_version = Ulid::r#gen();
         let outcomes = delete_objects(
             &context,
             DeleteObjectsInput {
@@ -211,8 +211,8 @@ mod test {
     async fn delete_objects_isolates_failures() {
         let (_temp, context) = test_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let user_id = UserId::local(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
         seed_object(
             &context, "mybucket", "keep.txt", user_id, group_id, realm_id, node_id,
@@ -226,7 +226,7 @@ mod test {
                 entries: vec![
                     DeleteObjectsEntry {
                         key: "keep.txt".to_string(),
-                        version_id: Some(Ulid::new()),
+                        version_id: Some(Ulid::r#gen()),
                     },
                     DeleteObjectsEntry {
                         key: "keep.txt".to_string(),

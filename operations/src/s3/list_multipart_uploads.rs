@@ -361,8 +361,8 @@ mod test {
             upload_id,
             bucket: bucket.to_string(),
             key: key.to_string(),
-            group_id: Ulid::new(),
-            created_by: UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::r#gen(),
+            created_by: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
             created_at,
             status: MultipartUploadStatus::Open,
             checksum_hint: None,
@@ -398,9 +398,17 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", "a")).await;
-        seed_upload(&storage_handle, &upload_record(Ulid::new(), "other", "b")).await;
-        seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", "c")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::r#gen(), "bucket", "a"),
+        )
+        .await;
+        seed_upload(&storage_handle, &upload_record(Ulid::r#gen(), "other", "b")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::r#gen(), "bucket", "c"),
+        )
+        .await;
 
         let result = drive(
             ListMultipartUploadsOperation::new(input(
@@ -430,7 +438,11 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", "a")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::r#gen(), "bucket", "a"),
+        )
+        .await;
 
         let result = drive(
             ListMultipartUploadsOperation::new(input("bucket", 0)),
@@ -454,8 +466,8 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let first = Ulid::new();
-        let second = Ulid::new();
+        let first = Ulid::r#gen();
+        let second = Ulid::r#gen();
         let (low, high) = if first < second {
             (first, second)
         } else {
@@ -464,7 +476,11 @@ mod test {
         // "b" comes after "aa" lexicographically; two uploads share key "aa".
         seed_upload(&storage_handle, &upload_record(high, "bucket", "aa")).await;
         seed_upload(&storage_handle, &upload_record(low, "bucket", "aa")).await;
-        seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", "b")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::r#gen(), "bucket", "b"),
+        )
+        .await;
 
         let result = drive(
             ListMultipartUploadsOperation::new(input(
@@ -501,8 +517,8 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         let versions = {
-            let first = Ulid::new();
-            let second = Ulid::new();
+            let first = Ulid::r#gen();
+            let second = Ulid::r#gen();
             if first < second {
                 (first, second)
             } else {
@@ -560,7 +576,11 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         for key in ["a", "b", "c", "d"] {
-            seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", key)).await;
+            seed_upload(
+                &storage_handle,
+                &upload_record(Ulid::r#gen(), "bucket", key),
+            )
+            .await;
         }
 
         let mut key_marker = None;
@@ -603,7 +623,7 @@ mod test {
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let ids = [Ulid::new(), Ulid::new(), Ulid::new()];
+        let ids = [Ulid::r#gen(), Ulid::r#gen(), Ulid::r#gen()];
         for (index, upload_id) in ids.iter().enumerate() {
             seed_upload(
                 &storage_handle,
@@ -664,7 +684,11 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         for key in ["docs/1", "docs/2", "images/1", "readme"] {
-            seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", key)).await;
+            seed_upload(
+                &storage_handle,
+                &upload_record(Ulid::r#gen(), "bucket", key),
+            )
+            .await;
         }
 
         let result = drive(
@@ -699,7 +723,11 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         for key in ["a.txt", "dir/1", "dir/2", "z.txt"] {
-            seed_upload(&storage_handle, &upload_record(Ulid::new(), "bucket", key)).await;
+            seed_upload(
+                &storage_handle,
+                &upload_record(Ulid::r#gen(), "bucket", key),
+            )
+            .await;
         }
 
         let result = drive(

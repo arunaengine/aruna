@@ -516,13 +516,13 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 async fn complete_multipart_upload_rejects_missing_initiated_checksum_contract() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
-    let created_by = UserId::local(Ulid::new(), realm_id);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "contract.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id: Ulid::r#gen(),
             created_by,
             checksum_hint: Some(MultipartUploadChecksumHint {
                 algorithm: Some(ChecksumAlgorithm::Sha256),

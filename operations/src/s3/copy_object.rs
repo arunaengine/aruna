@@ -286,7 +286,7 @@ mod test {
         data: &'static [u8],
     ) -> PutObjectConfig {
         PutObjectConfig {
-            user_id: UserId::local(Ulid::new(), realm_id),
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -305,7 +305,7 @@ mod test {
     }
 
     async fn write_version(context: &DriverContext, bucket: &str, key: &str, version: BlobVersion) {
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -370,7 +370,7 @@ mod test {
     async fn materialized_copy_dedups_source_blob() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
         let source = drive(
@@ -402,7 +402,7 @@ mod test {
                 source_group_id: group_id,
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -436,7 +436,7 @@ mod test {
     async fn reference_copy_materializes_bytes_with_snapshot_binding() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
         let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
@@ -450,7 +450,7 @@ mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
-            connector_id: Some(Ulid::new()),
+            connector_id: Some(Ulid::r#gen()),
         };
         write_version(
             &context,
@@ -466,7 +466,7 @@ mod test {
                     source_version: None,
                 },
                 SystemTime::UNIX_EPOCH,
-                UserId::local(Ulid::new(), realm_id),
+                UserId::local(Ulid::r#gen(), realm_id),
                 SystemTime::UNIX_EPOCH,
             ),
         )
@@ -481,7 +481,7 @@ mod test {
                 source_group_id: group_id,
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -512,7 +512,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id,
-                user_identity: UserId::local(Ulid::new(), realm_id),
+                user_identity: UserId::local(Ulid::r#gen(), realm_id),
             }),
             &context,
         )
@@ -532,10 +532,10 @@ mod test {
     async fn delete_marker_source_errors() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
-        let version_id = Ulid::new();
+        let version_id = Ulid::r#gen();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -553,7 +553,7 @@ mod test {
                     .into(),
                 value: BlobVersion::deleted(
                     SystemTime::now(),
-                    UserId::local(Ulid::new(), realm_id),
+                    UserId::local(Ulid::r#gen(), realm_id),
                 )
                 .to_bytes()
                 .unwrap()
@@ -575,7 +575,7 @@ mod test {
                 source_group_id: group_id,
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,
@@ -688,7 +688,7 @@ mod test {
     async fn precondition_failure_leaves_no_new_version() {
         let (_temp, context) = full_context().await;
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let node_id = context.net_handle.as_ref().unwrap().node_id();
 
         drive(
@@ -716,7 +716,7 @@ mod test {
                 source_group_id: group_id,
                 dest_bucket: "bucket".to_string(),
                 dest_key: "dest.txt".to_string(),
-                user_id: UserId::local(Ulid::new(), realm_id),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
                 group_id,
                 realm_id,
                 node_id,

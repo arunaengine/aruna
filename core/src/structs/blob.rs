@@ -653,8 +653,8 @@ mod tests {
         let now = SystemTime::now();
         let base = UserAccess {
             access_key: "access".into(),
-            user_identity: UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
-            group_id: Ulid::new(),
+            user_identity: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::r#gen(),
             secret: "secret".into(),
             expiry: now + Duration::from_secs(60),
             path_restrictions: None,

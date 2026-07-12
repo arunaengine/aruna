@@ -1057,8 +1057,8 @@ mod test {
             DeleteObjectOperation::new(DeleteObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "missing.txt".to_string(),
-                version_id: Some(Ulid::new()),
-                group_id: Ulid::new(),
+                version_id: Some(Ulid::r#gen()),
+                group_id: Ulid::r#gen(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: iroh::SecretKey::generate().public(),
                 deleted_by: test_user_id(),

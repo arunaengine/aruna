@@ -409,7 +409,7 @@ mod test {
     use tempfile::tempdir;
 
     fn test_user_id() -> UserId {
-        UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]))
+        UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32]))
     }
 
     #[tokio::test]
@@ -429,7 +429,7 @@ mod test {
             UploadPartOperation::new(UploadPartInput {
                 bucket: "mybucket".to_string(),
                 key: "object.txt".to_string(),
-                upload_id: Ulid::new(),
+                upload_id: Ulid::r#gen(),
                 part_number: 1,
                 content_length: None,
                 body: None,

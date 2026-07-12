@@ -2765,7 +2765,7 @@ mod tests {
             None
         );
 
-        let marker = Ulid::new();
+        let marker = Ulid::r#gen();
         assert_eq!(
             parse_upload_id_marker(Some("key"), Some(&marker.to_string())).unwrap(),
             Some(marker)
