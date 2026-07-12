@@ -236,7 +236,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::new(),
+            claim_token: Ulid::r#gen(),
             lease_expires_at_ms: 1,
         });
         insert_job(&storage, &record).await.unwrap();
@@ -263,7 +263,7 @@ mod tests {
         record.state = JobState::Running;
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
-            claim_token: Ulid::new(),
+            claim_token: Ulid::r#gen(),
             lease_expires_at_ms: unix_timestamp_millis() + JOB_LEASE_MS,
         });
         insert_job(&storage, &record).await.unwrap();
