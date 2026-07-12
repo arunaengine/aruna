@@ -523,6 +523,8 @@ pub async fn set_cancel_requested(
 }
 
 /// Owner-scoped listing, newest first, with an opaque cursor and optional state filter.
+/// Scans across owner-index pages until `limit` records match the filter or the index is
+/// exhausted, so a filtered page never returns empty with a dangling `next_cursor`.
 pub async fn list_jobs_for_user(
     storage: &StorageHandle,
     user_id: UserId,
@@ -530,35 +532,61 @@ pub async fn list_jobs_for_user(
     limit: usize,
     state_filter: Option<JobState>,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    let start_after = cursor.map(|cursor| {
+    if limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+    let prefix = job_owner_index_prefix(user_id);
+    let mut start_after = cursor.map(|cursor| {
         let mut key = user_id.to_storage_key();
         key.extend_from_slice(&cursor);
         ByteView::from(key)
     });
-    let (values, _) = iter_prefix_page(
-        storage,
-        JOB_OWNER_INDEX_KEYSPACE,
-        Some(job_owner_index_prefix(user_id)),
-        start_after,
-        limit.saturating_add(1),
-        None,
-    )
-    .await?;
-
-    let has_more = values.len() > limit;
     let mut records = Vec::new();
-    let mut last_cursor = None;
-    for (key, _) in values.into_iter().take(limit) {
-        let (_, created_at_ms, job_id) =
-            parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
-        last_cursor = Some(job_owner_cursor(created_at_ms, job_id));
-        if let Some(record) = read_job_record(storage, job_id, None).await?
-            && state_filter.is_none_or(|state| record.state == state)
-        {
-            records.push(record);
+    loop {
+        let (values, _) = iter_prefix_page(
+            storage,
+            JOB_OWNER_INDEX_KEYSPACE,
+            Some(prefix.clone()),
+            start_after,
+            limit,
+            None,
+        )
+        .await?;
+        if values.is_empty() {
+            return Ok((records, None));
         }
+        let scanned = values.len();
+        let mut resume = None;
+        for (key, _) in values {
+            let (_, created_at_ms, job_id) =
+                parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
+            resume = Some(key);
+            if let Some(record) = read_job_record(storage, job_id, None).await?
+                && state_filter.is_none_or(|state| record.state == state)
+            {
+                records.push(record);
+                if records.len() == limit {
+                    let next = job_owner_cursor(created_at_ms, job_id);
+                    let mut resume_key = user_id.to_storage_key();
+                    resume_key.extend_from_slice(&next);
+                    let (peek, _) = iter_prefix_page(
+                        storage,
+                        JOB_OWNER_INDEX_KEYSPACE,
+                        Some(prefix.clone()),
+                        Some(ByteView::from(resume_key)),
+                        1,
+                        None,
+                    )
+                    .await?;
+                    return Ok((records, if peek.is_empty() { None } else { Some(next) }));
+                }
+            }
+        }
+        if scanned < limit {
+            return Ok((records, None));
+        }
+        start_after = resume;
     }
-    Ok((records, if has_more { last_cursor } else { None }))
 }
 
 pub async fn find_dedup_job(
@@ -794,6 +822,7 @@ mod tests {
                 steps: 1,
                 step_sleep_ms: 0,
                 fail_at: None,
+                panic_at: None,
                 cleanup_marker: None,
             },
             UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
@@ -1121,6 +1150,49 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, ClaimOutcome::NotEligible));
+    }
+
+    // A state filter must scan past non-matching pages, not return an empty page + cursor.
+    #[tokio::test]
+    async fn filter_scans_pages() {
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let make = |seq: u64, state: JobState| {
+            let mut record = JobRecord::new(
+                JobId(Ulid::from_parts(seq, 0)),
+                JobPayload::Probe {
+                    steps: 1,
+                    step_sleep_ms: 0,
+                    fail_at: None,
+                    panic_at: None,
+                    cleanup_marker: None,
+                },
+                owner,
+                node_id(7),
+                seq * 1000,
+                seq * 1000,
+                None,
+            );
+            record.state = state;
+            record
+        };
+        for record in [
+            make(3, JobState::Queued),
+            make(2, JobState::Queued),
+            make(1, JobState::Failed),
+        ] {
+            insert_job(&storage, &record).await.unwrap();
+        }
+
+        let (page, cursor) = list_jobs_for_user(&storage, owner, None, 1, Some(JobState::Failed))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1, "the older Failed job is found across pages");
+        assert_eq!(page[0].state, JobState::Failed);
+        assert!(
+            cursor.is_none(),
+            "no dangling cursor on an exhausted filter"
+        );
     }
 
     #[tokio::test]
