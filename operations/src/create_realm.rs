@@ -880,9 +880,13 @@ mod test {
             .filter(|binding| binding.strategy_id == everywhere.strategy_id)
             .map(|binding| binding.scope.clone())
             .collect::<Vec<_>>();
-        assert_eq!(config_doc.strategy_bindings.len(), 2);
+        assert_eq!(config_doc.strategy_bindings.len(), 4);
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
+        // Group (which covers group authorization documents) and user documents
+        // must reach every node: the permission check reads them locally.
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Group)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::User)));
     }
 
     #[test]

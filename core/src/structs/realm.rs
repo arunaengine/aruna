@@ -373,9 +373,18 @@ impl RealmConfigDocument {
 
     /// Seeds the default placement strategies realm creation installs: a
     /// `default` strategy using the configured metadata replication factor (the
-    /// realm default) plus an `everywhere` strategy bound to the
-    /// `MetadataRegistry` and `Admin` document classes. Replaces any existing
-    /// strategy configuration.
+    /// realm default) plus an `everywhere` strategy bound to the control-document
+    /// classes. Replaces any existing strategy configuration.
+    ///
+    /// Group, user and metadata-registry documents are bound to `everywhere`
+    /// (`replica_count: None`, i.e. every sync-eligible node) rather than to the
+    /// capped default. They are control documents — O(groups + users), not
+    /// O(documents) — and the permission system structurally requires them
+    /// locally: `CheckPermissionsOperation` reads the group authorization
+    /// document from the local `AUTH_KEYSPACE` and hard-fails when it is absent,
+    /// so a node outside a group's replica set could not authorize any request
+    /// touching that group. `DocumentClass::Group` covers the group document and
+    /// its authorization document alike (see `placement::document_class`).
     pub fn seed_default_placement(&mut self) {
         let default_strategy = PlacementStrategy {
             strategy_id: Ulid::r#gen(),
@@ -394,16 +403,18 @@ impl RealmConfigDocument {
             shard_count: DEFAULT_SHARD_COUNT,
         };
         self.default_strategy_id = Some(default_strategy.strategy_id);
-        self.strategy_bindings = vec![
-            StrategyBinding {
-                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
-                strategy_id: everywhere_strategy.strategy_id,
-            },
-            StrategyBinding {
-                scope: BindingScope::Class(DocumentClass::Admin),
-                strategy_id: everywhere_strategy.strategy_id,
-            },
-        ];
+        self.strategy_bindings = [
+            DocumentClass::MetadataRegistry,
+            DocumentClass::Admin,
+            DocumentClass::Group,
+            DocumentClass::User,
+        ]
+        .into_iter()
+        .map(|class| StrategyBinding {
+            scope: BindingScope::Class(class),
+            strategy_id: everywhere_strategy.strategy_id,
+        })
+        .collect();
         self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
