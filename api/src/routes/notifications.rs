@@ -181,6 +181,9 @@ fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> Serve
         WatchDispatchError::CapExceeded => {
             ServerError::Conflict("notification watch subscription cap reached".to_string())
         }
+        // A holder-side denial answers exactly as the create-time check does, so
+        // an unreadable path never separates into a distinct existence signal.
+        WatchDispatchError::Unauthorized => ServerError::Forbidden,
         WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
         WatchDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");

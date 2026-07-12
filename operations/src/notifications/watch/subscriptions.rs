@@ -24,6 +24,7 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
+use crate::notifications::watch::authorization::is_watch_authorized;
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -34,8 +35,15 @@ const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
 /// holder proxy to surface a 409 to the API layer.
 pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscription cap reached";
 
+/// Stable reject reason for an unauthorized create; matched verbatim by the
+/// holder proxy to surface a 403 to the API layer.
+pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
+    "watch subscription owner lacks READ on the watched path";
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
+    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}")]
+    Unauthorized,
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
     #[error("watch path prefix must not start with a slash")]
@@ -75,6 +83,10 @@ pub async fn create_watch_subscription(
     create_subscription(storage, subscription, None).await
 }
 
+/// The one holder-side create path, used by both the local API arm and the
+/// holder RPC. A proxying peer's assertion is not authority to watch, so the
+/// holder that persists and replicates the subscription re-derives the canonical
+/// permission path and checks the owner's READ itself before any durable write.
 pub async fn create_replicated_watch_subscription(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
@@ -84,6 +96,18 @@ pub async fn create_replicated_watch_subscription(
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    if !is_watch_authorized(
+        context,
+        owner.realm_id,
+        owner,
+        &subscription.path_prefix,
+        subscription.event_mask,
+    )
+    .await
+    .map_err(WatchSubscriptionError::Storage)?
+    {
+        return Err(WatchSubscriptionError::Unauthorized);
+    }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
     let subscription =
         create_subscription(&context.storage_handle, subscription, Some(replication)).await?;

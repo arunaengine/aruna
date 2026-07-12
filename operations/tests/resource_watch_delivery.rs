@@ -364,6 +364,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     let group_id = Ulid::r#gen();
     let data_node_id = nodes[1].net.node_id();
+    install_group_authorization(&nodes, realm_id, group_id, owner).await?;
 
     // Node B is not the holder, so every create proxies to node A over the wire.
     for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {

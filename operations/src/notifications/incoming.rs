@@ -25,13 +25,13 @@ use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::authorization::list_authorized_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish,
 };
 use crate::notifications::watch::subscriptions::{
     create_replicated_watch_subscription, delete_replicated_watch_subscription,
-    list_watch_subscriptions,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -245,9 +245,9 @@ async fn build_response(
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match list_watch_subscriptions(&context.storage_handle, owner).await {
+            match list_authorized_watch_subscriptions(context, owner).await {
                 Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
@@ -653,7 +653,9 @@ mod tests {
         unread_count_remote,
     };
     use crate::notifications::inbox::upsert_inbox_records;
-    use crate::notifications::watch::subscriptions::create_watch_subscription;
+    use crate::notifications::watch::subscriptions::{
+        WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
+    };
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
@@ -1446,6 +1448,7 @@ mod tests {
         .await;
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
         let prefix = data_path("prefix");
         let created = create_watch_remote(&a.net, b.net.node_id(), owner, prefix.clone(), mask)
@@ -1522,6 +1525,104 @@ mod tests {
                 .await
                 .expect("list succeeds")
                 .is_empty()
+        );
+    }
+
+    // The holder persists and replicates the subscription, so a proxying peer's
+    // assertion is not authority to watch: an owner without READ is refused there
+    // too, and nothing durable is written.
+    #[tokio::test]
+    async fn create_requires_read() {
+        let realm_id = RealmId::from_bytes([86u8; 32]);
+        let a = spawn(realm_id, [86u8; 32]).await;
+        let b = spawn(realm_id, [87u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        // The watched group exists and is readable, just not by `owner`.
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        let error = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            data_path("prefix"),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )
+        .await
+        .expect_err("an owner without READ must be refused by the holder");
+        assert_eq!(error, WATCH_SUBSCRIPTION_UNAUTHORIZED);
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty(),
+            "an unauthorized create must not persist watch state"
+        );
+    }
+
+    // Enumeration shares the delivery authorization result: once READ is revoked
+    // the watch stops being listed, though the stored row itself survives.
+    #[tokio::test]
+    async fn revoked_watch_unlisted() {
+        let realm_id = RealmId::from_bytes([84u8; 32]);
+        let a = spawn(realm_id, [84u8; 32]).await;
+        let b = spawn(realm_id, [85u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
+        let created = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            data_path("prefix"),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )
+        .await
+        .expect("authorized create succeeds");
+        assert_eq!(
+            list_watches_remote(&a.net, b.net.node_id(), owner)
+                .await
+                .expect("list succeeds"),
+            vec![created]
+        );
+
+        // Re-owning the group drops the original owner's READ.
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        assert!(
+            list_watches_remote(&a.net, b.net.node_id(), owner)
+                .await
+                .expect("list after revocation succeeds")
+                .is_empty(),
+            "a watch whose READ was revoked must not be enumerable"
+        );
+        assert_eq!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("stored row survives")
+                .len(),
+            1,
+            "the row is filtered at the surface, not silently deleted"
         );
     }
 

@@ -1,16 +1,19 @@
 use std::str::FromStr;
 
 use aruna_core::NodeId;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, Permission, RealmId, WatchEventMask, WatchSubscription,
     blob_bucket_permission_path, parse_data_watch_resource_path,
 };
+use aruna_core::types::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::placement::filter_locally_held_watch_subscriptions;
+use crate::notifications::watch::subscriptions::list_watch_subscriptions;
 
 pub struct AuthorizedWatchSubscriptions {
     pub subscriptions: Vec<WatchSubscription>,
@@ -50,6 +53,80 @@ pub fn watch_permission_path(
     }
 }
 
+/// The single canonical authorization result every watch surface shares: the
+/// owner must still hold READ on the permission path derived from the watched
+/// prefix. A prefix with no canonical resource identity, and any non-user owner,
+/// is unauthorized. A check that cannot be evaluated is an error, never a grant,
+/// so callers fail closed.
+pub async fn is_watch_authorized(
+    context: &DriverContext,
+    realm_id: RealmId,
+    owner: UserId,
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+) -> Result<bool, String> {
+    let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
+        return Ok(false);
+    };
+    if owner.is_nil() || owner.realm_id != realm_id {
+        return Ok(false);
+    }
+    match drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: owner,
+                realm_id,
+                path_restrictions: None,
+            },
+            path: permission_path,
+            required_permission: Permission::READ,
+        }),
+        context,
+    )
+    .await
+    {
+        Ok(allowed) => Ok(allowed),
+        // A path whose realm, group or authorization state is absent is simply
+        // unreadable. Answering it exactly as a denied role keeps a watch from
+        // separating "does not exist" from "you may not read it", which is the
+        // same choice the metadata surface makes.
+        Err(
+            AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::AuthDocNotFound,
+        ) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Holder-side enumeration of one user's watches, filtered through the same
+/// authorization result delivery uses, so a revoked watch stops being visible as
+/// well as stopping delivery.
+pub async fn list_authorized_watch_subscriptions(
+    context: &DriverContext,
+    owner: UserId,
+) -> Result<Vec<WatchSubscription>, String> {
+    let subscriptions = list_watch_subscriptions(&context.storage_handle, owner)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut authorized = Vec::with_capacity(subscriptions.len());
+    for subscription in subscriptions {
+        if is_watch_authorized(
+            context,
+            owner.realm_id,
+            subscription.owner,
+            &subscription.path_prefix,
+            subscription.event_mask,
+        )
+        .await?
+        {
+            authorized.push(subscription);
+        }
+    }
+    Ok(authorized)
+}
+
 pub async fn filter_authorized_watch_subscriptions(
     context: &DriverContext,
     realm_id: RealmId,
@@ -65,28 +142,12 @@ pub async fn filter_authorized_watch_subscriptions(
     let mut check_failed = false;
 
     for subscription in subscriptions {
-        let Some(permission_path) =
-            watch_permission_path(realm_id, &subscription.path_prefix, subscription.event_mask)
-        else {
-            dropped = true;
-            continue;
-        };
-        if subscription.owner.is_nil() || subscription.owner.realm_id != realm_id {
-            dropped = true;
-            continue;
-        }
-        let auth_context = AuthContext {
-            user_id: subscription.owner,
-            realm_id,
-            path_restrictions: None,
-        };
-        match drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path: permission_path.clone(),
-                required_permission: Permission::READ,
-            }),
+        match is_watch_authorized(
             context,
+            realm_id,
+            subscription.owner,
+            &subscription.path_prefix,
+            subscription.event_mask,
         )
         .await
         {
@@ -97,7 +158,7 @@ pub async fn filter_authorized_watch_subscriptions(
                 check_failed = true;
                 warn!(
                     owner = %subscription.owner,
-                    path = %permission_path,
+                    path = %subscription.path_prefix,
                     %error,
                     "Watch permission re-check failed closed"
                 );
@@ -116,9 +177,40 @@ pub async fn filter_authorized_watch_subscriptions(
 mod tests {
     use super::*;
     use aruna_core::structs::{WatchEventKind, data_watch_resource_path};
+    use aruna_storage::FjallStorage;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    // Anonymous callers carry a nil user id and own no inbox to deliver into, so
+    // a watch stays a user-plane feature even where the watched resource is
+    // publicly readable. The nil owner is refused before any role is evaluated.
+    #[tokio::test]
+    async fn anonymous_owner_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = DriverContext {
+            storage_handle: FjallStorage::open(dir.path().to_str().expect("temp path"))
+                .expect("storage opens"),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+        let realm_id = RealmId([9u8; 32]);
+        let prefix = data_watch_resource_path(Ulid::from_bytes([4u8; 16]), node(3), "bucket", "");
+
+        assert_eq!(
+            is_watch_authorized(
+                &context,
+                realm_id,
+                UserId::nil(realm_id),
+                &prefix,
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            )
+            .await,
+            Ok(false)
+        );
     }
 
     #[test]
