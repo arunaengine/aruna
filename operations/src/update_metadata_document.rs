@@ -15,6 +15,7 @@ use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -41,7 +42,7 @@ pub struct UpdateMetadataDocumentConfig {
     pub mutation: UpdateMetadataDocumentMutation,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UpdateMetadataDocumentMutation {
     ReplaceRoCrate { jsonld: String },
     UpsertDataEntity { jsonld: String },

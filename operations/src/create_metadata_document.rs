@@ -12,9 +12,9 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument};
 use aruna_core::types::{Effects, GroupId};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::read_effect;
@@ -22,8 +22,7 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{read_registry_by_document_effect, write_create_event_effect};
 use crate::placement::{
-    PlacementResolutionContext, choose_origin_bucket, placement_ref_for_target,
-    strategy_for_target, subject_bytes,
+    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,7 +35,7 @@ pub struct CreateMetadataDocumentConfig {
     pub payload: CreateMetadataDocumentPayload,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CreateMetadataDocumentPayload {
     Scaffold {
         name: String,
@@ -97,6 +96,10 @@ pub enum CreateMetadataDocumentError {
     MetadataError(#[from] MetadataError),
     #[error("document already exists")]
     DocumentAlreadyExists,
+    /// The receiving node holds no bucket of the governing strategy, so it can
+    /// never publish this document. The caller forwards the create to a holder.
+    #[error("create-receiving node holds no bucket of the governing strategy")]
+    OriginHoldsNoBucket,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("topic announcement failed: {0}")]
@@ -125,6 +128,10 @@ impl CreateMetadataDocumentOperation {
         let mut operation = Self::new(config);
         operation.skip_existing_check = true;
         operation
+    }
+
+    pub fn config(&self) -> &CreateMetadataDocumentConfig {
+        &self.config
     }
 
     fn graph_iri(&self) -> String {
@@ -158,9 +165,17 @@ impl CreateMetadataDocumentOperation {
     /// buckets it holds. Stamped at event-append time only: the projector
     /// re-runs on replay, and re-choosing under a changed config would fork the
     /// document across two topics.
-    fn choose_placement(&self, config: Option<&RealmConfigDocument>) -> PlacementRef {
+    ///
+    /// `Err` when a strategy governs the target but the receiving node holds
+    /// none of its buckets: it could never publish this document onto the
+    /// bucket's topic, so the create must be forwarded to a holder rather than
+    /// accepted onto a bucket it cannot replicate.
+    fn choose_placement(
+        &self,
+        config: Option<&RealmConfigDocument>,
+    ) -> Result<PlacementRef, CreateMetadataDocumentError> {
         let Some(config) = config else {
-            return PlacementRef::NIL;
+            return Ok(PlacementRef::NIL);
         };
         let target = self.lifecycle_target();
         let document_path =
@@ -170,24 +185,15 @@ impl CreateMetadataDocumentOperation {
             metadata_path: Some(document_path.as_str()),
         };
         let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
-            return PlacementRef::NIL;
+            return Ok(PlacementRef::NIL);
         };
-        match choose_origin_bucket(
+        choose_origin_bucket(
             config,
             strategy,
             self.config.actor.node_id,
             &subject_bytes(&target),
-        ) {
-            Some(placement) => placement,
-            None => {
-                warn!(
-                    document_id = %self.config.document_id,
-                    node_id = %self.config.actor.node_id,
-                    "Create-receiving node holds no bucket of the governing strategy; falling back to the hashed bucket"
-                );
-                placement_ref_for_target(config, &target, context)
-            }
-        }
+        )
+        .ok_or(CreateMetadataDocumentError::OriginHoldsNoBucket)
     }
 
     fn build_record(
@@ -401,8 +407,10 @@ impl Operation for CreateMetadataDocumentOperation {
                         },
                         None => None,
                     };
-                    let placement = self.choose_placement(config.as_ref());
-                    self.append_create_event_effect(placement)
+                    match self.choose_placement(config.as_ref()) {
+                        Ok(placement) => self.append_create_event_effect(placement),
+                        Err(error) => self.fail_without_cleanup(error),
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())

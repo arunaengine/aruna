@@ -431,7 +431,7 @@ pub async fn process_shard_placements(
     outcome
 }
 
-async fn load_realm_config(
+pub(crate) async fn load_realm_config(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
 ) -> Option<RealmConfigDocument> {

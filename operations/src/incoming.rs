@@ -299,7 +299,10 @@ impl InboundEventHandler for OperationsInboundHandler {
                         warn!(node_id = %node_id, "Dropping inbound metadata stream without metadata handle");
                         return;
                     };
-                    if let Err(err) = metadata_handle.handle_inbound_stream(stream, node_id).await {
+                    if let Err(err) = metadata_handle
+                        .handle_inbound_stream(&self.context, stream, node_id)
+                        .await
+                    {
                         error!(error = ?err, "Failed to process inbound metadata stream");
                     }
                 }

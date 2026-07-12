@@ -1,8 +1,14 @@
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
+use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
+use ulid::Ulid;
+
+use crate::create_metadata_document::CreateMetadataDocumentPayload;
+use crate::update_metadata_document::UpdateMetadataDocumentMutation;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
@@ -83,6 +89,34 @@ pub enum MetadataTransportMessage {
     SearchResults {
         hits: Vec<MetadataSearchHit>,
     },
+    /// A metadata write that arrived at a node holding none of the document's
+    /// bucket, forwarded to a holder. The payloads mirror the HTTP handlers'
+    /// deconstructed request; `auth_token` carries the caller's authority so the
+    /// holder re-runs the same permission checks the origin would have run.
+    ForwardCreateDocument {
+        auth_token: Option<MetadataAuthToken>,
+        group_id: GroupId,
+        document_id: Ulid,
+        document_path: String,
+        public: bool,
+        payload: CreateMetadataDocumentPayload,
+    },
+    ForwardUpdateDocument {
+        auth_token: Option<MetadataAuthToken>,
+        document_id: Ulid,
+        /// `None` leaves the holder's current visibility untouched: the origin's
+        /// record copy may be stale, so only an explicit request value travels.
+        public: Option<bool>,
+        mutation: UpdateMetadataDocumentMutation,
+    },
+    ForwardDeleteDocument {
+        auth_token: Option<MetadataAuthToken>,
+        document_id: Ulid,
+    },
+    ForwardedRecord {
+        record: Box<MetadataRegistryRecord>,
+    },
+    ForwardedDelete,
     Reject(String),
 }
 
@@ -147,6 +181,58 @@ mod tests {
             query: "dataset".to_string(),
             limit: 10,
         });
+    }
+
+    #[test]
+    fn forwarded_writes_carry_authority() {
+        // The holder applies a forwarded write under the caller's own token, so
+        // every forward variant must carry one: a tokenless forward would be an
+        // unauthenticated internal write path.
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardCreateDocument {
+            auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            group_id: Ulid::nil(),
+            document_id: Ulid::nil(),
+            document_path: "datasets/forwarded".to_string(),
+            public: true,
+            payload: CreateMetadataDocumentPayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardUpdateDocument {
+            auth_token: Some(MetadataAuthToken::bearer("update-token").unwrap()),
+            document_id: Ulid::nil(),
+            public: None,
+            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+        });
+        assert_has_auth_token_field(MetadataTransportMessage::ForwardDeleteDocument {
+            auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
+            document_id: Ulid::nil(),
+        });
+    }
+
+    #[test]
+    fn forwarded_create_round_trips() {
+        let message = MetadataTransportMessage::ForwardCreateDocument {
+            auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            group_id: Ulid::from_bytes([3u8; 16]),
+            document_id: Ulid::from_bytes([4u8; 16]),
+            document_path: "datasets/forwarded".to_string(),
+            public: false,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Forwarded".to_string(),
+                description: "Placed by a holder".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+
+        assert_eq!(
+            postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
+            message
+        );
     }
 
     #[test]

@@ -941,6 +941,7 @@ impl MetadataHandle {
     )]
     pub async fn handle_inbound_stream(
         &self,
+        context: &Arc<DriverContext>,
         mut stream: BiStream,
         peer: NodeId,
     ) -> Result<(), MetadataError> {
@@ -949,7 +950,7 @@ impl MetadataHandle {
         let message = read_transport_message(&mut stream).await?;
         let span = Span::current();
         record_elapsed_ms(&span, "read_ms", read_started);
-        span.record("request", metadata_transport_message_kind(&message));
+        span.record("request", transport_message_kind(&message));
 
         let process_started = Instant::now();
         let response = match message {
@@ -1004,8 +1005,15 @@ impl MetadataHandle {
                 },
                 Err(error) => MetadataTransportMessage::Reject(error.to_string()),
             },
+            forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
+            | MetadataTransportMessage::ForwardUpdateDocument { .. }
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }) => {
+                super::forward::apply_forwarded_write(context, peer, forward).await
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
+            | MetadataTransportMessage::ForwardedRecord { .. }
+            | MetadataTransportMessage::ForwardedDelete
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -1021,8 +1029,50 @@ impl MetadataHandle {
         record_elapsed_ms(&span, "write_ms", write_started);
         close_stream(&mut stream).await;
         record_elapsed_ms(&span, "elapsed_ms", total_started);
-        span.record("response", metadata_transport_message_kind(&response));
+        span.record("response", transport_message_kind(&response));
         Ok(())
+    }
+
+    /// Validates a forwarded caller's bearer token and confirms the forwarding
+    /// peer belongs to the token's realm, exactly as the query/search paths do.
+    pub(crate) async fn authorize_remote_peer(
+        &self,
+        peer: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+    ) -> Result<Option<AuthContext>, MetadataError> {
+        authorize_remote_metadata_peer(
+            &self.inner.auth_validation,
+            &self.inner.storage_handle,
+            peer,
+            self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+            auth_token,
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "metadata.forward.remote",
+        level = "debug",
+        skip(self, message),
+        fields(
+            peer = ?node_id,
+            request = transport_message_kind(&message),
+            elapsed_ms = field::Empty,
+        )
+    )]
+    pub(crate) async fn request_forwarded_write(
+        &self,
+        node_id: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Result<MetadataTransportMessage, MetadataError> {
+        let started = Instant::now();
+        let span = Span::current();
+        let result = send_remote_metadata_request(&self.inner, &span, node_id, message).await;
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        if let Err(error) = &result {
+            record_error(&span, &error.to_string());
+        }
+        result
     }
 
     #[tracing::instrument(
@@ -3112,12 +3162,17 @@ fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResul
     }
 }
 
-fn metadata_transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
     match message {
         MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
         MetadataTransportMessage::QueryResults { .. } => "query_results",
         MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
         MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
+        MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
+        MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
+        MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
+        MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::Reject(_) => "reject",
     }
 }
@@ -4132,7 +4187,7 @@ async fn refresh_lifecycle_visibility_for_records(
     skip(net_handle, message),
     fields(
         peer = ?node_id,
-        request = metadata_transport_message_kind(&message),
+        request = transport_message_kind(&message),
         response = field::Empty,
         open_stream_ms = field::Empty,
         write_ms = field::Empty,
@@ -4176,7 +4231,7 @@ async fn send_request(
     close_stream(&mut stream).await;
     record_elapsed_ms(&span, "close_ms", close_started);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
-    span.record("response", metadata_transport_message_kind(&response));
+    span.record("response", transport_message_kind(&response));
     Ok(response)
 }
 
