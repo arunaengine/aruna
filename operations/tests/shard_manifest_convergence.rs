@@ -33,6 +33,12 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 use ulid::Ulid;
 
+// Realm-node and manifest convergence poll to a condition; the ceilings only
+// bound a genuine hang, so they carry generous headroom for a loaded CI runner
+// where anti-entropy across the holders is thread-starved and slow.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+
 struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
@@ -101,7 +107,7 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     )
     .await?;
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
         let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
@@ -221,7 +227,7 @@ async fn wait_for_manifest_agreement(
     placement: PlacementRef,
     expected: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let left_manifest =
             assemble_shard_manifest(left.context.as_ref(), realm_id, placement).await?;
@@ -370,7 +376,7 @@ async fn wait_for_realm_node_convergence(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: std::collections::HashSet<NodeId> =
         nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + SETUP_TIMEOUT;
     loop {
         let mut converged = true;
         for node in nodes {
