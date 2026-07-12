@@ -80,7 +80,7 @@ pub async fn create_watch_subscription(
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
-    create_subscription(storage, subscription, None).await
+    create_subscription(storage, subscription, None, None).await
 }
 
 /// The one holder-side create path, used by both the local API arm and the
@@ -109,8 +109,13 @@ pub async fn create_replicated_watch_subscription(
         return Err(WatchSubscriptionError::Unauthorized);
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
-    let subscription =
-        create_subscription(&context.storage_handle, subscription, Some(replication)).await?;
+    let subscription = create_subscription(
+        &context.storage_handle,
+        subscription,
+        Some(replication),
+        Some(context),
+    )
+    .await?;
     schedule_replication(context).await;
     Ok(subscription)
 }
@@ -153,13 +158,14 @@ async fn create_subscription(
     storage: &StorageHandle,
     subscription: WatchSubscription,
     replication: Option<WatchReplication>,
+    authorizer: Option<&DriverContext>,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    match create_once(storage, &subscription, replication.as_ref()).await {
+    match create_once(storage, &subscription, replication.as_ref(), authorizer).await {
         Ok(()) => Ok(subscription),
         Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
         Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
         Err(CreateFailure::Conflict) => {
-            match create_once(storage, &subscription, replication.as_ref()).await {
+            match create_once(storage, &subscription, replication.as_ref(), authorizer).await {
                 Ok(()) => Ok(subscription),
                 Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
                 Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
@@ -175,6 +181,7 @@ async fn create_once(
     storage: &StorageHandle,
     subscription: &WatchSubscription,
     replication: Option<&WatchReplication>,
+    authorizer: Option<&DriverContext>,
 ) -> Result<(), CreateFailure> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -211,8 +218,22 @@ async fn create_once(
         }
     };
     if existing.len() >= NOTIFICATION_WATCH_PER_USER_CAP {
-        abort_txn(storage, txn_id).await;
-        return Err(CreateFailure::Cap);
+        let cap_reached = match authorizer {
+            None => true,
+            Some(context) => {
+                match authorized_cap_reached(context, storage, subscription.owner, txn_id).await {
+                    Ok(reached) => reached,
+                    Err(failure) => {
+                        abort_txn(storage, txn_id).await;
+                        return Err(failure);
+                    }
+                }
+            }
+        };
+        if cap_reached {
+            abort_txn(storage, txn_id).await;
+            return Err(CreateFailure::Cap);
+        }
     }
 
     let subscription_write = match watch_subscription_write_entry(subscription) {
@@ -275,6 +296,68 @@ async fn create_once(
             "unexpected storage event: {other:?}"
         ))),
     }
+}
+
+/// Whether the owner already holds the per-user cap of subscriptions that still
+/// pass the authorization check. Consulted only once the raw row count reaches
+/// the cap, so a create below the cap adds no auth checks. Rows the owner can no
+/// longer read are excluded, so a revoked row never permanently holds a cap
+/// slot. The scan stops at the cap, bounding a rejected create.
+async fn authorized_cap_reached(
+    context: &DriverContext,
+    storage: &StorageHandle,
+    owner: UserId,
+    txn_id: TxnId,
+) -> Result<bool, CreateFailure> {
+    let mut authorized = 0usize;
+    let mut start = None;
+    loop {
+        let (values, next) = match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                prefix: Some(watch_subscription_prefix(owner)),
+                start: start.map(IterStart::After),
+                limit: NOTIFICATION_WATCH_PER_USER_CAP.saturating_add(1),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
+            other => {
+                return Err(CreateFailure::Fatal(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        };
+        for (_, value) in values {
+            let subscription = WatchSubscription::from_bytes(&value)
+                .map_err(|error| CreateFailure::Fatal(error.to_string()))?;
+            if is_watch_authorized(
+                context,
+                subscription.owner.realm_id,
+                subscription.owner,
+                &subscription.path_prefix,
+                subscription.event_mask,
+            )
+            .await
+            .map_err(CreateFailure::Fatal)?
+            {
+                authorized += 1;
+                if authorized >= NOTIFICATION_WATCH_PER_USER_CAP {
+                    return Ok(true);
+                }
+            }
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => break,
+        }
+    }
+    Ok(false)
 }
 
 pub async fn delete_watch_subscription(
@@ -641,7 +724,12 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, WatchEventKind};
+    use aruna_core::NodeId;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, WatchEventKind,
+        data_watch_resource_path,
+    };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
@@ -661,6 +749,64 @@ mod tests {
             WatchEventKind::MetadataCreated,
             WatchEventKind::DataUploaded,
         ])
+    }
+
+    fn data_mask() -> WatchEventMask {
+        WatchEventMask::from_kinds([WatchEventKind::DataUploaded])
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn test_context(storage: StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        }
+    }
+
+    async fn install_auth(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        owner: UserId,
+        group_id: Ulid,
+        node_id: NodeId,
+    ) {
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            match storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected auth write event: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -741,6 +887,45 @@ mod tests {
                 .len(),
             NOTIFICATION_WATCH_PER_USER_CAP
         );
+    }
+
+    // A user churned through revocations: every stored row is now unreadable.
+    // Those dead rows must not permanently occupy cap slots, so an authorized
+    // create still succeeds even though the raw row count is already at the cap.
+    #[tokio::test]
+    async fn cap_skips_unauthorized() {
+        let (_dir, storage) = temp_storage();
+        let realm_id = RealmId([7u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        install_auth(&storage, realm_id, owner, group_id, node_id).await;
+
+        let dead_prefix = data_watch_resource_path(Ulid::nil(), node_id, "bucket", "");
+        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+            create_watch_subscription(
+                &storage,
+                owner,
+                dead_prefix.clone(),
+                data_mask(),
+                index as u64,
+            )
+            .await
+            .expect("dead row create");
+        }
+
+        let context = test_context(storage);
+        let authorized_prefix = data_watch_resource_path(group_id, node_id, "bucket", "reports/");
+        create_replicated_watch_subscription(
+            &context,
+            node_id,
+            owner,
+            authorized_prefix,
+            data_mask(),
+            9_999,
+        )
+        .await
+        .expect("authorized create despite dead rows at cap");
     }
 
     #[tokio::test]
