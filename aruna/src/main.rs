@@ -108,13 +108,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    let compute_handle = build_compute_registry(&config);
+
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
-        compute_handle: None,
+        compute_handle: compute_handle.clone(),
     });
 
     // Start the ops listener before realm bootstrap so `/readyz` reports 503
@@ -135,7 +137,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
-    let jobs_runtime = JobsRuntime::new();
+    // A compute-enabled node reconciles lost external attempts (never a blind
+    // requeue) via the registered reconciler.
+    let jobs_runtime = if compute_handle.is_some() {
+        JobsRuntime::with_reconciler(
+            aruna_operations::jobs::workflow::reconcile::ComputeReconciler::new(driver_ctx.clone()),
+        )
+    } else {
+        JobsRuntime::new()
+    };
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle, jobs_runtime.clone()).await;
 
@@ -419,6 +429,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     Ok(())
+}
+
+/// Build the executor registry from config. The Docker backend is opt-in via
+/// `ARUNA_COMPUTE_DOCKER=true`; an unreachable daemon leaves the node compute-less.
+fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
+    let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !docker_enabled {
+        return None;
+    }
+    match aruna_compute::docker::DockerBackend::connect() {
+        Ok(backend) => {
+            let endpoint = config
+                .s3_public_url
+                .clone()
+                .or_else(|| Some(format!("http://{}", config.s3_host)));
+            let registry = aruna_compute::ExecutorRegistry::new()
+                .with_backend(Arc::new(backend))
+                .with_workspace_endpoint(endpoint, "eu-central-1".to_string());
+            info!("Docker executor backend enabled");
+            Some(Arc::new(registry))
+        }
+        Err(error) => {
+            warn!(error = %error, "Docker executor requested but unavailable; running without compute");
+            None
+        }
+    }
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
