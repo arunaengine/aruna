@@ -1,3 +1,4 @@
+mod binding_directory;
 mod blob;
 pub mod checksum;
 mod group;
@@ -17,6 +18,7 @@ mod staging;
 mod structs;
 mod usage;
 
+pub use binding_directory::*;
 pub use blob::*;
 pub use group::*;
 pub use info::*;
