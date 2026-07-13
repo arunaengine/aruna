@@ -19,6 +19,7 @@ pub mod operation;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;
+pub mod structured_id;
 pub mod task;
 pub mod telemetry;
 pub mod trace_context;
