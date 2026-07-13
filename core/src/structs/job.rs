@@ -606,9 +606,23 @@ pub fn job_run_crate_key(job_id: JobId) -> Key {
     ByteView::from(job_id.to_bytes().to_vec())
 }
 
-/// Dedup key of the follow-on `WriteRunCrate` obligation for `job_id`.
+/// Dedup key of the follow-on `WriteRunCrate` obligation for `job_id`. Internal
+/// obligation keys live in the `internal/` subspace, disjoint from user keys.
 pub fn run_crate_dedup_key(job_id: JobId) -> Vec<u8> {
-    format!("run-crate/{job_id}").into_bytes()
+    format!("internal/run-crate/{job_id}").into_bytes()
+}
+
+/// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
+/// scoped to the submitting user (fixed-width id), so a caller can neither
+/// suppress an internal obligation nor squat another user's key.
+pub fn user_dedup_key(created_by: UserId, idempotency_key: &str) -> Vec<u8> {
+    let user = created_by.to_bytes();
+    let mut bytes = Vec::with_capacity(5 + user.len() + 1 + idempotency_key.len());
+    bytes.extend_from_slice(b"user/");
+    bytes.extend_from_slice(&user);
+    bytes.push(b'/');
+    bytes.extend_from_slice(idempotency_key.as_bytes());
+    bytes
 }
 
 fn schedule_index_key(prefix: &[u8], timestamp_ms: u64, job_id: JobId) -> Key {
@@ -860,6 +874,25 @@ mod tests {
         assert!(name.ends_with("-a2"));
         assert_eq!(name, name.to_lowercase());
         assert_eq!(name, attempt_external_name(id, 2));
+    }
+
+    #[test]
+    fn dedup_key_namespaces() {
+        use crate::structs::RealmId;
+        let job = JobId::from_bytes([1u8; 16]);
+        let user_a = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let user_b = UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32]));
+
+        assert!(run_crate_dedup_key(job).starts_with(b"internal/"));
+        assert!(user_dedup_key(user_a, "k").starts_with(b"user/"));
+        // A caller cannot forge an internal obligation key through their
+        // idempotency key, and users cannot squat each other's keys.
+        assert_ne!(
+            user_dedup_key(user_a, &format!("internal/run-crate/{job}")),
+            run_crate_dedup_key(job)
+        );
+        assert_ne!(user_dedup_key(user_a, "k"), user_dedup_key(user_b, "k"));
+        assert_eq!(user_dedup_key(user_a, "k"), user_dedup_key(user_a, "k"));
     }
 
     #[test]

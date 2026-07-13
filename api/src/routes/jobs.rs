@@ -310,14 +310,12 @@ pub async fn submit_job(
         inputs,
         output_prefixes: request.output_prefixes,
     };
-    let dedup_key = request.idempotency_key.map(|key| key.into_bytes());
-
     let result = submit_execution_job(
         &state.get_ctx(),
         spec,
         auth.user_id,
         state.get_node_id(),
-        dedup_key,
+        request.idempotency_key,
     )
     .await
     .map_err(map_submit_error)?;

@@ -1,6 +1,8 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::structs::{ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RunCrateStatus};
+use aruna_core::structs::{
+    ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RunCrateStatus, user_dedup_key,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
@@ -17,14 +19,16 @@ use super::submit::{
 use crate::driver::{DriverContext, drive};
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
-/// and drives the fenced external attempt lifecycle.
+/// and drives the fenced external attempt lifecycle. The idempotency key is
+/// namespaced per user, disjoint from internal obligation keys.
 pub async fn submit_execution_job(
     context: &DriverContext,
     spec: ExecutionSpec,
     created_by: UserId,
     owner_node_id: NodeId,
-    dedup_key: Option<Vec<u8>>,
+    idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
+    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
     drive(
         SubmitJobOperation::new(SubmitJobSpec {
             payload: JobPayload::Execution(spec),
