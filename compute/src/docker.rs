@@ -8,7 +8,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
     LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-    StopContainerOptionsBuilder, WaitContainerOptions,
+    StopContainerOptionsBuilder,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -239,15 +239,19 @@ impl ExecutorBackend for DockerBackend {
         attempt: &AttemptRef,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        let name = attempt.external_name();
-        let mut stream = self
-            .docker
-            .wait_container(&name, None::<WaitContainerOptions>);
-        tokio::select! {
-            _ = cancel.cancelled() => self.status(attempt).await,
-            // wait_container reports non-zero exits as a stream error; inspect is
-            // the definitive evidence either way.
-            _ = stream.next() => self.status(attempt).await,
+        // The daemon's wait endpoint (condition "not-running") answers instantly
+        // for a created-but-never-started container, which would surface a
+        // non-terminal status and break the wait contract. Poll inspect to
+        // terminal evidence or the cancel token, like the trait default.
+        loop {
+            let status = self.status(attempt).await?;
+            if status.is_terminal() {
+                return Ok(status);
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return self.status(attempt).await,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
         }
     }
 
