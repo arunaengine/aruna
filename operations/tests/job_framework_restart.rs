@@ -119,7 +119,7 @@ async fn drive_until_terminal(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let batch = process_job_queue_batch(&context.storage_handle, node_id(9), 8).await?;
+        let batch = process_job_queue_batch(&context.storage_handle, node_id(9), 8, None).await?;
         for record in batch.claimed {
             runtime.spawn(context.clone(), record);
         }

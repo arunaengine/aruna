@@ -5,8 +5,8 @@ use aruna_core::keyspaces::{
     JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    JobClaim, JobError, JobId, JobProgress, JobRecord, JobResultPayload, JobState,
-    JobTransitionError, job_due_index_key, job_lease_index_key, job_owner_cursor,
+    JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord, JobResultPayload,
+    JobState, JobTransitionError, job_due_index_key, job_lease_index_key, job_owner_cursor,
     job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
     parse_job_owner_index_key, validate_transition,
 };
@@ -455,6 +455,9 @@ pub async fn cancel_running_job(
 pub enum RequeueOutcome {
     Requeued(JobRecord),
     Failed(JobRecord),
+    /// An external attempt lost its lease or the node restarted: requeuing would
+    /// double-run the container, so the record is left untouched for reconciliation.
+    NeedsReconcile(JobRecord),
     Skipped,
 }
 
@@ -462,6 +465,8 @@ pub enum RequeueOutcome {
 /// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
 /// re-check, in-txn, that the job still holds an expired lease: a revived renew is not
 /// revoked, and a claim-less record (already requeued) is not charged a second attempt.
+/// An external attempt that passes those checks is never requeued here; it returns
+/// `NeedsReconcile` untouched.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -471,8 +476,10 @@ pub async fn requeue_job(
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
     let mut persisted = false;
+    let mut needs_reconcile = false;
     let record = mutate_job(storage, job_id, |record| {
         persisted = false;
+        needs_reconcile = false;
         if let Some(token) = token {
             guard_token(record, token)?;
         }
@@ -486,6 +493,12 @@ pub async fn requeue_job(
             if claim.lease_expires_at_ms > now {
                 return Ok(JobMutation::Skip);
             }
+        }
+        // Checked AFTER the expired-lease re-check: a live renewed attempt is a
+        // plain Skip and must not be routed to the reconciler.
+        if record.execution_class == JobExecutionClass::ExternalAttempt {
+            needs_reconcile = true;
+            return Ok(JobMutation::Skip);
         }
         if let Some(error) = error.clone() {
             record.last_error = Some(error);
@@ -506,7 +519,9 @@ pub async fn requeue_job(
     })
     .await?;
 
-    Ok(if !persisted {
+    Ok(if needs_reconcile {
+        RequeueOutcome::NeedsReconcile(record)
+    } else if !persisted {
         RequeueOutcome::Skipped
     } else if record.state == JobState::Failed {
         RequeueOutcome::Failed(record)
@@ -1418,5 +1433,47 @@ mod tests {
                 .unwrap(),
             Some(job_b)
         );
+    }
+
+    // An external attempt with an expired lease is never requeued; it is reconciled.
+    #[tokio::test]
+    async fn external_never_requeued() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xE0; 16]);
+        let mut record = running_record(job_id, Ulid::r#gen(), 1);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        insert_job(&storage, &record).await.unwrap();
+
+        let outcome = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::NeedsReconcile(_)));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Running, "not requeued");
+        assert_eq!(stored.attempts, 0, "attempt count untouched");
+        assert!(stored.claim.is_some(), "claim untouched");
+    }
+
+    // A live renewed external lease is a plain sweep Skip, never routed to reconcile.
+    #[tokio::test]
+    async fn external_live_skipped() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xE2; 16]);
+        let mut record = running_record(job_id, Ulid::r#gen(), 10_000);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        insert_job(&storage, &record).await.unwrap();
+
+        let outcome = requeue_job(&storage, job_id, None, 5_000, Some(5_000), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::Skipped));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Running);
     }
 }

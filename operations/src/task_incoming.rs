@@ -1574,16 +1574,22 @@ impl OperationsTaskHandler {
         let node_id = net_handle.node_id();
         let capacity = self.jobs_runtime.available_slots();
 
-        let result =
-            match process_job_queue_batch(&self.context.storage_handle, node_id, capacity).await {
-                Ok(result) => result,
-                Err(error) => {
-                    warn!(error = %error, "Failed to drain job queue");
-                    self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
-                        .await;
-                    return;
-                }
-            };
+        let result = match process_job_queue_batch(
+            &self.context.storage_handle,
+            node_id,
+            capacity,
+            self.jobs_runtime.reconciler(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(error = %error, "Failed to drain job queue");
+                self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
+                    .await;
+                return;
+            }
+        };
 
         for record in result.claimed {
             self.jobs_runtime.spawn(self.context.clone(), record);

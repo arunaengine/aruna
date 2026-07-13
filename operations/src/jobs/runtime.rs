@@ -8,7 +8,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
-    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobId, JobRecord, JobState,
+    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobRecord, JobState,
     parse_job_schedule_index_key,
 };
 use aruna_core::task::TaskEvent;
@@ -22,14 +22,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
+use super::reconcile::ExternalReconciler;
 use super::store::{
-    JobMutationError, ReleaseOutcome, cancel_running_job, complete_job, fail_job, flush_progress,
-    iter_prefix_page, read_job_record, release_job, renew_lease, requeue_job,
+    JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
+    flush_progress, iter_prefix_page, read_job_record, release_job, renew_lease, requeue_job,
     transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
-    JOB_CONCURRENCY_CAP, JOB_DRAIN_BATCH_SIZE, JOB_HEARTBEAT_MS, JOB_PROGRESS_FLUSH_INTERVAL_MS,
+    JOB_CONCURRENCY_CAP, JOB_DRAIN_BATCH_SIZE, JOB_EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
+    JOB_PROGRESS_FLUSH_INTERVAL_MS,
 };
 use crate::driver::DriverContext;
 
@@ -39,6 +41,7 @@ struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
     /// zombie's `finish` cannot evict the newer execution that replaced it.
     nonce: u64,
+    class: JobExecutionClass,
     cancel: CancellationToken,
     completion: watch::Sender<bool>,
     claim_token: ulid::Ulid,
@@ -64,11 +67,13 @@ pub struct JobShutdownReport {
     pub skipped: usize,
 }
 
-/// Registry of locally executing jobs, their cancellation tokens, and the concurrency cap.
+/// Registry of locally executing jobs, their cancellation tokens, and per-class caps.
 pub struct JobsRuntime {
     state: Mutex<RuntimeState>,
     next_nonce: AtomicU64,
-    cap: usize,
+    internal_cap: usize,
+    external_cap: usize,
+    reconciler: Option<Arc<dyn ExternalReconciler>>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here, the lease goes back to the queue and the job runs again".
@@ -78,7 +83,8 @@ pub struct JobsRuntime {
 impl std::fmt::Debug for JobsRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobsRuntime")
-            .field("cap", &self.cap)
+            .field("internal_cap", &self.internal_cap)
+            .field("external_cap", &self.external_cap)
             .field("running", &self.running_count())
             .finish_non_exhaustive()
     }
@@ -90,10 +96,29 @@ impl JobsRuntime {
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
+        Self::build(cap, JOB_EXTERNAL_CONCURRENCY_CAP, None)
+    }
+
+    /// Wire the reconcile hook that receives lost external attempts (Stage 2).
+    pub fn with_reconciler(reconciler: Arc<dyn ExternalReconciler>) -> Arc<Self> {
+        Self::build(
+            JOB_CONCURRENCY_CAP,
+            JOB_EXTERNAL_CONCURRENCY_CAP,
+            Some(reconciler),
+        )
+    }
+
+    fn build(
+        internal_cap: usize,
+        external_cap: usize,
+        reconciler: Option<Arc<dyn ExternalReconciler>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RuntimeState::default()),
             next_nonce: AtomicU64::new(0),
-            cap,
+            internal_cap,
+            external_cap,
+            reconciler,
             shutdown: CancellationToken::new(),
         })
     }
@@ -102,17 +127,38 @@ impl JobsRuntime {
         self.state.lock().expect("runtime mutex poisoned")
     }
 
+    pub fn reconciler(&self) -> Option<&Arc<dyn ExternalReconciler>> {
+        self.reconciler.as_ref()
+    }
+
     pub fn running_count(&self) -> usize {
         self.state().running.len()
     }
 
-    /// Zero once draining, so the drain claims nothing more.
-    pub fn available_slots(&self) -> usize {
+    fn cap_for(&self, class: JobExecutionClass) -> usize {
+        match class {
+            JobExecutionClass::InProcess => self.internal_cap,
+            JobExecutionClass::ExternalAttempt => self.external_cap,
+        }
+    }
+
+    /// Free slots for a class; internal and external accounting are independent. Zero once
+    /// draining, so the drain claims nothing more once a shutdown has begun.
+    pub fn available_slots_for(&self, class: JobExecutionClass) -> usize {
         let state = self.state();
         if state.draining {
             return 0;
         }
-        self.cap.saturating_sub(state.running.len())
+        let running = state
+            .running
+            .values()
+            .filter(|job| job.class == class)
+            .count();
+        self.cap_for(class).saturating_sub(running)
+    }
+
+    pub fn available_slots(&self) -> usize {
+        self.available_slots_for(JobExecutionClass::InProcess)
     }
 
     /// Poke a locally running job's cancel token; `false` if it is not running here.
@@ -132,6 +178,7 @@ impl JobsRuntime {
             warn!(job_id = %job_id, "Spawned job has no claim token; skipping");
             return;
         };
+        let class = record.execution_class;
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let (completion, _) = watch::channel(false);
@@ -152,6 +199,7 @@ impl JobsRuntime {
                 job_id,
                 RunningJob {
                     nonce,
+                    class,
                     cancel: cancel.clone(),
                     completion,
                     claim_token,
@@ -256,13 +304,14 @@ impl JobsRuntime {
     }
 
     #[cfg(test)]
-    fn register_test_execution(&self, job_id: JobId) -> u64 {
+    fn register_test_execution(&self, job_id: JobId, class: JobExecutionClass) -> u64 {
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let (completion, _) = watch::channel(false);
         self.state().running.insert(
             job_id,
             RunningJob {
                 nonce,
+                class,
                 cancel: CancellationToken::new(),
                 completion,
                 claim_token: ulid::Ulid::r#gen(),
@@ -304,7 +353,9 @@ impl JobsRuntime {
         }
     }
 
-    /// At startup every claimed/running holder is definitionally dead: re-queue them all.
+    /// At startup every claimed/running holder is definitionally dead: re-queue the
+    /// in-process ones. External attempts route to the reconcile hook instead, since a
+    /// blind requeue would spawn a second container for a job that may still be running.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
@@ -344,6 +395,11 @@ impl JobsRuntime {
             )
             .await
             {
+                Ok(RequeueOutcome::NeedsReconcile(record)) => {
+                    if let Some(reconciler) = self.reconciler.as_ref() {
+                        reconciler.reconcile_lost_attempt(storage, record).await;
+                    }
+                }
                 Ok(_) => recovered += 1,
                 Err(JobMutationError::NotFound) => {}
                 Err(error) => return Err(error.to_string()),
@@ -1196,8 +1252,8 @@ mod tests {
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x5A; 16]);
 
-        let zombie = runtime.register_test_execution(job_id);
-        let survivor = runtime.register_test_execution(job_id);
+        let zombie = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
+        let survivor = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
         assert_ne!(zombie, survivor);
 
         runtime.finish(&ctx, job_id, zombie).await;
@@ -1206,5 +1262,80 @@ mod tests {
 
         runtime.finish(&ctx, job_id, survivor).await;
         assert_eq!(runtime.running_count(), 0);
+    }
+
+    #[derive(Default)]
+    struct RecordingReconciler {
+        seen: std::sync::Mutex<Vec<JobId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalReconciler for RecordingReconciler {
+        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+            self.seen.lock().unwrap().push(record.job_id);
+        }
+    }
+
+    // Internal and external slot accounting are independent: saturating one class
+    // leaves the other class fully available.
+    #[tokio::test]
+    async fn per_class_slots() {
+        let runtime = JobsRuntime::with_capacity(2);
+        for byte in 0..2u8 {
+            runtime.register_test_execution(
+                JobId::from_bytes([byte; 16]),
+                JobExecutionClass::InProcess,
+            );
+        }
+        assert_eq!(runtime.available_slots_for(JobExecutionClass::InProcess), 0);
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
+            JOB_EXTERNAL_CONCURRENCY_CAP,
+            "internal load never consumes external slots"
+        );
+
+        runtime.register_test_execution(
+            JobId::from_bytes([9u8; 16]),
+            JobExecutionClass::ExternalAttempt,
+        );
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
+            JOB_EXTERNAL_CONCURRENCY_CAP - 1
+        );
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::InProcess),
+            0,
+            "external load never frees or consumes internal slots"
+        );
+    }
+
+    // Restart recovery routes an external attempt to the reconcile hook instead of
+    // re-queuing it, so a container that may still be running is never re-run.
+    #[tokio::test]
+    async fn recover_reconciles_external() {
+        let (_dir, storage) = temp_storage();
+        let recorder = Arc::new(RecordingReconciler::default());
+        let runtime = JobsRuntime::with_reconciler(recorder.clone());
+        let job_id = JobId::from_bytes([0xE7; 16]);
+        let mut record = probe_record(job_id, 3, 0, None);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::r#gen(),
+            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        // No in-process job was recovered; the external one was reconciled, not requeued.
+        assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 0);
+        let after = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, JobState::Running, "not requeued");
+        assert_eq!(after.attempts, 0);
+        assert!(after.claim.is_some());
+        assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
     }
 }

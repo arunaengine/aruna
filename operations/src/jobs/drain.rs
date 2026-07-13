@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::effects::Effect;
@@ -16,28 +17,33 @@ use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::JOB_DRAIN_BATCH_SIZE;
+use super::reconcile::ExternalReconciler;
 use super::store::{
-    ClaimOutcome, JobMutationError, batch_delete, claim_job, first_schedule_entry,
+    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
     iter_prefix_page, requeue_job,
 };
+use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
 #[derive(Debug, Default)]
 pub struct JobDrainResult {
     pub claimed: Vec<JobRecord>,
     pub cancelled_fresh: usize,
     pub swept: usize,
+    /// Expired external attempts routed to the reconcile hook instead of a requeue.
+    pub reconciled: usize,
     pub next_due_after: Option<Duration>,
     /// A per-job error stopped the batch early; the caller should re-drive after a
     /// backoff. Set so `claimed` is never discarded by a later failure.
     pub retry_after_error: bool,
 }
 
-/// Claim up to `capacity` due jobs and re-queue expired leases; claimed records are returned.
+/// Claim up to `capacity` due jobs and re-queue expired leases; claimed records are
+/// returned. An expired external attempt is routed to `reconciler` instead of requeued.
 pub async fn process_job_queue_batch(
     storage: &StorageHandle,
     holder_node_id: NodeId,
     capacity: usize,
+    reconciler: Option<&Arc<dyn ExternalReconciler>>,
 ) -> Result<JobDrainResult, String> {
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
@@ -92,6 +98,12 @@ pub async fn process_job_queue_batch(
                     )
                     .await
                     {
+                        Ok(RequeueOutcome::NeedsReconcile(record)) => {
+                            if let Some(reconciler) = reconciler {
+                                reconciler.reconcile_lost_attempt(storage, record).await;
+                            }
+                            result.reconciled = result.reconciled.saturating_add(1);
+                        }
                         Ok(_) => result.swept = result.swept.saturating_add(1),
                         Err(JobMutationError::NotFound) => {
                             if let Err(error) =
@@ -117,8 +129,18 @@ pub async fn process_job_queue_batch(
         }
     }
 
-    match next_job_drain_timer_after(storage).await {
-        Ok(next) => result.next_due_after = next,
+    match next_drain_delays(storage).await {
+        Ok((due, lease)) => {
+            // A reconciled attempt keeps its expired lease row in place by design, which
+            // would pin the lease head at zero and busy-loop the drain; floor the lease
+            // side to a non-zero re-arm so the next reconcile pass waits its turn.
+            let lease = if result.reconciled > 0 {
+                lease.map(|after| after.max(JOB_RECONCILE_REARM))
+            } else {
+                lease
+            };
+            result.next_due_after = min_delay(due, lease);
+        }
         Err(error) => {
             warn!(error = %error, "Failed to compute next job drain timer");
             result.retry_after_error = true;
@@ -136,20 +158,31 @@ async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), St
     .await
 }
 
+/// Earliest `due/` and `lease/` heads as delays from now; `ZERO` when work is due.
+async fn next_drain_delays(
+    storage: &StorageHandle,
+) -> Result<(Option<Duration>, Option<Duration>), String> {
+    let now_ms = unix_timestamp_millis();
+    let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
+    let due = first_schedule_entry(storage, JOB_DUE_INDEX_PREFIX).await?;
+    let lease = first_schedule_entry(storage, JOB_LEASE_INDEX_PREFIX).await?;
+    Ok((due.map(|(ts, _)| delay(ts)), lease.map(|(ts, _)| delay(ts))))
+}
+
+fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration> {
+    match (due, lease) {
+        (Some(due), Some(lease)) => Some(due.min(lease)),
+        (due, None) => due,
+        (None, lease) => lease,
+    }
+}
+
 /// Earliest `due/`/`lease/` head as a delay from now; `ZERO` when work is due.
 pub async fn next_job_drain_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, String> {
-    let now_ms = unix_timestamp_millis();
-    let due = first_schedule_entry(storage, JOB_DUE_INDEX_PREFIX).await?;
-    let lease = first_schedule_entry(storage, JOB_LEASE_INDEX_PREFIX).await?;
-    let next = match (due, lease) {
-        (Some((due_ts, _)), Some((lease_ts, _))) => Some(due_ts.min(lease_ts)),
-        (Some((due_ts, _)), None) => Some(due_ts),
-        (None, Some((lease_ts, _))) => Some(lease_ts),
-        (None, None) => None,
-    };
-    Ok(next.map(|ts| Duration::from_millis(ts.saturating_sub(now_ms))))
+    let (due, lease) = next_drain_delays(storage).await?;
+    Ok(min_delay(due, lease))
 }
 
 /// ShortenTimer restore (startup + re-arm loop); never pushes a deadline later.
@@ -218,11 +251,24 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::{insert_job, read_job_record};
-    use aruna_core::structs::{JobClaim, JobPayload, JobState, RealmId};
+    use aruna_core::structs::{JobClaim, JobExecutionClass, JobPayload, JobState, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
+    use std::sync::Mutex;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[derive(Default)]
+    struct RecordingReconciler {
+        seen: Mutex<Vec<JobId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalReconciler for RecordingReconciler {
+        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+            self.seen.lock().unwrap().push(record.job_id);
+        }
+    }
 
     fn node_id(seed: u8) -> NodeId {
         let mut seed_bytes = [0u8; 32];
@@ -261,7 +307,7 @@ mod tests {
             .unwrap();
         }
 
-        let result = process_job_queue_batch(&storage, node_id(3), 2)
+        let result = process_job_queue_batch(&storage, node_id(3), 2, None)
             .await
             .unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
@@ -283,7 +329,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8)
+        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
             .await
             .unwrap();
         assert_eq!(result.swept, 1);
@@ -294,6 +340,48 @@ mod tests {
         assert_eq!(requeued.state, JobState::Queued);
         assert_eq!(requeued.attempts, 1);
         assert!(requeued.claim.is_none());
+    }
+
+    // An external attempt with an expired lease routes to the reconcile hook and is
+    // NOT requeued: no second container can be spawned. Its lease row stays in place,
+    // so the re-arm must be floored to a non-zero delay instead of busy-looping.
+    #[tokio::test]
+    async fn external_lease_reconciled() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([0xE1; 16]);
+        let mut record = queued_record(job_id, 1);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::r#gen(),
+            lease_expires_at_ms: 1,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let recorder = Arc::new(RecordingReconciler::default());
+        let reconciler: Arc<dyn ExternalReconciler> = recorder.clone();
+        let result = process_job_queue_batch(&storage, node_id(3), 8, Some(&reconciler))
+            .await
+            .unwrap();
+        assert_eq!(result.swept, 0, "external attempt is not swept");
+        assert_eq!(result.reconciled, 1, "external attempt is reconciled");
+        let after = result.next_due_after.expect("lease row still present");
+        assert!(
+            after >= JOB_RECONCILE_REARM,
+            "reconciled row must not re-arm the drain at zero, got {after:?}"
+        );
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Running, "not requeued");
+        assert_eq!(stored.attempts, 0);
+        assert!(stored.claim.is_some());
+        // The hook saw exactly this job, proving no blind re-run path was taken.
+        assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
     }
 
     #[tokio::test]
@@ -310,7 +398,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8)
+        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
             .await
             .unwrap();
         assert_eq!(result.swept, 0);
@@ -378,7 +466,7 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8)
+        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
             .await
             .unwrap();
         assert!(result.claimed.is_empty());
