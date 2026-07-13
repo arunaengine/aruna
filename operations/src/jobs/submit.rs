@@ -54,19 +54,24 @@ pub enum SubmitJobError {
 enum SubmitState {
     Init,
     ReadDedup,
-    VerifyDedup(JobId),
+    VerifyDedup {
+        job_id: JobId,
+        digest_matches: bool,
+    },
     WriteJob,
     ScheduleDrain,
     Finish,
     Error,
 }
 
-/// Effect-driven submit; a live `job_dedup_index` entry with a matching plan digest
-/// short-circuits to the existing id after verifying that job's record still decodes
-/// (a differing digest is a `JobPlanConflict`). A dangling entry (record quarantined
-/// or gone) falls through to a fresh create whose batch write repoints the dedup row,
-/// so a corrupt record cannot poison its key. Dedup is best-effort (read-then-write,
-/// no cross-submit lock), so under a concurrent race two jobs may share a key.
+/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the
+/// existing id (matching plan digest) or raises `JobPlanConflict` (differing
+/// digest), in both cases only after verifying that job's record still exists
+/// and decodes. A dangling entry (record quarantined or gone) falls through to a
+/// fresh create whose batch write repoints the dedup row, so a ghost row can
+/// neither poison its key nor conflict against a dead job. Dedup is best-effort
+/// (read-then-write, no cross-submit lock), so under a concurrent race two jobs
+/// may share a key.
 /// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
 /// the example).
 #[derive(Debug, PartialEq)]
@@ -114,8 +119,11 @@ impl SubmitJobOperation {
         }
     }
 
-    fn verify_dedup(&mut self, job_id: JobId) -> Effects {
-        self.state = SubmitState::VerifyDedup(job_id);
+    fn verify_dedup(&mut self, job_id: JobId, digest_matches: bool) -> Effects {
+        self.state = SubmitState::VerifyDedup {
+            job_id,
+            digest_matches,
+        };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_KEYSPACE.to_string(),
             key: job_record_key(job_id),
@@ -174,13 +182,13 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match parse_job_dedup_value(value.as_ref()) {
-                    // Same key + same plan is idempotent; a different plan is a conflict.
+                    // Same key + same plan is idempotent; a different plan is a
+                    // conflict. Either way the target record is verified first so
+                    // a ghost row never answers for a dead job.
                     Ok((existing_job_id, existing_digest)) => {
-                        if self.record.plan_digest.unwrap_or_default() == existing_digest {
-                            self.verify_dedup(existing_job_id)
-                        } else {
-                            self.fail(SubmitJobError::JobPlanConflict { existing_job_id })
-                        }
+                        let digest_matches =
+                            self.record.plan_digest.unwrap_or_default() == existing_digest;
+                        self.verify_dedup(existing_job_id, digest_matches)
                     }
                     Err(_) => self.write_job(),
                 },
@@ -188,11 +196,17 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
-            SubmitState::VerifyDedup(job_id) => match event {
+            SubmitState::VerifyDedup {
+                job_id,
+                digest_matches,
+            } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match decode_job_record(&value) {
-                    Ok(_) => self.finish_existing(job_id),
+                    Ok(_) if digest_matches => self.finish_existing(job_id),
+                    Ok(_) => self.fail(SubmitJobError::JobPlanConflict {
+                        existing_job_id: job_id,
+                    }),
                     Err(error) => {
                         warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
                         self.write_job()
@@ -462,6 +476,35 @@ mod tests {
         assert_ne!(result.job_id, ghost);
         assert_eq!(
             crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
+                .await
+                .unwrap(),
+            Some(result.job_id)
+        );
+    }
+
+    // A dangling dedup row with a DIFFERING digest must self-heal too, not raise
+    // a plan conflict against a job that no longer exists.
+    #[tokio::test]
+    async fn ghost_conflict_heals() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let ghost = JobId::from_bytes([9u8; 16]);
+        write_raw(
+            &storage,
+            JOB_DEDUP_INDEX_KEYSPACE,
+            ByteView::from(b"k".to_vec()),
+            ByteView::from(encode_job_dedup_value(ghost, [0xAB; 32])),
+        )
+        .await;
+
+        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+            .await
+            .expect("ghost row must not conflict");
+        assert!(result.created);
+        assert_ne!(result.job_id, ghost);
+        assert_eq!(
+            crate::jobs::store::find_dedup_job(&storage, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
