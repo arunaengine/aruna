@@ -17,7 +17,8 @@ use crate::placement::resolve_shard_holders;
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
-    ShardTransportMessage, ShardTransportResponse, read_shard_request, write_shard_response,
+    SHARD_MAX_RESPONSE_SIZE, ShardTransportMessage, ShardTransportResponse, partition_manifest,
+    read_shard_request, write_shard_response,
 };
 
 #[tracing::instrument(
@@ -45,16 +46,26 @@ pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, 
         }
     };
 
-    let response = build_response(context, net_handle, peer, message).await;
+    let responses = build_responses(context, net_handle, peer, message).await;
     if let Err(error) = with_shard_io_timeout(
         "writing shard manifest response",
-        write_shard_response(&mut stream, &response),
+        write_responses(&mut stream, &responses),
     )
     .await
     {
         warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
     }
     close_stream(&mut stream).await;
+}
+
+async fn write_responses(
+    stream: &mut BiStream,
+    responses: &[ShardTransportResponse],
+) -> Result<(), String> {
+    for response in responses {
+        write_shard_response(stream, response).await?;
+    }
+    Ok(())
 }
 
 async fn with_shard_io_timeout<T>(
@@ -74,30 +85,36 @@ async fn with_shard_io_timeout_after<T>(
         .unwrap_or_else(|_| Err(format!("timed out {operation}")))
 }
 
-async fn build_response(
+async fn build_responses(
     context: &DriverContext,
     net_handle: &NetHandle,
     peer: NodeId,
     message: ShardTransportMessage,
-) -> ShardTransportResponse {
-    let ShardTransportMessage::ManifestRequest {
-        realm_id,
-        placement,
-    } = message;
+) -> Vec<ShardTransportResponse> {
+    let (realm_id, placement, paged) = match message {
+        ShardTransportMessage::ManifestRequest {
+            realm_id,
+            placement,
+        } => (realm_id, placement, false),
+        ShardTransportMessage::ManifestRequestV2 {
+            realm_id,
+            placement,
+        } => (realm_id, placement, true),
+    };
 
     if realm_id != *net_handle.realm_id() {
-        return ShardTransportResponse::Reject(format!(
+        return vec![ShardTransportResponse::Reject(format!(
             "shard peer `{peer}` addressed foreign realm `{realm_id}`"
-        ));
+        ))];
     }
     let config = match read_realm_config(context, realm_id).await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            return ShardTransportResponse::Reject(format!(
+            return vec![ShardTransportResponse::Reject(format!(
                 "realm `{realm_id}` config unavailable"
-            ));
+            ))];
         }
-        Err(error) => return ShardTransportResponse::Reject(error),
+        Err(error) => return vec![ShardTransportResponse::Reject(error)],
     };
 
     // Trust gate: only sync-eligible (server-class) realm nodes may fetch a
@@ -105,39 +122,51 @@ async fn build_response(
     match config.sync_eligible_node_ids() {
         Ok(eligible) if eligible.contains(&peer) => {}
         Ok(_) => {
-            return ShardTransportResponse::Reject(format!(
+            return vec![ShardTransportResponse::Reject(format!(
                 "shard peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
-            ));
+            ))];
         }
-        Err(error) => return ShardTransportResponse::Reject(error.to_string()),
+        Err(error) => return vec![ShardTransportResponse::Reject(error.to_string())],
     }
 
     let holders = resolve_shard_holders(&config, &placement);
     // Only a current holder can answer authoritatively for a shard.
     if !holders.contains(&net_handle.node_id()) {
-        return ShardTransportResponse::Reject(format!(
+        return vec![ShardTransportResponse::Reject(format!(
             "node does not hold shard {}/{} in realm `{realm_id}`",
             placement.strategy_id, placement.shard
-        ));
+        ))];
     }
     if !holders.contains(&peer) {
-        return ShardTransportResponse::Reject(format!(
+        return vec![ShardTransportResponse::Reject(format!(
             "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
             placement.strategy_id, placement.shard
-        ));
+        ))];
     }
 
     match assemble_shard_manifest(context, realm_id, placement).await {
         Ok(manifest) => {
+            let entries = manifest.entries.len();
+            let responses = if paged {
+                match partition_manifest(&manifest, SHARD_MAX_RESPONSE_SIZE) {
+                    Ok(pages) => pages
+                        .into_iter()
+                        .map(|page| ShardTransportResponse::ManifestPageV2(Box::new(page)))
+                        .collect(),
+                    Err(error) => return vec![ShardTransportResponse::Reject(error)],
+                }
+            } else {
+                vec![ShardTransportResponse::Manifest(Box::new(manifest))]
+            };
             debug!(
                 strategy = %placement.strategy_id,
                 shard = placement.shard,
-                entries = manifest.entries.len(),
+                entries,
                 "Served shard manifest"
             );
-            ShardTransportResponse::Manifest(Box::new(manifest))
+            responses
         }
-        Err(error) => ShardTransportResponse::Reject(error),
+        Err(error) => vec![ShardTransportResponse::Reject(error)],
     }
 }
 

@@ -1,9 +1,12 @@
-use aruna_core::document::ShardManifest;
+use aruna_core::NodeId;
+use aruna_core::document::{ShardManifest, ShardManifestEntry};
 use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_net::streams::BiStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
+
+use crate::shard::manifest_entry_digest;
 
 /// A manifest request has only fixed-size identifiers and integer fields. This
 /// small envelope leaves encoding headroom without permitting a large body to
@@ -21,6 +24,24 @@ pub enum ShardTransportMessage {
         realm_id: RealmId,
         placement: PlacementRef,
     },
+    ManifestRequestV2 {
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ShardManifestPage {
+    pub placement: PlacementRef,
+    pub holder: NodeId,
+    pub cursor: Vec<u8>,
+    pub digest: [u8; 32],
+    pub updated_at_ms: u64,
+    pub entry_count: u64,
+    pub entry_digest: [u8; 32],
+    pub page_index: u32,
+    pub last: bool,
+    pub entries: Vec<ShardManifestEntry>,
 }
 
 /// Co-holder reply: the assembled manifest, or a rejection (foreign realm,
@@ -29,6 +50,236 @@ pub enum ShardTransportMessage {
 pub enum ShardTransportResponse {
     Manifest(Box<ShardManifest>),
     Reject(String),
+    ManifestPageV2(Box<ShardManifestPage>),
+}
+
+/// Partitions a manifest greedily and deterministically while measuring the
+/// actual postcard representation used by response frames.
+pub(crate) fn partition_manifest(
+    manifest: &ShardManifest,
+    max_size: usize,
+) -> Result<Vec<ShardManifestPage>, String> {
+    let entry_count = u64::try_from(manifest.entries.len())
+        .map_err(|_| "shard manifest entry count exceeds protocol range".to_string())?;
+    let entry_digest = manifest_entry_digest(&manifest.entries);
+    let entry_sizes = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            postcard::to_allocvec(entry)
+                .map(|bytes| bytes.len())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let empty_entries_size = postcard::to_allocvec(&Vec::<ShardManifestEntry>::new())
+        .map_err(|error| error.to_string())?
+        .len();
+
+    let mut pages = Vec::new();
+    let mut start = 0;
+    loop {
+        let page_index = u32::try_from(pages.len())
+            .map_err(|_| "shard manifest requires too many pages".to_string())?;
+        let empty_page = manifest_page(
+            manifest,
+            entry_count,
+            entry_digest,
+            page_index,
+            false,
+            Vec::new(),
+        );
+        let empty_page_size = encoded_page_size(&empty_page)?;
+        let fixed_size = empty_page_size
+            .checked_sub(empty_entries_size)
+            .ok_or_else(|| "invalid shard manifest page encoding".to_string())?;
+        if fixed_size
+            .checked_add(encoded_len(0)?)
+            .is_none_or(|size| size > max_size)
+        {
+            return Err("shard manifest page metadata exceeds maximum size".to_string());
+        }
+
+        let mut end = start;
+        let mut entries_size = 0usize;
+        while end < manifest.entries.len() {
+            entries_size = entries_size
+                .checked_add(entry_sizes[end])
+                .ok_or_else(|| "shard manifest page size overflow".to_string())?;
+            let page_len = end - start + 1;
+            let candidate_size = fixed_size
+                .checked_add(encoded_len(page_len)?)
+                .and_then(|size| size.checked_add(entries_size))
+                .ok_or_else(|| "shard manifest page size overflow".to_string())?;
+            if candidate_size > max_size {
+                break;
+            }
+            end += 1;
+        }
+        if end == start && start < manifest.entries.len() {
+            return Err("shard manifest entry exceeds maximum page size".to_string());
+        }
+
+        pages.push(manifest_page(
+            manifest,
+            entry_count,
+            entry_digest,
+            page_index,
+            false,
+            manifest.entries[start..end].to_vec(),
+        ));
+        start = end;
+        if start == manifest.entries.len() {
+            break;
+        }
+    }
+
+    pages.last_mut().expect("at least one manifest page").last = true;
+    for page in &pages {
+        if encoded_page_size(page)? > max_size {
+            return Err("shard manifest page exceeds maximum size".to_string());
+        }
+    }
+    Ok(pages)
+}
+
+fn manifest_page(
+    manifest: &ShardManifest,
+    entry_count: u64,
+    entry_digest: [u8; 32],
+    page_index: u32,
+    last: bool,
+    entries: Vec<ShardManifestEntry>,
+) -> ShardManifestPage {
+    ShardManifestPage {
+        placement: manifest.placement,
+        holder: manifest.holder,
+        cursor: manifest.cursor.clone(),
+        digest: manifest.digest,
+        updated_at_ms: manifest.updated_at_ms,
+        entry_count,
+        entry_digest,
+        page_index,
+        last,
+        entries,
+    }
+}
+
+fn encoded_page_size(page: &ShardManifestPage) -> Result<usize, String> {
+    postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+        page.clone(),
+    )))
+    .map(|bytes| bytes.len())
+    .map_err(|error| error.to_string())
+}
+
+fn encoded_len(len: usize) -> Result<usize, String> {
+    postcard::to_allocvec(&len)
+        .map(|bytes| bytes.len())
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManifestMetadata {
+    cursor: Vec<u8>,
+    digest: [u8; 32],
+    updated_at_ms: u64,
+    entry_count: u64,
+    entry_digest: [u8; 32],
+}
+
+pub(crate) struct ManifestAssembler {
+    holder: NodeId,
+    placement: PlacementRef,
+    metadata: Option<ManifestMetadata>,
+    entries: Vec<ShardManifestEntry>,
+    next_page: u32,
+    complete: bool,
+}
+
+impl ManifestAssembler {
+    pub(crate) fn new(holder: NodeId, placement: PlacementRef) -> Self {
+        Self {
+            holder,
+            placement,
+            metadata: None,
+            entries: Vec::new(),
+            next_page: 0,
+            complete: false,
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        page: ShardManifestPage,
+    ) -> Result<Option<ShardManifest>, String> {
+        if self.complete {
+            return Err("received shard manifest page after final page".to_string());
+        }
+        if page.placement != self.placement {
+            return Err("shard manifest page placement mismatch".to_string());
+        }
+        if page.holder != self.holder {
+            return Err("shard manifest page holder mismatch".to_string());
+        }
+        if page.page_index != self.next_page {
+            return Err(format!(
+                "shard manifest page index mismatch: expected {}, received {}",
+                self.next_page, page.page_index
+            ));
+        }
+        if !page.last && page.entries.is_empty() {
+            return Err("non-final shard manifest page is empty".to_string());
+        }
+
+        let metadata = ManifestMetadata {
+            cursor: page.cursor,
+            digest: page.digest,
+            updated_at_ms: page.updated_at_ms,
+            entry_count: page.entry_count,
+            entry_digest: page.entry_digest,
+        };
+        if let Some(expected) = &self.metadata {
+            if *expected != metadata {
+                return Err("shard manifest page metadata mismatch".to_string());
+            }
+        } else {
+            self.metadata = Some(metadata);
+        }
+        let metadata = self.metadata.as_ref().expect("manifest metadata set");
+        let received_count = u64::try_from(self.entries.len())
+            .ok()
+            .and_then(|count| u64::try_from(page.entries.len()).ok()?.checked_add(count))
+            .ok_or_else(|| "shard manifest entry count overflow".to_string())?;
+        if received_count > metadata.entry_count {
+            return Err("shard manifest contains more entries than declared".to_string());
+        }
+        self.entries.extend(page.entries);
+
+        if !page.last {
+            self.next_page = self
+                .next_page
+                .checked_add(1)
+                .ok_or_else(|| "shard manifest page index overflow".to_string())?;
+            return Ok(None);
+        }
+        if received_count != metadata.entry_count {
+            return Err("final shard manifest page has incomplete entry count".to_string());
+        }
+        if manifest_entry_digest(&self.entries) != metadata.entry_digest {
+            return Err("shard manifest entry digest mismatch".to_string());
+        }
+
+        self.complete = true;
+        let metadata = self.metadata.take().expect("manifest metadata set");
+        Ok(Some(ShardManifest {
+            placement: self.placement,
+            holder: self.holder,
+            entries: std::mem::take(&mut self.entries),
+            cursor: metadata.cursor,
+            digest: metadata.digest,
+            updated_at_ms: metadata.updated_at_ms,
+        }))
+    }
 }
 
 pub async fn write_shard_request(
@@ -143,6 +394,19 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
         assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
+        assert_eq!(bytes[0], 0, "legacy request variant index changed");
+        assert_eq!(
+            postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
+            message
+        );
+
+        let message = ShardTransportMessage::ManifestRequestV2 {
+            realm_id: RealmId::from_bytes([2; 32]),
+            placement,
+        };
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
+        assert_eq!(bytes[0], 1, "V2 request must follow the legacy variant");
         assert_eq!(
             postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
             message
@@ -170,8 +434,9 @@ mod tests {
             digest: [7u8; 32],
             updated_at_ms: 99,
         };
-        let response = ShardTransportResponse::Manifest(Box::new(manifest));
+        let response = ShardTransportResponse::Manifest(Box::new(manifest.clone()));
         let bytes = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(bytes[0], 0, "legacy manifest variant index changed");
         assert_eq!(
             postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
             response
@@ -179,10 +444,174 @@ mod tests {
 
         let reject = ShardTransportResponse::Reject("nope".to_string());
         let bytes = postcard::to_allocvec(&reject).unwrap();
+        assert_eq!(bytes[0], 1, "legacy reject variant index changed");
         assert_eq!(
             postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
             reject
         );
+
+        let page = partition_manifest(&manifest, SHARD_MAX_RESPONSE_SIZE)
+            .unwrap()
+            .remove(0);
+        let response = ShardTransportResponse::ManifestPageV2(Box::new(page));
+        let bytes = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(bytes[0], 2, "V2 page must follow the legacy variants");
+        assert_eq!(
+            postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn tiny_budget_pages() {
+        let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let entries = (1..=4)
+            .map(|seed| ShardManifestEntry {
+                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: Ulid::from_bytes([seed; 16]),
+                },
+                revision: DocumentSyncRevision {
+                    generation: u64::from(seed),
+                    event_id: Ulid::from_bytes([seed + 4; 16]),
+                    actor: holder,
+                    updated_at_ms: u64::from(seed),
+                },
+            })
+            .collect::<Vec<_>>();
+        let manifest = ShardManifest {
+            placement: placement(),
+            holder,
+            cursor: vec![1, 2, 3],
+            digest: [7; 32],
+            updated_at_ms: 99,
+            entries,
+        };
+        let entry_digest = crate::shard::manifest_entry_digest(&manifest.entries);
+        let sample_page = |entries: Vec<ShardManifestEntry>| ShardManifestPage {
+            placement: manifest.placement,
+            holder,
+            cursor: manifest.cursor.clone(),
+            digest: manifest.digest,
+            updated_at_ms: manifest.updated_at_ms,
+            entry_count: manifest.entries.len() as u64,
+            entry_digest,
+            page_index: 0,
+            last: false,
+            entries,
+        };
+        let budget = postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+            sample_page(vec![manifest.entries[0].clone()]),
+        )))
+        .unwrap()
+        .len();
+        assert!(
+            postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+                sample_page(manifest.entries[..2].to_vec()),
+            )))
+            .unwrap()
+            .len()
+                > budget
+        );
+
+        let pages = partition_manifest(&manifest, budget).expect("manifest pages");
+        assert_eq!(pages.len(), manifest.entries.len());
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(page.page_index, index as u32);
+            assert_eq!(page.last, index + 1 == pages.len());
+            assert!(
+                postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+                    page.clone(),
+                )))
+                .unwrap()
+                .len()
+                    <= budget
+            );
+        }
+
+        let mut assembler = ManifestAssembler::new(holder, manifest.placement);
+        let mut assembled = None;
+        for page in pages {
+            assembled = assembler.push(page).expect("valid page");
+        }
+        assert_eq!(assembled, Some(manifest));
+    }
+
+    #[test]
+    fn invalid_pages_fail() {
+        let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let other_holder = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let entries = (1..=2)
+            .map(|seed| ShardManifestEntry {
+                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                    document_id: Ulid::from_bytes([seed; 16]),
+                },
+                revision: DocumentSyncRevision {
+                    generation: u64::from(seed),
+                    event_id: Ulid::from_bytes([seed + 4; 16]),
+                    actor: holder,
+                    updated_at_ms: u64::from(seed),
+                },
+            })
+            .collect::<Vec<_>>();
+        let manifest = ShardManifest {
+            placement: placement(),
+            holder,
+            cursor: vec![1, 2, 3],
+            digest: [7; 32],
+            updated_at_ms: 99,
+            entries,
+        };
+        let entry_digest = manifest_entry_digest(&manifest.entries);
+        let one_entry = manifest_page(
+            &manifest,
+            manifest.entries.len() as u64,
+            entry_digest,
+            0,
+            false,
+            vec![manifest.entries[0].clone()],
+        );
+        let pages = partition_manifest(&manifest, encoded_page_size(&one_entry).unwrap()).unwrap();
+        assert_eq!(pages.len(), 2);
+        let first = pages[0].clone();
+        let second = pages[1].clone();
+        let rejects_second = |changed: ShardManifestPage| {
+            let mut assembler = ManifestAssembler::new(holder, manifest.placement);
+            assert_eq!(assembler.push(first.clone()).unwrap(), None);
+            assert!(assembler.push(changed).is_err());
+        };
+
+        let mut changed = second.clone();
+        changed.placement.shard += 1;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.holder = other_holder;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.cursor.push(4);
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.digest[0] ^= 1;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.updated_at_ms += 1;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.entry_count += 1;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.entry_digest[0] ^= 1;
+        rejects_second(changed);
+        let mut changed = second.clone();
+        changed.page_index += 1;
+        rejects_second(changed);
+        let mut changed = second;
+        changed.entries[0].revision.generation += 1;
+        rejects_second(changed);
+
+        let mut early_last = first;
+        early_last.last = true;
+        let mut assembler = ManifestAssembler::new(holder, manifest.placement);
+        assert!(assembler.push(early_last).is_err());
     }
 
     #[tokio::test]
