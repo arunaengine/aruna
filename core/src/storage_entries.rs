@@ -12,9 +12,10 @@ use crate::errors::ConversionError;
 use crate::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
     DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
@@ -91,6 +92,10 @@ pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
 
 pub fn metadata_document_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
+    metadata_document_key(document_id)
 }
 
 pub fn metadata_graph_lifecycle_key(graph_iri: &str) -> Key {
@@ -228,6 +233,16 @@ pub fn metadata_create_event_write_entry(
     Ok((
         METADATA_EVENT_LOG_KEYSPACE.to_string(),
         metadata_event_log_key(event.record.document_id, event.event_id),
+        postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+pub fn metadata_create_acceptance_write_entry(
+    event: &MetadataCreateEventRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+        metadata_create_acceptance_key(event.record.document_id),
         postcard::to_allocvec(event)?.into(),
     ))
 }

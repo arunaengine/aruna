@@ -3,12 +3,17 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     MetadataCreateCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
 };
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{
+    metadata_create_acceptance_key, metadata_create_acceptance_write_entry,
+};
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, shard_for_subject,
 };
@@ -19,7 +24,6 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::read_effect;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::schedule_pending_metadata_projection_drain;
 use crate::metadata::repository::{
@@ -76,6 +80,7 @@ pub struct CreateMetadataDocumentOperation {
     skip_existing_check: bool,
     /// Set when a non-holder forwarded this create; see [`Self::choose_placement`].
     forwarded: bool,
+    conflict_recheck: bool,
     txn_id: Option<TxnId>,
     state: CreateMetadataDocumentState,
     record: Option<MetadataRegistryRecord>,
@@ -89,7 +94,7 @@ enum CreateMetadataDocumentState {
     ValidateGraph,
     CheckExisting,
     StartTransaction,
-    ReadRealmConfig,
+    ReadCreateFence,
     AppendCreateEvent,
     CommitTransaction,
     Finish,
@@ -128,6 +133,7 @@ impl CreateMetadataDocumentOperation {
             config,
             skip_existing_check: false,
             forwarded: false,
+            conflict_recheck: false,
             txn_id: None,
             state: CreateMetadataDocumentState::Init,
             record: None,
@@ -356,15 +362,81 @@ impl CreateMetadataDocumentOperation {
         })]
     }
 
-    fn read_realm_config_effect(&mut self, txn_id: TxnId) -> Effects {
+    fn read_create_fence_effect(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = CreateMetadataDocumentState::ReadRealmConfig;
-        smallvec![read_effect(
-            &DocumentSyncTarget::RealmConfig {
-                realm_id: self.config.actor.realm_id,
+        self.state = CreateMetadataDocumentState::ReadCreateFence;
+        let realm_target = DocumentSyncTarget::RealmConfig {
+            realm_id: self.config.actor.realm_id,
+        };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                    metadata_create_acceptance_key(self.config.document_id),
+                ),
+                (
+                    realm_target.storage_keyspace().to_string(),
+                    realm_target.storage_key(),
+                ),
+            ],
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn accepted_identity_matches(&self, event: &MetadataCreateEventRecord) -> bool {
+        event.record.realm_id == self.config.actor.realm_id
+            && event.record.group_id == self.config.group_id
+            && event.record.document_path
+                == MetadataRegistryRecord::normalize_document_path(&self.config.document_path)
+    }
+
+    fn finish_accepted_create(&mut self, event: MetadataCreateEventRecord) -> Effects {
+        let Some(txn_id) = self.txn_id.take() else {
+            return self.fail(CreateMetadataDocumentError::MissingTransaction);
+        };
+        self.record = Some(event.record.clone());
+        self.create_event = Some(event.clone());
+        self.state = CreateMetadataDocumentState::Finish;
+        self.output = Some(Ok(CreateMetadataDocumentResult {
+            record: event.record,
+            event_id: event.event_id,
+        }));
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    fn apply_create_fence(
+        &mut self,
+        acceptance_value: Option<Value>,
+        realm_config_value: Option<Value>,
+    ) -> Effects {
+        if let Some(bytes) = acceptance_value {
+            let event: MetadataCreateEventRecord = match postcard::from_bytes(&bytes) {
+                Ok(event) => event,
+                Err(error) => {
+                    return self.fail(CreateMetadataDocumentError::ConversionError(error.into()));
+                }
+            };
+            return if self.accepted_identity_matches(&event) {
+                self.finish_accepted_create(event)
+            } else {
+                self.fail(CreateMetadataDocumentError::DocumentAlreadyExists)
+            };
+        }
+        if self.conflict_recheck {
+            return self.fail(StorageError::TransactionConflict.into());
+        }
+
+        let config = match realm_config_value.as_ref() {
+            Some(bytes) => match RealmConfigDocument::from_bytes(bytes) {
+                Ok(config) => Some(config),
+                Err(error) => return self.fail(error.into()),
             },
-            Some(txn_id),
-        )]
+            None => None,
+        };
+        match self.choose_placement(config.as_ref()) {
+            Ok(placement) => self.append_create_event_effect(placement, realm_config_value),
+            Err(error) => self.fail(error),
+        }
     }
 
     fn append_create_event_effect(
@@ -380,7 +452,12 @@ impl CreateMetadataDocumentOperation {
         self.create_event = Some(create_event.clone());
         self.record = Some(create_event.record.clone());
         self.state = CreateMetadataDocumentState::AppendCreateEvent;
-        match metadata_create_event_and_pending_projection_write_entries(&create_event) {
+        let writes = metadata_create_event_and_pending_projection_write_entries(&create_event)
+            .and_then(|mut writes| {
+                writes.push(metadata_create_acceptance_write_entry(&create_event)?);
+                Ok(writes)
+            });
+        match writes {
             Ok(mut writes) => {
                 if let Some(value) = realm_config_value {
                     let target = DocumentSyncTarget::RealmConfig {
@@ -482,28 +559,22 @@ impl Operation for CreateMetadataDocumentOperation {
             }
             CreateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.read_realm_config_effect(txn_id)
+                    self.read_create_fence_effect(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            CreateMetadataDocumentState::ReadRealmConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let (config, realm_config_value) = match value {
-                        Some(bytes) => match RealmConfigDocument::from_bytes(&bytes) {
-                            Ok(config) => (Some(config), Some(bytes)),
-                            Err(error) => return self.fail_without_cleanup(error.into()),
-                        },
-                        None => (None, None),
+            CreateMetadataDocumentState::ReadCreateFence => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    let [(_, acceptance_value), (_, realm_config_value)] = values.as_slice() else {
+                        return self.unexpected_event(
+                            "metadata create fence read",
+                            format!("batch read with {} values", values.len()),
+                        );
                     };
-                    match self.choose_placement(config.as_ref()) {
-                        Ok(placement) => {
-                            self.append_create_event_effect(placement, realm_config_value)
-                        }
-                        Err(error) => self.fail_without_cleanup(error),
-                    }
+                    self.apply_create_fence(acceptance_value.clone(), realm_config_value.clone())
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
@@ -538,6 +609,15 @@ impl Operation for CreateMetadataDocumentOperation {
                         event_id: create_event.event_id,
                     }));
                     smallvec![]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) => {
+                    self.txn_id = None;
+                    self.record = None;
+                    self.create_event = None;
+                    self.conflict_recheck = true;
+                    self.start_transaction_effect()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -581,15 +661,17 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-        METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::metadata::{
         MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataError,
         MetadataEvent, MetadataRequestDurability,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::storage_entries::{metadata_event_log_prefix, metadata_pending_projection_key};
+    use aruna_core::storage_entries::{
+        metadata_create_acceptance_key, metadata_event_log_prefix, metadata_pending_projection_key,
+    };
     use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::types::{Effects, GroupId, Key};
     use ulid::Ulid;
@@ -619,23 +701,32 @@ mod tests {
         config
     }
 
-    fn realm_config_read(config: Option<&RealmConfigDocument>, actor: &Actor) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: actor.realm_id.as_bytes().to_vec().into(),
-            value: config.map(|config| {
-                config
-                    .to_bytes(actor)
-                    .expect("realm config encodes")
-                    .to_vec()
-                    .into()
-            }),
+    fn realm_config_read(
+        config: Option<&RealmConfigDocument>,
+        actor: &Actor,
+        document_id: Ulid,
+    ) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (metadata_create_acceptance_key(document_id), None),
+                (
+                    actor.realm_id.as_bytes().to_vec().into(),
+                    config.map(|config| {
+                        config
+                            .to_bytes(actor)
+                            .expect("realm config encodes")
+                            .to_vec()
+                            .into()
+                    }),
+                ),
+            ],
         })
     }
 
     fn assert_realm_config_read(effects: &[Effect]) {
         let [
-            Effect::Storage(StorageEffect::Read {
-                key_space,
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
                 txn_id: Some(_),
                 ..
             }),
@@ -643,7 +734,9 @@ mod tests {
         else {
             panic!("expected realm config read");
         };
-        assert_eq!(key_space, REALM_CONFIG_KEYSPACE);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
+        assert_eq!(reads[1].0, REALM_CONFIG_KEYSPACE);
     }
 
     fn begin_transaction(
@@ -680,8 +773,8 @@ mod tests {
         let txn_id = Ulid::from_bytes([32; 16]);
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let [
-            Effect::Storage(StorageEffect::Read {
-                key_space,
+            Effect::Storage(StorageEffect::BatchRead {
+                reads,
                 txn_id: Some(read_txn),
                 ..
             }),
@@ -689,10 +782,12 @@ mod tests {
         else {
             panic!("expected transactional realm config read");
         };
-        assert_eq!(key_space, REALM_CONFIG_KEYSPACE);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].0, METADATA_CREATE_ACCEPTANCE_KEYSPACE);
+        assert_eq!(reads[1].0, REALM_CONFIG_KEYSPACE);
         assert_eq!(*read_txn, txn_id);
 
-        let effects = operation.step(realm_config_read(Some(&realm_config), &actor));
+        let effects = operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -715,6 +810,65 @@ mod tests {
             writes
                 .iter()
                 .any(|(key_space, _, _)| key_space == METADATA_PENDING_PROJECTION_KEYSPACE)
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+        );
+
+        let mut winner: MetadataCreateEventRecord = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+            .and_then(|(_, _, value)| postcard::from_bytes(value.as_ref()).ok())
+            .expect("create acceptance decodes");
+        winner.event_id = Ulid::from_bytes([33; 16]);
+        winner.record.last_event_id = winner.event_id;
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed })]
+                if *committed == txn_id
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::TransactionConflict,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+
+        let retry_txn = Ulid::from_bytes([34; 16]);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: retry_txn,
+        }));
+        assert_realm_config_read(effects.as_slice());
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    metadata_create_acceptance_key(document_id),
+                    Some(postcard::to_allocvec(&winner).unwrap().into()),
+                ),
+                (actor.realm_id.as_bytes().to_vec().into(), None),
+            ],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == retry_txn
+        ));
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize().expect("winner is replayed"),
+            super::CreateMetadataDocumentResult {
+                record: winner.record,
+                event_id: winner.event_id,
+            }
         );
     }
 
@@ -772,7 +926,7 @@ mod tests {
             panic!("expected metadata create event append");
         };
         assert!(txn_id.is_some());
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 3);
         let (_, key, value) = writes
             .iter()
             .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
@@ -789,9 +943,18 @@ mod tests {
         assert_eq!(event.user_id, actor.user_id);
         assert_eq!(event.node_id, actor.node_id);
         assert!(matches!(
-            event.payload,
+            &event.payload,
             MetadataCreateEventPayload::Scaffold { .. }
         ));
+
+        let (_, acceptance_key, acceptance_value) = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == METADATA_CREATE_ACCEPTANCE_KEYSPACE)
+            .expect("create acceptance write exists");
+        assert_eq!(acceptance_key, &metadata_create_acceptance_key(document_id));
+        let accepted: MetadataCreateEventRecord =
+            postcard::from_bytes(acceptance_value.as_ref()).expect("create acceptance decodes");
+        assert_eq!(accepted, event);
 
         let (_, marker_key, marker_value) = writes
             .iter()
@@ -833,7 +996,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor));
+        let effects = operation.step(realm_config_read(None, &actor, document_id));
         assert_create_event_append(effects.as_slice(), document_id, &actor);
     }
 
@@ -854,7 +1017,7 @@ mod tests {
         operation.start();
         let effects = operation.step(validation_result(document_id));
         begin_transaction(&mut operation, effects.as_slice());
-        operation.step(realm_config_read(Some(&realm_config), &actor));
+        operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
 
         let placement = operation
             .record
@@ -884,7 +1047,7 @@ mod tests {
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor));
+        let effects = operation.step(realm_config_read(None, &actor, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert_eq!(
             operation
@@ -925,7 +1088,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor));
+        let effects = operation.step(realm_config_read(None, &actor, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
@@ -986,7 +1149,7 @@ mod tests {
         }));
         let config_read = begin_transaction(&mut operation, config_read.as_slice());
         assert_realm_config_read(config_read.as_slice());
-        let append = operation.step(realm_config_read(None, &actor));
+        let append = operation.step(realm_config_read(None, &actor, document_id));
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {

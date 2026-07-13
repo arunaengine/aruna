@@ -22,7 +22,8 @@ use aruna_core::structs::{
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -56,6 +57,80 @@ struct TestContext {
     actor: Actor,
     config: RealmConfigDocument,
     context: Arc<DriverContext>,
+}
+
+#[tokio::test]
+async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
+    let config = CreateMetadataDocumentConfig {
+        actor: test.actor.clone(),
+        group_id,
+        document_id,
+        document_path: "datasets/lost-response".to_string(),
+        public: true,
+        payload: CreateMetadataDocumentPayload::Scaffold {
+            name: "Lost Response".to_string(),
+            description: "Retry before asynchronous projection".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+        },
+    };
+
+    // Drive only the durable create operation, then discard its response. The
+    // public wrapper has not scheduled projection, so the registry remains empty.
+    let accepted = drive(
+        CreateMetadataDocumentOperation::new(config.clone()),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert!(
+        drive(
+            ListMetadataDocumentsOperation::new(group_id),
+            test.context.as_ref(),
+        )
+        .await?
+        .is_empty()
+    );
+
+    let retried = drive(
+        CreateMetadataDocumentOperation::new(config.clone()),
+        test.context.as_ref(),
+    )
+    .await?;
+
+    assert_eq!(retried, accepted);
+    let group_error = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            group_id: Ulid::r#gen(),
+            ..config.clone()
+        }),
+        test.context.as_ref(),
+    )
+    .await
+    .expect_err("an accepted document id cannot move groups");
+    assert_eq!(
+        group_error,
+        CreateMetadataDocumentError::DocumentAlreadyExists
+    );
+    let path_error = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            document_path: "datasets/other".to_string(),
+            ..config
+        }),
+        test.context.as_ref(),
+    )
+    .await
+    .expect_err("an accepted document id cannot change path");
+    assert_eq!(
+        path_error,
+        CreateMetadataDocumentError::DocumentAlreadyExists
+    );
+    let events = read_create_events(&test, document_id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, accepted.event_id);
+    Ok(())
 }
 
 impl TestContext {
