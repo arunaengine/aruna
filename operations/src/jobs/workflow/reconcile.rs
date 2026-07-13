@@ -82,7 +82,7 @@ impl ExternalReconciler for ComputeReconciler {
             .workspace_bucket
             .clone()
             .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
-        let attempt = AttemptRef::new(job_id.to_string(), intent.attempt_no);
+        let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
 
         match backend.reconcile(&attempt).await {
             ReconcileOutcome::Found(status) if !status.is_terminal() => {

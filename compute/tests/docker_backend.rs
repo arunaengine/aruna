@@ -246,6 +246,65 @@ async fn resource_limits() {
 }
 
 #[tokio::test]
+async fn foreign_not_adopted() {
+    // A same-named container created outside Aruna (no aruna.io/* labels) is
+    // neither adopted as evidence nor removed by cleanup.
+    let backend = backend_or_skip!();
+    // Warm the image so the bare create below cannot 404.
+    let warmup = sh(&unique("warmup"), "true");
+    backend.submit(&warmup).await.unwrap();
+    backend
+        .wait(&warmup.attempt, &CancellationToken::new())
+        .await
+        .unwrap();
+    backend.cleanup(&warmup.attempt).await.unwrap();
+
+    use bollard::Docker;
+    use bollard::models::ContainerCreateBody;
+    use bollard::query_parameters::{
+        CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+    };
+    let spec = sh(&unique("foreign"), "sleep 30");
+    let attempt = spec.attempt.clone();
+    let docker = Docker::connect_with_defaults().unwrap();
+    let opts = CreateContainerOptionsBuilder::new()
+        .name(&attempt.external_name())
+        .build();
+    docker
+        .create_container(
+            Some(opts),
+            ContainerCreateBody {
+                image: Some(IMAGE.to_string()),
+                cmd: Some(vec!["sleep".to_string(), "30".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    match backend.reconcile(&attempt).await {
+        ReconcileOutcome::Unavailable(_) => {}
+        other => panic!("foreign container must not reconcile, got {other:?}"),
+    }
+    assert!(
+        backend.submit(&spec).await.is_err(),
+        "submit must not adopt a foreign name collision"
+    );
+    assert!(
+        backend.cleanup(&attempt).await.is_err(),
+        "cleanup must not remove a foreign container"
+    );
+
+    docker
+        .remove_container(
+            &attempt.external_name(),
+            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn walltime_enforced() {
     // A run past its walltime ceiling is stopped and surfaces a backend failure
     // instead of running forever.

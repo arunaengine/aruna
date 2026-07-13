@@ -256,7 +256,13 @@ impl ExecutorBackend for DockerBackend {
             // Name collision: adopt the existing attempt, never start a second run.
             Err(e) => match classify(&e) {
                 BackendError::Conflict(_) => {
-                    let status = self.status(&spec.attempt).await?;
+                    let inspect = self.inspect(&spec.attempt).await?;
+                    if !labels_match(&inspect, &spec.attempt) {
+                        return Err(BackendError::Conflict(format!(
+                            "container `{name}` exists but is not this attempt"
+                        )));
+                    }
+                    let status = inspect_to_status(inspect);
                     // Complete a partial submit in place, but only for a container
                     // that provably never ran: `docker start` on an exited
                     // container would re-run it.
@@ -377,6 +383,14 @@ impl ExecutorBackend for DockerBackend {
 
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome {
         match self.inspect(attempt).await {
+            // A same-named container without this attempt's labels is foreign
+            // (another instance or an operator): not adoptable evidence.
+            Ok(inspect) if !labels_match(&inspect, attempt) => {
+                ReconcileOutcome::Unavailable(BackendError::Conflict(format!(
+                    "container `{}` exists but is not this attempt",
+                    attempt.external_name()
+                )))
+            }
             Ok(inspect) => ReconcileOutcome::Found(inspect_to_status(inspect)),
             Err(BackendError::NotFound(_)) => ReconcileOutcome::NotFound,
             Err(other) => ReconcileOutcome::Unavailable(other),
@@ -388,6 +402,16 @@ impl ExecutorBackend for DockerBackend {
             return Ok(());
         }
         let name = attempt.external_name();
+        let inspect = match self.inspect(attempt).await {
+            Ok(inspect) => inspect,
+            Err(BackendError::NotFound(_)) => return Ok(()),
+            Err(other) => return Err(other),
+        };
+        if !labels_match(&inspect, attempt) {
+            return Err(BackendError::Conflict(format!(
+                "refusing to remove foreign container `{name}`"
+            )));
+        }
         let opts = RemoveContainerOptionsBuilder::new().force(true).build();
         match self.docker.remove_container(&name, Some(opts)).await {
             Ok(()) => Ok(()),
@@ -425,6 +449,23 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The container carries this attempt's `aruna.io/*` labels; matching by the
+/// deterministic name alone would adopt (or remove) a same-named container
+/// created by another instance.
+fn labels_match(inspect: &ContainerInspectResponse, attempt: &AttemptRef) -> bool {
+    let Some(labels) = inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+    else {
+        return false;
+    };
+    attempt
+        .labels()
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
 }
 
 /// A container created by a partial submit that never started a run: only such a
@@ -608,6 +649,25 @@ mod tests {
             split_image_ref("repo@sha256:abc"),
             ("repo".into(), Some("sha256:abc".into()))
         );
+    }
+
+    #[test]
+    fn label_gate() {
+        use bollard::models::ContainerConfig;
+        let attempt = AttemptRef::new("j1", 0);
+        let mut inspect = ContainerInspectResponse {
+            config: Some(ContainerConfig {
+                labels: Some(attempt.labels().into_iter().collect()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(labels_match(&inspect, &attempt));
+        // Another job, another attempt number, or an unlabeled container never matches.
+        assert!(!labels_match(&inspect, &AttemptRef::new("j2", 0)));
+        assert!(!labels_match(&inspect, &AttemptRef::new("j1", 1)));
+        inspect.config.as_mut().unwrap().labels = None;
+        assert!(!labels_match(&inspect, &attempt));
     }
 
     #[test]

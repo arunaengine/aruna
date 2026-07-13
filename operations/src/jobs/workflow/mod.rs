@@ -104,7 +104,8 @@ pub async fn run_execution_job(
     }
 
     let attempt_no = record.attempts;
-    let attempt = AttemptRef::new(job_id.to_string(), attempt_no);
+    // Lowercased: attempt ids must be injective under the backend name mapping.
+    let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
     let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
 
     // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
@@ -881,7 +882,7 @@ mod tests {
         let token = claimed.claim.as_ref().unwrap().claim_token;
         transition_to_preparing(storage, job_id, token, 3).await.unwrap();
         transition_to_ready(storage, job_id, token, 4).await.unwrap();
-        let attempt = AttemptRef::new(job_id.to_string(), claimed.attempts);
+        let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), claimed.attempts);
         let intent = AttemptIntent {
             attempt_no: claimed.attempts,
             external_name: attempt.external_name(),

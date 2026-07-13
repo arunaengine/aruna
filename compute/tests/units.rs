@@ -14,6 +14,9 @@ fn external_name() {
     assert!(AttemptRef::new("ok.name-1", 0).validate().is_ok());
     assert!(AttemptRef::new("bad name", 0).validate().is_err());
     assert!(AttemptRef::new("", 0).validate().is_err());
+    // Mixed case is rejected: `JobA` and `joba` would collide on one container
+    // name, breaking adopt-by-name.
+    assert!(AttemptRef::new("Job-XYZ", 0).validate().is_err());
 }
 
 #[test]

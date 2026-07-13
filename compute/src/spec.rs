@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 /// via [`AttemptRef::external_name`]; that name is the reconciliation key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptRef {
-    /// Caller-supplied stable job name. Must be unique under lowercasing and
-    /// restricted to `[a-z0-9._-]` so it maps cleanly onto backend object names.
+    /// Caller-supplied stable job name. Must be lowercase `[a-z0-9._-]` so it
+    /// maps injectively onto backend object names.
     pub job_id: String,
     pub attempt: u32,
 }
@@ -27,7 +27,9 @@ impl AttemptRef {
         format!("aruna-{}-a{}", self.job_id.to_lowercase(), self.attempt)
     }
 
-    /// Reject job ids that would not map onto a valid backend object name.
+    /// Reject job ids that would not map onto a valid backend object name. Only
+    /// lowercase ids are accepted: `external_name` folds case, so `JobA` and
+    /// `joba` would otherwise collide on one container name.
     pub fn validate(&self) -> Result<(), String> {
         if self.job_id.is_empty() {
             return Err("job_id is empty".to_string());
@@ -35,10 +37,10 @@ impl AttemptRef {
         let ok = self
             .job_id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
         if !ok {
             return Err(format!(
-                "job_id `{}` contains characters outside [A-Za-z0-9._-]",
+                "job_id `{}` contains characters outside [a-z0-9._-]",
                 self.job_id
             ));
         }
