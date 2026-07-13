@@ -560,6 +560,23 @@ impl OperationsTaskHandler {
                         &record.target,
                         record.placement,
                     );
+                    // Emit-time peer stamps go stale across a rebalance: a
+                    // drained holder refuses the sync as a non-member and the
+                    // whole record would ride the retry ladder while the
+                    // replacement holder never gets pushed to. Re-resolve the
+                    // shard's live holders on every drain; empty stamps keep
+                    // their realm-default-set semantics, and a config gap or an
+                    // unknown strategy keeps the stamp.
+                    if !record.peers.is_empty()
+                        && record.target.uses_shard_topic()
+                        && let Some(config) = realm_config.as_ref()
+                    {
+                        let holders =
+                            crate::placement::resolve_shard_holders(config, &record.placement);
+                        if !holders.is_empty() {
+                            record.peers = holders;
+                        }
+                    }
                     let topic = record.target.sync_topic_id(realm_id, &record.placement);
                     (record_key, record, topic)
                 })
