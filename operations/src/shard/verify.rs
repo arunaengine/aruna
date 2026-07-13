@@ -10,6 +10,7 @@ use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use byteview::ByteView;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -23,6 +24,10 @@ use crate::sync_placement::placement_key;
 /// A new holder retries digest reconciliation this many times against the first
 /// reachable co-holder before leaving the shard unverified for the next pass.
 pub const SHARD_VERIFICATION_MAX_ATTEMPTS: usize = 3;
+
+/// Limits startup verification work while allowing independent shards to make
+/// progress concurrently. Matches the existing bounded metadata fanout.
+const SHARD_VERIFICATION_CONCURRENCY_LIMIT: usize = 8;
 
 /// Persisted proof that the local node reconciled a shard against a co-holder.
 /// Presence of the row (keyed like a pending placement) means verified; a
@@ -45,13 +50,13 @@ pub struct ShardVerificationSummary {
     pub unverified: usize,
 }
 
-/// Reconciles every shard the local node newly holds against a co-holder: fetch
-/// the first reachable co-holder's manifest in rank order and compare the topic
-/// digest plus manifest entry digest. Equal ⇒ mark verified; differing ⇒ one
-/// anti-entropy pass against that co-holder and retry, bounded by
-/// [`SHARD_VERIFICATION_MAX_ATTEMPTS`]. Already verified shards (a persisted
-/// marker) are skipped, so this is idempotent and cheap in steady state and
-/// resumes unverified shards after a restart.
+/// Reconciles every shard the local node newly holds against a co-holder with
+/// bounded concurrency: fetch the first reachable co-holder's manifest in rank
+/// order and compare the topic digest plus manifest entry digest. Equal ⇒ mark
+/// verified; differing ⇒ one anti-entropy pass against that co-holder and retry,
+/// bounded by [`SHARD_VERIFICATION_MAX_ATTEMPTS`]. Already verified shards (a
+/// persisted marker) are skipped, so this is idempotent and cheap in steady
+/// state and resumes unverified shards after a restart.
 pub async fn verify_held_shards(
     context: &Arc<DriverContext>,
     node_id: NodeId,
@@ -65,31 +70,42 @@ pub async fn verify_held_shards(
         return summary;
     };
 
-    for strategy in &config.strategies {
-        for shard in 0..strategy.shard_count {
-            let placement = PlacementRef {
-                strategy_id: strategy.strategy_id,
-                epoch: 0,
-                shard,
+    let held_shards: Vec<_> = config
+        .strategies
+        .iter()
+        .flat_map(|strategy| {
+            (0..strategy.shard_count).filter_map(|shard| {
+                let placement = PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    epoch: 0,
+                    shard,
+                };
+                let holders = resolve_shard_holders(&config, &placement);
+                holders.contains(&node_id).then(|| {
+                    // Rank order is preserved by `resolve_shard_holders`; keep it so the
+                    // first reachable co-holder is the highest-ranked one.
+                    let co_holders: Vec<NodeId> = holders
+                        .into_iter()
+                        .filter(|candidate| *candidate != node_id)
+                        .collect();
+                    (placement, co_holders)
+                })
+            })
+        })
+        .collect();
+
+    let net_handle = &net_handle;
+    let pending = stream::iter(held_shards.into_iter().enumerate().map(
+        |(shard_index, (placement, co_holders))| async move {
+            let mut shard_summary = ShardVerificationSummary {
+                held: 1,
+                ..ShardVerificationSummary::default()
             };
-            let holders = resolve_shard_holders(&config, &placement);
-            if !holders.contains(&node_id) {
-                continue;
-            }
-            summary.held += 1;
             if is_shard_verified(context, realm_id, &placement).await {
-                summary.already_verified += 1;
-                continue;
-            }
-            // Rank order is preserved by `resolve_shard_holders`; keep it so the
-            // first reachable co-holder is the highest-ranked one.
-            let co_holders: Vec<NodeId> = holders
-                .into_iter()
-                .filter(|candidate| *candidate != node_id)
-                .collect();
-            if verify_one_shard(
+                shard_summary.already_verified = 1;
+            } else if verify_one_shard(
                 context,
-                &net_handle,
+                net_handle,
                 node_id,
                 realm_id,
                 placement,
@@ -97,11 +113,27 @@ pub async fn verify_held_shards(
             )
             .await
             {
-                summary.newly_verified += 1;
+                shard_summary.newly_verified = 1;
             } else {
-                summary.unverified += 1;
+                shard_summary.unverified = 1;
             }
-        }
+
+            (shard_index, shard_summary)
+        },
+    ))
+    .buffer_unordered(SHARD_VERIFICATION_CONCURRENCY_LIMIT);
+    futures_util::pin_mut!(pending);
+
+    let mut shard_summaries = Vec::new();
+    while let Some(shard_summary) = pending.next().await {
+        shard_summaries.push(shard_summary);
+    }
+    shard_summaries.sort_unstable_by_key(|(shard_index, _)| *shard_index);
+    for (_, shard_summary) in shard_summaries {
+        summary.held += shard_summary.held;
+        summary.already_verified += shard_summary.already_verified;
+        summary.newly_verified += shard_summary.newly_verified;
+        summary.unverified += shard_summary.unverified;
     }
     summary
 }
