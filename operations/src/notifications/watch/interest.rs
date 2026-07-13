@@ -7,18 +7,15 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
-};
+use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
     RealmConfigDocument, RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchInterestDigest,
-    WatchInterestEntry, WatchInterestTable, WatchSubscription, watch_interest_dirty_key,
+    WatchInterestEntry, WatchInterestTable, watch_interest_dirty_key,
     watch_interest_dirty_realm_id, watch_interest_key_node_id, watch_interest_key_realm_id,
     watch_interest_node_key, watch_interest_node_prefix, watch_interest_realm_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, KeySpace, UserId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -28,6 +25,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::watch::authorization::filter_authorized_watch_subscriptions;
+use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Debounce window for the coalesced watch-interest publisher. `ShortenTimer`
@@ -251,18 +249,9 @@ async fn build_realm_digest(
     realm_id: RealmId,
     realm_config: &RealmConfigDocument,
 ) -> Result<(WatchInterestDigest, bool), String> {
-    let entries = iter_all(
-        &ctx.storage_handle,
-        NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-        Some(UserId::storage_prefix(realm_id)),
-    )
-    .await?;
-    let mut subscriptions = Vec::with_capacity(entries.len());
-    for (_, value) in entries {
-        subscriptions.push(
-            WatchSubscription::from_bytes(value.as_ref()).map_err(|error| error.to_string())?,
-        );
-    }
+    let subscriptions = list_realm_watch_subscriptions(&ctx.storage_handle, realm_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let filtered =
         filter_authorized_watch_subscriptions(ctx, realm_id, realm_config, node_id, subscriptions)
             .await?;
@@ -642,6 +631,7 @@ mod tests {
         Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, RealmNodeKind,
         WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
+    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
