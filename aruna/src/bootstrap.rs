@@ -23,6 +23,7 @@ use aruna_operations::replicate_documents::{
 };
 use byteview::ByteView;
 use rand::Rng;
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
@@ -180,6 +181,7 @@ pub async fn fetch_core_onboarding_documents(
 
     if !user_documents.is_empty() {
         let config = load_realm_config(driver_ctx, realm_id).await;
+        let mut synced_topics = HashSet::new();
         for document in user_documents {
             let placement = match config.as_ref() {
                 Some(config) => placement_ref_for_target(config, &document, Default::default()),
@@ -189,7 +191,11 @@ pub async fn fetch_core_onboarding_documents(
                 warn!(document = ?document, "Skipping onboarding user document without a shard placement");
                 continue;
             }
-            let topic = document.sync_topic_id(realm_id, &placement);
+            let Some(topic) =
+                unique_user_topic(&mut synced_topics, realm_id, &placement, &document)
+            else {
+                continue;
+            };
             sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
         }
     }
@@ -259,6 +265,16 @@ async fn load_realm_config(
             .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
         _ => None,
     }
+}
+
+fn unique_user_topic(
+    synced_topics: &mut HashSet<::irokle::TopicId>,
+    realm_id: aruna_core::structs::RealmId,
+    placement: &aruna_core::structs::PlacementRef,
+    document: &DocumentSyncTarget,
+) -> Option<::irokle::TopicId> {
+    let topic = document.sync_topic_id(realm_id, placement);
+    synced_topics.insert(topic).then_some(topic)
 }
 
 async fn sync_topic_from_peer(
@@ -338,7 +354,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{core_document_targets, realm_config_has_node_placement};
+    use super::{core_document_targets, realm_config_has_node_placement, unique_user_topic};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -351,6 +367,35 @@ mod tests {
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use tempfile::tempdir;
+
+    #[test]
+    fn user_topics_deduplicate() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let first = DocumentSyncTarget::User {
+            user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
+        };
+        let second = DocumentSyncTarget::User {
+            user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
+        };
+        let first_shard = aruna_core::structs::PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
+            epoch: 0,
+            shard: 7,
+        };
+        let second_shard = aruna_core::structs::PlacementRef {
+            shard: 8,
+            ..first_shard
+        };
+        let mut synced_topics = std::collections::HashSet::new();
+
+        assert!(unique_user_topic(&mut synced_topics, realm_id, &first_shard, &first).is_some());
+        assert_eq!(
+            unique_user_topic(&mut synced_topics, realm_id, &first_shard, &second),
+            None
+        );
+        assert!(unique_user_topic(&mut synced_topics, realm_id, &second_shard, &second).is_some());
+        assert_eq!(synced_topics.len(), 2);
+    }
 
     fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
         DriverContext {
