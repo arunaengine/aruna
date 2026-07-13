@@ -5,7 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key};
+use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key, parse_job_dedup_value};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, UserId};
 use smallvec::smallvec;
@@ -44,6 +44,8 @@ pub enum SubmitJobError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
+    JobPlanConflict { existing_job_id: JobId },
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
 }
@@ -59,13 +61,14 @@ enum SubmitState {
     Error,
 }
 
-/// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the existing
-/// id after verifying that job's record still decodes. A dangling entry (record
-/// quarantined or gone) falls through to a fresh create whose batch write repoints the
-/// dedup row, so a corrupt record cannot poison its key. Dedup is best-effort
-/// (read-then-write, no cross-submit lock), so under a concurrent race two jobs may
-/// share a key. Execution is at-least-once: consumers must be idempotent (`Probe`'s
-/// marker file is the example).
+/// Effect-driven submit; a live `job_dedup_index` entry with a matching plan digest
+/// short-circuits to the existing id after verifying that job's record still decodes
+/// (a differing digest is a `JobPlanConflict`). A dangling entry (record quarantined
+/// or gone) falls through to a fresh create whose batch write repoints the dedup row,
+/// so a corrupt record cannot poison its key. Dedup is best-effort (read-then-write,
+/// no cross-submit lock), so under a concurrent race two jobs may share a key.
+/// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
+/// the example).
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -170,8 +173,15 @@ impl Operation for SubmitJobOperation {
             SubmitState::ReadDedup => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match <[u8; 16]>::try_from(value.as_ref()) {
-                    Ok(bytes) => self.verify_dedup(JobId::from_bytes(bytes)),
+                }) => match parse_job_dedup_value(value.as_ref()) {
+                    // Same key + same plan is idempotent; a different plan is a conflict.
+                    Ok((existing_job_id, existing_digest)) => {
+                        if self.record.plan_digest.unwrap_or_default() == existing_digest {
+                            self.verify_dedup(existing_job_id)
+                        } else {
+                            self.fail(SubmitJobError::JobPlanConflict { existing_job_id })
+                        }
+                    }
                     Err(_) => self.write_job(),
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
@@ -238,7 +248,7 @@ mod tests {
     use aruna_core::keyspaces::{
         JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
     };
-    use aruna_core::structs::{JobState, RealmId};
+    use aruna_core::structs::{JobState, RealmId, encode_job_dedup_value};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -365,6 +375,37 @@ mod tests {
         assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 2);
     }
 
+    // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
+    #[tokio::test]
+    async fn dedup_plan_conflict() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+
+        let mut first_spec = spec(Some(b"k".to_vec()));
+        let JobPayload::Probe { steps, .. } = &mut first_spec.payload;
+        *steps = 2;
+        let first = drive(SubmitJobOperation::new(first_spec), &ctx)
+            .await
+            .unwrap();
+        assert!(first.created);
+
+        let mut conflicting = spec(Some(b"k".to_vec()));
+        let JobPayload::Probe { steps, .. } = &mut conflicting.payload;
+        *steps = 9;
+        let error = drive(SubmitJobOperation::new(conflicting), &ctx)
+            .await
+            .expect_err("differing plan must conflict");
+        assert_eq!(
+            error,
+            SubmitJobError::JobPlanConflict {
+                existing_job_id: first.job_id
+            }
+        );
+        // The original job is untouched and no second record was written.
+        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+    }
+
     // Perf budget: a non-dedup submit is one atomic batch write of <=4 keys plus a
     // non-persisted drain kick.
     #[tokio::test]
@@ -400,11 +441,12 @@ mod tests {
         let ghost = JobId::from_bytes([9u8; 16]);
         let submission = spec(Some(b"k".to_vec()));
         let created_by = submission.created_by;
+        let digest = submission.payload.plan_digest();
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
             job_dedup_index_key(created_by, b"k"),
-            ByteView::from(ghost.to_bytes().to_vec()),
+            ByteView::from(encode_job_dedup_value(ghost, digest)),
         )
         .await;
 
@@ -430,6 +472,7 @@ mod tests {
         let ghost = JobId::from_bytes([9u8; 16]);
         let submission = spec(Some(b"k".to_vec()));
         let created_by = submission.created_by;
+        let digest = submission.payload.plan_digest();
         write_raw(
             &storage,
             JOB_KEYSPACE,
@@ -441,7 +484,7 @@ mod tests {
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
             job_dedup_index_key(created_by, b"k"),
-            ByteView::from(ghost.to_bytes().to_vec()),
+            ByteView::from(encode_job_dedup_value(ghost, digest)),
         )
         .await;
 

@@ -156,6 +156,34 @@ impl JobPayload {
             JobPayload::Probe { .. } => JobExecutionClass::InProcess,
         }
     }
+
+    /// Canonical plan digest: BLAKE3 over the postcard encoding of the payload.
+    /// The same idempotency identity with a matching digest is an idempotent
+    /// create; a differing digest is a `JobPlanConflict`.
+    pub fn plan_digest(&self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(self).expect("payload postcard is infallible");
+        *blake3::hash(&bytes).as_bytes()
+    }
+}
+
+/// Encode a `job_dedup_index` value: `job_id (16) || plan_digest (32)`.
+pub fn encode_job_dedup_value(job_id: JobId, plan_digest: [u8; 32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(&job_id.to_bytes());
+    bytes.extend_from_slice(&plan_digest);
+    bytes
+}
+
+pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), ConversionError> {
+    if bytes.len() != 48 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 48-byte dedup value, got {}",
+            bytes.len()
+        )));
+    }
+    let job_id = JobId::from_bytes(bytes[..16].try_into()?);
+    let plan_digest: [u8; 32] = bytes[16..48].try_into()?;
+    Ok((job_id, plan_digest))
 }
 
 /// Closed result enum parallel to `JobPayload`.
@@ -263,6 +291,7 @@ pub struct JobRecord {
     pub dedup_key: Option<Vec<u8>>,
     pub result: Option<JobResultPayload>,
     pub execution_class: JobExecutionClass,
+    pub plan_digest: Option<[u8; 32]>,
 }
 
 impl JobRecord {
@@ -278,6 +307,7 @@ impl JobRecord {
     ) -> Self {
         let unit = payload.progress_unit();
         let execution_class = payload.execution_class();
+        let plan_digest = Some(payload.plan_digest());
         Self {
             job_id,
             payload,
@@ -297,6 +327,7 @@ impl JobRecord {
             dedup_key,
             result: None,
             execution_class,
+            plan_digest,
         }
     }
 
@@ -623,6 +654,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dedup_value_roundtrips() {
+        let id = JobId::from_bytes([7u8; 16]);
+        let digest = [9u8; 32];
+        let encoded = encode_job_dedup_value(id, digest);
+        assert_eq!(encoded.len(), 48);
+        assert_eq!(parse_job_dedup_value(&encoded).unwrap(), (id, digest));
+        assert!(parse_job_dedup_value(&encoded[..16]).is_err());
     }
 
     #[test]

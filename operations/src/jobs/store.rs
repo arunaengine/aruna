@@ -6,9 +6,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord, JobResultPayload,
-    JobState, JobTransitionError, job_due_index_key, job_lease_index_key, job_owner_cursor,
-    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
-    parse_job_owner_index_key, validate_transition,
+    JobState, JobTransitionError, encode_job_dedup_value, job_due_index_key, job_lease_index_key,
+    job_owner_cursor, job_owner_index_key, job_owner_index_prefix, job_prune_index_key,
+    job_record_key, parse_job_dedup_value, parse_job_owner_index_key, validate_transition,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -97,7 +97,10 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         writes.push((
             JOB_DEDUP_INDEX_KEYSPACE.to_string(),
             job_dedup_index_key(record.created_by, dedup_key),
-            ByteView::from(record.job_id.to_bytes().to_vec()),
+            ByteView::from(encode_job_dedup_value(
+                record.job_id,
+                record.plan_digest.unwrap_or_default(),
+            )),
         ));
     }
     Ok(writes)
@@ -249,7 +252,11 @@ async fn cleanup_dedup_entry(
     let current = read_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;
-    if current.as_deref() == Some(old.job_id.to_bytes().as_slice()) {
+    let still_ours = current
+        .as_deref()
+        .and_then(|bytes| parse_job_dedup_value(bytes).ok())
+        .is_some_and(|(job_id, _)| job_id == old.job_id);
+    if still_ours {
         delete_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
             .await
             .map_err(JobMutationError::Storage)?;
@@ -699,11 +706,9 @@ pub async fn find_dedup_job(
     .await?
     {
         Some(value) => {
-            let bytes: [u8; 16] = value
-                .as_ref()
-                .try_into()
-                .map_err(|_| "malformed dedup index value".to_string())?;
-            Ok(Some(JobId::from_bytes(bytes)))
+            let (job_id, _) =
+                parse_job_dedup_value(value.as_ref()).map_err(|error| error.to_string())?;
+            Ok(Some(job_id))
         }
         None => Ok(None),
     }
@@ -1408,7 +1413,7 @@ mod tests {
             vec![(
                 JOB_DEDUP_INDEX_KEYSPACE.to_string(),
                 job_dedup_index_key(record.created_by, b"k"),
-                ByteView::from(job_b.to_bytes().to_vec()),
+                ByteView::from(encode_job_dedup_value(job_b, [3u8; 32])),
             )],
             None,
         )
