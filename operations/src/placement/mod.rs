@@ -6,7 +6,8 @@ pub mod selector;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::structs::{
-    PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument, shard_for_subject,
+    DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
+    shard_for_subject,
 };
 
 use crate::placement::selector::{ROLE_SHARD, rank_weighted};
@@ -67,27 +68,28 @@ pub fn placement_ref_for_target(
 
 /// Bucket the document's registry row rides.
 ///
-/// Resolved for the registry target itself, not for the document's own bucket:
-/// the registry class is bound "everywhere" so every node carries the row, while
-/// the document's bucket is replica-capped and reaches only its holders. The
-/// document path is deliberately not passed — a path-prefix binding steers where
-/// the *document* lives, and letting it cap the registry row too would put the
-/// row back out of reach of the nodes that need it to route.
+/// Resolved directly from the registry class, not from the document's general
+/// precedence chain: the registry class is bound "everywhere" so every node
+/// carries the row, while the document's bucket is replica-capped and reaches
+/// only its holders. Document overrides and group/path bindings steer where the
+/// *document* lives and must not cap the registry row too.
 pub fn registry_placement(
     config: &RealmConfigDocument,
     record: &aruna_core::structs::MetadataRegistryRecord,
 ) -> PlacementRef {
-    placement_ref_for_target(
-        config,
-        &DocumentSyncTarget::MetadataRegistry {
-            group_id: record.group_id,
-            document_id: record.document_id,
-        },
-        PlacementResolutionContext {
-            group_id: Some(record.group_id),
-            metadata_path: None,
-        },
-    )
+    let Some(strategy) = resolver::strategy_for_class(config, DocumentClass::MetadataRegistry)
+    else {
+        return PlacementRef::NIL;
+    };
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id: record.group_id,
+        document_id: record.document_id,
+    };
+    PlacementRef {
+        strategy_id: strategy.strategy_id,
+        epoch: 0,
+        shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
+    }
 }
 
 /// Placement plan for a document `target`: its shard's rank-ordered holder set
@@ -239,7 +241,9 @@ fn resolve_shard_holders_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        BindingScope, MetadataRegistryRecord, RealmId, RealmNodeKind, StrategyBinding,
+    };
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -279,6 +283,79 @@ mod tests {
 
     fn subject(seed: u64) -> [u8; 32] {
         *blake3::hash(&seed.to_le_bytes()).as_bytes()
+    }
+
+    #[test]
+    fn registry_uses_class() {
+        let (mut config, _) = config_and_placement();
+        let group_id = Ulid::from_bytes([6u8; 16]);
+        let document_id = Ulid::from_bytes([7u8; 16]);
+        let general_strategy_id = config.default_strategy_id.unwrap();
+        let class_strategy = PlacementStrategy {
+            strategy_id: Ulid::from_bytes([8u8; 16]),
+            name: "registry".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 16,
+        };
+        config.strategies.push(class_strategy.clone());
+        config.strategy_bindings = vec![
+            StrategyBinding {
+                scope: BindingScope::Group(group_id),
+                strategy_id: general_strategy_id,
+            },
+            StrategyBinding {
+                scope: BindingScope::Class(DocumentClass::MetadataRegistry),
+                strategy_id: class_strategy.strategy_id,
+            },
+        ];
+        config.placement_overrides = vec![PlacementOverride {
+            subject: document_id.to_bytes().to_vec(),
+            pinned: Vec::new(),
+            excluded: Vec::new(),
+            strategy_id: Some(general_strategy_id),
+        }];
+        let record = MetadataRegistryRecord {
+            realm_id: RealmId::from_bytes([3u8; 32]),
+            group_id,
+            document_id,
+            document_path: "datasets/example".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: String::new(),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event_id: Ulid::from_bytes([9u8; 16]),
+        };
+
+        let placement = registry_placement(&config, &record);
+        assert_eq!(placement.strategy_id, class_strategy.strategy_id);
+        assert_eq!(
+            placement.shard,
+            shard_for_subject(&document_id.to_bytes(), class_strategy.shard_count)
+        );
+
+        config.strategy_bindings[1].strategy_id = Ulid::from_bytes([99u8; 16]);
+        assert_eq!(registry_placement(&config, &record), PlacementRef::NIL);
+
+        config.strategy_bindings.truncate(1);
+        let fallback = registry_placement(&config, &record);
+        assert_eq!(fallback.strategy_id, config.default_strategy_id.unwrap());
+
+        config.default_strategy_id = Some(Ulid::from_bytes([99u8; 16]));
+        assert_eq!(registry_placement(&config, &record), PlacementRef::NIL);
+
+        config.default_strategy_id = None;
+        assert_eq!(
+            registry_placement(&config, &record).strategy_id,
+            config.strategies[0].strategy_id
+        );
+
+        config.strategies.clear();
+        assert_eq!(registry_placement(&config, &record), PlacementRef::NIL);
     }
 
     #[test]

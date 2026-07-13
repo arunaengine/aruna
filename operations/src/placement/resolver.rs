@@ -184,6 +184,19 @@ pub fn strategy_for_target<'a>(
     Some((strategy, override_))
 }
 
+/// Resolves a class binding without subject, path, or group precedence.
+pub(super) fn strategy_for_class(
+    config: &RealmConfigDocument,
+    class: DocumentClass,
+) -> Option<&PlacementStrategy> {
+    let strategy = match resolve_class_strategy(config, class) {
+        Ok(Some(strategy)) => strategy,
+        Ok(None) => config.strategies.first()?,
+        Err(()) => return None,
+    };
+    Some(strategy)
+}
+
 /// Coarse document class used for class-scoped strategy bindings.
 pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
     match target {
@@ -395,6 +408,22 @@ fn resolve_strategy<'a>(
     {
         return Ok(Some(strategy));
     }
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class))? {
+        return Ok(Some(strategy));
+    }
+    if let Some(strategy) = binding_strategy(config, &BindingScope::Realm)? {
+        return Ok(Some(strategy));
+    }
+    if let Some(id) = config.default_strategy_id {
+        return config.strategy(&id).map(Some).ok_or(());
+    }
+    Ok(None)
+}
+
+fn resolve_class_strategy(
+    config: &RealmConfigDocument,
+    class: DocumentClass,
+) -> Result<Option<&PlacementStrategy>, ()> {
     if let Some(strategy) = binding_strategy(config, &BindingScope::Class(class))? {
         return Ok(Some(strategy));
     }
