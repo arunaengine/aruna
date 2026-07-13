@@ -90,11 +90,12 @@ pub const DOCUMENT_SYNC_BATCH_SYNC_TOPIC_LIMIT: usize = 1_024;
 const DOCUMENT_SYNC_INBOUND_SYNC_MESSAGE_LIMIT: usize = 4_096;
 const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
-const MAX_DEFERRED_ADMIN_TOPICS: usize = 1_024;
-const MAX_DEFERRED_ADMIN_TOPICS_PER_DEPENDENCY: usize = 256;
+const MAX_DEFERRED_TOPICS: usize = 1_024;
+const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
 
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
+    topic_id: irokle_crate::TopicId,
     target: DocumentSyncTarget,
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
@@ -103,6 +104,12 @@ struct PendingMetadataCreateApply {
 
 struct MetadataPlacementFence {
     config_write: Option<(String, ByteView, Value)>,
+}
+
+enum MetadataPlacementOutcome<T> {
+    Accepted(T),
+    Deferred(DocumentSyncDependency),
+    Rejected,
 }
 
 #[derive(Default)]
@@ -1776,13 +1783,10 @@ impl DocumentSyncService {
         topic_ids: impl IntoIterator<Item = irokle_crate::TopicId>,
     ) -> Result<DocumentSyncReconcileResult> {
         let _reconcile_guard = self.reconcile_lock.lock().await;
-        let mut deferred_admin_topics: BTreeMap<
-            AdminEventDependency,
-            BTreeSet<irokle_crate::TopicId>,
-        > = self
-            .storage_read(
+        let mut deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+            self.storage_read(
                 DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                deferred_admin_topics_key(),
+                deferred_topics_key(),
             )
             .await?
             .map(|bytes| postcard::from_bytes(&bytes))
@@ -1797,25 +1801,13 @@ impl DocumentSyncService {
             }
         }
         let mut satisfied_persisted_dependencies = Vec::new();
-        for dependency in deferred_admin_topics.keys().copied().collect::<Vec<_>>() {
-            let available = match dependency {
-                AdminEventDependency::RealmConfig(realm_id) => {
-                    read_admin_realm_config(&self.storage, realm_id)
-                        .await?
-                        .is_some()
-                }
-                AdminEventDependency::RealmAuthorization(realm_id) => {
-                    read_admin_realm_authorization(&self.storage, realm_id)
-                        .await?
-                        .is_some()
-                }
-            };
-            if available {
+        for dependency in deferred_topics.keys().copied().collect::<Vec<_>>() {
+            if document_sync_dependency_available(&self.storage, dependency).await? {
                 satisfied_persisted_dependencies.push(dependency);
             }
         }
         for dependency in satisfied_persisted_dependencies {
-            if let Some(topics) = deferred_admin_topics.remove(&dependency) {
+            if let Some(topics) = deferred_topics.remove(&dependency) {
                 for topic_id in topics {
                     if queued_topics.insert(topic_id) {
                         topic_queue.push_back(topic_id);
@@ -1826,10 +1818,13 @@ impl DocumentSyncService {
         let mut applied_targets = Vec::new();
         let mut metadata_create_events = Vec::new();
         let mut metadata_graph_tombstones = Vec::new();
-        let mut pending_metadata_creates = Vec::new();
-        let mut deferred_cursor_writes = Vec::new();
+        let mut pending_metadata_creates: Vec<PendingMetadataCreateApply> = Vec::new();
+        let mut deferred_cursor_writes: Vec<(irokle_crate::TopicId, (String, ByteView, Value))> =
+            Vec::new();
         while let Some(topic_id) = topic_queue.pop_front() {
             queued_topics.remove(&topic_id);
+            pending_metadata_creates.retain(|pending| pending.topic_id != topic_id);
+            deferred_cursor_writes.retain(|(pending_topic_id, _)| *pending_topic_id != topic_id);
             let Some(topic) = self
                 .node
                 .storage()
@@ -1868,6 +1863,7 @@ impl DocumentSyncService {
             let mut deferred_creates = false;
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
+            let mut cross_topic_dependencies = BTreeSet::new();
             for (event, actor_id, actor_seq) in events {
                 if self
                     .shard_publishers
@@ -2047,11 +2043,51 @@ impl DocumentSyncService {
                         self.apply_upsert(target.clone(), bytes, change).await?;
                         applied_targets.push(target);
                     }
+                    DocumentSyncEvent::Upsert {
+                        target:
+                            target @ DocumentSyncTarget::MetadataRegistry {
+                                group_id,
+                                document_id,
+                            },
+                        bytes,
+                        ..
+                    } => {
+                        let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)
+                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        if record.group_id != group_id || record.document_id != document_id {
+                            return Err(NetError::Bootstrap(format!(
+                                "replicated metadata registry target {group_id}/{document_id} does not match payload {}/{}",
+                                record.group_id, record.document_id
+                            )));
+                        }
+                        let realm_id = record.realm_id;
+                        let strategy_id = record.placement.strategy_id;
+                        match self.apply_metadata_registry_upsert(record, bytes).await? {
+                            MetadataPlacementOutcome::Accepted(()) => applied_targets.push(target),
+                            MetadataPlacementOutcome::Deferred(dependency) => {
+                                warn!(
+                                    %topic_id,
+                                    %realm_id,
+                                    %document_id,
+                                    %strategy_id,
+                                    "Deferring metadata registry record until its placement strategy is available"
+                                );
+                                cross_topic_dependencies.insert(dependency);
+                            }
+                            MetadataPlacementOutcome::Rejected => warn!(
+                                %topic_id,
+                                %realm_id,
+                                %document_id,
+                                %strategy_id,
+                                "Rejecting metadata registry record with mismatched placement configuration"
+                            ),
+                        }
+                    }
                     event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
                     } => {
-                        let pending = self.pending_metadata_create_apply(event)?;
+                        let pending = self.pending_metadata_create_apply(topic_id, event)?;
                         pending_metadata_creates.push(pending);
                         deferred_creates = true;
                     }
@@ -2077,6 +2113,7 @@ impl DocumentSyncService {
                                 let bytes = postcard::to_allocvec(&record)
                                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
                                 pending_metadata_creates.push(PendingMetadataCreateApply {
+                                    topic_id,
                                     target,
                                     lifecycle_revision: Some(change),
                                     record,
@@ -2253,15 +2290,15 @@ impl DocumentSyncService {
                             }
                         }
 
+                        let dependencies =
+                            satisfied_document_sync_dependencies(&target, event.as_ref());
                         apply_admin_document_operation_to_storage(
                             &self.storage,
                             target.clone(),
                             *event,
                         )
                         .await?;
-                        if let Some(dependency) = satisfied_admin_dependency(&target) {
-                            satisfied_admin_dependencies.insert(dependency);
-                        }
+                        satisfied_admin_dependencies.extend(dependencies);
                         applied_targets.push(target);
                     }
                     event => {
@@ -2271,7 +2308,6 @@ impl DocumentSyncService {
                     }
                 }
             }
-            let mut cross_topic_dependencies = BTreeSet::new();
             let mut pending = deferred_admin_events;
             loop {
                 let mut progressed = false;
@@ -2289,15 +2325,15 @@ impl DocumentSyncService {
                     .await?
                     {
                         AdminEventValidation::Accepted => {
+                            let dependencies =
+                                satisfied_document_sync_dependencies(&target, &event);
                             apply_admin_document_operation_to_storage(
                                 &self.storage,
                                 target.clone(),
                                 event,
                             )
                             .await?;
-                            if let Some(dependency) = satisfied_admin_dependency(&target) {
-                                satisfied_admin_dependencies.insert(dependency);
-                            }
+                            satisfied_admin_dependencies.extend(dependencies);
                             applied_targets.push(target);
                             progressed = true;
                         }
@@ -2333,30 +2369,16 @@ impl DocumentSyncService {
                 }
             }
             if !cross_topic_dependencies.is_empty() {
-                remove_deferred_admin_topic(&mut deferred_admin_topics, topic_id);
+                remove_deferred_topic(&mut deferred_topics, topic_id);
                 let mut registered_dependency = false;
                 for dependency in cross_topic_dependencies {
-                    let total_topics = deferred_admin_topics
-                        .values()
-                        .map(BTreeSet::len)
-                        .sum::<usize>();
-                    let dependency_topics = deferred_admin_topics
-                        .get(&dependency)
-                        .map(BTreeSet::len)
-                        .unwrap_or_default();
-                    if total_topics < MAX_DEFERRED_ADMIN_TOPICS
-                        && dependency_topics < MAX_DEFERRED_ADMIN_TOPICS_PER_DEPENDENCY
-                    {
-                        deferred_admin_topics
-                            .entry(dependency)
-                            .or_default()
-                            .insert(topic_id);
+                    if register_deferred_topic(&mut deferred_topics, dependency, topic_id) {
                         registered_dependency = true;
                     } else {
                         warn!(
                             %topic_id,
                             ?dependency,
-                            "Dropping admin dependency registration because the deferred-topic registry is full"
+                            "Dropping document dependency registration because the deferred-topic registry is full"
                         );
                     }
                 }
@@ -2370,9 +2392,12 @@ impl DocumentSyncService {
             );
             if deferred_creates {
                 deferred_cursor_writes.push((
-                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-                    cursor_key,
-                    value,
+                    topic_id,
+                    (
+                        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                        cursor_key,
+                        value,
+                    ),
                 ));
             } else {
                 self.storage_write(
@@ -2383,10 +2408,10 @@ impl DocumentSyncService {
                 .await?;
             }
             let retry_topics = {
-                remove_deferred_admin_topic(&mut deferred_admin_topics, topic_id);
+                remove_deferred_topic(&mut deferred_topics, topic_id);
                 satisfied_admin_dependencies
                     .into_iter()
-                    .filter_map(|dependency| deferred_admin_topics.remove(&dependency))
+                    .filter_map(|dependency| deferred_topics.remove(&dependency))
                     .flatten()
                     .collect::<Vec<_>>()
             };
@@ -2396,21 +2421,32 @@ impl DocumentSyncService {
                 }
             }
         }
+        let persisted_deferred_topics = postcard::to_allocvec(&deferred_topics)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         self.storage_write(
             DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
-            deferred_admin_topics_key(),
-            postcard::to_allocvec(&deferred_admin_topics)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into(),
+            deferred_topics_key(),
+            persisted_deferred_topics.clone().into(),
         )
         .await?;
         self.apply_metadata_create_batch(
             pending_metadata_creates,
             deferred_cursor_writes,
+            &mut deferred_topics,
             &mut applied_targets,
             &mut metadata_create_events,
         )
         .await?;
+        let updated_deferred_topics = postcard::to_allocvec(&deferred_topics)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if updated_deferred_topics != persisted_deferred_topics {
+            self.storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                deferred_topics_key(),
+                updated_deferred_topics.into(),
+            )
+            .await?;
+        }
         Ok(DocumentSyncReconcileResult {
             targets: applied_targets,
             metadata_create_events,
@@ -2473,6 +2509,7 @@ impl DocumentSyncService {
 
     fn pending_metadata_create_apply(
         &self,
+        topic_id: irokle_crate::TopicId,
         event: DocumentSyncEvent,
     ) -> Result<PendingMetadataCreateApply> {
         let (document_id, target_event_id, bytes) = match event {
@@ -2498,6 +2535,7 @@ impl DocumentSyncService {
             )));
         }
         Ok(PendingMetadataCreateApply {
+            topic_id,
             target: DocumentSyncTarget::MetadataCreateEvent {
                 document_id,
                 event_id: target_event_id,
@@ -2511,7 +2549,8 @@ impl DocumentSyncService {
     async fn apply_metadata_create_batch(
         &self,
         pending: Vec<PendingMetadataCreateApply>,
-        cursor_writes: Vec<(String, ByteView, Value)>,
+        cursor_writes: Vec<(irokle_crate::TopicId, (String, ByteView, Value))>,
+        deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
         applied_targets: &mut Vec<DocumentSyncTarget>,
         metadata_create_events: &mut Vec<MetadataCreateEventRecord>,
     ) -> Result<()> {
@@ -2558,6 +2597,8 @@ impl DocumentSyncService {
         let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
         let mut config_writes = BTreeMap::new();
         let mut accepted = Vec::with_capacity(candidates.len());
+        let mut accepted_candidates = Vec::with_capacity(candidates.len());
+        let mut deferred_cursor_topics = BTreeSet::new();
         for (apply, entries) in candidates {
             let fence = match metadata_placement_fence_in_transaction(
                 &self.storage,
@@ -2566,13 +2607,33 @@ impl DocumentSyncService {
             )
             .await
             {
-                Ok(Some(fence)) => fence,
-                Ok(None) => {
+                Ok(MetadataPlacementOutcome::Accepted(fence)) => fence,
+                Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
                     warn!(
+                        topic_id = %apply.topic_id,
                         realm_id = %apply.record.record.realm_id,
                         document_id = %apply.record.record.document_id,
                         strategy_id = %apply.record.record.placement.strategy_id,
-                        "Rejecting replicated metadata create whose placement strategy is unavailable"
+                        "Deferring replicated metadata create until its placement strategy is available"
+                    );
+                    if register_deferred_topic(deferred_topics, dependency, apply.topic_id) {
+                        deferred_cursor_topics.insert(apply.topic_id);
+                    } else {
+                        warn!(
+                            topic_id = %apply.topic_id,
+                            ?dependency,
+                            "Dropping metadata placement dependency because the deferred-topic registry is full"
+                        );
+                    }
+                    continue;
+                }
+                Ok(MetadataPlacementOutcome::Rejected) => {
+                    warn!(
+                        topic_id = %apply.topic_id,
+                        realm_id = %apply.record.record.realm_id,
+                        document_id = %apply.record.record.document_id,
+                        strategy_id = %apply.record.record.placement.strategy_id,
+                        "Rejecting replicated metadata create with mismatched placement configuration"
                     );
                     continue;
                 }
@@ -2584,14 +2645,22 @@ impl DocumentSyncService {
                     return Err(error);
                 }
             };
-            if let Some(config_write) = fence.config_write {
+            accepted_candidates.push((apply, entries, fence.config_write));
+        }
+        for (apply, entries, config_write) in accepted_candidates {
+            if deferred_cursor_topics.contains(&apply.topic_id) {
+                continue;
+            }
+            if let Some(config_write) = config_write {
                 config_writes.insert(apply.record.record.realm_id, config_write);
             }
             writes.extend(entries);
             accepted.push(apply);
         }
         writes.extend(config_writes.into_values());
-        writes.extend(cursor_writes);
+        writes.extend(cursor_writes.into_iter().filter_map(|(topic_id, write)| {
+            (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
+        }));
         if let Err(error) =
             storage_batch_delete_and_write_in_transaction(&self.storage, txn_id, Vec::new(), writes)
                 .await
@@ -2698,7 +2767,8 @@ impl DocumentSyncService {
                     record.group_id, record.document_id
                 )));
             }
-            return self.apply_metadata_registry_upsert(record, bytes).await;
+            self.apply_metadata_registry_upsert(record, bytes).await?;
+            return Ok(());
         }
         if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
@@ -2755,7 +2825,7 @@ impl DocumentSyncService {
         &self,
         record: MetadataRegistryRecord,
         primary_bytes: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<MetadataPlacementOutcome<()>> {
         apply_metadata_registry_upsert_to_storage(&self.storage, record, primary_bytes).await
     }
 
@@ -3167,13 +3237,14 @@ async fn apply_metadata_registry_upsert_to_storage(
     storage: &StorageHandle,
     record: MetadataRegistryRecord,
     primary_bytes: Vec<u8>,
-) -> Result<()> {
+) -> Result<MetadataPlacementOutcome<()>> {
     if metadata_graph_deleted_in_storage(storage, &record.graph_iri).await? {
-        return storage_batch_delete_to(
+        storage_batch_delete_to(
             storage,
             metadata_registry_delete_entries(record.group_id, record.document_id),
         )
-        .await;
+        .await?;
+        return Ok(MetadataPlacementOutcome::Accepted(()));
     }
 
     let mut base_entries = metadata_registry_write_entries(&record)
@@ -3188,18 +3259,18 @@ async fn apply_metadata_registry_upsert_to_storage(
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
         let fence = match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
-            Ok(Some(fence)) => fence,
-            Ok(None) => {
-                warn!(
-                    realm_id = %record.realm_id,
-                    document_id = %record.document_id,
-                    strategy_id = %record.placement.strategy_id,
-                    "Rejecting metadata registry record whose placement strategy is unavailable"
-                );
+            Ok(MetadataPlacementOutcome::Accepted(fence)) => fence,
+            Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Ok(());
+                return Ok(MetadataPlacementOutcome::Deferred(dependency));
+            }
+            Ok(MetadataPlacementOutcome::Rejected) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(MetadataPlacementOutcome::Rejected);
             }
             Err(error) => {
                 let _ = storage
@@ -3243,7 +3314,7 @@ async fn apply_metadata_registry_upsert_to_storage(
             let _ = storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Ok(());
+            return Ok(MetadataPlacementOutcome::Accepted(()));
         }
 
         let mut entries = base_entries.clone();
@@ -3253,7 +3324,7 @@ async fn apply_metadata_registry_upsert_to_storage(
         match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), entries)
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
             Err(NetError::Dht(message))
                 if message == StorageError::TransactionConflict.to_string() =>
             {
@@ -4347,7 +4418,14 @@ async fn metadata_placement_fence_in_transaction(
     storage: &StorageHandle,
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
-) -> Result<Option<MetadataPlacementFence>> {
+) -> Result<MetadataPlacementOutcome<MetadataPlacementFence>> {
+    let dependency = DocumentSyncDependency::PlacementStrategy {
+        realm_id: record.realm_id,
+        strategy_id: record.placement.strategy_id,
+    };
+    if record.placement != PlacementRef::NIL && record.placement.strategy_id.is_nil() {
+        return Ok(MetadataPlacementOutcome::Rejected);
+    }
     let target = DocumentSyncTarget::RealmConfig {
         realm_id: record.realm_id,
     };
@@ -4360,20 +4438,24 @@ async fn metadata_placement_fence_in_transaction(
     .await?;
     let Some(value) = value else {
         return if record.placement == PlacementRef::NIL {
-            Ok(Some(MetadataPlacementFence { config_write: None }))
+            Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence {
+                config_write: None,
+            }))
         } else {
-            Ok(None)
+            Ok(MetadataPlacementOutcome::Deferred(dependency))
         };
     };
     let config = RealmConfigDocument::from_bytes(&value)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if config.realm_id != record.realm_id
-        || (record.placement != PlacementRef::NIL
-            && config.strategy(&record.placement.strategy_id).is_none())
-    {
-        return Ok(None);
+    if config.realm_id != record.realm_id {
+        return Ok(MetadataPlacementOutcome::Rejected);
     }
-    Ok(Some(MetadataPlacementFence {
+    if record.placement != PlacementRef::NIL
+        && config.strategy(&record.placement.strategy_id).is_none()
+    {
+        return Ok(MetadataPlacementOutcome::Deferred(dependency));
+    }
+    Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence {
         config_write: Some((
             REALM_CONFIG_KEYSPACE.to_string(),
             target.storage_key(),
@@ -4704,9 +4786,13 @@ enum AdminOperationFamily {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-enum AdminEventDependency {
+enum DocumentSyncDependency {
     RealmConfig(RealmId),
     RealmAuthorization(RealmId),
+    PlacementStrategy {
+        realm_id: RealmId,
+        strategy_id: Ulid,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4714,25 +4800,89 @@ enum AdminEventValidation {
     Accepted,
     Rejected(String),
     Deferred {
-        dependency: Option<AdminEventDependency>,
+        dependency: Option<DocumentSyncDependency>,
         reason: String,
     },
 }
 
-fn satisfied_admin_dependency(target: &DocumentSyncTarget) -> Option<AdminEventDependency> {
+fn satisfied_document_sync_dependencies(
+    target: &DocumentSyncTarget,
+    event: &AdminDocumentEvent,
+) -> Vec<DocumentSyncDependency> {
+    let mut dependencies = Vec::new();
     match target {
         DocumentSyncTarget::RealmConfig { realm_id } => {
-            Some(AdminEventDependency::RealmConfig(*realm_id))
+            dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
+            if let AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } =
+                &event.op
+            {
+                dependencies.push(DocumentSyncDependency::PlacementStrategy {
+                    realm_id: *realm_id,
+                    strategy_id: strategy.strategy_id,
+                });
+            }
         }
         DocumentSyncTarget::RealmAuthorization { realm_id } => {
-            Some(AdminEventDependency::RealmAuthorization(*realm_id))
+            dependencies.push(DocumentSyncDependency::RealmAuthorization(*realm_id));
         }
-        _ => None,
+        _ => {}
+    }
+    dependencies
+}
+
+async fn document_sync_dependency_available(
+    storage: &StorageHandle,
+    dependency: DocumentSyncDependency,
+) -> Result<bool> {
+    match dependency {
+        DocumentSyncDependency::RealmConfig(realm_id) => {
+            Ok(read_admin_realm_config(storage, realm_id).await?.is_some())
+        }
+        DocumentSyncDependency::RealmAuthorization(realm_id) => {
+            Ok(read_admin_realm_authorization(storage, realm_id)
+                .await?
+                .is_some())
+        }
+        DocumentSyncDependency::PlacementStrategy {
+            realm_id,
+            strategy_id,
+        } => Ok(read_admin_realm_config(storage, realm_id)
+            .await?
+            .is_some_and(|config| {
+                config.realm_id == realm_id && config.strategy(&strategy_id).is_some()
+            })),
     }
 }
 
-fn remove_deferred_admin_topic(
-    deferred_topics: &mut BTreeMap<AdminEventDependency, BTreeSet<irokle_crate::TopicId>>,
+fn register_deferred_topic(
+    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
+    dependency: DocumentSyncDependency,
+    topic_id: irokle_crate::TopicId,
+) -> bool {
+    if deferred_topics
+        .get(&dependency)
+        .is_some_and(|topics| topics.contains(&topic_id))
+    {
+        return true;
+    }
+    let total_topics = deferred_topics.values().map(BTreeSet::len).sum::<usize>();
+    let dependency_topics = deferred_topics
+        .get(&dependency)
+        .map(BTreeSet::len)
+        .unwrap_or_default();
+    if total_topics >= MAX_DEFERRED_TOPICS
+        || dependency_topics >= MAX_DEFERRED_TOPICS_PER_DEPENDENCY
+    {
+        return false;
+    }
+    deferred_topics
+        .entry(dependency)
+        .or_default()
+        .insert(topic_id)
+}
+
+fn remove_deferred_topic(
+    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
     topic_id: irokle_crate::TopicId,
 ) {
     for topics in deferred_topics.values_mut() {
@@ -5118,7 +5268,7 @@ async fn validate_realm_authorization_admin_authority(
         AdminEventValidation::Accepted
     } else {
         AdminEventValidation::Deferred {
-            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
             reason: "current realm config is unavailable".to_string(),
         }
     })
@@ -5136,7 +5286,7 @@ async fn validate_group_admin_authority(
     let realm_id = event.actor.realm_id;
     let Some(config) = read_admin_realm_config(storage, realm_id).await? else {
         return Ok(AdminEventValidation::Deferred {
-            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
             reason: "current realm config is unavailable".to_string(),
         });
     };
@@ -5222,7 +5372,7 @@ async fn validate_group_admin_authority(
     };
     let Some(realm_auth) = realm_auth else {
         return Ok(AdminEventValidation::Deferred {
-            dependency: Some(AdminEventDependency::RealmAuthorization(realm_id)),
+            dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
             reason: "realm authorization state is unavailable".to_string(),
         });
     };
@@ -5269,7 +5419,7 @@ async fn validate_user_admin_authority(
     let realm_id = user_id.realm_id;
     let Some(config) = read_admin_realm_config(storage, realm_id).await? else {
         return Ok(AdminEventValidation::Deferred {
-            dependency: Some(AdminEventDependency::RealmConfig(realm_id)),
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
             reason: "current realm config is unavailable".to_string(),
         });
     };
@@ -5320,7 +5470,7 @@ async fn validate_user_admin_authority(
     } else {
         let Some(auth) = read_admin_realm_authorization(storage, realm_id).await? else {
             return Ok(AdminEventValidation::Deferred {
-                dependency: Some(AdminEventDependency::RealmAuthorization(realm_id)),
+                dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
                 reason: "realm authorization state is unavailable".to_string(),
             });
         };
@@ -5523,7 +5673,8 @@ fn topic_cursor_key(topic_id: irokle_crate::TopicId) -> ByteView {
     ByteView::from(key)
 }
 
-fn deferred_admin_topics_key() -> ByteView {
+fn deferred_topics_key() -> ByteView {
+    // Retain the original key so previously persisted admin dependencies decode.
     ByteView::from(b"deferred-admin-topics".to_vec())
 }
 
@@ -9518,6 +9669,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_placement_defers() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(76).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let actor = test_actor(
+            76,
+            UserId::local(Ulid::from_parts(2_110, 1), realm_id),
+            realm_id,
+        );
+        assert_eq!(actor.node_id, local_node);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_node, RealmNodeKind::Management);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let strategy = PlacementStrategy {
+            strategy_id: Ulid::from_parts(2_111, 1),
+            name: "deferred".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 64,
+        };
+        let placement = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let group_id = Ulid::from_parts(2_112, 1);
+        let document_id = Ulid::from_parts(2_113, 1);
+        let create_event_id = Ulid::from_parts(2_114, 1);
+        let mut record = registry_record(
+            group_id,
+            document_id,
+            "datasets/deferred",
+            100,
+            create_event_id,
+        );
+        record.placement = placement;
+        let mut create = metadata_create_event(group_id, document_id, 100, create_event_id, 76);
+        create.record = record.clone();
+        let registry_target = DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        };
+        let create_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: create_event_id,
+        };
+        let metadata_topic = registry_target.sync_topic_id(realm_id, &placement);
+        service
+            .ensure_document_sync_topics(&[metadata_topic], Vec::new())
+            .expect("metadata shard topic genesis");
+        let change = |event_id| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: local_node,
+                updated_at_ms: 100,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(2_115, 1),
+                        target: registry_target.clone(),
+                        bytes: postcard::to_allocvec(&record).expect("registry serializes"),
+                        change: change(Ulid::from_parts(2_115, 1)),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: Ulid::from_parts(2_116, 1),
+                        target: create_target.clone(),
+                        bytes: postcard::to_allocvec(&create).expect("create serializes"),
+                        change: change(Ulid::from_parts(2_116, 1)),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "metadata publish failed: {published:?}"
+        );
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(metadata_topic),
+                postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                    .expect("clock serializes")
+                    .into(),
+            )
+            .await
+            .expect("metadata cursor resets");
+
+        let deferred = service
+            .reconcile_document_topics([metadata_topic])
+            .await
+            .expect("metadata reconciliation defers");
+        assert!(deferred.metadata_create_events.is_empty());
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_INDEX_KEYSPACE,
+                metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_EVENT_LOG_KEYSPACE,
+                metadata_event_log_key(document_id, create_event_id),
+            )
+            .await
+            .is_none()
+        );
+        let deferred_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(metadata_topic),
+            )
+            .await
+            .expect("deferred cursor remains stored"),
+        )
+        .expect("cursor decodes");
+        let metadata_clock = service
+            .node()
+            .storage()
+            .actor_clock(&metadata_topic)
+            .expect("metadata topic clock");
+        assert!(!deferred_cursor.dominates(&metadata_clock));
+        let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+            postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    deferred_topics_key(),
+                )
+                .await
+                .expect("deferred topic registry is persisted"),
+            )
+            .expect("deferred topic registry decodes");
+        assert_eq!(
+            deferred_topics
+                .get(&DocumentSyncDependency::PlacementStrategy {
+                    realm_id,
+                    strategy_id: strategy.strategy_id,
+                })
+                .and_then(|topics| topics.get(&metadata_topic)),
+            Some(&metadata_topic)
+        );
+
+        let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let strategy_event = test_admin_event(
+            Ulid::from_parts(2_117, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &actor,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+        );
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: config_target.clone(),
+                    event: Box::new(strategy_event),
+                    placement: PlacementRef::NIL,
+                    allow_genesis: true,
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "strategy publish failed: {published:?}"
+        );
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                topic_cursor_key(config_topic),
+                postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                    .expect("clock serializes")
+                    .into(),
+            )
+            .await
+            .expect("config cursor resets");
+
+        let applied = service
+            .reconcile_document_topics([config_topic])
+            .await
+            .expect("strategy reconciliation retries metadata");
+        assert!(applied.targets.contains(&registry_target));
+        assert!(applied.targets.contains(&create_target));
+        assert_eq!(applied.metadata_create_events, vec![create.clone()]);
+        assert_registry_record_present(&storage, &record).await;
+        let stored_create = read_storage_value(
+            &storage,
+            METADATA_EVENT_LOG_KEYSPACE,
+            metadata_event_log_key(document_id, create_event_id),
+        )
+        .await
+        .expect("create event exists");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&stored_create)
+                .expect("create event decodes"),
+            create
+        );
+        let applied_cursor: irokle_crate::ActorClock = postcard::from_bytes(
+            &read_storage_value(
+                &storage,
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                topic_cursor_key(metadata_topic),
+            )
+            .await
+            .expect("applied cursor is stored"),
+        )
+        .expect("cursor decodes");
+        assert!(applied_cursor.dominates(&metadata_clock));
+        assert!(
+            service
+                .reconcile_document_topics([metadata_topic])
+                .await
+                .expect("accepted metadata is idempotent")
+                .metadata_create_events
+                .is_empty()
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn document_sync_fencing_metadata_registry_stale_delete_preserves_newer_live_indexes() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_560, 1);
@@ -11091,12 +11506,12 @@ mod tests {
             .actor_clock(&auth_topic)
             .expect("auth topic clock");
         assert!(!deferred_cursor.dominates(&auth_clock));
-        let deferred_topics: BTreeMap<AdminEventDependency, BTreeSet<irokle_crate::TopicId>> =
+        let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
             postcard::from_bytes(
                 &read_storage_value(
                     &storage,
                     DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
-                    deferred_admin_topics_key(),
+                    deferred_topics_key(),
                 )
                 .await
                 .expect("deferred topic registry is persisted"),
@@ -11104,7 +11519,7 @@ mod tests {
             .expect("deferred topic registry decodes");
         assert_eq!(
             deferred_topics
-                .get(&AdminEventDependency::RealmConfig(realm_id))
+                .get(&DocumentSyncDependency::RealmConfig(realm_id))
                 .and_then(|topics| topics.get(&auth_topic)),
             Some(&auth_topic)
         );
