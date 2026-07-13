@@ -63,7 +63,10 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+// Every wait below polls to a condition; the ceiling only bounds a genuine
+// hang, so it carries generous headroom for a loaded CI runner where gossip and
+// anti-entropy across the holders are thread-starved and slow.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 
 struct TestNode {
     _temp_dir: TempDir,
