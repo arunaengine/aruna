@@ -59,7 +59,7 @@ use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
-use crate::process_placements::process_shard_placements;
+use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
@@ -68,7 +68,7 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::DOCUMENT_SYNC_DEFER_RETRY_AFTER;
+use crate::sync_placement::{DOCUMENT_SYNC_DEFER_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -1531,7 +1531,17 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
-                process_shard_placements(&self.context, realm_id, node_id).await;
+                if process_shard_placements(&self.context, realm_id, node_id)
+                    .await
+                    .status
+                    == PlacementReconcileStatus::StorageFailure
+                {
+                    self.reschedule_timer(
+                        TaskKey::SyncPlacements { realm_id, node_id },
+                        SYNC_PLACEMENT_RETRY_AFTER,
+                    )
+                    .await;
+                }
             }
             TaskKey::DrainDocumentSyncOutbox => {
                 self.drain_document_sync_outbox().await;
@@ -1582,7 +1592,9 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::{METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+    use aruna_core::keyspaces::{
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE,
+    };
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
@@ -1669,6 +1681,64 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected outbox write event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn placement_storage_rearms() {
+        let realm_id = RealmId::from_bytes([43u8; 32]);
+        let node_id = node(7);
+        let key = TaskKey::SyncPlacements { realm_id, node_id };
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                value: ByteView::from(b"malformed config".to_vec()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle),
+        });
+
+        let before_ms = unix_timestamp_millis();
+        OperationsTaskHandler::new(context)
+            .handle_timer(key.clone())
+            .await;
+        let after_ms = unix_timestamp_millis();
+
+        let persisted = match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => panic!("unexpected timer iter result: {other:?}"),
+        };
+        assert_eq!(persisted.len(), 1, "one retry timer must be persisted");
+        let timer: aruna_core::task::PersistedTaskTimer =
+            postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
+        assert_eq!(timer.key, key);
+        let retry_ms = crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
+        assert!(timer.due_at_unix_millis >= before_ms.saturating_add(retry_ms));
+        assert!(timer.due_at_unix_millis <= after_ms.saturating_add(retry_ms));
     }
 
     #[test]

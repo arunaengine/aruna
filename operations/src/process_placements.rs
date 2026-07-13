@@ -241,10 +241,50 @@ pub(crate) async fn ensure_rank0_shard_group(
 
 /// What a [`process_shard_placements`] pass decided about follow-up work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlacementReconcileStatus {
+    /// Reconciliation completed without scheduling more work.
+    #[default]
+    Clean,
+    /// A genesis was withheld or a record left incomplete, so the reconciler
+    /// scheduled its own [`TaskKey::SyncPlacements`] retry timer.
+    RetryScheduled,
+    /// Storage could not provide a trustworthy config or placement scan. A
+    /// timer consumer must re-arm the consumed timer.
+    StorageFailure,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlacementReconcileOutcome {
-    /// A genesis was withheld or a record left incomplete, so a
-    /// [`TaskKey::SyncPlacements`] retry timer was scheduled.
+    /// Compatibility signal for callers that only need to know whether the
+    /// reconciler armed its own retry.
     pub retry_scheduled: bool,
+    pub status: PlacementReconcileStatus,
+}
+
+impl PlacementReconcileOutcome {
+    fn clean() -> Self {
+        Self::default()
+    }
+
+    fn retry_scheduled() -> Self {
+        Self {
+            retry_scheduled: true,
+            status: PlacementReconcileStatus::RetryScheduled,
+        }
+    }
+
+    fn storage_failure() -> Self {
+        Self {
+            retry_scheduled: false,
+            status: PlacementReconcileStatus::StorageFailure,
+        }
+    }
+}
+
+enum RealmConfigLoadOutcome {
+    Found(RealmConfigDocument),
+    Absent,
+    StorageFailure,
 }
 
 /// Reconciles the local node's held shard topics with their co-holders.
@@ -270,13 +310,18 @@ pub async fn process_shard_placements(
     realm_id: RealmId,
     local_node_id: NodeId,
 ) -> PlacementReconcileOutcome {
-    let mut outcome = PlacementReconcileOutcome::default();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        warn!(%realm_id, "Cannot process shard placements without a realm config");
-        return outcome;
+    let config = match load_realm_config_outcome(context, realm_id).await {
+        RealmConfigLoadOutcome::Found(config) => config,
+        RealmConfigLoadOutcome::Absent => {
+            warn!(%realm_id, "Cannot process shard placements without a realm config");
+            return PlacementReconcileOutcome::clean();
+        }
+        RealmConfigLoadOutcome::StorageFailure => {
+            return PlacementReconcileOutcome::storage_failure();
+        }
     };
     let Some(net_handle) = context.net_handle.as_ref() else {
-        return outcome;
+        return PlacementReconcileOutcome::clean();
     };
 
     // A withheld genesis or an unpulled held topic leaves no placement record,
@@ -308,11 +353,11 @@ pub async fn process_shard_placements(
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 warn!(error = %error, "Failed to list pending shard placements");
-                return outcome;
+                return PlacementReconcileOutcome::storage_failure();
             }
             other => {
                 warn!(event = ?other, "Unexpected pending shard placement iter result");
-                return outcome;
+                return PlacementReconcileOutcome::storage_failure();
             }
         };
 
@@ -426,15 +471,15 @@ pub async fn process_shard_placements(
         let effect =
             crate::sync_placement::schedule_placement_retry_after(realm_id, local_node_id, after);
         let _ = task_handle.send_effect(effect).await;
-        outcome.retry_scheduled = true;
+        return PlacementReconcileOutcome::retry_scheduled();
     }
-    outcome
+    PlacementReconcileOutcome::clean()
 }
 
-pub(crate) async fn load_realm_config(
+async fn load_realm_config_outcome(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-) -> Option<RealmConfigDocument> {
+) -> RealmConfigLoadOutcome {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
     match context
         .storage_handle
@@ -445,10 +490,36 @@ pub(crate) async fn load_realm_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => RealmConfigLoadOutcome::Found(config),
+            Err(error) => {
+                warn!(%realm_id, error = %error, "Failed to decode realm config for shard placements");
+                RealmConfigLoadOutcome::StorageFailure
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            RealmConfigLoadOutcome::Absent
         }
-        _ => None,
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(%realm_id, error = %error, "Failed to read realm config for shard placements");
+            RealmConfigLoadOutcome::StorageFailure
+        }
+        other => {
+            warn!(%realm_id, event = ?other, "Unexpected realm config read result for shard placements");
+            RealmConfigLoadOutcome::StorageFailure
+        }
+    }
+}
+
+pub(crate) async fn load_realm_config(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+) -> Option<RealmConfigDocument> {
+    match load_realm_config_outcome(context, realm_id).await {
+        RealmConfigLoadOutcome::Found(config) => Some(config),
+        RealmConfigLoadOutcome::Absent | RealmConfigLoadOutcome::StorageFailure => None,
     }
 }
 
