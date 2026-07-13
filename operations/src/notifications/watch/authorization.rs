@@ -21,6 +21,12 @@ pub struct AuthorizedWatchSubscriptions {
     pub check_failed: bool,
 }
 
+enum WatchAuthorization {
+    Authorized,
+    Denied,
+    Unavailable(String),
+}
+
 pub fn watch_permission_path(
     realm_id: RealmId,
     path_prefix: &str,
@@ -65,11 +71,24 @@ pub async fn is_watch_authorized(
     path_prefix: &str,
     event_mask: WatchEventMask,
 ) -> Result<bool, String> {
+    Ok(matches!(
+        evaluate_watch_authorization(context, realm_id, owner, path_prefix, event_mask).await?,
+        WatchAuthorization::Authorized
+    ))
+}
+
+async fn evaluate_watch_authorization(
+    context: &DriverContext,
+    realm_id: RealmId,
+    owner: UserId,
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+) -> Result<WatchAuthorization, String> {
     let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
-        return Ok(false);
+        return Ok(WatchAuthorization::Denied);
     };
     if owner.is_nil() || owner.realm_id != realm_id {
-        return Ok(false);
+        return Ok(WatchAuthorization::Denied);
     }
     match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -85,17 +104,19 @@ pub async fn is_watch_authorized(
     )
     .await
     {
-        Ok(allowed) => Ok(allowed),
+        Ok(true) => Ok(WatchAuthorization::Authorized),
+        Ok(false) => Ok(WatchAuthorization::Denied),
         // A path whose realm, group or authorization state is absent is simply
         // unreadable. Answering it exactly as a denied role keeps a watch from
         // separating "does not exist" from "you may not read it", which is the
-        // same choice the metadata surface makes.
+        // same choice the metadata surface makes. Internally, retain that the
+        // state was unavailable so interest publication leaves a retry marker.
         Err(
-            AuthorizationError::InvalidRealmId
+            error @ (AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound,
-        ) => Ok(false),
+            | AuthorizationError::AuthDocNotFound),
+        ) => Ok(WatchAuthorization::Unavailable(error.to_string())),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -142,7 +163,7 @@ pub async fn filter_authorized_watch_subscriptions(
     let mut check_failed = false;
 
     for subscription in subscriptions {
-        match is_watch_authorized(
+        match evaluate_watch_authorization(
             context,
             realm_id,
             subscription.owner,
@@ -151,9 +172,9 @@ pub async fn filter_authorized_watch_subscriptions(
         )
         .await
         {
-            Ok(true) => authorized.push(subscription),
-            Ok(false) => dropped = true,
-            Err(error) => {
+            Ok(WatchAuthorization::Authorized) => authorized.push(subscription),
+            Ok(WatchAuthorization::Denied) => dropped = true,
+            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
                 dropped = true;
                 check_failed = true;
                 warn!(
@@ -180,8 +201,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, WatchEventKind,
-        data_watch_resource_path,
+        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
+        RealmNodeKind, WatchEventKind, data_watch_resource_path,
     };
     use aruna_storage::FjallStorage;
 
@@ -262,6 +283,47 @@ mod tests {
             .await,
             Ok(false)
         );
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_is_denied_and_marked_retryable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        let realm_id = RealmId([8u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let path = data_watch_resource_path(group_id, node_id, "bucket", "");
+        let event_mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let subscription = WatchSubscription::new(owner, path.clone(), event_mask, 1);
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.ensure_node(node_id, RealmNodeKind::Server);
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        assert_eq!(
+            is_watch_authorized(&context, realm_id, owner, &path, event_mask).await,
+            Ok(false),
+            "external callers still fail closed without exposing missing state"
+        );
+        let filtered = filter_authorized_watch_subscriptions(
+            &context,
+            realm_id,
+            &realm_config,
+            node_id,
+            vec![subscription],
+        )
+        .await
+        .expect("filter succeeds");
+        assert!(filtered.subscriptions.is_empty());
+        assert!(filtered.dropped);
+        assert!(filtered.check_failed, "interest publication must retry");
     }
 
     #[test]
