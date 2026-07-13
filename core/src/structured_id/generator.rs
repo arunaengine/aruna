@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -19,12 +19,30 @@ pub enum ClockHealthError {
 pub trait IdEnvironment {
     /// Validated wall-clock time as Unix milliseconds.
     fn now_ms(&self) -> u64;
+    /// Milliseconds from a monotonic clock with an arbitrary but fixed origin.
+    fn monotonic_ms(&self) -> u64;
     /// A fresh 48-bit nonce drawn from a cryptographically secure source.
     fn random_nonce(&self) -> u64;
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemEnvironment;
+#[derive(Debug, Clone, Copy)]
+pub struct SystemEnvironment {
+    origin: Instant,
+}
+
+impl SystemEnvironment {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemEnvironment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl IdEnvironment for SystemEnvironment {
     fn now_ms(&self) -> u64 {
@@ -32,6 +50,10 @@ impl IdEnvironment for SystemEnvironment {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
     }
 
     fn random_nonce(&self) -> u64 {
@@ -47,6 +69,15 @@ struct LastMint {
     nonce: u64,
 }
 
+/// Paired wall/monotonic reading from the most recent mint attempt. The wall
+/// clock is expected to advance in step with the monotonic clock; divergence
+/// beyond the skew bound is a forward jump.
+#[derive(Clone, Copy)]
+struct ClockAnchor {
+    wall_ms: u64,
+    monotonic_ms: u64,
+}
+
 /// Structured-ID generator: a monotonic ULID timestamp with a per
 /// `(timestamp_ms, handle, bucket)` monotonic nonce and a forward-clock-jump
 /// guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). It never emits a
@@ -54,12 +85,13 @@ struct LastMint {
 pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
     env: E,
     max_skew_ms: u64,
+    anchor: Option<ClockAnchor>,
     last: Option<LastMint>,
 }
 
 impl StructuredIdGenerator<SystemEnvironment> {
     pub fn new() -> Self {
-        Self::with_environment(SystemEnvironment, DEFAULT_MAX_ID_CLOCK_SKEW_MS)
+        Self::with_environment(SystemEnvironment::new(), DEFAULT_MAX_ID_CLOCK_SKEW_MS)
     }
 }
 
@@ -74,6 +106,7 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
         Self {
             env,
             max_skew_ms,
+            anchor: None,
             last: None,
         }
     }
@@ -91,15 +124,24 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
 
     fn next_value(&mut self, handle: u32, bucket: u16) -> Result<u128, ClockHealthError> {
         let now = self.env.now_ms();
+        let monotonic = self.env.monotonic_ms();
 
-        if let Some(last) = self.last
-            && now > last.timestamp_ms
-            && now - last.timestamp_ms > self.max_skew_ms
-        {
-            return Err(ClockHealthError::ForwardJump {
-                jump_ms: now - last.timestamp_ms,
-                max_skew_ms: self.max_skew_ms,
-            });
+        // Re-anchoring on every attempt keeps the guard non-sticky: idle time
+        // is covered by the monotonic delta, and a refused jump accepts the
+        // new wall clock as reality on the next mint.
+        if let Some(anchor) = self.anchor.replace(ClockAnchor {
+            wall_ms: now,
+            monotonic_ms: monotonic,
+        }) {
+            let expected = anchor
+                .wall_ms
+                .saturating_add(monotonic.saturating_sub(anchor.monotonic_ms));
+            if now > expected && now - expected > self.max_skew_ms {
+                return Err(ClockHealthError::ForwardJump {
+                    jump_ms: now - expected,
+                    max_skew_ms: self.max_skew_ms,
+                });
+            }
         }
 
         let mut timestamp_ms = match self.last {
@@ -143,6 +185,7 @@ mod tests {
 
     struct MockEnv {
         now: Cell<u64>,
+        monotonic: Cell<u64>,
         nonces: RefCell<VecDeque<u64>>,
     }
 
@@ -150,6 +193,7 @@ mod tests {
         fn new(now: u64, nonces: impl IntoIterator<Item = u64>) -> Self {
             Self {
                 now: Cell::new(now),
+                monotonic: Cell::new(0),
                 nonces: RefCell::new(nonces.into_iter().collect()),
             }
         }
@@ -157,11 +201,20 @@ mod tests {
         fn set_now(&self, now: u64) {
             self.now.set(now);
         }
+
+        fn advance(&self, wall_ms: u64, monotonic_ms: u64) {
+            self.now.set(self.now.get() + wall_ms);
+            self.monotonic.set(self.monotonic.get() + monotonic_ms);
+        }
     }
 
     impl IdEnvironment for MockEnv {
         fn now_ms(&self) -> u64 {
             self.now.get()
+        }
+
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic.get()
         }
 
         fn random_nonce(&self) -> u64 {
@@ -201,12 +254,13 @@ mod tests {
 
     #[test]
     fn forward_jump_blocks() {
-        // A wall-clock jump beyond the skew bound raises a clock-health error.
+        // The wall clock jumps past the bound while the monotonic clock
+        // barely moves: a genuine discontinuity is refused.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
         let (handle, bucket) = handle_bucket();
         let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
-        generator.env.set_now(1000 + 300_000 + 1);
+        generator.env.advance(300_002, 1);
         assert_eq!(
             generator
                 .mint::<MetaResourceId>(handle, bucket)
@@ -219,13 +273,42 @@ mod tests {
     }
 
     #[test]
-    fn within_skew_ok() {
-        // A forward step of exactly the bound is accepted.
+    fn jump_recovers() {
+        // A refused jump re-anchors: the next mint accepts the new wall clock.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
         let (handle, bucket) = handle_bucket();
         let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
-        generator.env.set_now(1000 + 300_000);
+        generator.env.advance(600_000, 0);
+        assert!(generator.mint::<MetaResourceId>(handle, bucket).is_err());
+        let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        assert_eq!(id.timestamp_ms(), 601_000);
+    }
+
+    #[test]
+    fn idle_gap_mints() {
+        // Wall and monotonic clocks advance together far beyond the bound:
+        // healthy idle time never errors and never bricks the generator.
+        let mut generator =
+            StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2, 3]), 300_000);
+        let (handle, bucket) = handle_bucket();
+        let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        generator.env.advance(3_600_000, 3_600_000);
+        let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        assert_eq!(id.timestamp_ms(), 3_601_000);
+        generator.env.advance(3_600_000, 3_600_000);
+        let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        assert_eq!(id.timestamp_ms(), 7_201_000);
+    }
+
+    #[test]
+    fn within_skew_ok() {
+        // A wall-only divergence of exactly the bound is accepted.
+        let mut generator =
+            StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
+        let (handle, bucket) = handle_bucket();
+        let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        generator.env.advance(300_000, 0);
         let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
         assert_eq!(id.timestamp_ms(), 1000 + 300_000);
     }
