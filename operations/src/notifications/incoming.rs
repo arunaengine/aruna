@@ -18,8 +18,8 @@ use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
+use crate::notifications::dispatch::list_notifications_on_holder;
 use crate::notifications::inbox::upsert_inbox_records_reporting;
-use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
 use crate::notifications::mark_read::{MARK_READ_MAX_IDS, MarkReadInput, MarkReadOperation};
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
@@ -116,21 +116,12 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                ListNotificationsOperation::new(ListNotificationsInput {
-                    recipient,
-                    cursor,
-                    limit: limit as usize,
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::ListResult {
-                    records: output.records,
-                    next_cursor: output.next_cursor,
+            match list_notifications_on_holder(context, recipient, cursor, limit as usize).await {
+                Ok((records, next_cursor)) => NotificationTransportMessage::ListResult {
+                    records,
+                    next_cursor,
                 },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::UnreadCount { recipient } => {
@@ -852,6 +843,24 @@ mod tests {
         )
     }
 
+    fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
+        let key = format!("object-{seed}");
+        NotificationRecord::new(
+            recipient,
+            NotificationClass::Transient,
+            NotificationKind::DataUploaded {
+                path: data_path(&key),
+                group_id: data_group_id(),
+                node_id: data_node_id(),
+                bucket: "bucket".to_string(),
+                key,
+                size_bytes: seed as u64,
+                actor_user_id: recipient,
+            },
+            1_700_000_000_000 + seed as u64,
+        )
+    }
+
     async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
         let realm_id = RealmId::from_bytes([realm_seed; 32]);
         let a = spawn(realm_id, [realm_seed; 32]).await;
@@ -1243,6 +1252,51 @@ mod tests {
                 1_700_000_000_000 + 1,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_skips_revoked_watch_records_without_consuming_page() {
+        let realm_id = RealmId::from_bytes([83u8; 32]);
+        let a = spawn(realm_id, [83u8; 32]).await;
+        let b = spawn(realm_id, [84u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        let direct = record(recipient, 1);
+        seed_inbox(
+            &b,
+            &[
+                direct.clone(),
+                watch_record(recipient, 2),
+                watch_record(recipient, 3),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("authorized list")
+                .0
+                .len(),
+            3
+        );
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+            .await
+            .expect("list after revocation");
+        assert_eq!(listed, vec![direct]);
+        assert_eq!(next_cursor, None);
     }
 
     #[tokio::test]

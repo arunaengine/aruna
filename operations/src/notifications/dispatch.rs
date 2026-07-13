@@ -1,5 +1,7 @@
 use aruna_core::NodeId;
-use aruna_core::structs::{NotificationRecord, WatchEventMask, WatchSubscription};
+use aruna_core::structs::{
+    NotificationKind, NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
+};
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
 use thiserror::Error;
@@ -12,11 +14,15 @@ use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
     unread_count_remote,
 };
-use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
+use crate::notifications::list::{
+    LIST_NOTIFICATIONS_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
+};
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
-use crate::notifications::watch::authorization::list_authorized_watch_subscriptions;
+use crate::notifications::watch::authorization::{
+    is_watch_authorized, list_authorized_watch_subscriptions,
+};
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WatchSubscriptionError,
@@ -116,17 +122,9 @@ pub async fn list_notifications_for_user(
 ) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        let output = drive(
-            ListNotificationsOperation::new(ListNotificationsInput {
-                recipient,
-                cursor,
-                limit,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
-        Ok((output.records, output.next_cursor))
+        list_notifications_on_holder(context, recipient, cursor, limit)
+            .await
+            .map_err(NotificationDispatchError::Internal)
     } else {
         let net_handle = context
             .net_handle
@@ -135,6 +133,62 @@ pub async fn list_notifications_for_user(
         list_remote(net_handle, holder, recipient, cursor, limit as u32)
             .await
             .map_err(NotificationDispatchError::Remote)
+    }
+}
+
+/// Reauthorizes persisted resource-watch records at the inbox-holder boundary.
+/// Suppressed rows do not consume the caller's page, so revocation cannot hide
+/// older ordinary notifications behind a page of stale watch records.
+pub(crate) async fn list_notifications_on_holder(
+    context: &DriverContext,
+    recipient: UserId,
+    mut cursor: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
+    let limit = limit.clamp(1, LIST_NOTIFICATIONS_MAX_LIMIT);
+    let mut records = Vec::with_capacity(limit);
+
+    loop {
+        let output = drive(
+            ListNotificationsOperation::new(ListNotificationsInput {
+                recipient,
+                cursor,
+                limit: limit - records.len(),
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        for record in output.records {
+            let watch = match &record.kind {
+                NotificationKind::MetadataCreated { path, .. } => Some((
+                    path.as_str(),
+                    WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+                )),
+                NotificationKind::DataUploaded { path, .. } => Some((
+                    path.as_str(),
+                    WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                )),
+                _ => None,
+            };
+            let visible = match watch {
+                None => true,
+                Some((path, event_mask)) => {
+                    is_watch_authorized(context, recipient.realm_id, recipient, path, event_mask)
+                        .await
+                        .unwrap_or(false)
+                }
+            };
+            if visible {
+                records.push(record);
+            }
+        }
+
+        if records.len() == limit || output.next_cursor.is_none() {
+            return Ok((records, output.next_cursor));
+        }
+        cursor = output.next_cursor;
     }
 }
 
