@@ -107,6 +107,10 @@ async fn create_off_holders() -> TestResult<()> {
         .await?;
     }
 
+    wait_until("document reaches origin", origin.node_id(), || {
+        document_present(origin, group_id, document_id)
+    })
+    .await?;
     let view = drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
         origin.context.as_ref(),
