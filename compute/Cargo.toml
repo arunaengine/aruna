@@ -1,0 +1,25 @@
+[package]
+name = "aruna-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["docker"]
+docker = ["dep:bollard"]
+
+[dependencies]
+async-trait = { workspace = true }
+bollard = { workspace = true, optional = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
