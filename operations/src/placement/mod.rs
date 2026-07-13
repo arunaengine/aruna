@@ -190,6 +190,7 @@ pub fn held_buckets(
     strategy: &PlacementStrategy,
     node_id: NodeId,
 ) -> Vec<u32> {
+    let view = build_view(config);
     (0..strategy.shard_count)
         .filter(|shard| {
             let placement = PlacementRef {
@@ -197,7 +198,7 @@ pub fn held_buckets(
                 epoch: 0,
                 shard: *shard,
             };
-            resolve_shard_holders_with(config, strategy, &placement).contains(&node_id)
+            resolve_shard_holders_from_view(config, &view, strategy, &placement).contains(&node_id)
         })
         .collect()
 }
@@ -230,8 +231,17 @@ fn resolve_shard_holders_with(
     placement: &PlacementRef,
 ) -> Vec<NodeId> {
     let view = build_view(config);
+    resolve_shard_holders_from_view(config, &view, strategy, placement)
+}
+
+fn resolve_shard_holders_from_view(
+    config: &RealmConfigDocument,
+    view: &PlacementView,
+    strategy: &PlacementStrategy,
+    placement: &PlacementRef,
+) -> Vec<NodeId> {
     resolve_holders(
-        &view,
+        view,
         strategy,
         &shard_subject_bytes(placement),
         shard_override(config, placement),
