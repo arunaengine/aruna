@@ -549,7 +549,7 @@ impl OperationsTaskHandler {
                     Some(oldest_record_ms.map_or(page_oldest, |current| current.min(page_oldest)));
             }
 
-            let records: Vec<DrainRecord> = batch
+            let mut records: Vec<DrainRecord> = batch
                 .records
                 .into_iter()
                 .map(|(record_key, mut record)| {
@@ -560,23 +560,6 @@ impl OperationsTaskHandler {
                         &record.target,
                         record.placement,
                     );
-                    // Emit-time peer stamps go stale across a rebalance: a
-                    // drained holder refuses the sync as a non-member and the
-                    // whole record would ride the retry ladder while the
-                    // replacement holder never gets pushed to. Re-resolve the
-                    // shard's live holders on every drain; empty stamps keep
-                    // their realm-default-set semantics, and a config gap or an
-                    // unknown strategy keeps the stamp.
-                    if !record.peers.is_empty()
-                        && record.target.uses_shard_topic()
-                        && let Some(config) = realm_config.as_ref()
-                    {
-                        let holders =
-                            crate::placement::resolve_shard_holders(config, &record.placement);
-                        if !holders.is_empty() {
-                            record.peers = holders;
-                        }
-                    }
                     let topic = record.target.sync_topic_id(realm_id, &record.placement);
                     (record_key, record, topic)
                 })
@@ -584,12 +567,17 @@ impl OperationsTaskHandler {
 
             // Shard topics are join-only for this node unless it is the shard's
             // rank-0 holder: a record whose topic has no local genesis yet cannot
-            // publish. Try one bootstrap pass against the record's peers (falling
-            // back to the shard's resolved holders when the record carries none,
-            // as admin operations do), then defer whatever is still missing to a
-            // short retry — the genesis arrives via gossip or the next pass. A
-            // topic already deferred earlier this run is skipped: its records
-            // stay deferred regardless, and re-probing would only waste RPCs.
+            // publish. Try one bootstrap pass against the union of the record's
+            // emit-time stamped peers and the shard's live holders, then defer
+            // whatever is still missing to a short retry — the genesis arrives
+            // via gossip or the next pass. The union matters after a rebalance:
+            // the genesis-with-history may survive only on a stamped ex-holder,
+            // and pulling from the live holders alone would leave it
+            // unreachable — this node would mint a fresh genesis, fork the
+            // topic, and irokle's genesis tie-break would evict acknowledged
+            // writes. A topic already deferred earlier this run is skipped: its
+            // records stay deferred regardless, and re-probing would only waste
+            // RPCs.
             //
             // Only buckets this node holds are pulled. Joining is not holder-gated,
             // so a non-holder could adopt the genesis here — and would then look
@@ -616,13 +604,15 @@ impl OperationsTaskHandler {
                     continue;
                 }
                 let mut bootstrap_peers = record.peers.clone();
-                if bootstrap_peers.is_empty()
-                    && let Some(config) = realm_config.as_ref()
-                {
-                    bootstrap_peers =
-                        crate::placement::resolve_shard_holders(config, &record.placement);
-                    bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
+                if let Some(config) = realm_config.as_ref() {
+                    for holder in crate::placement::resolve_shard_holders(config, &record.placement)
+                    {
+                        if !bootstrap_peers.contains(&holder) {
+                            bootstrap_peers.push(holder);
+                        }
+                    }
                 }
+                bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
                 if bootstrap_peers.is_empty() {
                     continue;
                 }
@@ -648,6 +638,27 @@ impl OperationsTaskHandler {
                     )
                     .await;
                 totals.merge(outcome);
+            }
+
+            // Emit-time peer stamps go stale across a rebalance: a drained
+            // holder refuses the push as a non-member and the whole record
+            // would ride the retry ladder while the replacement holder never
+            // gets pushed to. Re-resolve the shard's live holders for the
+            // publish path only — after the bootstrap pull above, which must
+            // keep the stamped ex-holders as genesis sources. Empty stamps keep
+            // their realm-default-set semantics, and a config gap or an unknown
+            // strategy keeps the stamp.
+            if let Some(config) = realm_config.as_ref() {
+                for (_, record, _) in &mut records {
+                    if record.peers.is_empty() || !record.target.uses_shard_topic() {
+                        continue;
+                    }
+                    let holders =
+                        crate::placement::resolve_shard_holders(config, &record.placement);
+                    if !holders.is_empty() {
+                        record.peers = holders;
+                    }
+                }
             }
 
             let (to_publish, deferred, undeliverable) = partition_drain_records(
@@ -2198,6 +2209,148 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        net.shutdown().await;
+    }
+
+    // Post-rebalance genesis adoption: the shard's live holders no longer
+    // include the emit-time stamped holder that carries the topic's genesis.
+    // The bootstrap pull must reach that ex-holder (union of the stamp and the
+    // live holders); pulling only from the re-resolved holders would leave the
+    // genesis unreachable and a fresh one would fork the topic, evicting
+    // acknowledged writes.
+    #[tokio::test]
+    async fn pull_reaches_ex_holder() {
+        let realm_id = RealmId::from_bytes([53u8; 32]);
+        let ex_dir = tempdir().expect("temp dir");
+        let ex_storage =
+            FjallStorage::open(ex_dir.path().to_str().expect("temp path")).expect("storage opens");
+        let ex_holder = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            ex_storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        net.add_peer_addr(ex_holder.endpoint_addr()).await;
+        ex_holder.add_peer_addr(net.endpoint_addr()).await;
+        // The ex-holder must serve inbound sync streams for the pull to reach
+        // its genesis.
+        crate::incoming::initialize_net_incoming(Arc::new(DriverContext {
+            storage_handle: ex_storage.clone(),
+            net_handle: Some(ex_holder.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        }));
+
+        // The live config resolves the shard's holders to this node only: the
+        // stamped ex-holder has been rebalanced out.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(net.node_id(), RealmNodeKind::Management);
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: config.to_bytes(&actor).expect("config bytes").into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+
+        let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
+        let placement = aruna_core::structs::PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 0,
+        };
+        let target = DocumentSyncTarget::MetadataRegistry {
+            group_id: Ulid::from_parts(1, 1),
+            document_id: Ulid::from_parts(2, 2),
+        };
+        let topic = target.sync_topic_id(realm_id, &placement);
+
+        // Only the ex-holder carries the genesis (with this node as a member,
+        // as the pre-rebalance membership reconciliation would have left it).
+        ex_holder
+            .ensure_document_sync_topics(&[topic], vec![net.node_id()])
+            .expect("genesis on the ex-holder");
+        assert!(!net.document_sync_topic_exists(topic).unwrap_or(true));
+
+        let mut change = change();
+        change.placement = placement;
+        let record = crate::document_sync_outbox::new_outbox_record(
+            net.node_id(),
+            target,
+            vec![ex_holder.node_id()],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"doc".to_vec(),
+                change,
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let record_key = outbox_key(&record).to_vec();
+        write_outbox_record(&storage, &record).await;
+
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        });
+        let handler = OperationsTaskHandler::new(context);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            handler.drain_document_sync_outbox().await;
+            if read_outbox_record(&storage, &record_key)
+                .await
+                .expect("read outbox record")
+                .is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "record never published: the drain did not adopt the ex-holder's genesis"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            net.document_sync_topic_exists(topic).unwrap_or(false),
+            "the genesis must be adopted from the stamped ex-holder"
+        );
+
+        ex_holder.shutdown().await;
         net.shutdown().await;
     }
 
