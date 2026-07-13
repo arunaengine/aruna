@@ -12,6 +12,8 @@ pub const DEFAULT_MAX_ID_CLOCK_SKEW_MS: u64 = 300_000;
 pub enum ClockHealthError {
     #[error("wall clock jumped forward {jump_ms} ms, beyond max_id_clock_skew_ms {max_skew_ms}")]
     ForwardJump { jump_ms: u64, max_skew_ms: u64 },
+    #[error("timestamp {timestamp_ms} ms exceeds the 48-bit id timestamp range")]
+    TimestampOverflow { timestamp_ms: u64 },
 }
 
 /// Injectable time and entropy source. The production impl reads the system
@@ -167,6 +169,10 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
             }
             _ => self.env.random_nonce() & layout::NONCE_MASK,
         };
+
+        if timestamp_ms > layout::MAX_TIMESTAMP_MS {
+            return Err(ClockHealthError::TimestampOverflow { timestamp_ms });
+        }
 
         self.last = Some(LastMint {
             timestamp_ms,
@@ -341,6 +347,44 @@ mod tests {
         let second: MetaResourceId = generator.mint(handle, BucketId::new(2).unwrap()).unwrap();
         assert_eq!(first.nonce(), 10);
         assert_eq!(second.nonce(), 20);
+    }
+
+    #[test]
+    fn timestamp_overflow_errs() {
+        // A wall clock past the 48-bit cap refuses instead of truncating.
+        let mut generator = StructuredIdGenerator::with_environment(
+            MockEnv::new(layout::MAX_TIMESTAMP_MS + 1, [1]),
+            300_000,
+        );
+        let (handle, bucket) = handle_bucket();
+        assert_eq!(
+            generator
+                .mint::<MetaResourceId>(handle, bucket)
+                .unwrap_err(),
+            ClockHealthError::TimestampOverflow {
+                timestamp_ms: layout::MAX_TIMESTAMP_MS + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_bump_errs() {
+        // The nonce-overflow +1 ms bump past the cap refuses as well.
+        let mut generator = StructuredIdGenerator::with_environment(
+            MockEnv::new(layout::MAX_TIMESTAMP_MS, [layout::MAX_NONCE, 1]),
+            300_000,
+        );
+        let (handle, bucket) = handle_bucket();
+        let first: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        assert_eq!(first.timestamp_ms(), layout::MAX_TIMESTAMP_MS);
+        assert_eq!(
+            generator
+                .mint::<MetaResourceId>(handle, bucket)
+                .unwrap_err(),
+            ClockHealthError::TimestampOverflow {
+                timestamp_ms: layout::MAX_TIMESTAMP_MS + 1,
+            }
+        );
     }
 
     #[test]
