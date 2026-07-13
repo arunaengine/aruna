@@ -70,11 +70,25 @@ impl FromStr for JobId {
     }
 }
 
+/// Whether a payload runs in-process (idempotent, safe to requeue) or drives an
+/// external attempt (a container that MUST NOT run twice). The lease sweep and
+/// restart recovery branch on this to route external attempts to reconciliation
+/// instead of a blind requeue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum JobExecutionClass {
+    InProcess,
+    ExternalAttempt,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JobState {
     Queued,
     Claimed,
+    Preparing,
+    Ready,
     Running,
+    Cancelling,
+    Indeterminate,
     Succeeded,
     Failed,
     Cancelled,
@@ -93,7 +107,11 @@ impl JobState {
         match self {
             JobState::Queued => "queued",
             JobState::Claimed => "claimed",
+            JobState::Preparing => "preparing",
+            JobState::Ready => "ready",
             JobState::Running => "running",
+            JobState::Cancelling => "cancelling",
+            JobState::Indeterminate => "indeterminate",
             JobState::Succeeded => "succeeded",
             JobState::Failed => "failed",
             JobState::Cancelled => "cancelled",
@@ -128,6 +146,14 @@ impl JobPayload {
     pub fn progress_unit(&self) -> &'static str {
         match self {
             JobPayload::Probe { .. } => "steps",
+        }
+    }
+
+    /// Execution class. Internal payloads are safe to requeue; external attempts
+    /// are not. The future `Execution` payload (Stage 2) is `ExternalAttempt`.
+    pub fn execution_class(&self) -> JobExecutionClass {
+        match self {
+            JobPayload::Probe { .. } => JobExecutionClass::InProcess,
         }
     }
 }
@@ -236,6 +262,7 @@ pub struct JobRecord {
     pub claim: Option<JobClaim>,
     pub dedup_key: Option<Vec<u8>>,
     pub result: Option<JobResultPayload>,
+    pub execution_class: JobExecutionClass,
 }
 
 impl JobRecord {
@@ -250,6 +277,7 @@ impl JobRecord {
         dedup_key: Option<Vec<u8>>,
     ) -> Self {
         let unit = payload.progress_unit();
+        let execution_class = payload.execution_class();
         Self {
             job_id,
             payload,
@@ -268,6 +296,7 @@ impl JobRecord {
             claim: None,
             dedup_key,
             result: None,
+            execution_class,
         }
     }
 
@@ -287,11 +316,28 @@ pub struct JobTransitionError {
     pub to: JobState,
 }
 
-/// Pure state-machine guard. Terminal states absorb nothing: any transition out of
-/// a terminal state is rejected.
-pub fn validate_transition(from: JobState, to: JobState) -> Result<(), JobTransitionError> {
+/// Pure state-machine guard, guarded by execution class so in-process jobs keep the
+/// original graph exactly and only external attempts use the extended states.
+/// Terminal states absorb nothing: any transition out of a terminal state is rejected.
+pub fn validate_transition(
+    class: JobExecutionClass,
+    from: JobState,
+    to: JobState,
+) -> Result<(), JobTransitionError> {
+    let legal = match class {
+        JobExecutionClass::InProcess => in_process_transition(from, to),
+        JobExecutionClass::ExternalAttempt => external_attempt_transition(from, to),
+    };
+    if legal {
+        Ok(())
+    } else {
+        Err(JobTransitionError { from, to })
+    }
+}
+
+fn in_process_transition(from: JobState, to: JobState) -> bool {
     use JobState::*;
-    let legal = matches!(
+    matches!(
         (from, to),
         (Queued, Claimed)
             | (Queued, Cancelled)
@@ -303,12 +349,37 @@ pub fn validate_transition(from: JobState, to: JobState) -> Result<(), JobTransi
             | (Running, Failed)
             | (Running, Cancelled)
             | (Running, Queued)
-    );
-    if legal {
-        Ok(())
-    } else {
-        Err(JobTransitionError { from, to })
-    }
+    )
+}
+
+/// The fenced execution graph (spec 16.7): a requeue is legal only before an attempt
+/// is submitted; `Indeterminate` exits only on evidence.
+fn external_attempt_transition(from: JobState, to: JobState) -> bool {
+    use JobState::*;
+    matches!(
+        (from, to),
+        (Queued, Claimed)
+            | (Queued, Cancelled)
+            | (Claimed, Preparing)
+            | (Claimed, Queued)
+            | (Claimed, Cancelled)
+            | (Claimed, Failed)
+            | (Preparing, Ready)
+            | (Preparing, Queued)
+            | (Ready, Running)
+            | (Ready, Queued)
+            | (Running, Succeeded)
+            | (Running, Failed)
+            | (Running, Cancelling)
+            | (Running, Indeterminate)
+            | (Cancelling, Cancelled)
+            | (Cancelling, Indeterminate)
+            | (Indeterminate, Running)
+            | (Indeterminate, Cancelling)
+            | (Indeterminate, Succeeded)
+            | (Indeterminate, Failed)
+            | (Indeterminate, Cancelled)
+    )
 }
 
 pub fn job_record_key(job_id: JobId) -> Key {
@@ -443,7 +514,10 @@ mod tests {
             (JobState::Running, JobState::Queued),
         ];
         for (from, to) in legal {
-            assert!(validate_transition(from, to).is_ok(), "{from:?} -> {to:?}");
+            assert!(
+                validate_transition(JobExecutionClass::InProcess, from, to).is_ok(),
+                "{from:?} -> {to:?}"
+            );
         }
     }
 
@@ -461,29 +535,88 @@ mod tests {
         ];
         for (from, to) in illegal {
             assert_eq!(
-                validate_transition(from, to),
+                validate_transition(JobExecutionClass::InProcess, from, to),
                 Err(JobTransitionError { from, to }),
                 "{from:?} -> {to:?}"
             );
         }
     }
 
+    // External-only states must be rejected for an in-process job.
+    #[test]
+    fn internal_rejects_external() {
+        let external_only = [
+            (JobState::Claimed, JobState::Preparing),
+            (JobState::Preparing, JobState::Ready),
+            (JobState::Ready, JobState::Running),
+            (JobState::Running, JobState::Cancelling),
+            (JobState::Running, JobState::Indeterminate),
+            (JobState::Cancelling, JobState::Cancelled),
+            (JobState::Indeterminate, JobState::Running),
+        ];
+        for (from, to) in external_only {
+            assert_eq!(
+                validate_transition(JobExecutionClass::InProcess, from, to),
+                Err(JobTransitionError { from, to }),
+                "in-process must reject {from:?} -> {to:?}"
+            );
+        }
+    }
+
+    // The fenced execution graph is accepted for external attempts.
+    #[test]
+    fn external_graph_legal() {
+        let legal = [
+            (JobState::Claimed, JobState::Preparing),
+            (JobState::Preparing, JobState::Ready),
+            (JobState::Preparing, JobState::Queued),
+            (JobState::Ready, JobState::Running),
+            (JobState::Ready, JobState::Queued),
+            (JobState::Running, JobState::Cancelling),
+            (JobState::Running, JobState::Indeterminate),
+            (JobState::Cancelling, JobState::Cancelled),
+            (JobState::Cancelling, JobState::Indeterminate),
+            (JobState::Indeterminate, JobState::Running),
+            (JobState::Indeterminate, JobState::Succeeded),
+        ];
+        for (from, to) in legal {
+            assert!(
+                validate_transition(JobExecutionClass::ExternalAttempt, from, to).is_ok(),
+                "external must accept {from:?} -> {to:?}"
+            );
+        }
+        // Ready cannot skip straight to Succeeded.
+        assert!(
+            validate_transition(
+                JobExecutionClass::ExternalAttempt,
+                JobState::Ready,
+                JobState::Succeeded,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn terminal_absorbs() {
-        for from in [JobState::Succeeded, JobState::Failed, JobState::Cancelled] {
-            for to in [
-                JobState::Queued,
-                JobState::Claimed,
-                JobState::Running,
-                JobState::Succeeded,
-                JobState::Failed,
-                JobState::Cancelled,
-            ] {
-                assert_eq!(
-                    validate_transition(from, to),
-                    Err(JobTransitionError { from, to }),
-                    "terminal {from:?} must reject -> {to:?}"
-                );
+        for class in [
+            JobExecutionClass::InProcess,
+            JobExecutionClass::ExternalAttempt,
+        ] {
+            for from in [JobState::Succeeded, JobState::Failed, JobState::Cancelled] {
+                for to in [
+                    JobState::Queued,
+                    JobState::Claimed,
+                    JobState::Running,
+                    JobState::Succeeded,
+                    JobState::Failed,
+                    JobState::Cancelled,
+                ] {
+                    assert_eq!(
+                        validate_transition(class, from, to),
+                        Err(JobTransitionError { from, to }),
+                        "terminal {from:?} must reject -> {to:?}"
+                    );
+                }
             }
         }
     }

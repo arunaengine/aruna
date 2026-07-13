@@ -44,7 +44,12 @@ pub enum JobMutationError {
 fn schedule_index_key_for(record: &JobRecord) -> Key {
     match record.state {
         JobState::Queued => job_due_index_key(record.due_at_ms, record.job_id),
-        JobState::Claimed | JobState::Running => {
+        JobState::Claimed
+        | JobState::Preparing
+        | JobState::Ready
+        | JobState::Running
+        | JobState::Cancelling
+        | JobState::Indeterminate => {
             let lease = record
                 .claim
                 .as_ref()
@@ -210,7 +215,7 @@ where
         JobMutation::Skip => Ok(old),
         JobMutation::Persist => {
             if old.state != record.state {
-                validate_transition(old.state, record.state)?;
+                validate_transition(old.execution_class, old.state, record.state)?;
             }
             let (writes, deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
