@@ -1173,6 +1173,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drain_pending_metadata_projection_queue(&context)
@@ -1216,6 +1217,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drain_pending_metadata_projection_queue(&context)
@@ -1251,6 +1253,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drain_pending_metadata_projection_queue(&context)
@@ -1341,6 +1344,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         project_metadata_create_event(&context, event.clone(), Some(event.node_id))
@@ -1422,6 +1426,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         project_metadata_create_event(&context, event.clone(), Some(event.node_id))
@@ -1663,6 +1668,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let error = project_metadata_create_events(&context, vec![event], None)
@@ -1702,6 +1708,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let error = drain_pending_metadata_projection_queue(&context)

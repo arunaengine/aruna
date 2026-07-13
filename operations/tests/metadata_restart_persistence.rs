@@ -171,6 +171,7 @@ fn build_context(
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: None,
+            compute_handle: None,
         }),
         actor,
     ))

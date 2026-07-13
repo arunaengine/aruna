@@ -102,6 +102,7 @@ async fn create_direct_local_bootstrap_token(bootstrap_secret: String) -> Result
         blob_handle: None,
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
     };
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
@@ -404,6 +405,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         blob_handle: None,
         metadata_handle: None,
         task_handle: None,
+        compute_handle: None,
     });
     let validation_state = DoctorTokenValidationState::load(driver_ctx.as_ref()).await;
     let token_view = token_view_from_token(&token, &validation_state).await?;
@@ -724,6 +726,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
         initialize_net_incoming(context.clone());
         initialize_task_incoming(

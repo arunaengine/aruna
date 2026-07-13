@@ -962,6 +962,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: Some(metadata_handle.clone()),
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         };
         let record = registry_record(Ulid::from_parts(8, 1), "docs/tombstoned");
         write_entries(
@@ -1018,6 +1019,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_metadata_graph_prune_batch(&context)
@@ -1049,6 +1051,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_metadata_graph_prune_batch(&context)
@@ -1287,6 +1290,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_metadata_graph_prune_batch(&context)

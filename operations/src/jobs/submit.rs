@@ -268,6 +268,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         }
     }
 
@@ -383,7 +384,9 @@ mod tests {
         let ctx = context(storage.clone());
 
         let mut first_spec = spec(Some(b"k".to_vec()));
-        let JobPayload::Probe { steps, .. } = &mut first_spec.payload;
+        let JobPayload::Probe { steps, .. } = &mut first_spec.payload else {
+            unreachable!()
+        };
         *steps = 2;
         let first = drive(SubmitJobOperation::new(first_spec), &ctx)
             .await
@@ -391,7 +394,9 @@ mod tests {
         assert!(first.created);
 
         let mut conflicting = spec(Some(b"k".to_vec()));
-        let JobPayload::Probe { steps, .. } = &mut conflicting.payload;
+        let JobPayload::Probe { steps, .. } = &mut conflicting.payload else {
+            unreachable!()
+        };
         *steps = 9;
         let error = drive(SubmitJobOperation::new(conflicting), &ctx)
             .await

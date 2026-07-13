@@ -1954,6 +1954,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
+            compute_handle: None,
         });
 
         let before_ms = unix_timestamp_millis();
@@ -2169,6 +2170,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
 
         // Every head-page record targets one shard topic with no local genesis,
@@ -2290,6 +2292,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
 
         // Install the config so this sole node is rank-0 of every shard, but do
@@ -2414,6 +2417,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         }));
 
         // The live config resolves the shard's holders to this node only: the
@@ -2480,6 +2484,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -2602,6 +2607,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let record = crate::document_sync_outbox::new_outbox_record(
@@ -2650,6 +2656,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let record = crate::document_sync_outbox::new_outbox_record(
@@ -2701,6 +2708,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         let document_id = Ulid::from_parts(17, 1);
@@ -2821,6 +2829,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -2915,6 +2924,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -3075,6 +3085,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
@@ -3106,6 +3117,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
@@ -3155,6 +3167,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
         handler.drain_notification_outbox().await;
@@ -3214,6 +3227,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         crate::incoming::initialize_net_incoming(context_b.clone());
 
@@ -3223,6 +3237,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let handler = OperationsTaskHandler::new(context_a, JobsRuntime::new());
         handler.drain_notification_outbox().await;

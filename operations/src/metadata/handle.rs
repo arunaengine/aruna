@@ -4187,6 +4187,7 @@ async fn can_read_record_locally(
         blob_handle: None,
         metadata_handle: None,
         task_handle: None,
+        compute_handle: None,
     };
     drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -4301,6 +4302,7 @@ async fn resolve_graph_visibility_scope(
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         let groups = drive(ListGroupOperation::new(), &context)
             .await

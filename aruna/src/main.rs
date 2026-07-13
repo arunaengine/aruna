@@ -114,6 +114,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
 
     // Start the ops listener before realm bootstrap so `/readyz` reports 503
@@ -527,6 +528,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         }
     }
 

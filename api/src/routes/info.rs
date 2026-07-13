@@ -1586,6 +1586,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -1996,6 +1997,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

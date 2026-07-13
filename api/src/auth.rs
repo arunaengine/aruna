@@ -590,6 +590,7 @@ mod test {
                 blob_handle: None,
                 metadata_handle: None,
                 task_handle: None,
+                compute_handle: None,
             }),
             realm_id,
             node_id,
@@ -811,6 +812,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -1229,6 +1231,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1415,6 +1418,7 @@ mod test {
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
             task_handle: Some(task_handle),
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1518,6 +1522,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1794,6 +1799,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 
@@ -1852,6 +1858,7 @@ mod test {
             net_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
             blob_handle: None,
         });
 

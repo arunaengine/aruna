@@ -2,7 +2,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+    JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE,
+    JOB_SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
     AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord,
@@ -593,6 +594,260 @@ pub async fn record_attempt_intent(
         Ok(JobMutation::Persist)
     })
     .await
+}
+
+/// Advance a claimed execution job to `Preparing`, renewing the lease. The
+/// workspace is built and inputs staged in this phase.
+pub async fn transition_to_preparing(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Preparing;
+        record.updated_at_ms = now_ms;
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Record the durable workspace bucket name on a claimed execution job; no state
+/// change so `Preparing` can persist the bucket before flipping it `Active`.
+pub async fn set_workspace_bucket(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    bucket: String,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.workspace_bucket = Some(bucket.clone());
+        record.updated_at_ms = now_ms;
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// `Preparing -> Ready`: workspace prepared and credentials minted.
+pub async fn transition_to_ready(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Ready;
+        record.updated_at_ms = now_ms;
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Commit `Running` for an external attempt: from `Ready` after the backend
+/// accepts the fenced attempt, or from `Indeterminate` when reconcile re-adopts a
+/// still-running container.
+pub async fn transition_external_to_running(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Running;
+        record.updated_at_ms = now_ms;
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// `Running/Indeterminate -> Cancelling`: a durable cancel intent precedes the
+/// backend stop so no evidence is lost across a crash.
+pub async fn transition_to_cancelling(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Cancelling;
+        record.updated_at_ms = now_ms;
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Park an ambiguous external attempt in `Indeterminate`, keeping the claim so the
+/// lease sweep later re-routes it to reconciliation. Exits only on evidence.
+pub async fn mark_indeterminate(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Indeterminate;
+        record.updated_at_ms = now_ms;
+        record.last_error = Some(error.clone());
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Terminal `Failed` for an execution job, capturing the exit evidence in the
+/// result so a failed run still yields a crate.
+pub async fn fail_execution(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    result: JobResultPayload,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Failed;
+        record.finished_at_ms = Some(now_ms);
+        record.updated_at_ms = now_ms;
+        record.last_error = Some(error.clone());
+        record.result = Some(result.clone());
+        record.claim = None;
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Terminal `Cancelled` for an execution job (from `Cancelling`), recording the
+/// exit evidence.
+pub async fn cancel_execution(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.state = JobState::Cancelled;
+        record.finished_at_ms = Some(now_ms);
+        record.updated_at_ms = now_ms;
+        record.result = Some(result.clone());
+        record.claim = None;
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Take over a lost external attempt with a fresh claim token so the reconciler
+/// can supervise it. No token guard: the previous holder is provably dead (lease
+/// swept or node restarted). State is preserved for the reconcile decision.
+pub async fn adopt_external_attempt(
+    storage: &StorageHandle,
+    job_id: JobId,
+    holder_node_id: NodeId,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.updated_at_ms = now_ms;
+        record.claim = Some(JobClaim {
+            holder_node_id,
+            claim_token: Ulid::r#gen(),
+            lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
+        });
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Requeue an execution job that failed BEFORE its attempt was submitted (image
+/// pull, prepare error): from `Preparing`/`Ready` back to `Queued` with backoff,
+/// or terminal `Failed` once attempts are spent. Safe because no container exists.
+pub async fn requeue_before_attempt(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    error: JobError,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.last_error = Some(error.clone());
+        record.attempts = record.attempts.saturating_add(1);
+        record.updated_at_ms = now_ms;
+        record.claim = None;
+        record.attempt_intent = None;
+        if record.attempts >= JOB_MAX_ATTEMPTS {
+            record.state = JobState::Failed;
+            record.finished_at_ms = Some(now_ms);
+        } else {
+            record.state = JobState::Queued;
+            record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Persist the run-crate obligation status in its side keyspace, leaving the
+/// terminal parent record untouched.
+pub async fn put_run_crate_status(
+    storage: &StorageHandle,
+    job_id: JobId,
+    status: &aruna_core::structs::RunCrateStatus,
+) -> Result<(), String> {
+    let bytes = status.to_bytes().map_err(|error| error.to_string())?;
+    batch_write(
+        storage,
+        vec![(
+            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            aruna_core::structs::job_run_crate_key(job_id),
+            ByteView::from(bytes),
+        )],
+        None,
+    )
+    .await
+}
+
+/// Read the run-crate obligation status for `job_id`, if recorded.
+pub async fn read_run_crate_status(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::RunCrateStatus>, String> {
+    match read_raw(
+        storage,
+        JOB_RUN_CRATE_KEYSPACE,
+        aruna_core::structs::job_run_crate_key(job_id),
+        None,
+    )
+    .await?
+    {
+        Some(value) => aruna_core::structs::RunCrateStatus::from_bytes(value.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        None => Ok(None),
+    }
 }
 
 pub enum CancelRequestOutcome {

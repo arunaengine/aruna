@@ -1088,6 +1088,7 @@ async fn spawn_node_configured(
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
+        compute_handle: None,
     });
 
     initialize_net_incoming(context.clone());

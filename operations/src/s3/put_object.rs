@@ -1095,6 +1095,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         // Jesus, Take the Wheel!
         let result = drive(put_operation, &context)
@@ -1261,6 +1262,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let data = b"hello, world!";
@@ -1480,6 +1482,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1663,6 +1666,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let data = b"hello, world!";

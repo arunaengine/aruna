@@ -424,14 +424,17 @@ async fn run_job(
     cancel: CancellationToken,
     shutdown: CancellationToken,
 ) {
-    let storage = &context.storage_handle;
-    let job_id = record.job_id;
-    // An external attempt is driven by the reconciler, not by an in-process payload: leave
-    // it claimed rather than walking it through the in-process transition graph.
+    // External attempts drive a container through the fenced lifecycle; a lost
+    // lease there reconciles rather than requeues (spec 16.7). A shutdown mid-supervise
+    // hands the lease back through `JobsRuntime::shutdown`, so the attempt is adopted
+    // rather than re-run.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
-        info!(job_id = %job_id, "External attempt has no in-process executor; leaving claimed for reconciliation");
+        super::workflow::run_execution_job(context, record, cancel).await;
         return;
     }
+
+    let storage = &context.storage_handle;
+    let job_id = record.job_id;
 
     if record.cancel_requested {
         run_cleanup(&record.payload);
@@ -695,6 +698,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         })
     }
 
@@ -843,7 +847,9 @@ mod tests {
         let marker = dir.path().join("late-cancel-marker");
         std::fs::write(&marker, b"partial").unwrap();
         let mut record = probe_record(job_id, 1, 0, Some(marker.to_str().unwrap().to_string()));
-        let JobPayload::Probe { fail_at, .. } = &mut record.payload;
+        let JobPayload::Probe { fail_at, .. } = &mut record.payload else {
+            panic!("probe payload");
+        };
         *fail_at = Some(0);
         let claimed = claim(&storage, record).await;
         let token = claimed.claim.as_ref().unwrap().claim_token;
@@ -1222,7 +1228,9 @@ mod tests {
         let runtime = JobsRuntime::with_capacity(1);
         let boom = JobId::from_bytes([0xEE; 16]);
         let mut record = probe_record(boom, 5, 0, None);
-        let JobPayload::Probe { panic_at, .. } = &mut record.payload;
+        let JobPayload::Probe { panic_at, .. } = &mut record.payload else {
+            unreachable!()
+        };
         *panic_at = Some(0);
         let claimed = claim(&storage, record).await;
 

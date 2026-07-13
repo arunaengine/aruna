@@ -197,6 +197,7 @@ mod test {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let group_id = Ulid::r#gen();

@@ -1137,6 +1137,7 @@ pub mod test {
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
             task_handle: Some(task_handle),
+            compute_handle: None,
             blob_handle: None,
         };
 

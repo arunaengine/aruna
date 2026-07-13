@@ -1061,6 +1061,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         let operation = GetObjectOperation::new(GetObjectInput {
             bucket,
@@ -1206,6 +1207,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         let operation = GetObjectOperation::new(GetObjectInput {
             bucket,
@@ -1270,6 +1272,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let bucket = "s3test".to_string();
@@ -1437,6 +1440,7 @@ mod test {
             blob_handle: Some(blob_handle),
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let version_id = Ulid::r#gen();

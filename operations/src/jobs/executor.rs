@@ -63,7 +63,9 @@ pub enum JobRunOutcome {
     Interrupted,
 }
 
-/// Payload dispatch, mirroring how the task handler matches `TaskKey`.
+/// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
+/// payloads never reach here: the runtime routes them to the fenced external path
+/// before this seam.
 pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunOutcome {
     match payload {
         JobPayload::Probe {
@@ -83,10 +85,18 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             )
             .await
         }
+        JobPayload::WriteRunCrate { for_job } => {
+            crate::jobs::workflow::run_crate::run_write_run_crate(ctx, *for_job).await
+        }
+        // Guard: an execution job must run through the external attempt path.
+        JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
+            "execution payload dispatched through the in-process seam",
+        )),
     }
 }
 
-/// Idempotent cleanup hook run on the cancellation path.
+/// Idempotent cleanup hook run on the cancellation path. Execution/crate payloads
+/// carry no in-process side effects here.
 pub fn run_cleanup(payload: &JobPayload) {
     match payload {
         JobPayload::Probe { cleanup_marker, .. } => {
@@ -94,6 +104,7 @@ pub fn run_cleanup(payload: &JobPayload) {
                 let _ = std::fs::remove_file(marker);
             }
         }
+        JobPayload::Execution(_) | JobPayload::WriteRunCrate { .. } => {}
     }
 }
 

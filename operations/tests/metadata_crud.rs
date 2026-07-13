@@ -1065,6 +1065,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,
@@ -1102,6 +1103,7 @@ async fn build_context_without_net() -> Result<TestContext, Box<dyn std::error::
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,

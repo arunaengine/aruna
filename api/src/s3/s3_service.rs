@@ -2802,6 +2802,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([40u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -2915,6 +2916,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         (storage_dir, context, net)
     }
@@ -3135,6 +3137,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let refresh = ReferenceMetadataRefresh {
             bucket: "bucket".to_string(),
@@ -3232,6 +3235,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = aruna_core::structs::RealmId([9u8; 32]);
 
@@ -3767,6 +3771,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([2u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3845,6 +3850,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([3u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3931,6 +3937,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([33u8; 32]);
         let group_id = Ulid::r#gen();
@@ -3997,6 +4004,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([34u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4118,6 +4126,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([4u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4203,6 +4212,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([5u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4300,6 +4310,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([6u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4365,6 +4376,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([7u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4440,6 +4452,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([8u8; 32]);
         let service =
@@ -4477,6 +4490,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([35u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4538,6 +4552,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
         let group_id = Ulid::r#gen();
@@ -4613,6 +4628,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([37u8; 32]);
         let group_id = Ulid::r#gen();

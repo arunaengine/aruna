@@ -8,6 +8,7 @@ pub mod runtime;
 pub mod service;
 pub mod store;
 pub mod submit;
+pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;

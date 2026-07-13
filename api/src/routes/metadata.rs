@@ -3040,6 +3040,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
         });
         initialize_net_incoming(context.clone());
         let state = Arc::new(
@@ -3324,6 +3325,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: Some(task_handle),
+            compute_handle: None,
         });
         let group_id = Ulid::r#gen();
         let group_auth =
@@ -3412,6 +3414,7 @@ mod tests {
                     blob_handle: None,
                     metadata_handle: None,
                     task_handle: None,
+                    compute_handle: None,
                 }),
                 realm_id,
                 node_id,

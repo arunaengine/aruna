@@ -1561,6 +1561,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drive(
@@ -1588,6 +1589,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         drive(
@@ -1637,6 +1639,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         drive(
@@ -1668,6 +1671,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drive(
@@ -1742,6 +1746,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = drive(
@@ -1795,6 +1800,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_blob_replication_batch(&context)
@@ -1818,6 +1824,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_blob_replication_batch(&context)
@@ -1841,6 +1848,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         write_corrupt_blob_job(&storage, "000-corrupt-blob-job").await;
         drive(
@@ -1873,6 +1881,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_blob_replication_batch(&context)
@@ -1905,6 +1914,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let first = process_blob_replication_batch(&context)
@@ -1940,6 +1950,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
 
         let result = process_blob_replication_batch(&context)
@@ -1965,6 +1976,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         drive(
             QueueBlobReplicationOperation::new(on_demand_input(), None),
@@ -1996,6 +2008,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         };
         drive(
             QueueBlobReplicationOperation::new(
