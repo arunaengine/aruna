@@ -118,6 +118,11 @@ pub enum MetadataTransportMessage {
     },
     ForwardedDelete,
     Reject(String),
+    /// A permanent update validation failure. Appended after `Reject` so the
+    /// postcard discriminants of existing control messages remain stable.
+    ForwardedUpdateInvalidInput {
+        message: String,
+    },
 }
 
 pub async fn write_message(
@@ -232,6 +237,14 @@ mod tests {
         assert_eq!(
             postcard::from_bytes::<MetadataTransportMessage>(&bytes).unwrap(),
             message
+        );
+    }
+
+    #[test]
+    fn legacy_reject_stable() {
+        assert_eq!(
+            postcard::to_allocvec(&MetadataTransportMessage::Reject(String::new())).unwrap(),
+            vec![9, 0]
         );
     }
 

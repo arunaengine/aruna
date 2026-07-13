@@ -1014,6 +1014,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::ForwardedRecord { .. }
             | MetadataTransportMessage::ForwardedDelete
+            | MetadataTransportMessage::ForwardedUpdateInvalidInput { .. }
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
@@ -3174,6 +3175,9 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
         MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
         MetadataTransportMessage::Reject(_) => "reject",
+        MetadataTransportMessage::ForwardedUpdateInvalidInput { .. } => {
+            "forwarded_update_invalid_input"
+        }
     }
 }
 

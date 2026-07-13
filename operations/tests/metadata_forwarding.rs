@@ -13,6 +13,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument,
     RealmId, RealmNodeKind, TokenClaims,
@@ -29,10 +30,15 @@ use aruna_operations::document_sync_outbox::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::forward::create_metadata_document_routed;
+use aruna_operations::metadata::forward::{
+    MetadataWriteError, create_metadata_document_routed, update_metadata_document_routed,
+};
 use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::update_metadata_document::{
+    UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
+};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -101,6 +107,48 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
         }
         sleep(Duration::from_millis(50)).await;
     }
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let group_id = seed_group(&realm, &nodes).await?;
+    let document_id = Ulid::r#gen();
+    let record = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
+    let holders = resolve_shard_holders(&config, &record.placement);
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    let error = update_metadata_document_routed(
+        &user_node.context,
+        Actor {
+            node_id: user_node.net.node_id(),
+            user_id: realm.user_id,
+            realm_id: realm.realm_id,
+        },
+        &record,
+        None,
+        UpdateMetadataDocumentMutation::UpsertDataEntity {
+            jsonld: "{}".to_string(),
+        },
+        Some(realm.bearer_token()),
+    )
+    .await
+    .expect_err("invalid forwarded update must fail");
+
+    assert!(
+        matches!(
+            &error,
+            MetadataWriteError::Update(UpdateMetadataDocumentError::MetadataError(
+                MetadataError::InvalidInput(_)
+            ))
+        ),
+        "unexpected forwarded update error: {error:?}"
+    );
 
     shutdown(nodes).await;
     Ok(())

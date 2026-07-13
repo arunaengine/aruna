@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
     RealmId,
@@ -176,6 +177,9 @@ pub async fn update_metadata_document_routed(
     .await?;
     match response {
         MetadataTransportMessage::ForwardedRecord { record } => Ok(*record),
+        MetadataTransportMessage::ForwardedUpdateInvalidInput { message } => Err(
+            UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(message)).into(),
+        ),
         other => Err(unexpected_response(other)),
     }
 }
@@ -340,6 +344,9 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(record) => MetadataTransportMessage::ForwardedRecord {
                     record: Box::new(record),
                 },
+                Err(UpdateMetadataDocumentError::MetadataError(MetadataError::InvalidInput(
+                    message,
+                ))) => MetadataTransportMessage::ForwardedUpdateInvalidInput { message },
                 Err(error) => reject(format!("forwarded metadata update failed: {error}")),
             }
         }
