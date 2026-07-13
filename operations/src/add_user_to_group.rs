@@ -6,14 +6,15 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
+use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, AuthContext, GroupAuthorizationDocument, Permission, ResourceEvent,
+    Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
+    ResourceEvent,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId, UserId};
@@ -30,6 +31,7 @@ use crate::document_sync_outbox::{
 };
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
+use crate::placement::placement_ref_for_target;
 use crate::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +213,10 @@ impl AddUserToGroupOperation {
                     ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
                     admin_document_reducer_state_key(&target),
                 ),
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    ByteView::from(*self.input.actor.realm_id.as_bytes()),
+                ),
             ],
             txn_id: Some(txn_id),
         })])
@@ -225,10 +231,15 @@ impl AddUserToGroupOperation {
                 got,
             );
         };
-        let [(_, auth_doc_value), (_, reducer_state_value)] = values.as_slice() else {
+        let [
+            (_, auth_doc_value),
+            (_, reducer_state_value),
+            (_, realm_config_value),
+        ] = values.as_slice()
+        else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values",
+                "Event::Storage(StorageEvent::BatchReadResult) with auth doc, admin state, and realm config values",
                 got,
             );
         };
@@ -237,6 +248,7 @@ impl AddUserToGroupOperation {
             txn_id,
             auth_doc_value.clone(),
             reducer_state_value.clone(),
+            realm_config_value.clone(),
         ) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
@@ -248,6 +260,7 @@ impl AddUserToGroupOperation {
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
+        realm_config_value: Option<ByteView>,
     ) -> Result<Effects, AddUserToGroupError> {
         let mut auth_doc = GroupAuthorizationDocument::from_bytes(
             &auth_doc.ok_or_else(|| AddUserToGroupError::AuthDocNotFound)?,
@@ -322,6 +335,12 @@ impl AddUserToGroupOperation {
         let document_target = DocumentSyncTarget::GroupAuthorization {
             group_id: self.input.group_id,
         };
+        let placement = realm_config_value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()?
+            .map(|config| placement_ref_for_target(&config, &document_target, Default::default()))
+            .unwrap_or(PlacementRef::NIL);
         for event in &admin_events {
             let record = new_outbox_record_with_id(
                 event.event_id,
@@ -331,9 +350,7 @@ impl AddUserToGroupOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event.clone()),
                 },
-                // No realm config in reach here; the stage-2 topic flip resolves
-                // the real ref for this target.
-                aruna_core::structs::PlacementRef::NIL,
+                placement,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -782,7 +799,7 @@ pub mod test {
     };
     use aruna_core::structs::{
         Actor, Group, GroupAuthorizationDocument, NotificationOutboxRecord, NotificationRecord,
-        Permission, RealmId, Role,
+        Permission, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, Role,
     };
     use aruna_core::task::TaskEvent;
     use aruna_core::task::TaskKey;
@@ -975,6 +992,7 @@ pub mod test {
                 TxnId::r#gen(),
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 None,
+                None,
             )
             .unwrap();
         let outbox_records: Vec<DocumentSyncOutboxRecord> = match effects.first().unwrap() {
@@ -1053,6 +1071,18 @@ pub mod test {
             role_ids: HashSet::from([role_id]),
         };
         let target = AdminDocumentTarget::Group { group_id };
+        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.seed_default_placement();
+        for seed in 20..24u8 {
+            realm_config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let expected_placement = crate::placement::placement_ref_for_target(
+            &realm_config,
+            &document_target,
+            Default::default(),
+        );
+        assert_ne!(expected_placement, PlacementRef::NIL);
         let mut operation = AddUserToGroupOperation::new(input);
 
         operation.start();
@@ -1071,6 +1101,10 @@ pub mod test {
                 (
                     admin_document_reducer_state_key(&target),
                     Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+                ),
+                (
+                    realm_id.as_bytes().to_vec().into(),
+                    Some(realm_config.to_bytes(&actor).unwrap().into()),
                 ),
             ],
         }));
@@ -1114,10 +1148,8 @@ pub mod test {
             other => panic!("unexpected write effect: {other:?}"),
         };
         assert_eq!(outbox_records.len(), 1);
-        assert_eq!(
-            outbox_records[0].target,
-            DocumentSyncTarget::GroupAuthorization { group_id }
-        );
+        assert_eq!(outbox_records[0].target, document_target);
+        assert_eq!(outbox_records[0].placement, expected_placement);
         assert!(matches!(
             &outbox_records[0].event,
             DocumentSyncOutboxEvent::AdminOperation { event }
@@ -1220,6 +1252,7 @@ pub mod test {
                 txn_id,
                 Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 Some(postcard::to_allocvec(&reducer_state).unwrap().into()),
+                None,
             )
             .unwrap();
         assert!(matches!(
@@ -1536,6 +1569,7 @@ pub mod test {
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
                 (admin_document_reducer_state_key(&target), None),
+                (realm_id.as_bytes().to_vec().into(), None),
             ],
         }));
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
@@ -1591,6 +1625,7 @@ pub mod test {
                     Some(auth_doc.to_bytes(&actor).unwrap().into()),
                 ),
                 (admin_document_reducer_state_key(&target), None),
+                (realm_id.as_bytes().to_vec().into(), None),
             ],
         }));
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {

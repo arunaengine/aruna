@@ -9,13 +9,16 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_write_entry,
 };
 use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, Role, group_owner_index_key, group_owner_index_prefix,
+    Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument, Role,
+    group_owner_index_key, group_owner_index_prefix,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId, Value};
@@ -25,6 +28,8 @@ use std::collections::HashSet;
 use thiserror::Error;
 use tracing::trace;
 use ulid::Ulid;
+
+use crate::placement::placement_ref_for_target;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -41,6 +46,7 @@ pub struct CreateGroupOperation {
     config: CreateGroupConfig,
     group: Option<Group>,
     auth_doc: Option<GroupAuthorizationDocument>,
+    realm_config: Option<RealmConfigDocument>,
     state: CreateGroupState,
     txn_id: Option<Ulid>,
     output: Option<Result<(Group, GroupAuthorizationDocument), CreateGroupError>>,
@@ -65,6 +71,7 @@ impl CreateGroupOperation {
             config,
             group: None,
             auth_doc: None,
+            realm_config: None,
             state: CreateGroupState::Init,
             txn_id: None,
             output: None,
@@ -219,6 +226,11 @@ impl CreateGroupOperation {
         }
 
         let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let placement = self
+            .realm_config
+            .as_ref()
+            .map(|config| placement_ref_for_target(config, &document_target, Default::default()))
+            .unwrap_or(PlacementRef::NIL);
         let mut writes = vec![admin_document_reducer_state_write_entry(&reducer_state)?];
         for event in admin_events {
             let record = new_outbox_record_with_id(
@@ -229,9 +241,7 @@ impl CreateGroupOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
-                // No realm config in reach here; the stage-2 topic flip resolves
-                // the real ref for this target.
-                aruna_core::structs::PlacementRef::NIL,
+                placement,
                 true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -312,6 +322,35 @@ impl CreateGroupOperation {
         };
 
         self.txn_id = Some(txn_id);
+        self.state = CreateGroupState::ReadRealmConfig;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*self.config.actor.realm_id.as_bytes()),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_read_realm_config(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::ReadRealmConfig,
+                "Event::Storage(StorageEvent::ReadResult)",
+                got,
+            );
+        };
+        self.realm_config = match value
+            .as_deref()
+            .map(RealmConfigDocument::from_bytes)
+            .transpose()
+        {
+            Ok(config) => config,
+            Err(error) => {
+                let cleanup_effects = self.abort();
+                return self.fail_with_cleanup(error.into(), cleanup_effects);
+            }
+        };
+
         match self.config.owner_cap {
             Some(0) => {
                 let cleanup_effects = self.abort();
@@ -453,6 +492,7 @@ fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
 pub enum CreateGroupState {
     Init,
     StartTransaction,
+    ReadRealmConfig,
     CountOwnedGroups,
     CreateGroup,
     WriteOwnerIndex,
@@ -514,6 +554,7 @@ impl Operation for CreateGroupOperation {
 
         match self.state {
             CreateGroupState::StartTransaction => self.handle_start_transaction(event),
+            CreateGroupState::ReadRealmConfig => self.handle_read_realm_config(event),
             CreateGroupState::CountOwnedGroups => self.handle_count_owned_groups(event),
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::WriteOwnerIndex => self.handle_write_owner_index(event),
