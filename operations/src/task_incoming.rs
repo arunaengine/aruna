@@ -60,7 +60,7 @@ use crate::notifications::watch::interest::{
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
 use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
-use crate::queue_backoff::timer_retry_after_secs;
+use crate::queue_backoff::{queue_retry_after_ms, retry_after_ms};
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
 };
@@ -359,7 +359,11 @@ impl OperationsTaskHandler {
     }
 
     /// Backoff interval for the next re-arm of `key`, derived from the in-memory
-    /// attempt count without mutating it.
+    /// attempt count without mutating it. The drain re-arm is the only path that
+    /// delivers an already-accepted write after a transient sync failure, so it
+    /// retries on the queue scale (250ms doubling to the 30s cap), not a
+    /// 30s-base timer: a single failed peer sync must not stall convergence for
+    /// tens of seconds.
     fn backoff_after(&self, key: &TaskKey) -> Duration {
         let attempts = self
             .retry_backoff
@@ -368,7 +372,7 @@ impl OperationsTaskHandler {
             .get(key)
             .copied()
             .unwrap_or(0);
-        Duration::from_secs(timer_retry_after_secs(attempts))
+        Duration::from_millis(queue_retry_after_ms(attempts))
     }
 
     fn note_retry_backoff(&self, key: &TaskKey) {
@@ -387,8 +391,11 @@ impl OperationsTaskHandler {
             .remove(key);
     }
 
-    /// Keeps the first missing-topic pull retry prompt, then backs off each
-    /// subsequent full placement scan using the existing per-key retry state.
+    /// Keeps the first missing-topic pull retry prompt, then doubles each
+    /// subsequent full placement scan from the pull base up to the placement
+    /// interval. A new holder usually only needs its co-holders to apply the
+    /// same config change, so the ladder must not cliff to 30s on the second
+    /// attempt.
     fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
         let mut backoff = self
             .retry_backoff
@@ -400,9 +407,13 @@ impl OperationsTaskHandler {
                 SHARD_TOPIC_PULL_RETRY_AFTER
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let attempts = *entry.get();
-                entry.insert(attempts.saturating_add(1));
-                Duration::from_secs(timer_retry_after_secs(attempts))
+                let attempts = entry.get().saturating_add(1);
+                entry.insert(attempts);
+                Duration::from_millis(retry_after_ms(
+                    attempts,
+                    SHARD_TOPIC_PULL_RETRY_AFTER.as_millis() as u64,
+                    SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64,
+                ))
             }
         }
     }
