@@ -3223,6 +3223,7 @@ fn realm_config_from_reducer_materialization(
         default_strategy_id: None,
         strategy_bindings: Vec::new(),
         placement_overrides: Vec::new(),
+        placement_bindings: Vec::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)

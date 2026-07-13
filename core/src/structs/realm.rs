@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, NodePlacementEntry, PlacementOverride,
-    PlacementStrategy, StrategyBinding,
+    Actor, BindingAppend, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass,
+    NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -157,6 +157,9 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
+    /// Append-only, immutable Placement Binding set. The alpha RealmReplicated
+    /// bridge: the derived binding directory is rebuilt from this (spec 6.3.4).
+    pub placement_bindings: Vec<PlacementBinding>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -360,6 +363,7 @@ impl RealmConfigDocument {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
         }
     }
 
@@ -480,6 +484,32 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
+    }
+
+    /// Appends a Placement Binding to the append-only set. Identical entries
+    /// collapse; a same-handle entry with a different tuple is retained
+    /// (never overwritten) and reported as a fail-closed conflict
+    /// (REQ-META-PLACEMENT-BINDING-002/CONFLICT-001).
+    pub fn append_placement_binding(&mut self, binding: PlacementBinding) -> BindingAppend {
+        if self.placement_bindings.contains(&binding) {
+            return BindingAppend::Duplicate;
+        }
+        let tuple = binding.tuple();
+        let conflict = self
+            .placement_bindings
+            .iter()
+            .any(|existing| existing.handle == binding.handle && existing.tuple() != tuple);
+        self.placement_bindings.push(binding);
+        if conflict {
+            BindingAppend::Conflict
+        } else {
+            BindingAppend::Added
+        }
+    }
+
+    /// Rebuilds the derived Placement Binding Directory from the stored set.
+    pub fn binding_directory(&self) -> BindingDirectory {
+        BindingDirectory::from_bindings(&self.placement_bindings)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -636,6 +666,7 @@ mod test {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -744,6 +775,7 @@ mod test {
             default_strategy_id: None,
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
+            placement_bindings: Vec::new(),
         };
 
         assert_eq!(
@@ -851,5 +883,51 @@ mod test {
 
         assert_eq!(document.node_ids().unwrap(), vec![server, user_device]);
         assert_eq!(document.sync_eligible_node_ids().unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn binding_append_and_rebuild() {
+        use crate::structs::{BindingAppend, DocumentClass, PlacementBinding, PlacementScope};
+        use crate::structured_id::PlacementHandle;
+
+        fn binding(handle: u32, seed: u8) -> PlacementBinding {
+            PlacementBinding {
+                handle: PlacementHandle::new(handle).unwrap(),
+                scope: PlacementScope::Group(Ulid::from_bytes([seed; 16])),
+                document_class: DocumentClass::Metadata,
+                strategy_id: Ulid::from_bytes([seed.wrapping_add(1); 16]),
+                allocator_range_id: None,
+                allocated_by: None,
+                allocated_at_ms: None,
+            }
+        }
+
+        let mut config = RealmConfigDocument::new(RealmId([2u8; 32]), Vec::new(), 3);
+        let first = binding(10, 1);
+        assert_eq!(
+            config.append_placement_binding(first.clone()),
+            BindingAppend::Added
+        );
+        assert_eq!(
+            config.append_placement_binding(first.clone()),
+            BindingAppend::Duplicate
+        );
+
+        // The derived directory indexes the stored set.
+        let directory = config.binding_directory();
+        assert_eq!(
+            directory.resolve(first.handle).map(|t| t.strategy_id),
+            Ok(first.strategy_id)
+        );
+        assert_eq!(directory.allocated(), 1);
+
+        // A same-handle, different-tuple append is retained and flagged.
+        assert_eq!(
+            config.append_placement_binding(binding(10, 2)),
+            BindingAppend::Conflict
+        );
+        assert_eq!(config.placement_bindings.len(), 2);
+        assert!(config.binding_directory().resolve(first.handle).is_err());
+        assert_eq!(config.binding_directory().conflicted(), 1);
     }
 }
