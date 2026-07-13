@@ -465,13 +465,17 @@ pub(crate) async fn finalize_attempt(
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let outputs = collect_or_empty(context, spec, bucket).await;
+            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+                return;
+            };
             let result = execution_result_for(bucket, Some(0), outputs);
             let record = terminal_complete(storage, job_id, token, result).await;
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
         AttemptPhase::Exited { code } => {
-            let outputs = collect_or_empty(context, spec, bucket).await;
+            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+                return;
+            };
             let result = execution_result_for(bucket, Some(code), outputs);
             let record = terminal_fail(
                 storage,
@@ -524,9 +528,11 @@ async fn finalize_cancel(
     // Running -> Cancelling (idempotent: a re-entry may already be Cancelling).
     let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
     let evidence = backend.cancel(attempt).await;
-    let outputs = collect_or_empty(context, spec, bucket).await;
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
+            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+                return;
+            };
             let code = match status.phase {
                 AttemptPhase::Exited { code } => Some(code),
                 _ => None,
@@ -536,6 +542,9 @@ async fn finalize_cancel(
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
         Ok(CancelEvidence::AlreadyGone) => {
+            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+                return;
+            };
             let result = execution_result_for(bucket, None, outputs);
             let record = terminal_cancel(storage, job_id, token, result).await;
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
@@ -707,16 +716,29 @@ async fn requeue_or_fail_pre_submit(
     }
 }
 
-async fn collect_or_empty(
+/// Inventory the declared outputs, or park the job `Indeterminate` for a retry:
+/// a transient listing failure must never terminalize the job with a
+/// false-empty output manifest.
+async fn collect_or_park(
     context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
     spec: &ExecutionSpec,
     bucket: &str,
-) -> Vec<OutputObject> {
+) -> Option<Vec<OutputObject>> {
     match collect_outputs(context, spec, bucket).await {
-        Ok(outputs) => outputs,
+        Ok(outputs) => Some(outputs),
         Err(error) => {
-            warn!(bucket = %bucket, error = ?error, "Output inventory failed");
-            Vec::new()
+            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed; parking");
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                error,
+                unix_timestamp_millis(),
+            )
+            .await;
+            None
         }
     }
 }
@@ -929,6 +951,64 @@ mod tests {
         assert_eq!(stored.attempts, 0, "no attempt charged");
         let intent = stored.attempt_intent.expect("intent retained");
         assert_eq!(intent.external_name, attempt.external_name());
+    }
+
+    // An output-inventory failure at finalize parks the job for a retry instead
+    // of terminalizing Succeeded with a false-empty output manifest.
+    #[tokio::test]
+    async fn inventory_failure_parks() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+        use byteview::ByteView;
+
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, 6)
+            .await
+            .unwrap();
+
+        // Poison the workspace listing: an undecodable head row fails the scan.
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: ByteView::from(b"ws-test/poison".to_vec()),
+                value: ByteView::from(vec![0xFF]),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+
+        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+        finalize_attempt(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &attempt,
+            &execution_spec(),
+            "ws-test",
+            Ok(AttemptStatus {
+                phase: AttemptPhase::Exited { code: 0 },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+            }),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Indeterminate);
+        assert!(stored.result.is_none(), "no false-empty manifest recorded");
     }
 
     // A submit error with the container confirmed absent keeps the pre-submit
