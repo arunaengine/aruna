@@ -5,10 +5,11 @@ use aruna_core::keyspaces::{
     JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord, JobResultPayload,
-    JobState, JobTransitionError, encode_job_dedup_value, job_due_index_key, job_lease_index_key,
-    job_owner_cursor, job_owner_index_key, job_owner_index_prefix, job_prune_index_key,
-    job_record_key, parse_job_dedup_value, parse_job_owner_index_key, validate_transition,
+    AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord,
+    JobResultPayload, JobState, JobTransitionError, encode_job_dedup_value, job_due_index_key,
+    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
+    job_prune_index_key, job_record_key, parse_job_dedup_value, parse_job_owner_index_key,
+    validate_transition,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -573,6 +574,25 @@ pub async fn release_job(
     } else {
         ReleaseOutcome::Skipped
     })
+}
+
+/// Write-ahead attempt intent: record the deterministic external identity BEFORE any
+/// external submit so a lost attempt can be adopted by name. Token-fenced; no state
+/// change.
+pub async fn record_attempt_intent(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    intent: AttemptIntent,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.attempt_intent = Some(intent.clone());
+        record.updated_at_ms = now_ms;
+        Ok(JobMutation::Persist)
+    })
+    .await
 }
 
 pub enum CancelRequestOutcome {
@@ -1460,6 +1480,31 @@ mod tests {
         assert_eq!(stored.state, JobState::Running, "not requeued");
         assert_eq!(stored.attempts, 0, "attempt count untouched");
         assert!(stored.claim.is_some(), "claim untouched");
+    }
+
+    #[tokio::test]
+    async fn attempt_intent_persists() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA0; 16]);
+        let token = Ulid::r#gen();
+        insert_job(&storage, &running_record(job_id, token, 10_000))
+            .await
+            .unwrap();
+
+        let intent = AttemptIntent {
+            attempt_no: 1,
+            external_name: aruna_core::structs::attempt_external_name(job_id, 1),
+            executor_kind: "docker".to_string(),
+        };
+        record_attempt_intent(&storage, job_id, token, intent.clone(), 6_000)
+            .await
+            .unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempt_intent, Some(intent));
     }
 
     // A live renewed external lease is a plain sweep Skip, never routed to reconcile.

@@ -166,6 +166,21 @@ impl JobPayload {
     }
 }
 
+/// Deterministic external identity of one attempt, recorded write-ahead before any
+/// external submit so a lost attempt can be adopted by name on reconcile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptIntent {
+    pub attempt_no: u32,
+    pub external_name: String,
+    pub executor_kind: String,
+}
+
+/// Reconciliation key: the container name, K8s Job name, or Slurm job-name an
+/// attempt deterministically owns.
+pub fn attempt_external_name(job_id: JobId, attempt_no: u32) -> String {
+    format!("aruna-{}-a{attempt_no}", job_id.to_string().to_lowercase())
+}
+
 /// Encode a `job_dedup_index` value: `job_id (16) || plan_digest (32)`.
 pub fn encode_job_dedup_value(job_id: JobId, plan_digest: [u8; 32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(48);
@@ -292,6 +307,7 @@ pub struct JobRecord {
     pub result: Option<JobResultPayload>,
     pub execution_class: JobExecutionClass,
     pub plan_digest: Option<[u8; 32]>,
+    pub attempt_intent: Option<AttemptIntent>,
 }
 
 impl JobRecord {
@@ -328,6 +344,7 @@ impl JobRecord {
             result: None,
             execution_class,
             plan_digest,
+            attempt_intent: None,
         }
     }
 
@@ -654,6 +671,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn external_name_deterministic() {
+        let id = JobId::from_bytes([0xAB; 16]);
+        let name = attempt_external_name(id, 2);
+        assert!(name.starts_with("aruna-"));
+        assert!(name.ends_with("-a2"));
+        assert_eq!(name, name.to_lowercase());
+        assert_eq!(name, attempt_external_name(id, 2));
     }
 
     #[test]
