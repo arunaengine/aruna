@@ -37,6 +37,10 @@ pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use metadata::*;
 pub use onboarding::*;
+pub use structured_id::{
+    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle,
+    StructuredId, StructuredIdGenerator, SystemEnvironment,
+};
 pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
 pub use user_id::UserId;

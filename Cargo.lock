@@ -317,6 +317,7 @@ dependencies = [
  "oxrdf",
  "postcard",
  "prometheus-client",
+ "proptest",
  "serde",
  "serde_json",
  "smallvec",
