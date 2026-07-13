@@ -45,10 +45,10 @@ use tokio::time::sleep;
 use ulid::Ulid;
 
 // Positive delivery waits poll to a condition; the ceiling only bounds a
-// genuine hang. With the outbox drain and placement pulls retrying on the
-// queue scale delivery measures single-digit seconds under contention, so 60s
-// is a generous backstop for a loaded CI runner, not a latency budget.
-const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+// genuine hang. Delivery measures single-digit seconds, but a loaded CI runner
+// can stall consecutive peer syncs for the full 30s peer-sync timeout each, so
+// the backstop is 2-3x that timeout, not the expected latency.
+const POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
 // Interest publication is debounced by 2s, so a few seconds comfortably bounds
 // the window an erroneous delivery would need to land in for negative assertions.
