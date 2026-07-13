@@ -45,6 +45,8 @@ pub enum AdminDocumentReducerError {
         MAX_PLACEMENT_SHARD_COUNT
     )]
     InvalidPlacementShardCount,
+    #[error("placement strategy shard count cannot be changed")]
+    PlacementShardCountChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +477,13 @@ impl AdminDocumentReducerState {
                     || strategy.shard_count > MAX_PLACEMENT_SHARD_COUNT
                 {
                     return Err(AdminDocumentReducerError::InvalidPlacementShardCount);
+                }
+                if self
+                    .materialized_realm_config_placement_strategies()
+                    .get(&strategy.strategy_id)
+                    .is_some_and(|current| current.shard_count != strategy.shard_count)
+                {
+                    return Err(AdminDocumentReducerError::PlacementShardCountChanged);
                 }
                 self.apply_realm_config_placement_field(
                     event,
@@ -4210,6 +4219,54 @@ mod tests {
             BTreeMap::from([(strategy_id, strategy)])
         );
         assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn strategy_shards_immutable() {
+        let mut state = realm_config_state();
+        let origin = node(1);
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        let initial = placement_strategy(strategy_id, Some(3));
+        let mut renamed = initial.clone();
+        renamed.name = "renamed".to_string();
+
+        assert_eq!(
+            state.apply(&realm_config_event(
+                1,
+                origin,
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: initial },
+            )),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            state.apply(&realm_config_event(
+                2,
+                origin,
+                2,
+                AdminDocumentClock::default().with_observed(origin, 1),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: renamed.clone(),
+                },
+            )),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        let before = state.clone();
+        let mut changed = renamed;
+        changed.shard_count *= 2;
+        assert_eq!(
+            state.apply(&realm_config_event(
+                3,
+                origin,
+                3,
+                AdminDocumentClock::default().with_observed(origin, 2),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: changed },
+            )),
+            Err(AdminDocumentReducerError::PlacementShardCountChanged)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
