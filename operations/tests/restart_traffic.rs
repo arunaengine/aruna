@@ -33,10 +33,11 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // Realm-node and document convergence poll to a condition; the ceilings only
-// bound a genuine hang, so they carry generous headroom for a loaded CI runner
-// where anti-entropy across three nodes is thread-starved and slow.
+// bound a genuine hang. With the outbox drain and placement pulls retrying on
+// the queue scale convergence measures single-digit seconds under contention,
+// so 60s is a generous backstop for a loaded CI runner, not a latency budget.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 500;
 

@@ -50,9 +50,10 @@ use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine
-// hang, so it carries generous headroom for a loaded CI runner where forwarded
-// writes and holder convergence are thread-starved and slow.
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+// hang. With the outbox drain and placement pulls retrying on the queue scale
+// convergence measures single-digit seconds under contention, so 60s is a
+// generous backstop for a loaded CI runner, not a latency budget.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct TestNode {
     _temp_dir: TempDir,

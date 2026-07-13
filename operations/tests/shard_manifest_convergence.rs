@@ -34,10 +34,11 @@ use tokio::time::sleep;
 use ulid::Ulid;
 
 // Realm-node and manifest convergence poll to a condition; the ceilings only
-// bound a genuine hang, so they carry generous headroom for a loaded CI runner
-// where anti-entropy across the holders is thread-starved and slow.
+// bound a genuine hang. With the outbox drain and placement pulls retrying on
+// the queue scale convergence measures single-digit seconds under contention,
+// so 60s is a generous backstop for a loaded CI runner, not a latency budget.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct TestNode {
     _temp_dir: TempDir,

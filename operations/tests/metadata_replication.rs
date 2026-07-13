@@ -64,9 +64,10 @@ use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine
-// hang, so it carries generous headroom for a loaded CI runner where gossip and
-// anti-entropy across the holders are thread-starved and slow.
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+// hang. Post-replan convergence measures ~1s (registry row) to ~10s (event
+// log behind a holder-transition graph sync) under tenfold contention, so 60s
+// is a generous backstop for a loaded CI runner, not a latency budget.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct TestNode {
     _temp_dir: TempDir,
