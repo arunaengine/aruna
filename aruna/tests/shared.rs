@@ -63,11 +63,13 @@ pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct S3Endpoint {
     pub(crate) endpoint_url: String,
     pub(crate) host: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct S3Credentials {
     pub(crate) access_key_id: String,
     pub(crate) access_secret: String,
