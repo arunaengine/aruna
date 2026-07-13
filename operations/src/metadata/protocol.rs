@@ -153,7 +153,7 @@ pub(crate) async fn write_encoded_message(
         .map_err(|err| err.to_string())?;
     stream
         .0
-        .write_all(&bytes)
+        .write_all(bytes)
         .await
         .map_err(|err| err.to_string())?;
     stream.0.flush().await.map_err(|err| err.to_string())?;
