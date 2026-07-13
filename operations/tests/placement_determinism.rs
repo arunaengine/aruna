@@ -4,32 +4,32 @@ use std::time::Duration;
 
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
 use aruna_core::structs::{
     Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
     NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::create_metadata_document::{
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::mutate_realm_placement::{
     MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::node_info::{read_node_info_document, seed_node_info_document};
-use aruna_operations::placement::{
-    PlacementResolutionContext, build_view, plan_target_placement, resolve_holders,
-};
+use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::sync_placement::{decode_placement, placement_key};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -56,32 +56,6 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let actor = test_actor(&nodes[0], realm_id);
     let group_id = Ulid::from_bytes([71; 16]);
     let document_id = Ulid::from_bytes([72; 16]);
-    let event_id = Ulid::from_bytes([73; 16]);
-    let target = DocumentSyncTarget::MetadataCreateEvent {
-        document_id,
-        event_id,
-    };
-    write_metadata_create_event(
-        &nodes[0],
-        realm_id,
-        group_id,
-        document_id,
-        event_id,
-        &target,
-    )
-    .await?;
-
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: nodes[0].net.node_id(),
-            excluded_peers: Vec::new(),
-            documents: vec![target.clone()],
-            allow_genesis: true,
-        }),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
 
     let initial_config = drive(
         GetRealmConfigOperation::new(realm_id),
@@ -89,20 +63,23 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     )
     .await?;
     assert_weighted_distinct_resolution(&nodes, &initial_config);
-    let mut expected_initial = plan_target_placement(
-        &initial_config,
-        &target,
-        PlacementResolutionContext::default(),
-    )
-    .expect("default placement strategy should plan the document")
-    .holders;
-    sort_node_ids(&mut expected_initial);
-    let initial = wait_for_placement(&nodes[0], realm_id, &target, |record| {
-        record.desired_holder_count == 2 && record.selected_holders == expected_initial
-    })
-    .await?;
 
-    let obsolete = initial.selected_holders[0];
+    // The create-receiving node chooses the document's bucket out of the ones
+    // it holds; every record of the document rides that bucket.
+    let created = create_metadata_document(&nodes[0], realm_id, group_id, document_id).await?;
+    let placement = created.placement;
+    let target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id: created.last_event_id,
+    };
+
+    let mut expected_initial = resolve_shard_holders(&initial_config, &placement);
+    sort_node_ids(&mut expected_initial);
+    assert_eq!(expected_initial.len(), 2);
+    assert!(expected_initial.contains(&nodes[0].net.node_id()));
+    wait_for_document_on_holders(&nodes, &expected_initial, &target).await?;
+
+    let obsolete = expected_initial[0];
     let old_entry = initial_config
         .placement_entry(obsolete)
         .expect("selected holder should have a placement entry");
@@ -139,37 +116,18 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let configs = wait_for_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
     assert_placement_state_identical(&configs);
     assert_resolve_holders_identical(&configs);
-    let mut expected_final =
-        plan_target_placement(&configs[0], &target, PlacementResolutionContext::default())
-            .expect("updated placement strategy should plan the document")
-            .holders;
+    assert_eq!(placement.strategy_id, expanded_strategy.strategy_id);
+    let mut expected_final = resolve_shard_holders(&configs[0], &placement);
     sort_node_ids(&mut expected_final);
     assert_eq!(expected_final.len(), 3);
     assert!(!expected_final.contains(&obsolete));
-
-    let final_record = wait_for_placement(&nodes[0], realm_id, &target, |record| {
-        record.desired_holder_count == 3 && record.selected_holders == expected_final
-    })
-    .await?;
-    assert_eq!(
-        final_record.placement.strategy_id,
-        expanded_strategy.strategy_id
-    );
-    assert!(!final_record.selected_holders.contains(&obsolete));
     assert!(
-        final_record
-            .selected_holders
+        expected_final
             .iter()
-            .any(|holder| !initial.selected_holders.contains(holder)),
+            .any(|holder| !expected_initial.contains(holder)),
         "policy change should add replacement/top-up holders"
     );
-    for holder in &final_record.selected_holders {
-        let node = nodes
-            .iter()
-            .find(|node| node.net.node_id() == *holder)
-            .expect("final holder should be a fixture node");
-        wait_for_document(node, &target).await?;
-    }
+    wait_for_document_on_holders(&nodes, &expected_final, &target).await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -260,114 +218,49 @@ fn test_actor(node: &TestNode, realm_id: RealmId) -> Actor {
     }
 }
 
-async fn write_metadata_create_event(
+async fn create_metadata_document(
     node: &TestNode,
     realm_id: RealmId,
     group_id: Ulid,
     document_id: Ulid,
-    event_id: Ulid,
-    target: &DocumentSyncTarget,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let document_path = "datasets/issue-261";
-    let record = MetadataCreateEventRecord {
-        event_id,
-        record: MetadataRegistryRecord {
-            realm_id,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    Ok(drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: node.net.node_id(),
+                user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
+                realm_id,
+            },
             group_id,
             document_id,
-            document_path: document_path.to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            document_path: "datasets/issue-261".to_string(),
             public: false,
-            permission_path: MetadataRegistryRecord::permission_path_for(
-                &realm_id,
-                group_id,
-                document_path,
-                document_id,
-            ),
-            holder_node_ids: vec![node.net.node_id()],
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            last_event_id: event_id,
-        },
-        user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
-        node_id: node.net.node_id(),
-        payload: MetadataCreateEventPayload::Scaffold {
-            name: "Issue 261 placement".to_string(),
-            description: "Integration placement fixture".to_string(),
-            date_published: "2026-07-10".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
-        },
-        occurred_at_ms: 1,
-    };
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            value: postcard::to_allocvec(&record)?.into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("unexpected metadata create-event write: {other:?}").into()),
-    }
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Issue 261 placement".to_string(),
+                description: "Integration placement fixture".to_string(),
+                date_published: "2026-07-10".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        }),
+        node.context.as_ref(),
+    )
+    .await?
+    .record)
 }
 
-async fn read_placement(
-    node: &TestNode,
-    realm_id: RealmId,
+async fn wait_for_document_on_holders(
+    nodes: &[TestNode],
+    holders: &[aruna_core::NodeId],
     target: &DocumentSyncTarget,
-) -> Result<Option<PendingDocumentPlacement>, Box<dyn std::error::Error>> {
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE.to_string(),
-            key: placement_key(realm_id, target),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|value| decode_placement(value.as_ref()))
-            .transpose()?),
-        other => Err(format!("unexpected placement read event: {other:?}").into()),
+) -> Result<(), Box<dyn std::error::Error>> {
+    for holder in holders {
+        let node = nodes
+            .iter()
+            .find(|node| node.net.node_id() == *holder)
+            .expect("holder should be a fixture node");
+        wait_for_document(node, target).await?;
     }
-}
-
-async fn wait_for_placement(
-    node: &TestNode,
-    realm_id: RealmId,
-    target: &DocumentSyncTarget,
-    predicate: impl Fn(&PendingDocumentPlacement) -> bool,
-) -> Result<PendingDocumentPlacement, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    let mut last_record = None;
-    loop {
-        if let Some(record) = read_placement(node, realm_id, target).await? {
-            if predicate(&record) {
-                return Ok(record);
-            }
-            last_record = Some(record);
-        }
-        if Instant::now() >= deadline {
-            let config = drive(
-                GetRealmConfigOperation::new(realm_id),
-                node.context.as_ref(),
-            )
-            .await?;
-            let active_strategy = config
-                .default_strategy_id
-                .and_then(|strategy_id| config.strategy(&strategy_id));
-            return Err(format!(
-                "placement inventory did not reach the expected state; active strategy: {active_strategy:?}; last record: {last_record:?}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    Ok(())
 }
 
 async fn wait_for_document(
@@ -458,7 +351,7 @@ fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigD
     let mut baseline_hot_wins = 0usize;
     for counter in 0u64..2_000 {
         let subject = blake3::hash(&counter.to_le_bytes());
-        let holders = resolve_holders(&view, strategy, subject.as_bytes(), 0, None);
+        let holders = resolve_holders(&view, strategy, subject.as_bytes(), None);
         let locations: std::collections::HashSet<_> = holders
             .iter()
             .map(|holder| {
@@ -473,9 +366,8 @@ fn assert_weighted_distinct_resolution(nodes: &[TestNode], config: &RealmConfigD
         assert_eq!(holders.len(), 2);
         assert_eq!(locations.len(), 2);
         hot_wins += usize::from(holders[0] == hot_node);
-        baseline_hot_wins += usize::from(
-            resolve_holders(&view, &baseline, subject.as_bytes(), 0, None)[0] == hot_node,
-        );
+        baseline_hot_wins +=
+            usize::from(resolve_holders(&view, &baseline, subject.as_bytes(), None)[0] == hot_node);
     }
     assert!(
         hot_wins > baseline_hot_wins + 400,
@@ -521,13 +413,13 @@ fn assert_resolve_holders_identical(configs: &[RealmConfigDocument]) {
 
     for counter in 0u64..100 {
         let subject = *blake3::hash(&counter.to_le_bytes()).as_bytes();
-        let reference = resolve_holders(&views[0], &strategy, &subject, 0, None);
+        let reference = resolve_holders(&views[0], &strategy, &subject, None);
         assert!(
             !reference.is_empty(),
             "empty holder set for subject {counter}"
         );
         for view in &views[1..] {
-            let holders = resolve_holders(view, &strategy, &subject, 0, None);
+            let holders = resolve_holders(view, &strategy, &subject, None);
             assert_eq!(
                 holders, reference,
                 "holder set diverged for subject {counter}"
@@ -579,12 +471,20 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     )
     .await?;
     let task_handle = TaskHandle::new();
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
+        net.node_id(),
+        storage.clone(),
+        Some(net.clone()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+    )?;
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: None,
+        metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
 
@@ -669,6 +569,16 @@ async fn install_realm_config(
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
     seed_realm_config_sync_topic(nodes, realm_id, &config).await?;
+    // Config apply hook: the shard's rank-0 holder eagerly creates each
+    // shard topic genesis (mirrors the production realm-config apply path).
+    for node in nodes {
+        aruna_operations::process_placements::process_shard_placements(
+            &node.context,
+            realm_id,
+            node.net.node_id(),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -678,6 +588,9 @@ async fn seed_realm_config_sync_topic(
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let placement =
+        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+    let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),
         user_id: aruna_core::UserId::nil(realm_id),
@@ -703,6 +616,7 @@ async fn seed_realm_config_sync_topic(
                 documents: vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(event),
+                    placement,
                     allow_genesis: true,
                 }],
                 peers: Vec::new(),
@@ -720,7 +634,7 @@ async fn seed_realm_config_sync_topic(
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::SyncDocuments {
-                targets: vec![target],
+                topics: vec![topic],
                 peers: Vec::new(),
             },
         )))

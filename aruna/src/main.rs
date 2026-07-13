@@ -31,8 +31,7 @@ use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealm
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
-use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
-use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
+use aruna_operations::startup::restore_shard_subscriptions;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -251,12 +250,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::Provisioned => {
-            drive(
-                RestoreTopicSubscriptionsOperation::new(config.node_id, config.realm_id),
-                driver_ctx.as_ref(),
-            )
-            .await?;
-
             if matches!(
                 &config.node_capabilities,
                 NodeCapabilities::Management { .. }
@@ -309,15 +302,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to publish initial node usage snapshots");
     }
 
-    drive(
-        ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id: config.realm_id,
-            local_node_id: config.node_id,
-            retry_after: aruna_operations::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
-        }),
-        driver_ctx.as_ref(),
+    // All startup modes: join the held shard topics (a freshly onboarded node
+    // pulls existing shard data from its co-holders here), then create the
+    // geneses of the shards this node is rank-0 holder of.
+    let restore_summary =
+        restore_shard_subscriptions(&driver_ctx, config.node_id, config.realm_id).await;
+    tracing::info!(
+        held_shards = restore_summary.held_shards,
+        shard_topics = restore_summary.shard_topics,
+        shared_topics = restore_summary.shared_topics,
+        "Restored held shard subscriptions",
+    );
+    aruna_operations::process_placements::process_shard_placements(
+        &driver_ctx,
+        config.realm_id,
+        config.node_id,
     )
-    .await?;
+    .await;
 
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {

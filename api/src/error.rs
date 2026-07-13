@@ -39,6 +39,8 @@ pub enum ServerError {
     BadGateway,
     #[error("Service unavailable")]
     ServiceUnavailable,
+    #[error("{0}")]
+    ServiceUnavailableReason(String),
 }
 
 #[derive(Debug, Error)]
@@ -177,7 +179,10 @@ impl IntoResponse for ServerError {
         let body = ErrorResponse::new(&message).with_code(code);
 
         let mut response = (status, Json(body)).into_response();
-        if matches!(self, ServerError::ServiceUnavailable) {
+        if matches!(
+            self,
+            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_)
+        ) {
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
@@ -198,7 +203,9 @@ impl ServerError {
             ServerError::Conflict(_) => StatusCode::CONFLICT,
             ServerError::BadRequest | ServerError::BadRequestReason(_) => StatusCode::BAD_REQUEST,
             ServerError::BadGateway => StatusCode::BAD_GATEWAY,
-            ServerError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -212,7 +219,9 @@ impl ServerError {
             ServerError::Conflict(_) => "Conflict".to_string(),
             ServerError::BadRequest | ServerError::BadRequestReason(_) => "Bad request".to_string(),
             ServerError::BadGateway => "Bad gateway".to_string(),
-            ServerError::ServiceUnavailable => "Service unavailable".to_string(),
+            ServerError::ServiceUnavailable | ServerError::ServiceUnavailableReason(_) => {
+                "Service unavailable".to_string()
+            }
         }
     }
 

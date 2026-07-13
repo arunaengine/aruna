@@ -13,10 +13,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, create_metadata_document as run_create_metadata_document,
-};
-use aruna_operations::delete_metadata_document::{
-    DeleteMetadataDocumentOperation, delete_metadata_document as run_delete_metadata_document,
+    CreateMetadataDocumentPayload,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_metadata_document::load_metadata_record_by_document as load_metadata_record_by_document_from_operations;
@@ -28,13 +25,17 @@ use aruna_operations::metadata::api::{
     export_metadata_rocrate as run_export_metadata_rocrate,
     get_visible_metadata_document as run_get_visible_metadata_document,
     list_visible_metadata_documents as run_list_visible_metadata_documents,
-    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
-    search_metadata as run_search_metadata,
+    metadata_auth_token_from_bearer, query_metadata as run_query_metadata,
+    query_metadata_document as run_query_metadata_document, search_metadata as run_search_metadata,
+};
+use aruna_operations::metadata::forward::{
+    MetadataWriteError, create_metadata_document_routed as run_create_metadata_document,
+    delete_metadata_document_routed as run_delete_metadata_document,
+    update_metadata_document_routed as run_update_metadata_document,
 };
 use aruna_operations::notifications::watch::emit::emit_resource_watch_event;
 use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation, update_metadata_document as run_update_metadata_document,
+    UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -55,8 +56,7 @@ use aruna_operations::metadata::MetadataAuthToken;
 #[cfg(test)]
 use aruna_operations::metadata::api::{
     MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    deduplicate_search_hits, document_replica_query_nodes, load_metadata_realm_nodes,
-    metadata_auth_token_from_bearer, query_select_limit,
+    deduplicate_search_hits, load_metadata_realm_nodes, query_select_limit,
 };
 #[cfg(test)]
 use std::time::Duration;
@@ -445,6 +445,7 @@ impl MetadataDocumentListItem {
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -491,9 +492,10 @@ pub async fn create_metadata_document(
             },
         ),
         ctx.clone(),
+        forwarded_auth_token(bearer_token),
     )
     .await
-    .map_err(map_create_metadata_error)?;
+    .map_err(map_metadata_write_error)?;
     let result = created.record;
 
     // Post-commit, best-effort resource-watch emission. Fire-and-forget: a failed
@@ -627,6 +629,7 @@ pub async fn get_metadata_document(
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
@@ -636,20 +639,17 @@ pub async fn delete_metadata_document(
 
     let ctx = state.get_ctx();
     run_delete_metadata_document(
-        DeleteMetadataDocumentOperation::new(
-            Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            record.group_id,
-            document_id,
-        ),
-        ctx.as_ref(),
-        document_id,
+        &ctx,
+        Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        &record,
+        forwarded_auth_token(bearer_token),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(map_metadata_write_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -813,6 +813,7 @@ pub async fn export_metadata_rocrate(
 pub async fn replace_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(request): Json<ReplaceMetadataRoCrateRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
@@ -823,23 +824,21 @@ pub async fn replace_metadata_rocrate(
 
     let ctx = state.get_ctx();
     let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
-            document_id,
-            public: request.public.unwrap_or(record.public),
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
-                jsonld: serialize_jsonld_object(&request.rocrate)?,
-            },
-        }),
-        ctx.as_ref(),
+        &ctx,
+        Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        &record,
+        request.public,
+        UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            jsonld: serialize_jsonld_object(&request.rocrate)?,
+        },
+        forwarded_auth_token(bearer_token),
     )
     .await
-    .map_err(map_update_metadata_error)?;
+    .map_err(map_metadata_write_error)?;
 
     Ok((
         StatusCode::OK,
@@ -906,6 +905,7 @@ pub async fn replace_metadata_rocrate(
 pub async fn add_metadata_data_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
@@ -916,23 +916,21 @@ pub async fn add_metadata_data_entity(
 
     let ctx = state.get_ctx();
     let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
-            document_id,
-            public: record.public,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
-                jsonld: serialize_jsonld_entity(&entity)?,
-            },
-        }),
-        ctx.as_ref(),
+        &ctx,
+        Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        &record,
+        None,
+        UpdateMetadataDocumentMutation::UpsertDataEntity {
+            jsonld: serialize_jsonld_entity(&entity)?,
+        },
+        forwarded_auth_token(bearer_token),
     )
     .await
-    .map_err(map_update_metadata_error)?;
+    .map_err(map_metadata_write_error)?;
 
     Ok((
         StatusCode::OK,
@@ -995,6 +993,7 @@ pub async fn add_metadata_data_entity(
 pub async fn add_metadata_contextual_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
@@ -1005,23 +1004,21 @@ pub async fn add_metadata_contextual_entity(
 
     let ctx = state.get_ctx();
     let updated = run_update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
-            group_id: record.group_id,
-            document_id,
-            public: record.public,
-            mutation: UpdateMetadataDocumentMutation::UpsertContextualEntity {
-                jsonld: serialize_jsonld_entity(&entity)?,
-            },
-        }),
-        ctx.as_ref(),
+        &ctx,
+        Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        &record,
+        None,
+        UpdateMetadataDocumentMutation::UpsertContextualEntity {
+            jsonld: serialize_jsonld_entity(&entity)?,
+        },
+        forwarded_auth_token(bearer_token),
     )
     .await
-    .map_err(map_update_metadata_error)?;
+    .map_err(map_metadata_write_error)?;
 
     Ok((
         StatusCode::OK,
@@ -1291,6 +1288,20 @@ fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
     serde_json::to_string(value).map_err(|_| ServerError::BadRequest)
 }
 
+/// A write that could neither be applied locally nor forwarded to a holder is a
+/// loud failure: the caller is told it was not accepted, rather than being
+/// answered `201` for a record that can never replicate.
+fn map_metadata_write_error(error: MetadataWriteError) -> ServerError {
+    match error {
+        MetadataWriteError::Create(error) => map_create_metadata_error(error),
+        MetadataWriteError::Update(error) => map_update_metadata_error(error),
+        MetadataWriteError::Delete(error) => ServerError::InternalError(error.to_string()),
+        MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(format!(
+            "metadata write is undeliverable: {error}"
+        )),
+    }
+}
+
 fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError {
     match error {
         CreateMetadataDocumentError::MetadataError(metadata_error) => {
@@ -1308,6 +1319,14 @@ fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError 
         }
         other => ServerError::InternalError(other.to_string()),
     }
+}
+
+/// The caller's own bearer token, carried to the holder a write is forwarded to
+/// so it re-runs the same permission checks under the same authority.
+fn forwarded_auth_token(
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
+) -> Option<aruna_operations::metadata::MetadataAuthToken> {
+    metadata_auth_token_from_bearer(bearer_token_to_string(bearer_token).as_deref())
 }
 
 fn map_metadata_error(error: MetadataError) -> ServerError {
@@ -1650,6 +1669,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -1742,6 +1762,7 @@ mod tests {
         let _ = replace_metadata_rocrate(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
                 rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
@@ -1856,6 +1877,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::RoCrate(
                 CreateMetadataRoCrateRequest {
                     group_id: test.group_id.to_string(),
@@ -1895,6 +1917,7 @@ mod tests {
         let _ = add_metadata_contextual_entity(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(document_id.clone()),
             Json(json!({
                 "@id": "#person-ada",
@@ -1908,6 +1931,7 @@ mod tests {
         let _ = add_metadata_data_entity(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(document_id.clone()),
             Json(json!({
                 "@id": "./data/run-42.raw",
@@ -1945,6 +1969,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -1977,6 +2002,7 @@ mod tests {
         let status = delete_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(created.summary.document_id.clone()),
         )
         .await
@@ -2003,6 +2029,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2116,6 +2143,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2248,38 +2276,6 @@ mod tests {
     }
 
     #[test]
-    fn document_replica_query_nodes_use_deduplicated_replicas() {
-        let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
-        let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
-        let document_id = Ulid::r#gen();
-        let record = MetadataRegistryRecord {
-            realm_id: RealmId([3u8; 32]),
-            group_id: Ulid::r#gen(),
-            document_id,
-            document_path: "datasets/query-targets".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: true,
-            permission_path: "/metadata/query-targets".to_string(),
-            holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            last_event_id: Ulid::nil(),
-        };
-
-        assert_eq!(
-            document_replica_query_nodes(&record, local_node_id),
-            vec![remote_node_id, local_node_id]
-        );
-
-        let mut empty_replicas = record;
-        empty_replicas.holder_node_ids.clear();
-        assert_eq!(
-            document_replica_query_nodes(&empty_replicas, local_node_id),
-            vec![local_node_id]
-        );
-    }
-
-    #[test]
     fn deduplicate_fanout_nodes_preserves_first_seen_order() {
         let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
         let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
@@ -2339,6 +2335,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2398,6 +2395,7 @@ mod tests {
         let (_, Json(_created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2651,6 +2649,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -2705,6 +2704,7 @@ mod tests {
             let _ = create_metadata_document(
                 State(test.state.clone()),
                 Extension(Some(test.auth.clone())),
+                Extension(None),
                 Json(CreateMetadataRequest::Scaffold(
                     CreateMetadataScaffoldRequest {
                         group_id: test.group_id.to_string(),
@@ -3148,6 +3148,7 @@ mod tests {
         let _ = create_metadata_document(
             State(state),
             Extension(Some(auth)),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: group_id.to_string(),

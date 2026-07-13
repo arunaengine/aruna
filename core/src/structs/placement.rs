@@ -7,6 +7,11 @@ use ulid::Ulid;
 
 pub const DEFAULT_LOCATION: &str = "default";
 pub const DEFAULT_NODE_WEIGHT: u32 = 100;
+/// Default per-strategy shard fan-out. Power of two so `shard_for_subject`
+/// can mask with `shard_count - 1`.
+pub const DEFAULT_SHARD_COUNT: u32 = 64;
+/// Maximum per-strategy shard fan-out accepted from placement config.
+pub const MAX_PLACEMENT_SHARD_COUNT: u32 = 4096;
 /// Upper bound for a configurable node weight; onboarding/config inputs clamp
 /// present values into `1..=MAX_NODE_WEIGHT`.
 pub const MAX_NODE_WEIGHT: u32 = 10_000;
@@ -73,6 +78,9 @@ pub struct PlacementStrategy {
     pub replica_count: Option<u32>,
     pub distinct_locations: bool,
     pub affinity: Vec<AffinityRule>,
+    /// Number of sync shards subjects hash into. Power of two so the topic
+    /// derivation is a pure mask; validated on upsert.
+    pub shard_count: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -128,6 +136,7 @@ pub struct StrategyBinding {
 pub struct PlacementRef {
     pub strategy_id: Ulid,
     pub epoch: u64,
+    pub shard: u32,
 }
 
 impl PlacementRef {
@@ -137,7 +146,22 @@ impl PlacementRef {
     pub const NIL: PlacementRef = PlacementRef {
         strategy_id: Ulid::nil(),
         epoch: 0,
+        shard: 0,
     };
+}
+
+/// Shard a subject hashes into for `shard_count` shards. Blake3 of a domain
+/// tag concatenated with the subject, masked into `0..shard_count`. All
+/// records of one logical document share a subject (see `subject_bytes`) and so
+/// land in one shard.
+pub fn shard_for_subject(subject: &[u8], shard_count: u32) -> u32 {
+    debug_assert!(shard_count.is_power_of_two());
+    let mut input = b"aruna-shard-v1".to_vec();
+    input.extend_from_slice(subject);
+    let hash = blake3::hash(&input);
+    let mut head = [0u8; 4];
+    head.copy_from_slice(&hash.as_bytes()[..4]);
+    u32::from_be_bytes(head) & (shard_count - 1)
 }
 
 #[cfg(test)]
@@ -204,6 +228,7 @@ mod tests {
                     effect: AffinityEffect::Multiply { permille: 1500 },
                 },
             ],
+            shard_count: 64,
         };
         let bytes = postcard::to_allocvec(&strategy).unwrap();
         assert_eq!(
@@ -288,11 +313,52 @@ mod tests {
         let placement = PlacementRef {
             strategy_id: Ulid::from_bytes([9u8; 16]),
             epoch: 0,
+            shard: 7,
         };
         let bytes = postcard::to_allocvec(&placement).unwrap();
         assert_eq!(
             postcard::from_bytes::<PlacementRef>(&bytes).unwrap(),
             placement
         );
+    }
+
+    #[test]
+    fn shard_for_subject_matches_golden_vectors() {
+        // Fixed subjects → fixed shards. These are the stage-2 cross-node
+        // canaries: a change here means a document would remap topics.
+        assert_eq!(shard_for_subject(b"", 64), 30);
+        assert_eq!(shard_for_subject(b"aruna", 64), 20);
+        assert_eq!(shard_for_subject(b"aruna", 128), 84);
+        assert_eq!(shard_for_subject(&[0u8; 16], 64), 4);
+        assert_eq!(shard_for_subject(&[0u8; 16], 128), 4);
+    }
+
+    #[test]
+    fn shard_for_subject_stays_in_range() {
+        for count in [1u32, 2, 4, 64, 128, 1024] {
+            for seed in 0u32..256 {
+                let shard = shard_for_subject(&seed.to_be_bytes(), count);
+                assert!(shard < count, "shard {shard} out of range for {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn shard_for_subject_distributes_evenly() {
+        let shard_count = 64u32;
+        let samples = 10_000u32;
+        let mut counts = vec![0u32; shard_count as usize];
+        let mut cursor = [0u8; 32];
+        for _ in 0..samples {
+            cursor = *blake3::hash(&cursor).as_bytes();
+            let shard = shard_for_subject(&cursor, shard_count);
+            counts[shard as usize] += 1;
+        }
+        let expected = samples / shard_count; // ~156
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        // Generous band around the mean; a broken mask would collapse or spike.
+        assert!(min > expected / 2, "under-filled shard: {min} < {expected}");
+        assert!(max < expected * 2, "over-filled shard: {max} > {expected}");
     }
 }

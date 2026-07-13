@@ -21,6 +21,7 @@ use crate::driver::{DriverContext, drive};
 use crate::ensure_realm_config::{
     EnsureRealmConfigConfig, EnsureRealmConfigError, EnsureRealmConfigOperation,
 };
+use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
 use crate::issue_onboarding_sync_ticket::{
     IssueOnboardingSyncTicketError, IssueOnboardingSyncTicketInput,
     IssueOnboardingSyncTicketOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
@@ -32,7 +33,7 @@ use crate::mutate_realm_placement::{
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
-use crate::process_placements::{PlacementConfig, PlacementError, ProcessPlacementsOperation};
+use crate::process_placements::process_shard_placements;
 use crate::read_realm_authorization::ReadRealmAuthorizationOperation;
 use crate::reserve_onboarding_secret::{
     ReserveOnboardingSecretError, ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
@@ -74,7 +75,7 @@ pub enum BootstrapOnboardingFinalizeError {
     #[error(transparent)]
     SetNodePlacement(#[from] MutateRealmPlacementError),
     #[error(transparent)]
-    Placement(#[from] PlacementError),
+    GetRealmConfig(#[from] GetRealmConfigError),
     #[error(transparent)]
     IssueTicket(#[from] IssueOnboardingSyncTicketError),
     #[error(transparent)]
@@ -89,6 +90,8 @@ pub enum BootstrapOnboardingFinalizeError {
     ReservedNodeLabel,
     #[error("placement location must be at most 64 characters")]
     NodeLocationTooLong,
+    #[error("ticketed user {0} has no placement")]
+    UserPlacementUnavailable(UserId),
 }
 
 pub async fn bootstrap_onboarding_finalize(
@@ -112,7 +115,7 @@ pub async fn bootstrap_onboarding_finalize(
 
     ensure_realm_node_with_retries(&input, reserved.mode, context.as_ref()).await?;
     set_joiner_placement_entry(&input, placement_entry, context.as_ref()).await?;
-    process_pending_placements(&input, context.as_ref()).await?;
+    process_pending_placements(&input, &context).await;
 
     let ticket = drive(
         IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
@@ -128,15 +131,22 @@ pub async fn bootstrap_onboarding_finalize(
     .await?;
     let encoded_ticket = ticket.encode()?;
 
+    let onboarding_topics =
+        onboarding_sync_topics(&context, input.realm_id, input.node_id, &ticket).await?;
     let net_handle = context
         .net_handle
         .as_ref()
         .ok_or(BootstrapOnboardingFinalizeError::NetHandleUnavailable)?;
+    // Shared realm topics may be created here (the issuer is a legitimate
+    // origin for them); shard topics are join-only — their genesis comes from
+    // the shard's rank-0 holder, so the joiner is only added as a member.
     net_handle
-        .ensure_document_sync_topics(&ticket.payload.documents, vec![input.node_id])
+        .ensure_document_sync_topics(&onboarding_topics.shared, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
+    let mut all_topics = onboarding_topics.shared;
+    all_topics.extend(onboarding_topics.shard);
     net_handle
-        .allow_document_sync_peers(&ticket.payload.documents, vec![input.node_id])
+        .allow_document_sync_peers(&all_topics, vec![input.node_id])
         .map_err(|error| BootstrapOnboardingFinalizeError::PeerAdmission(error.to_string()))?;
 
     let consumed = drive(
@@ -297,38 +307,76 @@ async fn set_joiner_placement_entry(
 
 async fn process_pending_placements(
     input: &BootstrapOnboardingFinalizeInput,
-    context: &DriverContext,
-) -> Result<(), PlacementError> {
-    match drive(
-        ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id: input.realm_id,
-            local_node_id: input.local_node_id,
-            retry_after: crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            warn!(error = %error, "Failed to process pending document-sync placements during onboarding");
-            Err(error)
+    context: &Arc<DriverContext>,
+) {
+    process_shard_placements(context, input.realm_id, input.local_node_id).await;
+}
+
+struct OnboardingSyncTopics {
+    shared: Vec<::irokle::TopicId>,
+    shard: Vec<::irokle::TopicId>,
+}
+
+/// Derives the sync topics for a ticket's documents so the issuer can add the
+/// joiner to them: shared realm targets ignore the placement, while user
+/// documents ride their shard topic only when the joiner holds that placement
+/// under the issuer's realm config. Shared and shard topics are returned
+/// separately because only shared topics may be created by the issuer; shard
+/// topics are join-only.
+async fn onboarding_sync_topics(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    joiner_node_id: NodeId,
+    ticket: &aruna_core::onboarding::OnboardingSyncTicket,
+) -> Result<OnboardingSyncTopics, BootstrapOnboardingFinalizeError> {
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::structs::PlacementRef;
+    let config = drive(GetRealmConfigOperation::new(realm_id), context.as_ref()).await?;
+    let mut topics = OnboardingSyncTopics {
+        shared: Vec::new(),
+        shard: Vec::new(),
+    };
+    for document in &ticket.payload.documents {
+        if document.uses_shard_topic() {
+            if !matches!(document, DocumentSyncTarget::User { .. }) {
+                continue;
+            }
+            let placement =
+                crate::placement::placement_ref_for_target(&config, document, Default::default());
+            if placement == PlacementRef::NIL {
+                let DocumentSyncTarget::User { user_id } = document else {
+                    unreachable!("shard onboarding documents are restricted to users");
+                };
+                return Err(BootstrapOnboardingFinalizeError::UserPlacementUnavailable(
+                    *user_id,
+                ));
+            }
+            if crate::placement::holds_placement(&config, &placement, joiner_node_id) {
+                topics
+                    .shard
+                    .push(document.sync_topic_id(realm_id, &placement));
+            }
+        } else {
+            topics
+                .shared
+                .push(document.sync_topic_id(realm_id, &PlacementRef::NIL));
         }
     }
+    Ok(topics)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-        bootstrap_onboarding_finalize, emit_node_onboarded_notification,
+        bootstrap_onboarding_finalize, emit_node_onboarded_notification, onboarding_sync_topics,
     };
     use crate::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::get_realm_config::GetRealmConfigOperation;
+    use crate::get_realm_config::{GetRealmConfigError, GetRealmConfigOperation};
     use crate::onboarding_secret_state::secret_state_key;
     use crate::reserve_onboarding_secret::ReserveOnboardingSecretError;
     use aruna_core::NodeId;
@@ -341,8 +389,8 @@ mod tests {
         OnboardingSyncTicket,
     };
     use aruna_core::structs::{
-        Actor, KIND_LABEL_KEY, NotificationKind, NotificationOutboxRecord,
-        RealmAuthorizationDocument, RealmId,
+        Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, NotificationKind,
+        NotificationOutboxRecord, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -561,6 +609,37 @@ mod tests {
             .await;
     }
 
+    async fn clear_placement_strategies(fixture: &FinalizeFixture) {
+        let mut config = drive(
+            GetRealmConfigOperation::new(fixture.realm_id),
+            fixture.context.as_ref(),
+        )
+        .await
+        .unwrap();
+        config.strategies.clear();
+        let actor = Actor {
+            node_id: fixture.local_node_id,
+            user_id: UserId::nil(fixture.realm_id),
+            realm_id: fixture.realm_id,
+        };
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: fixture.realm_id,
+        };
+        let event = fixture
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
     async fn read_outbox_rows(
         storage_handle: &storage::StorageHandle,
     ) -> Vec<NotificationOutboxRecord> {
@@ -677,7 +756,9 @@ mod tests {
         let state = net_handle
             .document_sync_node()
             .storage()
-            .topic_state(&target.sync_topic_id())
+            .topic_state(
+                &target.sync_topic_id(fixture.realm_id, &aruna_core::structs::PlacementRef::NIL),
+            )
             .unwrap()
             .expect("issuer node-info topic admitted during finalize");
         assert!(state.members.contains(&irokle::PeerId::from_bytes(
@@ -685,6 +766,146 @@ mod tests {
         )));
 
         net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn topic_errors_propagate() {
+        let fixture = setup_finalize_fixture().await;
+        clear_placement_strategies(&fixture).await;
+        let user_id = UserId::local(Ulid::from_bytes([44u8; 16]), fixture.realm_id);
+        let ticket = OnboardingSyncTicket::issue(
+            &fixture.realm_signing_key,
+            &fixture.realm_id,
+            fixture.joiner_node_id,
+            100,
+            vec![DocumentSyncTarget::User { user_id }],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            onboarding_sync_topics(
+                &fixture.context,
+                fixture.realm_id,
+                fixture.joiner_node_id,
+                &ticket,
+            )
+            .await,
+            Err(BootstrapOnboardingFinalizeError::UserPlacementUnavailable(id)) if id == user_id
+        ));
+
+        let missing_realm_id = RealmId::from_bytes([9u8; 32]);
+        let missing_ticket = OnboardingSyncTicket::issue(
+            &fixture.realm_signing_key,
+            &missing_realm_id,
+            fixture.joiner_node_id,
+            100,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            onboarding_sync_topics(
+                &fixture.context,
+                missing_realm_id,
+                fixture.joiner_node_id,
+                &missing_ticket,
+            )
+            .await,
+            Err(BootstrapOnboardingFinalizeError::GetRealmConfig(
+                GetRealmConfigError::DocumentNotFound
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonholder_shard_excluded() {
+        let fixture = setup_finalize_fixture().await;
+        let mut config = drive(
+            GetRealmConfigOperation::new(fixture.realm_id),
+            fixture.context.as_ref(),
+        )
+        .await
+        .unwrap();
+        config.ensure_node(fixture.joiner_node_id, RealmNodeKind::Server);
+        let user_strategy_id = config
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == BindingScope::Class(DocumentClass::User))
+            .unwrap()
+            .strategy_id;
+        config
+            .strategies
+            .iter_mut()
+            .find(|strategy| strategy.strategy_id == user_strategy_id)
+            .unwrap()
+            .replica_count = Some(1);
+
+        let actor = Actor {
+            node_id: fixture.local_node_id,
+            user_id: UserId::nil(fixture.realm_id),
+            realm_id: fixture.realm_id,
+        };
+        let config_target = DocumentSyncTarget::RealmConfig {
+            realm_id: fixture.realm_id,
+        };
+        let event = fixture
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: config_target.storage_keyspace().to_string(),
+                key: config_target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let mut held = None;
+        let mut nonholder = None;
+        for seed in 0u16..=u16::MAX {
+            let mut bytes = [0u8; 16];
+            bytes[..2].copy_from_slice(&seed.to_be_bytes());
+            let target = DocumentSyncTarget::User {
+                user_id: UserId::local(Ulid::from_bytes(bytes), fixture.realm_id),
+            };
+            let placement =
+                crate::placement::placement_ref_for_target(&config, &target, Default::default());
+            if crate::placement::holds_placement(&config, &placement, fixture.joiner_node_id) {
+                held.get_or_insert(target);
+            } else {
+                nonholder.get_or_insert(target);
+            }
+            if held.is_some() && nonholder.is_some() {
+                break;
+            }
+        }
+        let held = held.expect("joiner holds a capped user shard");
+        let nonholder = nonholder.expect("joiner does not hold every capped user shard");
+        let held_placement =
+            crate::placement::placement_ref_for_target(&config, &held, Default::default());
+        let ticket = OnboardingSyncTicket::issue(
+            &fixture.realm_signing_key,
+            &fixture.realm_id,
+            fixture.joiner_node_id,
+            100,
+            vec![nonholder, held.clone()],
+        )
+        .unwrap();
+
+        let topics = onboarding_sync_topics(
+            &fixture.context,
+            fixture.realm_id,
+            fixture.joiner_node_id,
+            &ticket,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            topics.shard,
+            vec![held.sync_topic_id(fixture.realm_id, &held_placement)]
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use ulid::Ulid;
 use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
+use crate::placement::placement_ref_for_target;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -224,6 +225,10 @@ impl CreateRealmOperation {
 
         let realm_auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let realm_auth_placement =
+            placement_ref_for_target(config_doc, &realm_auth_target, Default::default());
+        let realm_config_placement =
+            placement_ref_for_target(config_doc, &realm_config_target, Default::default());
         let realm_auth_record = new_outbox_record_with_id(
             realm_role_event.event_id,
             self.config.actor.node_id,
@@ -232,6 +237,7 @@ impl CreateRealmOperation {
             DocumentSyncOutboxEvent::AdminOperation {
                 event: Box::new(realm_role_event),
             },
+            realm_auth_placement,
             true,
         );
         let mut writes = vec![
@@ -248,6 +254,7 @@ impl CreateRealmOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event),
                 },
+                realm_config_placement,
                 true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -697,7 +704,7 @@ mod test {
             config_doc.default_strategy_id,
             Some(seeded_strategies[0].strategy_id)
         );
-        assert_eq!(seeded_bindings.len(), 2);
+        assert_eq!(seeded_bindings.len(), 4);
         assert_eq!(
             config_state.materialized_realm_config_default_strategy(),
             Some(seeded_default_strategy_id)
@@ -712,14 +719,15 @@ mod test {
             config_state
                 .materialized_realm_config_strategy_bindings()
                 .len(),
-            2
+            4
         );
 
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 12);
+        // Two more than the strategies alone: the group and user class bindings.
+        assert_eq!(outbox_records.len(), 14);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentSyncTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -818,6 +826,18 @@ mod test {
                 ),
                 (
                     11,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[2].clone(),
+                    },
+                ),
+                (
+                    12,
+                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                        binding: seeded_bindings[3].clone(),
+                    },
+                ),
+                (
+                    13,
                     AdminDocumentOperation::RealmConfigNodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,
@@ -873,9 +893,13 @@ mod test {
             .filter(|binding| binding.strategy_id == everywhere.strategy_id)
             .map(|binding| binding.scope.clone())
             .collect::<Vec<_>>();
-        assert_eq!(config_doc.strategy_bindings.len(), 2);
+        assert_eq!(config_doc.strategy_bindings.len(), 4);
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
         assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
+        // Group (which covers group authorization documents) and user documents
+        // must reach every node: the permission check reads them locally.
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Group)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::User)));
     }
 
     #[test]

@@ -324,10 +324,7 @@ mod tests {
     #[tokio::test]
     async fn transfer_idle_timeout_returns_timed_out_error() {
         let err = with_transfer_idle_timeout(
-            async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                Ok::<(), io::Error>(())
-            },
+            std::future::pending::<io::Result<()>>(),
             Duration::from_millis(1),
             "reading bao chunk from network stream",
         )

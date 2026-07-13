@@ -17,11 +17,13 @@ use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::notifications::watch::interest::{
     ensure_local_watch_interest_digest, mark_watch_interest_dirty,
 };
+use aruna_operations::placement::placement_ref_for_target;
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
 use byteview::ByteView;
 use rand::Rng;
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
@@ -150,7 +152,7 @@ async fn core_document_targets(
 pub async fn fetch_core_onboarding_documents(
     driver_ctx: &DriverContext,
     node_state: &PersistedNodeState,
-    _realm_id: &aruna_core::structs::RealmId,
+    realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
@@ -162,9 +164,40 @@ pub async fn fetch_core_onboarding_documents(
     let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
         return Err("net handle unavailable".into());
     };
+    let realm_id = *realm_id;
 
+    // Fetch the shared realm documents first (they include the realm config), so
+    // the shard-classed user documents can then be routed onto their shard
+    // topics via the freshly synced config.
+    let mut user_documents = Vec::new();
     for document in onboarding_sync_ticket.payload.documents.clone() {
-        sync_document_from_peer(net_handle, document, bootstrap_peer).await?;
+        if matches!(document, DocumentSyncTarget::User { .. }) {
+            user_documents.push(document);
+            continue;
+        }
+        let topic = document.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+    }
+
+    if !user_documents.is_empty() {
+        let config = load_realm_config(driver_ctx, realm_id).await;
+        let mut synced_topics = HashSet::new();
+        for document in user_documents {
+            let placement = match config.as_ref() {
+                Some(config) => placement_ref_for_target(config, &document, Default::default()),
+                None => aruna_core::structs::PlacementRef::NIL,
+            };
+            if placement == aruna_core::structs::PlacementRef::NIL {
+                warn!(document = ?document, "Skipping onboarding user document without a shard placement");
+                continue;
+            }
+            let Some(topic) =
+                unique_user_topic(&mut synced_topics, realm_id, &placement, &document)
+            else {
+                continue;
+            };
+            sync_topic_from_peer(net_handle, topic, bootstrap_peer, &document).await?;
+        }
     }
 
     Ok(())
@@ -186,13 +219,14 @@ pub async fn wait_for_onboarding_placement(
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
 
-            sync_document_from_peer(
+            sync_topic_from_peer(
                 driver_ctx
                     .net_handle
                     .as_ref()
                     .ok_or("net handle unavailable")?,
-                target.clone(),
+                target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL),
                 bootstrap_peer,
+                &target,
             )
             .await?;
             tokio::time::sleep(ONBOARDING_PLACEMENT_RETRY_INTERVAL).await;
@@ -214,15 +248,45 @@ fn realm_config_has_node_placement(
     config.has_node(node_id) && config.placement_entry(node_id).is_some()
 }
 
-async fn sync_document_from_peer(
+async fn load_realm_config(
+    driver_ctx: &DriverContext,
+    realm_id: aruna_core::structs::RealmId,
+) -> Option<aruna_core::structs::RealmConfigDocument> {
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*realm_id.as_bytes()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+        _ => None,
+    }
+}
+
+fn unique_user_topic(
+    synced_topics: &mut HashSet<::irokle::TopicId>,
+    realm_id: aruna_core::structs::RealmId,
+    placement: &aruna_core::structs::PlacementRef,
+    document: &DocumentSyncTarget,
+) -> Option<::irokle::TopicId> {
+    let topic = document.sync_topic_id(realm_id, placement);
+    synced_topics.insert(topic).then_some(topic)
+}
+
+async fn sync_topic_from_peer(
     net_handle: &aruna_net::NetHandle,
-    document: DocumentSyncTarget,
+    topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
+    document_for_error: &DocumentSyncTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let document_for_error = document.clone();
+    let document_for_error = document_for_error.clone();
     let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
         DocumentSyncEffect::SyncDocument {
-            target: document,
+            topic,
             peers: vec![bootstrap_peer],
         },
     )));
@@ -290,7 +354,7 @@ pub async fn ensure_initial_local_onboarding_secret(
 
 #[cfg(test)]
 mod tests {
-    use super::{core_document_targets, realm_config_has_node_placement};
+    use super::{core_document_targets, realm_config_has_node_placement, unique_user_topic};
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -303,6 +367,35 @@ mod tests {
     use aruna_storage::FjallStorage;
     use byteview::ByteView;
     use tempfile::tempdir;
+
+    #[test]
+    fn user_topics_deduplicate() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let first = DocumentSyncTarget::User {
+            user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
+        };
+        let second = DocumentSyncTarget::User {
+            user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
+        };
+        let first_shard = aruna_core::structs::PlacementRef {
+            strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
+            epoch: 0,
+            shard: 7,
+        };
+        let second_shard = aruna_core::structs::PlacementRef {
+            shard: 8,
+            ..first_shard
+        };
+        let mut synced_topics = std::collections::HashSet::new();
+
+        assert!(unique_user_topic(&mut synced_topics, realm_id, &first_shard, &first).is_some());
+        assert_eq!(
+            unique_user_topic(&mut synced_topics, realm_id, &first_shard, &second),
+            None
+        );
+        assert!(unique_user_topic(&mut synced_topics, realm_id, &second_shard, &second).is_some());
+        assert_eq!(synced_topics.len(), 2);
+    }
 
     fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
         DriverContext {

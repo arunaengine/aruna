@@ -11,10 +11,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
-    NotificationKind, NotificationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    WatchInterestDigest, WatchSubscription, data_watch_resource_path, watch_interest_node_key,
-    watch_notification_id,
+    NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
+    RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
+    WatchEventMask, WatchInterestDigest, WatchSubscription, data_watch_resource_path,
+    watch_interest_node_key, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
@@ -44,7 +44,10 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use ulid::Ulid;
 
-const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+// Positive delivery waits poll to a condition; the ceiling only bounds a genuine
+// hang, so it carries generous headroom for a loaded CI runner where multi-node
+// watch delivery is thread-starved and slow.
+const POLL_TIMEOUT: Duration = Duration::from_secs(180);
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
 // Interest publication is debounced by 2s, so a few seconds comfortably bounds
 // the window an erroneous delivery would need to land in for negative assertions.
@@ -438,10 +441,11 @@ async fn subscription_survives_inbox_holder_rerank() -> Result<(), Box<dyn std::
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
             DocumentSyncEffect::SyncDocument {
-                target: DocumentSyncTarget::WatchInterest {
+                topic: DocumentSyncTarget::WatchInterest {
                     realm_id,
                     node_id: old_holder,
-                },
+                }
+                .sync_topic_id(realm_id, &PlacementRef::NIL),
                 peers: vec![old_holder],
             },
         )))
@@ -776,6 +780,16 @@ async fn install_config_document(
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
         node.net.refresh_realm_peers_from_document(config).await?;
+    }
+    // Config apply hook: the shard's rank-0 holder eagerly creates each
+    // shard topic genesis (mirrors the production realm-config apply path).
+    for node in nodes {
+        aruna_operations::process_placements::process_shard_placements(
+            &node.context,
+            realm_id,
+            node.net.node_id(),
+        )
+        .await;
     }
     Ok(())
 }

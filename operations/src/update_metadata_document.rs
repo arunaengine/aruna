@@ -15,18 +15,19 @@ use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_sync_outbox::schedule_outbox_drain_effect;
+use crate::document_sync_outbox::{outbox_write_entry, schedule_outbox_drain_effect};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_materialization_status,
     schedule_metadata_materialization_drain_effect,
 };
-use crate::metadata::projector::create_event_outbox_record;
+use crate::metadata::projector::{create_event_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, metadata_event_projection_write_entries, parse_registry_read,
     read_registry_effect,
@@ -41,7 +42,7 @@ pub struct UpdateMetadataDocumentConfig {
     pub mutation: UpdateMetadataDocumentMutation,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UpdateMetadataDocumentMutation {
     ReplaceRoCrate { jsonld: String },
     UpsertDataEntity { jsonld: String },
@@ -229,6 +230,16 @@ impl UpdateMetadataDocumentOperation {
         let job = new_materialization_job(event, now);
         let mut writes =
             metadata_event_projection_write_entries(event, &audit, outbox, &status, &job)?;
+        // Refresh the everywhere-bound registry row so non-holders see the new
+        // revision, not just the bucket's holders.
+        if let Some(registry_outbox) =
+            registry_outbox_record(event, self.realm_config.as_ref(), false)
+        {
+            writes.push(
+                outbox_write_entry(&registry_outbox)
+                    .map_err(aruna_core::errors::ConversionError::from)?,
+            );
+        }
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
             event: Box::new(event.clone()),
         };
@@ -509,7 +520,7 @@ mod tests {
         METADATA_MATERIALIZATION_STATUS_KEYSPACE,
     };
     use aruna_core::storage_entries::{document_sync_revision_key, metadata_registry_key};
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::{Actor, PlacementRef, RealmId};
 
     fn actor() -> Actor {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -537,6 +548,7 @@ mod tests {
                 document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![actor.node_id],
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -702,6 +714,40 @@ mod tests {
             }
         );
         event
+    }
+
+    // The bucket is chosen once, by the create-receiving node; re-choosing it on
+    // an update under a changed config would fork the document across topics.
+    #[test]
+    fn update_keeps_placement() {
+        let actor = actor();
+        let mut record = record(&actor);
+        record.placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([5u8; 16]),
+            epoch: 0,
+            shard: 11,
+        };
+        let txn_id = Ulid::r#gen();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Placement Preserved"),
+            },
+        ));
+
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(Event::Metadata(MetadataEvent::ValidationResult {
+            graph_iri: record.graph_iri.clone(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
+            matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
+        });
+        assert_eq!(event.record.placement, record.placement);
     }
 
     #[test]

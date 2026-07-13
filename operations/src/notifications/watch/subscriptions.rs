@@ -463,6 +463,7 @@ fn watch_upsert_replication(
                 .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
             change: revision,
         },
+        PlacementRef::NIL,
         false,
     );
     Ok(WatchReplication { revision, outbox })
@@ -492,6 +493,7 @@ fn watch_delete_replication(
         watch_subscription_target(owner, watch_id),
         Vec::new(),
         DocumentSyncOutboxEvent::Delete { change: revision },
+        PlacementRef::NIL,
         false,
     );
     WatchReplication { revision, outbox }

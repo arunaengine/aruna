@@ -11,10 +11,10 @@ use crate::admin_documents::{
     AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
 use crate::structs::{
-    Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, MetadataRegistryRecord,
-    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, PlacementOverride,
-    PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind, StrategyBinding,
+    Actor, BindingScope, DocumentClass, KIND_LABEL_KEY, MAX_PLACEMENT_SHARD_COUNT,
+    MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+    PlacementOverride, PlacementStrategy, QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig,
+    RealmId, RealmNodeKind, StrategyBinding,
 };
 use crate::types::{RoleId, UserId};
 use crate::user_update_validation::{
@@ -40,6 +40,13 @@ pub enum AdminDocumentReducerError {
     ReservedPlacementLabel,
     #[error("placement strategy replica count must not be zero")]
     ZeroPlacementReplicaCount,
+    #[error(
+        "placement strategy shard count must be a non-zero power of two no greater than {}",
+        MAX_PLACEMENT_SHARD_COUNT
+    )]
+    InvalidPlacementShardCount,
+    #[error("placement strategy shard count cannot be changed")]
+    PlacementShardCountChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +471,19 @@ impl AdminDocumentReducerState {
             ) => {
                 if strategy.replica_count == Some(0) {
                     return Err(AdminDocumentReducerError::ZeroPlacementReplicaCount);
+                }
+                if strategy.shard_count == 0
+                    || !strategy.shard_count.is_power_of_two()
+                    || strategy.shard_count > MAX_PLACEMENT_SHARD_COUNT
+                {
+                    return Err(AdminDocumentReducerError::InvalidPlacementShardCount);
+                }
+                if self
+                    .materialized_realm_config_placement_strategies()
+                    .get(&strategy.strategy_id)
+                    .is_some_and(|current| current.shard_count != strategy.shard_count)
+                {
+                    return Err(AdminDocumentReducerError::PlacementShardCountChanged);
                 }
                 self.apply_realm_config_placement_field(
                     event,
@@ -1661,10 +1681,10 @@ mod tests {
     };
     use crate::structs::{
         Actor, AffinityEffect, AffinityRule, BindingScope, DocumentClass, GroupQuotaOverride,
-        KIND_LABEL_KEY, LabelMatch, MetadataReplicationConfig, NodePlacementEntry,
-        OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy, QuotaConfig,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
-        UserGroupCapOverride,
+        KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT, MetadataReplicationConfig,
+        NodePlacementEntry, OidcProviderConfig, Permission, PlacementOverride, PlacementStrategy,
+        QuotaConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind,
+        StrategyBinding, UserGroupCapOverride,
     };
     use crate::types::{GroupId, RoleId};
     use crate::user_update_validation::UserAttributeValidationError;
@@ -3739,6 +3759,7 @@ mod tests {
                 },
                 effect: AffinityEffect::Filter,
             }],
+            shard_count: 64,
         }
     }
 
@@ -4201,6 +4222,54 @@ mod tests {
     }
 
     #[test]
+    fn strategy_shards_immutable() {
+        let mut state = realm_config_state();
+        let origin = node(1);
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        let initial = placement_strategy(strategy_id, Some(3));
+        let mut renamed = initial.clone();
+        renamed.name = "renamed".to_string();
+
+        assert_eq!(
+            state.apply(&realm_config_event(
+                1,
+                origin,
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: initial },
+            )),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+        assert_eq!(
+            state.apply(&realm_config_event(
+                2,
+                origin,
+                2,
+                AdminDocumentClock::default().with_observed(origin, 1),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: renamed.clone(),
+                },
+            )),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
+        let before = state.clone();
+        let mut changed = renamed;
+        changed.shard_count *= 2;
+        assert_eq!(
+            state.apply(&realm_config_event(
+                3,
+                origin,
+                3,
+                AdminDocumentClock::default().with_observed(origin, 2),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: changed },
+            )),
+            Err(AdminDocumentReducerError::PlacementShardCountChanged)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn realm_config_placement_strategy_rejects_zero_replica_count() {
         let mut state = realm_config_state();
         let before = state.clone();
@@ -4218,6 +4287,75 @@ mod tests {
             Err(AdminDocumentReducerError::ZeroPlacementReplicaCount)
         );
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn realm_config_placement_strategy_accepts_max_shard_count() {
+        let mut state = realm_config_state();
+        let strategy_id = Ulid::from_bytes([4; 16]);
+        let mut strategy = placement_strategy(strategy_id, Some(3));
+        strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT;
+
+        state
+            .apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    strategy: strategy.clone(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.materialized_realm_config_placement_strategies(),
+            BTreeMap::from([(strategy_id, strategy)])
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_config_placement_strategy_rejects_shard_count_above_max() {
+        let mut state = realm_config_state();
+        let before = state.clone();
+        let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
+        strategy.shard_count = MAX_PLACEMENT_SHARD_COUNT * 2;
+
+        assert_eq!(
+            state.apply(&realm_config_event(
+                1,
+                node(1),
+                1,
+                AdminDocumentClock::default(),
+                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+            )),
+            Err(AdminDocumentReducerError::InvalidPlacementShardCount)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn realm_config_placement_strategy_rejects_zero_and_non_power_of_two_shard_count() {
+        let mut state = realm_config_state();
+        let before = state.clone();
+
+        for bad in [0u32, 3, 63] {
+            let mut strategy = placement_strategy(Ulid::from_bytes([4; 16]), Some(3));
+            strategy.shard_count = bad;
+            assert_eq!(
+                state.apply(&realm_config_event(
+                    1,
+                    node(1),
+                    1,
+                    AdminDocumentClock::default(),
+                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
+                )),
+                Err(AdminDocumentReducerError::InvalidPlacementShardCount),
+                "shard_count {bad} must be rejected"
+            );
+            assert_eq!(state, before);
+        }
     }
 
     #[test]

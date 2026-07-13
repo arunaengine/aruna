@@ -452,6 +452,13 @@ async fn next_local_stream_step(
 ) -> StreamStep {
     use tokio::sync::broadcast::error::RecvError;
 
+    // An already-elapsed sleep_until is not guaranteed ready on its first poll, so
+    // a continuously ready wake bus could starve the overdue recheck indefinitely.
+    // Resolve it deterministically before the select.
+    if Instant::now() >= recheck_deadline {
+        return StreamStep::Recheck;
+    }
+
     tokio::select! {
         biased;
         // Once overdue, holder re-resolution must win over a continuously ready

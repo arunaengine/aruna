@@ -372,6 +372,7 @@ mod tests {
                 },
                 effect: AffinityEffect::Multiply { permille: 1500 },
             }],
+            shard_count: 64,
         }
     }
 

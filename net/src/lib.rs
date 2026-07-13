@@ -52,7 +52,7 @@ use tracing::{Instrument, Span, debug, warn};
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
-pub use document_sync::DocumentSyncService;
+pub use document_sync::{DocumentSyncService, ShardGenesisProbe};
 pub use error::{NetError, Result};
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -445,6 +445,7 @@ impl NetHandle {
             Alpn::DocumentSync.as_bytes().to_vec(),
             Alpn::Metadata.as_bytes().to_vec(),
             Alpn::Notification.as_bytes().to_vec(),
+            Alpn::Shard.as_bytes().to_vec(),
         ];
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
@@ -575,6 +576,7 @@ impl NetHandle {
             app_alpns,
             config.document_sync_runtime.unwrap_or_default(),
             config.fjall_persist_policy,
+            config.realm_id,
         )?);
 
         let streams = Arc::new(StreamsService::new(
@@ -840,22 +842,69 @@ impl NetHandle {
 
     pub fn allow_document_sync_peers(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .allow_document_sync_peers(targets, peers)
+            .allow_document_sync_peers(topics, peers)
+    }
+
+    /// Reconciles shard-only topics to their exact current holder membership and
+    /// publisher policy. Shared topic membership and default peers are unchanged.
+    pub async fn reconcile_shard_membership(
+        &self,
+        topics: &[::irokle::TopicId],
+        holders: Vec<NodeId>,
+        verified_topics: &std::collections::BTreeSet<::irokle::TopicId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .reconcile_shard_membership(topics, holders, verified_topics)
+            .await
     }
 
     pub fn ensure_document_sync_topics(
         &self,
-        targets: &[DocumentSyncTarget],
+        topics: &[::irokle::TopicId],
         peers: Vec<NodeId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .ensure_document_sync_topics(targets, peers)
+            .ensure_document_sync_topics(topics, peers)
+    }
+
+    /// Whether a document sync topic's genesis is known locally.
+    pub fn document_sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.topic_exists(topic)
+    }
+
+    /// Probes a shard's co-holders for an existing genesis of `topics` (see
+    /// [`ShardGenesisProbe`]). A rank-0 holder uses the result to create a fresh
+    /// genesis only when every co-holder was reached and none had the topic.
+    pub async fn probe_shard_topic_geneses(
+        &self,
+        topics: Vec<::irokle::TopicId>,
+        co_holders: Vec<NodeId>,
+    ) -> ShardGenesisProbe {
+        self.inner
+            .document_sync
+            .probe_shard_topic_geneses(topics, co_holders)
+            .await
+    }
+
+    /// Shard-topic anti-entropy for the startup restore and placement
+    /// reconciler: ensures the topics locally, syncs them with `peers`, and
+    /// reconciles the applied events.
+    pub async fn sync_document_topics(
+        &self,
+        topics: Vec<::irokle::TopicId>,
+        peers: Vec<NodeId>,
+    ) -> aruna_core::document::DocumentSyncNetEvent {
+        self.inner
+            .document_sync
+            .sync_documents_event(topics, peers)
+            .await
     }
 
     pub async fn handle_document_sync_stream(
@@ -2306,6 +2355,7 @@ mod tests {
                 realm_id: RealmId::from_bytes([seed; 32]),
             },
             event: aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+            placement: aruna_core::structs::PlacementRef::NIL,
             allow_genesis: false,
         }
     }

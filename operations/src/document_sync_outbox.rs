@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+use aruna_core::structs::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId};
 use aruna_core::util::unix_timestamp_secs;
@@ -39,6 +40,12 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
+    // One event can enqueue several publishes under its own id — a metadata
+    // create emits both the document's lifecycle event and its registry row, each
+    // onto a different topic. Without the target in the key the second would
+    // silently overwrite the first and that publish would simply never happen.
+    // Ordering is untouched: the id still compares first, so this only breaks ties.
+    bytes.extend_from_slice(record.target.storage_key().as_ref());
     ByteView::from(bytes)
 }
 
@@ -47,26 +54,45 @@ pub fn new_outbox_record(
     target: DocumentSyncTarget,
     peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
-    new_outbox_record_with_id(Ulid::r#gen(), node_id, target, peers, event, allow_genesis)
+    new_outbox_record_with_id(
+        Ulid::r#gen(),
+        node_id,
+        target,
+        peers,
+        event,
+        admin_placement,
+        allow_genesis,
+    )
 }
 
+/// `admin_placement` is only consulted for `AdminOperation` records (which carry
+/// no envelope change); `Upsert`/`Delete` always take their ref from the event's
+/// change so the record and its envelope can never diverge.
 pub fn new_outbox_record_with_id(
     outbox_id: Ulid,
     node_id: NodeId,
     target: DocumentSyncTarget,
     mut peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
+    admin_placement: PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncOutboxRecord {
     crate::sync_placement::sort_node_ids(&mut peers);
+    let placement = match &event {
+        DocumentSyncOutboxEvent::Upsert { change, .. }
+        | DocumentSyncOutboxEvent::Delete { change } => change.placement,
+        DocumentSyncOutboxEvent::AdminOperation { .. } => admin_placement,
+    };
     DocumentSyncOutboxRecord {
         outbox_id,
         node_id,
         target,
         peers,
         event,
+        placement,
         updated_at: unix_timestamp_secs(),
         allow_genesis,
     }
@@ -74,14 +100,6 @@ pub fn new_outbox_record_with_id(
 
 pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, postcard::Error> {
     write_outbox_effect_with_txn(record, None)
-}
-
-pub fn delete_outbox_effect(record: &DocumentSyncOutboxRecord) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-        key: outbox_key(record),
-        txn_id: None,
-    })
 }
 
 pub fn outbox_write_entry(
@@ -107,42 +125,6 @@ pub fn write_outbox_effect_with_txn(
     }))
 }
 
-fn decode_outbox_record(bytes: &[u8]) -> Result<DocumentSyncOutboxRecord, postcard::Error> {
-    match postcard::from_bytes::<DocumentSyncOutboxRecord>(bytes) {
-        Ok(record) => Ok(record),
-        Err(_) => postcard::from_bytes::<LegacyDocumentSyncOutboxRecord>(bytes).map(Into::into),
-    }
-}
-
-/// Pre-`allow_genesis` mirror of [`DocumentSyncOutboxRecord`], used only to
-/// decode outbox rows persisted before that field existed. Keep field order
-/// identical to the historical layout.
-#[derive(serde::Deserialize)]
-struct LegacyDocumentSyncOutboxRecord {
-    outbox_id: Ulid,
-    node_id: NodeId,
-    target: DocumentSyncTarget,
-    peers: Vec<NodeId>,
-    event: DocumentSyncOutboxEvent,
-    updated_at: u64,
-}
-
-impl From<LegacyDocumentSyncOutboxRecord> for DocumentSyncOutboxRecord {
-    fn from(legacy: LegacyDocumentSyncOutboxRecord) -> Self {
-        Self {
-            outbox_id: legacy.outbox_id,
-            node_id: legacy.node_id,
-            target: legacy.target,
-            peers: legacy.peers,
-            event: legacy.event,
-            updated_at: legacy.updated_at,
-            // Before `allow_genesis` existed, outbox publishes could mint missing
-            // sync topic genesis. Preserve that behavior for already-queued work.
-            allow_genesis: true,
-        }
-    }
-}
-
 pub fn schedule_outbox_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainDocumentSyncOutbox,
@@ -163,7 +145,10 @@ pub async fn read_outbox_record(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| decode_outbox_record(&bytes).map_err(|error| error.to_string()))
+            .map(|bytes| {
+                postcard::from_bytes::<DocumentSyncOutboxRecord>(&bytes)
+                    .map_err(|error| error.to_string())
+            })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
@@ -178,6 +163,7 @@ pub struct OutboxReadBatch {
 pub async fn read_outbox_records(
     storage: &StorageHandle,
     prefix: &[u8],
+    start_after: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<OutboxReadBatch, String> {
     let read_limit = limit.saturating_add(1);
@@ -185,7 +171,7 @@ pub async fn read_outbox_records(
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(prefix.to_vec())),
-            start: None,
+            start: start_after.map(|key| IterStart::After(ByteView::from(key))),
             limit: read_limit,
             txn_id: None,
         })
@@ -195,7 +181,7 @@ pub async fn read_outbox_records(
             let has_more = values.len() > limit;
             let mut records = Vec::with_capacity(values.len().min(limit));
             for (key, value) in values.into_iter().take(limit) {
-                match decode_outbox_record(&value) {
+                match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();
@@ -321,6 +307,14 @@ mod tests {
         }
     }
 
+    fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
+        aruna_core::structs::PlacementRef {
+            strategy_id: Ulid::from_parts(42, 1),
+            epoch: 0,
+            shard,
+        }
+    }
+
     fn change() -> DocumentSyncChange {
         DocumentSyncChange {
             base: None,
@@ -331,7 +325,7 @@ mod tests {
                 updated_at_ms: 9,
             },
             kind: DocumentSyncChangeKind::Upsert,
-            placement: aruna_core::structs::PlacementRef::NIL,
+            placement: placement(5),
         }
     }
 
@@ -357,69 +351,6 @@ mod tests {
         }
     }
 
-    fn legacy_pre_allow_genesis_bytes(record: &DocumentSyncOutboxRecord) -> Vec<u8> {
-        #[derive(serde::Serialize)]
-        struct LegacyRecord {
-            outbox_id: Ulid,
-            node_id: NodeId,
-            target: DocumentSyncTarget,
-            peers: Vec<NodeId>,
-            event: DocumentSyncOutboxEvent,
-            updated_at: u64,
-        }
-
-        postcard::to_allocvec(&LegacyRecord {
-            outbox_id: record.outbox_id,
-            node_id: record.node_id,
-            target: record.target.clone(),
-            peers: record.peers.clone(),
-            event: record.event.clone(),
-            updated_at: record.updated_at,
-        })
-        .expect("legacy record serializes")
-    }
-
-    #[tokio::test]
-    async fn legacy_pre_allow_genesis_outbox_record_is_preserved() {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let mut legacy = new_outbox_record(
-            node(1),
-            target(),
-            vec![node(2)],
-            DocumentSyncOutboxEvent::Upsert {
-                bytes: vec![4, 5],
-                change: change(),
-            },
-            false,
-        );
-        legacy.outbox_id = Ulid::from_parts(3, 4);
-        legacy.updated_at = 42;
-        let key = outbox_key(&legacy).to_vec();
-        write_raw_outbox_record(
-            &storage,
-            key.clone(),
-            legacy_pre_allow_genesis_bytes(&legacy),
-        )
-        .await;
-
-        let mut expected = legacy;
-        expected.allow_genesis = true;
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
-            .await
-            .expect("outbox read succeeds");
-
-        assert_eq!(batch.records, vec![(key.clone(), expected.clone())]);
-        assert!(!batch.has_more);
-        assert_eq!(
-            read_outbox_record(&storage, &key)
-                .await
-                .expect("legacy record was preserved"),
-            Some(expected)
-        );
-    }
-
     #[tokio::test]
     async fn malformed_outbox_record_is_deleted() {
         let dir = tempdir().expect("temp dir");
@@ -428,7 +359,7 @@ mod tests {
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
             .expect("outbox read succeeds");
 
@@ -456,6 +387,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_raw_outbox_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
@@ -467,7 +399,7 @@ mod tests {
             other => panic!("unexpected valid outbox write event: {other:?}"),
         }
 
-        let batch = read_outbox_records(&storage, &[], OUTBOX_DRAIN_BATCH_SIZE)
+        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE)
             .await
             .expect("outbox read succeeds");
 
@@ -505,6 +437,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -525,6 +458,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -533,6 +467,9 @@ mod tests {
 
         assert_eq!(decoded, record);
         assert!(decoded.allow_genesis);
+        // Upsert mirrors the envelope change's ref, never the admin fallback.
+        assert_eq!(decoded.placement, change().placement);
+        assert_ne!(decoded.placement, aruna_core::structs::PlacementRef::NIL);
     }
 
     #[test]
@@ -544,6 +481,7 @@ mod tests {
             DocumentSyncOutboxEvent::Delete {
                 change: delete_change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -551,6 +489,7 @@ mod tests {
             postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
+        assert_eq!(decoded.placement, delete_change().placement);
     }
 
     #[test]
@@ -559,8 +498,22 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
-        let right = new_outbox_record(node(1), target(), vec![node(2)], event, false);
+        let left = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let right = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event,
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
         let prefix = outbox_prefix(&left.event);
 
         assert_ne!(outbox_key(&left), outbox_key(&right));
@@ -574,7 +527,14 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone(), false);
+        let mut older = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(
             node(1),
@@ -583,6 +543,7 @@ mod tests {
             },
             vec![node(2)],
             event,
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         newer.outbox_id = Ulid::from_parts(2, 0);
@@ -599,6 +560,7 @@ mod tests {
             target.clone(),
             Vec::new(),
             user_admin_event(user_id, 1),
+            placement(9),
             false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
@@ -607,10 +569,42 @@ mod tests {
             target,
             Vec::new(),
             user_admin_event(user_id, 2),
+            placement(9),
             false,
         );
         later.outbox_id = Ulid::from_parts(1, 1);
 
         assert!(outbox_key(&earlier) < outbox_key(&later));
+        // AdminOperation records take the supplied ref (no envelope change).
+        assert_eq!(earlier.placement, placement(9));
+    }
+
+    #[test]
+    fn outbox_key_is_byte_identical_regardless_of_placement() {
+        let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
+        let event = user_admin_event(user_id, 1);
+        let outbox_id = Ulid::from_parts(5, 5);
+        let target = DocumentSyncTarget::User { user_id };
+        let nil = new_outbox_record_with_id(
+            outbox_id,
+            node(1),
+            target.clone(),
+            Vec::new(),
+            event.clone(),
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        );
+        let sharded = new_outbox_record_with_id(
+            outbox_id,
+            node(1),
+            target,
+            Vec::new(),
+            event,
+            placement(17),
+            false,
+        );
+        // The FIFO key layout must not depend on the placement field.
+        assert_ne!(nil.placement, sharded.placement);
+        assert_eq!(outbox_key(&nil), outbox_key(&sharded));
     }
 }

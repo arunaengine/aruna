@@ -2,128 +2,90 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingDocumentPlacement};
+use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::storage_entries::{
-    document_placement_delete_entry, document_placement_key, document_placement_write_entry,
-};
+use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{GroupId, Key, TxnId};
+use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
 
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// Retry interval for outbox records deferred on a missing shard-topic
+/// genesis. Short: the genesis is usually one gossip push away (the rank-0
+/// holder creates it eagerly on config apply).
+pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// Retry interval for a held shard topic the local node could not pull yet
+/// (its rank-0 holder has not created the genesis, or no co-holder served it).
+/// The first retry is short, for the same reason as
+/// [`DOCUMENT_SYNC_DEFER_RETRY_AFTER`]: the pull is join-only and cannot fork,
+/// and a holder should not initially wait a whole
+/// [`SYNC_PLACEMENT_RETRY_AFTER`] to be pushed to. Consecutive failed pulls are
+/// backed off by the task handler because each attempt scans every shard.
+pub const SHARD_TOPIC_PULL_RETRY_AFTER: Duration = Duration::from_secs(1);
+
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())
 }
 
-pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
-    document_placement_key(realm_id, target)
+/// Shard-scoped record key: `realm(32) ‖ strategy(16) ‖ epoch(8, le) ‖
+/// shard(4, be)`. One record per shard the local node authoritatively holds.
+pub fn placement_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
+    let mut bytes = realm_id.as_bytes().to_vec();
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
+    ByteView::from(bytes)
 }
 
 pub fn new_placement(
     realm_id: RealmId,
-    target: DocumentSyncTarget,
-    origin_node_id: NodeId,
-    desired_holder_count: usize,
-    selected_holders: Vec<NodeId>,
     placement: PlacementRef,
-) -> PendingDocumentPlacement {
-    new_placement_with_context(
+    authoritative_node_id: NodeId,
+    mut selected_peers: Vec<NodeId>,
+) -> PendingShardPlacement {
+    selected_peers.retain(|node_id| *node_id != authoritative_node_id);
+    sort_node_ids(&mut selected_peers);
+    PendingShardPlacement {
         realm_id,
-        target,
-        origin_node_id,
-        None,
-        None,
-        desired_holder_count,
-        selected_holders,
         placement,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn new_placement_with_context(
-    realm_id: RealmId,
-    target: DocumentSyncTarget,
-    origin_node_id: NodeId,
-    group_id: Option<GroupId>,
-    metadata_path: Option<String>,
-    desired_holder_count: usize,
-    mut selected_holders: Vec<NodeId>,
-    placement: PlacementRef,
-) -> PendingDocumentPlacement {
-    sort_node_ids(&mut selected_holders);
-    PendingDocumentPlacement {
-        realm_id,
-        target,
-        group_id,
-        metadata_path,
-        desired_holder_count,
-        selected_holders,
+        selected_peers,
         updated_at: unix_timestamp_secs(),
-        origin_node_id,
-        placement,
+        authoritative_node_id,
     }
 }
 
-pub fn missing_holder_count(record: &PendingDocumentPlacement) -> usize {
-    let mut selected_holders = record.selected_holders.clone();
-    sort_node_ids(&mut selected_holders);
-    record
-        .desired_holder_count
-        .saturating_sub(selected_holders.len())
+/// Co-holders still to add to a shard to reach `desired_peer_count` total
+/// holders (the authoritative node counts as one).
+pub fn missing_peer_count(record: &PendingShardPlacement, desired_peer_count: usize) -> usize {
+    let mut selected_peers = record.selected_peers.clone();
+    selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
+    sort_node_ids(&mut selected_peers);
+    desired_peer_count.saturating_sub(selected_peers.len().saturating_add(1))
 }
 
-pub fn placement_satisfied(selected_holder_count: usize, desired_holder_count: usize) -> bool {
-    selected_holder_count >= desired_holder_count
+pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize) -> bool {
+    selected_peer_count.saturating_add(1) >= desired_peer_count
 }
 
-pub fn schedule_document_sync_effect(
-    node_id: NodeId,
-    target: DocumentSyncTarget,
-    mut peers: Vec<NodeId>,
-) -> Effect {
-    sort_node_ids(&mut peers);
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::SyncDocument {
-            node_id,
-            target,
-            peers,
-        },
-        after: Duration::ZERO,
-    })
-}
-
-pub fn write_placement_effect(
-    record: &PendingDocumentPlacement,
-) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = document_placement_write_entry(record)?;
+pub fn write_placement_effect(record: &PendingShardPlacement) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
+        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
+        key: placement_key(record.realm_id, &record.placement),
+        value: ByteView::from(postcard::to_allocvec(record)?),
         txn_id: None,
     }))
 }
 
-pub fn delete_placement_effect(realm_id: RealmId, target: &DocumentSyncTarget) -> Effect {
-    delete_placement_effect_with_txn(realm_id, target, None)
-}
-
-pub fn delete_placement_effect_with_txn(
-    realm_id: RealmId,
-    target: &DocumentSyncTarget,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    let (key_space, key) = document_placement_delete_entry(realm_id, target);
+pub fn delete_placement_effect(realm_id: RealmId, placement: &PlacementRef) -> Effect {
     Effect::Storage(StorageEffect::Delete {
-        key_space,
-        key,
-        txn_id,
+        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
+        key: placement_key(realm_id, placement),
+        txn_id: None,
     })
 }
 
@@ -149,7 +111,7 @@ pub fn schedule_placement_retry_after(
     })
 }
 
-pub fn decode_placement(value: &[u8]) -> Result<PendingDocumentPlacement, postcard::Error> {
+pub fn decode_placement(value: &[u8]) -> Result<PendingShardPlacement, postcard::Error> {
     postcard::from_bytes(value)
 }
 
@@ -166,6 +128,7 @@ fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
 mod tests {
     use super::*;
     use aruna_core::structs::RealmId;
+    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -173,23 +136,28 @@ mod tests {
         iroh::SecretKey::from_bytes(&bytes).public()
     }
 
-    fn target() -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
-            realm_id: RealmId::from_bytes([7u8; 32]),
+    fn placement(shard: u32) -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([9u8; 16]),
+            epoch: 0,
+            shard,
         }
     }
 
     #[test]
-    fn placement_key_is_realm_scoped() {
-        let target = target();
+    fn placement_key_is_realm_and_shard_scoped() {
         let first_realm = RealmId::from_bytes([1u8; 32]);
         let second_realm = RealmId::from_bytes([2u8; 32]);
 
-        let first_key = placement_key(first_realm, &target);
-        let second_key = placement_key(second_realm, &target);
+        let first_key = placement_key(first_realm, &placement(3));
+        let second_key = placement_key(second_realm, &placement(3));
+        let other_shard = placement_key(first_realm, &placement(4));
 
         assert_ne!(first_key, second_key);
+        assert_ne!(first_key, other_shard);
         assert!(first_key.as_ref().starts_with(first_realm.as_bytes()));
+        // Layout: realm(32) ‖ strategy(16) ‖ epoch(8) ‖ shard(4) = 60 bytes.
+        assert_eq!(first_key.as_ref().len(), 60);
         assert_eq!(
             placement_prefix(first_realm).as_ref(),
             first_realm.as_bytes()
@@ -197,108 +165,50 @@ mod tests {
     }
 
     #[test]
-    fn placement_deduplicates_holders_and_computes_missing_count() {
+    fn placement_deduplicates_peers_and_computes_missing_count() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
-        let origin = node(1);
-        let holder = node(5);
-        let placement = new_placement(
-            realm_id,
-            target(),
-            origin,
-            3,
-            vec![holder, holder],
-            PlacementRef::NIL,
-        );
+        let authoritative = node(1);
+        let peer = node(5);
+        let record = new_placement(realm_id, placement(2), authoritative, vec![peer, peer]);
 
-        assert_eq!(placement.realm_id, realm_id);
-        assert_eq!(placement.origin_node_id, origin);
-        assert_eq!(placement.selected_holders, vec![holder]);
-        assert_eq!(missing_holder_count(&placement), 2);
+        assert_eq!(record.realm_id, realm_id);
+        assert_eq!(record.authoritative_node_id, authoritative);
+        assert_eq!(record.selected_peers, vec![peer]);
+        assert_eq!(missing_peer_count(&record, 3), 1);
     }
 
     #[test]
-    fn placement_does_not_count_origin_implicitly() {
+    fn placement_counts_authoritative_node_toward_desired_peer_count() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let placement = new_placement(
-            realm_id,
-            target(),
-            node(1),
-            3,
-            vec![node(5), node(6)],
-            PlacementRef::NIL,
-        );
+        let record = new_placement(realm_id, placement(2), node(1), vec![node(5), node(6)]);
 
-        assert_eq!(missing_holder_count(&placement), 1);
-        assert!(!placement_satisfied(
-            placement.selected_holders.len(),
-            placement.desired_holder_count
-        ));
+        assert_eq!(missing_peer_count(&record, 3), 0);
+        assert!(placement_satisfied(record.selected_peers.len(), 3));
     }
 
     #[test]
-    fn placement_records_origin_separately() {
+    fn placement_records_authoritative_holder_explicitly() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
-        let origin = node(7);
+        let authoritative = node(7);
 
-        let placement = new_placement(
-            realm_id,
-            target(),
-            origin,
-            3,
-            vec![node(8)],
-            PlacementRef::NIL,
-        );
+        let record = new_placement(realm_id, placement(2), authoritative, vec![node(8)]);
 
-        assert_eq!(placement.origin_node_id, origin);
-        assert!(!placement.selected_holders.contains(&origin));
+        assert_eq!(record.authoritative_node_id, authoritative);
     }
 
     #[test]
-    fn placement_counts_origin_only_when_selected_as_holder() {
+    fn placement_deduplicates_selected_peers_and_excludes_authoritative() {
         let realm_id = RealmId::from_bytes([6u8; 32]);
-        let origin = node(7);
+        let authoritative = node(7);
 
-        let placement = new_placement(
+        let record = new_placement(
             realm_id,
-            target(),
-            origin,
-            3,
-            vec![node(8), origin, node(8), node(9)],
-            PlacementRef::NIL,
+            placement(2),
+            authoritative,
+            vec![node(8), authoritative, node(8), node(9)],
         );
 
-        assert_eq!(placement.selected_holders, vec![origin, node(9), node(8)]);
-        assert_eq!(missing_holder_count(&placement), 0);
-        assert!(placement_satisfied(
-            placement.selected_holders.len(),
-            placement.desired_holder_count
-        ));
-    }
-
-    #[test]
-    fn metadata_resolution_context_survives_placement_roundtrip() {
-        let group_id = GroupId::from_bytes([8; 16]);
-        let placement = new_placement_with_context(
-            RealmId::from_bytes([7; 32]),
-            DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: GroupId::from_bytes([9; 16]),
-            },
-            node(1),
-            Some(group_id),
-            Some("datasets/context/object".to_string()),
-            2,
-            vec![node(1), node(2)],
-            PlacementRef::NIL,
-        );
-
-        let bytes = postcard::to_allocvec(&placement).expect("placement serializes");
-        let decoded = decode_placement(&bytes).expect("placement decodes");
-
-        assert_eq!(decoded.group_id, Some(group_id));
-        assert_eq!(
-            decoded.metadata_path.as_deref(),
-            Some("datasets/context/object")
-        );
-        assert_eq!(decoded, placement);
+        assert_eq!(record.selected_peers, vec![node(9), node(8)]);
+        assert_eq!(missing_peer_count(&record, 3), 0);
     }
 }

@@ -1,6 +1,8 @@
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{PlacementStrategy, RealmConfigDocument, WatchSubscription};
+use aruna_core::structs::{
+    DEFAULT_SHARD_COUNT, PlacementStrategy, RealmConfigDocument, WatchSubscription,
+};
 use aruna_core::types::UserId;
 use ulid::Ulid;
 
@@ -24,6 +26,7 @@ fn inbox_strategy() -> PlacementStrategy {
         replica_count: Some(1),
         distinct_locations: false,
         affinity: Vec::new(),
+        shard_count: DEFAULT_SHARD_COUNT,
     }
 }
 
@@ -33,7 +36,7 @@ pub fn resolve_inbox_holder(
 ) -> Result<Option<NodeId>, ConversionError> {
     let view = build_view(realm_config);
     let subject = inbox_topic_id(user_id);
-    Ok(resolve_holders(&view, &inbox_strategy(), &subject, 0, None)
+    Ok(resolve_holders(&view, &inbox_strategy(), &subject, None)
         .into_iter()
         .next())
 }

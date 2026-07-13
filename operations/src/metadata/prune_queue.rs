@@ -832,6 +832,7 @@ mod tests {
         metadata_graph_lifecycle_write_entry, metadata_registry_write_entries,
     };
     use aruna_core::structs::MetadataRegistryRecord;
+    use aruna_core::structs::PlacementRef;
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -865,6 +866,7 @@ mod tests {
                 path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,

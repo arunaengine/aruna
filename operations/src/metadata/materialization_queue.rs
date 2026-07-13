@@ -2000,7 +2000,7 @@ mod tests {
     use super::*;
     use aruna_core::NodeId;
     use aruna_core::storage_entries::metadata_create_event_write_entry;
-    use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::collections::BTreeSet;
     use std::thread;
@@ -2027,6 +2027,7 @@ mod tests {
                 &document_path,
                 document_id,
             ),
+            placement: PlacementRef::NIL,
             holder_node_ids: vec![node(1)],
             created_at_ms: 1,
             updated_at_ms: 1,

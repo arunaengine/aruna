@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncPublish, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -15,7 +17,7 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
@@ -57,7 +59,7 @@ use crate::notifications::watch::interest::{
     WATCH_INTEREST_PUBLISH_DEBOUNCE, rebuild_watch_interest_table,
     refresh_watch_interest_for_targets, restore_watch_interest_publish_timer,
 };
-use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
+use crate::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::queue_backoff::timer_retry_after_secs;
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_replication_batch, restore_blob_replication_timer,
@@ -66,7 +68,9 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::DOCUMENT_SYNC_RETRY_AFTER;
+use crate::sync_placement::{
+    DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER,
+};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -76,6 +80,16 @@ use crate::usage_stats::{
 
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+/// How long a record may wait for its shard topic's genesis before the drain
+/// stops treating the wait as normal and says so at error level.
+const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
+
+/// One drained outbox record with its resolved publish topic.
+type DrainRecord = (
+    Vec<u8>,
+    aruna_core::document::DocumentSyncOutboxRecord,
+    irokle::TopicId,
+);
 
 #[derive(Debug)]
 struct OperationsTaskHandler {
@@ -88,21 +102,25 @@ struct OperationsTaskHandler {
 struct DrainSubBatch {
     peers: Vec<aruna_core::NodeId>,
     documents: Vec<DocumentSyncPublish>,
+    topics: Vec<irokle::TopicId>,
     targets: Vec<DocumentSyncTarget>,
     record_keys: Vec<Vec<u8>>,
 }
 
 impl DrainSubBatch {
     fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
+        let mut topics = Vec::with_capacity(indices.len());
         let mut targets = Vec::with_capacity(indices.len());
         let mut record_keys = Vec::with_capacity(indices.len());
         for &index in indices {
+            topics.push(*self.topics.get(index)?);
             targets.push(self.targets.get(index)?.clone());
             record_keys.push(self.record_keys.get(index)?.clone());
         }
         Some(Self {
             peers: self.peers.clone(),
             documents: Vec::new(),
+            topics,
             targets,
             record_keys,
         })
@@ -117,27 +135,72 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
-pub(crate) fn document_publish_from_outbox(
-    record: &aruna_core::document::DocumentSyncOutboxRecord,
+/// Resolves the shard placement a drained record publishes under. A record
+/// that already carries a real ref keeps it; a NIL ref (admin-operation
+/// emitters leave one) is resolved from the realm config for the target. Shared
+/// realm targets ignore the placement, so resolving them is harmless.
+fn resolve_publish_placement(
+    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    target: &DocumentSyncTarget,
+    current: aruna_core::structs::PlacementRef,
+) -> aruna_core::structs::PlacementRef {
+    if current != aruna_core::structs::PlacementRef::NIL {
+        return current;
+    }
+    match config {
+        Some(config) => {
+            crate::placement::placement_ref_for_target(config, target, Default::default())
+        }
+        None => aruna_core::structs::PlacementRef::NIL,
+    }
+}
+
+async fn load_realm_config_for_drain(
+    context: &Arc<DriverContext>,
+    realm_id: aruna_core::structs::RealmId,
+) -> Option<aruna_core::structs::RealmConfigDocument> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match context
+        .storage_handle
+        .send_storage_effect(aruna_core::effects::StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+        _ => None,
+    }
+}
+
+fn document_publish_from_outbox(
+    event_id: ulid::Ulid,
+    target: DocumentSyncTarget,
+    event: DocumentSyncOutboxEvent,
+    placement: aruna_core::structs::PlacementRef,
+    allow_genesis: bool,
 ) -> DocumentSyncPublish {
-    match &record.event {
+    match event {
         DocumentSyncOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
-            event_id: record.outbox_id,
-            target: record.target.clone(),
-            bytes: bytes.clone(),
-            change: *change,
-            allow_genesis: record.allow_genesis,
+            event_id,
+            target,
+            bytes,
+            change,
+            allow_genesis,
         },
         DocumentSyncOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
-            event_id: record.outbox_id,
-            target: record.target.clone(),
-            change: *change,
-            allow_genesis: record.allow_genesis,
+            event_id,
+            target,
+            change,
+            allow_genesis,
         },
         DocumentSyncOutboxEvent::AdminOperation { event } => DocumentSyncPublish::AdminOperation {
-            target: record.target.clone(),
-            event: event.clone(),
-            allow_genesis: record.allow_genesis,
+            target,
+            event,
+            placement,
+            allow_genesis,
         },
     }
 }
@@ -151,11 +214,147 @@ impl DrainSyncOutcome {
     }
 }
 
+/// Per-run defer state, carried across the drain's pages so a topic deferred on
+/// one page keeps deferring on later pages (preserving FIFO within a topic) and
+/// each topic's holdership and genesis presence are decided at most once per run.
+#[derive(Default)]
+struct DrainDeferState {
+    topic_exists: HashMap<irokle::TopicId, bool>,
+    topic_held: HashMap<irokle::TopicId, bool>,
+    deferred_topics: HashSet<irokle::TopicId>,
+    undeliverable_topics: HashSet<irokle::TopicId>,
+}
+
+/// Whether a shard-classed record can ever publish from this node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferOutcome {
+    /// The local node holds the bucket, so it may publish onto the bucket's topic
+    /// once the genesis is there (rank-0 creates it, every other holder pulls it).
+    Retry,
+    /// The local node holds none of the record's bucket. Topic membership is the
+    /// holder set, so it may neither mint the genesis nor join the topic: this
+    /// record can never publish from here, however long it waits.
+    Undeliverable,
+}
+
+/// Splits FIFO-ordered drain records into those to publish now, those deferred
+/// because their shard topic has no local genesis yet, and those that can never
+/// publish from this node at all.
+///
+/// Holdership is checked *before* topic availability, and it is the only thing
+/// that decides publishability. Joining a shard topic is not holder-gated — a
+/// non-holder can adopt a co-holder's genesis, and the drain's own bootstrap pass
+/// will happily pull one — but its publishes onto that topic are not accepted. So
+/// "the topic exists locally" is not evidence this node may publish onto it, and
+/// classifying on that first would route a non-holder's records into a publish
+/// that silently goes nowhere instead of into the forwarding path.
+///
+/// Each topic's holdership and genesis presence are decided once per run (state
+/// persists in `defer`); once a topic defers, every later record of that topic
+/// defers too. Splitting FIFO-adjacent records of one topic across a
+/// defer/publish boundary would let the newer op publish first, invert its origin
+/// sequence on receivers, and drop the older op forever as StaleOriginSequence —
+/// so a topic never straddles that boundary within a run, across pages included.
+fn partition_drain_records(
+    records: Vec<DrainRecord>,
+    defer: &mut DrainDeferState,
+    mut topic_available: impl FnMut(irokle::TopicId) -> bool,
+    mut classify_defer: impl FnMut(&DocumentSyncOutboxRecord) -> DeferOutcome,
+) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
+    let mut to_publish = Vec::with_capacity(records.len());
+    let mut deferred = Vec::new();
+    let mut undeliverable = Vec::new();
+    for (record_key, record, topic) in records {
+        if !record.target.uses_shard_topic() {
+            to_publish.push((record_key, record, topic));
+            continue;
+        }
+        if defer.undeliverable_topics.contains(&topic) {
+            undeliverable.push((record_key, record, topic));
+            continue;
+        }
+        let held = *defer
+            .topic_held
+            .entry(topic)
+            .or_insert_with(|| classify_defer(&record) == DeferOutcome::Retry);
+        if !held {
+            defer.undeliverable_topics.insert(topic);
+            undeliverable.push((record_key, record, topic));
+            continue;
+        }
+        let already_deferred = defer.deferred_topics.contains(&topic);
+        let available = !already_deferred
+            && *defer
+                .topic_exists
+                .entry(topic)
+                .or_insert_with(|| topic_available(topic));
+        if available {
+            to_publish.push((record_key, record, topic));
+            continue;
+        }
+        defer.deferred_topics.insert(topic);
+        debug!(
+            event = "pipeline.drain.deferred",
+            target = ?record.target,
+            %topic,
+            "Deferring outbox record: shard topic genesis not yet known"
+        );
+        deferred.push((record_key, record, topic));
+    }
+    (to_publish, deferred, undeliverable)
+}
+
+/// Whether a record whose shard topic is missing locally can ever publish from
+/// here. Holdership is read from the live realm config, never from the presence
+/// of a local copy: a rebalance leaves a stale copy on a node that has lost the
+/// bucket. Without a readable config nothing is decided and the record retries.
+fn classify_deferred_record(
+    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    net_handle: &aruna_net::NetHandle,
+    record: &DocumentSyncOutboxRecord,
+) -> DeferOutcome {
+    let Some(config) = config else {
+        return DeferOutcome::Retry;
+    };
+    if crate::placement::holds_placement(config, &record.placement, net_handle.node_id()) {
+        DeferOutcome::Retry
+    } else {
+        DeferOutcome::Undeliverable
+    }
+}
+
 impl OperationsTaskHandler {
     fn new(context: Arc<DriverContext>) -> Self {
         Self {
             context,
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Surfaces records this node can never publish, loudly, and leaves them in
+    /// the outbox.
+    ///
+    /// This node holds none of the record's bucket, so it may neither mint that
+    /// bucket's topic genesis nor join the topic: it can never publish the record
+    /// from here. The record is never relayed to a holder — a peer-relayed
+    /// upsert/delete would publish under the holder's signature with no proof it
+    /// was permission-checked — and never deleted, since the caller already holds
+    /// a 200 and there is no replay source. It stays in the outbox, error-logged
+    /// on every drain, until a config change makes this node a holder or an
+    /// operator intervenes. In practice the only record that lands here is the
+    /// rare rebalance race: a node that held the bucket when it accepted the
+    /// write and lost holdership before draining.
+    fn report_undeliverable_records(&self, undeliverable: &[DrainRecord]) {
+        for (_, record, topic) in undeliverable {
+            error!(
+                event = "pipeline.drain.undeliverable",
+                target = ?record.target,
+                %topic,
+                strategy = %record.placement.strategy_id,
+                shard = record.placement.shard,
+                age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
+                "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
+            );
         }
     }
 
@@ -186,6 +385,26 @@ impl OperationsTaskHandler {
             .lock()
             .expect("retry backoff mutex poisoned")
             .remove(key);
+    }
+
+    /// Keeps the first missing-topic pull retry prompt, then backs off each
+    /// subsequent full placement scan using the existing per-key retry state.
+    fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
+        let mut backoff = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned");
+        match backoff.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(0);
+                SHARD_TOPIC_PULL_RETRY_AFTER
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let attempts = *entry.get();
+                entry.insert(attempts.saturating_add(1));
+                Duration::from_secs(timer_retry_after_secs(attempts))
+            }
+        }
     }
 
     /// Re-arms `key` at its current backoff interval and records the attempt.
@@ -221,35 +440,26 @@ impl OperationsTaskHandler {
         }
     }
 
+    // Kicks the placement reconciler immediately (not persisted; it is re-derived
+    // from the realm config at startup by `restore_shard_subscriptions`).
+    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
+        let Some(task_handle) = self.context.task_handle.as_ref() else {
+            warn!("Cannot schedule shard placement sync without task handle");
+            return;
+        };
+        let effect = Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::SyncPlacements { realm_id, node_id },
+            after: Duration::ZERO,
+        });
+        if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
+        {
+            warn!(message = %message, "Failed to schedule shard placement sync after local realm config change");
+        }
+    }
+
     async fn drain_document_sync_outbox(&self) {
         let retry_key = TaskKey::DrainDocumentSyncOutbox;
         let drain_started = Instant::now();
-        let batch =
-            match read_outbox_records(&self.context.storage_handle, &[], OUTBOX_DRAIN_BATCH_SIZE)
-                .await
-            {
-                Ok(batch) if batch.records.is_empty() => {
-                    if batch.has_more {
-                        self.reschedule_timer(retry_key, Duration::ZERO).await;
-                    } else {
-                        self.reset_backoff(&retry_key);
-                    }
-                    return;
-                }
-                Ok(batch) => batch,
-                Err(error) => {
-                    warn!(error = %error, "Failed to read document sync outbox record");
-                    self.reschedule_with_backoff(retry_key).await;
-                    return;
-                }
-            };
-        let scan_elapsed = drain_started.elapsed();
-        let record_count = batch.records.len();
-        let oldest_record_ms = batch
-            .records
-            .iter()
-            .map(|(_, record)| record.outbox_id.timestamp_ms())
-            .min();
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
@@ -257,107 +467,345 @@ impl OperationsTaskHandler {
             return;
         };
 
-        let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
-            BTreeMap::new();
-        for (record_key, record) in batch.records {
-            let document = document_publish_from_outbox(&record);
+        let realm_id = *net_handle.realm_id();
+        // Admin-operation records (group/user document ops) are stamped NIL by
+        // their emitters; resolve their shard placement here from the realm
+        // config so they publish onto the right shard topic. Records that
+        // already carry a real ref (metadata upserts/deletes) keep it.
+        let realm_config = load_realm_config_for_drain(&self.context, realm_id).await;
 
-            let subbatches = publish_groups.entry(record.peers.clone()).or_default();
-            if subbatches
-                .last()
-                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
-            {
-                subbatches.push(DrainSubBatch {
-                    peers: record.peers,
-                    documents: Vec::new(),
-                    targets: Vec::new(),
-                    record_keys: Vec::new(),
-                });
-            }
-            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
-            subbatch.documents.push(document);
-            subbatch.targets.push(record.target);
-            subbatch.record_keys.push(record_key);
-        }
-
-        let group_count = publish_groups.len();
-        let subbatches: Vec<DrainSubBatch> = publish_groups.into_values().flatten().collect();
-        let subbatch_count = subbatches.len();
-
-        // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
-        // sub-batches enter the sync stage strictly in submission order.
-        let mut publish_elapsed = Duration::ZERO;
         let mut totals = DrainSyncOutcome::default();
-        let mut awaiting_sync: Option<DrainSubBatch> = None;
-        for mut subbatch in subbatches {
-            let documents = std::mem::take(&mut subbatch.documents);
-            let peers = subbatch.peers.clone();
-            let publish = async {
-                let publish_started = Instant::now();
-                let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::PublishDocuments { documents, peers },
-                    )))
-                    .await;
-                (event, publish_started.elapsed())
-            };
-            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
-                publish,
-                self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-            );
-            publish_elapsed += publish_time;
-            totals.merge(sync_outcome);
-            match publish_event {
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
-                    ..
-                })) => {
-                    awaiting_sync = Some(subbatch);
+        let mut defer_state = DrainDeferState::default();
+        let mut realm_config_drained = false;
+        let mut start_after: Option<Vec<u8>> = None;
+        let mut scan_elapsed = Duration::ZERO;
+        let mut publish_elapsed = Duration::ZERO;
+        let mut record_count = 0usize;
+        let mut deferred_total = 0usize;
+        let mut stuck_total = 0usize;
+        let mut oldest_stuck: Option<(
+            u64,
+            DocumentSyncTarget,
+            irokle::TopicId,
+            aruna_core::structs::PlacementRef,
+        )> = None;
+        let mut undeliverable_total = 0usize;
+        let mut group_count = 0usize;
+        let mut subbatch_count = 0usize;
+        let mut pages = 0usize;
+        let mut oldest_record_ms: Option<u64> = None;
+        let mut read_failed = false;
+
+        // Drain the whole outbox in pages every run rather than only the FIFO
+        // head: a page of permanently-deferred records (a missing shard genesis)
+        // at the head must never starve records for other topics sitting behind
+        // it. Deferred records are left in place but paged past; published
+        // records are deleted, so the next run reads from the head again. The
+        // per-topic defer state carries across pages so a topic deferred on one
+        // page keeps deferring on the next (FIFO within a topic).
+        loop {
+            let scan_started = Instant::now();
+            let batch = match read_outbox_records(
+                &self.context.storage_handle,
+                &[],
+                start_after.clone(),
+                OUTBOX_DRAIN_BATCH_SIZE,
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(error = %error, "Failed to read document sync outbox record");
+                    read_failed = true;
+                    break;
                 }
-                Event::Net(NetEvent::DocumentSync(
-                    DocumentSyncNetEvent::DocumentsPartiallyPublished {
-                        published_indices,
-                        retry_indices,
-                        error,
-                    },
-                )) => {
-                    warn!(
-                        key = ?retry_key,
-                        published = published_indices.len(),
-                        retry = retry_indices.len(),
-                        error = %error,
-                        "Partially created local document sync batch"
+            };
+            scan_elapsed += scan_started.elapsed();
+            if batch.records.is_empty() {
+                break;
+            }
+            pages += 1;
+            let has_more = batch.has_more;
+            start_after = batch.records.last().map(|(key, _)| key.clone());
+            record_count += batch.records.len();
+            if let Some(page_oldest) = batch
+                .records
+                .iter()
+                .map(|(_, record)| record.outbox_id.timestamp_ms())
+                .min()
+            {
+                oldest_record_ms =
+                    Some(oldest_record_ms.map_or(page_oldest, |current| current.min(page_oldest)));
+            }
+
+            let records: Vec<DrainRecord> = batch
+                .records
+                .into_iter()
+                .map(|(record_key, mut record)| {
+                    realm_config_drained |=
+                        matches!(record.target, DocumentSyncTarget::RealmConfig { .. });
+                    record.placement = resolve_publish_placement(
+                        realm_config.as_ref(),
+                        &record.target,
+                        record.placement,
                     );
-                    totals.retry_needed = true;
-                    match subbatch.sync_subset(&published_indices) {
-                        Some(published_subbatch) if !published_subbatch.record_keys.is_empty() => {
-                            awaiting_sync = Some(published_subbatch);
-                        }
-                        Some(_) => {}
-                        None => {
-                            warn!(key = ?retry_key, "Invalid partial document publish indices");
+                    let topic = record.target.sync_topic_id(realm_id, &record.placement);
+                    (record_key, record, topic)
+                })
+                .collect();
+
+            // Shard topics are join-only for this node unless it is the shard's
+            // rank-0 holder: a record whose topic has no local genesis yet cannot
+            // publish. Try one bootstrap pass against the record's peers (falling
+            // back to the shard's resolved holders when the record carries none,
+            // as admin operations do), then defer whatever is still missing to a
+            // short retry — the genesis arrives via gossip or the next pass. A
+            // topic already deferred earlier this run is skipped: its records
+            // stay deferred regardless, and re-probing would only waste RPCs.
+            //
+            // Only buckets this node holds are pulled. Joining is not holder-gated,
+            // so a non-holder could adopt the genesis here — and would then look
+            // publishable while its publishes went nowhere. Its records belong in
+            // the forwarding path instead.
+            let mut missing_topics: BTreeMap<
+                Vec<aruna_core::NodeId>,
+                (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
+            > = BTreeMap::new();
+            for (_, record, topic) in &records {
+                if !record.target.uses_shard_topic()
+                    || defer_state.deferred_topics.contains(topic)
+                    || !realm_config.as_ref().is_none_or(|config| {
+                        crate::placement::holds_placement(
+                            config,
+                            &record.placement,
+                            net_handle.node_id(),
+                        )
+                    })
+                    || net_handle
+                        .document_sync_topic_exists(*topic)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let mut bootstrap_peers = record.peers.clone();
+                if bootstrap_peers.is_empty()
+                    && let Some(config) = realm_config.as_ref()
+                {
+                    bootstrap_peers =
+                        crate::placement::resolve_shard_holders(config, &record.placement);
+                    bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
+                }
+                if bootstrap_peers.is_empty() {
+                    continue;
+                }
+                let mut peer_key = bootstrap_peers.clone();
+                crate::sync_placement::sort_node_ids(&mut peer_key);
+                missing_topics
+                    .entry(peer_key)
+                    .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
+                    .1
+                    .insert(*topic);
+            }
+            for (_, (peers, topics)) in missing_topics {
+                let event = net_handle
+                    .sync_document_topics(topics.into_iter().collect(), peers)
+                    .await;
+                let outcome = self
+                    .finish_sync_drain_subbatch(
+                        &retry_key,
+                        Vec::new(),
+                        Vec::new(),
+                        Event::Net(NetEvent::DocumentSync(event)),
+                        Default::default(),
+                    )
+                    .await;
+                totals.merge(outcome);
+            }
+
+            let (to_publish, deferred, undeliverable) = partition_drain_records(
+                records,
+                &mut defer_state,
+                |topic| {
+                    net_handle
+                        .document_sync_topic_exists(topic)
+                        .unwrap_or(false)
+                },
+                |record| classify_deferred_record(realm_config.as_ref(), net_handle, record),
+            );
+            deferred_total += deferred.len();
+            let now_ms = unix_timestamp_millis();
+            for (_, record, topic) in &deferred {
+                let record_ms = record.outbox_id.timestamp_ms();
+                if now_ms.saturating_sub(record_ms) < OUTBOX_STUCK_AFTER.as_millis() as u64 {
+                    continue;
+                }
+                stuck_total += 1;
+                if oldest_stuck
+                    .as_ref()
+                    .is_none_or(|(oldest_ms, ..)| record_ms < *oldest_ms)
+                {
+                    oldest_stuck =
+                        Some((record_ms, record.target.clone(), *topic, record.placement));
+                }
+            }
+            undeliverable_total += undeliverable.len();
+            self.report_undeliverable_records(&undeliverable);
+
+            let mut publish_groups: BTreeMap<
+                Vec<aruna_core::NodeId>,
+                (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
+            > = BTreeMap::new();
+            for (record_key, record, topic) in to_publish {
+                let document = document_publish_from_outbox(
+                    record.outbox_id,
+                    record.target.clone(),
+                    record.event,
+                    record.placement,
+                    record.allow_genesis,
+                );
+
+                let mut peer_key = record.peers.clone();
+                crate::sync_placement::sort_node_ids(&mut peer_key);
+                let (peers, subbatches) = publish_groups
+                    .entry(peer_key)
+                    .or_insert_with(|| (record.peers.clone(), Vec::new()));
+                if subbatches
+                    .last()
+                    .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+                {
+                    subbatches.push(DrainSubBatch {
+                        peers: peers.clone(),
+                        documents: Vec::new(),
+                        topics: Vec::new(),
+                        targets: Vec::new(),
+                        record_keys: Vec::new(),
+                    });
+                }
+                let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
+                subbatch.documents.push(document);
+                subbatch.topics.push(topic);
+                subbatch.targets.push(record.target);
+                subbatch.record_keys.push(record_key);
+            }
+
+            group_count += publish_groups.len();
+            let subbatches: Vec<DrainSubBatch> = publish_groups
+                .into_values()
+                .flat_map(|(_, subbatches)| subbatches)
+                .collect();
+            subbatch_count += subbatches.len();
+
+            // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
+            // sub-batches enter the sync stage strictly in submission order.
+            let mut awaiting_sync: Option<DrainSubBatch> = None;
+            for mut subbatch in subbatches {
+                let documents = std::mem::take(&mut subbatch.documents);
+                let peers = subbatch.peers.clone();
+                let publish = async {
+                    let publish_started = Instant::now();
+                    let event = net_handle
+                        .send_effect(Effect::Net(NetEffect::DocumentSync(
+                            DocumentSyncEffect::PublishDocuments { documents, peers },
+                        )))
+                        .await;
+                    (event, publish_started.elapsed())
+                };
+                let ((publish_event, publish_time), sync_outcome) = tokio::join!(
+                    publish,
+                    self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
+                );
+                publish_elapsed += publish_time;
+                totals.merge(sync_outcome);
+                match publish_event {
+                    Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPublished { .. },
+                    )) => {
+                        awaiting_sync = Some(subbatch);
+                    }
+                    Event::Net(NetEvent::DocumentSync(
+                        DocumentSyncNetEvent::DocumentsPartiallyPublished {
+                            published_indices,
+                            retry_indices,
+                            error,
+                        },
+                    )) => {
+                        warn!(
+                            key = ?retry_key,
+                            published = published_indices.len(),
+                            retry = retry_indices.len(),
+                            error = %error,
+                            "Partially created local document sync batch"
+                        );
+                        totals.retry_needed = true;
+                        match subbatch.sync_subset(&published_indices) {
+                            Some(published_subbatch)
+                                if !published_subbatch.record_keys.is_empty() =>
+                            {
+                                awaiting_sync = Some(published_subbatch);
+                            }
+                            Some(_) => {}
+                            None => {
+                                warn!(key = ?retry_key, "Invalid partial document publish indices");
+                            }
                         }
                     }
-                }
-                Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                    error, ..
-                })) => {
-                    warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
-                    totals.retry_needed = true;
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
-                    totals.retry_needed = true;
-                }
-                other => {
-                    warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
-                    totals.retry_needed = true;
+                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+                        error,
+                        ..
+                    })) => {
+                        warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
+                        totals.retry_needed = true;
+                    }
+                    Event::Net(NetEvent::Error(error)) => {
+                        warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                        totals.retry_needed = true;
+                    }
+                    other => {
+                        warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                        totals.retry_needed = true;
+                    }
                 }
             }
+            let sync_outcome = self
+                .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
+                .await;
+            totals.merge(sync_outcome);
+
+            if !has_more {
+                break;
+            }
         }
-        let sync_outcome = self
-            .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
-            .await;
-        totals.merge(sync_outcome);
+
+        if let Some((oldest_ms, target, topic, placement)) = oldest_stuck {
+            error!(
+                event = "pipeline.drain.stuck",
+                count = stuck_total,
+                oldest_age_ms = unix_timestamp_millis().saturating_sub(oldest_ms),
+                representative_target = ?target,
+                representative_topic = %topic,
+                representative_strategy = %placement.strategy_id,
+                representative_shard = placement.shard,
+                "Document sync outbox records are stuck: this node holds their buckets but their shard topic geneses have never arrived"
+            );
+        }
+
+        // A locally-originated realm-config change (strategy upsert, node
+        // placement, quota) must re-run the placement reconciler on this origin
+        // so its rank-0 shard topic geneses are created without a restart; the
+        // inbound reconcile path does the same for remote changes.
+        if realm_config_drained {
+            self.schedule_sync_placements(realm_id, net_handle.node_id())
+                .await;
+        }
+
+        if record_count == 0 {
+            if read_failed {
+                self.reschedule_with_backoff(retry_key).await;
+            } else {
+                self.reset_backoff(&retry_key);
+            }
+            return;
+        }
 
         let oldest_age_ms = oldest_record_ms
             .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
@@ -365,8 +813,11 @@ impl OperationsTaskHandler {
         info!(
             event = "pipeline.drain.summary",
             records = record_count,
+            deferred = deferred_total,
+            undeliverable = undeliverable_total,
             groups = group_count,
             subbatches = subbatch_count,
+            pages,
             scan_ms = duration_ms(scan_elapsed),
             publish_ms = duration_ms(publish_elapsed),
             sync_ms = duration_ms(totals.sync_elapsed),
@@ -375,14 +826,16 @@ impl OperationsTaskHandler {
             total_ms = duration_ms(drain_started.elapsed()),
             oldest_age_ms,
             retry = totals.retry_needed,
-            has_more = batch.has_more,
             "Document sync outbox drain summary"
         );
 
-        if totals.retry_needed {
+        if totals.retry_needed || read_failed {
             self.reschedule_with_backoff(retry_key).await;
-        } else if batch.has_more {
-            self.reschedule_timer(retry_key, std::time::Duration::ZERO)
+        } else if deferred_total > 0 {
+            // Deferred records wait only for a genesis to arrive from the
+            // shard's rank-0 holder; retry quickly rather than on the failure
+            // backoff.
+            self.reschedule_timer(retry_key, DOCUMENT_SYNC_DEFER_RETRY_AFTER)
                 .await;
         } else {
             self.reset_backoff(&retry_key);
@@ -404,7 +857,7 @@ impl OperationsTaskHandler {
         let event = net_handle
             .send_effect(Effect::Net(NetEffect::DocumentSync(
                 DocumentSyncEffect::SyncDocuments {
-                    targets: subbatch.targets,
+                    topics: subbatch.topics,
                     peers: subbatch.peers,
                 },
             )))
@@ -1127,101 +1580,17 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
-                let retry_key = TaskKey::SyncPlacements { realm_id, node_id };
-                let op = ProcessPlacementsOperation::new(PlacementConfig {
-                    realm_id,
-                    local_node_id: node_id,
-                    retry_after: self.backoff_after(&retry_key),
-                });
-                match drive(op, self.context.as_ref()).await {
-                    // The sweep re-armed itself for still-pending placements: grow the
-                    // backoff so a persistently unsatisfiable placement stops hot-looping.
-                    Ok(true) => self.note_retry_backoff(&retry_key),
-                    // A clean sweep clears the backoff for the next unrelated re-arm.
-                    Ok(false) => self.reset_backoff(&retry_key),
-                    Err(err) => {
-                        error!(error = ?err, "Failed to process pending sync placements timer event");
-                        self.reschedule_with_backoff(retry_key).await;
+                let key = TaskKey::SyncPlacements { realm_id, node_id };
+                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                match outcome.status {
+                    PlacementReconcileStatus::Clean => self.reset_backoff(&key),
+                    PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
+                        let after = self.placement_pull_retry_after(&key);
+                        self.reschedule_timer(key, after).await;
                     }
-                }
-            }
-            TaskKey::SyncDocument {
-                node_id,
-                target,
-                peers,
-            } => {
-                let requested_target = target.clone();
-                let retry_key = TaskKey::SyncDocument {
-                    node_id,
-                    target: target.clone(),
-                    peers: peers.clone(),
-                };
-                let Some(net_handle) = self.context.net_handle.as_ref() else {
-                    warn!(key = ?retry_key, "Cannot sync document without net handle");
-                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                        .await;
-                    return;
-                };
-                let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentSyncEffect::SyncDocument { target, peers },
-                    )))
-                    .await;
-                match event {
-                    Event::Net(NetEvent::DocumentSync(
-                        DocumentSyncNetEvent::DocumentsReconciled {
-                            targets,
-                            metadata_create_events,
-                            metadata_graph_tombstones,
-                            ..
-                        },
-                    )) => {
-                        process_metadata_graph_tombstones(
-                            self.context.as_ref(),
-                            metadata_graph_tombstones,
-                        )
-                        .await;
-                        let mut refresh_targets = targets.clone();
-                        refresh_targets.push(requested_target);
-                        refresh_realm_usage_summary_for_targets(
-                            self.context.as_ref(),
-                            net_handle.node_id(),
-                            &refresh_targets,
-                        )
-                        .await;
-                        refresh_watch_interest_for_targets(self.context.as_ref(), &refresh_targets)
-                            .await;
-                        if self
-                            .project_reconciled_metadata_create_events(
-                                &retry_key,
-                                targets,
-                                metadata_create_events,
-                            )
-                            .await
-                            .is_err()
-                        {
-                            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                                .await;
-                            return;
-                        }
-                    }
-                    Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
-                        error,
-                        ..
-                    })) => {
-                        warn!(key = ?retry_key, error = %error, "Failed to process durable document sync timer event");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
-                    }
-                    Event::Net(NetEvent::Error(error)) => {
-                        warn!(key = ?retry_key, error = ?error, "Failed to process durable document sync timer event");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
-                    }
-                    other => {
-                        warn!(key = ?retry_key, event = ?other, "Unexpected durable document sync timer result");
-                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                            .await;
+                    PlacementReconcileStatus::RetryScheduled => {}
+                    PlacementReconcileStatus::StorageFailure => {
+                        self.reschedule_timer(key, SYNC_PLACEMENT_RETRY_AFTER).await;
                     }
                 }
             }
@@ -1266,8 +1635,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
 mod tests {
     use super::*;
     use crate::document_sync_outbox::{
-        new_outbox_record_with_id, outbox_key, read_outbox_record,
-        restore_document_sync_outbox_timers, write_outbox_effect,
+        outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
@@ -1275,7 +1643,9 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::{METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+    use aruna_core::keyspaces::{
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE,
+    };
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
@@ -1364,23 +1734,79 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn placement_storage_rearms() {
+        let realm_id = RealmId::from_bytes([43u8; 32]);
+        let node_id = node(7);
+        let key = TaskKey::SyncPlacements { realm_id, node_id };
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: ByteView::from(realm_id.as_bytes().to_vec()),
+                value: ByteView::from(b"malformed config".to_vec()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle),
+        });
+
+        let before_ms = unix_timestamp_millis();
+        OperationsTaskHandler::new(context)
+            .handle_timer(key.clone())
+            .await;
+        let after_ms = unix_timestamp_millis();
+
+        let persisted = match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => panic!("unexpected timer iter result: {other:?}"),
+        };
+        assert_eq!(persisted.len(), 1, "one retry timer must be persisted");
+        let timer: aruna_core::task::PersistedTaskTimer =
+            postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
+        assert_eq!(timer.key, key);
+        let retry_ms = crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64;
+        assert!(timer.due_at_unix_millis >= before_ms.saturating_add(retry_ms));
+        assert!(timer.due_at_unix_millis <= after_ms.saturating_add(retry_ms));
+    }
+
     #[test]
     fn outbox_upsert_maps_to_publish_with_revision() {
         let event_id = Ulid::from_parts(10, 1);
         let target = target();
         let change = change();
-        let record = new_outbox_record_with_id(
+        let publish = document_publish_from_outbox(
             event_id,
-            node(1),
             target.clone(),
-            Vec::new(),
             DocumentSyncOutboxEvent::Upsert {
                 bytes: vec![1, 2, 3],
                 change,
             },
+            aruna_core::structs::PlacementRef::NIL,
             true,
         );
-        let publish = document_publish_from_outbox(&record);
 
         assert_eq!(publish.target(), &target);
         assert_eq!(publish.event_id(), event_id);
@@ -1401,6 +1827,11 @@ mod tests {
         let subbatch = DrainSubBatch {
             peers: vec![node(2)],
             documents: Vec::new(),
+            topics: vec![
+                irokle::TopicId::hash(b"first"),
+                irokle::TopicId::hash(b"second"),
+                irokle::TopicId::hash(b"third"),
+            ],
             targets: vec![
                 duplicate_target.clone(),
                 other_target,
@@ -1414,9 +1845,332 @@ mod tests {
             .expect("published index selects a record");
 
         assert_eq!(selected.targets, vec![duplicate_target]);
+        assert_eq!(selected.topics, vec![irokle::TopicId::hash(b"third")]);
         assert_eq!(selected.record_keys, vec![b"third".to_vec()]);
         assert!(selected.documents.is_empty());
         assert!(subbatch.sync_subset(&[3]).is_none());
+    }
+
+    fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
+        crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: vec![origin_seq as u8],
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            false,
+        )
+    }
+
+    // Two FIFO-adjacent records for one shard topic must never split across a
+    // defer/publish boundary: if the genesis "arrives" (availability flips
+    // false→true) between the two records, the older would defer and the newer
+    // publish first, inverting their origin sequence on receivers. The fix
+    // evaluates availability once per topic, so both defer together.
+    #[test]
+    fn drain_partition_never_splits_a_topic_when_availability_flips() {
+        let topic = irokle::TopicId::hash(b"shard-genesis-race");
+        let older = shard_topic_record(1);
+        let newer = shard_topic_record(2);
+        assert!(older.target.uses_shard_topic());
+        let records = vec![
+            (b"older".to_vec(), older, topic),
+            (b"newer".to_vec(), newer, topic),
+        ];
+
+        let mut calls = 0usize;
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut defer,
+            |_| {
+                calls += 1;
+                calls > 1
+            },
+            |_| DeferOutcome::Retry,
+        );
+
+        assert_eq!(calls, 1, "topic availability is evaluated once per run");
+        assert!(
+            to_publish.is_empty(),
+            "no record of a deferred topic may publish"
+        );
+        assert_eq!(deferred.len(), 2);
+        assert!(undeliverable.is_empty());
+    }
+
+    #[test]
+    fn drain_partition_publishes_all_records_of_an_available_topic_in_fifo_order() {
+        let topic = irokle::TopicId::hash(b"shard-genesis-present");
+        let records = vec![
+            (b"older".to_vec(), shard_topic_record(1), topic),
+            (b"newer".to_vec(), shard_topic_record(2), topic),
+        ];
+
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred, undeliverable) =
+            partition_drain_records(records, &mut defer, |_| true, |_| DeferOutcome::Retry);
+
+        assert!(deferred.is_empty());
+        assert!(undeliverable.is_empty());
+        let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
+        assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
+    }
+
+    // A record for a bucket this node does not hold can never publish: it may
+    // neither mint the topic's genesis nor join the topic. Deferring it forever
+    // would be silent data loss, so it is separated out to be dropped loudly.
+    #[test]
+    fn unheld_bucket_records_are_undeliverable() {
+        let topic = irokle::TopicId::hash(b"unheld-bucket");
+        let records = vec![
+            (b"older".to_vec(), shard_topic_record(1), topic),
+            (b"newer".to_vec(), shard_topic_record(2), topic),
+        ];
+
+        let mut classified = 0usize;
+        let mut defer = DrainDeferState::default();
+        let (to_publish, deferred, undeliverable) = partition_drain_records(
+            records,
+            &mut defer,
+            |_| false,
+            |_| {
+                classified += 1;
+                DeferOutcome::Undeliverable
+            },
+        );
+
+        assert_eq!(classified, 1, "holdership is decided once per topic");
+        assert!(to_publish.is_empty());
+        assert!(deferred.is_empty());
+        let keys: Vec<Vec<u8>> = undeliverable.into_iter().map(|(key, _, _)| key).collect();
+        assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
+    }
+
+    // A full first page of records for a genesis-less shard topic (all deferred)
+    // must not starve records for other topics behind it in the FIFO: the drain
+    // pages the whole outbox per run, so a later-page record still publishes.
+    #[tokio::test]
+    async fn drain_paginates_past_a_deferred_head_page_to_publish_later_records() {
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        });
+
+        // Every head-page record targets one shard topic with no local genesis,
+        // so all of them defer.
+        let deferred_change = DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(8, 1),
+                actor: node(1),
+                updated_at_ms: 9,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement: aruna_core::structs::PlacementRef {
+                strategy_id: Ulid::from_parts(42, 1),
+                epoch: 0,
+                shard: 3,
+            },
+        };
+        let deferred_target = DocumentSyncTarget::MetadataRegistry {
+            group_id: Ulid::from_parts(1, 1),
+            document_id: Ulid::from_parts(2, 2),
+        };
+        let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
+        for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
+            let record = crate::document_sync_outbox::new_outbox_record_with_id(
+                Ulid::from_parts(1, index as u128),
+                node(1),
+                deferred_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::Upsert {
+                    bytes: Vec::new(),
+                    change: deferred_change,
+                },
+                aruna_core::structs::PlacementRef::NIL,
+                false,
+            );
+            writes.push(
+                crate::document_sync_outbox::outbox_write_entry(&record).expect("outbox entry"),
+            );
+        }
+
+        // One later origin record for a shared (non-shard) topic, ordered
+        // strictly after the head page, so only pagination reaches it.
+        let publish_record = crate::document_sync_outbox::new_outbox_record_with_id(
+            Ulid::from_parts(2, 0),
+            node(1),
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"realm-auth".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        let publish_key = outbox_key(&publish_record).to_vec();
+        writes
+            .push(crate::document_sync_outbox::outbox_write_entry(&publish_record).expect("entry"));
+
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected batch write event: {other:?}"),
+        }
+
+        let handler = OperationsTaskHandler::new(context);
+        handler.drain_document_sync_outbox().await;
+
+        assert_eq!(
+            read_outbox_record(&storage, &publish_key)
+                .await
+                .expect("read publish record"),
+            None,
+            "the later-page record must publish despite an all-deferred first page"
+        );
+        let remaining = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_BATCH_SIZE + 8)
+            .await
+            .expect("read remaining");
+        assert_eq!(
+            remaining.records.len(),
+            OUTBOX_DRAIN_BATCH_SIZE,
+            "every deferred record is retained for the next run"
+        );
+
+        net.shutdown().await;
+    }
+
+    // A realm-config change originated locally lands only in the outbox; draining
+    // it must kick the placement reconciler so this rank-0 node creates its shard
+    // topic geneses without waiting for a restart.
+    #[tokio::test]
+    async fn draining_a_local_realm_config_change_creates_rank0_shard_topics() {
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+        });
+
+        // Install the config so this sole node is rank-0 of every shard, but do
+        // not run the placement reconciler yet.
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        config.ensure_node(net.node_id(), RealmNodeKind::Management);
+        let actor = Actor {
+            node_id: net.node_id(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        match storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: config.to_bytes(&actor).expect("config bytes").into(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write: {other:?}"),
+        }
+        net.refresh_realm_peers_from_document(&config)
+            .await
+            .expect("refresh peers");
+
+        initialize_task_incoming(context.clone(), task_handle.clone()).await;
+
+        let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
+        let topic = aruna_core::document::shard_topic_id(
+            realm_id,
+            &aruna_core::structs::PlacementRef {
+                strategy_id,
+                epoch: 0,
+                shard: 0,
+            },
+        );
+        assert!(
+            !net.document_sync_topic_exists(topic).unwrap_or(false),
+            "the rank-0 shard topic must not exist before the config change is drained"
+        );
+
+        let record = crate::document_sync_outbox::new_outbox_record(
+            net.node_id(),
+            DocumentSyncTarget::RealmConfig { realm_id },
+            Vec::new(),
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"config".to_vec(),
+                change: change(),
+            },
+            aruna_core::structs::PlacementRef::NIL,
+            true,
+        );
+        write_outbox_record(&storage, &record).await;
+        task_handle
+            .send_effect(crate::document_sync_outbox::schedule_outbox_drain_effect())
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if net.document_sync_topic_exists(topic).unwrap_or(false) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rank-0 shard topic was not created after the local config change drained"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        net.shutdown().await;
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(
@@ -1449,6 +2203,7 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_outbox_record(&storage, &record).await;
@@ -1471,6 +2226,7 @@ mod tests {
                 bytes: b"restore durable work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         write_outbox_record(&storage, &record).await;
@@ -1522,6 +2278,7 @@ mod tests {
                 bytes: b"retained work".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let key = outbox_key(&record).to_vec();
@@ -1569,6 +2326,7 @@ mod tests {
                 bytes: b"retry after restart".to_vec(),
                 change: change(),
             },
+            aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let key = outbox_key(&record).to_vec();

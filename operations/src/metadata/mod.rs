@@ -1,4 +1,5 @@
 pub mod api;
+pub mod forward;
 mod handle;
 pub mod materialization_queue;
 pub mod projector;

@@ -236,6 +236,7 @@ impl RegisterOrGetOidcUserOperation {
                 DocumentSyncOutboxEvent::AdminOperation {
                     event: Box::new(event.clone()),
                 },
+                placement,
                 true,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

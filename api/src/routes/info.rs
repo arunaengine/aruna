@@ -353,6 +353,7 @@ pub struct RealmPlacementStrategy {
     pub replica_count: Option<u32>,
     pub distinct_locations: bool,
     pub affinity: Vec<RealmPlacementAffinityRule>,
+    pub shard_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -480,6 +481,7 @@ impl From<&aruna_core::structs::PlacementStrategy> for RealmPlacementStrategy {
                     },
                 })
                 .collect(),
+            shard_count: strategy.shard_count,
         }
     }
 }
@@ -509,6 +511,7 @@ impl RealmPlacementStrategy {
                     },
                 })
                 .collect(),
+            shard_count: self.shard_count,
         })
     }
 }
@@ -936,6 +939,11 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
     match error {
         MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
         MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
+        error @ (MutateRealmPlacementError::AdminDocumentReducerError(_)
+        | MutateRealmPlacementError::DisjointHolderTransition { .. }
+        | MutateRealmPlacementError::EmptyShardHolders { .. }) => {
+            ServerError::BadRequestReason(error.to_string())
+        }
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
         ),
@@ -1431,6 +1439,7 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
         Alpn::DocumentSync => "document_sync".to_string(),
         Alpn::Metadata => "metadata".to_string(),
         Alpn::Notification => "notification".to_string(),
+        Alpn::Shard => "shard".to_string(),
     })
 }
 
@@ -1903,6 +1912,7 @@ mod tests {
             replica_count: Some(2),
             distinct_locations: true,
             affinity: Vec::new(),
+            shard_count: 64,
         }
     }
 

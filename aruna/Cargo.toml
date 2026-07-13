@@ -15,6 +15,7 @@ aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
+irokle = { workspace = true }
 
 # The rest
 base64 = { workspace = true }

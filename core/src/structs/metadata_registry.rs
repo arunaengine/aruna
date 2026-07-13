@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::RealmId;
+use crate::structs::{PlacementRef, RealmId};
 use crate::types::{GroupId, UserId};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,6 +14,11 @@ pub struct MetadataRegistryRecord {
     pub graph_iri: String,
     pub public: bool,
     pub permission_path: String,
+    /// Bucket chosen by the create-receiving node from the buckets it holds.
+    /// Recorded once, never re-derived: re-choosing under a changed config
+    /// would fork the document across two sync topics. Holders stay derived
+    /// from `(placement, config)`, so a rebalance moves buckets, not documents.
+    pub placement: PlacementRef,
     pub holder_node_ids: Vec<NodeId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,

@@ -58,11 +58,12 @@ fn replica_one() -> PlacementStrategy {
         replica_count: Some(1),
         distinct_locations: false,
         affinity: Vec::new(),
+        shard_count: 64,
     }
 }
 
 fn top_holder(view: &PlacementView, strategy: &PlacementStrategy, counter: u64) -> NodeId {
-    resolve_holders(view, strategy, &subject(counter), 0, None)[0]
+    resolve_holders(view, strategy, &subject(counter), None)[0]
 }
 
 fn share_of(view: &PlacementView, strategy: &PlacementStrategy, seed: u8) -> f64 {
