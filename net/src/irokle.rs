@@ -92,6 +92,9 @@ const DOCUMENT_SYNC_INBOUND_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const DOCUMENT_SYNC_FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_DEFERRED_TOPICS: usize = 1_024;
 const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
+/// Bounds concurrent co-holder genesis probes so a large holder set cannot open
+/// an unbounded number of simultaneous sync streams.
+const SHARD_GENESIS_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 struct PendingMetadataCreateApply {
@@ -1603,6 +1606,8 @@ impl DocumentSyncService {
         topics: Vec<irokle_crate::TopicId>,
         co_holders: Vec<NodeId>,
     ) -> ShardGenesisProbe {
+        use futures::StreamExt as _;
+
         let mut probe = ShardGenesisProbe::default();
         if topics.is_empty() {
             return probe;
@@ -1610,13 +1615,15 @@ impl DocumentSyncService {
         let wanted: BTreeSet<irokle_crate::TopicId> = topics.iter().copied().collect();
         // Callers pass co-holders with the local node already excluded.
         let topic_ids = &topics;
-        let probes = co_holders.iter().copied().map(|node_id| async move {
+        let probes = futures::stream::iter(co_holders.iter().copied().map(|node_id| async move {
             let peer = node_id_to_peer_id(&node_id);
             (node_id, self.probe_topics_on_peer(topic_ids, peer).await)
-        });
-        // Poll every independent peer probe together, then aggregate in the
-        // co-holder input order preserved by join_all.
-        for (node_id, result) in futures::future::join_all(probes).await {
+        }))
+        .buffer_unordered(SHARD_GENESIS_PROBE_CONCURRENCY);
+        // Poll a bounded number of peer probes together; aggregation is order
+        // independent (set unions plus an unreachable list).
+        let probe_results: Vec<_> = probes.collect().await;
+        for (node_id, result) in probe_results {
             match result {
                 Ok(peer_probe) => {
                     probe
