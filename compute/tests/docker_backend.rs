@@ -245,6 +245,32 @@ async fn resource_limits() {
     let _ = backend.cleanup(&attempt).await;
 }
 
+#[tokio::test]
+async fn walltime_enforced() {
+    // A run past its walltime ceiling is stopped and surfaces a backend failure
+    // instead of running forever.
+    let backend = backend_or_skip!();
+    let mut spec = sh(&unique("wall"), "sleep 300");
+    spec.resources.max_walltime = Some(Duration::from_secs(1));
+    let attempt = spec.attempt.clone();
+
+    backend.submit(&spec).await.unwrap();
+    let status = tokio::time::timeout(
+        Duration::from_secs(60),
+        backend.wait(&attempt, &CancellationToken::new()),
+    )
+    .await
+    .expect("wait must terminalize an over-walltime run")
+    .unwrap();
+    assert!(
+        matches!(status.phase, AttemptPhase::Failed { .. }),
+        "expected walltime failure, got {:?}",
+        status.phase
+    );
+
+    let _ = backend.cleanup(&attempt).await;
+}
+
 /// Count containers (any state) carrying the given name, via an independent client.
 async fn list_by_name(name: &str) -> usize {
     use bollard::Docker;

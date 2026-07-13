@@ -64,6 +64,8 @@ pub struct ResourceRequest {
     pub max_walltime: Option<Duration>,
     pub preemptible: bool,
     /// Namespaced backend-specific knobs (e.g. GPUs) with no first-class field.
+    /// A backend that does not understand an extension must reject the spec
+    /// rather than silently dropping it.
     pub backend_extensions: BTreeMap<String, String>,
 }
 
