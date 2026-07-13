@@ -2370,11 +2370,11 @@ impl DocumentSyncService {
             }
             if !cross_topic_dependencies.is_empty() {
                 remove_deferred_topic(&mut deferred_topics, topic_id);
-                let mut registered_dependency = false;
                 for dependency in cross_topic_dependencies {
-                    if register_deferred_topic(&mut deferred_topics, dependency, topic_id) {
-                        registered_dependency = true;
-                    } else {
+                    if matches!(
+                        register_deferred_topic(&mut deferred_topics, dependency, topic_id),
+                        DeferredTopicRegistrationOutcome::CapacityExceeded
+                    ) {
                         warn!(
                             %topic_id,
                             ?dependency,
@@ -2382,9 +2382,9 @@ impl DocumentSyncService {
                         );
                     }
                 }
-                if registered_dependency {
-                    continue;
-                }
+                // Registry capacity limits retry discovery, not whether an
+                // unresolved topic is safe to mark as applied.
+                continue;
             }
             let value = ByteView::from(
                 postcard::to_allocvec(&cursor)
@@ -2616,9 +2616,11 @@ impl DocumentSyncService {
                         strategy_id = %apply.record.record.placement.strategy_id,
                         "Deferring replicated metadata create until its placement strategy is available"
                     );
-                    if register_deferred_topic(deferred_topics, dependency, apply.topic_id) {
-                        deferred_cursor_topics.insert(apply.topic_id);
-                    } else {
+                    deferred_cursor_topics.insert(apply.topic_id);
+                    if matches!(
+                        register_deferred_topic(deferred_topics, dependency, apply.topic_id),
+                        DeferredTopicRegistrationOutcome::CapacityExceeded
+                    ) {
                         warn!(
                             topic_id = %apply.topic_id,
                             ?dependency,
@@ -4795,6 +4797,13 @@ enum DocumentSyncDependency {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredTopicRegistrationOutcome {
+    Inserted,
+    AlreadyRegistered,
+    CapacityExceeded,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AdminEventValidation {
     Accepted,
@@ -4858,12 +4867,12 @@ fn register_deferred_topic(
     deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>>,
     dependency: DocumentSyncDependency,
     topic_id: irokle_crate::TopicId,
-) -> bool {
+) -> DeferredTopicRegistrationOutcome {
     if deferred_topics
         .get(&dependency)
         .is_some_and(|topics| topics.contains(&topic_id))
     {
-        return true;
+        return DeferredTopicRegistrationOutcome::AlreadyRegistered;
     }
     let total_topics = deferred_topics.values().map(BTreeSet::len).sum::<usize>();
     let dependency_topics = deferred_topics
@@ -4873,12 +4882,13 @@ fn register_deferred_topic(
     if total_topics >= MAX_DEFERRED_TOPICS
         || dependency_topics >= MAX_DEFERRED_TOPICS_PER_DEPENDENCY
     {
-        return false;
+        return DeferredTopicRegistrationOutcome::CapacityExceeded;
     }
     deferred_topics
         .entry(dependency)
         .or_default()
-        .insert(topic_id)
+        .insert(topic_id);
+    DeferredTopicRegistrationOutcome::Inserted
 }
 
 fn remove_deferred_topic(
@@ -9666,6 +9676,260 @@ mod tests {
             .await
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_retains_cursors() {
+        let (_storage_dir, storage) = test_storage();
+        let doc_dir = tempfile::tempdir().expect("doc dir");
+        let realm_id = RealmId::from_bytes([42; 32]);
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(77).await,
+            storage.clone(),
+            doc_dir.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let actor = test_actor(
+            77,
+            UserId::local(Ulid::from_parts(2_120, 1), realm_id),
+            realm_id,
+        );
+        assert_eq!(actor.node_id, local_node);
+
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(local_node, RealmNodeKind::Management);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentSyncTarget::RealmConfig { realm_id },
+                config
+                    .to_bytes(&actor)
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        let strategy_id = Ulid::from_parts(2_121, 1);
+        assert!(config.strategy(&strategy_id).is_none());
+        let registry_placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 4,
+        };
+        let create_placement = PlacementRef {
+            strategy_id,
+            epoch: 0,
+            shard: 5,
+        };
+        let registry_group_id = Ulid::from_parts(2_122, 1);
+        let registry_document_id = Ulid::from_parts(2_123, 1);
+        let registry_event_id = Ulid::from_parts(2_124, 1);
+        let mut registry = registry_record(
+            registry_group_id,
+            registry_document_id,
+            "datasets/capacity-registry",
+            100,
+            registry_event_id,
+        );
+        registry.placement = registry_placement;
+        let registry_target = DocumentSyncTarget::MetadataRegistry {
+            group_id: registry_group_id,
+            document_id: registry_document_id,
+        };
+
+        let create_group_id = Ulid::from_parts(2_125, 1);
+        let create_document_id = Ulid::from_parts(2_126, 1);
+        let create_event_id = Ulid::from_parts(2_127, 1);
+        let mut create = metadata_create_event(
+            create_group_id,
+            create_document_id,
+            100,
+            create_event_id,
+            77,
+        );
+        create.record.placement = create_placement;
+        let create_target = DocumentSyncTarget::MetadataCreateEvent {
+            document_id: create_document_id,
+            event_id: create_event_id,
+        };
+        let registry_topic = registry_target.sync_topic_id(realm_id, &registry_placement);
+        let create_topic = create_target.sync_topic_id(realm_id, &create_placement);
+        service
+            .ensure_document_sync_topics(&[registry_topic, create_topic], Vec::new())
+            .expect("metadata shard topic genesis");
+        let change = |event_id, placement| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: local_node,
+                updated_at_ms: 100,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement,
+        };
+        let published = service
+            .publish_documents(
+                vec![
+                    DocumentSyncPublish::Upsert {
+                        event_id: registry_event_id,
+                        target: registry_target,
+                        bytes: postcard::to_allocvec(&registry).expect("registry serializes"),
+                        change: change(registry_event_id, registry_placement),
+                        allow_genesis: true,
+                    },
+                    DocumentSyncPublish::Upsert {
+                        event_id: create_event_id,
+                        target: create_target,
+                        bytes: postcard::to_allocvec(&create).expect("create serializes"),
+                        change: change(create_event_id, create_placement),
+                        allow_genesis: true,
+                    },
+                ],
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+            "metadata publish failed: {published:?}"
+        );
+        for topic_id in [registry_topic, create_topic] {
+            assert_ne!(
+                service
+                    .node()
+                    .storage()
+                    .actor_clock(&topic_id)
+                    .expect("metadata topic clock"),
+                irokle_crate::ActorClock::default(),
+                "metadata topic must contain its published event"
+            );
+            service
+                .storage_write(
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                    topic_cursor_key(topic_id),
+                    postcard::to_allocvec(&irokle_crate::ActorClock::default())
+                        .expect("clock serializes")
+                        .into(),
+                )
+                .await
+                .expect("metadata cursor resets");
+        }
+
+        let dependency = DocumentSyncDependency::PlacementStrategy {
+            realm_id,
+            strategy_id,
+        };
+        assert!(
+            !document_sync_dependency_available(&storage, dependency)
+                .await
+                .expect("placement dependency checks")
+        );
+        let mut filler_topics = BTreeSet::new();
+        for index in 0..MAX_DEFERRED_TOPICS_PER_DEPENDENCY {
+            let mut filler_realm = [0xA5; 32];
+            filler_realm[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let filler_realm = RealmId::from_bytes(filler_realm);
+            filler_topics.insert(
+                DocumentSyncTarget::RealmConfig {
+                    realm_id: filler_realm,
+                }
+                .sync_topic_id(filler_realm, &PlacementRef::NIL),
+            );
+        }
+        assert_eq!(filler_topics.len(), MAX_DEFERRED_TOPICS_PER_DEPENDENCY);
+        assert!(!filler_topics.contains(&registry_topic));
+        assert!(!filler_topics.contains(&create_topic));
+        let deferred_topics = BTreeMap::from([(dependency, filler_topics)]);
+        let mut capacity_probe = deferred_topics.clone();
+        let existing_topic = *capacity_probe
+            .get(&dependency)
+            .and_then(BTreeSet::first)
+            .expect("full dependency has a topic");
+        assert_eq!(
+            register_deferred_topic(&mut capacity_probe, dependency, existing_topic),
+            DeferredTopicRegistrationOutcome::AlreadyRegistered
+        );
+        assert_eq!(
+            register_deferred_topic(&mut capacity_probe, dependency, registry_topic),
+            DeferredTopicRegistrationOutcome::CapacityExceeded
+        );
+        service
+            .storage_write(
+                DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+                deferred_topics_key(),
+                postcard::to_allocvec(&deferred_topics)
+                    .expect("deferred topics serialize")
+                    .into(),
+            )
+            .await
+            .expect("full deferred topic registry writes");
+
+        service
+            .reconcile_document_topics([registry_topic, create_topic])
+            .await
+            .expect("metadata reconciliation remains retryable at capacity");
+        let deferred_topics: BTreeMap<DocumentSyncDependency, BTreeSet<irokle_crate::TopicId>> =
+            postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    deferred_topics_key(),
+                )
+                .await
+                .expect("deferred topic registry remains stored"),
+            )
+            .expect("deferred topic registry decodes");
+        assert_eq!(
+            deferred_topics.get(&dependency).map(BTreeSet::len),
+            Some(MAX_DEFERRED_TOPICS_PER_DEPENDENCY)
+        );
+        let registered_dependencies = deferred_topics
+            .iter()
+            .filter(|(_, topics)| {
+                topics.contains(&registry_topic) || topics.contains(&create_topic)
+            })
+            .map(|(dependency, _)| *dependency)
+            .collect::<Vec<_>>();
+        assert!(
+            registered_dependencies.is_empty(),
+            "expected full {dependency:?}; topics registered under {registered_dependencies:?}"
+        );
+        for topic_id in [registry_topic, create_topic] {
+            let cursor: irokle_crate::ActorClock = postcard::from_bytes(
+                &read_storage_value(
+                    &storage,
+                    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+                    topic_cursor_key(topic_id),
+                )
+                .await
+                .expect("deferred cursor remains stored"),
+            )
+            .expect("cursor decodes");
+            assert_eq!(
+                cursor,
+                irokle_crate::ActorClock::default(),
+                "capacity-blocked metadata dependency changed cursor for {topic_id}"
+            );
+            let topic_clock = service
+                .node()
+                .storage()
+                .actor_clock(&topic_id)
+                .expect("metadata topic clock");
+            assert!(
+                !cursor.dominates(&topic_clock),
+                "capacity-blocked metadata dependency advanced cursor for {topic_id}"
+            );
+        }
+
+        service.shutdown().await;
     }
 
     #[tokio::test]
