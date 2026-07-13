@@ -567,8 +567,10 @@ impl OperationsTaskHandler {
             // so a non-holder could adopt the genesis here — and would then look
             // publishable while its publishes went nowhere. Its records belong in
             // the forwarding path instead.
-            let mut missing_topics: BTreeMap<Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>> =
-                BTreeMap::new();
+            let mut missing_topics: BTreeMap<
+                Vec<aruna_core::NodeId>,
+                (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
+            > = BTreeMap::new();
             for (_, record, topic) in &records {
                 if !record.target.uses_shard_topic()
                     || defer_state.deferred_topics.contains(topic)
@@ -592,17 +594,19 @@ impl OperationsTaskHandler {
                     bootstrap_peers =
                         crate::placement::resolve_shard_holders(config, &record.placement);
                     bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
-                    crate::sync_placement::sort_node_ids(&mut bootstrap_peers);
                 }
                 if bootstrap_peers.is_empty() {
                     continue;
                 }
+                let mut peer_key = bootstrap_peers.clone();
+                crate::sync_placement::sort_node_ids(&mut peer_key);
                 missing_topics
-                    .entry(bootstrap_peers)
-                    .or_default()
+                    .entry(peer_key)
+                    .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
+                    .1
                     .insert(*topic);
             }
-            for (peers, topics) in missing_topics {
+            for (_, (peers, topics)) in missing_topics {
                 let event = net_handle
                     .sync_document_topics(topics.into_iter().collect(), peers)
                     .await;
@@ -647,8 +651,10 @@ impl OperationsTaskHandler {
             undeliverable_total += undeliverable.len();
             self.report_undeliverable_records(&undeliverable);
 
-            let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
-                BTreeMap::new();
+            let mut publish_groups: BTreeMap<
+                Vec<aruna_core::NodeId>,
+                (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>),
+            > = BTreeMap::new();
             for (record_key, record, topic) in to_publish {
                 let document = document_publish_from_outbox(
                     record.outbox_id,
@@ -658,13 +664,17 @@ impl OperationsTaskHandler {
                     record.allow_genesis,
                 );
 
-                let subbatches = publish_groups.entry(record.peers.clone()).or_default();
+                let mut peer_key = record.peers.clone();
+                crate::sync_placement::sort_node_ids(&mut peer_key);
+                let (peers, subbatches) = publish_groups
+                    .entry(peer_key)
+                    .or_insert_with(|| (record.peers.clone(), Vec::new()));
                 if subbatches
                     .last()
                     .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
                 {
                     subbatches.push(DrainSubBatch {
-                        peers: record.peers,
+                        peers: peers.clone(),
                         documents: Vec::new(),
                         topics: Vec::new(),
                         targets: Vec::new(),
@@ -679,7 +689,10 @@ impl OperationsTaskHandler {
             }
 
             group_count += publish_groups.len();
-            let subbatches: Vec<DrainSubBatch> = publish_groups.into_values().flatten().collect();
+            let subbatches: Vec<DrainSubBatch> = publish_groups
+                .into_values()
+                .flat_map(|(_, subbatches)| subbatches)
+                .collect();
             subbatch_count += subbatches.len();
 
             // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;

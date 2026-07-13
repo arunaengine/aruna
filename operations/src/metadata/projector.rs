@@ -812,7 +812,7 @@ pub fn registry_outbox_record(
         group_id: record.group_id,
         document_id: record.document_id,
     };
-    let mut peers = resolve_shard_holders(config, &placement);
+    let peers = resolve_shard_holders(config, &placement);
     if peers.is_empty() {
         return None;
     }
@@ -827,7 +827,6 @@ pub fn registry_outbox_record(
         kind: DocumentSyncChangeKind::Upsert,
         placement,
     };
-    sort_node_ids(&mut peers);
     Some(DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
@@ -858,11 +857,10 @@ pub fn create_event_outbox_record(
     // publish after a rebalance targets the current holder set and not the
     // event-time one.
     let placement = event.record.placement;
-    let mut peers = realm_config
+    let peers = realm_config
         .map(|config| resolve_shard_holders(config, &placement))
         .unwrap_or_default();
     let change = metadata_document_lifecycle_revision_change(&lifecycle, event.node_id, placement);
-    sort_node_ids(&mut peers);
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
