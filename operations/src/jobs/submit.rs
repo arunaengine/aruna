@@ -3,9 +3,9 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_DEDUP_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobId, JobPayload, JobRecord};
+use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, UserId};
 use byteview::ByteView;
@@ -13,7 +13,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::job_insert_entries;
+use super::store::{decode_job_record, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_job_drain_effect() -> Effect {
@@ -53,6 +53,7 @@ pub enum SubmitJobError {
 enum SubmitState {
     Init,
     ReadDedup,
+    VerifyDedup(JobId),
     WriteJob,
     ScheduleDrain,
     Finish,
@@ -60,9 +61,12 @@ enum SubmitState {
 }
 
 /// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the existing
-/// id. Dedup is best-effort (read-then-write, no cross-submit lock), so under a
-/// concurrent race two jobs may share a key. Execution is at-least-once: consumers
-/// must be idempotent (`Probe`'s marker file is the example).
+/// id after verifying that job's record still decodes. A dangling entry (record
+/// quarantined or gone) falls through to a fresh create whose batch write repoints the
+/// dedup row, so a corrupt record cannot poison its key. Dedup is best-effort
+/// (read-then-write, no cross-submit lock), so under a concurrent race two jobs may
+/// share a key. Execution is at-least-once: consumers must be idempotent (`Probe`'s
+/// marker file is the example).
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -106,6 +110,15 @@ impl SubmitJobOperation {
             }
             None => self.write_job(),
         }
+    }
+
+    fn verify_dedup(&mut self, job_id: JobId) -> Effects {
+        self.state = SubmitState::VerifyDedup(job_id);
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: JOB_KEYSPACE.to_string(),
+            key: job_record_key(job_id),
+            txn_id: None,
+        })]
     }
 
     fn write_job(&mut self) -> Effects {
@@ -159,10 +172,27 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match <[u8; 16]>::try_from(value.as_ref()) {
-                    Ok(bytes) => self.finish_existing(JobId::from_bytes(bytes)),
+                    Ok(bytes) => self.verify_dedup(JobId::from_bytes(bytes)),
                     Err(_) => self.write_job(),
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::VerifyDedup(job_id) => match event {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => match decode_job_record(&value) {
+                    Ok(_) => self.finish_existing(job_id),
+                    Err(error) => {
+                        warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
+                        self.write_job()
+                    }
+                },
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                    warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
+                    self.write_job()
+                }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
@@ -255,6 +285,21 @@ mod tests {
             .len()
     }
 
+    async fn write_raw(storage: &StorageHandle, key_space: &str, key: ByteView, value: ByteView) {
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write event: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn submit_creates_job() {
         let dir = tempdir().unwrap();
@@ -324,6 +369,69 @@ mod tests {
             + count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await
             + count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await;
         assert!(keys <= 4, "submit writes at most four keys, got {keys}");
+    }
+
+    // A dedup row left dangling by a quarantined record must not ghost future submits.
+    #[tokio::test]
+    async fn ghost_dedup_heals() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let ghost = JobId::from_bytes([9u8; 16]);
+        write_raw(
+            &storage,
+            JOB_DEDUP_INDEX_KEYSPACE,
+            ByteView::from(b"k".to_vec()),
+            ByteView::from(ghost.to_bytes().to_vec()),
+        )
+        .await;
+
+        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+            .await
+            .unwrap();
+        assert!(result.created);
+        assert_ne!(result.job_id, ghost);
+        assert_eq!(
+            crate::jobs::store::find_dedup_job(&storage, b"k", None)
+                .await
+                .unwrap(),
+            Some(result.job_id)
+        );
+    }
+
+    // Same when the record row still exists but no longer decodes.
+    #[tokio::test]
+    async fn corrupt_dedup_heals() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let ghost = JobId::from_bytes([9u8; 16]);
+        write_raw(
+            &storage,
+            JOB_KEYSPACE,
+            job_record_key(ghost),
+            ByteView::from(vec![1, 2, 3]),
+        )
+        .await;
+        write_raw(
+            &storage,
+            JOB_DEDUP_INDEX_KEYSPACE,
+            ByteView::from(b"k".to_vec()),
+            ByteView::from(ghost.to_bytes().to_vec()),
+        )
+        .await;
+
+        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+            .await
+            .unwrap();
+        assert!(result.created);
+        assert_ne!(result.job_id, ghost);
+        assert_eq!(
+            crate::jobs::store::find_dedup_job(&storage, b"k", None)
+                .await
+                .unwrap(),
+            Some(result.job_id)
+        );
     }
 
     #[tokio::test]
