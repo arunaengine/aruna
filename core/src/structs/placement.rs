@@ -463,18 +463,30 @@ mod tests {
     }
 
     #[test]
-    fn binding_carries_no_bucket() {
-        // The record has exactly the spec fields and nothing bucket/holder-shaped.
-        let names: &[&str] = &[
-            "handle",
-            "scope",
-            "document_class",
-            "strategy_id",
-            "allocator_range_id",
-            "allocated_by",
-            "allocated_at_ms",
-        ];
-        assert!(!names.contains(&"bucket"));
-        assert!(!names.contains(&"holders"));
+    fn binding_no_bucket() {
+        // REQ-META-PLACEMENT-BINDING-001: a binding must not carry a bucket
+        // or holders. The exhaustive pattern below has no rest pattern, so
+        // adding any field to PlacementBinding breaks this test's compilation
+        // until the addition is reviewed against the invariant.
+        use crate::structured_id::PlacementHandle;
+
+        let binding = PlacementBinding {
+            handle: PlacementHandle::new(1).unwrap(),
+            scope: PlacementScope::Group(Ulid::from_bytes([1u8; 16])),
+            document_class: DocumentClass::Metadata,
+            strategy_id: Ulid::from_bytes([2u8; 16]),
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        };
+        let PlacementBinding {
+            handle: _,
+            scope: _,
+            document_class: _,
+            strategy_id: _,
+            allocator_range_id: _,
+            allocated_by: _,
+            allocated_at_ms: _,
+        } = binding;
     }
 }
