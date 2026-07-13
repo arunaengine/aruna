@@ -416,7 +416,7 @@ impl DocumentSyncTarget {
     }
 
     /// Sync topic this target's records ride. Shard-classed targets (group,
-    /// user, metadata) derive one topic per `(strategy, epoch, shard)` from the
+    /// user, metadata) derive one topic per `(strategy, shard)` from the
     /// placement; shared realm-scoped targets keep their per-domain topic and
     /// ignore the placement. A NIL placement on a shard-classed target is a bug
     /// (the emitter failed to stamp a real ref) — it is asserted in debug and
@@ -468,15 +468,16 @@ impl DocumentSyncTarget {
     }
 }
 
-/// Sync topic a shard's records ride, derived purely from the placement
-/// reference (no config lookup at the net layer). Mirrors the `TopicId::hash`
-/// idiom [`DocumentSyncTarget::sync_topic_id`] uses, which routes every
-/// shard-classed target here.
+/// Sync topic a shard's records ride, derived from the realm, strategy, and
+/// shard (no config lookup at the net layer). The epoch slot is canonicalized
+/// to zero so transitions retain their epoch-0 topic identity. Mirrors the
+/// `TopicId::hash` idiom [`DocumentSyncTarget::sync_topic_id`] uses, which
+/// routes every shard-classed target here.
 pub fn shard_topic_id(realm_id: RealmId, placement: &PlacementRef) -> irokle::TopicId {
     let mut bytes = b"aruna-shard-topic-v1".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
     bytes.extend_from_slice(&placement.strategy_id.to_bytes());
-    bytes.extend_from_slice(&placement.epoch.to_le_bytes());
+    bytes.extend_from_slice(&0_u64.to_le_bytes());
     bytes.extend_from_slice(&placement.shard.to_be_bytes());
     irokle::TopicId::hash(bytes)
 }
@@ -868,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_topic_id_matches_golden_and_separates_dimensions() {
+    fn shard_topic_identity() {
         let realm_id = test_realm(2);
         let placement = PlacementRef {
             strategy_id: test_ulid(4),
@@ -882,7 +883,7 @@ mod tests {
             "b375275475edc34ab568776cea1fdf4053e57458816e8ed35c5925e3caa07cf4"
         );
 
-        // Each hashed dimension moves the topic.
+        // Realm, strategy, and shard move the topic; an epoch transition does not.
         let other_shard = PlacementRef {
             shard: 6,
             ..placement
@@ -899,7 +900,7 @@ mod tests {
             shard_topic_id(realm_id, &placement),
             shard_topic_id(realm_id, &other_shard)
         );
-        assert_ne!(
+        assert_eq!(
             shard_topic_id(realm_id, &placement),
             shard_topic_id(realm_id, &other_epoch)
         );
