@@ -15,87 +15,10 @@ use crate::shard::protocol::{
 
 pub const SHARD_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Fetches a co-holder's assembled manifest for one shard over the shard ALPN.
-/// A `Reject` from the co-holder (foreign realm, untrusted peer, or a shard it
-/// does not hold) surfaces as `Err`.
+/// Fetches a co-holder's paged manifest for one shard over the shard ALPN and
+/// assembles it. A `Reject` from the co-holder (foreign realm, untrusted peer,
+/// or a shard it does not hold) surfaces as `Err`.
 pub async fn fetch_shard_manifest(
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    realm_id: RealmId,
-    placement: PlacementRef,
-) -> Result<ShardManifest, String> {
-    if let Some(manifest) =
-        fetch_shard_manifest_v2(net_handle, node_id, realm_id, placement).await?
-    {
-        return validate_manifest_response(manifest, node_id, placement);
-    }
-    fetch_shard_manifest_legacy(net_handle, node_id, realm_id, placement).await
-}
-
-async fn fetch_shard_manifest_v2(
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    realm_id: RealmId,
-    placement: PlacementRef,
-) -> Result<Option<ShardManifest>, String> {
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Shard)
-        .await
-        .map_err(|error| error.to_string())?;
-    let request = ShardTransportMessage::ManifestRequestV2 {
-        realm_id,
-        placement,
-    };
-    write_message(&mut stream, &request).await?;
-    stream.0.finish().map_err(|error| error.to_string())?;
-
-    let deadline = Instant::now() + SHARD_IO_TIMEOUT;
-    let mut assembler = ManifestAssembler::new(node_id, placement);
-    let mut received_v2 = false;
-    loop {
-        let response = match read_response_before(&mut stream, deadline).await {
-            Ok(response) => response,
-            Err(_) if !received_v2 => {
-                close_stream(&mut stream).await;
-                return Ok(None);
-            }
-            Err(error) => {
-                close_stream(&mut stream).await;
-                return Err(error);
-            }
-        };
-        match response {
-            ShardTransportResponse::ManifestPageV2(page) => {
-                received_v2 = true;
-                match assembler.push(*page) {
-                    Ok(Some(manifest)) => {
-                        close_stream(&mut stream).await;
-                        return Ok(Some(manifest));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        close_stream(&mut stream).await;
-                        return Err(error);
-                    }
-                }
-            }
-            ShardTransportResponse::Reject(reason) => {
-                close_stream(&mut stream).await;
-                return Err(reason);
-            }
-            ShardTransportResponse::Manifest(_) if !received_v2 => {
-                close_stream(&mut stream).await;
-                return Ok(None);
-            }
-            ShardTransportResponse::Manifest(_) => {
-                close_stream(&mut stream).await;
-                return Err("received legacy shard manifest after V2 page".to_string());
-            }
-        }
-    }
-}
-
-async fn fetch_shard_manifest_legacy(
     net_handle: &NetHandle,
     node_id: NodeId,
     realm_id: RealmId,
@@ -111,15 +34,33 @@ async fn fetch_shard_manifest_legacy(
     };
     write_message(&mut stream, &request).await?;
     stream.0.finish().map_err(|error| error.to_string())?;
-    let response = read_response(&mut stream).await?;
-    close_stream(&mut stream).await;
-    match response {
-        ShardTransportResponse::Manifest(manifest) => {
-            validate_manifest_response(*manifest, node_id, placement)
-        }
-        ShardTransportResponse::Reject(reason) => Err(reason),
-        ShardTransportResponse::ManifestPageV2(_) => {
-            Err("received V2 shard page for legacy request".to_string())
+
+    let deadline = Instant::now() + SHARD_IO_TIMEOUT;
+    let mut assembler = ManifestAssembler::new(node_id, placement);
+    loop {
+        let response = match read_response_before(&mut stream, deadline).await {
+            Ok(response) => response,
+            Err(error) => {
+                close_stream(&mut stream).await;
+                return Err(error);
+            }
+        };
+        match response {
+            ShardTransportResponse::ManifestPage(page) => match assembler.push(*page) {
+                Ok(Some(manifest)) => {
+                    close_stream(&mut stream).await;
+                    return validate_manifest_response(manifest, node_id, placement);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    close_stream(&mut stream).await;
+                    return Err(error);
+                }
+            },
+            ShardTransportResponse::Reject(reason) => {
+                close_stream(&mut stream).await;
+                return Err(reason);
+            }
         }
     }
 }
@@ -151,10 +92,6 @@ async fn write_message(
     timeout(SHARD_IO_TIMEOUT, write_shard_request(stream, message))
         .await
         .map_err(|_| "timed out writing shard message".to_string())?
-}
-
-async fn read_response(stream: &mut BiStream) -> Result<ShardTransportResponse, String> {
-    read_response_before(stream, Instant::now() + SHARD_IO_TIMEOUT).await
 }
 
 async fn read_response_before(

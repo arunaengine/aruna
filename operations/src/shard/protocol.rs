@@ -19,14 +19,10 @@ pub const SHARD_MAX_REQUEST_SIZE: usize = 128;
 /// bounds a large response while still refusing a hostile oversized frame.
 pub const SHARD_MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
-/// New-holder request: give me your manifest for this shard.
+/// New-holder request: give me your paged manifest for this shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum ShardTransportMessage {
     ManifestRequest {
-        realm_id: RealmId,
-        placement: PlacementRef,
-    },
-    ManifestRequestV2 {
         realm_id: RealmId,
         placement: PlacementRef,
     },
@@ -46,13 +42,12 @@ pub struct ShardManifestPage {
     pub entries: Vec<ShardManifestEntry>,
 }
 
-/// Co-holder reply: the assembled manifest, or a rejection (foreign realm,
-/// untrusted peer, or a shard the responder does not hold).
+/// Co-holder reply: a rejection (foreign realm, untrusted peer, or a shard the
+/// responder does not hold), or one page of the assembled manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum ShardTransportResponse {
-    Manifest(Box<ShardManifest>),
     Reject(String),
-    ManifestPageV2(Box<ShardManifestPage>),
+    ManifestPage(Box<ShardManifestPage>),
 }
 
 pub(crate) struct ManifestPagePlan {
@@ -64,9 +59,8 @@ pub(crate) struct ManifestPagePlan {
 #[allow(dead_code)]
 #[derive(Serialize)]
 enum BorrowedShardTransportResponse<'a> {
-    Manifest,
     Reject,
-    ManifestPageV2(BorrowedShardManifestPage<'a>),
+    ManifestPage(BorrowedShardManifestPage<'a>),
 }
 
 #[derive(Serialize)]
@@ -199,7 +193,7 @@ fn borrowed_page_response<'a>(
     last: bool,
     entries: &'a [ShardManifestEntry],
 ) -> BorrowedShardTransportResponse<'a> {
-    BorrowedShardTransportResponse::ManifestPageV2(BorrowedShardManifestPage {
+    BorrowedShardTransportResponse::ManifestPage(BorrowedShardManifestPage {
         placement: manifest.placement,
         holder: manifest.holder,
         cursor: &manifest.cursor,
@@ -268,7 +262,7 @@ fn manifest_page(
 
 #[cfg(test)]
 fn encoded_page_size(page: &ShardManifestPage) -> Result<usize, String> {
-    postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+    postcard::to_allocvec(&ShardTransportResponse::ManifestPage(Box::new(
         page.clone(),
     )))
     .map(|bytes| bytes.len())
@@ -495,19 +489,6 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
         assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
-        assert_eq!(bytes[0], 0, "legacy request variant index changed");
-        assert_eq!(
-            postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
-            message
-        );
-
-        let message = ShardTransportMessage::ManifestRequestV2 {
-            realm_id: RealmId::from_bytes([2; 32]),
-            placement,
-        };
-        let bytes = postcard::to_allocvec(&message).unwrap();
-        assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
-        assert_eq!(bytes[0], 1, "V2 request must follow the legacy variant");
         assert_eq!(
             postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
             message
@@ -535,17 +516,9 @@ mod tests {
             digest: [7u8; 32],
             updated_at_ms: 99,
         };
-        let response = ShardTransportResponse::Manifest(Box::new(manifest.clone()));
-        let bytes = postcard::to_allocvec(&response).unwrap();
-        assert_eq!(bytes[0], 0, "legacy manifest variant index changed");
-        assert_eq!(
-            postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
-            response
-        );
-
         let reject = ShardTransportResponse::Reject("nope".to_string());
         let bytes = postcard::to_allocvec(&reject).unwrap();
-        assert_eq!(bytes[0], 1, "legacy reject variant index changed");
+        assert_eq!(bytes[0], 0, "reject variant index changed");
         assert_eq!(
             postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
             reject
@@ -554,9 +527,9 @@ mod tests {
         let page = partition_manifest(&manifest, SHARD_MAX_RESPONSE_SIZE)
             .unwrap()
             .remove(0);
-        let response = ShardTransportResponse::ManifestPageV2(Box::new(page));
+        let response = ShardTransportResponse::ManifestPage(Box::new(page));
         let bytes = postcard::to_allocvec(&response).unwrap();
-        assert_eq!(bytes[0], 2, "V2 page must follow the legacy variants");
+        assert_eq!(bytes[0], 1, "manifest page must follow reject");
         assert_eq!(
             postcard::from_bytes::<ShardTransportResponse>(&bytes).unwrap(),
             response
@@ -600,13 +573,13 @@ mod tests {
             last: false,
             entries,
         };
-        let budget = postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+        let budget = postcard::to_allocvec(&ShardTransportResponse::ManifestPage(Box::new(
             sample_page(vec![manifest.entries[0].clone()]),
         )))
         .unwrap()
         .len();
         assert!(
-            postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+            postcard::to_allocvec(&ShardTransportResponse::ManifestPage(Box::new(
                 sample_page(manifest.entries[..2].to_vec()),
             )))
             .unwrap()
@@ -620,7 +593,7 @@ mod tests {
             assert_eq!(page.page_index, index as u32);
             assert_eq!(page.last, index + 1 == pages.len());
             assert!(
-                postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
+                postcard::to_allocvec(&ShardTransportResponse::ManifestPage(Box::new(
                     page.clone(),
                 )))
                 .unwrap()

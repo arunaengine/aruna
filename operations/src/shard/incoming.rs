@@ -102,16 +102,10 @@ async fn build_response(
     peer: NodeId,
     message: ShardTransportMessage,
 ) -> PreparedShardResponse {
-    let (realm_id, placement, paged) = match message {
-        ShardTransportMessage::ManifestRequest {
-            realm_id,
-            placement,
-        } => (realm_id, placement, false),
-        ShardTransportMessage::ManifestRequestV2 {
-            realm_id,
-            placement,
-        } => (realm_id, placement, true),
-    };
+    let ShardTransportMessage::ManifestRequest {
+        realm_id,
+        placement,
+    } = message;
 
     if realm_id != *net_handle.realm_id() {
         return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
@@ -164,18 +158,12 @@ async fn build_response(
     match assemble_shard_manifest(context, realm_id, placement).await {
         Ok(manifest) => {
             let entries = manifest.entries.len();
-            let response = if paged {
-                match plan_manifest_pages(&manifest, SHARD_MAX_RESPONSE_SIZE) {
-                    Ok(plan) => PreparedShardResponse::ManifestPages {
-                        manifest: Box::new(manifest),
-                        plan,
-                    },
-                    Err(error) => {
-                        PreparedShardResponse::Message(ShardTransportResponse::Reject(error))
-                    }
-                }
-            } else {
-                PreparedShardResponse::Message(ShardTransportResponse::Manifest(Box::new(manifest)))
+            let response = match plan_manifest_pages(&manifest, SHARD_MAX_RESPONSE_SIZE) {
+                Ok(plan) => PreparedShardResponse::ManifestPages {
+                    manifest: Box::new(manifest),
+                    plan,
+                },
+                Err(error) => PreparedShardResponse::Message(ShardTransportResponse::Reject(error)),
             };
             debug!(
                 strategy = %placement.strategy_id,
