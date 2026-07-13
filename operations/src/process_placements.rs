@@ -258,6 +258,8 @@ pub struct PlacementReconcileOutcome {
     /// Compatibility signal for callers that only need to know whether the
     /// reconciler armed its own retry.
     pub retry_scheduled: bool,
+    /// The retry includes a held topic that could not be pulled yet.
+    pub pull_pending: bool,
     pub status: PlacementReconcileStatus,
 }
 
@@ -266,9 +268,10 @@ impl PlacementReconcileOutcome {
         Self::default()
     }
 
-    fn retry_scheduled() -> Self {
+    fn retry_scheduled(pull_pending: bool) -> Self {
         Self {
             retry_scheduled: true,
+            pull_pending,
             status: PlacementReconcileStatus::RetryScheduled,
         }
     }
@@ -276,6 +279,7 @@ impl PlacementReconcileOutcome {
     fn storage_failure() -> Self {
         Self {
             retry_scheduled: false,
+            pull_pending: false,
             status: PlacementReconcileStatus::StorageFailure,
         }
     }
@@ -471,7 +475,7 @@ pub async fn process_shard_placements(
         let effect =
             crate::sync_placement::schedule_placement_retry_after(realm_id, local_node_id, after);
         let _ = task_handle.send_effect(effect).await;
-        return PlacementReconcileOutcome::retry_scheduled();
+        return PlacementReconcileOutcome::retry_scheduled(held.pull_pending);
     }
     PlacementReconcileOutcome::clean()
 }

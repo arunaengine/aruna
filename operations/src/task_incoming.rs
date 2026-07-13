@@ -68,7 +68,9 @@ use crate::s3::refresh_reference_metadata::{
     REFERENCE_METADATA_REFRESH_RETRY_AFTER, process_reference_metadata_refresh_batch,
     restore_reference_metadata_refresh_timer,
 };
-use crate::sync_placement::{DOCUMENT_SYNC_DEFER_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
+use crate::sync_placement::{
+    DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER,
+};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -403,6 +405,26 @@ impl OperationsTaskHandler {
             .lock()
             .expect("retry backoff mutex poisoned")
             .remove(key);
+    }
+
+    /// Keeps the first missing-topic pull retry prompt, then backs off each
+    /// subsequent full placement scan using the existing per-key retry state.
+    fn placement_pull_retry_after(&self, key: &TaskKey) -> Duration {
+        let mut backoff = self
+            .retry_backoff
+            .lock()
+            .expect("retry backoff mutex poisoned");
+        match backoff.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(0);
+                SHARD_TOPIC_PULL_RETRY_AFTER
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let attempts = *entry.get();
+                entry.insert(attempts.saturating_add(1));
+                Duration::from_secs(timer_retry_after_secs(attempts))
+            }
+        }
     }
 
     /// Re-arms `key` at its current backoff interval and records the attempt.
@@ -1531,16 +1553,18 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 }
             }
             TaskKey::SyncPlacements { realm_id, node_id } => {
-                if process_shard_placements(&self.context, realm_id, node_id)
-                    .await
-                    .status
-                    == PlacementReconcileStatus::StorageFailure
-                {
-                    self.reschedule_timer(
-                        TaskKey::SyncPlacements { realm_id, node_id },
-                        SYNC_PLACEMENT_RETRY_AFTER,
-                    )
-                    .await;
+                let key = TaskKey::SyncPlacements { realm_id, node_id };
+                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                match outcome.status {
+                    PlacementReconcileStatus::Clean => self.reset_backoff(&key),
+                    PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
+                        let after = self.placement_pull_retry_after(&key);
+                        self.reschedule_timer(key, after).await;
+                    }
+                    PlacementReconcileStatus::RetryScheduled => {}
+                    PlacementReconcileStatus::StorageFailure => {
+                        self.reschedule_timer(key, SYNC_PLACEMENT_RETRY_AFTER).await;
+                    }
                 }
             }
             TaskKey::DrainDocumentSyncOutbox => {
