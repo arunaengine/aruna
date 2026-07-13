@@ -5,18 +5,23 @@ use aruna_core::admin_document_reducer::{
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::{
+    ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
+};
+use aruna_core::metadata::MetadataCreateEventRecord;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_key,
-    admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
+    admin_document_reducer_state_write_entry, metadata_pending_projection_target,
+    stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingScope, NodePlacementEntry, PlacementOverride, PlacementStrategy,
-    RealmConfigDocument, StrategyBinding,
+    Actor, BindingScope, MetadataRegistryRecord, NodePlacementEntry, PlacementOverride,
+    PlacementRef, PlacementStrategy, RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -30,6 +35,8 @@ use crate::document_sync_outbox::{
 };
 use crate::placement::placement_ref_for_target;
 use crate::sync_placement::schedule_placement_revalidation_effect;
+
+const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealmPlacementMutation {
@@ -155,10 +162,27 @@ pub struct MutateRealmPlacementOperation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct StrategyRemovalCheck {
+    document_value: Value,
+    reducer_state_value: Option<Value>,
+    strategy_id: Ulid,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum MutateRealmPlacementState {
     Init,
     StartTransaction,
     ReadCurrent,
+    ReadRegistryReferences {
+        check: StrategyRemovalCheck,
+    },
+    ReadPendingReferences {
+        check: StrategyRemovalCheck,
+    },
+    ReadPendingEvents {
+        check: StrategyRemovalCheck,
+        next_start_after: Option<Key>,
+    },
     WriteDocumentAndAdminState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
@@ -318,6 +342,85 @@ impl MutateRealmPlacementOperation {
         })])
     }
 
+    fn emit_reference_check_or_write(
+        &mut self,
+        document_value: Option<Value>,
+        reducer_state_value: Option<Value>,
+    ) -> Result<Effects, MutateRealmPlacementError> {
+        let Some(document_value) = document_value else {
+            return Err(MutateRealmPlacementError::RealmConfigNotFound);
+        };
+        let document = RealmConfigDocument::from_bytes(&document_value)?;
+        self.config.mutation.validate(&document)?;
+        let strategy_id = match &self.config.mutation {
+            RealmPlacementMutation::RemoveStrategy(strategy_id) => *strategy_id,
+            _ => {
+                return self.emit_write_document_and_admin_state(
+                    Some(document_value),
+                    reducer_state_value,
+                );
+            }
+        };
+        let check = StrategyRemovalCheck {
+            document_value,
+            reducer_state_value,
+            strategy_id,
+        };
+        Ok(self.emit_registry_reference_scan(check, None))
+    }
+
+    fn emit_registry_reference_scan(
+        &mut self,
+        check: StrategyRemovalCheck,
+        start_after: Option<Key>,
+    ) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(MutateRealmPlacementError::MissingTransaction);
+        };
+        self.state = MutateRealmPlacementState::ReadRegistryReferences { check };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: METADATA_INDEX_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: STRATEGY_REFERENCE_SCAN_PAGE_SIZE,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn emit_pending_reference_scan(
+        &mut self,
+        check: StrategyRemovalCheck,
+        start_after: Option<Key>,
+    ) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(MutateRealmPlacementError::MissingTransaction);
+        };
+        self.state = MutateRealmPlacementState::ReadPendingReferences { check };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: STRATEGY_REFERENCE_SCAN_PAGE_SIZE,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn reference_matches(&self, record: &MetadataRegistryRecord, strategy_id: Ulid) -> bool {
+        record.realm_id == self.config.actor.realm_id
+            && record.placement != PlacementRef::NIL
+            && record.placement.strategy_id == strategy_id
+    }
+
+    fn emit_write_after_reference_check(&mut self, check: StrategyRemovalCheck) -> Effects {
+        match self.emit_write_document_and_admin_state(
+            Some(check.document_value),
+            check.reducer_state_value,
+        ) {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
     fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(MutateRealmPlacementError::MissingTransaction);
@@ -371,7 +474,7 @@ impl Operation for MutateRealmPlacementOperation {
                             format!("{values:?}"),
                         );
                     };
-                    match self.emit_write_document_and_admin_state(
+                    match self.emit_reference_check_or_write(
                         document_value.clone(),
                         reducer_state_value.clone(),
                     ) {
@@ -381,6 +484,108 @@ impl Operation for MutateRealmPlacementOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+            },
+            MutateRealmPlacementState::ReadRegistryReferences { check } => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    for (_, value) in values {
+                        let record: MetadataRegistryRecord = match postcard::from_bytes(&value) {
+                            Ok(record) => record,
+                            Err(error) => return self.fail(ConversionError::from(error).into()),
+                        };
+                        if self.reference_matches(&record, check.strategy_id) {
+                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                                strategy_id: check.strategy_id,
+                            });
+                        }
+                    }
+                    match next_start_after {
+                        Some(start_after) => {
+                            self.emit_registry_reference_scan(check, Some(start_after))
+                        }
+                        None => self.emit_pending_reference_scan(check, None),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata registry scan result", format!("{other:?}"))
+                }
+            },
+            MutateRealmPlacementState::ReadPendingReferences { check } => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    if values.is_empty() {
+                        return match next_start_after {
+                            Some(start_after) => {
+                                self.emit_pending_reference_scan(check, Some(start_after))
+                            }
+                            None => self.emit_write_after_reference_check(check),
+                        };
+                    }
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(MutateRealmPlacementError::MissingTransaction);
+                    };
+                    self.state = MutateRealmPlacementState::ReadPendingEvents {
+                        check,
+                        next_start_after,
+                    };
+                    smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: values
+                            .into_iter()
+                            .map(|(key, _)| (METADATA_EVENT_LOG_KEYSPACE.to_string(), key))
+                            .collect(),
+                        txn_id: Some(txn_id),
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("pending projection scan result", format!("{other:?}"))
+                }
+            },
+            MutateRealmPlacementState::ReadPendingEvents {
+                check,
+                next_start_after,
+            } => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    for (key, value) in values {
+                        let Some(value) = value else {
+                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                                strategy_id: check.strategy_id,
+                            });
+                        };
+                        let event: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
+                            Ok(event) => event,
+                            Err(_) => {
+                                return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                                    strategy_id: check.strategy_id,
+                                });
+                            }
+                        };
+                        let valid_target = metadata_pending_projection_target(key.as_ref())
+                            .is_some_and(|(document_id, event_id)| {
+                                event.record.document_id == document_id
+                                    && event.event_id == event_id
+                            });
+                        if !valid_target || self.reference_matches(&event.record, check.strategy_id)
+                        {
+                            return self.fail(MutateRealmPlacementError::StrategyReferenced {
+                                strategy_id: check.strategy_id,
+                            });
+                        }
+                    }
+                    match next_start_after {
+                        Some(start_after) => {
+                            self.emit_pending_reference_scan(check, Some(start_after))
+                        }
+                        None => self.emit_write_after_reference_check(check),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("pending create event reads", format!("{other:?}")),
             },
             MutateRealmPlacementState::WriteDocumentAndAdminState {
                 document,
@@ -490,7 +695,13 @@ mod tests {
 
     use aruna_core::document::DocumentSyncTarget;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{DEFAULT_NODE_WEIGHT, DocumentClass, RealmId};
+    use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
+    use aruna_core::storage_entries::{
+        metadata_create_event_and_pending_projection_write_entries, metadata_registry_write_entries,
+    };
+    use aruna_core::structs::{
+        DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord, PlacementRef, RealmId,
+    };
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -567,6 +778,59 @@ mod tests {
             affinity: Vec::new(),
             shard_count: 64,
         }
+    }
+
+    fn create_event(
+        actor: &Actor,
+        strategy_id: Ulid,
+        document_seed: u8,
+    ) -> MetadataCreateEventRecord {
+        let document_id = Ulid::from_bytes([document_seed; 16]);
+        let event_id = Ulid::from_bytes([document_seed.wrapping_add(1); 16]);
+        MetadataCreateEventRecord {
+            event_id,
+            record: MetadataRegistryRecord {
+                realm_id: actor.realm_id,
+                group_id: Ulid::from_bytes([document_seed.wrapping_add(2); 16]),
+                document_id,
+                document_path: "datasets/referenced".to_string(),
+                graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+                public: true,
+                permission_path: "/referenced".to_string(),
+                placement: PlacementRef {
+                    strategy_id,
+                    epoch: 0,
+                    shard: 1,
+                },
+                holder_node_ids: vec![actor.node_id],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                last_event_id: event_id,
+            },
+            user_id: actor.user_id,
+            node_id: actor.node_id,
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Referenced".to_string(),
+                description: "Strategy reference".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: 1,
+        }
+    }
+
+    async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
     }
 
     #[tokio::test]
@@ -789,6 +1053,72 @@ mod tests {
         let actor = actor(realm_id);
         let document = seed_config(&context, &actor).await;
         let strategy_id = document.default_strategy_id.unwrap();
+
+        assert_eq!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::RemoveStrategy(strategy_id)
+            )
+            .await,
+            Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_reference_blocks() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([14; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+        let strategy_id = Ulid::from_bytes([14; 16]);
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+        )
+        .await
+        .unwrap();
+        let event = create_event(&actor, strategy_id, 31);
+        write_entries(
+            &context,
+            metadata_registry_write_entries(&event.record).unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::RemoveStrategy(strategy_id)
+            )
+            .await,
+            Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_reference_blocks() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([15; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+        let strategy_id = Ulid::from_bytes([15; 16]);
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
+        )
+        .await
+        .unwrap();
+        let event = create_event(&actor, strategy_id, 41);
+        write_entries(
+            &context,
+            metadata_create_event_and_pending_projection_write_entries(&event).unwrap(),
+        )
+        .await;
 
         assert_eq!(
             mutate(

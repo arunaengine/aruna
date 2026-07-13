@@ -31,7 +31,7 @@ use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
     DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE,
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
@@ -99,6 +99,10 @@ struct PendingMetadataCreateApply {
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
     lifecycle_revision: Option<DocumentSyncChange>,
+}
+
+struct MetadataPlacementFence {
+    config_write: Option<(String, ByteView, Value)>,
 }
 
 #[derive(Default)]
@@ -2514,16 +2518,12 @@ impl DocumentSyncService {
         if pending.is_empty() && cursor_writes.is_empty() {
             return Ok(());
         }
-        let mut writes = Vec::with_capacity(pending.len() + cursor_writes.len());
-        let mut accepted = Vec::with_capacity(pending.len());
+        let mut candidates = Vec::with_capacity(pending.len());
         for apply in pending {
             if self.metadata_create_fenced(&apply.record).await? {
                 continue;
             }
-            let target = DocumentSyncTarget::MetadataCreateEvent {
-                document_id: apply.record.record.document_id,
-                event_id: apply.record.event_id,
-            };
+            let mut entries = Vec::new();
             if let Some(revision) = &apply.lifecycle_revision {
                 if incoming_metadata_document_lifecycle_stale_or_equal(
                     &self.storage,
@@ -2534,26 +2534,73 @@ impl DocumentSyncService {
                 {
                     continue;
                 }
-                writes.push(
+                entries.push(
                     document_sync_revision_write_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
                 if let Some(manifest) = shard_manifest_write_entry(&apply.target, revision)
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 {
-                    writes.push(manifest);
+                    entries.push(manifest);
                 }
             }
-            writes.push((
-                target.storage_keyspace().to_string(),
-                target.storage_key(),
-                ByteView::from(apply.bytes.clone()),
-            ));
+            let mut event_entries =
+                metadata_create_event_and_pending_projection_write_entries(&apply.record)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if let Some((_, _, value)) = event_entries.first_mut() {
+                *value = ByteView::from(apply.bytes.clone());
+            }
+            entries.extend(event_entries);
+            candidates.push((apply, entries));
+        }
+
+        let txn_id = start_storage_transaction(&self.storage).await?;
+        let mut writes = Vec::with_capacity(candidates.len() * 3 + cursor_writes.len());
+        let mut config_writes = BTreeMap::new();
+        let mut accepted = Vec::with_capacity(candidates.len());
+        for (apply, entries) in candidates {
+            let fence = match metadata_placement_fence_in_transaction(
+                &self.storage,
+                &apply.record.record,
+                txn_id,
+            )
+            .await
+            {
+                Ok(Some(fence)) => fence,
+                Ok(None) => {
+                    warn!(
+                        realm_id = %apply.record.record.realm_id,
+                        document_id = %apply.record.record.document_id,
+                        strategy_id = %apply.record.record.placement.strategy_id,
+                        "Rejecting replicated metadata create whose placement strategy is unavailable"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let _ = self
+                        .storage
+                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if let Some(config_write) = fence.config_write {
+                config_writes.insert(apply.record.record.realm_id, config_write);
+            }
+            writes.extend(entries);
             accepted.push(apply);
         }
+        writes.extend(config_writes.into_values());
         writes.extend(cursor_writes);
-        if !writes.is_empty() {
-            self.storage_batch_write(writes).await?;
+        if let Err(error) =
+            storage_batch_delete_and_write_in_transaction(&self.storage, txn_id, Vec::new(), writes)
+                .await
+        {
+            let _ = self
+                .storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Err(error);
         }
         for apply in accepted {
             applied_targets.push(apply.target);
@@ -3129,32 +3176,102 @@ async fn apply_metadata_registry_upsert_to_storage(
         .await;
     }
 
+    let mut base_entries = metadata_registry_write_entries(&record)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if let Some((_, _, value)) = base_entries.first_mut() {
+        *value = primary_bytes.into();
+    }
     let target = DocumentSyncTarget::MetadataRegistry {
         group_id: record.group_id,
         document_id: record.document_id,
     };
-    let existing = storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?
-    .map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if existing
-        .as_ref()
-        .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
-    {
-        return Ok(());
-    }
+    for _ in 0..2 {
+        let txn_id = start_storage_transaction(storage).await?;
+        let fence = match metadata_placement_fence_in_transaction(storage, &record, txn_id).await {
+            Ok(Some(fence)) => fence,
+            Ok(None) => {
+                warn!(
+                    realm_id = %record.realm_id,
+                    document_id = %record.document_id,
+                    strategy_id = %record.placement.strategy_id,
+                    "Rejecting metadata registry record whose placement strategy is unavailable"
+                );
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let existing_value = match storage_read_from_transaction(
+            storage,
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            Some(txn_id),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        };
+        let existing = match existing_value
+            .map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes))
+            .transpose()
+        {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(NetError::Bootstrap(error.to_string()));
+            }
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
+        {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Ok(());
+        }
 
-    let mut entries = metadata_registry_write_entries(&record)
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if let Some((_, _, value)) = entries.first_mut() {
-        *value = primary_bytes.into();
+        let mut entries = base_entries.clone();
+        if let Some(config_write) = fence.config_write {
+            entries.push(config_write);
+        }
+        match storage_batch_delete_and_write_in_transaction(storage, txn_id, Vec::new(), entries)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(NetError::Dht(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+            }
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error);
+            }
+        }
     }
-    storage_batch_write_to(storage, entries).await
+    Err(NetError::Dht(
+        "metadata registry admission conflicted twice".to_string(),
+    ))
 }
 
 async fn apply_metadata_graph_lifecycle_to_storage(
@@ -4224,6 +4341,45 @@ async fn metadata_create_fenced_in_storage(
         return Ok(event.event_id <= delete.deleted_after_event_id);
     }
     metadata_graph_deleted_in_storage(storage, &event.record.graph_iri).await
+}
+
+async fn metadata_placement_fence_in_transaction(
+    storage: &StorageHandle,
+    record: &MetadataRegistryRecord,
+    txn_id: TxnId,
+) -> Result<Option<MetadataPlacementFence>> {
+    let target = DocumentSyncTarget::RealmConfig {
+        realm_id: record.realm_id,
+    };
+    let value = storage_read_from_transaction(
+        storage,
+        REALM_CONFIG_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return if record.placement == PlacementRef::NIL {
+            Ok(Some(MetadataPlacementFence { config_write: None }))
+        } else {
+            Ok(None)
+        };
+    };
+    let config = RealmConfigDocument::from_bytes(&value)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if config.realm_id != record.realm_id
+        || (record.placement != PlacementRef::NIL
+            && config.strategy(&record.placement.strategy_id).is_none())
+    {
+        return Ok(None);
+    }
+    Ok(Some(MetadataPlacementFence {
+        config_write: Some((
+            REALM_CONFIG_KEYSPACE.to_string(),
+            target.storage_key(),
+            value,
+        )),
+    }))
 }
 
 async fn storage_read_from(
@@ -9300,6 +9456,65 @@ mod tests {
         assert_eq!(primary, local);
         assert_eq!(document_index, local);
         assert_eq!(holders, local.holder_node_ids);
+    }
+
+    #[tokio::test]
+    async fn registry_strategy_fenced() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(2_100, 1);
+        let document_id = Ulid::from_parts(2_101, 1);
+        let mut record = registry_record(
+            group_id,
+            document_id,
+            "datasets/missing-strategy",
+            100,
+            Ulid::from_parts(2_102, 1),
+        );
+        record.placement = PlacementRef {
+            strategy_id: Ulid::from_parts(2_103, 1),
+            epoch: 0,
+            shard: 1,
+        };
+        let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
+        config.seed_default_placement();
+        let config_target = DocumentSyncTarget::RealmConfig {
+            realm_id: record.realm_id,
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+                config
+                    .to_bytes(&test_actor(
+                        1,
+                        UserId::nil(record.realm_id),
+                        record.realm_id,
+                    ))
+                    .expect("realm config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("realm config writes");
+
+        apply_metadata_registry_upsert_to_storage(
+            &storage,
+            record.clone(),
+            postcard::to_allocvec(&record).expect("registry serializes"),
+        )
+        .await
+        .expect("invalid strategy is rejected without wedging reconciliation");
+
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_INDEX_KEYSPACE,
+                metadata_registry_key(group_id, document_id),
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]

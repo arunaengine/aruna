@@ -272,9 +272,9 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
         .requests_total;
 
     assert_eq!(created.record.document_id, document_id);
-    // Realm config read (bucket choice) plus the event append; a generated id
-    // still skips the existing-document read a client-supplied id needs.
-    assert_eq!(after - before, 2);
+    // Transaction start, realm config read, atomic event/fence write, and commit;
+    // a generated id still skips the existing-document read a client-supplied id needs.
+    assert_eq!(after - before, 4);
     Ok(())
 }
 
