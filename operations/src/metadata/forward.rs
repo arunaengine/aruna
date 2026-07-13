@@ -60,16 +60,21 @@ pub enum MetadataWriteError {
 
 /// Route for a write against `placement`, from the local node's point of view.
 ///
-/// An empty holder set means no strategy governs the bucket (early bootstrap,
-/// [`PlacementRef::NIL`]): there is nowhere to forward to and no sharding to
-/// respect, so the local node stays the authority.
+/// [`PlacementRef::NIL`] has no governing strategy (early bootstrap), so the
+/// local node stays the authority even without readable config. A non-NIL
+/// placement needs config to establish authority; when config is unavailable,
+/// an empty forward route fails closed as undeliverable.
 pub fn write_route(
     config: Option<&RealmConfigDocument>,
     placement: &PlacementRef,
     local_node_id: NodeId,
 ) -> MetadataWriteRoute {
     let Some(config) = config else {
-        return MetadataWriteRoute::Local;
+        return if *placement == PlacementRef::NIL {
+            MetadataWriteRoute::Local
+        } else {
+            MetadataWriteRoute::Forward(Vec::new())
+        };
     };
     if holds_placement(config, placement, local_node_id) {
         return MetadataWriteRoute::Local;
@@ -616,6 +621,16 @@ mod tests {
             write_route(Some(&config), &placement, node(9)),
             MetadataWriteRoute::Forward(_)
         ));
+    }
+
+    #[test]
+    fn missing_config_forwards() {
+        let (_, placement) = config_and_placement();
+
+        assert_eq!(
+            write_route(None, &placement, node(1)),
+            MetadataWriteRoute::Forward(Vec::new())
+        );
     }
 
     #[test]
