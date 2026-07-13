@@ -114,7 +114,7 @@ impl DockerBackend {
                         return Err(classify_pull_error(&err));
                     }
                 }
-                Err(e) => return Err(classify(&e)),
+                Err(e) => return Err(classify_pull(&e)),
             }
         }
         Ok(())
@@ -386,6 +386,25 @@ fn classify(err: &bollard::errors::Error) -> BackendError {
     }
 }
 
+/// Pull-scoped HTTP classification. Registries answer a missing or unreadable
+/// repository with a 404 ("pull access denied", "repository does not exist"),
+/// which must become a permanent Image* error, never a retryable `NotFound`.
+fn classify_pull(err: &bollard::errors::Error) -> BackendError {
+    use bollard::errors::Error;
+    match err {
+        Error::DockerResponseServerError {
+            status_code,
+            message,
+        } => match status_code {
+            400 => BackendError::InvalidSpec(message.clone()),
+            401 | 403 => BackendError::ImageUnauthorized(message.clone()),
+            404 => BackendError::ImageNotFound(message.clone()),
+            _ => classify_pull_error(message),
+        },
+        _ => classify(err),
+    }
+}
+
 fn classify_pull_error(message: &str) -> BackendError {
     let lower = message.to_lowercase();
     if lower.contains("not found")
@@ -491,6 +510,46 @@ mod tests {
             split_image_ref("repo@sha256:abc"),
             ("repo".into(), Some("sha256:abc".into()))
         );
+    }
+
+    #[test]
+    fn pull_classification() {
+        use bollard::errors::Error;
+        // A registry 404 ("pull access denied", "repository does not exist") is a
+        // permanent image error, never a retryable attempt-NotFound.
+        let denied = Error::DockerResponseServerError {
+            status_code: 404,
+            message: "pull access denied for private/img".to_string(),
+        };
+        let classified = classify_pull(&denied);
+        assert!(matches!(classified, BackendError::ImageNotFound(_)));
+        assert!(!classified.retryable());
+
+        let unauthorized = Error::DockerResponseServerError {
+            status_code: 403,
+            message: "forbidden".to_string(),
+        };
+        let classified = classify_pull(&unauthorized);
+        assert!(matches!(classified, BackendError::ImageUnauthorized(_)));
+        assert!(!classified.retryable());
+
+        // A daemon 500 wrapping a registry auth failure is still permanent.
+        let wrapped = Error::DockerResponseServerError {
+            status_code: 500,
+            message: "unauthorized: authentication required".to_string(),
+        };
+        assert!(!classify_pull(&wrapped).retryable());
+
+        // Genuinely transient faults stay retryable.
+        let flaky = Error::DockerResponseServerError {
+            status_code: 500,
+            message: "registry timeout".to_string(),
+        };
+        assert!(classify_pull(&flaky).retryable());
+        let io = Error::IOError {
+            err: std::io::Error::other("socket closed"),
+        };
+        assert!(classify_pull(&io).retryable());
     }
 
     #[test]

@@ -561,7 +561,8 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
 
 /// The fenced execution graph (spec 16.7): a requeue is legal only before an attempt
 /// is submitted; `Indeterminate` exits only on evidence. `Ready -> Indeterminate`
-/// parks a submit whose outcome is unknowable after the intent was written.
+/// parks a submit whose outcome is unknowable after the intent was written;
+/// `Preparing/Ready -> Failed` terminalizes a permanent pre-attempt failure.
 fn external_attempt_transition(from: JobState, to: JobState) -> bool {
     use JobState::*;
     matches!(
@@ -574,8 +575,10 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Claimed, Failed)
             | (Preparing, Ready)
             | (Preparing, Queued)
+            | (Preparing, Failed)
             | (Ready, Running)
             | (Ready, Queued)
+            | (Ready, Failed)
             | (Ready, Indeterminate)
             | (Running, Succeeded)
             | (Running, Failed)
@@ -791,6 +794,11 @@ mod tests {
             (JobState::Preparing, JobState::Queued),
             (JobState::Ready, JobState::Running),
             (JobState::Ready, JobState::Queued),
+            // A permanent pre-attempt failure terminalizes without a container.
+            (JobState::Preparing, JobState::Failed),
+            (JobState::Ready, JobState::Failed),
+            // A submit with an unknowable outcome parks after the intent write.
+            (JobState::Ready, JobState::Indeterminate),
             (JobState::Running, JobState::Cancelling),
             (JobState::Running, JobState::Indeterminate),
             (JobState::Cancelling, JobState::Cancelled),
