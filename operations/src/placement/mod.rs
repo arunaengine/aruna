@@ -168,9 +168,9 @@ pub fn resolve_shard_holders(
 }
 
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
-/// topic. An empty holder set means no strategy governs the bucket (early
-/// bootstrap, [`PlacementRef::NIL`]): nobody shards it, so it is nobody's to
-/// withhold and the local node counts as a holder.
+/// topic. [`PlacementRef::NIL`] means no strategy governs the bucket during
+/// early bootstrap: nobody shards it, so it is nobody's to withhold and the
+/// local node counts as a holder.
 ///
 /// The presence of a local copy of a document is never evidence of holdership:
 /// a rebalance leaves a stale copy behind on a node that is no longer a holder.
@@ -180,7 +180,7 @@ pub fn holds_placement(
     node_id: NodeId,
 ) -> bool {
     let holders = resolve_shard_holders(config, placement);
-    holders.is_empty() || holders.contains(&node_id)
+    *placement == PlacementRef::NIL || holders.contains(&node_id)
 }
 
 /// Buckets of `strategy` that `node_id` is a holder of. Empty when the node is
@@ -423,6 +423,24 @@ mod tests {
             choose_origin_bucket(&config, strategy, node(9), &subject(1)),
             None
         );
+    }
+
+    #[test]
+    fn empty_holders_rejected() {
+        let (mut config, placement) = config_and_placement();
+        assert!(holds_placement(&config, &placement, node(1)));
+
+        config.nodes.clear();
+        assert!(resolve_shard_holders(&config, &placement).is_empty());
+        assert!(!holds_placement(&config, &placement, node(1)));
+
+        let dangling = PlacementRef {
+            strategy_id: Ulid::from_bytes([99u8; 16]),
+            ..placement
+        };
+        assert!(resolve_shard_holders(&config, &dangling).is_empty());
+        assert!(!holds_placement(&config, &dangling, node(1)));
+        assert!(holds_placement(&config, &PlacementRef::NIL, node(1)));
     }
 
     #[test]
