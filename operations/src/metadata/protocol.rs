@@ -129,11 +129,23 @@ pub async fn write_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {
+    let bytes = encode_message(message)?;
+    write_encoded_message(stream, &bytes).await
+}
+
+pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
     let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
     if bytes.len() > MAX_MESSAGE_SIZE {
         return Err("metadata message exceeds maximum size".to_string());
     }
 
+    Ok(bytes)
+}
+
+pub(crate) async fn write_encoded_message(
+    stream: &mut BiStream,
+    bytes: &[u8],
+) -> Result<(), String> {
     stream
         .0
         .write_all(&(bytes.len() as u32).to_be_bytes())

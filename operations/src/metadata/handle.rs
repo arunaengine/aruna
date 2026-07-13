@@ -45,7 +45,10 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
-use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
+use super::protocol::{
+    MetadataAuthToken, MetadataTransportMessage, encode_message, read_message,
+    write_encoded_message, write_message,
+};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use crate::auth::{
     ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache,
@@ -68,6 +71,48 @@ const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataRequestDelivery {
+    DefinitelyNotSent,
+    PossiblySent,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataRequestError {
+    delivery: MetadataRequestDelivery,
+    error: MetadataError,
+}
+
+impl MetadataRequestError {
+    fn definitely_not_sent(error: MetadataError) -> Self {
+        Self {
+            delivery: MetadataRequestDelivery::DefinitelyNotSent,
+            error,
+        }
+    }
+
+    fn possibly_sent(error: MetadataError) -> Self {
+        Self {
+            delivery: MetadataRequestDelivery::PossiblySent,
+            error,
+        }
+    }
+
+    pub(crate) fn delivery(&self) -> MetadataRequestDelivery {
+        self.delivery
+    }
+
+    fn into_metadata_error(self) -> MetadataError {
+        self.error
+    }
+}
+
+impl std::fmt::Display for MetadataRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1065,7 +1110,7 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         message: MetadataTransportMessage,
-    ) -> Result<MetadataTransportMessage, MetadataError> {
+    ) -> Result<MetadataTransportMessage, MetadataRequestError> {
         let started = Instant::now();
         let span = Span::current();
         let result = send_remote_metadata_request(&self.inner, &span, node_id, message).await;
@@ -1215,7 +1260,8 @@ impl MetadataHandle {
                 sparql,
             },
         )
-        .await?
+        .await
+        .map_err(MetadataRequestError::into_metadata_error)?
         {
             MetadataTransportMessage::QueryResults { results } => Ok(results),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
@@ -1269,7 +1315,8 @@ impl MetadataHandle {
                 limit,
             },
         )
-        .await?
+        .await
+        .map_err(MetadataRequestError::into_metadata_error)?
         {
             MetadataTransportMessage::SearchResults { hits } => Ok(hits),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
@@ -1378,10 +1425,12 @@ async fn send_remote_metadata_request(
     span: &Span,
     node_id: NodeId,
     message: MetadataTransportMessage,
-) -> Result<MetadataTransportMessage, MetadataError> {
+) -> Result<MetadataTransportMessage, MetadataRequestError> {
     let Some(net_handle) = inner.net_handle.clone() else {
         record_error(span, "metadata net handle missing");
-        return Err(MetadataError::HandleMissing);
+        return Err(MetadataRequestError::definitely_not_sent(
+            MetadataError::HandleMissing,
+        ));
     };
 
     send_request(&net_handle, node_id, message).await
@@ -4205,30 +4254,40 @@ async fn send_request(
     net_handle: &NetHandle,
     node_id: NodeId,
     message: MetadataTransportMessage,
-) -> Result<MetadataTransportMessage, MetadataError> {
+) -> Result<MetadataTransportMessage, MetadataRequestError> {
     let span = Span::current();
     let total_started = Instant::now();
+
+    let bytes = encode_message(&message)
+        .map_err(MetadataError::Backend)
+        .map_err(MetadataRequestError::definitely_not_sent)?;
 
     let open_started = Instant::now();
     let mut stream = net_handle
         .open_stream(node_id, Alpn::Metadata)
         .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::definitely_not_sent)?;
     record_elapsed_ms(&span, "open_stream_ms", open_started);
 
     let write_started = Instant::now();
-    write_transport_message(&mut stream, &message).await?;
+    write_encoded_transport_message(&mut stream, &bytes)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "write_ms", write_started);
 
     let finish_started = Instant::now();
     stream
         .0
         .finish()
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
-    let response = read_transport_message(&mut stream).await?;
+    let response = read_transport_message(&mut stream)
+        .await
+        .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "read_ms", read_started);
 
     let close_started = Instant::now();
@@ -4245,6 +4304,17 @@ async fn write_transport_message(
 ) -> Result<(), MetadataError> {
     let result: Result<Result<(), String>, tokio::time::error::Elapsed> =
         timeout(METADATA_IO_TIMEOUT, write_message(stream, message)).await;
+    result
+        .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn write_encoded_transport_message(
+    stream: &mut BiStream,
+    bytes: &[u8],
+) -> Result<(), MetadataError> {
+    let result: Result<Result<(), String>, tokio::time::error::Elapsed> =
+        timeout(METADATA_IO_TIMEOUT, write_encoded_message(stream, bytes)).await;
     result
         .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
         .map_err(MetadataError::Backend)

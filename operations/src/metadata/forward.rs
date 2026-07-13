@@ -21,6 +21,7 @@ use crate::delete_metadata_document::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
+use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
 use crate::placement::{
     PlacementResolutionContext, holds_placement, plan_target_placement, resolve_shard_holders,
@@ -548,6 +549,11 @@ async fn forward_to_holders(
             Ok(response) => return Ok(response),
             Err(error) => {
                 warn!(holder = %holder, error = %error, "Failed to forward a metadata write to holder");
+                if retry_disposition(&message, error.delivery()) == RetryDisposition::Stop {
+                    return Err(MetadataWriteError::Undeliverable(format!(
+                        "forward to holder `{holder}` may have applied the metadata write before failing; refusing to replay it: {error}"
+                    )));
+                }
                 failures.push(format!("{holder}: {error}"));
             }
         }
@@ -564,6 +570,27 @@ async fn forward_to_holders(
         "Metadata write reached a non-holder and no holder accepted the forward"
     );
     Err(MetadataWriteError::Undeliverable(detail))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryDisposition {
+    TryNext,
+    Stop,
+}
+
+fn retry_disposition(
+    message: &MetadataTransportMessage,
+    delivery: MetadataRequestDelivery,
+) -> RetryDisposition {
+    match delivery {
+        MetadataRequestDelivery::DefinitelyNotSent => RetryDisposition::TryNext,
+        MetadataRequestDelivery::PossiblySent => match message {
+            MetadataTransportMessage::ForwardCreateDocument { .. } => RetryDisposition::TryNext,
+            MetadataTransportMessage::ForwardUpdateDocument { .. }
+            | MetadataTransportMessage::ForwardDeleteDocument { .. } => RetryDisposition::Stop,
+            _ => RetryDisposition::Stop,
+        },
+    }
 }
 
 fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
@@ -679,6 +706,49 @@ mod tests {
         assert_eq!(
             write_route(None, &PlacementRef::NIL, node(1)),
             MetadataWriteRoute::Local
+        );
+    }
+
+    #[test]
+    fn ambiguous_mutations_stop() {
+        let update = MetadataTransportMessage::ForwardUpdateDocument {
+            auth_token: None,
+            document_id: Ulid::nil(),
+            public: None,
+            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+        };
+        let delete = MetadataTransportMessage::ForwardDeleteDocument {
+            auth_token: None,
+            document_id: Ulid::nil(),
+        };
+        let create = MetadataTransportMessage::ForwardCreateDocument {
+            auth_token: None,
+            group_id: Ulid::nil(),
+            document_id: Ulid::nil(),
+            document_path: "datasets/forwarded".to_string(),
+            public: false,
+            payload: crate::create_metadata_document::CreateMetadataDocumentPayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+        };
+
+        assert_eq!(
+            retry_disposition(&update, MetadataRequestDelivery::PossiblySent),
+            RetryDisposition::Stop
+        );
+        assert_eq!(
+            retry_disposition(&delete, MetadataRequestDelivery::PossiblySent),
+            RetryDisposition::Stop
+        );
+        assert_eq!(
+            retry_disposition(&update, MetadataRequestDelivery::DefinitelyNotSent),
+            RetryDisposition::TryNext
+        );
+        assert_eq!(
+            retry_disposition(&create, MetadataRequestDelivery::PossiblySent),
+            RetryDisposition::TryNext
         );
     }
 }
