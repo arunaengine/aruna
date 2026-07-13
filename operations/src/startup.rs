@@ -250,8 +250,32 @@ async fn restore_held_shard_topics(
         if peers.is_empty() || topics.is_empty() {
             continue;
         }
-        let event = net_handle.sync_document_topics(topics, peers).await;
+        let mut current_holders = peers.clone();
+        current_holders.push(node_id);
+        current_holders.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        // Install publisher policy before pulling history. Missing topics are
+        // expected and get an exact membership pass after a successful join.
+        let _ = net_handle
+            .reconcile_shard_membership(&topics, current_holders.clone())
+            .await;
+        let event = net_handle.sync_document_topics(topics.clone(), peers).await;
         apply_restored_reconcile(context, node_id, event).await;
+        let present: Vec<::irokle::TopicId> = topics
+            .into_iter()
+            .filter(|topic| {
+                net_handle
+                    .document_sync_topic_exists(*topic)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !present.is_empty()
+            && let Err(error) = net_handle
+                .reconcile_shard_membership(&present, current_holders)
+                .await
+        {
+            warn!(error = %error, "Failed to reconcile joined shard membership on restart");
+            withheld = true;
+        }
     }
     withheld
 }

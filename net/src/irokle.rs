@@ -109,6 +109,24 @@ struct PublishEventsOutcome {
     retry_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ShardPublisherPolicy {
+    current: BTreeSet<irokle_crate::ActorId>,
+    // Existing history remains applicable across holder replacement. Once a
+    // topic is local, only former-holder ops above this cutover clock are stale.
+    history_cutoff: Option<irokle_crate::ActorClock>,
+}
+
+impl ShardPublisherPolicy {
+    fn allows(&self, actor_id: &irokle_crate::ActorId, actor_seq: u64) -> bool {
+        self.current.contains(actor_id)
+            || self
+                .history_cutoff
+                .as_ref()
+                .is_none_or(|cutoff| actor_seq <= cutoff.get(actor_id))
+    }
+}
+
 /// Outcome of probing a shard's co-holders for an existing genesis before a
 /// rank-0 holder considers creating a fresh one. A genesis may be created only
 /// when every co-holder was reached (`unreachable` empty), none advertised the
@@ -136,6 +154,7 @@ pub struct DocumentSyncService {
     persist_policy: FjallPersistPolicy,
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
+    shard_publishers: Arc<RwLock<BTreeMap<irokle_crate::TopicId, ShardPublisherPolicy>>>,
     storage_path: PathBuf,
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     // Genesis tie-break evictions from every admission path (irokle's own
@@ -226,6 +245,7 @@ impl DocumentSyncService {
             persist_policy,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
+            shard_publishers: Arc::new(RwLock::new(BTreeMap::new())),
             storage_path,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             eviction_tx,
@@ -484,6 +504,144 @@ impl DocumentSyncService {
                         topic_id,
                         actor_id,
                         TopicControl::AddPeer { peer },
+                        self.node.signer(),
+                    )
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            }
+            self.net.schedule_topic_recheck(topic_id)?;
+        }
+
+        self.flush_database()
+    }
+
+    /// Reconciles shard-only topic membership to the authoritative current
+    /// holder set. The publisher cutover is installed before controls are
+    /// emitted, so later events from a removed holder cannot apply while
+    /// pre-cutover replacement history remains usable. Shared topics and the
+    /// default peer set are intentionally untouched.
+    pub async fn reconcile_shard_membership(
+        &self,
+        topics: &[irokle_crate::TopicId],
+        holders: Vec<NodeId>,
+    ) -> Result<()> {
+        if topics.is_empty() {
+            return Ok(());
+        }
+
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        let holder_peers: BTreeSet<PeerId> = holders
+            .into_iter()
+            .map(|node_id| node_id_to_peer_id(&node_id))
+            .collect();
+        let local_peer = self.node.peer_id();
+        if !holder_peers.contains(&local_peer) {
+            return Err(NetError::Bootstrap(
+                "local node is not an authoritative shard holder".to_string(),
+            ));
+        }
+
+        let mut seen_topics = BTreeSet::new();
+        let topics: Vec<irokle_crate::TopicId> = topics
+            .iter()
+            .copied()
+            .filter(|topic_id| seen_topics.insert(*topic_id))
+            .collect();
+        let mut states = Vec::with_capacity(topics.len());
+        let mut policies = Vec::with_capacity(topics.len());
+        let mut missing_topic = None;
+        for topic_id in topics {
+            let state = self
+                .node
+                .storage()
+                .topic_state(&topic_id)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            let current = holder_peers
+                .iter()
+                .copied()
+                .map(|peer| irokle_crate::actor_id_for(topic_id, peer))
+                .collect();
+            match state {
+                Some(state) => {
+                    if state.event_type_id != DocumentSyncEvent::TYPE_ID {
+                        return Err(NetError::Bootstrap(format!(
+                            "Document sync topic {topic_id} has event type {}, expected {}",
+                            state.event_type_id,
+                            DocumentSyncEvent::TYPE_ID
+                        )));
+                    }
+                    let history_cutoff = self
+                        .node
+                        .storage()
+                        .actor_clock(&topic_id)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                    policies.push((
+                        topic_id,
+                        ShardPublisherPolicy {
+                            current,
+                            history_cutoff: Some(history_cutoff),
+                        },
+                    ));
+                    states.push((topic_id, state));
+                }
+                None => {
+                    missing_topic.get_or_insert(topic_id);
+                    policies.push((
+                        topic_id,
+                        ShardPublisherPolicy {
+                            current,
+                            history_cutoff: None,
+                        },
+                    ));
+                }
+            }
+        }
+        self.shard_publishers.write().extend(policies);
+        let sync_peers: BTreeSet<PeerId> = holder_peers
+            .iter()
+            .copied()
+            .filter(|peer| *peer != local_peer)
+            .collect();
+        self.allow_sync_peers(&sync_peers)?;
+        if let Some(topic_id) = missing_topic {
+            return Err(NetError::Bootstrap(format!(
+                "document sync topic {topic_id} is missing"
+            )));
+        }
+
+        let oplog = Oplog::with_storage(self.node.storage().clone());
+        for (topic_id, state) in states {
+            let missing_peers = holder_peers
+                .iter()
+                .copied()
+                .filter(|peer| *peer != local_peer && !state.members.contains(peer))
+                .collect::<Vec<_>>();
+            let stale_peers = state
+                .members
+                .iter()
+                .copied()
+                .filter(|peer| !holder_peers.contains(peer))
+                .collect::<Vec<_>>();
+            if missing_peers.is_empty() && stale_peers.is_empty() {
+                continue;
+            }
+
+            let actor_id = irokle_crate::actor_id_for(topic_id, local_peer);
+            for peer in missing_peers {
+                oplog
+                    .create_control_op(
+                        topic_id,
+                        actor_id,
+                        TopicControl::AddPeer { peer },
+                        self.node.signer(),
+                    )
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            }
+            for peer in stale_peers {
+                oplog
+                    .create_control_op(
+                        topic_id,
+                        actor_id,
+                        TopicControl::RemovePeer { peer },
                         self.node.signer(),
                     )
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -1706,7 +1864,20 @@ impl DocumentSyncService {
             let mut deferred_creates = false;
             let mut deferred_admin_events = Vec::new();
             let mut satisfied_admin_dependencies = BTreeSet::new();
-            for (event, actor_id) in events {
+            for (event, actor_id, actor_seq) in events {
+                if self
+                    .shard_publishers
+                    .read()
+                    .get(&topic_id)
+                    .is_some_and(|policy| !policy.allows(&actor_id, actor_seq))
+                {
+                    warn!(
+                        %topic_id,
+                        %actor_id,
+                        "Rejecting shard event from a publisher outside the current holder set"
+                    );
+                    continue;
+                }
                 let target_topic_id = event
                     .target()
                     .sync_topic_id(self.realm_id, &event.placement());
@@ -2245,21 +2416,22 @@ impl DocumentSyncService {
 
     /// Returns the decoded document events above the applied cursor, reading
     /// only the unapplied portion of the topic history where possible. Each
-    /// event is paired with the authenticated `actor_id` of the op that carried
-    /// it: irokle admits an op only after verifying its signature against
-    /// `body.author` and enforcing `actor_id == actor_id_for(topic, author)`, so
-    /// the returned actor id is a trustworthy proxy for the signed publisher.
+    /// event is paired with the authenticated actor id and sequence of the op
+    /// that carried it: irokle admits an op only after verifying its signature
+    /// against `body.author` and enforcing
+    /// `actor_id == actor_id_for(topic, author)`, so the returned actor id is a
+    /// trustworthy proxy for the signed publisher.
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
-    ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId)>> {
+    ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>> {
         match self.node.open_topic::<DocumentSyncEvent>(topic_id) {
             Ok(topic) => Ok(topic
                 .history_after(cursor, HistoryOrder::OldestFirst)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 .into_iter()
-                .map(|record| (record.event, record.meta.actor_id))
+                .map(|record| (record.event, record.meta.actor_id, record.meta.actor_seq))
                 .collect()),
             // Topics we hold ops for without being a listed member still
             // reconcile via the full history.
@@ -2277,6 +2449,7 @@ impl DocumentSyncService {
                         continue;
                     }
                     let actor_id = op.signed.body.actor_id;
+                    let actor_seq = op.signed.body.actor_seq;
                     let TopicPayload::Event(envelope) = op.signed.body.payload else {
                         continue;
                     };
@@ -2285,6 +2458,7 @@ impl DocumentSyncService {
                             .decode_event::<DocumentSyncEvent>()
                             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                         actor_id,
+                        actor_seq,
                     ));
                 }
                 Ok(events)
@@ -11631,5 +11805,218 @@ mod tests {
         );
 
         service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shard_membership_exact() {
+        let (_dir, storage) = test_storage();
+        let doc = tempfile::tempdir().expect("document sync dir");
+        let realm_id = restart_realm();
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(80).await,
+            storage,
+            doc.path().join("document-sync"),
+            &[node(81), node(82)],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("document sync service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let current_node = node(81);
+        let stale_node = node(82);
+        let shard_topic = restart_topic();
+        let shared_topic = DocumentSyncTarget::RealmConfig { realm_id }
+            .sync_topic_id(realm_id, &PlacementRef::NIL);
+
+        service
+            .ensure_document_sync_topics(&[shard_topic], vec![current_node, stale_node])
+            .expect("shard topic exists");
+        service
+            .ensure_document_sync_topics(&[shared_topic], vec![stale_node])
+            .expect("shared topic exists");
+
+        service
+            .reconcile_shard_membership(&[shard_topic], vec![local_node, current_node])
+            .await
+            .expect("shard membership reconciles");
+
+        let shard_state = service
+            .node()
+            .storage()
+            .topic_state(&shard_topic)
+            .expect("shard state reads")
+            .expect("shard state exists");
+        assert!(
+            shard_state
+                .members
+                .contains(&node_id_to_peer_id(&local_node))
+        );
+        assert!(
+            shard_state
+                .members
+                .contains(&node_id_to_peer_id(&current_node))
+        );
+        assert!(
+            !shard_state
+                .members
+                .contains(&node_id_to_peer_id(&stale_node))
+        );
+
+        let shared_state = service
+            .node()
+            .storage()
+            .topic_state(&shared_topic)
+            .expect("shared state reads")
+            .expect("shared state exists");
+        assert!(
+            shared_state
+                .members
+                .contains(&node_id_to_peer_id(&stale_node)),
+            "exact shard reconciliation must not alter shared topics"
+        );
+        assert!(
+            service
+                .default_peers
+                .read()
+                .contains(&node_id_to_peer_id(&stale_node)),
+            "former shard holders remain available as default network peers"
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_publisher_rejected() {
+        let (_receiver_dir, receiver_storage) = test_storage();
+        let (_publisher_dir, publisher_storage) = test_storage();
+        let receiver_doc = tempfile::tempdir().expect("receiver document sync dir");
+        let publisher_doc = tempfile::tempdir().expect("publisher document sync dir");
+        let realm_id = restart_realm();
+        let receiver = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(83).await,
+            receiver_storage.clone(),
+            receiver_doc.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("receiver opens");
+        let publisher = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(84).await,
+            publisher_storage,
+            publisher_doc.path().join("document-sync"),
+            &[],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("publisher opens");
+        let receiver_node = receiver.local_node_id().expect("receiver node id");
+        let publisher_node = publisher.local_node_id().expect("publisher node id");
+        let topic_id = restart_topic();
+
+        receiver
+            .ensure_document_sync_topics(&[topic_id], vec![publisher_node])
+            .expect("receiver creates shard topic");
+        let receiver_ops = irokle_crate::oplog::topological(receiver.node().storage(), &topic_id)
+            .expect("receiver history reads");
+        publisher
+            .node()
+            .receive_sync_data_from_evicting(
+                node_id_to_peer_id(&receiver_node),
+                SyncData {
+                    topic_id,
+                    ops: receiver_ops,
+                },
+            )
+            .expect("publisher adopts shard genesis");
+
+        let published = publisher
+            .publish_documents(
+                vec![DocumentSyncPublish::Upsert {
+                    event_id: restart_event_id(),
+                    target: restart_target(),
+                    bytes: restart_payload(),
+                    change: revision_change(),
+                    allow_genesis: false,
+                }],
+                vec![receiver_node],
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentSyncNetEvent::DocumentsPublished { .. }
+        ));
+        let publisher_ops = irokle_crate::oplog::topological(publisher.node().storage(), &topic_id)
+            .expect("publisher history reads");
+        receiver
+            .reconcile_shard_membership(&[topic_id], vec![receiver_node])
+            .await
+            .expect("former holder is removed");
+        receiver
+            .node()
+            .receive_sync_data_from_evicting(
+                node_id_to_peer_id(&publisher_node),
+                SyncData {
+                    topic_id,
+                    ops: publisher_ops,
+                },
+            )
+            .expect("receiver admits the publisher's pre-removal causal history");
+        let result = receiver
+            .reconcile_document_topics([topic_id])
+            .await
+            .expect("stale publisher event is skipped");
+        assert!(
+            result.targets.is_empty(),
+            "a former holder's shard event must not apply"
+        );
+        assert!(
+            read_storage_value(
+                &receiver_storage,
+                restart_target().storage_keyspace(),
+                restart_target().storage_key(),
+            )
+            .await
+            .is_none(),
+            "rejected event must not mutate document storage"
+        );
+
+        let cursor_bytes = read_storage_value(
+            &receiver_storage,
+            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+            topic_cursor_key(topic_id),
+        )
+        .await
+        .expect("cursor persisted");
+        let cursor: irokle_crate::ActorClock =
+            postcard::from_bytes(&cursor_bytes).expect("cursor decodes");
+        let topic_clock = receiver
+            .node()
+            .storage()
+            .actor_clock(&topic_id)
+            .expect("topic clock reads");
+        assert!(
+            cursor.dominates(&topic_clock),
+            "rejected stale-holder event must not wedge reconciliation"
+        );
+        let retained_events =
+            irokle_crate::oplog::topological(receiver.node().storage(), &topic_id)
+                .expect("retained history reads")
+                .into_iter()
+                .filter(|op| matches!(&op.signed.body.payload, TopicPayload::Event(_)))
+                .count();
+        assert_eq!(
+            retained_events, 1,
+            "membership changes retain event history"
+        );
+
+        publisher.shutdown().await;
+        receiver.shutdown().await;
     }
 }

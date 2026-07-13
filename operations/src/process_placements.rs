@@ -104,6 +104,15 @@ async fn ensure_held_shard_topics(
         if co_holders.is_empty() {
             continue;
         }
+        let mut current_holders = co_holders.clone();
+        current_holders.push(local_node_id);
+        sort_node_ids(&mut current_holders);
+        // Install the current publisher policy before pulling any history. A
+        // missing topic is expected here; the exact membership pass below is
+        // repeated after a successful pull.
+        let _ = net_handle
+            .reconcile_shard_membership(&topics, current_holders.clone())
+            .await;
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
                 net_handle
@@ -137,7 +146,10 @@ async fn ensure_held_shard_topics(
         if known.is_empty() {
             continue;
         }
-        if let Err(error) = net_handle.allow_document_sync_peers(&known, co_holders) {
+        if let Err(error) = net_handle
+            .reconcile_shard_membership(&known, current_holders)
+            .await
+        {
             debug!(error = %error, "Could not complete held shard topic membership");
             outcome.withheld = true;
         }
@@ -167,6 +179,15 @@ pub(crate) async fn ensure_rank0_shard_group(
     co_holders: Vec<NodeId>,
     topics: Vec<::irokle::TopicId>,
 ) -> bool {
+    let mut current_holders = co_holders.clone();
+    current_holders.push(local_node_id);
+    sort_node_ids(&mut current_holders);
+    // This first pass installs publisher policy even when a topic still needs
+    // to be adopted or created. Exact membership is retried once it exists.
+    let _ = net_handle
+        .reconcile_shard_membership(&topics, current_holders.clone())
+        .await;
+
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
     let mut missing: Vec<::irokle::TopicId> = Vec::new();
     for topic in topics {
@@ -230,11 +251,22 @@ pub(crate) async fn ensure_rank0_shard_group(
         }
     }
 
-    if !to_ensure.is_empty()
-        && let Err(error) = net_handle.ensure_document_sync_topics(&to_ensure, co_holders)
-    {
-        warn!(error = %error, "Failed to ensure rank-0 shard topics");
-        withheld = true;
+    if !to_ensure.is_empty() {
+        match net_handle.ensure_document_sync_topics(&to_ensure, co_holders) {
+            Ok(()) => {
+                if let Err(error) = net_handle
+                    .reconcile_shard_membership(&to_ensure, current_holders)
+                    .await
+                {
+                    warn!(error = %error, "Failed to reconcile rank-0 shard membership");
+                    withheld = true;
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to ensure rank-0 shard topics");
+                withheld = true;
+            }
+        }
     }
     withheld
 }
@@ -298,10 +330,10 @@ enum RealmConfigLoadOutcome {
 /// from a co-holder. Then iterates the
 /// [`SYNC_PLACEMENT_KEYSPACE`] records the write path left behind (one per
 /// shard that was not fully replicated at write time), re-resolves each
-/// shard's holder set from the current realm config, and adds every co-holder
-/// as a member of the shard topic. Membership changes schedule an irokle topic
-/// recheck, so the resync loop then pushes the shard's events to any freshly
-/// added co-holder. A record whose co-holders are all members is removed; a
+/// shard's holder set from the current realm config, and makes those holders
+/// the shard topic's exact members and accepted publishers. Membership changes
+/// schedule an irokle topic recheck, so the resync loop then pushes the shard's
+/// events to any freshly added co-holder. A satisfied record is removed; a
 /// record the local node no longer holds is dropped; a record whose shard
 /// topic has no genesis locally yet (non-rank-0 holder, genesis in flight) is
 /// kept for retry.
@@ -391,9 +423,9 @@ pub async fn process_shard_placements(
                 .await;
                 continue;
             }
-            let local_is_rank0 = holders.first() == Some(&local_node_id);
             let mut co_holders: Vec<NodeId> = holders
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|node_id| *node_id != local_node_id)
                 .collect();
             sort_node_ids(&mut co_holders);
@@ -429,13 +461,11 @@ pub async fn process_shard_placements(
                 retry_needed = true;
                 continue;
             }
-            // The topic exists locally, so ensure only adds members (never
-            // creates); a non-rank-0 holder likewise only adds members.
-            let membership = if local_is_rank0 {
-                net_handle.ensure_document_sync_topics(&[topic], co_holders.clone())
-            } else {
-                net_handle.allow_document_sync_peers(&[topic], co_holders.clone())
-            };
+            // The topic exists locally, so reconcile its exact canonical holder
+            // set without creating a genesis or changing shared/default peers.
+            let membership = net_handle
+                .reconcile_shard_membership(&[topic], holders)
+                .await;
             match membership {
                 Ok(()) => {
                     // Every co-holder is now a member; the resync loop delivers
