@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use aruna_core::NodeId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
 use aruna_core::structs::{PlacementRef, RealmId};
@@ -53,42 +55,61 @@ pub enum ShardTransportResponse {
     ManifestPageV2(Box<ShardManifestPage>),
 }
 
-/// Partitions a manifest greedily and deterministically while measuring the
-/// actual postcard representation used by response frames.
-pub(crate) fn partition_manifest(
+pub(crate) struct ManifestPagePlan {
+    entry_count: u64,
+    entry_digest: [u8; 32],
+    ranges: Vec<Range<usize>>,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+enum BorrowedShardTransportResponse<'a> {
+    Manifest,
+    Reject,
+    ManifestPageV2(BorrowedShardManifestPage<'a>),
+}
+
+#[derive(Serialize)]
+struct BorrowedShardManifestPage<'a> {
+    placement: PlacementRef,
+    holder: NodeId,
+    cursor: &'a [u8],
+    digest: [u8; 32],
+    updated_at_ms: u64,
+    entry_count: u64,
+    entry_digest: [u8; 32],
+    page_index: u32,
+    last: bool,
+    entries: &'a [ShardManifestEntry],
+}
+
+pub(crate) fn plan_manifest_pages(
     manifest: &ShardManifest,
     max_size: usize,
-) -> Result<Vec<ShardManifestPage>, String> {
+) -> Result<ManifestPagePlan, String> {
     let entry_count = u64::try_from(manifest.entries.len())
         .map_err(|_| "shard manifest entry count exceeds protocol range".to_string())?;
     let entry_digest = manifest_entry_digest(&manifest.entries);
     let entry_sizes = manifest
         .entries
         .iter()
-        .map(|entry| {
-            postcard::to_allocvec(entry)
-                .map(|bytes| bytes.len())
-                .map_err(|error| error.to_string())
-        })
+        .map(serialized_size)
         .collect::<Result<Vec<_>, _>>()?;
-    let empty_entries_size = postcard::to_allocvec(&Vec::<ShardManifestEntry>::new())
-        .map_err(|error| error.to_string())?
-        .len();
+    let empty_entries_size = serialized_size(&Vec::<ShardManifestEntry>::new())?;
 
-    let mut pages = Vec::new();
+    let mut ranges = Vec::new();
     let mut start = 0;
     loop {
-        let page_index = u32::try_from(pages.len())
+        let page_index = u32::try_from(ranges.len())
             .map_err(|_| "shard manifest requires too many pages".to_string())?;
-        let empty_page = manifest_page(
+        let empty_page_size = serialized_size(&borrowed_page_response(
             manifest,
             entry_count,
             entry_digest,
             page_index,
             false,
-            Vec::new(),
-        );
-        let empty_page_size = encoded_page_size(&empty_page)?;
+            &[],
+        ))?;
         let fixed_size = empty_page_size
             .checked_sub(empty_entries_size)
             .ok_or_else(|| "invalid shard manifest page encoding".to_string())?;
@@ -119,29 +140,110 @@ pub(crate) fn partition_manifest(
             return Err("shard manifest entry exceeds maximum page size".to_string());
         }
 
-        pages.push(manifest_page(
-            manifest,
-            entry_count,
-            entry_digest,
-            page_index,
-            false,
-            manifest.entries[start..end].to_vec(),
-        ));
+        ranges.push(start..end);
         start = end;
         if start == manifest.entries.len() {
             break;
         }
     }
 
-    pages.last_mut().expect("at least one manifest page").last = true;
-    for page in &pages {
-        if encoded_page_size(page)? > max_size {
+    for (index, range) in ranges.iter().enumerate() {
+        let page_index = u32::try_from(index)
+            .map_err(|_| "shard manifest requires too many pages".to_string())?;
+        let response = borrowed_page_response(
+            manifest,
+            entry_count,
+            entry_digest,
+            page_index,
+            index + 1 == ranges.len(),
+            &manifest.entries[range.clone()],
+        );
+        if serialized_size(&response)? > max_size {
             return Err("shard manifest page exceeds maximum size".to_string());
         }
     }
-    Ok(pages)
+
+    Ok(ManifestPagePlan {
+        entry_count,
+        entry_digest,
+        ranges,
+    })
 }
 
+pub(crate) async fn write_manifest_pages(
+    stream: &mut BiStream,
+    manifest: &ShardManifest,
+    plan: &ManifestPagePlan,
+) -> Result<(), String> {
+    for (index, range) in plan.ranges.iter().enumerate() {
+        let page_index = u32::try_from(index)
+            .map_err(|_| "shard manifest requires too many pages".to_string())?;
+        let response = borrowed_page_response(
+            manifest,
+            plan.entry_count,
+            plan.entry_digest,
+            page_index,
+            index + 1 == plan.ranges.len(),
+            &manifest.entries[range.clone()],
+        );
+        write_frame(stream, &response, SHARD_MAX_RESPONSE_SIZE).await?;
+    }
+    Ok(())
+}
+
+fn borrowed_page_response<'a>(
+    manifest: &'a ShardManifest,
+    entry_count: u64,
+    entry_digest: [u8; 32],
+    page_index: u32,
+    last: bool,
+    entries: &'a [ShardManifestEntry],
+) -> BorrowedShardTransportResponse<'a> {
+    BorrowedShardTransportResponse::ManifestPageV2(BorrowedShardManifestPage {
+        placement: manifest.placement,
+        holder: manifest.holder,
+        cursor: &manifest.cursor,
+        digest: manifest.digest,
+        updated_at_ms: manifest.updated_at_ms,
+        entry_count,
+        entry_digest,
+        page_index,
+        last,
+        entries,
+    })
+}
+
+fn serialized_size<T: Serialize + ?Sized>(value: &T) -> Result<usize, String> {
+    postcard::serialize_with_flavor(value, postcard::ser_flavors::Size::default())
+        .map_err(|error| error.to_string())
+}
+
+/// Partitions a manifest greedily and deterministically while measuring the
+/// actual postcard representation used by response frames.
+#[cfg(test)]
+pub(crate) fn partition_manifest(
+    manifest: &ShardManifest,
+    max_size: usize,
+) -> Result<Vec<ShardManifestPage>, String> {
+    let plan = plan_manifest_pages(manifest, max_size)?;
+    Ok(plan
+        .ranges
+        .iter()
+        .enumerate()
+        .map(|(index, range)| {
+            manifest_page(
+                manifest,
+                plan.entry_count,
+                plan.entry_digest,
+                index as u32,
+                index + 1 == plan.ranges.len(),
+                manifest.entries[range.clone()].to_vec(),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
 fn manifest_page(
     manifest: &ShardManifest,
     entry_count: u64,
@@ -164,6 +266,7 @@ fn manifest_page(
     }
 }
 
+#[cfg(test)]
 fn encoded_page_size(page: &ShardManifestPage) -> Result<usize, String> {
     postcard::to_allocvec(&ShardTransportResponse::ManifestPageV2(Box::new(
         page.clone(),
@@ -173,9 +276,7 @@ fn encoded_page_size(page: &ShardManifestPage) -> Result<usize, String> {
 }
 
 fn encoded_len(len: usize) -> Result<usize, String> {
-    postcard::to_allocvec(&len)
-        .map(|bytes| bytes.len())
-        .map_err(|error| error.to_string())
+    serialized_size(&len)
 }
 
 #[derive(Debug, PartialEq, Eq)]
