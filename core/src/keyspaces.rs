@@ -61,6 +61,7 @@ pub const JOB_KEYSPACE: &str = "jobs";
 pub const JOB_SCHEDULE_INDEX_KEYSPACE: &str = "job_schedule_index";
 pub const JOB_OWNER_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const JOB_DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
+pub const JOB_RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 

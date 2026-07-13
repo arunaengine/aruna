@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -9,7 +10,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::invert_timestamp_ms;
-use crate::types::{Key, UserId};
+use crate::types::{GroupId, Key, UserId};
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).
 pub const JOB_RECORD_KEY_PREFIX: &[u8] = b"jobs-v1/";
@@ -119,6 +120,58 @@ impl JobState {
     }
 }
 
+/// How an input is captured into the workspace. v1 supports snapshot only:
+/// resolved bytes are copied into the workspace at submit time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputMode {
+    Snapshot,
+}
+
+/// Where an input comes from. v1 supports internal S3 objects only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputSource {
+    S3 {
+        bucket: String,
+        key: String,
+        version_id: Option<String>,
+    },
+}
+
+/// One declared input and where it lands in the workspace bucket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSelection {
+    pub source: InputSource,
+    /// Destination key inside the workspace bucket (16.4 non-overlapping).
+    pub dest_key: String,
+    pub mode: InputMode,
+}
+
+/// Resource ceilings requested for the container. `None` fills from backend defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeResources {
+    pub cpu_cores: Option<u32>,
+    pub ram_bytes: Option<u64>,
+    pub max_walltime_ms: Option<u64>,
+}
+
+/// The container plan carried by a `JobPayload::Execution`. Bounded per spec 16.2.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSpec {
+    /// Workspace parent group; also the credential/crate authorization scope.
+    pub group_id: GroupId,
+    pub image: String,
+    /// Overrides the image ENTRYPOINT when set.
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub resources: ComputeResources,
+    /// Pin a backend wire kind (`docker`); `None` runs on any enabled backend.
+    pub executor_constraint: Option<String>,
+    pub inputs: Vec<InputSelection>,
+    /// Declared output prefixes in the workspace, inventoried at completion.
+    pub output_prefixes: Vec<String>,
+}
+
 /// Closed job payload enum, keeping the typed-queue discipline of `TaskKey` and
 /// `DocumentSyncOutboxEvent`. Additive-only until a version envelope lands (#286).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +185,12 @@ pub enum JobPayload {
         panic_at: Option<u32>,
         cleanup_marker: Option<String>,
     },
+    /// Run a container against an S3 workspace; the sole `ExternalAttempt` payload.
+    Execution(ExecutionSpec),
+    /// Follow-on internal obligation: write the run crate for a finished execution
+    /// job. Idempotent by dedup key `run-crate/{JobId}`; a failure never affects
+    /// the parent job.
+    WriteRunCrate { for_job: JobId },
 }
 
 impl JobPayload {
@@ -139,6 +198,8 @@ impl JobPayload {
     pub fn kind(&self) -> &'static str {
         match self {
             JobPayload::Probe { .. } => "probe",
+            JobPayload::Execution(_) => "execution",
+            JobPayload::WriteRunCrate { .. } => "write_run_crate",
         }
     }
 
@@ -146,14 +207,19 @@ impl JobPayload {
     pub fn progress_unit(&self) -> &'static str {
         match self {
             JobPayload::Probe { .. } => "steps",
+            JobPayload::Execution(_) => "phases",
+            JobPayload::WriteRunCrate { .. } => "steps",
         }
     }
 
     /// Execution class. Internal payloads are safe to requeue; external attempts
-    /// are not. The future `Execution` payload (Stage 2) is `ExternalAttempt`.
+    /// are not. Only `Execution` drives an external container.
     pub fn execution_class(&self) -> JobExecutionClass {
         match self {
-            JobPayload::Probe { .. } => JobExecutionClass::InProcess,
+            JobPayload::Probe { .. } | JobPayload::WriteRunCrate { .. } => {
+                JobExecutionClass::InProcess
+            }
+            JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
 
@@ -201,16 +267,38 @@ pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), Conversi
     Ok((job_id, plan_digest))
 }
 
+/// One output object inventoried in the workspace at completion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputObject {
+    pub key: String,
+    pub size: u64,
+    /// Hex BLAKE3 digest when known.
+    pub digest: Option<String>,
+}
+
 /// Closed result enum parallel to `JobPayload`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobResultPayload {
-    Probe { completed_steps: u32 },
+    Probe {
+        completed_steps: u32,
+    },
+    Execution {
+        /// Container exit code; `None` when the outcome is evidence-free.
+        exit_code: Option<i32>,
+        workspace_bucket: String,
+        outputs: Vec<OutputObject>,
+    },
+    RunCrate {
+        resource: String,
+    },
 }
 
 impl JobResultPayload {
     pub fn kind(&self) -> &'static str {
         match self {
             JobResultPayload::Probe { .. } => "probe",
+            JobResultPayload::Execution { .. } => "execution",
+            JobResultPayload::RunCrate { .. } => "run_crate",
         }
     }
 
@@ -219,6 +307,69 @@ impl JobResultPayload {
         match self {
             JobResultPayload::Probe { completed_steps } => {
                 serde_json::json!({ "completed_steps": completed_steps })
+            }
+            JobResultPayload::Execution {
+                exit_code,
+                workspace_bucket,
+                outputs,
+            } => serde_json::json!({
+                "exit_code": exit_code,
+                "workspace_bucket": workspace_bucket,
+                "outputs": outputs
+                    .iter()
+                    .map(|output| serde_json::json!({
+                        "key": output.key,
+                        "size": output.size,
+                        "digest": output.digest,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            JobResultPayload::RunCrate { resource } => {
+                serde_json::json!({ "resource": resource })
+            }
+        }
+    }
+}
+
+/// Terminal outcome of the run-crate obligation, stored in a side keyspace so the
+/// immutable terminal parent record is never rewritten. Surfaced on the job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunCrateStatus {
+    Pending,
+    Written { resource: String },
+    Denied { message: String },
+    Failed { message: String },
+}
+
+impl RunCrateStatus {
+    pub fn name(&self) -> &'static str {
+        match self {
+            RunCrateStatus::Pending => "pending",
+            RunCrateStatus::Written { .. } => "written",
+            RunCrateStatus::Denied { .. } => "denied",
+            RunCrateStatus::Failed { .. } => "failed",
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn to_public_json(&self) -> serde_json::Value {
+        match self {
+            RunCrateStatus::Pending => serde_json::json!({ "status": "pending" }),
+            RunCrateStatus::Written { resource } => {
+                serde_json::json!({ "status": "written", "resource": resource })
+            }
+            RunCrateStatus::Denied { message } => {
+                serde_json::json!({ "status": "denied", "message": message })
+            }
+            RunCrateStatus::Failed { message } => {
+                serde_json::json!({ "status": "failed", "message": message })
             }
         }
     }
@@ -308,6 +459,8 @@ pub struct JobRecord {
     pub execution_class: JobExecutionClass,
     pub plan_digest: Option<[u8; 32]>,
     pub attempt_intent: Option<AttemptIntent>,
+    /// Durable workspace/run bucket name (`ws-{jobid}`) for execution jobs.
+    pub workspace_bucket: Option<String>,
 }
 
 impl JobRecord {
@@ -345,7 +498,13 @@ impl JobRecord {
             execution_class,
             plan_digest,
             attempt_intent: None,
+            workspace_bucket: None,
         }
+    }
+
+    /// The run bucket name for an execution job, deterministic from the id.
+    pub fn workspace_bucket_name(job_id: JobId) -> String {
+        format!("ws-{}", job_id.to_string().to_lowercase())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -435,6 +594,16 @@ pub fn job_record_key(job_id: JobId) -> Key {
     bytes.extend_from_slice(JOB_RECORD_KEY_PREFIX);
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
+}
+
+/// Side-row key holding the run-crate obligation status for an execution job.
+pub fn job_run_crate_key(job_id: JobId) -> Key {
+    ByteView::from(job_id.to_bytes().to_vec())
+}
+
+/// Dedup key of the follow-on `WriteRunCrate` obligation for `job_id`.
+pub fn run_crate_dedup_key(job_id: JobId) -> Vec<u8> {
+    format!("run-crate/{job_id}").into_bytes()
 }
 
 fn schedule_index_key(prefix: &[u8], timestamp_ms: u64, job_id: JobId) -> Key {
