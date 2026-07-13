@@ -78,10 +78,13 @@ struct ClockAnchor {
     monotonic_ms: u64,
 }
 
-/// Structured-ID generator: a monotonic ULID timestamp with a per
-/// `(timestamp_ms, handle, bucket)` monotonic nonce and a forward-clock-jump
-/// guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). It never emits a
-/// generic ULID, so the structured fields are always preserved.
+/// Structured-ID generator: a monotonic ULID timestamp with a forward-clock-
+/// jump guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). The nonce
+/// increments only across consecutive mints of the same
+/// `(timestamp_ms, handle, bucket)`; any other mint draws a fresh random
+/// nonce, so uniqueness rests on the 48 random bits, not on monotonicity.
+/// It never emits a generic ULID, so the structured fields are always
+/// preserved.
 pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
     env: E,
     max_skew_ms: u64,
@@ -228,7 +231,9 @@ mod tests {
 
     #[test]
     fn nonce_monotonic() {
-        // Same millisecond and same (handle, bucket): the nonce increments by one.
+        // Consecutive mints in the same millisecond for the same
+        // (handle, bucket) increment the nonce by one; any interleaved mint
+        // for another key would reset it to a fresh random nonce.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [100, 200]), 300_000);
         let (handle, bucket) = handle_bucket();
