@@ -44,7 +44,10 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use ulid::Ulid;
 
-const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+// Positive delivery waits poll to a condition; the ceiling only bounds a genuine
+// hang, so it carries generous headroom for a loaded CI runner where multi-node
+// watch delivery is thread-starved and slow.
+const POLL_TIMEOUT: Duration = Duration::from_secs(180);
 const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
 // Interest publication is debounced by 2s, so a few seconds comfortably bounds
 // the window an erroneous delivery would need to land in for negative assertions.
