@@ -448,7 +448,8 @@ pub enum RequeueOutcome {
 
 /// Re-queue with backoff, or fail once `JOB_MAX_ATTEMPTS` is spent. `token` is `None`
 /// for the lease sweep and startup recovery. `require_expired_before` makes the sweep
-/// re-check, in-txn, that the lease is still expired so a revived renew is not revoked.
+/// re-check, in-txn, that the job still holds an expired lease: a revived renew is not
+/// revoked, and a claim-less record (already requeued) is not charged a second attempt.
 pub async fn requeue_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -457,18 +458,22 @@ pub async fn requeue_job(
     require_expired_before: Option<u64>,
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
+    let mut persisted = false;
     let record = mutate_job(storage, job_id, |record| {
+        persisted = false;
         if let Some(token) = token {
             guard_token(record, token)?;
         }
         if record.state.is_terminal() {
             return Ok(JobMutation::Skip);
         }
-        if let Some(now) = require_expired_before
-            && let Some(claim) = &record.claim
-            && claim.lease_expires_at_ms > now
-        {
-            return Ok(JobMutation::Skip);
+        if let Some(now) = require_expired_before {
+            let Some(claim) = &record.claim else {
+                return Ok(JobMutation::Skip);
+            };
+            if claim.lease_expires_at_ms > now {
+                return Ok(JobMutation::Skip);
+            }
         }
         if let Some(error) = error.clone() {
             record.last_error = Some(error);
@@ -483,14 +488,17 @@ pub async fn requeue_job(
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
         }
+        persisted = true;
         Ok(JobMutation::Persist)
     })
     .await?;
 
-    Ok(match record.state {
-        JobState::Queued => RequeueOutcome::Requeued(record),
-        JobState::Failed => RequeueOutcome::Failed(record),
-        _ => RequeueOutcome::Skipped,
+    Ok(if !persisted {
+        RequeueOutcome::Skipped
+    } else if record.state == JobState::Failed {
+        RequeueOutcome::Failed(record)
+    } else {
+        RequeueOutcome::Requeued(record)
     })
 }
 
@@ -1134,6 +1142,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.state, JobState::Running);
+    }
+
+    // A sweep racing a completed requeue (record already Queued, claim gone) must not
+    // charge a second attempt or overwrite last_error.
+    #[tokio::test]
+    async fn sweep_skips_requeued() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([11u8; 16]);
+        let mut record = queued_record(job_id);
+        record.attempts = 1;
+        insert_job(&storage, &record).await.unwrap();
+
+        let outcome = requeue_job(
+            &storage,
+            job_id,
+            None,
+            6_000,
+            Some(6_000),
+            Some(JobError::retryable("lease expired")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::Skipped));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert_eq!(stored.attempts, 1);
+        assert!(stored.last_error.is_none());
     }
 
     #[tokio::test]
