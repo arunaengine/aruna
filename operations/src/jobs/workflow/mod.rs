@@ -5,9 +5,9 @@ pub mod workspace;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_compute::backend::{ExecutorBackend, ExecutorKind};
+use aruna_compute::backend::{BackendError, ExecutorBackend, ExecutorKind};
 use aruna_compute::spec::{AttemptRef, ResourceRequest, Secret, TaskSpec, WorkspaceBinding};
-use aruna_compute::status::{AttemptPhase, AttemptStatus, CancelEvidence};
+use aruna_compute::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
 use aruna_core::structs::{
     AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
     OutputObject, run_crate_dedup_key,
@@ -123,14 +123,11 @@ pub async fn run_execution_job(
     match backend.submit(&task_spec).await {
         Ok(_) => {}
         Err(error) => {
-            // The attempt never started; reconcile-by-name would confirm absence,
-            // but Docker submit is name-idempotent so a bare error is safe to retry.
-            let job_error = if error.retryable() {
-                JobError::retryable(format!("submit failed: {error}"))
-            } else {
-                JobError::permanent(format!("submit failed: {error}"))
-            };
-            requeue_or_fail_pre_submit(&context, job_id, token, &record, job_error).await;
+            recover_failed_submit(
+                &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket, &record,
+                cancel, error,
+            )
+            .await;
             return;
         }
     }
@@ -243,6 +240,108 @@ fn build_task_spec(
         workspace: workspace_binding,
         log_limits: Default::default(),
     }
+}
+
+/// A submit error after the write-ahead intent is ambiguous: the container may
+/// already exist (created, or even running when the final status read faulted).
+/// Requeueing would erase the intent and launch a second container under the
+/// next attempt name, so the error is resolved by the deterministic name instead.
+#[allow(clippy::too_many_arguments)]
+async fn recover_failed_submit(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
+    task_spec: &TaskSpec,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    record: &JobRecord,
+    cancel: CancellationToken,
+    error: BackendError,
+) {
+    let storage = &context.storage_handle;
+    match backend.reconcile(attempt).await {
+        // Confirmed absent: the submit failed before a container could exist, so
+        // the pre-submit routing (requeue with backoff, or terminal fail) is safe.
+        ReconcileOutcome::NotFound => {
+            let job_error = if error.retryable() {
+                JobError::retryable(format!("submit failed: {error}"))
+            } else {
+                JobError::permanent(format!("submit failed: {error}"))
+            };
+            requeue_or_fail_pre_submit(context, job_id, token, record, job_error).await;
+        }
+        // The attempt already finished: commit its evidence.
+        ReconcileOutcome::Found(status) if status.is_terminal() => {
+            if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            finalize_attempt(
+                context,
+                job_id,
+                token,
+                backend,
+                attempt,
+                spec,
+                bucket,
+                Ok(status),
+            )
+            .await;
+        }
+        // The container exists and is live: adopt it, never launch a second one.
+        // A created-but-never-started container is completed in place; the name
+        // collision makes the re-submit idempotent.
+        ReconcileOutcome::Found(status) => {
+            if matches!(status.phase, AttemptPhase::Submitted)
+                && backend.submit(task_spec).await.is_err()
+            {
+                park_failed_submit(context, job_id, token, &error).await;
+                return;
+            }
+            if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            supervise_and_finalize(
+                context.clone(),
+                job_id,
+                token,
+                backend.clone(),
+                attempt.clone(),
+                spec.clone(),
+                bucket.to_string(),
+                cancel,
+            )
+            .await;
+        }
+        // Backend unobservable: park; the retained intent keeps the attempt
+        // adoptable when the lease sweep routes the job to the reconciler.
+        ReconcileOutcome::Unavailable(_) => {
+            park_failed_submit(context, job_id, token, &error).await;
+        }
+    }
+}
+
+async fn park_failed_submit(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    error: &BackendError,
+) {
+    let _ = mark_indeterminate(
+        &context.storage_handle,
+        job_id,
+        token,
+        JobError::retryable(format!("submit failed ambiguously: {error}")),
+        unix_timestamp_millis(),
+    )
+    .await;
 }
 
 /// Heartbeat + backend wait race, then evidence-based terminalization. Shared by
@@ -647,4 +746,222 @@ fn execution_result_for(
 
 fn default_node_id() -> NodeId {
     iroh::SecretKey::from_bytes(&[0u8; 32]).public()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job};
+    use aruna_compute::logs::{LogSink, LogTails};
+    use aruna_compute::spec::LogLimits;
+    use aruna_core::structs::{ComputeResources, JobState, RealmId};
+    use aruna_core::types::UserId;
+    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_tasks::TaskHandle;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    enum StubReconcile {
+        NotFound,
+        Unavailable,
+    }
+
+    struct StubBackend {
+        reconcile: StubReconcile,
+        submits: Mutex<Vec<String>>,
+    }
+
+    impl StubBackend {
+        fn new(reconcile: StubReconcile) -> Arc<Self> {
+            Arc::new(Self {
+                reconcile,
+                submits: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorBackend for StubBackend {
+        fn kind(&self) -> ExecutorKind {
+            ExecutorKind::Docker
+        }
+        async fn health(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn submit(&self, spec: &TaskSpec) -> Result<AttemptStatus, BackendError> {
+            self.submits
+                .lock()
+                .unwrap()
+                .push(spec.attempt.external_name());
+            Err(BackendError::Unavailable("stub submit".to_string()))
+        }
+        async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+            Err(BackendError::Unavailable("stub status".to_string()))
+        }
+        async fn cancel(&self, _attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+            Ok(CancelEvidence::AlreadyGone)
+        }
+        async fn fetch_logs(
+            &self,
+            _attempt: &AttemptRef,
+            _limits: &LogLimits,
+            _sink: &dyn LogSink,
+        ) -> Result<LogTails, BackendError> {
+            unimplemented!()
+        }
+        async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
+            match self.reconcile {
+                StubReconcile::NotFound => ReconcileOutcome::NotFound,
+                StubReconcile::Unavailable => {
+                    ReconcileOutcome::Unavailable(BackendError::Unavailable("down".to_string()))
+                }
+            }
+        }
+        async fn cleanup(&self, _attempt: &AttemptRef) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn context(storage: StorageHandle) -> Arc<DriverContext> {
+        Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        })
+    }
+
+    fn execution_spec() -> ExecutionSpec {
+        ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            env: Default::default(),
+            resources: ComputeResources {
+                cpu_cores: None,
+                ram_bytes: None,
+                max_walltime_ms: None,
+            },
+            executor_constraint: None,
+            inputs: Vec::new(),
+            output_prefixes: Vec::new(),
+        }
+    }
+
+    /// A claimed execution job in `Ready` with its attempt intent written, i.e.
+    /// the exact state at the moment `backend.submit()` fails.
+    async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, AttemptRef) {
+        let job_id = JobId::new();
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(execution_spec()),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        insert_job(storage, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node_id(7), 2)
+            .await
+            .unwrap()
+        else {
+            panic!("claim failed");
+        };
+        let token = claimed.claim.as_ref().unwrap().claim_token;
+        transition_to_preparing(storage, job_id, token, 3).await.unwrap();
+        transition_to_ready(storage, job_id, token, 4).await.unwrap();
+        let attempt = AttemptRef::new(job_id.to_string(), claimed.attempts);
+        let intent = AttemptIntent {
+            attempt_no: claimed.attempts,
+            external_name: attempt.external_name(),
+            executor_kind: "docker".to_string(),
+        };
+        let record = record_attempt_intent(storage, job_id, token, intent, 5)
+            .await
+            .unwrap();
+        (record, token, attempt)
+    }
+
+    // A submit error with an unobservable backend parks the job Indeterminate and
+    // keeps the write-ahead intent, so the possibly-started container a{N} stays
+    // adoptable and no second container is ever launched under a{N+1}.
+    #[tokio::test]
+    async fn ambiguous_submit_parks() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::Unavailable);
+        let task_spec = TaskSpec::new(attempt.clone(), "alpine:3");
+
+        recover_failed_submit(
+            &ctx,
+            record.job_id,
+            token,
+            &backend,
+            &attempt,
+            &task_spec,
+            &execution_spec(),
+            "ws-test",
+            &record,
+            CancellationToken::new(),
+            BackendError::Unavailable("io fault".to_string()),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, record.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Indeterminate);
+        assert_eq!(stored.attempts, 0, "no attempt charged");
+        let intent = stored.attempt_intent.expect("intent retained");
+        assert_eq!(intent.external_name, attempt.external_name());
+    }
+
+    // A submit error with the container confirmed absent keeps the pre-submit
+    // routing: requeue with backoff, intent cleared, attempt charged.
+    #[tokio::test]
+    async fn absent_submit_requeues() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+        let task_spec = TaskSpec::new(attempt.clone(), "alpine:3");
+
+        recover_failed_submit(
+            &ctx,
+            record.job_id,
+            token,
+            &backend,
+            &attempt,
+            &task_spec,
+            &execution_spec(),
+            "ws-test",
+            &record,
+            CancellationToken::new(),
+            BackendError::Unavailable("io fault".to_string()),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, record.job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert_eq!(stored.attempts, 1);
+        assert!(stored.attempt_intent.is_none());
+    }
 }

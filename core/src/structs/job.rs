@@ -560,7 +560,8 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
 }
 
 /// The fenced execution graph (spec 16.7): a requeue is legal only before an attempt
-/// is submitted; `Indeterminate` exits only on evidence.
+/// is submitted; `Indeterminate` exits only on evidence. `Ready -> Indeterminate`
+/// parks a submit whose outcome is unknowable after the intent was written.
 fn external_attempt_transition(from: JobState, to: JobState) -> bool {
     use JobState::*;
     matches!(
@@ -575,6 +576,7 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Preparing, Queued)
             | (Ready, Running)
             | (Ready, Queued)
+            | (Ready, Indeterminate)
             | (Running, Succeeded)
             | (Running, Failed)
             | (Running, Cancelling)
