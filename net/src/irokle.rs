@@ -530,10 +530,15 @@ impl DocumentSyncService {
     /// emitted, so later events from a removed holder cannot apply while
     /// pre-cutover replacement history remains usable. Shared topics and the
     /// default peer set are intentionally untouched.
+    ///
+    /// A `history_cutoff` is only frozen for topics in `verified_topics`: until a
+    /// node has durably verified a shard, its local clock is not a trustworthy
+    /// cutover boundary, so former-holder history is left admissible ([BR-030]).
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[irokle_crate::TopicId],
         holders: Vec<NodeId>,
+        verified_topics: &BTreeSet<irokle_crate::TopicId>,
     ) -> Result<()> {
         if topics.is_empty() {
             return Ok(());
@@ -580,16 +585,21 @@ impl DocumentSyncService {
                             DocumentSyncEvent::TYPE_ID
                         )));
                     }
-                    let history_cutoff = self
-                        .node
-                        .storage()
-                        .actor_clock(&topic_id)
-                        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                    let history_cutoff = if verified_topics.contains(&topic_id) {
+                        Some(
+                            self.node
+                                .storage()
+                                .actor_clock(&topic_id)
+                                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                        )
+                    } else {
+                        None
+                    };
                     policies.push((
                         topic_id,
                         ShardPublisherPolicy {
                             current,
-                            history_cutoff: Some(history_cutoff),
+                            history_cutoff,
                         },
                     ));
                     states.push((topic_id, state));
@@ -12732,7 +12742,11 @@ mod tests {
             .expect("shared topic exists");
 
         service
-            .reconcile_shard_membership(&[shard_topic], vec![local_node, current_node])
+            .reconcile_shard_membership(
+                &[shard_topic],
+                vec![local_node, current_node],
+                &BTreeSet::new(),
+            )
             .await
             .expect("shard membership reconciles");
 
@@ -12849,7 +12863,11 @@ mod tests {
         let publisher_ops = irokle_crate::oplog::topological(publisher.node().storage(), &topic_id)
             .expect("publisher history reads");
         receiver
-            .reconcile_shard_membership(&[topic_id], vec![receiver_node])
+            .reconcile_shard_membership(
+                &[topic_id],
+                vec![receiver_node],
+                &BTreeSet::from([topic_id]),
+            )
             .await
             .expect("former holder is removed");
         receiver
@@ -12912,5 +12930,68 @@ mod tests {
 
         publisher.shutdown().await;
         receiver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cutoff_gated_by_verification() {
+        // An unverified shard freezes no former-holder history cutoff; a verified
+        // shard does. The local clock is only a trustworthy cutover boundary once
+        // the shard is durably verified.
+        let (_dir, storage) = test_storage();
+        let doc = tempfile::tempdir().expect("document sync dir");
+        let realm_id = restart_realm();
+        let service = DocumentSyncService::open_with_persist_policy(
+            test_endpoint(85).await,
+            storage,
+            doc.path().join("document-sync"),
+            &[node(86)],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            irokle_crate::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            realm_id,
+        )
+        .expect("service opens");
+        let local_node = service.local_node_id().expect("local node id");
+        let co_holder = node(86);
+        let topic = restart_topic();
+        service
+            .ensure_document_sync_topics(&[topic], vec![co_holder])
+            .expect("shard topic exists");
+
+        service
+            .reconcile_shard_membership(&[topic], vec![local_node, co_holder], &BTreeSet::new())
+            .await
+            .expect("membership reconciles");
+        assert!(
+            service
+                .shard_publishers
+                .read()
+                .get(&topic)
+                .expect("publisher policy installed")
+                .history_cutoff
+                .is_none(),
+            "an unverified shard must not freeze a history cutoff"
+        );
+
+        service
+            .reconcile_shard_membership(
+                &[topic],
+                vec![local_node, co_holder],
+                &BTreeSet::from([topic]),
+            )
+            .await
+            .expect("membership reconciles");
+        assert!(
+            service
+                .shard_publishers
+                .read()
+                .get(&topic)
+                .expect("publisher policy installed")
+                .history_cutoff
+                .is_some(),
+            "a verified shard must freeze a history cutoff"
+        );
+
+        service.shutdown().await;
     }
 }

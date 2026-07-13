@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
@@ -50,6 +50,7 @@ async fn ensure_held_shard_topics(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     local_node_id: NodeId,
+    verified: &BTreeSet<::irokle::TopicId>,
 ) -> HeldTopicOutcome {
     let mut rank0_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut member_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
@@ -89,8 +90,15 @@ async fn ensure_held_shard_topics(
             co_holders = co_holders.len(),
             "Ensuring rank-0 shard topic geneses"
         );
-        outcome.withheld |=
-            ensure_rank0_shard_group(context, net_handle, local_node_id, co_holders, topics).await;
+        outcome.withheld |= ensure_rank0_shard_group(
+            context,
+            net_handle,
+            local_node_id,
+            co_holders,
+            topics,
+            verified,
+        )
+        .await;
     }
     // Non-rank-0 held shards. A topic not known locally is pulled from a
     // co-holder: `sync_document_topics` is join-only (it adopts an existing
@@ -111,7 +119,7 @@ async fn ensure_held_shard_topics(
         // missing topic is expected here; the exact membership pass below is
         // repeated after a successful pull.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone())
+            .reconcile_shard_membership(&topics, current_holders.clone(), verified)
             .await;
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
@@ -147,7 +155,7 @@ async fn ensure_held_shard_topics(
             continue;
         }
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&known, current_holders)
+            .reconcile_shard_membership(&known, current_holders, verified)
             .await
         {
             debug!(error = %error, "Could not complete held shard topic membership");
@@ -178,6 +186,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     local_node_id: NodeId,
     co_holders: Vec<NodeId>,
     topics: Vec<::irokle::TopicId>,
+    verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
     let mut current_holders = co_holders.clone();
     current_holders.push(local_node_id);
@@ -185,7 +194,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     // This first pass installs publisher policy even when a topic still needs
     // to be adopted or created. Exact membership is retried once it exists.
     let _ = net_handle
-        .reconcile_shard_membership(&topics, current_holders.clone())
+        .reconcile_shard_membership(&topics, current_holders.clone(), verified)
         .await;
 
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
@@ -255,7 +264,7 @@ pub(crate) async fn ensure_rank0_shard_group(
         match net_handle.ensure_document_sync_topics(&to_ensure, co_holders) {
             Ok(()) => {
                 if let Err(error) = net_handle
-                    .reconcile_shard_membership(&to_ensure, current_holders)
+                    .reconcile_shard_membership(&to_ensure, current_holders, verified)
                     .await
                 {
                     warn!(error = %error, "Failed to reconcile rank-0 shard membership");
@@ -360,11 +369,21 @@ pub async fn process_shard_placements(
         return PlacementReconcileOutcome::clean();
     };
 
+    // Former-holder history cutoffs are frozen only for durably verified shards.
+    let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
+
     // A withheld genesis or an unpulled held topic leaves no placement record,
     // so it alone must still arm the retry below (otherwise writes defer at 1s
     // forever).
-    let held =
-        ensure_held_shard_topics(context, net_handle, &config, realm_id, local_node_id).await;
+    let held = ensure_held_shard_topics(
+        context,
+        net_handle,
+        &config,
+        realm_id,
+        local_node_id,
+        &verified,
+    )
+    .await;
     let mut retry_needed = held.withheld || held.pull_pending;
 
     let mut start_after: Option<Key> = None;
@@ -464,7 +483,7 @@ pub async fn process_shard_placements(
             // The topic exists locally, so reconcile its exact canonical holder
             // set without creating a genesis or changing shared/default peers.
             let membership = net_handle
-                .reconcile_shard_membership(&[topic], holders)
+                .reconcile_shard_membership(&[topic], holders, &verified)
                 .await;
             match membership {
                 Ok(()) => {

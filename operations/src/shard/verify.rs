@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::document::shard_topic_id;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
@@ -19,7 +20,10 @@ use crate::placement::resolve_shard_holders;
 use crate::shard::client::fetch_shard_manifest;
 use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
 use crate::startup::apply_restored_reconcile;
-use crate::sync_placement::placement_key;
+use crate::sync_placement::{placement_key, placement_prefix};
+
+/// Page size for scanning persisted shard verification markers.
+const VERIFIED_SHARD_SCAN_PAGE_SIZE: usize = 256;
 
 /// A new holder retries digest reconciliation this many times against the first
 /// reachable co-holder before leaving the shard unverified for the next pass.
@@ -268,6 +272,55 @@ pub async fn delete_shard_verification(
     {
         warn!(error = %error, "Failed to delete shard verification marker");
     }
+}
+
+/// Topic ids of every shard the local node has durably verified in `realm_id`.
+///
+/// Reconciliation installs a former-holder history cutoff only for these topics:
+/// an unverified shard's local clock is not a trustworthy cutover boundary, so
+/// its history is left admissible until verification proves the transfer.
+pub async fn load_verified_shard_topics(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> BTreeSet<::irokle::TopicId> {
+    let mut topics = BTreeSet::new();
+    let mut start_after: Option<Key> = None;
+    loop {
+        let (values, next) = match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SHARD_VERIFICATION_KEYSPACE.to_string(),
+                prefix: Some(placement_prefix(realm_id)),
+                start: start_after.take().map(IterStart::After),
+                limit: VERIFIED_SHARD_SCAN_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                warn!(%realm_id, error = %error, "Failed to scan verified shards");
+                return topics;
+            }
+            other => {
+                warn!(%realm_id, event = ?other, "Unexpected verified shard scan result");
+                return topics;
+            }
+        };
+        for (_, value) in &values {
+            if let Ok(record) = postcard::from_bytes::<ShardVerificationRecord>(value) {
+                topics.insert(shard_topic_id(realm_id, &record.placement));
+            }
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => break,
+        }
+    }
+    topics
 }
 
 /// Whether the local node has a persisted verification marker for a shard.

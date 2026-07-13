@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -150,6 +150,9 @@ pub async fn restore_shard_subscriptions(
         }
     }
 
+    // Former-holder history cutoffs are frozen only for shards a prior run
+    // durably verified; join verification below happens after this restore.
+    let verified = crate::shard::verify::load_verified_shard_topics(context, realm_id).await;
     let withheld = restore_held_shard_topics(
         context,
         &net_handle,
@@ -157,6 +160,7 @@ pub async fn restore_shard_subscriptions(
         shared_ensure_groups,
         rank0_shard_groups,
         join_groups,
+        &verified,
     )
     .await;
 
@@ -183,6 +187,7 @@ async fn restore_held_shard_topics(
     shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
     join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
     // Shared realm topics: ensured directly (every node's genesis of a shared
     // topic is deterministic, not a shard-holder decision).
@@ -227,6 +232,7 @@ async fn restore_held_shard_topics(
             node_id,
             co_holders.clone(),
             topics.clone(),
+            verified,
         )
         .await;
         // Fetch events for the topics whose genesis is now local (created,
@@ -256,7 +262,7 @@ async fn restore_held_shard_topics(
         // Install publisher policy before pulling history. Missing topics are
         // expected and get an exact membership pass after a successful join.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone())
+            .reconcile_shard_membership(&topics, current_holders.clone(), verified)
             .await;
         let event = net_handle.sync_document_topics(topics.clone(), peers).await;
         apply_restored_reconcile(context, node_id, event).await;
@@ -270,7 +276,7 @@ async fn restore_held_shard_topics(
             .collect();
         if !present.is_empty()
             && let Err(error) = net_handle
-                .reconcile_shard_membership(&present, current_holders)
+                .reconcile_shard_membership(&present, current_holders, verified)
                 .await
         {
             warn!(error = %error, "Failed to reconcile joined shard membership on restart");
