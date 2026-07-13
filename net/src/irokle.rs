@@ -1430,9 +1430,15 @@ impl DocumentSyncService {
         }
         let wanted: BTreeSet<irokle_crate::TopicId> = topics.iter().copied().collect();
         // Callers pass co-holders with the local node already excluded.
-        for node_id in &co_holders {
-            let peer = node_id_to_peer_id(node_id);
-            match self.probe_topics_on_peer(&topics, peer).await {
+        let topic_ids = &topics;
+        let probes = co_holders.iter().copied().map(|node_id| async move {
+            let peer = node_id_to_peer_id(&node_id);
+            (node_id, self.probe_topics_on_peer(topic_ids, peer).await)
+        });
+        // Poll every independent peer probe together, then aggregate in the
+        // co-holder input order preserved by join_all.
+        for (node_id, result) in futures::future::join_all(probes).await {
+            match result {
                 Ok(peer_probe) => {
                     probe
                         .known_by_co_holder
@@ -1451,7 +1457,7 @@ impl DocumentSyncService {
                 }
                 Err(error) => {
                     debug!(%node_id, error = %error, "co-holder unreachable while probing shard genesis");
-                    probe.unreachable.push(*node_id);
+                    probe.unreachable.push(node_id);
                 }
             }
         }
