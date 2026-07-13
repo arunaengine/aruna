@@ -81,6 +81,19 @@ impl PlacementHandle {
     }
 }
 
+impl Serialize for PlacementHandle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u32::deserialize(deserializer)?;
+        PlacementHandle::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A 12-bit bucket carried inside the id (REQ-META-ID-FORMAT-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketId(u16);
