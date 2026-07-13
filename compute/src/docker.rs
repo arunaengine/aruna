@@ -216,8 +216,10 @@ impl ExecutorBackend for DockerBackend {
             Err(e) => match classify(&e) {
                 BackendError::Conflict(_) => {
                     let status = self.status(&spec.attempt).await?;
-                    // Complete a partial submit (created but never started) in place.
-                    if matches!(status.phase, AttemptPhase::Submitted) {
+                    // Complete a partial submit in place, but only for a container
+                    // that provably never ran: `docker start` on an exited
+                    // container would re-run it.
+                    if is_fresh_created(&status) {
                         self.start_by_name(&name).await?;
                         return self.status(&spec.attempt).await;
                     }
@@ -335,6 +337,14 @@ impl ExecutorBackend for DockerBackend {
             },
         }
     }
+}
+
+/// A container created by a partial submit that never started a run: only such a
+/// fresh attempt may be started when adopting a name collision.
+fn is_fresh_created(status: &AttemptStatus) -> bool {
+    matches!(status.phase, AttemptPhase::Submitted)
+        && status.started_at_ms.is_none()
+        && status.finished_at_ms.is_none()
 }
 
 fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
@@ -510,6 +520,35 @@ mod tests {
             split_image_ref("repo@sha256:abc"),
             ("repo".into(), Some("sha256:abc".into()))
         );
+    }
+
+    #[test]
+    fn freshness_gate() {
+        let fresh = AttemptStatus {
+            phase: AttemptPhase::Submitted,
+            backend_ref: "id".to_string(),
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        assert!(is_fresh_created(&fresh));
+        // Anything that ever ran (or whose state is unreadable but timestamped)
+        // must be adopted as evidence, never started again.
+        assert!(!is_fresh_created(&AttemptStatus {
+            started_at_ms: Some(1),
+            ..fresh.clone()
+        }));
+        assert!(!is_fresh_created(&AttemptStatus {
+            finished_at_ms: Some(2),
+            ..fresh.clone()
+        }));
+        assert!(!is_fresh_created(&AttemptStatus {
+            phase: AttemptPhase::Exited { code: 0 },
+            ..fresh.clone()
+        }));
+        assert!(!is_fresh_created(&AttemptStatus {
+            phase: AttemptPhase::Running,
+            ..fresh
+        }));
     }
 
     #[test]
