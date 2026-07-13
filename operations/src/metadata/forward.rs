@@ -260,7 +260,9 @@ pub(crate) async fn apply_forwarded_write(
             payload,
             ..
         } => {
-            if MetadataRegistryRecord::normalize_document_path(&document_path).is_empty() {
+            let normalized_document_path =
+                MetadataRegistryRecord::normalize_document_path(&document_path);
+            if normalized_document_path.is_empty() {
                 return reject("forwarded metadata create has an empty document path");
             }
             let path = format!("/{realm_id}/g/{group_id}/meta/**");
@@ -273,9 +275,12 @@ pub(crate) async fn apply_forwarded_write(
             // would fork one document into two. Replay the record instead.
             match existing_record(context, document_id).await {
                 Ok(Some(record)) => {
-                    return MetadataTransportMessage::ForwardedRecord {
-                        record: Box::new(record),
-                    };
+                    return forwarded_create_replay(
+                        record,
+                        realm_id,
+                        group_id,
+                        &normalized_document_path,
+                    );
                 }
                 Ok(None) => {}
                 Err(error) => return reject(error),
@@ -301,9 +306,12 @@ pub(crate) async fn apply_forwarded_write(
                 // forward: the winner's record is the answer, not an error.
                 Err(CreateMetadataDocumentError::DocumentAlreadyExists) => {
                     match existing_record(context, document_id).await {
-                        Ok(Some(record)) => MetadataTransportMessage::ForwardedRecord {
-                            record: Box::new(record),
-                        },
+                        Ok(Some(record)) => forwarded_create_replay(
+                            record,
+                            realm_id,
+                            group_id,
+                            &normalized_document_path,
+                        ),
                         Ok(None) => reject(format!(
                             "forwarded metadata create for `{document_id}` raced a delete"
                         )),
@@ -379,6 +387,24 @@ pub(crate) async fn apply_forwarded_write(
             "unexpected forwarded metadata message: {}",
             super::handle::transport_message_kind(&other)
         )),
+    }
+}
+
+fn forwarded_create_replay(
+    record: MetadataRegistryRecord,
+    realm_id: RealmId,
+    group_id: Ulid,
+    normalized_document_path: &str,
+) -> MetadataTransportMessage {
+    if record.realm_id == realm_id
+        && record.group_id == group_id
+        && record.document_path == normalized_document_path
+    {
+        MetadataTransportMessage::ForwardedRecord {
+            record: Box::new(record),
+        }
+    } else {
+        reject("forwarded metadata create collides with an existing document")
     }
 }
 

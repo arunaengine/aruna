@@ -260,6 +260,51 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+#[tokio::test]
+async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
+    let realm = Realm::new();
+    let (nodes, config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let first_group = seed_group(&realm, &nodes).await?;
+    let other_group = seed_group(&realm, &nodes).await?;
+    let document_id = Ulid::r#gen();
+
+    let created = drive_forwarded_create(&realm, user_node, first_group, document_id).await?;
+    let holders = resolve_shard_holders(&config, &created.placement);
+    wait_for_record_on_holders(&nodes, &holders, document_id).await?;
+
+    let group_error = drive_forwarded_create_at(
+        &realm,
+        user_node,
+        other_group,
+        document_id,
+        "datasets/forwarded",
+    )
+    .await
+    .expect_err("a document id cannot replay a record from another group");
+    assert!(matches!(
+        group_error.downcast_ref::<MetadataWriteError>(),
+        Some(MetadataWriteError::Undeliverable(_))
+    ));
+
+    let path_error = drive_forwarded_create_at(
+        &realm,
+        user_node,
+        first_group,
+        document_id,
+        "datasets/other",
+    )
+    .await
+    .expect_err("a document id cannot replay a record from another path");
+    assert!(matches!(
+        path_error.downcast_ref::<MetadataWriteError>(),
+        Some(MetadataWriteError::Undeliverable(_))
+    ));
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
 fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncChange {
     DocumentSyncChange {
         base: None,
@@ -547,6 +592,16 @@ async fn drive_forwarded_create(
     group_id: Ulid,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    drive_forwarded_create_at(realm, node, group_id, document_id, "datasets/forwarded").await
+}
+
+async fn drive_forwarded_create_at(
+    realm: &Realm,
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let created = create_metadata_document_routed(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
@@ -556,7 +611,7 @@ async fn drive_forwarded_create(
             },
             group_id,
             document_id,
-            document_path: "datasets/forwarded".to_string(),
+            document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
                 name: "Forwarded".to_string(),
