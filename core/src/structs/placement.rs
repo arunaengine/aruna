@@ -1,4 +1,6 @@
 use crate::NodeId;
+use crate::structs::RealmId;
+use crate::structured_id::PlacementHandle;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -109,7 +111,7 @@ pub struct PlacementOverride {
     pub strategy_id: Option<Ulid>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocumentClass {
     Admin,
     Group,
@@ -162,6 +164,70 @@ pub fn shard_for_subject(subject: &[u8], shard_count: u32) -> u32 {
     let mut head = [0u8; 4];
     head.copy_from_slice(&hash.as_bytes()[..4]);
     u32::from_be_bytes(head) & (shard_count - 1)
+}
+
+/// Discriminant of a placement binding's scope (spec 6.3.4).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PlacementScopeKind {
+    Realm,
+    Group,
+}
+
+/// A placement binding's scope: the `scope_kind`/`scope_id` pair of the spec
+/// record unified into one sum type so an impossible (kind, id) combination is
+/// unrepresentable. `JobControl` bindings are realm-scoped; `GroupBulk`
+/// bindings name the group (spec 6.3.4).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PlacementScope {
+    Realm(RealmId),
+    Group(GroupId),
+}
+
+impl PlacementScope {
+    pub fn kind(&self) -> PlacementScopeKind {
+        match self {
+            PlacementScope::Realm(_) => PlacementScopeKind::Realm,
+            PlacementScope::Group(_) => PlacementScopeKind::Group,
+        }
+    }
+}
+
+/// The immutable identity a placement handle maps to
+/// (`scope_kind, scope_id, document_class, strategy_id`). This is exactly the
+/// value compared for conflict/alias detection: it carries no handle, no
+/// provenance, no bucket, and no holder ids (REQ-META-PLACEMENT-BINDING-001).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindingTuple {
+    pub scope: PlacementScope,
+    pub document_class: DocumentClass,
+    pub strategy_id: Ulid,
+}
+
+/// An immutable, append-only Placement Binding record
+/// (REQ-META-PLACEMENT-BINDING-001/002). It maps one handle to its base
+/// placement tuple plus allocation provenance. It MUST NOT carry a bucket (the
+/// bucket travels in the id) or any holder node ids.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PlacementBinding {
+    pub handle: PlacementHandle,
+    pub scope: PlacementScope,
+    pub document_class: DocumentClass,
+    pub strategy_id: Ulid,
+    pub allocator_range_id: Option<Ulid>,
+    pub allocated_by: Option<NodeId>,
+    pub allocated_at_ms: Option<u64>,
+}
+
+impl PlacementBinding {
+    /// The identity tuple used for conflict/alias detection; allocation
+    /// provenance is deliberately excluded.
+    pub fn tuple(&self) -> BindingTuple {
+        BindingTuple {
+            scope: self.scope,
+            document_class: self.document_class,
+            strategy_id: self.strategy_id,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +426,55 @@ mod tests {
         // Generous band around the mean; a broken mask would collapse or spike.
         assert!(min > expected / 2, "under-filled shard: {min} < {expected}");
         assert!(max < expected * 2, "over-filled shard: {max} > {expected}");
+    }
+
+    #[test]
+    fn binding_round_trips() {
+        use crate::structs::RealmId;
+        use crate::structured_id::PlacementHandle;
+
+        let binding = PlacementBinding {
+            handle: PlacementHandle::new(0x1234).unwrap(),
+            scope: PlacementScope::Group(Ulid::from_bytes([7u8; 16])),
+            document_class: DocumentClass::Metadata,
+            strategy_id: Ulid::from_bytes([8u8; 16]),
+            allocator_range_id: Some(Ulid::from_bytes([9u8; 16])),
+            allocated_by: Some(node(1)),
+            allocated_at_ms: Some(1_700_000_000_000),
+        };
+        let bytes = postcard::to_allocvec(&binding).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PlacementBinding>(&bytes).unwrap(),
+            binding
+        );
+
+        // The tuple identity drops provenance; realm scope also round-trips.
+        let realm = PlacementBinding {
+            scope: PlacementScope::Realm(RealmId([3u8; 32])),
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+            ..binding.clone()
+        };
+        assert_ne!(realm.scope, binding.scope);
+        assert_eq!(realm.tuple().document_class, DocumentClass::Metadata);
+        assert_eq!(binding.scope.kind(), PlacementScopeKind::Group);
+        assert_eq!(realm.scope.kind(), PlacementScopeKind::Realm);
+    }
+
+    #[test]
+    fn binding_carries_no_bucket() {
+        // The record has exactly the spec fields and nothing bucket/holder-shaped.
+        let names: &[&str] = &[
+            "handle",
+            "scope",
+            "document_class",
+            "strategy_id",
+            "allocator_range_id",
+            "allocated_by",
+            "allocated_at_ms",
+        ];
+        assert!(!names.contains(&"bucket"));
+        assert!(!names.contains(&"holders"));
     }
 }
