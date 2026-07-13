@@ -939,6 +939,11 @@ fn map_mutate_realm_placement_error(error: MutateRealmPlacementError) -> ServerE
     match error {
         MutateRealmPlacementError::RealmConfigNotFound => ServerError::NotFound,
         MutateRealmPlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
+        error @ (MutateRealmPlacementError::AdminDocumentReducerError(_)
+        | MutateRealmPlacementError::DisjointHolderTransition { .. }
+        | MutateRealmPlacementError::EmptyShardHolders { .. }) => {
+            ServerError::BadRequestReason(error.to_string())
+        }
         MutateRealmPlacementError::StrategyReferenced { strategy_id } => ServerError::Conflict(
             format!("placement strategy {strategy_id} is currently referenced"),
         ),
