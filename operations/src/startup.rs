@@ -38,6 +38,16 @@ fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentSyncTarget; 5]
     ]
 }
 
+fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
+    config
+        .nodes
+        .iter()
+        .filter(|node| node.kind.is_sync_eligible())
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .filter(|candidate| *candidate != node_id)
+        .collect()
+}
+
 /// Fixed realm-scoped topics restored on every start (see [`shared_targets`]).
 pub const SHARED_RESTORE_TOPIC_COUNT: usize = 5;
 
@@ -86,13 +96,6 @@ pub async fn restore_shard_subscriptions(
         return summary;
     };
 
-    let realm_nodes: Vec<NodeId> = config
-        .nodes
-        .iter()
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .filter(|candidate| *candidate != node_id)
-        .collect();
-
     // Group topics by their co-holder peer set so co-located shards ride one
     // ensure + one sync instead of one round trip each. Shared realm topics are
     // ensured directly. Shards the local node is rank-0 holder of go through the
@@ -104,7 +107,7 @@ pub async fn restore_shard_subscriptions(
     let mut rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
     let mut join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
 
-    let mut shared_peers = realm_nodes.clone();
+    let mut shared_peers = shared_topic_peers(&config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     for target in shared_targets(realm_id, node_id) {
         let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
@@ -348,5 +351,56 @@ async fn load_realm_config(
             value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::{RealmNode, RealmNodeKind};
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn shared_peers_filter() {
+        let self_id = node(1);
+        let management = node(2);
+        let server = node(3);
+        let local = node(4);
+        let user = node(5);
+        let mut config = RealmConfigDocument::default_for_realm(RealmId([9; 32]), Vec::new());
+        config.nodes = vec![
+            RealmNode {
+                node_id: self_id.to_string(),
+                kind: RealmNodeKind::Management,
+            },
+            RealmNode {
+                node_id: management.to_string(),
+                kind: RealmNodeKind::Management,
+            },
+            RealmNode {
+                node_id: user.to_string(),
+                kind: RealmNodeKind::User,
+            },
+            RealmNode {
+                node_id: "malformed-eligible-id".to_string(),
+                kind: RealmNodeKind::Server,
+            },
+            RealmNode {
+                node_id: server.to_string(),
+                kind: RealmNodeKind::Server,
+            },
+            RealmNode {
+                node_id: local.to_string(),
+                kind: RealmNodeKind::Local,
+            },
+        ];
+
+        assert_eq!(
+            shared_topic_peers(&config, self_id),
+            vec![management, server, local]
+        );
     }
 }
