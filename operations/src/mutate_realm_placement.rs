@@ -211,6 +211,12 @@ pub enum MutateRealmPlacementError {
     RealmConfigNotFound,
     #[error("invalid placement mutation: {0}")]
     InvalidInput(String),
+    #[error(
+        "disjoint holder transition for strategy {strategy_id} shard {shard}: at least one current holder must remain until new holders verify"
+    )]
+    DisjointHolderTransition { strategy_id: Ulid, shard: u32 },
+    #[error("placement leaves strategy {strategy_id} shard {shard} with no eligible holders")]
+    EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
     #[error("missing active transaction")]
@@ -301,7 +307,23 @@ impl MutateRealmPlacementOperation {
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
         let admin_event = reducer_state
             .apply_operation(&self.config.actor, self.config.mutation.admin_operation())?;
+        let pre_document = document.clone();
         overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
+
+        if let Some(placement) =
+            crate::placement::first_disjoint_shard_transition(&pre_document, &document)
+        {
+            return Err(MutateRealmPlacementError::DisjointHolderTransition {
+                strategy_id: placement.strategy_id,
+                shard: placement.shard,
+            });
+        }
+        if let Some(placement) = crate::placement::first_empty_referenced_shard(&document) {
+            return Err(MutateRealmPlacementError::EmptyShardHolders {
+                strategy_id: placement.strategy_id,
+                shard: placement.shard,
+            });
+        }
 
         let stale_conflict_deletes = stale_admin_document_conflict_delete_entries(
             previous_reducer_state.as_ref(),
@@ -700,7 +722,8 @@ mod tests {
         metadata_create_event_and_pending_projection_write_entries, metadata_registry_write_entries,
     };
     use aruna_core::structs::{
-        DEFAULT_NODE_WEIGHT, DocumentClass, MetadataRegistryRecord, PlacementRef, RealmId,
+        AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
+        LabelMatch, MetadataRegistryRecord, PlacementRef, RealmId, RealmNodeKind,
     };
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
@@ -1173,6 +1196,132 @@ mod tests {
                 },
                 after,
             })] if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
+        ));
+    }
+
+    async fn seed_placement_config(
+        context: &DriverContext,
+        actor: &Actor,
+        nodes: &[aruna_core::NodeId],
+        replica: Option<u32>,
+    ) -> RealmConfigDocument {
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.seed_default_placement();
+        let default_id = document.default_strategy_id.unwrap();
+        for strategy in document.strategies.iter_mut() {
+            if strategy.strategy_id == default_id {
+                strategy.replica_count = replica;
+            }
+        }
+        for node_id in nodes {
+            document.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: document.to_bytes(actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        document
+    }
+
+    fn draining_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+        NodePlacementEntry {
+            node_id,
+            location: String::new(),
+            weight: DEFAULT_NODE_WEIGHT,
+            full: false,
+            draining: true,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disjoint_transition_rejected() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let actor = actor(realm_id);
+        // Single-replica: every shard has one holder, so draining a node moves its
+        // shards to a disjoint holder.
+        seed_placement_config(&context, &actor, &[node(1), node(2)], Some(1)).await;
+
+        assert!(matches!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::UpsertNode(draining_entry(node(1)))
+            )
+            .await,
+            Err(MutateRealmPlacementError::DisjointHolderTransition { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn overlapping_transition_allowed() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([22; 32]);
+        let actor = actor(realm_id);
+        // Replica two with two nodes: every shard holds both, so draining one
+        // leaves the other as an overlapping holder.
+        seed_placement_config(&context, &actor, &[node(1), node(2)], Some(2)).await;
+
+        let result = mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::UpsertNode(draining_entry(node(1))),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "overlap-preserving change rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_holder_config_rejected() {
+        let directory = tempdir().unwrap();
+        let context = context(directory.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([23; 32]);
+        let actor = actor(realm_id);
+        let document = seed_placement_config(&context, &actor, &[node(1), node(2)], Some(2)).await;
+        let default_id = document.default_strategy_id.unwrap();
+        // Refilter the referenced default strategy onto a label no node carries:
+        // its shards resolve to zero holders while both nodes stay usable.
+        let filtered = PlacementStrategy {
+            strategy_id: default_id,
+            name: "default".to_string(),
+            replica_count: Some(2),
+            distinct_locations: false,
+            affinity: vec![AffinityRule {
+                matcher: LabelMatch {
+                    key: "tier".to_string(),
+                    value: "hot".to_string(),
+                },
+                effect: AffinityEffect::Filter,
+            }],
+            shard_count: DEFAULT_SHARD_COUNT,
+        };
+
+        assert!(matches!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::UpsertStrategy(filtered)
+            )
+            .await,
+            Err(MutateRealmPlacementError::EmptyShardHolders { .. })
         ));
     }
 

@@ -167,6 +167,86 @@ pub fn resolve_shard_holders(
     resolve_shard_holders_with(config, strategy, placement)
 }
 
+/// First `(strategy, shard)` whose holder set is non-empty both before and after
+/// a config change yet shares no holder: a disjoint transition that would strand
+/// the shard's history and let a new holder mint a rival genesis. Interim
+/// [BR-025] guard until the staged handoff protocol (#264) lands; at least one
+/// current holder must remain until the new holders have verified.
+pub fn first_disjoint_shard_transition(
+    pre: &RealmConfigDocument,
+    post: &RealmConfigDocument,
+) -> Option<PlacementRef> {
+    let pre_view = build_view(pre);
+    let post_view = build_view(post);
+    for strategy in &post.strategies {
+        let Some(pre_strategy) = pre.strategy(&strategy.strategy_id) else {
+            continue;
+        };
+        for shard in 0..strategy.shard_count {
+            let placement = PlacementRef {
+                strategy_id: strategy.strategy_id,
+                epoch: 0,
+                shard,
+            };
+            let pre_holders =
+                resolve_shard_holders_from_view(pre, &pre_view, pre_strategy, &placement);
+            if pre_holders.is_empty() {
+                continue;
+            }
+            let post_holders =
+                resolve_shard_holders_from_view(post, &post_view, strategy, &placement);
+            if post_holders.is_empty() {
+                continue;
+            }
+            if !pre_holders.iter().any(|node| post_holders.contains(node)) {
+                return Some(placement);
+            }
+        }
+    }
+    None
+}
+
+/// First shard of a referenced strategy that resolves to zero holders while the
+/// realm still has usable capacity: a filter, affinity, or override that leaves
+/// documents routed to it with nowhere to live. Bootstrap, full drain, and
+/// all-full realms have no usable node and are not flagged (fail-early for a
+/// genuine misconfiguration, not for an empty realm).
+pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<PlacementRef> {
+    let view = build_view(config);
+    let has_capacity = view.nodes.iter().any(|node| {
+        node.kind.is_sync_eligible() && !node.full && !node.draining && node.weight > 0
+    });
+    if !has_capacity {
+        return None;
+    }
+    for strategy in &config.strategies {
+        let id = strategy.strategy_id;
+        let referenced = config.default_strategy_id == Some(id)
+            || config
+                .strategy_bindings
+                .iter()
+                .any(|binding| binding.strategy_id == id)
+            || config
+                .placement_overrides
+                .iter()
+                .any(|record| record.strategy_id == Some(id));
+        if !referenced {
+            continue;
+        }
+        for shard in 0..strategy.shard_count {
+            let placement = PlacementRef {
+                strategy_id: id,
+                epoch: 0,
+                shard,
+            };
+            if resolve_shard_holders_from_view(config, &view, strategy, &placement).is_empty() {
+                return Some(placement);
+            }
+        }
+    }
+    None
+}
+
 /// Whether `node_id` holds `placement`, and may therefore publish onto its
 /// topic. [`PlacementRef::NIL`] means no strategy governs the bucket during
 /// early bootstrap: nobody shards it, so it is nobody's to withhold and the
