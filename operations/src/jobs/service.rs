@@ -1,18 +1,50 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::structs::{JobId, JobRecord, JobState};
+use aruna_core::structs::{ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RunCrateStatus};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::UserId;
+use aruna_core::types::{NodeId, UserId};
 use aruna_core::util::unix_timestamp_millis;
 use tracing::warn;
 
 use super::runtime::JobsRuntime;
 use super::store::{
     CancelRequestOutcome, JobMutationError, list_jobs_for_user, read_job_record,
-    set_cancel_requested,
+    read_run_crate_status, set_cancel_requested,
 };
-use super::submit::schedule_job_drain_effect;
-use crate::driver::DriverContext;
+use super::submit::{
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, schedule_job_drain_effect,
+};
+use crate::driver::{DriverContext, drive};
+
+/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// and drives the fenced external attempt lifecycle.
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    spec: ExecutionSpec,
+    created_by: UserId,
+    owner_node_id: NodeId,
+    dedup_key: Option<Vec<u8>>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    drive(
+        SubmitJobOperation::new(SubmitJobSpec {
+            payload: JobPayload::Execution(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+        }),
+        context,
+    )
+    .await
+}
+
+/// Read the run-crate obligation status surfaced alongside an execution job.
+pub async fn read_job_run_crate_status(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<RunCrateStatus>, String> {
+    read_run_crate_status(&context.storage_handle, job_id).await
+}
 
 /// API-facing helpers so REST handlers never orchestrate storage/task effects directly.
 pub async fn list_owned_jobs(

@@ -1,9 +1,14 @@
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aruna_core::structs::{AuthContext, JobId, JobRecord, JobState};
+use aruna_core::structs::{
+    AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
+    JobRecord, JobState,
+};
 use aruna_operations::jobs::service::{
-    CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_owned_job,
+    CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_job_run_crate_status, read_owned_job,
+    submit_execution_job,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -12,6 +17,7 @@ use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::auth::require_unrestricted_realm_auth;
@@ -24,15 +30,56 @@ const MAX_LIST_LIMIT: usize = 200;
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "jobs", description = "Durable background jobs")),
-    paths(list_jobs, get_job, cancel_job)
+    paths(list_jobs, get_job, cancel_job, submit_job)
 )]
 pub struct JobsApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/jobs/", get(list_jobs))
+        .route("/jobs/", get(list_jobs).post(submit_job))
         .route("/jobs/{job_id}", get(get_job))
         .route("/jobs/{job_id}/cancel", post(cancel_job))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionInputRequest {
+    pub bucket: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub dest_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitExecutionRequest {
+    pub group_id: String,
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_walltime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_constraint: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<ExecutionInputRequest>,
+    #[serde(default)]
+    pub output_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitJobResponse {
+    pub job_id: String,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -72,6 +119,10 @@ pub struct JobStatusResponse {
     pub error: Option<JobErrorResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_crate: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -107,6 +158,8 @@ fn job_status_response(record: &JobRecord) -> JobStatusResponse {
             kind: error.kind.name().to_string(),
         }),
         result: record.result.as_ref().map(|result| result.to_public_json()),
+        workspace_bucket: record.workspace_bucket.clone(),
+        run_crate: None,
     }
 }
 
@@ -114,7 +167,11 @@ fn parse_state(value: &str) -> ServerResult<JobState> {
     match value {
         "queued" => Ok(JobState::Queued),
         "claimed" => Ok(JobState::Claimed),
+        "preparing" => Ok(JobState::Preparing),
+        "ready" => Ok(JobState::Ready),
         "running" => Ok(JobState::Running),
+        "cancelling" => Ok(JobState::Cancelling),
+        "indeterminate" => Ok(JobState::Indeterminate),
         "succeeded" => Ok(JobState::Succeeded),
         "failed" => Ok(JobState::Failed),
         "cancelled" => Ok(JobState::Cancelled),
@@ -143,6 +200,16 @@ fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
 
 fn parse_job_id(raw: &str) -> ServerResult<JobId> {
     JobId::from_str(raw).map_err(|_| ServerError::NotFound)
+}
+
+fn map_submit_error(error: aruna_operations::jobs::submit::SubmitJobError) -> ServerError {
+    use aruna_operations::jobs::submit::SubmitJobError;
+    match error {
+        SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::Conflict(format!(
+            "idempotency key already bound to job {existing_job_id}"
+        )),
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 #[utoipa::path(
@@ -190,6 +257,86 @@ pub async fn list_jobs(
 }
 
 #[utoipa::path(
+    post,
+    path = "/jobs/",
+    tag = "jobs",
+    request_body = SubmitExecutionRequest,
+    responses(
+        (status = 201, description = "Execution job created", body = SubmitJobResponse),
+        (status = 200, description = "Idempotent match of an existing job", body = SubmitJobResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 409, description = "Idempotency key bound to a different plan", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn submit_job(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<SubmitExecutionRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitJobResponse>)> {
+    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+    if request.image.trim().is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+
+    let inputs = request
+        .inputs
+        .into_iter()
+        .map(|input| InputSelection {
+            source: InputSource::S3 {
+                bucket: input.bucket,
+                key: input.key,
+                version_id: input.version_id,
+            },
+            dest_key: input.dest_key,
+            mode: InputMode::Snapshot,
+        })
+        .collect();
+
+    let spec = ExecutionSpec {
+        group_id,
+        image: request.image,
+        entrypoint: request.entrypoint,
+        command: request.command,
+        env: request.env,
+        resources: ComputeResources {
+            cpu_cores: request.cpu_cores,
+            ram_bytes: request.ram_bytes,
+            max_walltime_ms: request.max_walltime_ms,
+        },
+        executor_constraint: request.executor_constraint,
+        inputs,
+        output_prefixes: request.output_prefixes,
+    };
+    let dedup_key = request.idempotency_key.map(|key| key.into_bytes());
+
+    let result = submit_execution_job(
+        &state.get_ctx(),
+        spec,
+        auth.user_id,
+        state.get_node_id(),
+        dedup_key,
+    )
+    .await
+    .map_err(map_submit_error)?;
+
+    let status = if result.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(SubmitJobResponse {
+            job_id: result.job_id.to_string(),
+            created: result.created,
+        }),
+    ))
+}
+
+#[utoipa::path(
     get,
     path = "/jobs/{job_id}",
     tag = "jobs",
@@ -211,7 +358,12 @@ pub async fn get_job(
         .await
         .map_err(ServerError::InternalError)?
         .ok_or(ServerError::NotFound)?;
-    Ok((StatusCode::OK, Json(job_status_response(&record))))
+    let mut response = job_status_response(&record);
+    response.run_crate = read_job_run_crate_status(&state.get_ctx(), job_id)
+        .await
+        .map_err(ServerError::InternalError)?
+        .map(|status| status.to_public_json());
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
