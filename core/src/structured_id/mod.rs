@@ -5,7 +5,13 @@
 //! bucket, and a 48-bit nonce. All raw bit knowledge lives in [`layout`]; this
 //! module exposes only typed fields so downstream code never touches raw bits.
 
+mod generator;
 mod layout;
+
+pub use generator::{
+    ClockHealthError, DEFAULT_MAX_ID_CLOCK_SKEW_MS, IdEnvironment, StructuredIdGenerator,
+    SystemEnvironment,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
