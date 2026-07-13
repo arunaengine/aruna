@@ -26,7 +26,9 @@ use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
+use aruna_operations::delete_metadata_document::{
+    DeleteMetadataDocumentError, DeleteMetadataDocumentOperation,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
@@ -37,7 +39,8 @@ use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
 use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
+    UpdateMetadataDocumentOperation,
 };
 use ulid::Ulid;
 
@@ -171,11 +174,15 @@ async fn read_misses_nonholder() -> TestResult<()> {
     Ok(())
 }
 
-// #398's fail-loud invariant: a node that holds nothing for the document and
-// did not author it must reject the mutation rather than accept a write it can
-// never publish. Silent acceptance here is the data-loss shape.
+// What main actually pins for a bystander (no registry copy, not the author):
+// the metadata write ops carry no holdership or authorship gate, so the failure
+// is exactly the first local registry read missing (`DocumentNotFound`), the
+// same miss `read_misses_nonholder` pins. #398's forward-before-acceptance
+// routing is unimplemented: a non-holder that had acquired a registry copy
+// would accept the mutation locally (event + outbox) with no forward and no
+// holder check. Do not seed such a copy here until #398 lands.
 #[tokio::test]
-async fn bystander_writes_fail() -> TestResult<()> {
+async fn bystander_writes_miss() -> TestResult<()> {
     let realm_id = RealmId([97u8; 32]);
     let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
 
@@ -215,9 +222,10 @@ async fn bystander_writes_fail() -> TestResult<()> {
         bystander.context.as_ref(),
     )
     .await;
-    assert!(
-        updated.is_err(),
-        "non-holder accepted an update it cannot publish"
+    assert_eq!(
+        updated.unwrap_err(),
+        UpdateMetadataDocumentError::DocumentNotFound,
+        "bystander update must fail on the local registry miss"
     );
 
     let deleted = drive(
@@ -225,12 +233,13 @@ async fn bystander_writes_fail() -> TestResult<()> {
         bystander.context.as_ref(),
     )
     .await;
-    assert!(
-        deleted.is_err(),
-        "non-holder accepted a delete it cannot publish"
+    assert_eq!(
+        deleted.unwrap_err(),
+        DeleteMetadataDocumentError::DocumentNotFound,
+        "bystander delete must fail on the local registry miss"
     );
 
-    // The rejected writes must not have disturbed the real holders.
+    // The failed writes must not have disturbed the real holders.
     for holder in &holders {
         let node = realm.find(*holder);
         let view = drive(
