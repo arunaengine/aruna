@@ -323,26 +323,6 @@ fn classify_deferred_record(
     }
 }
 
-/// Escalates a record that has been waiting for its shard topic far longer than
-/// a genesis takes to arrive. It is still retried, but it stops being silent.
-fn report_stuck_records(deferred: &[DrainRecord]) {
-    let now_ms = unix_timestamp_millis();
-    for (_, record, topic) in deferred {
-        let age_ms = now_ms.saturating_sub(record.outbox_id.timestamp_ms());
-        if age_ms >= OUTBOX_STUCK_AFTER.as_millis() as u64 {
-            error!(
-                event = "pipeline.drain.stuck",
-                target = ?record.target,
-                %topic,
-                age_ms,
-                strategy = %record.placement.strategy_id,
-                shard = record.placement.shard,
-                "Document sync outbox record is stuck: this node holds the bucket but its shard topic genesis has never arrived"
-            );
-        }
-    }
-}
-
 impl OperationsTaskHandler {
     fn new(context: Arc<DriverContext>) -> Self {
         Self {
@@ -502,6 +482,13 @@ impl OperationsTaskHandler {
         let mut publish_elapsed = Duration::ZERO;
         let mut record_count = 0usize;
         let mut deferred_total = 0usize;
+        let mut stuck_total = 0usize;
+        let mut oldest_stuck: Option<(
+            u64,
+            DocumentSyncTarget,
+            irokle::TopicId,
+            aruna_core::structs::PlacementRef,
+        )> = None;
         let mut undeliverable_total = 0usize;
         let mut group_count = 0usize;
         let mut subbatch_count = 0usize;
@@ -642,7 +629,21 @@ impl OperationsTaskHandler {
                 |record| classify_deferred_record(realm_config.as_ref(), net_handle, record),
             );
             deferred_total += deferred.len();
-            report_stuck_records(&deferred);
+            let now_ms = unix_timestamp_millis();
+            for (_, record, topic) in &deferred {
+                let record_ms = record.outbox_id.timestamp_ms();
+                if now_ms.saturating_sub(record_ms) < OUTBOX_STUCK_AFTER.as_millis() as u64 {
+                    continue;
+                }
+                stuck_total += 1;
+                if oldest_stuck
+                    .as_ref()
+                    .is_none_or(|(oldest_ms, ..)| record_ms < *oldest_ms)
+                {
+                    oldest_stuck =
+                        Some((record_ms, record.target.clone(), *topic, record.placement));
+                }
+            }
             undeliverable_total += undeliverable.len();
             self.report_undeliverable_records(&undeliverable);
 
@@ -760,6 +761,19 @@ impl OperationsTaskHandler {
             if !has_more {
                 break;
             }
+        }
+
+        if let Some((oldest_ms, target, topic, placement)) = oldest_stuck {
+            error!(
+                event = "pipeline.drain.stuck",
+                count = stuck_total,
+                oldest_age_ms = unix_timestamp_millis().saturating_sub(oldest_ms),
+                representative_target = ?target,
+                representative_topic = %topic,
+                representative_strategy = %placement.strategy_id,
+                representative_shard = placement.shard,
+                "Document sync outbox records are stuck: this node holds their buckets but their shard topic geneses have never arrived"
+            );
         }
 
         // A locally-originated realm-config change (strategy upsert, node
