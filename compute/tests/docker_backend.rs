@@ -261,9 +261,7 @@ async fn foreign_not_adopted() {
 
     use bollard::Docker;
     use bollard::models::ContainerCreateBody;
-    use bollard::query_parameters::{
-        CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
-    };
+    use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
     let spec = sh(&unique("foreign"), "sleep 30");
     let attempt = spec.attempt.clone();
     let docker = Docker::connect_with_defaults().unwrap();

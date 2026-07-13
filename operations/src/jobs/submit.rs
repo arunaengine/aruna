@@ -54,10 +54,7 @@ pub enum SubmitJobError {
 enum SubmitState {
     Init,
     ReadDedup,
-    VerifyDedup {
-        job_id: JobId,
-        digest_matches: bool,
-    },
+    VerifyDedup { job_id: JobId, digest_matches: bool },
     WriteJob,
     ScheduleDrain,
     Finish,

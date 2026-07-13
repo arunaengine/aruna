@@ -159,7 +159,6 @@ impl DockerBackend {
             },
         }
     }
-
 }
 
 fn build_config(config: &DockerConfig, spec: &TaskSpec) -> ContainerCreateBody {
@@ -705,10 +704,7 @@ mod tests {
             host.storage_opt.unwrap().get("size").unwrap(),
             &(1u64 << 30).to_string()
         );
-        assert_eq!(
-            body.labels.unwrap().get(WALLTIME_LABEL).unwrap(),
-            "600000"
-        );
+        assert_eq!(body.labels.unwrap().get(WALLTIME_LABEL).unwrap(), "600000");
     }
 
     #[test]

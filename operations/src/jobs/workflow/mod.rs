@@ -895,15 +895,18 @@ mod tests {
             None,
         );
         insert_job(storage, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node_id(7), 2)
-            .await
-            .unwrap()
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(storage, job_id, node_id(7), 2).await.unwrap()
         else {
             panic!("claim failed");
         };
         let token = claimed.claim.as_ref().unwrap().claim_token;
-        transition_to_preparing(storage, job_id, token, 3).await.unwrap();
-        transition_to_ready(storage, job_id, token, 4).await.unwrap();
+        transition_to_preparing(storage, job_id, token, 3)
+            .await
+            .unwrap();
+        transition_to_ready(storage, job_id, token, 4)
+            .await
+            .unwrap();
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), claimed.attempts);
         let intent = AttemptIntent {
             attempt_no: claimed.attempts,
