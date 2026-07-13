@@ -126,16 +126,19 @@ fn decode_canonical(input: &str) -> Result<u128, ParseError> {
 }
 
 mod sealed {
-    pub trait Sealed {}
+    use ulid::Ulid;
+
+    /// The raw constructor lives here so no code outside this module can
+    /// wrap an unvalidated ULID (e.g. one carrying the reserved handle 0).
+    pub trait Sealed {
+        fn from_ulid(ulid: Ulid) -> Self;
+    }
 }
 
 /// Shared codec for the Aruna Structured ULID family (`MetaResourceId`,
 /// `JobId`). Every constructor guarantees a non-zero handle, so extracted
 /// fields are always valid.
 pub trait StructuredId: Sized + Copy + sealed::Sealed {
-    #[doc(hidden)]
-    fn from_ulid(ulid: Ulid) -> Self;
-
     fn as_ulid(&self) -> Ulid;
 
     /// Builds an id from its four fields, rejecting an out-of-range timestamp or
@@ -206,13 +209,13 @@ macro_rules! structured_id_newtype {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(Ulid);
 
-        impl sealed::Sealed for $name {}
-
-        impl StructuredId for $name {
+        impl sealed::Sealed for $name {
             fn from_ulid(ulid: Ulid) -> Self {
                 Self(ulid)
             }
+        }
 
+        impl StructuredId for $name {
             fn as_ulid(&self) -> Ulid {
                 self.0
             }
