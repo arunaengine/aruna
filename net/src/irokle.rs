@@ -650,7 +650,7 @@ impl DocumentSyncService {
 
         let oplog = Oplog::with_storage(self.node.storage().clone());
         for (topic_id, state) in states {
-            let missing_peers = holder_peers
+            let missing_peers = member_peers
                 .iter()
                 .copied()
                 .filter(|peer| *peer != local_peer && !state.members.contains(peer))
