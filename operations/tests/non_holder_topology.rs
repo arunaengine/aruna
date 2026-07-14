@@ -31,7 +31,9 @@ use aruna_operations::delete_metadata_document::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::get_metadata_document::{
+    GetMetadataDocumentError, GetMetadataDocumentOperation,
+};
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::placement::PlacementResolutionContext;
 use aruna_operations::read_user_document::ReadUserDocumentOperation;
@@ -165,8 +167,9 @@ async fn read_misses_nonholder() -> TestResult<()> {
         bystander.context.as_ref(),
     )
     .await;
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result.unwrap_err(),
+        GetMetadataDocumentError::DocumentNotFound,
         "non-holder served a document it never received"
     );
 
@@ -317,7 +320,14 @@ async fn mutate_off_holders() -> TestResult<()> {
     for holder in &holders {
         let node = realm.find(*holder);
         wait_until("delete reaches holder", node.node_id(), || async {
-            !document_present(node, group_id, document_id).await
+            matches!(
+                drive(
+                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    node.context.as_ref(),
+                )
+                .await,
+                Err(GetMetadataDocumentError::DocumentNotFound)
+            )
         })
         .await?;
     }
