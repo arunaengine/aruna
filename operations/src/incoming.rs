@@ -14,6 +14,7 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
 use crate::process_placements::process_shard_placements;
+use crate::queue_backoff::queue_retry_after_ms;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
@@ -82,6 +83,7 @@ impl DocumentSyncReconcileCoalescer {
         }
         let coalescer = self.clone();
         tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
                 let batch: Vec<irokle::TopicId> = {
                     let mut state = coalescer
@@ -96,9 +98,29 @@ impl DocumentSyncReconcileCoalescer {
                     state.queued_since = None;
                     std::mem::take(&mut state.queued).into_iter().collect()
                 };
-                reconcile_inbound_document_sync_topics(&context, batch).await;
+                if reconcile_inbound_document_sync_topics(&context, batch.clone()).await {
+                    failures = 0;
+                } else {
+                    coalescer.trigger(context.clone(), batch);
+                    let retry_after = Duration::from_millis(queue_retry_after_ms(failures));
+                    failures = failures.saturating_add(1);
+                    sleep(retry_after).await;
+                }
             }
         });
+    }
+
+    fn trigger_all(self: &Arc<Self>, context: Arc<DriverContext>) {
+        let Some(net_handle) = context.net_handle.as_ref() else {
+            return;
+        };
+        let Ok(topics) = net_handle.document_sync_node().list_topics() else {
+            return;
+        };
+        self.trigger(
+            context,
+            topics.into_iter().map(|topic| topic.topic_id).collect(),
+        );
     }
 
     fn lag_snapshot(&self) -> (usize, bool, u64) {
@@ -144,9 +166,9 @@ fn spawn_reconcile_queue_gauge(coalescer: Weak<DocumentSyncReconcileCoalescer>) 
 async fn reconcile_inbound_document_sync_topics(
     context: &Arc<DriverContext>,
     topics: Vec<irokle::TopicId>,
-) {
+) -> bool {
     let Some(net_handle) = context.net_handle.clone() else {
-        return;
+        return true;
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
@@ -154,14 +176,14 @@ async fn reconcile_inbound_document_sync_topics(
         Ok(targets) => targets,
         Err(err) => {
             error!(error = ?err, "Failed to reconcile inbound document sync topics");
-            return;
+            return false;
         }
     };
     let reconcile_elapsed = run_started.elapsed();
     let applied = targets.applied();
     debug!(applied, "Reconciled inbound document sync events");
     if applied == 0 {
-        return;
+        return true;
     }
     let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
@@ -188,6 +210,7 @@ async fn reconcile_inbound_document_sync_topics(
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
+    true
 }
 
 pub fn initialize_net_incoming(context: Arc<DriverContext>) {
@@ -196,10 +219,15 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
         return;
     };
     let metadata_handle = context.metadata_handle.clone();
+    let inbound_handler = Arc::new(OperationsInboundHandler::new(context.clone()));
 
-    net_handle.set_inbound_handler(Arc::new(OperationsInboundHandler::new(context)));
+    net_handle.set_inbound_handler(inbound_handler.clone());
     if let Some(metadata_handle) = metadata_handle {
-        schedule_periodic_metadata_document_sync_maintenance(metadata_handle);
+        schedule_periodic_metadata_document_sync_maintenance(
+            context,
+            Arc::downgrade(&inbound_handler.document_sync_reconcile),
+            metadata_handle,
+        );
     }
 }
 
@@ -291,7 +319,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                             self.document_sync_reconcile
                                 .trigger(self.context.clone(), touched_topics);
                         }
-                        Err(err) => error!(error = ?err, "Failed to process inbound document sync stream"),
+                        Err(err) => {
+                            error!(error = ?err, "Failed to process inbound document sync stream");
+                            self.document_sync_reconcile
+                                .trigger_all(self.context.clone());
+                        }
                     }
                 }
                 Alpn::Metadata => {
@@ -463,7 +495,11 @@ async fn schedule_projection_retry(context: &DriverContext) {
     }
 }
 
-fn schedule_periodic_metadata_document_sync_maintenance(metadata_handle: MetadataHandle) {
+fn schedule_periodic_metadata_document_sync_maintenance(
+    context: Arc<DriverContext>,
+    coalescer: Weak<DocumentSyncReconcileCoalescer>,
+    metadata_handle: MetadataHandle,
+) {
     let jitter = Duration::from_secs(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -474,6 +510,10 @@ fn schedule_periodic_metadata_document_sync_maintenance(metadata_handle: Metadat
         let mut cycle = 0usize;
         loop {
             sleep(METADATA_DOCUMENT_SYNC_MAINTENANCE_INTERVAL + jitter).await;
+            let Some(coalescer) = coalescer.upgrade() else {
+                return;
+            };
+            coalescer.trigger_all(context.clone());
             cycle = cycle.saturating_add(1);
             run_metadata_document_sync_maintenance(&metadata_handle, "periodic", cycle).await;
         }
