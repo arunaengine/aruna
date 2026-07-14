@@ -1620,9 +1620,6 @@ async fn sync_graph_once(
     // fork rival ones for the same graph.
     let setup_started = Instant::now();
     let topic_id = bind_or_derive_graph_topic(&inner, &graph_iri).await?;
-    net_handle
-        .allow_document_sync_peers(&[topic_id], peers.clone())
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
     record_elapsed_ms(&span, "local_peer_setup_ms", setup_started);
 
     let sync_started = Instant::now();
@@ -1640,6 +1637,7 @@ async fn sync_graph_once(
     if !document_sync_topic_exists(&net_handle, topic_id)? {
         ensure_graph_topic_genesis(&inner, &net_handle, &graph_iri, topic_id, &peers).await?;
     }
+    add_graph_topic_peers(&inner, &net_handle, &graph_iri, topic_id, &peers).await?;
 
     net_handle
         .sync_document_topic_with_peers(topic_id, peers)
@@ -1648,6 +1646,41 @@ async fn sync_graph_once(
     record_elapsed_ms(&span, "network_sync_ms", sync_started);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok(())
+}
+
+async fn add_graph_topic_peers(
+    inner: &Arc<MetadataInner>,
+    net_handle: &NetHandle,
+    graph_iri: &str,
+    topic_id: irokle::TopicId,
+    peers: &[NodeId],
+) -> Result<(), MetadataError> {
+    let sync_node = net_handle.document_sync_node();
+    let Some(state) = irokle::Storage::topic_state(sync_node.storage(), &topic_id)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let node = inner.node.clone();
+    let graph_iri = graph_iri.to_string();
+    let peers = peers
+        .iter()
+        .copied()
+        .filter(|peer| !state.members.contains(&document_sync_peer_id(*peer)))
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(move || {
+        let graph = GraphId::new(&graph_iri);
+        for peer in peers {
+            node.add_irokle_peer(&graph, document_sync_peer_id(peer))?;
+        }
+        Ok::<_, CraqleError>(())
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(metadata_error_from_craqle)
 }
 
 /// Creates the graph topic genesis under the single-minter discipline.
