@@ -413,12 +413,14 @@ mod tests {
         let (_dir, state) = build_state().await;
         let owner = user(2);
         let job_id = JobId::from_bytes([9u8; 16]);
-        insert_job(
-            &state.get_ctx().storage_handle,
-            &job_for(job_id, owner, 1000),
-        )
-        .await
-        .unwrap();
+        // has_run keeps this job off the never-run direct-cancel fast path (see
+        // set_cancel_requested), so it stays live and cancel_requested-flagged across
+        // repeated cancel calls, which is what this test exercises.
+        let mut record = job_for(job_id, owner, 1000);
+        record.has_run = true;
+        insert_job(&state.get_ctx().storage_handle, &record)
+            .await
+            .unwrap();
 
         let (status, _) = cancel_job(
             State(state.clone()),

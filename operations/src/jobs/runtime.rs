@@ -164,9 +164,15 @@ impl JobsRuntime {
             // A panicking payload is turned into a job failure inside `supervise`; this
             // guard still runs `finish` if anything else unwinds, so a panic can never
             // leak the concurrency slot and wedge the runtime.
-            let _ = AssertUnwindSafe(run_job(context.clone(), record, claim_token, cancel, shutdown))
-                .catch_unwind()
-                .await;
+            let _ = AssertUnwindSafe(run_job(
+                context.clone(),
+                record,
+                claim_token,
+                cancel,
+                shutdown,
+            ))
+            .catch_unwind()
+            .await;
             runtime.finish(&context, job_id, nonce).await;
         });
     }
