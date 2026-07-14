@@ -539,6 +539,7 @@ fn classify_pull(err: &bollard::errors::Error) -> BackendError {
             404 => BackendError::ImageNotFound(message.clone()),
             _ => classify_pull_error(message),
         },
+        Error::DockerStreamError { error } => classify_pull_error(error),
         _ => classify(err),
     }
 }
@@ -804,6 +805,16 @@ mod tests {
             err: std::io::Error::other("socket closed"),
         };
         assert!(classify_pull(&io).retryable());
+    }
+
+    #[test]
+    fn pull_stream_error_classification() {
+        let error = bollard::errors::Error::DockerStreamError {
+            error: "manifest unknown".to_string(),
+        };
+        let classified = classify_pull(&error);
+        assert!(matches!(classified, BackendError::ImageNotFound(_)));
+        assert!(!classified.retryable());
     }
 
     #[test]
