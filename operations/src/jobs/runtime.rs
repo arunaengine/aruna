@@ -752,8 +752,8 @@ mod tests {
         std::fs::write(&marker, b"partial").unwrap();
         let mut record = probe_record(job_id, 5, 0, Some(marker.to_str().unwrap().to_string()));
         record.cancel_requested = true;
-        // A prior attempt means it is claimed (not fresh-cancelled) so cleanup runs.
-        record.attempts = 1;
+        // A prior run means it is claimed (not fresh-cancelled) so cleanup runs.
+        record.has_run = true;
         let claimed = claim(&storage, record).await;
 
         runtime.spawn(ctx.clone(), claimed);
