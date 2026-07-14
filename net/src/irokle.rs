@@ -64,9 +64,8 @@ use globset::Glob;
 use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
 use irokle_crate::TopicControl;
-use irokle_crate::history::HistoryOrder;
 use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
-use irokle_crate::oplog::Oplog;
+use irokle_crate::oplog::{Oplog, topological_subset};
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
 use irokle_crate::{
     EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
@@ -2487,57 +2486,52 @@ impl DocumentSyncService {
         })
     }
 
-    /// Returns the decoded document events above the applied cursor, reading
-    /// only the unapplied portion of the topic history where possible. Each
-    /// event is paired with the authenticated actor id and sequence of the op
-    /// that carried it: irokle admits an op only after verifying its signature
-    /// against `body.author` and enforcing
-    /// `actor_id == actor_id_for(topic, author)`, so the returned actor id is a
-    /// trustworthy proxy for the signed publisher.
+    /// Returns authenticated document events above a component-wise cursor.
+    /// Actor ranges keep covered DAG heads from hiding unapplied dependencies.
     fn document_events_after(
         &self,
         topic_id: irokle_crate::TopicId,
         cursor: &irokle_crate::ActorClock,
     ) -> Result<Vec<(DocumentSyncEvent, irokle_crate::ActorId, u64)>> {
-        match self.node.open_topic::<DocumentSyncEvent>(topic_id) {
-            Ok(topic) => Ok(topic
-                .history_after(cursor, HistoryOrder::OldestFirst)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                .into_iter()
-                .map(|record| (record.event, record.meta.actor_id, record.meta.actor_seq))
-                .collect()),
-            // Topics we hold ops for without being a listed member still
-            // reconcile via the full history.
-            Err(irokle_crate::Error::NotTopicMember) => {
-                let raw = self
-                    .node
-                    .raw_topic(topic_id)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                let ops = raw
-                    .history()
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                let mut events = Vec::new();
-                for op in ops {
-                    if cursor.get(&op.signed.body.actor_id) >= op.signed.body.actor_seq {
-                        continue;
-                    }
-                    let actor_id = op.signed.body.actor_id;
-                    let actor_seq = op.signed.body.actor_seq;
-                    let TopicPayload::Event(envelope) = op.signed.body.payload else {
-                        continue;
-                    };
-                    events.push((
-                        envelope
-                            .decode_event::<DocumentSyncEvent>()
-                            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-                        actor_id,
-                        actor_seq,
-                    ));
-                }
-                Ok(events)
+        let storage = self.node.storage();
+        let topic_clock = storage
+            .actor_clock(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut op_ids = BTreeSet::new();
+        for (actor_id, actor_tip) in topic_clock.iter() {
+            let Some(first_unapplied) = cursor.get(actor_id).checked_add(1) else {
+                continue;
+            };
+            for actor_seq in first_unapplied..=*actor_tip {
+                let op_id = storage
+                    .actor_index(&topic_id, actor_id, actor_seq)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                    .ok_or_else(|| {
+                        NetError::Bootstrap(format!(
+                            "missing document sync op for actor {actor_id} sequence {actor_seq}"
+                        ))
+                    })?;
+                op_ids.insert(op_id);
             }
-            Err(error) => Err(NetError::Bootstrap(error.to_string())),
         }
+        let ops = topological_subset(storage, &op_ids)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let mut events = Vec::new();
+        for op in ops {
+            let actor_id = op.signed.body.actor_id;
+            let actor_seq = op.signed.body.actor_seq;
+            let TopicPayload::Event(envelope) = op.signed.body.payload else {
+                continue;
+            };
+            events.push((
+                envelope
+                    .decode_event::<DocumentSyncEvent>()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                actor_id,
+                actor_seq,
+            ));
+        }
+        Ok(events)
     }
 
     fn pending_metadata_create_apply(
@@ -9514,7 +9508,7 @@ mod tests {
             .open_topic::<DocumentSyncEvent>(restart_topic())
             .expect("published topic reopens after restart");
         let history = topic
-            .history(HistoryOrder::OldestFirst)
+            .history(irokle_crate::history::HistoryOrder::OldestFirst)
             .expect("published history reads after restart");
 
         assert_eq!(history.len(), 1);
@@ -12815,6 +12809,79 @@ mod tests {
                 .contains(&node_id_to_peer_id(&stale_node)),
             "former shard holders remain available as default network peers"
         );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn document_events_after_keeps_unapplied_dependency_of_covered_head() {
+        use irokle_crate::{Ed25519Signer, Signer as _};
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let service = open_restart_service(root.path(), "causal-cursor-storage").await;
+        let local_node = service.local_node_id().expect("local node id");
+        let remote_node = node(88);
+        let topic_id = restart_topic();
+        service
+            .ensure_document_sync_topics(&[topic_id], vec![remote_node])
+            .expect("shard topic exists");
+        let oplog = Oplog::with_storage(service.node().storage().clone());
+        let remote_signer = Ed25519Signer::from_bytes(&[88; 32]);
+        let remote_event_id = Ulid::from_parts(1_727_000_000_000, 43);
+        let local_event_id = Ulid::from_parts(1_727_000_000_000, 44);
+        let change = |event_id, actor| DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor,
+                updated_at_ms: 1_727_000_000_101,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+            placement: restart_placement(),
+        };
+        let publish = |event_id, actor| DocumentSyncEvent::Upsert {
+            event_id,
+            target: restart_target(),
+            bytes: restart_payload(),
+            change: change(event_id, actor),
+        };
+        let remote_actor = irokle_crate::actor_id_for(topic_id, remote_signer.peer_id());
+        oplog
+            .create_event_op(
+                topic_id,
+                remote_actor,
+                EventEnvelope::encode_event(&publish(remote_event_id, remote_node))
+                    .expect("remote event encodes"),
+                &remote_signer,
+            )
+            .expect("remote event publishes");
+        let local_op = oplog
+            .create_event_op(
+                topic_id,
+                irokle_crate::actor_id_for(topic_id, node_id_to_peer_id(&local_node)),
+                EventEnvelope::encode_event(&publish(local_event_id, local_node))
+                    .expect("local event encodes"),
+                service.node().signer(),
+            )
+            .expect("local event publishes above remote head");
+        let mut cursor = irokle_crate::ActorClock::default();
+        cursor.observe(
+            local_op.signed.body.actor_id,
+            local_op.signed.body.actor_seq,
+        );
+
+        let events = service
+            .document_events_after(topic_id, &cursor)
+            .expect("unapplied document events read");
+        let event_ids = events
+            .into_iter()
+            .filter_map(|(event, _, _)| match event {
+                DocumentSyncEvent::Upsert { event_id, .. } => Some(event_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(event_ids, vec![remote_event_id]);
 
         service.shutdown().await;
     }
