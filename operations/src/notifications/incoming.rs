@@ -383,6 +383,14 @@ fn validate_inbound_watch_event(
 }
 
 fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(), String> {
+    if record.watch_authorization.is_some()
+        || matches!(
+            record.kind,
+            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+        )
+    {
+        return Err("resource watch records must use watch event delivery".to_string());
+    }
     if record.read_at_ms.is_some() {
         return Err("delivered notification records must be unread".to_string());
     }
@@ -1088,7 +1096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_with_invalid_watch_actor_is_rejected_without_partial_write() {
+    async fn generic_batch_rejects_watch_records_without_partial_write() {
         let (a, b, recipient) = delivery_pair(83).await;
         let valid = record(recipient, 1);
         let mut invalid = record(recipient, 2);
@@ -1101,14 +1109,14 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             size_bytes: 0,
-            actor_user_id: UserId::nil(recipient.realm_id),
+            actor_user_id: recipient,
         };
 
         let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
             .await
-            .expect_err("batch containing invalid watch actor must be rejected");
+            .expect_err("generic batch containing watch data must be rejected");
         assert!(
-            error.contains("empty actor_user_id"),
+            error.contains("must use watch event delivery"),
             "unexpected reject reason: {error}"
         );
         assert!(read_inbox(&b).await.is_empty());
