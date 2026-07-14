@@ -19,6 +19,7 @@ pub mod operation;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;
+pub mod structured_id;
 pub mod task;
 pub mod telemetry;
 pub mod trace_context;
@@ -36,6 +37,10 @@ pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use metadata::*;
 pub use onboarding::*;
+pub use structured_id::{
+    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle,
+    StructuredId, StructuredIdGenerator, SystemEnvironment,
+};
 pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
 pub use user_id::UserId;
