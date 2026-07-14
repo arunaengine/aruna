@@ -188,7 +188,7 @@ fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> Serve
         }
         // A holder-side denial answers exactly as the create-time check does, so
         // an unreadable path never separates into a distinct existence signal.
-        WatchDispatchError::Unauthorized => ServerError::Forbidden,
+        WatchDispatchError::Unauthorized(_) => ServerError::Forbidden,
         WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
         WatchDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");
@@ -818,8 +818,8 @@ pub async fn create_watch(
     )
     .await
     .map_err(|error| {
-        if matches!(error, WatchDispatchError::Unauthorized) {
-            record_watch_creation_denial(&state, WatchAuthorizationMetricReason::PermissionDenied);
+        if let WatchDispatchError::Unauthorized(reason) = &error {
+            record_watch_creation_denial(&state, *reason);
         }
         map_watch_dispatch_error(error, "create_watch")
     })?;

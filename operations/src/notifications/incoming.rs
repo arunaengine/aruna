@@ -1775,7 +1775,10 @@ mod tests {
         )
         .await
         .expect_err("an owner without READ must be refused by the holder");
-        assert_eq!(error, WATCH_SUBSCRIPTION_UNAUTHORIZED);
+        assert_eq!(
+            error,
+            format!("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: permission_denied")
+        );
         assert!(
             list_watch_subscriptions(&b.context.storage_handle, owner)
                 .await

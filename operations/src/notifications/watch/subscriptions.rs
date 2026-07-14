@@ -7,6 +7,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::storage_entries::{
     document_sync_revision_write_entry, watch_subscription_delete_entry,
     watch_subscription_write_entry,
@@ -25,7 +26,9 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
-use crate::notifications::watch::authorization::is_watch_authorized;
+use crate::notifications::watch::authorization::{
+    WatchAuthorization, evaluate_watch_authorization,
+};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -43,8 +46,8 @@ pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
-    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}")]
-    Unauthorized,
+    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
+    Unauthorized(WatchAuthorizationMetricReason),
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
     #[error("watch path prefix must not start with a slash")]
@@ -105,7 +108,7 @@ pub async fn create_replicated_watch_subscription(
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     let subscription =
         validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
-    if !is_watch_authorized(
+    match evaluate_watch_authorization(
         context,
         owner.realm_id,
         owner,
@@ -116,7 +119,15 @@ pub async fn create_replicated_watch_subscription(
     .await
     .map_err(WatchSubscriptionError::Storage)?
     {
-        return Err(WatchSubscriptionError::Unauthorized);
+        WatchAuthorization::Authorized => {}
+        WatchAuthorization::Denied(reason) => {
+            return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
+        }
+        WatchAuthorization::Unavailable(_) => {
+            return Err(WatchSubscriptionError::Unauthorized(
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            ));
+        }
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
     let subscription =
@@ -134,7 +145,9 @@ fn validated_subscription(
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     validate_subscription_fields(&path_prefix, event_mask)?;
     if !authorization.is_valid() {
-        return Err(WatchSubscriptionError::Unauthorized);
+        return Err(WatchSubscriptionError::Unauthorized(
+            WatchAuthorizationMetricReason::InvalidState,
+        ));
     }
 
     Ok(WatchSubscription::new_with_authorization(

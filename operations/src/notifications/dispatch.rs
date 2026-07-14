@@ -1,4 +1,5 @@
 use aruna_core::NodeId;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
     WatchEventMask, WatchSubscription,
@@ -53,8 +54,8 @@ pub enum WatchDispatchError {
     Unavailable,
     #[error("notification watch subscription cap reached")]
     CapExceeded,
-    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}")]
-    Unauthorized,
+    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
+    Unauthorized(WatchAuthorizationMetricReason),
     #[error("holder proxy failed: {0}")]
     Remote(String),
     #[error("{0}")]
@@ -366,7 +367,9 @@ pub async fn create_watch_for_user(
         .await
         .map_err(|error| match error {
             WatchSubscriptionError::CapExceeded => WatchDispatchError::CapExceeded,
-            WatchSubscriptionError::Unauthorized => WatchDispatchError::Unauthorized,
+            WatchSubscriptionError::Unauthorized(reason) => {
+                WatchDispatchError::Unauthorized(reason)
+            }
             other => WatchDispatchError::Internal(other.to_string()),
         })?;
         schedule_watch_interest_publish(context).await;
@@ -388,8 +391,12 @@ pub async fn create_watch_for_user(
         .map_err(|reason| {
             if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
                 WatchDispatchError::CapExceeded
-            } else if reason == WATCH_SUBSCRIPTION_UNAUTHORIZED {
-                WatchDispatchError::Unauthorized
+            } else if let Some(reason) = reason
+                .strip_prefix(WATCH_SUBSCRIPTION_UNAUTHORIZED)
+                .and_then(|value| value.strip_prefix(": "))
+                .and_then(WatchAuthorizationMetricReason::parse)
+            {
+                WatchDispatchError::Unauthorized(reason)
             } else {
                 WatchDispatchError::Remote(reason)
             }

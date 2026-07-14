@@ -83,6 +83,20 @@ impl WatchAuthorizationMetricReason {
             Self::InvalidState => "invalid_state",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "invalid_resource" => Self::InvalidResource,
+            "invalid_owner" => Self::InvalidOwner,
+            "token_restricted" => Self::TokenRestricted,
+            "token_expired" => Self::TokenExpired,
+            "token_revoked" => Self::TokenRevoked,
+            "permission_denied" => Self::PermissionDenied,
+            "authorization_unavailable" => Self::AuthorizationUnavailable,
+            "invalid_state" => Self::InvalidState,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -358,6 +372,10 @@ mod tests {
 
     #[tokio::test]
     async fn notification_watch_metrics_use_bounded_reason_labels() {
+        assert_eq!(
+            WatchAuthorizationMetricReason::parse("token_revoked"),
+            Some(WatchAuthorizationMetricReason::TokenRevoked)
+        );
         let metrics = NodeMetrics::new();
         let watch_metrics = NotificationWatchMetrics::default();
         watch_metrics.register(&metrics).await;
