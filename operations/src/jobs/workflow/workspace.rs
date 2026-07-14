@@ -1,15 +1,18 @@
 use std::time::{Duration, SystemTime};
 
 use aruna_core::structs::{
-    BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord, OutputObject,
-    PathRestriction, Permission, blob_bucket_permission_path,
+    AuthContext, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
+    OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
 };
 use aruna_core::types::NodeId;
 use ulid::Ulid;
 
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::get_realm_config::GetRealmConfigOperation;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
+use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -125,6 +128,35 @@ async fn stage_one_input(
     let version = version_id
         .as_deref()
         .and_then(|v| Ulid::from_string(v).ok());
+    let bucket_info = drive(GetBucketInfoOperation::new(src_bucket.clone()), context)
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| JobError::permanent(format!("input bucket lookup failed: {error}")))?
+        .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+            },
+            path: blob_bucket_permission_path(
+                record.created_by.realm_id,
+                bucket_info.group_id,
+                node_id,
+                src_bucket,
+            ),
+            required_permission: Permission::READ,
+        }),
+        context,
+    )
+    .await
+    .map_err(|error| JobError::permanent(format!("input authorization failed: {error}")))?;
+    if !allowed {
+        return Err(JobError::permanent(format!(
+            "input {src_bucket}/{src_key} access denied"
+        )));
+    }
     let get = drive(
         GetObjectOperation::new(GetObjectInput {
             bucket: src_bucket.clone(),
@@ -142,6 +174,13 @@ async fn stage_one_input(
     .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
 
     let content_length = get.location.as_ref().map(|location| location.blob_size);
+    let realm_config = drive(
+        GetRealmConfigOperation::new(record.created_by.realm_id),
+        context,
+    )
+    .await
+    .map_err(|error| JobError::retryable(format!("quota lookup failed: {error}")))?;
+    let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
     drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -158,7 +197,7 @@ async fn stage_one_input(
             checksum_type: None,
             exists: false,
             version_source: None,
-            quota_ceiling: None,
+            quota_ceiling,
         }),
         context,
     )
