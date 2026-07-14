@@ -264,6 +264,17 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
     }
 
     match transition_to_running(storage, job_id, token, unix_timestamp_millis()).await {
+        Ok(fresh_record) if fresh_record.cancel_requested => {
+            run_cleanup(&record.payload);
+            terminal_or_none(
+                retry_terminal(|| {
+                    cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                })
+                .await,
+                job_id,
+            );
+            return;
+        }
         Ok(_) => {}
         Err(JobMutationError::TokenMismatch) => {
             warn!(job_id = %job_id, "Lost claim before running; aborting");
@@ -334,14 +345,14 @@ async fn run_job(context: Arc<DriverContext>, record: JobRecord, cancel: Cancell
             }
         }
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {
-            run_cleanup(&record.payload);
-            terminal_or_none(
-                retry_terminal(|| {
-                    cancel_running_job(storage, job_id, token, unix_timestamp_millis())
-                })
-                .await,
-                job_id,
-            );
+            let terminal = retry_terminal(|| {
+                cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+            })
+            .await;
+            if !matches!(&terminal, Err(JobMutationError::TokenMismatch)) {
+                run_cleanup(&record.payload);
+            }
+            terminal_or_none(terminal, job_id);
         }
     }
 }
@@ -466,7 +477,9 @@ async fn heartbeat_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::{claim_job, complete_job, insert_job};
+    use crate::jobs::store::{
+        ClaimOutcome, claim_job, complete_job, insert_job, set_cancel_requested,
+    };
     use aruna_core::structs::{JobClaim, JobPayload, JobResultPayload, RealmId};
     use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
@@ -602,6 +615,78 @@ mod tests {
             .unwrap();
         assert_eq!(state, JobState::Cancelled);
         assert!(!marker.exists(), "cleanup removes partial state on reclaim");
+    }
+
+    // A cancel committed after claim must beat payload execution from the stale snapshot.
+    #[tokio::test]
+    async fn cancel_after_claim() {
+        let (dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x3A; 16]);
+        let marker = dir.path().join("late-cancel-marker");
+        std::fs::write(&marker, b"partial").unwrap();
+        let mut record = probe_record(job_id, 1, 0, Some(marker.to_str().unwrap().to_string()));
+        let JobPayload::Probe { fail_at, .. } = &mut record.payload;
+        *fail_at = Some(0);
+        let claimed = claim(&storage, record).await;
+        set_cancel_requested(&storage, job_id, unix_timestamp_millis())
+            .await
+            .unwrap();
+
+        run_job(ctx, claimed, CancellationToken::new()).await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+        assert!(!marker.exists(), "late cancellation must run cleanup");
+    }
+
+    // Cleanup is claim-owned; a reclaimed zombie must leave the side effect alone.
+    #[tokio::test]
+    async fn zombie_skips_cleanup() {
+        let (dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x2A; 16]);
+        let marker = dir.path().join("zombie-marker");
+        let marker_str = marker.to_str().unwrap().to_string();
+        let claimed = claim(&storage, probe_record(job_id, 1, 60_000, Some(marker_str))).await;
+        let stale_token = claimed.claim.as_ref().unwrap().claim_token;
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn(run_job(ctx, claimed, cancel.clone()));
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(marker.exists(), "probe must reach its cleanup side effect");
+
+        requeue_job(
+            &storage,
+            job_id,
+            Some(stale_token),
+            unix_timestamp_millis(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            claim_job(&storage, job_id, node_id(4), unix_timestamp_millis())
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(
+            !execution.is_finished(),
+            "stale payload must still be running"
+        );
+
+        cancel.cancel();
+        execution.await.unwrap();
+        assert!(marker.exists(), "zombie must not run cleanup");
     }
 
     #[tokio::test]
