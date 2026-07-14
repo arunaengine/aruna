@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::{Host, Url};
 
 /// The portal loads its webfont stylesheet from Google Fonts and the font files
@@ -226,6 +226,7 @@ fn directive(base: &str, origins: &BTreeSet<String>) -> String {
 fn normalize_origin(value: &str) -> Option<String> {
     let url = Url::parse(value.trim()).ok()?;
     if !is_secure_origin(&url) {
+        warn!(origin = %value, "Portal CSP ignores insecure origin");
         return None;
     }
     let origin = url.origin().ascii_serialization();
