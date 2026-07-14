@@ -535,6 +535,14 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
+    let record = match read_owned_job(&state.get_ctx(), auth.user_id, job_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return TesError::not_found("TES task not found").into_response(),
+        Err(error) => return TesError::internal(error).into_response(),
+    };
+    if !matches!(record.payload, JobPayload::Execution(_)) {
+        return TesError::not_found("TES task not found").into_response();
+    }
 
     match cancel_owned_job(
         &state.get_ctx(),
