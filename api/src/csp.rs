@@ -5,7 +5,8 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use std::collections::BTreeSet;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -23,6 +24,7 @@ const BASELINE_CSP: &str = "frame-ancestors 'none'";
 /// OIDC origins change rarely; a point-read behind this window keeps the common
 /// portal response off the storage path.
 const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
+const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-opener-policy");
@@ -59,13 +61,27 @@ struct ResolvedOrigins {
 #[derive(Default)]
 struct OidcOriginCache {
     origins: BTreeSet<String>,
+    token_origins: BTreeMap<String, String>,
     refreshed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct S3OriginCache {
+    base_url: Option<String>,
+    origin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OidcDiscoveryDocument {
+    token_endpoint: String,
 }
 
 #[derive(Clone)]
 pub(crate) struct PortalSecurity {
     state: Arc<ServerState>,
     config: Arc<PortalCspConfig>,
+    client: reqwest::Client,
+    s3_cache: Arc<RwLock<S3OriginCache>>,
     oidc_cache: Arc<RwLock<OidcOriginCache>>,
 }
 
@@ -74,6 +90,8 @@ impl PortalSecurity {
         Self {
             state,
             config: Arc::new(config),
+            client: reqwest::Client::new(),
+            s3_cache: Arc::new(RwLock::new(S3OriginCache::default())),
             oidc_cache: Arc::new(RwLock::new(OidcOriginCache::default())),
         }
     }
@@ -92,7 +110,21 @@ impl PortalSecurity {
 
     async fn s3_origin(&self) -> Option<String> {
         let s3 = self.state.interface_state().await.s3?;
-        normalize_origin(&s3.base_url)
+        {
+            let cache = self.s3_cache.read().await;
+            if cache.base_url.as_ref() == Some(&s3.base_url) {
+                return cache.origin.clone();
+            }
+        }
+
+        let mut cache = self.s3_cache.write().await;
+        if cache.base_url.as_ref() == Some(&s3.base_url) {
+            return cache.origin.clone();
+        }
+        let origin = normalize_origin(&s3.base_url);
+        cache.base_url = Some(s3.base_url);
+        cache.origin = origin.clone();
+        origin
     }
 
     /// Cached OIDC origins; a stale window triggers a point-read, and a failed
@@ -118,11 +150,29 @@ impl PortalSecurity {
         {
             Ok(config) => {
                 let mut origins = BTreeSet::new();
+                let mut token_origins = BTreeMap::new();
                 for provider in config.oidc_providers {
                     origins.extend(normalize_origin(&provider.issuer));
                     origins.extend(normalize_origin(&provider.discovery_url));
+                    let token_origin = match self.oidc_token_endpoint(&provider.discovery_url).await
+                    {
+                        Ok(token_endpoint) => normalize_origin(&token_endpoint),
+                        Err(error) => {
+                            debug!(
+                                error = %error,
+                                discovery_url = %provider.discovery_url,
+                                "Portal CSP reuses cached OIDC token endpoint"
+                            );
+                            cache.token_origins.get(&provider.discovery_url).cloned()
+                        }
+                    };
+                    if let Some(token_origin) = token_origin {
+                        origins.insert(token_origin.clone());
+                        token_origins.insert(provider.discovery_url, token_origin);
+                    }
                 }
                 cache.origins = origins.clone();
+                cache.token_origins = token_origins;
                 cache.refreshed_at = Some(Instant::now());
                 origins
             }
@@ -138,6 +188,19 @@ impl PortalSecurity {
         let cache = self.oidc_cache.read().await;
         let refreshed_at = cache.refreshed_at?;
         (refreshed_at.elapsed() < OIDC_ORIGIN_TTL).then(|| cache.origins.clone())
+    }
+
+    async fn oidc_token_endpoint(&self, discovery_url: &str) -> reqwest::Result<String> {
+        let discovery = self
+            .client
+            .get(discovery_url)
+            .timeout(OIDC_DISCOVERY_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OidcDiscoveryDocument>()
+            .await?;
+        Ok(discovery.token_endpoint)
     }
 }
 

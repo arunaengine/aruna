@@ -169,13 +169,15 @@ mod tests {
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::extract::Request;
     use axum::http::{Method, StatusCode, header};
+    use axum::routing::get;
+    use axum::{Json, Router};
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
     use ulid::Ulid;
 
@@ -212,9 +214,23 @@ mod tests {
 
     /// Realm config with an OIDC provider, an S3 interface and an installed
     /// portal: everything the served policy derives its origins from.
-    async fn setup_serving_node(portal_dir: &std::path::Path) -> (Router, TempDir) {
+    async fn setup_serving_node(portal_dir: &std::path::Path) -> (Router, TempDir, String) {
         let (state, tempdir) = setup_state().await;
         let realm_id = state.get_realm_id();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_origin = format!("http://{}", listener.local_addr().unwrap());
+        let discovery_url = format!("{discovery_origin}/.well-known/openid-configuration");
+        let discovery_router = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(|| async {
+                Json(serde_json::json!({
+                    "token_endpoint": "https://tokens.test/oauth2/token"
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, discovery_router).await.unwrap();
+        });
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
@@ -227,9 +243,7 @@ mod tests {
                     id: "main".to_string(),
                     issuer: "https://issuer.test/realms/aruna".to_string(),
                     audience: "aruna".to_string(),
-                    discovery_url:
-                        "https://discovery.test/realms/aruna/.well-known/openid-configuration"
-                            .to_string(),
+                    discovery_url,
                 }],
                 node_location: None,
                 node_weight: None,
@@ -259,7 +273,7 @@ mod tests {
         )
         .build_router();
 
-        (router, tempdir)
+        (router, tempdir, discovery_origin)
     }
 
     async fn enable_portal(state: &ServerState, dir: &std::path::Path) {
@@ -428,7 +442,8 @@ mod tests {
     #[tokio::test]
     async fn portal_sets_security_headers() {
         let tempdir = tempdir().unwrap();
-        let (router, _state_dir) = setup_serving_node(&tempdir.path().join("portal")).await;
+        let (router, _state_dir, _discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
 
         for path in [
             "/",
@@ -474,7 +489,8 @@ mod tests {
     #[tokio::test]
     async fn connect_src_lists_node_origins() {
         let tempdir = tempdir().unwrap();
-        let (router, _state_dir) = setup_serving_node(&tempdir.path().join("portal")).await;
+        let (router, _state_dir, discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
 
         let response = router.oneshot(request(Method::GET, "/")).await.unwrap();
 
@@ -492,10 +508,8 @@ mod tests {
         assert!(connect_src.contains("'self'"), "{connect_src}");
         assert!(connect_src.contains("https://s3.test"), "{connect_src}");
         assert!(connect_src.contains("https://issuer.test"), "{connect_src}");
-        assert!(
-            connect_src.contains("https://discovery.test"),
-            "{connect_src}"
-        );
+        assert!(connect_src.contains(&discovery_origin), "{connect_src}");
+        assert!(connect_src.contains("https://tokens.test"), "{connect_src}");
         assert!(connect_src.contains("https://peer.test"), "{connect_src}");
 
         let img_src = policy
@@ -510,7 +524,8 @@ mod tests {
     async fn api_routes_baseline() {
         // API and swagger get the anti-clickjacking baseline, but not the strict portal CSP.
         let tempdir = tempdir().unwrap();
-        let (router, _state_dir) = setup_serving_node(&tempdir.path().join("portal")).await;
+        let (router, _state_dir, _discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
 
         for path in ["/api/v1/info", "/api-docs/openapi.json"] {
             let response = router

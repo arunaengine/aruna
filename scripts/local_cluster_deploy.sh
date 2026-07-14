@@ -164,6 +164,7 @@ write_node_env() {
       printf 'PORTAL_MODE=artifact\n'
       printf 'PORTAL_DIR=%s\n' "$PORTAL_DIR"
       printf 'CORS_ALLOWED_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
+      printf 'PORTAL_CSP_EXTRA_ORIGINS=%s\n' "$PORTAL_CORS_ORIGINS"
     fi
     if [[ "$WITH_KEYCLOAK" == "1" ]]; then
       printf 'OIDC_PROVIDER_IDS=main\n'
