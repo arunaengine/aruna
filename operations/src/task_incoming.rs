@@ -69,7 +69,8 @@ use crate::s3::refresh_reference_metadata::{
     restore_reference_metadata_refresh_timer,
 };
 use crate::sync_placement::{
-    DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER,
+    DOCUMENT_SYNC_DEFER_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_AFTER, SHARD_TOPIC_PULL_RETRY_MAX,
+    SYNC_PLACEMENT_RETRY_AFTER,
 };
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
@@ -412,7 +413,7 @@ impl OperationsTaskHandler {
                 Duration::from_millis(retry_after_ms(
                     attempts,
                     SHARD_TOPIC_PULL_RETRY_AFTER.as_millis() as u64,
-                    SYNC_PLACEMENT_RETRY_AFTER.as_millis() as u64,
+                    SHARD_TOPIC_PULL_RETRY_MAX.as_millis() as u64,
                 ))
             }
         }
