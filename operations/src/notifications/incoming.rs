@@ -14,13 +14,15 @@ use aruna_net::streams::BiStream;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
-use crate::notifications::dispatch::{list_notifications_on_holder, unread_count_on_holder};
+use crate::notifications::dispatch::{
+    list_notifications_on_holder, mark_read_on_holder, unread_count_on_holder,
+};
 use crate::notifications::inbox::upsert_inbox_records_reporting;
-use crate::notifications::mark_read::{MARK_READ_MAX_IDS, MarkReadInput, MarkReadOperation};
+use crate::notifications::mark_read::MARK_READ_MAX_IDS;
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
@@ -152,26 +154,14 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                MarkReadOperation::new(MarkReadInput {
-                    recipient,
-                    ids,
-                    up_to_ms,
-                    now_ms: unix_timestamp_millis(),
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => {
-                    if output.marked > 0 {
+            match mark_read_on_holder(context, recipient, ids, up_to_ms).await {
+                Ok(marked) => {
+                    if marked > 0 {
                         net_handle.notify_inbox_activity(recipient);
                     }
-                    NotificationTransportMessage::MarkReadResult {
-                        marked: output.marked as u32,
-                    }
+                    NotificationTransportMessage::MarkReadResult { marked }
                 }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::CreateWatch {
@@ -1405,6 +1395,27 @@ mod tests {
                 .await
                 .expect("unread count after token revocation"),
             (1, false)
+        );
+        assert_eq!(
+            mark_read_remote(
+                &a.net,
+                b.net.node_id(),
+                recipient,
+                vec![watch.notification_id],
+                None,
+            )
+            .await
+            .expect("mark revoked watch record"),
+            0
+        );
+        assert!(
+            read_inbox(&b)
+                .await
+                .into_iter()
+                .find(|record| record.notification_id == watch.notification_id)
+                .expect("stored watch record")
+                .read_at_ms
+                .is_none()
         );
     }
 

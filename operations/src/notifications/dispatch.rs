@@ -273,23 +273,15 @@ pub async fn mark_read_for_user(
 ) -> Result<u32, NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        let output = drive(
-            MarkReadOperation::new(MarkReadInput {
-                recipient,
-                ids,
-                up_to_ms,
-                now_ms: unix_timestamp_millis(),
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
-        if output.marked > 0
+        let marked = mark_read_on_holder(context, recipient, ids, up_to_ms)
+            .await
+            .map_err(NotificationDispatchError::Internal)?;
+        if marked > 0
             && let Some(net_handle) = context.net_handle.as_ref()
         {
             net_handle.notify_inbox_activity(recipient);
         }
-        Ok(output.marked as u32)
+        Ok(marked)
     } else {
         let net_handle = context
             .net_handle
@@ -298,6 +290,57 @@ pub async fn mark_read_for_user(
         mark_read_remote(net_handle, holder, recipient, ids, up_to_ms)
             .await
             .map_err(NotificationDispatchError::Remote)
+    }
+}
+
+pub(crate) async fn mark_read_on_holder(
+    context: &DriverContext,
+    recipient: UserId,
+    mut ids: Vec<Ulid>,
+    up_to_ms: Option<u64>,
+) -> Result<u32, String> {
+    if ids.len() > crate::notifications::mark_read::MARK_READ_MAX_IDS {
+        return Err("mark read id count exceeds cap".to_string());
+    }
+    if ids.is_empty() && up_to_ms.is_none() {
+        return Ok(0);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut cursor = None;
+    let mut marked = 0u32;
+    let now_ms = unix_timestamp_millis();
+    loop {
+        let (records, next_cursor) =
+            list_notifications_on_holder(context, recipient, cursor, LIST_NOTIFICATIONS_MAX_LIMIT)
+                .await?;
+        let visible_ids: Vec<_> = records
+            .into_iter()
+            .filter(|record| {
+                record.read_at_ms.is_none()
+                    && (ids.binary_search(&record.notification_id).is_ok()
+                        || up_to_ms.is_some_and(|limit| record.created_at_ms <= limit))
+            })
+            .map(|record| record.notification_id)
+            .collect();
+        for chunk in visible_ids.chunks(crate::notifications::mark_read::MARK_READ_MAX_IDS) {
+            marked += drive(
+                MarkReadOperation::new(MarkReadInput {
+                    recipient,
+                    ids: chunk.to_vec(),
+                    up_to_ms: None,
+                    now_ms,
+                }),
+                context,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .marked as u32;
+        }
+        match next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(marked),
+        }
     }
 }
 
