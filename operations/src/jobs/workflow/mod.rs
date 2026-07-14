@@ -85,45 +85,85 @@ pub async fn run_execution_job(
         return;
     }
 
-    let bucket = JobRecord::workspace_bucket_name(job_id);
-    let credential =
-        match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
-            Ok(credential) => credential,
-            Err(error) => {
-                requeue_or_fail_pre_submit(&context, job_id, token, &record, error).await;
-                return;
-            }
+    let stop = CancellationToken::new();
+    let heartbeat = tokio::spawn(execution_heartbeat(
+        storage.clone(),
+        job_id,
+        token,
+        cancel.clone(),
+        stop.clone(),
+    ));
+    tokio::pin!(heartbeat);
+
+    let prepare_and_submit = async {
+        let bucket = JobRecord::workspace_bucket_name(job_id);
+        let credential =
+            match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    requeue_or_fail_pre_submit(&context, job_id, token, &record, error).await;
+                    return None;
+                }
+            };
+
+        // Preparing -> Ready.
+        if transition_to_ready(storage, job_id, token, unix_timestamp_millis())
+            .await
+            .is_err()
+        {
+            return None;
+        }
+
+        let attempt_no = record.attempts;
+        // Lowercased: attempt ids must be injective under the backend name mapping.
+        let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
+        let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
+
+        // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
+        let intent = AttemptIntent {
+            attempt_no,
+            external_name: attempt.external_name(),
+            executor_kind: backend.kind().as_wire(),
         };
+        if record_attempt_intent(storage, job_id, token, intent, unix_timestamp_millis())
+            .await
+            .is_err()
+        {
+            return None;
+        }
 
-    // Preparing -> Ready.
-    if transition_to_ready(storage, job_id, token, unix_timestamp_millis())
-        .await
-        .is_err()
-    {
-        return;
-    }
+        if let Err(error) = backend.submit(&task_spec).await {
+            return Some(Err((
+                backend, attempt, task_spec, spec, bucket, cancel, error,
+            )));
+        }
 
-    let attempt_no = record.attempts;
-    // Lowercased: attempt ids must be injective under the backend name mapping.
-    let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
-    let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
+        // Ready -> Running only after the backend accepted the fenced attempt.
+        if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
+            .await
+            .is_err()
+        {
+            return None;
+        }
 
-    // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
-    let intent = AttemptIntent {
-        attempt_no,
-        external_name: attempt.external_name(),
-        executor_kind: backend.kind().as_wire(),
+        Some(Ok((backend, attempt, spec, bucket, cancel)))
     };
-    if record_attempt_intent(storage, job_id, token, intent, unix_timestamp_millis())
-        .await
-        .is_err()
-    {
-        return;
-    }
+    tokio::pin!(prepare_and_submit);
 
-    match backend.submit(&task_spec).await {
-        Ok(_) => {}
-        Err(error) => {
+    let prepared = tokio::select! {
+        result = &mut prepare_and_submit => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            result
+        }
+        _ = &mut heartbeat => None,
+    };
+    let Some(prepared) = prepared else {
+        return;
+    };
+    let (backend, attempt, spec, bucket, cancel) = match prepared {
+        Ok(prepared) => prepared,
+        Err((backend, attempt, task_spec, spec, bucket, cancel, error)) => {
             recover_failed_submit(
                 &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket, &record,
                 cancel, error,
@@ -131,15 +171,7 @@ pub async fn run_execution_job(
             .await;
             return;
         }
-    }
-
-    // Ready -> Running only after the backend accepted the fenced attempt.
-    if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
-        .await
-        .is_err()
-    {
-        return;
-    }
+    };
 
     supervise_and_finalize(
         context.clone(),
