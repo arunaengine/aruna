@@ -140,6 +140,10 @@ impl RealmPlacementMutation {
                         .iter()
                         .any(|binding| binding.strategy_id == *strategy_id)
                     || document
+                        .placement_bindings
+                        .iter()
+                        .any(|binding| binding.strategy_id == *strategy_id)
+                    || document
                         .placement_overrides
                         .iter()
                         .any(|record| record.strategy_id == Some(*strategy_id));
@@ -779,8 +783,10 @@ mod tests {
     };
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        LabelMatch, MetadataRegistryRecord, PlacementRef, RealmId, RealmNodeKind,
+        LabelMatch, MetadataRegistryRecord, PlacementBinding, PlacementRef, PlacementScope,
+        RealmId, RealmNodeKind,
     };
+    use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::UserId;
     use tempfile::tempdir;
@@ -1140,6 +1146,30 @@ mod tests {
                 RealmPlacementMutation::RemoveStrategy(strategy_id)
             )
             .await,
+            Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
+        );
+    }
+
+    // Removing a strategy still named by an immutable placement binding is a
+    // StrategyReferenced conflict, like the other reference kinds above.
+    #[test]
+    fn binding_blocks_removal() {
+        let realm_id = RealmId::from_bytes([14; 32]);
+        let strategy_id = Ulid::from_bytes([14; 16]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.strategies.push(strategy(strategy_id));
+        document.placement_bindings.push(PlacementBinding {
+            handle: PlacementHandle::new(1).unwrap(),
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        });
+
+        assert_eq!(
+            RealmPlacementMutation::RemoveStrategy(strategy_id).validate(&document),
             Err(MutateRealmPlacementError::StrategyReferenced { strategy_id })
         );
     }
