@@ -1,10 +1,11 @@
 use byteview::ByteView;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::RealmId;
+use crate::structs::{RealmId, WatchAuthorizationBinding};
 use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -98,9 +99,38 @@ pub struct NotificationRecord {
     pub kind: NotificationKind,
     pub created_at_ms: u64,
     pub read_at_ms: Option<u64>,
+    pub watch_authorization: Option<WatchAuthorizationBinding>,
+}
+
+type LegacyNotificationRecord = (
+    Ulid,
+    UserId,
+    NotificationClass,
+    NotificationKind,
+    u64,
+    Option<u64>,
+);
+
+fn from_exact_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
+    match postcard::take_from_bytes(bytes)? {
+        (record, []) => Ok(record),
+        _ => Err(postcard::Error::SerdeDeCustom),
+    }
 }
 
 impl NotificationRecord {
+    fn from_legacy(record: LegacyNotificationRecord) -> Self {
+        Self {
+            notification_id: record.0,
+            recipient: record.1,
+            class: record.2,
+            kind: record.3,
+            created_at_ms: record.4,
+            read_at_ms: record.5,
+            watch_authorization: None,
+        }
+    }
+
     pub fn new(
         recipient: UserId,
         class: NotificationClass,
@@ -114,6 +144,7 @@ impl NotificationRecord {
             kind,
             created_at_ms,
             read_at_ms: None,
+            watch_authorization: None,
         }
     }
 
@@ -126,7 +157,9 @@ impl NotificationRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        from_exact_bytes(bytes)
+            .or_else(|_| from_exact_bytes(bytes).map(Self::from_legacy))
+            .map_err(Into::into)
     }
 }
 
@@ -156,6 +189,19 @@ pub enum ResourceEvent {
 pub struct NotificationOutboxRecord {
     pub outbox_id: Ulid,
     pub record: NotificationRecord,
+}
+
+impl NotificationOutboxRecord {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        from_exact_bytes(bytes)
+            .or_else(|_| {
+                from_exact_bytes::<(Ulid, LegacyNotificationRecord)>(bytes).map(|record| Self {
+                    outbox_id: record.0,
+                    record: NotificationRecord::from_legacy(record.1),
+                })
+            })
+            .map_err(Into::into)
+    }
 }
 
 pub fn invert_timestamp_ms(timestamp_ms: u64) -> u64 {
@@ -245,6 +291,35 @@ mod tests {
             group_id: Ulid::r#gen(),
             actor_user_id: user(1, actor),
         }
+    }
+
+    #[test]
+    fn notification_record_decodes_legacy_schema() {
+        let recipient = user(1, 2);
+        let notification_id = Ulid::r#gen();
+        let legacy = (
+            notification_id,
+            recipient,
+            NotificationClass::Direct,
+            added(3),
+            1234,
+            None::<u64>,
+        );
+        let legacy_bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = NotificationRecord::from_bytes(&legacy_bytes)
+            .expect("legacy notification record decodes");
+        assert_eq!(decoded.notification_id, notification_id);
+        assert_eq!(decoded.recipient, recipient);
+        assert_eq!(decoded.watch_authorization, None);
+        assert!(NotificationRecord::from_bytes(&[legacy_bytes, vec![2]].concat()).is_err());
+
+        let outbox_id = Ulid::r#gen();
+        let outbox = (outbox_id, legacy);
+        let decoded =
+            NotificationOutboxRecord::from_bytes(&postcard::to_allocvec(&outbox).unwrap())
+                .expect("legacy notification outbox record decodes");
+        assert_eq!(decoded.outbox_id, outbox_id);
+        assert_eq!(decoded.record.watch_authorization, None);
     }
 
     #[test]

@@ -7,18 +7,16 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
-};
+use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::{
     RealmConfigDocument, RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchInterestDigest,
-    WatchInterestEntry, WatchInterestTable, WatchSubscription, watch_interest_dirty_key,
+    WatchInterestEntry, WatchInterestTable, watch_interest_dirty_key,
     watch_interest_dirty_realm_id, watch_interest_key_node_id, watch_interest_key_realm_id,
-    watch_interest_node_key, watch_interest_node_prefix, watch_interest_realm_prefix,
+    watch_interest_node_key, watch_interest_node_prefix, watch_interest_pending_key,
+    watch_interest_realm_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, KeySpace, UserId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -28,6 +26,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::watch::authorization::filter_authorized_watch_subscriptions;
+use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 use crate::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Debounce window for the coalesced watch-interest publisher. `ShortenTimer`
@@ -181,7 +180,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         return Ok(false);
     }
 
-    let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(realms.len());
+    let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(realms.len() * 2);
     let mut targets: Vec<(RealmId, DocumentSyncTarget)> = Vec::with_capacity(realms.len());
     let mut authorization_retries = Vec::new();
     for realm_id in &realms {
@@ -193,11 +192,48 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         if check_failed {
             authorization_retries.push(*realm_id);
         }
-        writes.push((
-            NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-            Key::from(watch_interest_node_key(*realm_id, node_id)),
-            Value::from(digest.to_bytes().map_err(|e| e.to_string())?),
-        ));
+        let digest_key = Key::from(watch_interest_node_key(*realm_id, node_id));
+        let pending_key = Key::from(watch_interest_pending_key(*realm_id));
+        let digest_value = Value::from(digest.to_bytes().map_err(|e| e.to_string())?);
+        let current = match storage
+            .send_storage_effect(StorageEffect::BatchRead {
+                reads: vec![
+                    (
+                        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                        digest_key.clone(),
+                    ),
+                    (
+                        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                        pending_key.clone(),
+                    ),
+                ],
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("watch interest digest read failed: {other:?}")),
+        };
+        let [(_, current_digest), (_, pending)] = current.as_slice() else {
+            return Err("watch interest digest read count mismatch".to_string());
+        };
+        let changed = current_digest.as_ref() != Some(&digest_value);
+        if !changed && pending.is_none() {
+            continue;
+        }
+        if changed {
+            writes.push((
+                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                digest_key,
+                digest_value,
+            ));
+            writes.push((
+                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                pending_key,
+                Value::from(Vec::new()),
+            ));
+        }
         targets.push((
             *realm_id,
             DocumentSyncTarget::WatchInterest {
@@ -207,11 +243,12 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         ));
     }
 
-    // Persist the refreshed digests but keep the dirty markers until the
-    // documents have been durably handed to replication.
+    // Persist changed digests with pending markers, but keep the dirty markers
+    // until the documents have been durably handed to replication.
     write_documents(storage, writes).await?;
 
     // Each realm rides its own realm-scoped topic, so replicate per realm.
+    let published = !targets.is_empty();
     for (realm_id, target) in targets {
         drive(
             ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -227,6 +264,22 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         )
         .await
         .map_err(|error| format!("watch interest replication failed: {error}"))?;
+        match storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key: Key::from(watch_interest_pending_key(realm_id)),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => {
+                return Err(format!(
+                    "watch interest pending marker delete failed: {other:?}"
+                ));
+            }
+        }
     }
 
     // Preserve a retry generation when a permission lookup failed. The current
@@ -239,7 +292,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
     // those a concurrent CRUD did not re-dirty in the meantime.
     clear_consumed_markers(storage, observed_markers).await?;
 
-    Ok(true)
+    Ok(published)
 }
 
 /// Builds this node's digest for one realm from subscriptions whose owners are
@@ -251,18 +304,9 @@ async fn build_realm_digest(
     realm_id: RealmId,
     realm_config: &RealmConfigDocument,
 ) -> Result<(WatchInterestDigest, bool), String> {
-    let entries = iter_all(
-        &ctx.storage_handle,
-        NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-        Some(UserId::storage_prefix(realm_id)),
-    )
-    .await?;
-    let mut subscriptions = Vec::with_capacity(entries.len());
-    for (_, value) in entries {
-        subscriptions.push(
-            WatchSubscription::from_bytes(value.as_ref()).map_err(|error| error.to_string())?,
-        );
-    }
+    let subscriptions = list_realm_watch_subscriptions(&ctx.storage_handle, realm_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let filtered =
         filter_authorized_watch_subscriptions(ctx, realm_id, realm_config, node_id, subscriptions)
             .await?;
@@ -278,8 +322,7 @@ async fn build_realm_digest(
     ))
 }
 
-/// Persists the refreshed digest documents. Each digest key has a single writer
-/// (this node), so a plain batch write is enough.
+/// Persists changed digests and their pending markers atomically.
 async fn write_documents(
     storage: &StorageHandle,
     writes: Vec<(KeySpace, Key, Value)>,
@@ -509,6 +552,12 @@ pub async fn refresh_watch_interest_for_targets(
             DocumentSyncTarget::WatchSubscription { owner, .. } => {
                 dirty_realms.insert(owner.realm_id);
             }
+            DocumentSyncTarget::GroupAuthorization { .. } => {
+                dirty_realms.insert(*net_handle.realm_id());
+            }
+            DocumentSyncTarget::RealmAuthorization { realm_id } => {
+                dirty_realms.insert(*realm_id);
+            }
             DocumentSyncTarget::RealmConfig { realm_id } => {
                 realms.insert(*realm_id);
                 dirty_realms.insert(*realm_id);
@@ -642,6 +691,7 @@ mod tests {
         Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, RealmNodeKind,
         WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
+    use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
@@ -824,6 +874,21 @@ mod tests {
         }
     }
 
+    async fn read_pending(ctx: &DriverContext, realm_id: RealmId) -> Option<Value> {
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key: Key::from(watch_interest_pending_key(realm_id)),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected pending marker read event: {other:?}"),
+        }
+    }
+
     async fn read_digest(
         ctx: &DriverContext,
         realm_id: RealmId,
@@ -926,6 +991,106 @@ mod tests {
                 .await
                 .expect("republish")
         );
+    }
+
+    // An acknowledged unchanged digest consumes a fresh dirty marker without
+    // another replication handoff.
+    #[tokio::test]
+    async fn unchanged_skips_publish() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let realm_id = RealmId([7u8; 32]);
+        let node_id = node(5);
+        let owner = user(7, 2);
+        let group_id = Ulid::r#gen();
+        install_realm_config(&ctx, realm_id, &[node_id]).await;
+        install_authorization(&ctx, realm_id, node_id, group_id, owner, &[]).await;
+        create_watch_subscription(
+            &ctx.storage_handle,
+            owner,
+            metadata_prefix(group_id, "a"),
+            mask(),
+            1,
+        )
+        .await
+        .expect("create");
+
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("publish")
+        );
+        let before = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("digest")
+            .to_bytes()
+            .unwrap();
+        assert!(read_pending(&ctx, realm_id).await.is_none());
+
+        mark_watch_interest_dirty(&ctx, realm_id)
+            .await
+            .expect("mark dirty");
+        assert!(
+            !publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("republish")
+        );
+
+        let after = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("digest")
+            .to_bytes()
+            .unwrap();
+        assert_eq!(after, before);
+        assert!(read_marker(&ctx, realm_id).await.is_none());
+        assert!(read_pending(&ctx, realm_id).await.is_none());
+    }
+
+    // Persistent authorization unavailability retains retries while identical
+    // empty digests stop producing replicated events.
+    #[tokio::test]
+    async fn retry_stays_dirty() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let realm_id = RealmId([8u8; 32]);
+        let node_id = node(6);
+        let owner = user(8, 2);
+        let group_id = Ulid::r#gen();
+        install_realm_config(&ctx, realm_id, &[node_id]).await;
+        create_watch_subscription(
+            &ctx.storage_handle,
+            owner,
+            metadata_prefix(group_id, "a"),
+            mask(),
+            1,
+        )
+        .await
+        .expect("create");
+
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("publish")
+        );
+        assert!(read_marker(&ctx, realm_id).await.is_some());
+        let digest = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("empty digest");
+        assert!(digest.entries.is_empty());
+        let before = digest.to_bytes().unwrap();
+
+        assert!(
+            !publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("republish")
+        );
+        let after = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("empty digest")
+            .to_bytes()
+            .unwrap();
+        assert_eq!(after, before);
+        assert!(read_marker(&ctx, realm_id).await.is_some());
     }
 
     #[tokio::test]
@@ -1111,6 +1276,65 @@ mod tests {
             vec![holder]
         );
         assert_eq!(table.nodes(realm_id).map(|nodes| nodes.len()), Some(1));
+    }
+
+    // A consumed empty digest must be re-dirtied by group authorization
+    // reconciliation so a later READ grant restores remote interest.
+    #[tokio::test]
+    async fn regrant_restores_digest() {
+        let realm_id = RealmId([6u8; 32]);
+        let (_dir, ctx, net) = ctx_with_net(realm_id, [72u8; 32]).await;
+        let node_id = net.node_id();
+        install_realm_config(&ctx, realm_id, &[node_id]).await;
+        let group_id = Ulid::r#gen();
+        let auth_owner = user(6, 3);
+        let watch_owner = user(6, 2);
+        let prefix = metadata_prefix(group_id, "a");
+        install_authorization(&ctx, realm_id, node_id, group_id, auth_owner, &[]).await;
+        create_watch_subscription(&ctx.storage_handle, watch_owner, prefix.clone(), mask(), 1)
+            .await
+            .expect("create");
+
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("publish")
+        );
+        assert!(
+            read_digest(&ctx, realm_id, node_id)
+                .await
+                .expect("empty digest")
+                .entries
+                .is_empty()
+        );
+        assert!(read_marker(&ctx, realm_id).await.is_none());
+
+        install_authorization(
+            &ctx,
+            realm_id,
+            node_id,
+            group_id,
+            auth_owner,
+            &[watch_owner],
+        )
+        .await;
+        refresh_watch_interest_for_targets(
+            &ctx,
+            &[DocumentSyncTarget::GroupAuthorization { group_id }],
+        )
+        .await;
+
+        assert!(read_marker(&ctx, realm_id).await.is_some());
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("republish")
+        );
+        let digest = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("restored digest");
+        assert_eq!(digest.entries.len(), 1);
+        assert_eq!(digest.entries[0].path_prefix, prefix);
     }
 
     #[tokio::test]

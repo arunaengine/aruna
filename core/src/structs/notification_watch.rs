@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::{NotificationKind, RealmId};
+use crate::structs::{NotificationKind, PathRestriction, RealmId};
 use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
@@ -233,12 +233,48 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
 /// Durable watch subscription row on the owner's inbox-holder node. Placed and
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchAuthorizationBinding {
+    pub token_hash: String,
+    pub expires_at_secs: u64,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+    pub watch_path_prefix: String,
+}
+
+impl WatchAuthorizationBinding {
+    pub fn is_valid(&self) -> bool {
+        self.expires_at_secs > 0
+            && self.token_hash.len() == 64
+            && self
+                .token_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && self
+                .path_restrictions
+                .iter()
+                .flatten()
+                .all(|restriction| globset::Glob::new(&restriction.pattern).is_ok())
+    }
+}
+
+impl Default for WatchAuthorizationBinding {
+    fn default() -> Self {
+        Self {
+            token_hash: blake3::hash(b"internal-watch").to_hex().to_string(),
+            expires_at_secs: u64::MAX,
+            path_restrictions: None,
+            watch_path_prefix: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchSubscription {
     pub watch_id: Ulid,
     pub owner: UserId,
     pub path_prefix: String,
     pub event_mask: WatchEventMask,
     pub created_at_ms: u64,
+    pub authorization: WatchAuthorizationBinding,
 }
 
 impl WatchSubscription {
@@ -248,12 +284,30 @@ impl WatchSubscription {
         event_mask: WatchEventMask,
         created_at_ms: u64,
     ) -> Self {
+        Self::new_with_authorization(
+            owner,
+            path_prefix,
+            event_mask,
+            created_at_ms,
+            WatchAuthorizationBinding::default(),
+        )
+    }
+
+    pub fn new_with_authorization(
+        owner: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+        created_at_ms: u64,
+        mut authorization: WatchAuthorizationBinding,
+    ) -> Self {
+        authorization.watch_path_prefix = path_prefix.clone();
         Self {
             watch_id: Ulid::r#gen(),
             owner,
             path_prefix,
             event_mask,
             created_at_ms,
+            authorization,
         }
     }
 
@@ -291,11 +345,11 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
 
 /// Keys in the watch-interest keyspace. Per-node digests use fixed-length keys
 /// so their prefixes are unambiguous: `n/` + realm id + node id (realm first so
-/// all nodes' digests for one realm form a single scan range). Local-only dirty
-/// markers use a text prefix (`dirty/`) that never collides with the binary
-/// digest prefix.
+/// all nodes' digests for one realm form a single scan range). Local-only
+/// markers use text prefixes that never collide with the binary digest prefix.
 pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
 pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
+const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
 
 /// One coalesced interest entry: the union of every subscription a node holds
 /// for a realm that shares this path prefix.
@@ -386,6 +440,13 @@ pub fn watch_interest_key_node_id(key: &[u8]) -> Option<NodeId> {
 pub fn watch_interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_DIRTY_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_DIRTY_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_interest_pending_key(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
@@ -732,6 +793,14 @@ mod tests {
             watch_notification_id(event_id, watch_id),
             watch_notification_id(Ulid::from_bytes([9u8; 16]), watch_id)
         );
+    }
+
+    #[test]
+    fn watch_authorization_hash_must_be_canonical() {
+        let mut binding = WatchAuthorizationBinding::default();
+        assert!(binding.is_valid());
+        binding.token_hash.make_ascii_uppercase();
+        assert!(!binding.is_valid());
     }
 
     #[test]

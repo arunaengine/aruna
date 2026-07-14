@@ -14,24 +14,25 @@ use aruna_net::streams::BiStream;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
+use crate::notifications::dispatch::{
+    list_notifications_on_holder, mark_read_on_holder, unread_count_on_holder,
+};
 use crate::notifications::inbox::upsert_inbox_records_reporting;
-use crate::notifications::list::{ListNotificationsInput, ListNotificationsOperation};
-use crate::notifications::mark_read::{MARK_READ_MAX_IDS, MarkReadInput, MarkReadOperation};
+use crate::notifications::mark_read::MARK_READ_MAX_IDS;
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
-use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::watch::authorization::list_authorized_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{
     mark_watch_interest_dirty, schedule_watch_interest_publish,
 };
 use crate::notifications::watch::subscriptions::{
     create_replicated_watch_subscription, delete_replicated_watch_subscription,
-    list_watch_subscriptions,
 };
 
 const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -116,21 +117,12 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                ListNotificationsOperation::new(ListNotificationsInput {
-                    recipient,
-                    cursor,
-                    limit: limit as usize,
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::ListResult {
-                    records: output.records,
-                    next_cursor: output.next_cursor,
+            match list_notifications_on_holder(context, recipient, cursor, limit as usize).await {
+                Ok((records, next_cursor)) => NotificationTransportMessage::ListResult {
+                    records,
+                    next_cursor,
                 },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::UnreadCount { recipient } => {
@@ -139,17 +131,11 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                UnreadCountOperation::new(UnreadCountInput { recipient }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::UnreadCountResult {
-                    count: output.count as u32,
-                    capped: output.capped,
-                },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+            match unread_count_on_holder(context, recipient).await {
+                Ok((count, capped)) => {
+                    NotificationTransportMessage::UnreadCountResult { count, capped }
+                }
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::MarkRead {
@@ -168,32 +154,21 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                MarkReadOperation::new(MarkReadInput {
-                    recipient,
-                    ids,
-                    up_to_ms,
-                    now_ms: unix_timestamp_millis(),
-                }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => {
-                    if output.marked > 0 {
+            match mark_read_on_holder(context, recipient, ids, up_to_ms).await {
+                Ok(marked) => {
+                    if marked > 0 {
                         net_handle.notify_inbox_activity(recipient);
                     }
-                    NotificationTransportMessage::MarkReadResult {
-                        marked: output.marked as u32,
-                    }
+                    NotificationTransportMessage::MarkReadResult { marked }
                 }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::CreateWatch {
             owner,
             path_prefix,
             event_mask,
+            authorization,
         } => {
             if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
             {
@@ -206,6 +181,7 @@ async fn build_response(
                 owner,
                 path_prefix,
                 event_mask,
+                authorization,
                 unix_timestamp_millis(),
             )
             .await
@@ -245,9 +221,9 @@ async fn build_response(
                 return NotificationTransportMessage::Reject(reason);
             }
 
-            match list_watch_subscriptions(&context.storage_handle, owner).await {
+            match list_authorized_watch_subscriptions(context, owner).await {
                 Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
@@ -397,6 +373,14 @@ fn validate_inbound_watch_event(
 }
 
 fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(), String> {
+    if record.watch_authorization.is_some()
+        || matches!(
+            record.kind,
+            NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+        )
+    {
+        return Err("resource watch records must use watch event delivery".to_string());
+    }
     if record.read_at_ms.is_some() {
         return Err("delivered notification records must be unread".to_string());
     }
@@ -653,18 +637,24 @@ mod tests {
         unread_count_remote,
     };
     use crate::notifications::inbox::upsert_inbox_records;
-    use crate::notifications::watch::subscriptions::create_watch_subscription;
+    use crate::notifications::watch::subscriptions::{
+        WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
+    };
+    use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        RealmAuthorizationDocument, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
-        WatchEventMask, data_watch_resource_path, watch_interest_dirty_key,
+        PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
+        WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
+        blob_object_permission_path, data_watch_resource_path, watch_interest_dirty_key,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -848,6 +838,30 @@ mod tests {
             },
             1_700_000_000_000 + seed as u64,
         )
+    }
+
+    fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
+        let key = format!("object-{seed}");
+        let mut record = NotificationRecord::new(
+            recipient,
+            NotificationClass::Transient,
+            NotificationKind::DataUploaded {
+                path: data_path(&key),
+                group_id: data_group_id(),
+                node_id: data_node_id(),
+                bucket: "bucket".to_string(),
+                key,
+                size_bytes: seed as u64,
+                actor_user_id: recipient,
+            },
+            1_700_000_000_000 + seed as u64,
+        );
+        let authorization = WatchAuthorizationBinding {
+            watch_path_prefix: data_path(""),
+            ..Default::default()
+        };
+        record.watch_authorization = Some(authorization);
+        record
     }
 
     async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
@@ -1076,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_with_invalid_watch_actor_is_rejected_without_partial_write() {
+    async fn generic_batch_rejects_watch_records_without_partial_write() {
         let (a, b, recipient) = delivery_pair(83).await;
         let valid = record(recipient, 1);
         let mut invalid = record(recipient, 2);
@@ -1089,14 +1103,14 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             size_bytes: 0,
-            actor_user_id: UserId::nil(recipient.realm_id),
+            actor_user_id: recipient,
         };
 
         let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
             .await
-            .expect_err("batch containing invalid watch actor must be rejected");
+            .expect_err("generic batch containing watch data must be rejected");
         assert!(
-            error.contains("empty actor_user_id"),
+            error.contains("must use watch event delivery"),
             "unexpected reject reason: {error}"
         );
         assert!(read_inbox(&b).await.is_empty());
@@ -1240,6 +1254,202 @@ mod tests {
                 1_700_000_000_000 + 2,
                 1_700_000_000_000 + 1,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_skips_revoked_watch_records_without_consuming_page() {
+        let realm_id = RealmId::from_bytes([83u8; 32]);
+        let a = spawn(realm_id, [83u8; 32]).await;
+        let b = spawn(realm_id, [84u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        let direct = record(recipient, 1);
+        let watch_two = watch_record(recipient, 2);
+        let watch_three = watch_record(recipient, 3);
+        seed_inbox(
+            &b,
+            &[direct.clone(), watch_two.clone(), watch_three.clone()],
+        )
+        .await;
+
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("authorized list")
+                .0
+                .len(),
+            3
+        );
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("authorized unread count"),
+            (3, false)
+        );
+        let (first_page, retry_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+            .await
+            .expect("first authorized page");
+        assert_eq!(first_page, vec![watch_three]);
+        let retry_cursor = retry_cursor.expect("cursor after first authorized page");
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+            .await
+            .expect("list after revocation");
+        assert_eq!(listed, vec![direct]);
+        assert_eq!(next_cursor, None);
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count after revocation"),
+            (1, false)
+        );
+
+        assert!(matches!(
+            b.context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: data_group_id().to_bytes().to_vec().into(),
+                    value: vec![0xff].into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        list_remote(
+            &a.net,
+            b.net.node_id(),
+            recipient,
+            Some(retry_cursor.clone()),
+            1,
+        )
+        .await
+        .expect_err("authorization decode failure must reject the page");
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, Some(retry_cursor), 1,)
+                .await
+                .expect("same cursor retries after authorization recovers")
+                .0,
+            vec![watch_two]
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_hides_watch_record_after_token_revocation() {
+        let realm_id = RealmId::from_bytes([82u8; 32]);
+        let a = spawn(realm_id, [82u8; 32]).await;
+        let b = spawn(realm_id, [83u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        let direct = record(recipient, 1);
+        let watch = watch_record(recipient, 2);
+        seed_inbox(&b, &[direct.clone(), watch.clone()]).await;
+
+        let revoked = HashSet::from([watch
+            .watch_authorization
+            .as_ref()
+            .expect("watch binding")
+            .token_hash
+            .clone()]);
+        assert!(matches!(
+            b.context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: API_STATE_KEYSPACE.to_string(),
+                    key: TOKEN_REVOCATION_LIST_KEY.into(),
+                    value: postcard::to_allocvec(&revoked).unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("list after token revocation")
+                .0,
+            vec![direct]
+        );
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count after token revocation"),
+            (1, false)
+        );
+        assert_eq!(
+            mark_read_remote(
+                &a.net,
+                b.net.node_id(),
+                recipient,
+                vec![watch.notification_id],
+                None,
+            )
+            .await
+            .expect("mark revoked watch record"),
+            0
+        );
+        assert!(
+            read_inbox(&b)
+                .await
+                .into_iter()
+                .find(|record| record.notification_id == watch.notification_id)
+                .expect("stored watch record")
+                .read_at_ms
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_requires_original_watch_prefix() {
+        let (a, b, recipient) = delivery_pair(80).await;
+        install_watch_authorization(&b, recipient.realm_id, recipient, &[]).await;
+        let mut watch = watch_record(recipient, 2);
+        watch
+            .watch_authorization
+            .as_mut()
+            .unwrap()
+            .path_restrictions = Some(vec![PathRestriction {
+            pattern: blob_object_permission_path(
+                recipient.realm_id,
+                data_group_id(),
+                data_node_id(),
+                "bucket",
+                "object-2",
+            ),
+            permission: Permission::READ,
+        }]);
+        seed_inbox(&b, &[watch.clone()]).await;
+
+        assert!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("list with unreadable watch prefix")
+                .0
+                .is_empty()
         );
     }
 
@@ -1446,11 +1656,19 @@ mod tests {
         .await;
 
         let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
         let prefix = data_path("prefix");
-        let created = create_watch_remote(&a.net, b.net.node_id(), owner, prefix.clone(), mask)
-            .await
-            .expect("create succeeds");
+        let created = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            prefix.clone(),
+            mask,
+            WatchAuthorizationBinding::default(),
+        )
+        .await
+        .expect("create succeeds");
         assert_eq!(created.owner, owner);
         assert_eq!(created.path_prefix, prefix);
         assert_eq!(created.event_mask, mask);
@@ -1494,6 +1712,7 @@ mod tests {
             owner,
             data_path(""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect_err("create on non-holder must be rejected");
@@ -1521,6 +1740,120 @@ mod tests {
             list_watch_subscriptions(&b.context.storage_handle, owner)
                 .await
                 .expect("list succeeds")
+                .is_empty()
+        );
+    }
+
+    // The holder persists and replicates the subscription, so a proxying peer's
+    // assertion is not authority to watch: an owner without READ is refused there
+    // too, and nothing durable is written.
+    #[tokio::test]
+    async fn create_requires_read() {
+        let realm_id = RealmId::from_bytes([86u8; 32]);
+        let a = spawn(realm_id, [86u8; 32]).await;
+        let b = spawn(realm_id, [87u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        // The watched group exists and is readable, just not by `owner`.
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        let error = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            data_path("prefix"),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
+        )
+        .await
+        .expect_err("an owner without READ must be refused by the holder");
+        assert_eq!(
+            error,
+            format!("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: permission_denied")
+        );
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list succeeds")
+                .is_empty(),
+            "an unauthorized create must not persist watch state"
+        );
+    }
+
+    // Enumeration shares the delivery authorization result: once READ is revoked
+    // only an opaque cleanup id remains visible for the stored row.
+    #[tokio::test]
+    async fn revoked_watch_unlisted() {
+        let realm_id = RealmId::from_bytes([84u8; 32]);
+        let a = spawn(realm_id, [84u8; 32]).await;
+        let b = spawn(realm_id, [85u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+
+        let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, owner, &[]).await;
+        let created = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            data_path("prefix"),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
+        )
+        .await
+        .expect("authorized create succeeds");
+        assert_eq!(
+            list_watches_remote(&a.net, b.net.node_id(), owner)
+                .await
+                .expect("list succeeds"),
+            vec![created.clone()]
+        );
+
+        // Re-owning the group drops the original owner's READ.
+        install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
+
+        let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
+            .await
+            .expect("list after revocation succeeds");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].watch_id, created.watch_id);
+        assert_eq!(listed[0].owner, owner);
+        assert!(listed[0].path_prefix.is_empty());
+        assert!(listed[0].event_mask.is_empty());
+        assert_eq!(listed[0].created_at_ms, 0);
+        assert_eq!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("stored row survives")
+                .len(),
+            1,
+            "the row is filtered at the surface, not silently deleted"
+        );
+        delete_watch_remote(&a.net, b.net.node_id(), owner, listed[0].watch_id)
+            .await
+            .expect("redacted watch remains deletable");
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list after delete succeeds")
                 .is_empty()
         );
     }
@@ -1890,6 +2223,7 @@ mod tests {
             owner,
             "bucket".to_string(),
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect_err("non-eligible peer must be rejected");

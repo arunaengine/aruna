@@ -11,7 +11,6 @@ use aruna_core::types::{Effects, Key, UserId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 
 pub const LIST_NOTIFICATIONS_MAX_LIMIT: usize = 200;
 
@@ -106,15 +105,22 @@ impl ListNotificationsOperation {
     fn collect(&mut self, values: Vec<(Key, Value)>) -> Result<Effects, ListNotificationsError> {
         let mut records = Vec::with_capacity(values.len());
         for (key, value) in values {
-            let (recipient, _, _) = parse_notification_inbox_key(&key)?;
-            if recipient != self.input.recipient {
-                warn!(
-                    ?recipient,
-                    "Skipping notification row with foreign recipient"
-                );
-                continue;
+            let (recipient, created_at_ms, notification_id) = parse_notification_inbox_key(&key)?;
+            let record = NotificationRecord::from_bytes(&value)?;
+            if recipient != self.input.recipient
+                || (recipient, created_at_ms, notification_id)
+                    != (
+                        record.recipient,
+                        record.created_at_ms,
+                        record.notification_id,
+                    )
+            {
+                return Err(ConversionError::FromStrError(
+                    "notification inbox key does not match payload identity".to_string(),
+                )
+                .into());
             }
-            records.push(NotificationRecord::from_bytes(&value)?);
+            records.push(record);
         }
 
         let next_cursor = if records.len() > self.input.limit {
@@ -197,7 +203,9 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::notifications::inbox::upsert_inbox_records;
     use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-    use aruna_core::structs::{NotificationClass, NotificationKind, RealmId};
+    use aruna_core::structs::{
+        NotificationClass, NotificationKind, RealmId, notification_inbox_key,
+    };
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -401,6 +409,44 @@ mod tests {
         )
         .await;
         assert_eq!(result, Err(ListNotificationsError::InvalidCursor));
+    }
+
+    #[tokio::test]
+    async fn list_rejects_key_payload_identity_mismatch() {
+        let (_tempdir, context) = context_with_storage();
+        let recipient = user(1, 1);
+        let original = record(recipient, 10);
+        let mut mismatched = original.clone();
+        mismatched.notification_id = Ulid::r#gen();
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                    key: notification_inbox_key(
+                        recipient,
+                        original.created_at_ms,
+                        original.notification_id,
+                    ),
+                    value: mismatched.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(matches!(
+            drive(
+                ListNotificationsOperation::new(ListNotificationsInput {
+                    recipient,
+                    cursor: None,
+                    limit: 10,
+                }),
+                &context,
+            )
+            .await,
+            Err(ListNotificationsError::ConversionError(_))
+        ));
     }
 
     #[test]

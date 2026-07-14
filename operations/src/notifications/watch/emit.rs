@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::notifications::client::deliver_watch_events_remote;
-use crate::notifications::watch::authorization::filter_authorized_watch_subscriptions;
+use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::mark_watch_interest_dirty;
 use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
@@ -100,25 +100,18 @@ async fn include_local_holder_from_subscriptions(
     let realm_config = drive(GetRealmConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
-    let filtered = filter_authorized_watch_subscriptions(
-        context,
-        event.realm_id,
-        &realm_config,
-        local_node_id,
-        subscriptions,
-    )
-    .await?;
+    let (subscriptions, found_stale) =
+        filter_locally_held_watch_subscriptions(subscriptions, &realm_config, local_node_id)
+            .map_err(|error| error.to_string())?;
     holders.retain(|holder| *holder != local_node_id);
-    if filtered.subscriptions.iter().any(|subscription| {
+    if subscriptions.iter().any(|subscription| {
         subscription.created_at_ms <= event.occurred_at_ms
             && subscription.event_mask.contains(event.kind)
             && event.path.starts_with(subscription.path_prefix.as_str())
     }) {
         holders.push(local_node_id);
     }
-    if filtered.dropped
-        && let Err(error) = mark_watch_interest_dirty(context, event.realm_id).await
-    {
+    if found_stale && let Err(error) = mark_watch_interest_dirty(context, event.realm_id).await {
         warn!(%error, "Failed to mark stale watch interest dirty while emitting event");
     }
     Ok(realm_config)
@@ -131,6 +124,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+    use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationRecord, RealmAuthorizationDocument,
         RealmConfigDocument, RealmId, RealmNodeKind, WatchEventDetail, WatchEventKind,
@@ -294,6 +288,8 @@ mod tests {
     async fn local_subscription_matches_before_interest_publish() {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [84u8; 32]).await;
+        let metrics = NodeMetrics::new();
+        net.notification_watch_metrics().register(&metrics).await;
         let owner = UserId::new(Ulid::r#gen(), realm);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let prefix = data_watch_resource_path(group_id, net.node_id(), "bucket", "");
@@ -325,6 +321,13 @@ mod tests {
             Vec::new(),
             "the local subscription has not needed a published digest"
         );
+
+        install_authorization(&ctx, realm, group_id, UserId::new(Ulid::r#gen(), realm)).await;
+        emit_resource_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
+        assert_eq!(read_inbox_rows(&ctx).await.len(), 1);
+        assert!(metrics.render().await.contains(
+            "aruna_notification_watch_delivery_suppressions_total{reason=\"permission_denied\"} 1"
+        ));
     }
 
     #[tokio::test]

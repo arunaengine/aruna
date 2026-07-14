@@ -1,21 +1,27 @@
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::auth::bearer_token_hash;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, Permission, WatchEventKind, WatchEventMask, WatchSubscription,
+    NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
+    WatchSubscription,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
     delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
-    resolve_inbox_holder_for_user, subscribe_inbox_wakes, unread_count_for_user,
+    record_watch_creation_denial_metric, resolve_inbox_holder_for_user, subscribe_inbox_wakes,
+    unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
-use aruna_operations::notifications::watch::authorization::watch_permission_path;
+use aruna_operations::notifications::watch::authorization::{
+    WatchAuthorization, evaluate_watch_authorization, watch_permission_path,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -181,6 +187,9 @@ fn map_watch_dispatch_error(error: WatchDispatchError, operation: &str) -> Serve
         WatchDispatchError::CapExceeded => {
             ServerError::Conflict("notification watch subscription cap reached".to_string())
         }
+        // A holder-side denial answers exactly as the create-time check does, so
+        // an unreadable path never separates into a distinct existence signal.
+        WatchDispatchError::Unauthorized(_) => ServerError::Forbidden,
         WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
         WatchDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");
@@ -201,6 +210,15 @@ fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
             .collect(),
         created_at_ms: subscription.created_at_ms,
     }
+}
+
+fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
+    record_watch_creation_denial_metric(state.get_ctx().as_ref(), reason);
+    warn!(
+        parent: None,
+        reason = reason.as_str(),
+        "Notification watch creation denied"
+    );
 }
 
 /// Watch subscriptions cannot retain token-only path restrictions on their
@@ -316,15 +334,51 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
     response
 }
 
+/// Creation shares the exact authorization result delivery and enumeration use,
+/// so a watch cannot be created on anything they would later refuse. A prefix
+/// with no canonical resource identity is a malformed request; everything else a
+/// caller may not read answers Forbidden, whether or not it exists.
 async fn authorize_watch(
     state: &ServerState,
     auth: &AuthContext,
     path_prefix: &str,
     event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
 ) -> ServerResult<()> {
-    let permission_path = watch_permission_path(state.get_realm_id(), path_prefix, event_mask)
-        .ok_or(ServerError::BadRequest)?;
-    ensure_permission(state, auth, permission_path, Permission::READ).await
+    if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
+        record_watch_creation_denial(state, WatchAuthorizationMetricReason::InvalidResource);
+        return Err(ServerError::BadRequest);
+    }
+    match evaluate_watch_authorization(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        auth.user_id,
+        path_prefix,
+        event_mask,
+        authorization,
+    )
+    .await
+    {
+        Ok(WatchAuthorization::Authorized) => Ok(()),
+        Ok(WatchAuthorization::Denied(reason)) => {
+            record_watch_creation_denial(state, reason.metric_reason());
+            Err(ServerError::Forbidden)
+        }
+        Ok(WatchAuthorization::Unavailable(_)) => {
+            record_watch_creation_denial(
+                state,
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            );
+            Err(ServerError::Forbidden)
+        }
+        Err(error) => {
+            record_watch_creation_denial(
+                state,
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            );
+            Err(ServerError::InternalError(error))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -713,24 +767,43 @@ pub async fn list_watches(
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
+    let bearer_token = bearer_token.ok_or(ServerError::Unauthorized)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
         || request.events.is_empty()
     {
+        record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
     let mut event_mask = WatchEventMask::empty();
     for name in &request.events {
-        let kind = WatchEventKind::from_name(name).ok_or(ServerError::BadRequest)?;
+        let Some(kind) = WatchEventKind::from_name(name) else {
+            record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+            return Err(ServerError::BadRequest);
+        };
         event_mask.insert(kind);
     }
+    let authorization = WatchAuthorizationBinding {
+        token_hash: bearer_token_hash(bearer_token.as_str()),
+        expires_at_secs: bearer_token.expires_at_secs(),
+        path_restrictions: auth.path_restrictions.clone(),
+        watch_path_prefix: request.path_prefix.clone(),
+    };
     // A remote holder receives only the durable subscription, not this request's
     // AuthContext. Authorize the immutable canonical identity before dispatch.
-    authorize_watch(&state, &auth, &request.path_prefix, event_mask).await?;
+    authorize_watch(
+        &state,
+        &auth,
+        &request.path_prefix,
+        event_mask,
+        &authorization,
+    )
+    .await?;
 
     let subscription = create_watch_for_user(
         &state.get_ctx(),
@@ -738,9 +811,15 @@ pub async fn create_watch(
         auth.user_id,
         request.path_prefix,
         event_mask,
+        authorization,
     )
     .await
-    .map_err(|error| map_watch_dispatch_error(error, "create_watch"))?;
+    .map_err(|error| {
+        if let WatchDispatchError::Unauthorized(reason) = &error {
+            record_watch_creation_denial(&state, *reason);
+        }
+        map_watch_dispatch_error(error, "create_watch")
+    })?;
 
     Ok((StatusCode::CREATED, Json(watch_response(&subscription))))
 }
@@ -788,6 +867,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, Permission,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -977,6 +1057,12 @@ mod tests {
             realm_id,
             path_restrictions: None,
         }
+    }
+
+    fn bearer() -> Extension<Option<ValidatedArunaBearerTokenCarrier>> {
+        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+            "notification-watch-test-token",
+        )))
     }
 
     #[tokio::test]
@@ -1456,6 +1542,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1494,8 +1581,10 @@ mod tests {
     #[tokio::test]
     async fn create_watch_requires_metadata_group_read_permission() {
         let realm_id = realm_id(15);
-        let holder = node(15);
-        let (_dir, state) = build_state(realm_id, holder).await;
+        let (_dir, state, net) = build_state_with_net(realm_id, [15u8; 32]).await;
+        let holder = net.node_id();
+        let metrics = NodeMetrics::new();
+        net.notification_watch_metrics().register(&metrics).await;
         install_local_holder_config(&state, realm_id, holder).await;
         let authorized = UserId::new(Ulid::r#gen(), realm_id);
         let unauthorized = UserId::new(Ulid::r#gen(), realm_id);
@@ -1506,6 +1595,7 @@ mod tests {
         let error = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(unauthorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["metadata_created".to_string()],
@@ -1514,10 +1604,14 @@ mod tests {
         .await
         .expect_err("user without metadata READ must be rejected");
         assert!(matches!(error, ServerError::Forbidden));
+        assert!(metrics.render().await.contains(
+            "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
+        ));
 
         let (status, created) = create_watch(
             State(state),
             Extension(Some(auth_for(authorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["metadata_created".to_string()],
@@ -1546,6 +1640,7 @@ mod tests {
         let error = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(unauthorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1558,6 +1653,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state),
             Extension(Some(auth_for(authorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1567,6 +1663,52 @@ mod tests {
         .expect("bucket reader may create a watch");
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created.path_prefix, path_prefix);
+    }
+
+    // A group that does not exist and a group the caller may not read answer
+    // identically, so creating a watch is never an existence oracle.
+    #[tokio::test]
+    async fn missing_group_forbidden() {
+        let realm_id = realm_id(18);
+        let holder = node(18);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
+        let caller = UserId::new(Ulid::r#gen(), realm_id);
+        let existing_group = Ulid::r#gen();
+        install_group_authorization(
+            &state,
+            realm_id,
+            existing_group,
+            UserId::new(Ulid::r#gen(), realm_id),
+            &[],
+        )
+        .await;
+
+        let missing = create_watch(
+            State(state.clone()),
+            Extension(Some(auth_for(caller, realm_id))),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{}/datasets", Ulid::r#gen()),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a watch on a group that does not exist must be refused");
+        assert!(matches!(missing, ServerError::Forbidden));
+
+        let unreadable = create_watch(
+            State(state),
+            Extension(Some(auth_for(caller, realm_id))),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: format!("meta/{existing_group}/datasets"),
+                events: vec!["metadata_created".to_string()],
+            }),
+        )
+        .await
+        .expect_err("a watch on an existing unreadable group must be refused");
+        assert!(matches!(unreadable, ServerError::Forbidden));
     }
 
     #[tokio::test]
@@ -1582,6 +1724,7 @@ mod tests {
         let error = create_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix,
                 events,
@@ -1601,6 +1744,7 @@ mod tests {
         let empty_prefix = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: String::new(),
                 events: vec!["metadata_created".to_string()],
@@ -1613,6 +1757,7 @@ mod tests {
         let leading_slash = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "/bucket".to_string(),
                 events: vec!["metadata_created".to_string()],
@@ -1625,6 +1770,7 @@ mod tests {
         let empty_events = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: Vec::new(),
@@ -1637,6 +1783,7 @@ mod tests {
         let unknown_event = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: vec!["not_an_event".to_string()],
@@ -1649,6 +1796,7 @@ mod tests {
         let unscoped_data = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "reports".to_string(),
                 events: vec!["data_uploaded".to_string()],
@@ -1662,6 +1810,7 @@ mod tests {
         let unscoped_metadata = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{group_id}"),
                 events: vec!["metadata_created".to_string()],
@@ -1674,6 +1823,7 @@ mod tests {
         let noncanonical_metadata = create_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{group_id}/datasets/proteomics/"),
                 events: vec!["metadata_created".to_string()],
@@ -1700,13 +1850,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_endpoints_reject_path_restricted_token() {
+    async fn watch_creation_honors_path_restricted_token() {
         let realm_id = realm_id(9);
-        let (_dir, state) = build_state(realm_id, node(9)).await;
+        let holder = node(9);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
         let user_id = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
+        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
         let mut auth = auth_for(user_id, realm_id);
         auth.path_restrictions = Some(vec![PathRestriction {
-            pattern: "/bucket/**".to_string(),
+            pattern: format!("/{realm_id}/g/{group_id}/data/{holder}/bucket/allowed/**"),
             permission: Permission::READ,
         }]);
 
@@ -1715,16 +1869,29 @@ mod tests {
             .expect_err("delegated token must be rejected");
         assert!(matches!(list_err, ServerError::Forbidden));
 
-        let create_err = create_watch(
+        let _ = create_watch(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            bearer(),
             Json(CreateWatchRequest {
-                path_prefix: "bucket".to_string(),
-                events: vec!["metadata_created".to_string()],
+                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "allowed/"),
+                events: vec!["data_uploaded".to_string()],
             }),
         )
         .await
-        .expect_err("delegated token must be rejected");
+        .expect("delegated token may watch its allowed prefix");
+
+        let create_err = create_watch(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "private/"),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect_err("delegated token must not watch outside its prefix");
         assert!(matches!(create_err, ServerError::Forbidden));
 
         let delete_err = delete_watch(

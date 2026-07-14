@@ -343,22 +343,28 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedArunaBearerTokenCarrier {
     token: String,
+    expires_at_secs: u64,
 }
 
 impl ValidatedArunaBearerTokenCarrier {
-    fn new(token: impl Into<String>) -> Self {
+    fn new(token: impl Into<String>, expires_at_secs: u64) -> Self {
         Self {
             token: token.into(),
+            expires_at_secs,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(token: impl Into<String>) -> Self {
-        Self::new(token)
+        Self::new(token, u64::MAX)
     }
 
     pub fn as_str(&self) -> &str {
         &self.token
+    }
+
+    pub fn expires_at_secs(&self) -> u64 {
+        self.expires_at_secs
     }
 }
 
@@ -396,13 +402,17 @@ async fn extract_auth_context_and_bearer_token(
         Ok(claims) => claims,
         Err(_) => return (None, None),
     };
+    let expires_at_secs = claims.exp;
     let auth_context: AuthContext = match claims.try_into() {
         Ok(auth_context) => auth_context,
         Err(_) => return (None, None),
     };
     (
         Some(auth_context),
-        Some(ValidatedArunaBearerTokenCarrier::new(token)),
+        Some(ValidatedArunaBearerTokenCarrier::new(
+            token,
+            expires_at_secs,
+        )),
     )
 }
 

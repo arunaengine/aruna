@@ -1,4 +1,6 @@
-use aruna_core::structs::{NotificationRecord, WatchEvent, WatchEventMask, WatchSubscription};
+use aruna_core::structs::{
+    NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+};
 use aruna_core::types::UserId;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,7 @@ pub enum NotificationTransportMessage {
         owner: UserId,
         path_prefix: String,
         event_mask: WatchEventMask,
+        authorization: WatchAuthorizationBinding,
     },
     WatchCreated {
         subscription: WatchSubscription,

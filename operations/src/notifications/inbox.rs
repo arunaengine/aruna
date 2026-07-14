@@ -7,7 +7,8 @@ use aruna_core::structs::{NotificationRecord, notification_inbox_key};
 use aruna_core::types::{Key, KeySpace, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
 
-enum UpsertFailure {
+#[derive(Debug)]
+pub(crate) enum UpsertFailure {
     Conflict,
     Fatal(String),
 }
@@ -74,6 +75,35 @@ async fn upsert_once(
         }
     };
 
+    let outcome = match upsert_inbox_records_in_transaction(storage, records, txn_id).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            abort_txn(storage, txn_id).await;
+            return Err(error);
+        }
+    };
+    if outcome.written == 0 {
+        abort_txn(storage, txn_id).await;
+        return Ok(outcome);
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(outcome),
+        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
+        other => Err(UpsertFailure::Fatal(format!(
+            "unexpected storage event: {other:?}"
+        ))),
+    }
+}
+
+pub(crate) async fn upsert_inbox_records_in_transaction(
+    storage: &StorageHandle,
+    records: &[NotificationRecord],
+    txn_id: TxnId,
+) -> Result<InboxWriteOutcome, UpsertFailure> {
     let reads: Vec<(KeySpace, Key)> = records
         .iter()
         .map(|record| {
@@ -96,11 +126,8 @@ async fn upsert_once(
         .await
     {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
         other => {
-            abort_txn(storage, txn_id).await;
             return Err(UpsertFailure::Fatal(format!(
                 "unexpected storage event: {other:?}"
             )));
@@ -122,14 +149,12 @@ async fn upsert_once(
                 }
             }
             Err(error) => {
-                abort_txn(storage, txn_id).await;
                 return Err(UpsertFailure::Fatal(error.to_string()));
             }
         }
     }
 
     if writes.is_empty() {
-        abort_txn(storage, txn_id).await;
         return Ok(InboxWriteOutcome::default());
     }
 
@@ -141,27 +166,15 @@ async fn upsert_once(
         .await
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
         other => {
-            abort_txn(storage, txn_id).await;
             return Err(UpsertFailure::Fatal(format!(
                 "unexpected storage event: {other:?}"
             )));
         }
     }
 
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(outcome),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
+    Ok(outcome)
 }
 
 fn classify(error: StorageError) -> UpsertFailure {
@@ -176,15 +189,6 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
     let _ = storage
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await;
-}
-
-async fn abort_and_classify(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    error: StorageError,
-) -> UpsertFailure {
-    abort_txn(storage, txn_id).await;
-    classify(error)
 }
 
 #[cfg(test)]

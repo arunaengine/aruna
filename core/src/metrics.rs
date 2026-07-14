@@ -58,6 +58,93 @@ pub struct RouteLabels {
     pub op: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchAuthorizationMetricReason {
+    InvalidResource,
+    InvalidOwner,
+    TokenRestricted,
+    TokenExpired,
+    TokenRevoked,
+    PermissionDenied,
+    AuthorizationUnavailable,
+    InvalidState,
+}
+
+impl WatchAuthorizationMetricReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidResource => "invalid_resource",
+            Self::InvalidOwner => "invalid_owner",
+            Self::TokenRestricted => "token_restricted",
+            Self::TokenExpired => "token_expired",
+            Self::TokenRevoked => "token_revoked",
+            Self::PermissionDenied => "permission_denied",
+            Self::AuthorizationUnavailable => "authorization_unavailable",
+            Self::InvalidState => "invalid_state",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "invalid_resource" => Self::InvalidResource,
+            "invalid_owner" => Self::InvalidOwner,
+            "token_restricted" => Self::TokenRestricted,
+            "token_expired" => Self::TokenExpired,
+            "token_revoked" => Self::TokenRevoked,
+            "permission_denied" => Self::PermissionDenied,
+            "authorization_unavailable" => Self::AuthorizationUnavailable,
+            "invalid_state" => Self::InvalidState,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct WatchAuthorizationLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NotificationWatchMetrics {
+    creation_denials: Family<WatchAuthorizationLabels, Counter>,
+    delivery_suppressions: Family<WatchAuthorizationLabels, Counter>,
+}
+
+impl NotificationWatchMetrics {
+    pub fn record_creation_denial(&self, reason: WatchAuthorizationMetricReason) {
+        self.creation_denials
+            .get_or_create(&WatchAuthorizationLabels {
+                reason: reason.as_str(),
+            })
+            .inc();
+    }
+
+    pub fn record_delivery_suppression(&self, reason: WatchAuthorizationMetricReason) {
+        self.delivery_suppressions
+            .get_or_create(&WatchAuthorizationLabels {
+                reason: reason.as_str(),
+            })
+            .inc();
+    }
+
+    pub async fn register(&self, metrics: &NodeMetrics) {
+        metrics
+            .register(
+                "notification_watch_creation_denials",
+                "Notification watch creation denials",
+                self.creation_denials.clone(),
+            )
+            .await;
+        metrics
+            .register(
+                "notification_watch_delivery_suppressions",
+                "Notification watch delivery suppressions",
+                self.delivery_suppressions.clone(),
+            )
+            .await;
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BuildInfoLabels {
     version: String,
@@ -281,5 +368,26 @@ mod tests {
         assert!(metrics.render().await.contains("aruna_refreshes 1"));
         assert!(metrics.render().await.contains("aruna_refreshes 2"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn notification_watch_metrics_use_bounded_reason_labels() {
+        assert_eq!(
+            WatchAuthorizationMetricReason::parse("token_revoked"),
+            Some(WatchAuthorizationMetricReason::TokenRevoked)
+        );
+        let metrics = NodeMetrics::new();
+        let watch_metrics = NotificationWatchMetrics::default();
+        watch_metrics.register(&metrics).await;
+        watch_metrics.record_creation_denial(WatchAuthorizationMetricReason::PermissionDenied);
+        watch_metrics.record_delivery_suppression(WatchAuthorizationMetricReason::TokenRestricted);
+
+        let body = metrics.render().await;
+        assert!(body.contains(
+            "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
+        ));
+        assert!(body.contains(
+            "aruna_notification_watch_delivery_suppressions_total{reason=\"token_restricted\"} 1"
+        ));
     }
 }

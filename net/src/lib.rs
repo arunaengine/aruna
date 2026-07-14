@@ -28,6 +28,7 @@ use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, St
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
+use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
@@ -394,6 +395,7 @@ struct NetInner {
     relay_method: RelayMethod,
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
+    notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
@@ -790,6 +792,7 @@ impl NetHandle {
             relay_method,
             realm_peers,
             watch_interest,
+            notification_watch_metrics: NotificationWatchMetrics::default(),
             notification_wakes,
             dht_signed_authorized_nodes,
             dht,
@@ -1032,6 +1035,10 @@ impl NetHandle {
     /// events against this table without any per-event storage read.
     pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
         self.inner.watch_interest.read().clone()
+    }
+
+    pub fn notification_watch_metrics(&self) -> &NotificationWatchMetrics {
+        &self.inner.notification_watch_metrics
     }
 
     /// Replaces the whole watch interest cache (startup and full rebuilds).

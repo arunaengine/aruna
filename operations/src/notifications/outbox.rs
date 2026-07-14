@@ -60,7 +60,7 @@ pub async fn read_notification_outbox_batch(
             let next_start_after = page.last().map(|(key, _)| key.to_vec());
             let mut records = Vec::with_capacity(page.len());
             for (key, value) in page {
-                match postcard::from_bytes(&value) {
+                match NotificationOutboxRecord::from_bytes(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();

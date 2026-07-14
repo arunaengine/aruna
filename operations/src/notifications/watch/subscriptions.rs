@@ -7,13 +7,15 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::storage_entries::{
     document_sync_revision_write_entry, watch_subscription_delete_entry,
     watch_subscription_write_entry,
 };
 use aruna_core::structs::{
     NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef, RealmId,
-    WatchEventMask, WatchSubscription, watch_subscription_prefix,
+    WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_subscription_key,
+    watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -24,6 +26,9 @@ use crate::document_sync_outbox::{
     new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
 };
 use crate::driver::DriverContext;
+use crate::notifications::watch::authorization::{
+    WatchAuthorization, evaluate_watch_authorization,
+};
 use crate::notifications::watch::interest::watch_interest_dirty_marker_write;
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
@@ -34,8 +39,15 @@ const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
 /// holder proxy to surface a 409 to the API layer.
 pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscription cap reached";
 
+/// Stable reject reason for an unauthorized create; matched verbatim by the
+/// holder proxy to surface a 403 to the API layer.
+pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
+    "watch subscription owner lacks READ on the watched path";
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WatchSubscriptionError {
+    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
+    Unauthorized(WatchAuthorizationMetricReason),
     #[error("watch path prefix must not be empty")]
     EmptyPrefix,
     #[error("watch path prefix must not start with a slash")]
@@ -71,19 +83,52 @@ pub async fn create_watch_subscription(
     event_mask: WatchEventMask,
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    let subscription = validated_subscription(
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+        WatchAuthorizationBinding::default(),
+    )?;
     create_subscription(storage, subscription, None).await
 }
 
+/// The one holder-side create path, used by both the local API arm and the
+/// holder RPC. A proxying peer's assertion is not authority to watch, so the
+/// holder that persists and replicates the subscription re-derives the canonical
+/// permission path and checks the owner's READ itself before any durable write.
 pub async fn create_replicated_watch_subscription(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
+    authorization: WatchAuthorizationBinding,
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    let subscription =
+        validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
+    match evaluate_watch_authorization(
+        context,
+        owner.realm_id,
+        owner,
+        &subscription.path_prefix,
+        subscription.event_mask,
+        &subscription.authorization,
+    )
+    .await
+    .map_err(WatchSubscriptionError::Storage)?
+    {
+        WatchAuthorization::Authorized => {}
+        WatchAuthorization::Denied(reason) => {
+            return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
+        }
+        WatchAuthorization::Unavailable(_) => {
+            return Err(WatchSubscriptionError::Unauthorized(
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            ));
+        }
+    }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
     let subscription =
         create_subscription(&context.storage_handle, subscription, Some(replication)).await?;
@@ -96,7 +141,28 @@ fn validated_subscription(
     path_prefix: String,
     event_mask: WatchEventMask,
     now_ms: u64,
+    authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
+    validate_subscription_fields(&path_prefix, event_mask)?;
+    if !authorization.is_valid() {
+        return Err(WatchSubscriptionError::Unauthorized(
+            WatchAuthorizationMetricReason::InvalidState,
+        ));
+    }
+
+    Ok(WatchSubscription::new_with_authorization(
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+        authorization,
+    ))
+}
+
+fn validate_subscription_fields(
+    path_prefix: &str,
+    event_mask: WatchEventMask,
+) -> Result<(), WatchSubscriptionError> {
     if path_prefix.is_empty() {
         return Err(WatchSubscriptionError::EmptyPrefix);
     }
@@ -117,12 +183,7 @@ fn validated_subscription(
         return Err(WatchSubscriptionError::InvalidMask);
     }
 
-    Ok(WatchSubscription::new(
-        owner,
-        path_prefix,
-        event_mask,
-        now_ms,
-    ))
+    Ok(())
 }
 
 async fn create_subscription(
@@ -508,6 +569,40 @@ async fn schedule_replication(context: &DriverContext) {
         .await;
 }
 
+fn decode_stored_subscription(
+    key: &[u8],
+    value: &[u8],
+) -> Result<WatchSubscription, WatchSubscriptionError> {
+    let (key_owner, key_watch_id) = parse_watch_subscription_key(key)
+        .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
+    let subscription = WatchSubscription::from_bytes(value)
+        .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
+    if key_owner.is_nil()
+        || key_watch_id.is_nil()
+        || subscription.owner != key_owner
+        || subscription.watch_id != key_watch_id
+    {
+        return Err(WatchSubscriptionError::Storage(
+            "stored watch subscription key does not match payload identity".to_string(),
+        ));
+    }
+    validate_subscription_fields(&subscription.path_prefix, subscription.event_mask).map_err(
+        |error| {
+            WatchSubscriptionError::Storage(format!(
+                "stored watch subscription violates invariants: {error}"
+            ))
+        },
+    )?;
+    if !subscription.authorization.is_valid()
+        || subscription.authorization.watch_path_prefix != subscription.path_prefix
+    {
+        return Err(WatchSubscriptionError::Storage(
+            "stored watch subscription has invalid authorization binding".to_string(),
+        ));
+    }
+    Ok(subscription)
+}
+
 pub async fn list_watch_subscriptions(
     storage: &StorageHandle,
     owner: UserId,
@@ -534,11 +629,14 @@ pub async fn list_watch_subscriptions(
     };
 
     let mut subscriptions = Vec::with_capacity(values.len());
-    for (_, value) in values {
-        subscriptions.push(
-            WatchSubscription::from_bytes(&value)
-                .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
-        );
+    for (key, value) in values {
+        let subscription = decode_stored_subscription(&key, &value)?;
+        if subscription.owner != owner {
+            return Err(WatchSubscriptionError::Storage(
+                "stored watch subscription belongs to a different owner".to_string(),
+            ));
+        }
+        subscriptions.push(subscription);
     }
     Ok(subscriptions)
 }
@@ -577,11 +675,14 @@ pub async fn list_realm_watch_subscriptions(
                 )));
             }
         };
-        for (_, value) in values {
-            subscriptions.push(
-                WatchSubscription::from_bytes(&value)
-                    .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
-            );
+        for (key, value) in values {
+            let subscription = decode_stored_subscription(&key, &value)?;
+            if subscription.owner.realm_id != realm_id {
+                return Err(WatchSubscriptionError::Storage(
+                    "stored watch subscription belongs to a different realm".to_string(),
+                ));
+            }
+            subscriptions.push(subscription);
         }
         match next {
             Some(next) => start = Some(next),
@@ -617,7 +718,12 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, WatchEventKind};
+    use aruna_core::NodeId;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId, WatchEventKind,
+        data_watch_resource_path,
+    };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
@@ -637,6 +743,64 @@ mod tests {
             WatchEventKind::MetadataCreated,
             WatchEventKind::DataUploaded,
         ])
+    }
+
+    fn data_mask() -> WatchEventMask {
+        WatchEventMask::from_kinds([WatchEventKind::DataUploaded])
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn test_context(storage: StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        }
+    }
+
+    async fn install_auth(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        owner: UserId,
+        group_id: Ulid,
+        node_id: NodeId,
+    ) {
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            match storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected auth write event: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -717,6 +881,95 @@ mod tests {
                 .len(),
             NOTIFICATION_WATCH_PER_USER_CAP
         );
+    }
+
+    // Revocation hides a watch but does not delete its replicated row. Those
+    // durable rows must keep occupying cap slots until explicit deletion, or a
+    // user can grow storage and fan-out without bound by churning permissions.
+    #[tokio::test]
+    async fn revoked_rows_still_count_toward_cap() {
+        let (_dir, storage) = temp_storage();
+        let realm_id = RealmId([7u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        install_auth(&storage, realm_id, owner, group_id, node_id).await;
+
+        let dead_prefix = data_watch_resource_path(Ulid::nil(), node_id, "bucket", "");
+        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+            create_watch_subscription(
+                &storage,
+                owner,
+                dead_prefix.clone(),
+                data_mask(),
+                index as u64,
+            )
+            .await
+            .expect("dead row create");
+        }
+
+        let context = test_context(storage);
+        let authorized_prefix = data_watch_resource_path(group_id, node_id, "bucket", "reports/");
+        assert_eq!(
+            create_replicated_watch_subscription(
+                &context,
+                node_id,
+                owner,
+                authorized_prefix,
+                data_mask(),
+                WatchAuthorizationBinding::default(),
+                9_999,
+            )
+            .await,
+            Err(WatchSubscriptionError::CapExceeded)
+        );
+        assert_eq!(
+            list_watch_subscriptions(&context.storage_handle, owner)
+                .await
+                .expect("durable rows remain listable")
+                .len(),
+            NOTIFICATION_WATCH_PER_USER_CAP
+        );
+    }
+
+    #[test]
+    fn stored_rows_require_valid_key_payload_identity() {
+        let owner = user(1, 1);
+        let watch_id = Ulid::from_bytes([9u8; 16]);
+        let mut subscription = WatchSubscription::new(owner, "prefix".to_string(), mask(), 1);
+        subscription.watch_id = watch_id;
+        let bytes = subscription.to_bytes().expect("subscription encodes");
+        let key = aruna_core::structs::watch_subscription_key(owner, watch_id);
+        assert_eq!(
+            decode_stored_subscription(&key, &bytes).expect("valid row"),
+            subscription
+        );
+
+        let wrong_key = aruna_core::structs::watch_subscription_key(owner, Ulid::r#gen());
+        assert!(matches!(
+            decode_stored_subscription(&wrong_key, &bytes),
+            Err(WatchSubscriptionError::Storage(_))
+        ));
+
+        subscription.watch_id = Ulid::nil();
+        let nil_key = aruna_core::structs::watch_subscription_key(owner, Ulid::nil());
+        assert!(matches!(
+            decode_stored_subscription(
+                &nil_key,
+                &subscription.to_bytes().expect("nil row encodes")
+            ),
+            Err(WatchSubscriptionError::Storage(_))
+        ));
+
+        subscription.watch_id = watch_id;
+        subscription.path_prefix.clear();
+        assert!(matches!(
+            decode_stored_subscription(
+                &key,
+                &subscription.to_bytes().expect("invalid row encodes")
+            ),
+            Err(WatchSubscriptionError::Storage(_))
+        ));
     }
 
     #[tokio::test]

@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::{NotificationRecord, WatchEvent, WatchEventMask, WatchSubscription};
+use aruna_core::structs::{
+    NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+};
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -124,6 +126,7 @@ pub async fn create_watch_remote(
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
+    authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, String> {
     match send_notification_request(
         net_handle,
@@ -132,6 +135,7 @@ pub async fn create_watch_remote(
             owner,
             path_prefix,
             event_mask,
+            authorization,
         },
     )
     .await?
