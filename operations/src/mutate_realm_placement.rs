@@ -727,8 +727,10 @@ pub async fn drive_realm_placement_mutation(
     );
     let outcome = crate::driver::drive(MutateRealmPlacementOperation::new(config), context).await;
     if outcome.is_ok() && drains_node && context.net_handle.is_some() {
-        crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(context.clone()))
-            .await;
+        crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(
+            context.clone(),
+        ))
+        .await;
     }
     outcome
 }
