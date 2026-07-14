@@ -169,7 +169,8 @@ async fn restart_recovery_child() -> Result<(), Box<dyn std::error::Error>> {
     std::process::exit(0);
 }
 
-async fn seed_claimed(storage: &StorageHandle, record: JobRecord) {
+async fn seed_claimed(storage: &StorageHandle, mut record: JobRecord) {
+    record.has_run = true;
     insert_job(storage, &record).await.unwrap();
     claim_job(storage, record.job_id, node_id(1), 1)
         .await

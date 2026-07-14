@@ -279,7 +279,7 @@ pub enum ClaimOutcome {
     NotEligible,
 }
 
-/// Claim a queued job, or cancel it directly if it was never-attempted and cancel-requested.
+/// Claim a queued job, or cancel it directly if it never ran and is cancel-requested.
 pub async fn claim_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -295,7 +295,7 @@ pub async fn claim_job(
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
-        if record.cancel_requested && record.attempts == 0 {
+        if record.cancel_requested && !record.has_run {
             record.state = JobState::Cancelled;
             record.finished_at_ms = Some(now_ms);
             record.claim = None;
@@ -332,6 +332,7 @@ pub async fn transition_to_running(
     mutate_job(storage, job_id, |record| {
         guard_token(record, token)?;
         record.state = JobState::Running;
+        record.has_run = true;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
