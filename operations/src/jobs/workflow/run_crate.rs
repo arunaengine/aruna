@@ -1,12 +1,14 @@
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
-    Actor, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload, OutputObject,
-    RunCrateStatus,
+    Actor, AuthContext, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
+    OutputObject, Permission, RunCrateStatus,
 };
 use serde_json::json;
 use ulid::Ulid;
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_run_crate_status, read_job_record};
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload,
@@ -50,6 +52,45 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         user_id: parent.created_by,
         realm_id: parent.created_by.realm_id,
     };
+    let denied = match drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: parent.created_by,
+                realm_id: parent.created_by.realm_id,
+                path_restrictions: None,
+            },
+            path: format!(
+                "/{}/g/{}/meta/**",
+                parent.created_by.realm_id, spec.group_id
+            ),
+            required_permission: Permission::WRITE,
+        }),
+        context,
+    )
+    .await
+    {
+        Ok(allowed) => !allowed,
+        Err(
+            AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::AuthDocNotFound,
+        ) => true,
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate authorization failed: {error}"
+            )));
+        }
+    };
+    if denied {
+        let status = RunCrateStatus::Denied {
+            message: "metadata write access denied".to_string(),
+        };
+        let _ = put_run_crate_status(storage, for_job, &status).await;
+        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
+            resource: status.name().to_string(),
+        });
+    }
 
     let document_id = Ulid::r#gen();
     let jsonld = build_run_crate_jsonld(&parent, spec, document_id);
