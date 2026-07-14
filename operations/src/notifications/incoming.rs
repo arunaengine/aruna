@@ -856,8 +856,10 @@ mod tests {
             },
             1_700_000_000_000 + seed as u64,
         );
-        let mut authorization = WatchAuthorizationBinding::default();
-        authorization.watch_path_prefix = data_path("");
+        let authorization = WatchAuthorizationBinding {
+            watch_path_prefix: data_path(""),
+            ..Default::default()
+        };
         record.watch_authorization = Some(authorization);
         record
     }
