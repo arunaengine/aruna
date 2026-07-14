@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aruna_compute::spec::AttemptRef;
-use aruna_compute::status::ReconcileOutcome;
+use aruna_compute::status::{AttemptPhase, ReconcileOutcome};
 use aruna_core::structs::{ExecutionSpec, JobError, JobPayload, JobRecord, JobState};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -13,12 +13,13 @@ use super::super::store::{
     adopt_external_attempt, mark_indeterminate, requeue_before_attempt,
     transition_external_to_running,
 };
-use super::{finalize_attempt, resolve_backend, supervise_and_finalize};
+use super::workspace::mint_workspace_credential;
+use super::{build_task_spec, finalize_attempt, resolve_backend, supervise_and_finalize};
 use crate::driver::DriverContext;
 
 /// The real Stage-0 reconcile seam: a lost external attempt is adopted by name and
 /// resolved by evidence (adopt-and-resume, terminalize, or Indeterminate). It never
-/// submits a new attempt, so a container is never double-run.
+/// submits a new attempt name, so a container is never double-run.
 pub struct ComputeReconciler {
     context: Arc<DriverContext>,
 }
@@ -84,13 +85,43 @@ impl ExternalReconciler for ComputeReconciler {
             .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
 
-        match backend.reconcile(&attempt).await {
+        let outcome = backend.reconcile(&attempt).await;
+        if matches!(outcome, ReconcileOutcome::Found(_))
+            && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
+            && transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
+                .await
+                .is_err()
+        {
+            return;
+        }
+
+        match outcome {
             ReconcileOutcome::Found(status) if !status.is_terminal() => {
-                self.resume(job_id, token, backend, attempt, spec, bucket, adopted.state)
-                    .await;
+                self.resume(
+                    job_id,
+                    token,
+                    backend,
+                    attempt,
+                    status.phase,
+                    spec,
+                    bucket,
+                    adopted,
+                )
+                .await;
             }
             // Terminal evidence: commit it now (correlates the cancel intent).
-            ReconcileOutcome::Found(status) => {
+            ReconcileOutcome::Found(mut status) => {
+                let max_walltime_ms = spec
+                    .resources
+                    .max_walltime_ms
+                    .unwrap_or(24 * 60 * 60 * 1_000);
+                if status.started_at_ms.zip(status.finished_at_ms).is_some_and(
+                    |(started, finished)| finished.saturating_sub(started) > max_walltime_ms,
+                ) {
+                    status.phase = AttemptPhase::Failed {
+                        reason: "walltime limit exceeded while unobserved".to_string(),
+                    };
+                }
                 finalize_attempt(
                     &self.context,
                     job_id,
@@ -130,8 +161,8 @@ impl ExternalReconciler for ComputeReconciler {
 }
 
 impl ComputeReconciler {
-    /// Adopt a still-running container: ensure `Running` and resume supervision on a
-    /// detached task so the drain loop is never blocked.
+    /// Adopt a live container and resume supervision on a detached task so the drain
+    /// loop is never blocked.
     #[allow(clippy::too_many_arguments)]
     async fn resume(
         &self,
@@ -139,19 +170,49 @@ impl ComputeReconciler {
         token: ulid::Ulid,
         backend: Arc<dyn aruna_compute::backend::ExecutorBackend>,
         attempt: AttemptRef,
+        phase: AttemptPhase,
         spec: ExecutionSpec,
         bucket: String,
-        state: JobState,
+        record: JobRecord,
     ) {
-        // Return to Running from an evidence-free state; a live Running needs no move.
-        if matches!(state, JobState::Indeterminate | JobState::Ready) {
-            let _ = transition_external_to_running(
-                &self.context.storage_handle,
-                job_id,
-                token,
-                unix_timestamp_millis(),
-            )
-            .await;
+        if matches!(phase, AttemptPhase::Submitted) {
+            let node_id = holder(&self.context);
+            let credential =
+                match mint_workspace_credential(&self.context, &spec, &record, node_id, &bucket)
+                    .await
+                {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        let _ = mark_indeterminate(
+                            &self.context.storage_handle,
+                            job_id,
+                            token,
+                            error,
+                            unix_timestamp_millis(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            let task_spec = build_task_spec(
+                &self.context,
+                &spec,
+                &attempt,
+                &credential,
+                &bucket,
+                node_id,
+            );
+            if let Err(error) = backend.submit(&task_spec).await {
+                let _ = mark_indeterminate(
+                    &self.context.storage_handle,
+                    job_id,
+                    token,
+                    JobError::retryable(format!("resubmit failed: {error}")),
+                    unix_timestamp_millis(),
+                )
+                .await;
+                return;
+            }
         }
         let context = self.context.clone();
         tokio::spawn(async move {
