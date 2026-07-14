@@ -1205,13 +1205,18 @@ impl S3 for ArunaS3Service {
         .map_err(IntoS3Error::into_s3_error)?
         .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
 
+        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
+            AuthContext {
+                user_id: user_access.user_identity,
+                realm_id: user_access.user_identity.realm_id,
+                path_restrictions: user_access.path_restrictions.clone(),
+            }
+        } else {
+            AuthContext::anonymous(self.realm_id)
+        };
         let source_allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: user_access.user_identity.realm_id,
-                    path_restrictions: user_access.path_restrictions.clone(),
-                },
+                auth_context: source_auth_context,
                 path: blob_object_permission_path(
                     self.realm_id,
                     source_bucket_info.group_id,
@@ -1503,13 +1508,18 @@ impl S3 for ArunaS3Service {
         .map_err(IntoS3Error::into_s3_error)?
         .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
 
+        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
+            AuthContext {
+                user_id: user_access.user_identity,
+                realm_id: user_access.user_identity.realm_id,
+                path_restrictions: user_access.path_restrictions.clone(),
+            }
+        } else {
+            AuthContext::anonymous(self.realm_id)
+        };
         let source_allowed = drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: user_access.user_identity.realm_id,
-                    path_restrictions: user_access.path_restrictions.clone(),
-                },
+                auth_context: source_auth_context,
                 path: blob_object_permission_path(
                     self.realm_id,
                     source_bucket_info.group_id,
@@ -2718,7 +2728,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
@@ -3525,6 +3535,174 @@ mod tests {
             created_at: UNIX_EPOCH,
             created_by,
             cors_configuration: None,
+        }
+    }
+
+    async fn setup_copy_source_authorization(
+        same_group: bool,
+        public: bool,
+    ) -> (TempDir, ArunaS3Service, UserAccess, BucketInfo) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([36u8; 32]);
+        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let credential_group_id = Ulid::r#gen();
+        let source_group_id = if same_group {
+            credential_group_id
+        } else {
+            Ulid::r#gen()
+        };
+        let user_access = test_user_access(credential_group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_access.user_identity,
+            realm_id,
+            source_group_id,
+        );
+        if public {
+            source_auth
+                .roles
+                .values_mut()
+                .find(|role| role.name == "viewer")
+                .unwrap()
+                .assigned_users
+                .insert(UserId::nil(realm_id));
+        }
+
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            source_group_id.to_bytes().to_vec(),
+            source_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            S3_BUCKET_KEYSPACE,
+            b"source".to_vec(),
+            test_bucket_info(source_group_id, user_access.user_identity)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await;
+
+        let destination_info = test_bucket_info(credential_group_id, user_access.user_identity);
+        (
+            storage_dir,
+            ArunaS3Service::new(context, realm_id, node_id).await,
+            user_access,
+            destination_info,
+        )
+    }
+
+    fn test_copy_request<T>(
+        input: T,
+        user_access: UserAccess,
+        bucket_info: BucketInfo,
+    ) -> S3Request<T> {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access);
+        extensions.insert(bucket_info);
+        S3Request {
+            input,
+            method: Method::PUT,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_object_scopes_source_authorization_to_credential_group() {
+        for (same_group, public, allowed) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let (_storage_dir, service, user_access, bucket_info) =
+                setup_copy_source_authorization(same_group, public).await;
+            let input = CopyObjectInput::builder()
+                .bucket("destination".to_string())
+                .key("copied".to_string())
+                .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
+                .metadata_directive(Some(MetadataDirective::from_static(
+                    MetadataDirective::REPLACE,
+                )))
+                .build()
+                .unwrap();
+            let error = service
+                .copy_object(test_copy_request(input, user_access, bucket_info))
+                .await
+                .unwrap_err();
+            let expected = if allowed {
+                S3ErrorCode::NotImplemented
+            } else {
+                S3ErrorCode::AccessDenied
+            };
+            assert_eq!(
+                *error.code(),
+                expected,
+                "same_group={same_group}, public={public}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_scopes_source_authorization_to_credential_group() {
+        for (same_group, public, allowed) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let (_storage_dir, service, user_access, bucket_info) =
+                setup_copy_source_authorization(same_group, public).await;
+            let input = UploadPartCopyInput::builder()
+                .bucket("destination".to_string())
+                .key("copied".to_string())
+                .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
+                .upload_id(Ulid::r#gen().to_string())
+                .part_number(1)
+                .build()
+                .unwrap();
+            let error = service
+                .upload_part_copy(test_copy_request(input, user_access, bucket_info))
+                .await
+                .unwrap_err();
+            let expected = if allowed {
+                S3ErrorCode::NoSuchUpload
+            } else {
+                S3ErrorCode::AccessDenied
+            };
+            assert_eq!(
+                *error.code(),
+                expected,
+                "same_group={same_group}, public={public}"
+            );
         }
     }
 
