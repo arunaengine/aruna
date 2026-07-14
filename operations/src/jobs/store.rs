@@ -757,6 +757,13 @@ pub async fn cancel_execution(
     .await
 }
 
+#[derive(Debug)]
+pub enum AdoptOutcome {
+    Adopted(JobRecord),
+    /// Terminal, or the lease is still live: leave the current holder alone.
+    Skipped,
+}
+
 /// Take over a lost external attempt with a fresh claim token so the reconciler
 /// can supervise it. No token guard: the previous holder is provably dead (lease
 /// swept or node restarted). State is preserved for the reconcile decision.
@@ -765,9 +772,19 @@ pub async fn adopt_external_attempt(
     job_id: JobId,
     holder_node_id: NodeId,
     now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+) -> Result<AdoptOutcome, JobMutationError> {
+    let mut adopted = false;
+    let record = mutate_job(storage, job_id, |record| {
+        adopted = false;
         if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        // Re-check the lease INSIDE the transaction: a holder that renewed between the
+        // sweep's read and here is still alive, and stealing its claim would put two
+        // supervisors on one container.
+        if let Some(claim) = &record.claim
+            && claim.lease_expires_at_ms > now_ms
+        {
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
@@ -776,9 +793,16 @@ pub async fn adopt_external_attempt(
             claim_token: Ulid::r#gen(),
             lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
+        adopted = true;
         Ok(JobMutation::Persist)
     })
-    .await
+    .await?;
+
+    Ok(if adopted {
+        AdoptOutcome::Adopted(record)
+    } else {
+        AdoptOutcome::Skipped
+    })
 }
 
 /// Requeue an execution job that failed BEFORE its attempt was submitted (image
@@ -1215,6 +1239,47 @@ mod tests {
                 .await
                 .expect("scan schedule index");
         values.into_iter().map(|(key, _)| key).collect()
+    }
+
+    // Stealing a claim whose lease is still live would put two supervisors on one
+    // container. Only a genuinely expired lease may be adopted.
+    #[tokio::test]
+    async fn adopt_spares_live() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x77; 16]);
+        let mut record = queued_record(job_id);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        let live_token = Ulid::r#gen();
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: live_token,
+            lease_expires_at_ms: 10_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        // The holder renewed: its lease outlives `now`, so adoption must skip.
+        let outcome = adopt_external_attempt(&storage, job_id, node_id(4), 9_000)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AdoptOutcome::Skipped));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.claim.unwrap().claim_token, live_token);
+
+        // Once the lease really has expired, the attempt is adopted with a fresh token.
+        let AdoptOutcome::Adopted(adopted) =
+            adopt_external_attempt(&storage, job_id, node_id(4), 11_000)
+                .await
+                .unwrap()
+        else {
+            panic!("expired lease must be adopted");
+        };
+        let claim = adopted.claim.unwrap();
+        assert_ne!(claim.claim_token, live_token);
+        assert_eq!(claim.holder_node_id, node_id(4));
     }
 
     #[tokio::test]

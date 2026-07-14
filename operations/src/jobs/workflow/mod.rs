@@ -806,7 +806,8 @@ fn default_node_id() -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job};
+    use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, put_run_crate_status};
     use aruna_compute::logs::{LogSink, LogTails};
     use aruna_compute::spec::LogLimits;
     use aruna_core::structs::{ComputeResources, JobState, RealmId};
@@ -1079,5 +1080,40 @@ mod tests {
         assert_eq!(stored.state, JobState::Queued);
         assert_eq!(stored.attempts, 1);
         assert!(stored.attempt_intent.is_none());
+    }
+
+    // A re-driven crate job must return the already-written resource instead of minting a
+    // second document. Without the durable-status early return it would fall through and
+    // fail here on the missing net handle.
+    #[tokio::test]
+    async fn crate_write_idempotent() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (record, _token, _attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+
+        put_run_crate_status(
+            &storage,
+            job_id,
+            &aruna_core::structs::RunCrateStatus::Written {
+                resource: "already-there".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = JobContext {
+            driver: context(storage.clone()),
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&record.progress),
+        };
+        let outcome = super::run_crate::run_write_run_crate(&ctx, job_id).await;
+        match outcome {
+            JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
+                assert_eq!(resource, "already-there");
+            }
+            _ => panic!("re-drive must return the already-written resource"),
+        }
     }
 }

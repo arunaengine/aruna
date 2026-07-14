@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use super::super::reconcile::ExternalReconciler;
 use super::super::store::{
-    adopt_external_attempt, mark_indeterminate, requeue_before_attempt,
+    AdoptOutcome, adopt_external_attempt, mark_indeterminate, requeue_before_attempt,
     transition_external_to_running,
 };
 use super::workspace::mint_workspace_credential;
@@ -46,7 +46,7 @@ impl ExternalReconciler for ComputeReconciler {
             }
         };
 
-        // Take over with a fresh claim token; the old holder is provably dead.
+        // Take over with a fresh claim token, but only if the old holder is really gone.
         let adopted = match adopt_external_attempt(
             storage,
             job_id,
@@ -55,7 +55,11 @@ impl ExternalReconciler for ComputeReconciler {
         )
         .await
         {
-            Ok(record) => record,
+            Ok(AdoptOutcome::Adopted(record)) => record,
+            Ok(AdoptOutcome::Skipped) => {
+                info!(job_id = %job_id, "Attempt is terminal or still held; not adopting");
+                return;
+            }
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Adoption failed");
                 return;

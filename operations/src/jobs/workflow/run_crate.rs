@@ -7,7 +7,7 @@ use serde_json::json;
 use ulid::Ulid;
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{put_run_crate_status, read_job_record};
+use super::super::store::{put_run_crate_status, read_job_record, read_run_crate_status};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -21,6 +21,20 @@ use crate::driver::drive;
 pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
     let context = ctx.driver.as_ref();
     let storage = &context.storage_handle;
+
+    // A re-driven crate job must not mint a second document_id and write a duplicate
+    // metadata document; the durable status is the idempotency record, not the dedup key.
+    match read_run_crate_status(storage, for_job).await {
+        Ok(Some(RunCrateStatus::Written { resource })) => {
+            return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate read status failed: {error}"
+            )));
+        }
+    }
 
     let parent = match read_job_record(storage, for_job, None).await {
         Ok(Some(record)) => record,

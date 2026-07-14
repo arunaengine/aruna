@@ -576,6 +576,11 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Preparing, Ready)
             | (Preparing, Queued)
             | (Preparing, Failed)
+            // Pre-attempt cancels: only ever taken while `attempt_intent` is still None,
+            // so no container can exist. Without these a cancel cannot terminalize until
+            // the job reaches Running, and TES sticks in CANCELING.
+            | (Preparing, Cancelled)
+            | (Ready, Cancelled)
             | (Ready, Running)
             | (Ready, Queued)
             | (Ready, Failed)
@@ -811,6 +816,10 @@ mod tests {
             // A permanent pre-attempt failure terminalizes without a container.
             (JobState::Preparing, JobState::Failed),
             (JobState::Ready, JobState::Failed),
+            // A cancel before the attempt intent is written terminalizes without a
+            // container; without these a cancel cannot land until the job is Running.
+            (JobState::Preparing, JobState::Cancelled),
+            (JobState::Ready, JobState::Cancelled),
             // A submit with an unknowable outcome parks after the intent write.
             (JobState::Ready, JobState::Indeterminate),
             (JobState::Running, JobState::Cancelling),
