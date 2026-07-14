@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     // Enumeration shares the delivery authorization result: once READ is revoked
-    // the watch stops being listed, though the stored row itself survives.
+    // only an opaque cleanup id remains visible for the stored row.
     #[tokio::test]
     async fn revoked_watch_unlisted() {
         let realm_id = RealmId::from_bytes([84u8; 32]);
@@ -1657,19 +1657,21 @@ mod tests {
             list_watches_remote(&a.net, b.net.node_id(), owner)
                 .await
                 .expect("list succeeds"),
-            vec![created]
+            vec![created.clone()]
         );
 
         // Re-owning the group drops the original owner's READ.
         install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
 
-        assert!(
-            list_watches_remote(&a.net, b.net.node_id(), owner)
-                .await
-                .expect("list after revocation succeeds")
-                .is_empty(),
-            "a watch whose READ was revoked must not be enumerable"
-        );
+        let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
+            .await
+            .expect("list after revocation succeeds");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].watch_id, created.watch_id);
+        assert_eq!(listed[0].owner, owner);
+        assert!(listed[0].path_prefix.is_empty());
+        assert!(listed[0].event_mask.is_empty());
+        assert_eq!(listed[0].created_at_ms, 0);
         assert_eq!(
             list_watch_subscriptions(&b.context.storage_handle, owner)
                 .await
@@ -1677,6 +1679,15 @@ mod tests {
                 .len(),
             1,
             "the row is filtered at the surface, not silently deleted"
+        );
+        delete_watch_remote(&a.net, b.net.node_id(), owner, listed[0].watch_id)
+            .await
+            .expect("redacted watch remains deletable");
+        assert!(
+            list_watch_subscriptions(&b.context.storage_handle, owner)
+                .await
+                .expect("list after delete succeeds")
+                .is_empty()
         );
     }
 

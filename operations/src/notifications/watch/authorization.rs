@@ -121,9 +121,9 @@ async fn evaluate_watch_authorization(
     }
 }
 
-/// Holder-side enumeration of one user's watches, filtered through the same
-/// authorization result delivery uses, so a revoked watch stops being visible as
-/// well as stopping delivery.
+/// Holder-side enumeration of one user's watches through the same authorization
+/// result delivery uses. Revoked watches retain only their opaque deletion id;
+/// protected watch details are redacted so the owner can still release quota.
 pub async fn list_authorized_watch_subscriptions(
     context: &DriverContext,
     owner: UserId,
@@ -132,8 +132,8 @@ pub async fn list_authorized_watch_subscriptions(
         .await
         .map_err(|error| error.to_string())?;
     let mut authorized = Vec::with_capacity(subscriptions.len());
-    for subscription in subscriptions {
-        if is_watch_authorized(
+    for mut subscription in subscriptions {
+        if !is_watch_authorized(
             context,
             owner.realm_id,
             subscription.owner,
@@ -142,8 +142,11 @@ pub async fn list_authorized_watch_subscriptions(
         )
         .await?
         {
-            authorized.push(subscription);
+            subscription.path_prefix.clear();
+            subscription.event_mask = WatchEventMask::empty();
+            subscription.created_at_ms = 0;
         }
+        authorized.push(subscription);
     }
     Ok(authorized)
 }
