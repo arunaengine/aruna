@@ -580,7 +580,9 @@ fn decode_stored_subscription(
             ))
         },
     )?;
-    if !subscription.authorization.is_valid() {
+    if !subscription.authorization.is_valid()
+        || subscription.authorization.watch_path_prefix != subscription.path_prefix
+    {
         return Err(WatchSubscriptionError::Storage(
             "stored watch subscription has invalid authorization binding".to_string(),
         ));

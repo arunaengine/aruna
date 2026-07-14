@@ -647,9 +647,9 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        RealmAuthorizationDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
-        WatchEventDetail, WatchEventKind, WatchEventMask, data_watch_resource_path,
-        watch_interest_dirty_key,
+        PathRestriction, Permission, RealmAuthorizationDocument, RealmNodeKind,
+        WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
+        blob_object_permission_path, data_watch_resource_path, watch_interest_dirty_key,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -856,7 +856,9 @@ mod tests {
             },
             1_700_000_000_000 + seed as u64,
         );
-        record.watch_authorization = Some(WatchAuthorizationBinding::default());
+        let mut authorization = WatchAuthorizationBinding::default();
+        authorization.watch_path_prefix = data_path("");
+        record.watch_authorization = Some(authorization);
         record
     }
 
@@ -1416,6 +1418,36 @@ mod tests {
                 .expect("stored watch record")
                 .read_at_ms
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_requires_original_watch_prefix() {
+        let (a, b, recipient) = delivery_pair(80).await;
+        install_watch_authorization(&b, recipient.realm_id, recipient, &[]).await;
+        let mut watch = watch_record(recipient, 2);
+        watch
+            .watch_authorization
+            .as_mut()
+            .unwrap()
+            .path_restrictions = Some(vec![PathRestriction {
+            pattern: blob_object_permission_path(
+                recipient.realm_id,
+                data_group_id(),
+                data_node_id(),
+                "bucket",
+                "object-2",
+            ),
+            permission: Permission::READ,
+        }]);
+        seed_inbox(&b, &[watch.clone()]).await;
+
+        assert!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("list with unreadable watch prefix")
+                .0
+                .is_empty()
         );
     }
 

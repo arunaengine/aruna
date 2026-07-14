@@ -413,6 +413,14 @@ mod tests {
         assert_eq!(records[0].recipient, owner);
         assert_eq!(records[0].class, NotificationClass::Transient);
         assert_eq!(records[0].created_at_ms, 5_000);
+        assert_eq!(
+            records[0]
+                .watch_authorization
+                .as_ref()
+                .unwrap()
+                .watch_path_prefix,
+            subs[0].path_prefix
+        );
         assert!(matches!(
             records[0].kind,
             NotificationKind::DataUploaded { .. }

@@ -237,6 +237,7 @@ pub struct WatchAuthorizationBinding {
     pub token_hash: String,
     pub expires_at_secs: u64,
     pub path_restrictions: Option<Vec<PathRestriction>>,
+    pub watch_path_prefix: String,
 }
 
 impl WatchAuthorizationBinding {
@@ -261,6 +262,7 @@ impl Default for WatchAuthorizationBinding {
             token_hash: blake3::hash(b"internal-watch").to_hex().to_string(),
             expires_at_secs: u64::MAX,
             path_restrictions: None,
+            watch_path_prefix: String::new(),
         }
     }
 }
@@ -296,8 +298,9 @@ impl WatchSubscription {
         path_prefix: String,
         event_mask: WatchEventMask,
         created_at_ms: u64,
-        authorization: WatchAuthorizationBinding,
+        mut authorization: WatchAuthorizationBinding,
     ) -> Self {
+        authorization.watch_path_prefix = path_prefix.clone();
         Self {
             watch_id: Ulid::r#gen(),
             owner,

@@ -254,6 +254,36 @@ pub async fn evaluate_watch_notification_authorization(
     kind: &NotificationKind,
     authorization: &WatchAuthorizationBinding,
 ) -> Result<WatchAuthorization, String> {
+    let event_mask = match kind {
+        NotificationKind::MetadataCreated { path, .. }
+            if path.starts_with(&authorization.watch_path_prefix) =>
+        {
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated])
+        }
+        NotificationKind::DataUploaded { path, .. }
+            if path.starts_with(&authorization.watch_path_prefix) =>
+        {
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded])
+        }
+        _ => {
+            return Ok(WatchAuthorization::Denied(
+                WatchAuthorizationDenial::InvalidState,
+            ));
+        }
+    };
+    match evaluate_watch_authorization(
+        context,
+        recipient.realm_id,
+        recipient,
+        &authorization.watch_path_prefix,
+        event_mask,
+        authorization,
+    )
+    .await?
+    {
+        WatchAuthorization::Authorized => {}
+        result => return Ok(result),
+    }
     let Some(permission_path) = watch_notification_permission_path(recipient.realm_id, kind) else {
         return Ok(WatchAuthorization::Denied(
             WatchAuthorizationDenial::InvalidState,

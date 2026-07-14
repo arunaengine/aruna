@@ -795,6 +795,7 @@ pub async fn create_watch(
         token_hash: bearer_token_hash(bearer_token.as_str()),
         expires_at_secs: bearer_token.expires_at_secs(),
         path_restrictions: auth.path_restrictions.clone(),
+        watch_path_prefix: request.path_prefix.clone(),
     };
     // A remote holder receives only the durable subscription, not this request's
     // AuthContext. Authorize the immutable canonical identity before dispatch.
