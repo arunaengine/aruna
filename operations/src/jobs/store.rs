@@ -59,6 +59,12 @@ fn schedule_index_key_for(record: &JobRecord) -> Key {
     }
 }
 
+pub(super) fn job_dedup_index_key(created_by: UserId, dedup_key: &[u8]) -> Key {
+    let mut key = created_by.to_storage_key();
+    key.extend_from_slice(dedup_key);
+    ByteView::from(key)
+}
+
 fn empty_value() -> Value {
     ByteView::from(Vec::new())
 }
@@ -85,7 +91,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
     if let Some(dedup_key) = &record.dedup_key {
         writes.push((
             JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-            ByteView::from(dedup_key.clone()),
+            job_dedup_index_key(record.created_by, dedup_key),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ));
     }
@@ -234,7 +240,7 @@ async fn cleanup_dedup_entry(
     if old.state.is_terminal() || !new.state.is_terminal() {
         return Ok(());
     }
-    let key = ByteView::from(dedup_key.clone());
+    let key = job_dedup_index_key(old.created_by, dedup_key);
     let current = read_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;
@@ -487,6 +493,7 @@ pub async fn requeue_job(
         } else {
             record.state = JobState::Queued;
             record.due_at_ms = now_ms.saturating_add(queue_retry_after_ms(record.attempts));
+            record.progress = JobProgress::new(record.payload.progress_unit());
         }
         persisted = true;
         Ok(JobMutation::Persist)
@@ -599,13 +606,14 @@ pub async fn list_jobs_for_user(
 
 pub async fn find_dedup_job(
     storage: &StorageHandle,
+    created_by: UserId,
     dedup_key: &[u8],
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobId>, String> {
     match read_raw(
         storage,
         JOB_DEDUP_INDEX_KEYSPACE,
-        ByteView::from(dedup_key.to_vec()),
+        job_dedup_index_key(created_by, dedup_key),
         txn_id,
     )
     .await?
@@ -977,6 +985,32 @@ mod tests {
         assert!(record.claim.is_none());
     }
 
+    // Retried payload work starts over, so persisted progress must start over too.
+    #[tokio::test]
+    async fn retry_resets_progress() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([12u8; 16]);
+        let mut record = queued_record(job_id);
+        record.progress.current = 1;
+        record.progress.total = Some(1);
+        insert_job(&storage, &record).await.unwrap();
+        claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap();
+
+        let RequeueOutcome::Requeued(record) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected requeue");
+        };
+        assert_eq!(
+            record.progress,
+            JobProgress::new(record.payload.progress_unit())
+        );
+    }
+
     #[tokio::test]
     async fn requeue_exhausts() {
         let (_dir, storage) = temp_storage();
@@ -1052,7 +1086,9 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
         assert_eq!(
-            find_dedup_job(&storage, b"dedup", None).await.unwrap(),
+            find_dedup_job(&storage, record.created_by, b"dedup", None)
+                .await
+                .unwrap(),
             Some(job_id)
         );
 
@@ -1068,7 +1104,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            find_dedup_job(&storage, b"dedup", None).await.unwrap(),
+            find_dedup_job(&storage, record.created_by, b"dedup", None)
+                .await
+                .unwrap(),
             None
         );
         let keys = schedule_keys(&storage).await;
@@ -1248,7 +1286,7 @@ mod tests {
             &storage,
             vec![(
                 JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-                ByteView::from(b"k".to_vec()),
+                job_dedup_index_key(record.created_by, b"k"),
                 ByteView::from(job_b.to_bytes().to_vec()),
             )],
             None,
@@ -1269,7 +1307,9 @@ mod tests {
 
         // A going terminal must not delete B's dedup row.
         assert_eq!(
-            find_dedup_job(&storage, b"k", None).await.unwrap(),
+            find_dedup_job(&storage, record.created_by, b"k", None)
+                .await
+                .unwrap(),
             Some(job_b)
         );
     }
