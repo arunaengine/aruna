@@ -699,6 +699,9 @@ fn map_output(output: &TesOutput) -> String {
 /// evidence: a captured container exit code is an executor error, an evidence-free
 /// failure is a system error. `Indeterminate` maps to TES `UNKNOWN`.
 fn tes_state(record: &JobRecord) -> TesState {
+    if record.cancel_requested && !record.state.is_terminal() {
+        return TesState::Canceling;
+    }
     match record.state {
         JobState::Queued | JobState::Claimed => TesState::Queued,
         JobState::Preparing | JobState::Ready => TesState::Initializing,
@@ -789,11 +792,10 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         tags.insert(EXECUTOR_TAG_KEY.to_string(), constraint.clone());
     }
 
-    let logs = if view == TesView::Full {
-        vec![build_task_log(record, base_url)]
-    } else {
-        Vec::new()
-    };
+    let mut log = build_task_log(record, base_url);
+    if view == TesView::Basic {
+        log.system_logs.clear();
+    }
 
     TesTask {
         id: Some(id),
@@ -803,15 +805,18 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         outputs,
         resources,
         tags,
-        logs,
+        logs: vec![log],
         creation_time: Some(rfc3339(record.created_at_ms)),
         ..Default::default()
     }
 }
 
 fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
+    let started = matches!(record.state, JobState::Running | JobState::Cancelling)
+        || record.result.is_some();
+    let start_time = started.then(|| rfc3339(record.created_at_ms));
     let mut executor_log = TesExecutorLog {
-        start_time: Some(rfc3339(record.created_at_ms)),
+        start_time: start_time.clone(),
         end_time: record.finished_at_ms.map(rfc3339),
         ..Default::default()
     };
@@ -842,7 +847,7 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
 
     TesTaskLog {
         logs: vec![executor_log],
-        start_time: Some(rfc3339(record.created_at_ms)),
+        start_time,
         end_time: record.finished_at_ms.map(rfc3339),
         outputs,
         system_logs,
@@ -1182,6 +1187,10 @@ mod tests {
             record.state = job_state;
             assert_eq!(tes_state(&record), expected, "{job_state:?}");
         }
+        record.state = JobState::Queued;
+        record.cancel_requested = true;
+        assert_eq!(tes_state(&record), TesState::Canceling);
+        record.cancel_requested = false;
         // Failed splits on evidence.
         record.state = JobState::Failed;
         record.result = None;
@@ -1198,6 +1207,9 @@ mod tests {
     fn view_projections() {
         let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16]))).unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
+        let queued = project_task(&record, TesView::Full, "http://x");
+        assert!(queued.logs[0].start_time.is_none());
+        assert!(queued.logs[0].logs[0].start_time.is_none());
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(2_000);
         record.workspace_bucket = Some("ws-x".to_string());
@@ -1219,7 +1231,7 @@ mod tests {
         let basic = project_task(&record, TesView::Basic, "http://x");
         assert_eq!(basic.executors.len(), 1);
         assert_eq!(basic.executors[0].command, vec!["echo", "hi"]);
-        assert!(basic.logs.is_empty());
+        assert_eq!(basic.logs.len(), 1);
         assert_eq!(basic.inputs.len(), 1);
 
         let full = project_task(&record, TesView::Full, "http://x");
