@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{NotificationRecord, RealmConfigDocument, RealmId};
+use aruna_core::structs::{JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
@@ -1572,7 +1572,13 @@ impl OperationsTaskHandler {
             return;
         };
         let node_id = net_handle.node_id();
-        let capacity = self.jobs_runtime.available_slots();
+        let capacity = self
+            .jobs_runtime
+            .available_slots_for(JobExecutionClass::InProcess)
+            .saturating_add(
+                self.jobs_runtime
+                    .available_slots_for(JobExecutionClass::ExternalAttempt),
+            );
 
         let result = match process_job_queue_batch(
             &self.context.storage_handle,
@@ -1592,6 +1598,13 @@ impl OperationsTaskHandler {
         };
 
         for record in result.claimed {
+            if self
+                .jobs_runtime
+                .available_slots_for(record.execution_class)
+                == 0
+            {
+                continue;
+            }
             self.jobs_runtime.spawn(self.context.clone(), record);
         }
 
@@ -1605,7 +1618,17 @@ impl OperationsTaskHandler {
 
         // At capacity with work due, wait for a completion kick, not a ZERO hot-loop.
         match result.next_due_after {
-            Some(after) if after.is_zero() && self.jobs_runtime.available_slots() == 0 => {
+            Some(after)
+                if after.is_zero()
+                    && self
+                        .jobs_runtime
+                        .available_slots_for(JobExecutionClass::InProcess)
+                        == 0
+                    && self
+                        .jobs_runtime
+                        .available_slots_for(JobExecutionClass::ExternalAttempt)
+                        == 0 =>
+            {
                 self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                     .await;
             }
