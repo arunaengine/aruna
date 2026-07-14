@@ -302,6 +302,48 @@ pub fn is_draining_former_holder(
     .contains(&node_id)
 }
 
+/// First shard whose retained holdership would change for a node that remains
+/// draining across a config transition. Rejecting such transitions preserves
+/// the drain-time holder set until that node un-drains or is removed.
+pub fn first_draining_holder_set_change(
+    pre: &RealmConfigDocument,
+    post: &RealmConfigDocument,
+) -> Option<(NodeId, PlacementRef)> {
+    for entry in pre.placement_map.iter().filter(|entry| entry.draining) {
+        let node_id = entry.node_id;
+        if !post
+            .placement_entry(node_id)
+            .is_some_and(|entry| entry.draining)
+        {
+            continue;
+        }
+        for strategy in pre.strategies.iter().chain(
+            post.strategies
+                .iter()
+                .filter(|strategy| pre.strategy(&strategy.strategy_id).is_none()),
+        ) {
+            let shard_count = post
+                .strategy(&strategy.strategy_id)
+                .map_or(strategy.shard_count, |post| {
+                    strategy.shard_count.max(post.shard_count)
+                });
+            for shard in 0..shard_count {
+                let placement = PlacementRef {
+                    strategy_id: strategy.strategy_id,
+                    epoch: 0,
+                    shard,
+                };
+                if is_draining_former_holder(pre, &placement, node_id)
+                    != is_draining_former_holder(post, &placement, node_id)
+                {
+                    return Some((node_id, placement));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Every draining former-holder of `placement` (see [`is_draining_former_holder`]).
 /// Co-holders keep these peers in the shard topic's membership and publisher set
 /// until they leave the config, so their in-flight flush is never cut off. Cheap

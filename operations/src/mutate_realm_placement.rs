@@ -332,6 +332,14 @@ impl MutateRealmPlacementOperation {
         let pre_document = document.clone();
         overlay_realm_config_placement_reducer_materialization(&mut document, &reducer_state);
 
+        if let Some((node_id, placement)) =
+            crate::placement::first_draining_holder_set_change(&pre_document, &document)
+        {
+            return Err(MutateRealmPlacementError::InvalidInput(format!(
+                "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
+                placement.strategy_id, placement.shard
+            )));
+        }
         if let Some(placement) =
             crate::placement::first_disjoint_shard_transition(&pre_document, &document)
         {
