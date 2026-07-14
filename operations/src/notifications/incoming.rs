@@ -1272,13 +1272,11 @@ mod tests {
         let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
         install_watch_authorization(&b, realm_id, recipient, &[]).await;
         let direct = record(recipient, 1);
+        let watch_two = watch_record(recipient, 2);
+        let watch_three = watch_record(recipient, 3);
         seed_inbox(
             &b,
-            &[
-                direct.clone(),
-                watch_record(recipient, 2),
-                watch_record(recipient, 3),
-            ],
+            &[direct.clone(), watch_two.clone(), watch_three.clone()],
         )
         .await;
 
@@ -1290,6 +1288,11 @@ mod tests {
                 .len(),
             3
         );
+        let (first_page, retry_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+            .await
+            .expect("first authorized page");
+        assert_eq!(first_page, vec![watch_three]);
+        let retry_cursor = retry_cursor.expect("cursor after first authorized page");
         install_watch_authorization(&b, realm_id, UserId::new(Ulid::r#gen(), realm_id), &[]).await;
 
         let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
@@ -1297,6 +1300,35 @@ mod tests {
             .expect("list after revocation");
         assert_eq!(listed, vec![direct]);
         assert_eq!(next_cursor, None);
+        assert!(matches!(
+            b.context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: data_group_id().to_bytes().to_vec().into(),
+                    value: vec![0xff].into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        list_remote(
+            &a.net,
+            b.net.node_id(),
+            recipient,
+            Some(retry_cursor.clone()),
+            1,
+        )
+        .await
+        .expect_err("authorization decode failure must reject the page");
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, Some(retry_cursor), 1,)
+                .await
+                .expect("same cursor retries after authorization recovers")
+                .0,
+            vec![watch_two]
+        );
     }
 
     #[tokio::test]

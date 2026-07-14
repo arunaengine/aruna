@@ -136,6 +136,30 @@ pub async fn list_notifications_for_user(
     }
 }
 
+async fn notification_is_visible(
+    context: &DriverContext,
+    recipient: UserId,
+    record: &NotificationRecord,
+) -> Result<bool, String> {
+    let watch = match &record.kind {
+        NotificationKind::MetadataCreated { path, .. } => Some((
+            path.as_str(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        )),
+        NotificationKind::DataUploaded { path, .. } => Some((
+            path.as_str(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )),
+        _ => None,
+    };
+    match watch {
+        None => Ok(true),
+        Some((path, event_mask)) => {
+            is_watch_authorized(context, recipient.realm_id, recipient, path, event_mask).await
+        }
+    }
+}
+
 /// Reauthorizes persisted resource-watch records at the inbox-holder boundary.
 /// Suppressed rows do not consume the caller's page, so revocation cannot hide
 /// older ordinary notifications behind a page of stale watch records.
@@ -161,26 +185,7 @@ pub(crate) async fn list_notifications_on_holder(
         .map_err(|error| error.to_string())?;
 
         for record in output.records {
-            let watch = match &record.kind {
-                NotificationKind::MetadataCreated { path, .. } => Some((
-                    path.as_str(),
-                    WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
-                )),
-                NotificationKind::DataUploaded { path, .. } => Some((
-                    path.as_str(),
-                    WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-                )),
-                _ => None,
-            };
-            let visible = match watch {
-                None => true,
-                Some((path, event_mask)) => {
-                    is_watch_authorized(context, recipient.realm_id, recipient, path, event_mask)
-                        .await
-                        .unwrap_or(false)
-                }
-            };
-            if visible {
+            if notification_is_visible(context, recipient, &record).await? {
                 records.push(record);
             }
         }
