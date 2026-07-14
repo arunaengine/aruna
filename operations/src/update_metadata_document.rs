@@ -363,8 +363,10 @@ impl Operation for UpdateMetadataDocumentOperation {
                 Ok(Some(record)) => {
                     let record = self.updated_record(record);
                     let update_event = self.update_event_record(&record);
+                    // The event carries the new revision id; the returned record and
+                    // registry cache must reflect it, not the pre-update id.
+                    self.record = Some(update_event.record.clone());
                     self.update_event = Some(update_event);
-                    self.record = Some(record.clone());
                     self.state = UpdateMetadataDocumentState::ReadRealmConfig;
                     smallvec![Effect::Storage(StorageEffect::Read {
                         key_space: REALM_CONFIG_KEYSPACE.to_string(),

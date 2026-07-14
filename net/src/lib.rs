@@ -856,11 +856,12 @@ impl NetHandle {
         &self,
         topics: &[::irokle::TopicId],
         holders: Vec<NodeId>,
+        retained: &std::collections::BTreeSet<NodeId>,
         verified_topics: &std::collections::BTreeSet<::irokle::TopicId>,
     ) -> Result<()> {
         self.inner
             .document_sync
-            .reconcile_shard_membership(topics, holders, verified_topics)
+            .reconcile_shard_membership(topics, holders, retained, verified_topics)
             .await
     }
 

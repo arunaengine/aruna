@@ -26,7 +26,25 @@ pub const DOCUMENT_SYNC_DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// and a holder should not initially wait a whole
 /// [`SYNC_PLACEMENT_RETRY_AFTER`] to be pushed to. Consecutive failed pulls are
 /// backed off by the task handler because each attempt scans every shard.
-pub const SHARD_TOPIC_PULL_RETRY_AFTER: Duration = Duration::from_secs(1);
+///
+/// A freshly promoted holder's first pull almost always fast-fails: the config
+/// change reaches it before its co-holders have admitted it onto the shard
+/// topic, so no peer serves the genesis yet. It then rides this ladder waiting
+/// for a co-holder to admit it, which is a gossip round away, not a network
+/// round-trip. So the base matches the write path's queue backoff base
+/// (`QUEUE_RETRY_BASE_MS`) rather than a whole second: on a config-driven holder
+/// transition the new holder converges in a couple of retries instead of
+/// climbing the 1s-doubling ladder for tens of seconds.
+pub const SHARD_TOPIC_PULL_RETRY_AFTER: Duration = Duration::from_millis(250);
+
+/// Cap for the join-only shard-pull retry ladder. A freshly promoted holder
+/// polls for a co-holder to admit it onto the topic; the admission is a gossip
+/// round away, so the ladder must keep retrying on a short cadence rather than
+/// cliffing to the genesis-create interval [`SYNC_PLACEMENT_RETRY_AFTER`] (30s),
+/// under which a missed admission window costs 30s per attempt and stalls a
+/// replan past the test ceiling under load. The pull is join-only and cannot
+/// fork, so a 2s cap is cheap even for a genuinely stuck topic.
+pub const SHARD_TOPIC_PULL_RETRY_MAX: Duration = Duration::from_secs(2);
 
 pub fn placement_prefix(realm_id: RealmId) -> Key {
     ByteView::from(realm_id.as_bytes().to_vec())

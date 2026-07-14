@@ -13,7 +13,7 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::resolve_shard_holders;
+use crate::placement::{draining_former_holders, resolve_shard_holders};
 use crate::sync_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
@@ -52,8 +52,9 @@ async fn ensure_held_shard_topics(
     local_node_id: NodeId,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> HeldTopicOutcome {
-    let mut rank0_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
-    let mut member_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+    type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+    let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut member_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
@@ -71,19 +72,22 @@ async fn ensure_held_shard_topics(
                 .filter(|candidate| *candidate != local_node_id)
                 .collect();
             sort_node_ids(&mut co_holders);
+            let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
+                .into_iter()
+                .collect();
             let groups = if local_is_rank0 {
                 &mut rank0_groups
             } else {
                 &mut member_groups
             };
             groups
-                .entry(co_holders)
+                .entry((co_holders, retained))
                 .or_default()
                 .push(shard_topic_id(realm_id, &placement));
         }
     }
     let mut outcome = HeldTopicOutcome::default();
-    for (co_holders, topics) in rank0_groups {
+    for ((co_holders, retained), topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
             topics = topics.len(),
@@ -96,6 +100,7 @@ async fn ensure_held_shard_topics(
             local_node_id,
             co_holders,
             topics,
+            &retained,
             verified,
         )
         .await;
@@ -108,7 +113,7 @@ async fn ensure_held_shard_topics(
     // origin is drained out of the holder set, nobody does.
     // Topics already known are topped up with the current co-holder set, which
     // is what admits a freshly added holder on the pushing side.
-    for (co_holders, topics) in member_groups {
+    for ((co_holders, retained), topics) in member_groups {
         if co_holders.is_empty() {
             continue;
         }
@@ -119,7 +124,7 @@ async fn ensure_held_shard_topics(
         // missing topic is expected here; the exact membership pass below is
         // repeated after a successful pull.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone(), verified)
+            .reconcile_shard_membership(&topics, current_holders.clone(), &retained, verified)
             .await;
         let (mut known, missing): (Vec<::irokle::TopicId>, Vec<::irokle::TopicId>) =
             topics.into_iter().partition(|topic| {
@@ -155,7 +160,7 @@ async fn ensure_held_shard_topics(
             continue;
         }
         if let Err(error) = net_handle
-            .reconcile_shard_membership(&known, current_holders, verified)
+            .reconcile_shard_membership(&known, current_holders, &retained, verified)
             .await
         {
             debug!(error = %error, "Could not complete held shard topic membership");
@@ -186,6 +191,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     local_node_id: NodeId,
     co_holders: Vec<NodeId>,
     topics: Vec<::irokle::TopicId>,
+    retained: &BTreeSet<NodeId>,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
     let mut current_holders = co_holders.clone();
@@ -194,7 +200,7 @@ pub(crate) async fn ensure_rank0_shard_group(
     // This first pass installs publisher policy even when a topic still needs
     // to be adopted or created. Exact membership is retried once it exists.
     let _ = net_handle
-        .reconcile_shard_membership(&topics, current_holders.clone(), verified)
+        .reconcile_shard_membership(&topics, current_holders.clone(), retained, verified)
         .await;
 
     let mut to_ensure: Vec<::irokle::TopicId> = Vec::new();
@@ -264,7 +270,7 @@ pub(crate) async fn ensure_rank0_shard_group(
         match net_handle.ensure_document_sync_topics(&to_ensure, co_holders) {
             Ok(()) => {
                 if let Err(error) = net_handle
-                    .reconcile_shard_membership(&to_ensure, current_holders, verified)
+                    .reconcile_shard_membership(&to_ensure, current_holders, retained, verified)
                     .await
                 {
                     warn!(error = %error, "Failed to reconcile rank-0 shard membership");
@@ -482,8 +488,11 @@ pub async fn process_shard_placements(
             }
             // The topic exists locally, so reconcile its exact canonical holder
             // set without creating a genesis or changing shared/default peers.
+            let retained = draining_former_holders(&config, &record.placement)
+                .into_iter()
+                .collect();
             let membership = net_handle
-                .reconcile_shard_membership(&[topic], holders, &verified)
+                .reconcile_shard_membership(&[topic], holders, &retained, &verified)
                 .await;
             match membership {
                 Ok(()) => {

@@ -34,10 +34,11 @@ use tokio::time::sleep;
 use ulid::Ulid;
 
 // Realm-node and manifest convergence poll to a condition; the ceilings only
-// bound a genuine hang, so they carry generous headroom for a loaded CI runner
-// where anti-entropy across the holders is thread-starved and slow.
+// bound a genuine hang. Convergence measures single-digit seconds, but a
+// loaded CI runner can stall consecutive peer syncs for the full 30s peer-sync
+// timeout each, so the backstop is 2-3x that timeout, not the expected latency.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct TestNode {
     _temp_dir: TempDir,
