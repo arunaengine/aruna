@@ -537,10 +537,18 @@ impl DocumentSyncService {
     /// A `history_cutoff` is only frozen for topics in `verified_topics`: until a
     /// node has durably verified a shard, its local clock is not a trustworthy
     /// cutover boundary, so former-holder history is left admissible ([BR-030]).
+    ///
+    /// `retained` peers are draining former-holders that must keep publishing onto
+    /// the shard until they have flushed (flush-then-leave): they stay members and
+    /// accepted publishers even though they are not canonical holders, so a
+    /// removal never cuts off an in-flight flush. They rejoin neither the missing
+    /// nor the local-holder computation — only a canonical holder may mint or top
+    /// up membership — so a true non-holder is never added (DECISIONS D11).
     pub async fn reconcile_shard_membership(
         &self,
         topics: &[irokle_crate::TopicId],
         holders: Vec<NodeId>,
+        retained: &BTreeSet<NodeId>,
         verified_topics: &BTreeSet<irokle_crate::TopicId>,
     ) -> Result<()> {
         if topics.is_empty() {
@@ -558,6 +566,14 @@ impl DocumentSyncService {
                 "local node is not an authoritative shard holder".to_string(),
             ));
         }
+        // Canonical holders plus draining former-holders still flushing: the set
+        // that may publish onto and stay in the shard topic. Only canonical
+        // holders drive membership top-up and the local-holder guard above.
+        let member_peers: BTreeSet<PeerId> = holder_peers
+            .iter()
+            .copied()
+            .chain(retained.iter().map(node_id_to_peer_id))
+            .collect();
 
         let mut seen_topics = BTreeSet::new();
         let topics: Vec<irokle_crate::TopicId> = topics
@@ -574,7 +590,7 @@ impl DocumentSyncService {
                 .storage()
                 .topic_state(&topic_id)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let current = holder_peers
+            let current = member_peers
                 .iter()
                 .copied()
                 .map(|peer| irokle_crate::actor_id_for(topic_id, peer))
@@ -620,7 +636,7 @@ impl DocumentSyncService {
             }
         }
         self.shard_publishers.write().extend(policies);
-        let sync_peers: BTreeSet<PeerId> = holder_peers
+        let sync_peers: BTreeSet<PeerId> = member_peers
             .iter()
             .copied()
             .filter(|peer| *peer != local_peer)
@@ -643,7 +659,7 @@ impl DocumentSyncService {
                 .members
                 .iter()
                 .copied()
-                .filter(|peer| !holder_peers.contains(peer))
+                .filter(|peer| !member_peers.contains(peer))
                 .collect::<Vec<_>>();
             if missing_peers.is_empty() && stale_peers.is_empty() {
                 continue;
@@ -12753,6 +12769,7 @@ mod tests {
                 &[shard_topic],
                 vec![local_node, current_node],
                 &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .await
             .expect("shard membership reconciles");
@@ -12873,6 +12890,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic_id],
                 vec![receiver_node],
+                &BTreeSet::new(),
                 &BTreeSet::from([topic_id]),
             )
             .await
@@ -12966,7 +12984,12 @@ mod tests {
             .expect("shard topic exists");
 
         service
-            .reconcile_shard_membership(&[topic], vec![local_node, co_holder], &BTreeSet::new())
+            .reconcile_shard_membership(
+                &[topic],
+                vec![local_node, co_holder],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
             .await
             .expect("membership reconciles");
         assert!(
@@ -12984,6 +13007,7 @@ mod tests {
             .reconcile_shard_membership(
                 &[topic],
                 vec![local_node, co_holder],
+                &BTreeSet::new(),
                 &BTreeSet::from([topic]),
             )
             .await

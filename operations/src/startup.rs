@@ -19,7 +19,7 @@ use crate::metadata::projector::{
 };
 use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::notifications::watch::interest::refresh_watch_interest_for_targets;
-use crate::placement::resolve_shard_holders;
+use crate::placement::{draining_former_holders, resolve_shard_holders};
 use crate::usage_stats::refresh_realm_usage_summary_for_targets;
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
@@ -103,9 +103,10 @@ pub async fn restore_shard_subscriptions(
     // confirmation); the rest are join-only — synced if their genesis is known
     // or bootstrappable from a co-holder, otherwise left for the rank-0 holder's
     // gossip to deliver.
+    type ShardGroup = (Vec<::irokle::TopicId>, BTreeSet<NodeId>);
     let mut shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
-    let mut rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
-    let mut join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut rank0_shard_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
+    let mut join_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
 
     let mut shared_peers = shared_topic_peers(&config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -140,12 +141,15 @@ pub async fn restore_shard_subscriptions(
                 continue;
             }
             let topic = shard_topic_id(realm_id, &placement);
+            let retained = draining_former_holders(&config, &placement);
             let groups = if local_is_rank0 {
                 &mut rank0_shard_groups
             } else {
                 &mut join_groups
             };
-            groups.entry(co_holders).or_default().push(topic);
+            let entry = groups.entry(co_holders).or_default();
+            entry.0.push(topic);
+            entry.1.extend(retained);
             summary.shard_topics += 1;
         }
     }
@@ -185,8 +189,8 @@ async fn restore_held_shard_topics(
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    rank0_shard_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
+    rank0_shard_groups: BTreeMap<Vec<NodeId>, (Vec<::irokle::TopicId>, BTreeSet<NodeId>)>,
+    join_groups: BTreeMap<Vec<NodeId>, (Vec<::irokle::TopicId>, BTreeSet<NodeId>)>,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
     // Shared realm topics: ensured directly (every node's genesis of a shared
@@ -222,7 +226,7 @@ async fn restore_held_shard_topics(
     // just moved rank-0 onto this node, so an unreachable co-holder that might
     // still hold the genesis withholds creation rather than forking one.
     let mut withheld = false;
-    for (co_holders, topics) in rank0_shard_groups {
+    for (co_holders, (topics, retained)) in rank0_shard_groups {
         if co_holders.is_empty() || topics.is_empty() {
             continue;
         }
@@ -232,6 +236,7 @@ async fn restore_held_shard_topics(
             node_id,
             co_holders.clone(),
             topics.clone(),
+            &retained,
             verified,
         )
         .await;
@@ -252,7 +257,7 @@ async fn restore_held_shard_topics(
     }
 
     // Non-rank-0 held shards: join-only, synced if bootstrappable.
-    for (peers, topics) in join_groups {
+    for (peers, (topics, retained)) in join_groups {
         if peers.is_empty() || topics.is_empty() {
             continue;
         }
@@ -262,7 +267,7 @@ async fn restore_held_shard_topics(
         // Install publisher policy before pulling history. Missing topics are
         // expected and get an exact membership pass after a successful join.
         let _ = net_handle
-            .reconcile_shard_membership(&topics, current_holders.clone(), verified)
+            .reconcile_shard_membership(&topics, current_holders.clone(), &retained, verified)
             .await;
         let event = net_handle.sync_document_topics(topics.clone(), peers).await;
         apply_restored_reconcile(context, node_id, event).await;
@@ -276,7 +281,7 @@ async fn restore_held_shard_topics(
             .collect();
         if !present.is_empty()
             && let Err(error) = net_handle
-                .reconcile_shard_membership(&present, current_holders, verified)
+                .reconcile_shard_membership(&present, current_holders, &retained, verified)
                 .await
         {
             warn!(error = %error, "Failed to reconcile joined shard membership on restart");
