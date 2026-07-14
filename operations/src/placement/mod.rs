@@ -302,9 +302,9 @@ pub fn is_draining_former_holder(
     .contains(&node_id)
 }
 
-/// First shard whose retained holdership would change for a node that remains
+/// First shard whose retained holdership would be lost for a node that remains
 /// draining across a config transition. Rejecting such transitions preserves
-/// the drain-time holder set until that node un-drains or is removed.
+/// its acknowledged writes until that node un-drains or is removed.
 pub fn first_draining_holder_set_change(
     pre: &RealmConfigDocument,
     post: &RealmConfigDocument,
@@ -334,7 +334,7 @@ pub fn first_draining_holder_set_change(
                     shard,
                 };
                 if is_draining_former_holder(pre, &placement, node_id)
-                    != is_draining_former_holder(post, &placement, node_id)
+                    && !is_draining_former_holder(post, &placement, node_id)
                 {
                     return Some((node_id, placement));
                 }
