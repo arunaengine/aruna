@@ -102,6 +102,14 @@ impl PortalSecurity {
             return cached;
         }
 
+        let mut cache = self.oidc_cache.write().await;
+        if cache
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < OIDC_ORIGIN_TTL)
+        {
+            return cache.origins.clone();
+        }
+
         match drive(
             GetRealmConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
@@ -114,14 +122,14 @@ impl PortalSecurity {
                     origins.extend(normalize_origin(&provider.issuer));
                     origins.extend(normalize_origin(&provider.discovery_url));
                 }
-                let mut cache = self.oidc_cache.write().await;
                 cache.origins = origins.clone();
                 cache.refreshed_at = Some(Instant::now());
                 origins
             }
             Err(error) => {
                 debug!(error = %error, "Portal CSP reuses cached OIDC origins");
-                self.oidc_cache.read().await.origins.clone()
+                cache.refreshed_at = Some(Instant::now());
+                cache.origins.clone()
             }
         }
     }
