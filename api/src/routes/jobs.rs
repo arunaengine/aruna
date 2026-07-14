@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobRecord, JobState,
+    JobRecord, JobState, Permission, blob_group_permission_path,
 };
 use aruna_operations::jobs::service::{
     CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_job_run_crate_status, read_owned_job,
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::auth::require_unrestricted_realm_auth;
+use crate::auth::{ensure_permission, require_unrestricted_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 
@@ -280,6 +280,16 @@ pub async fn submit_job(
     if request.image.trim().is_empty() {
         return Err(ServerError::BadRequest);
     }
+    if request.cpu_cores == Some(0) || request.ram_bytes == Some(0) {
+        return Err(ServerError::BadRequest);
+    }
+    ensure_permission(
+        &state,
+        &auth,
+        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
+        Permission::WRITE,
+    )
+    .await?;
 
     let inputs = request
         .inputs
