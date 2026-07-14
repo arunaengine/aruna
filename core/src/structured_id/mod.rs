@@ -101,7 +101,7 @@ impl BucketId {
     /// Fail-closed `bucket < bucket_count` check (REQ-META-ID-FORMAT-001): an id
     /// whose bucket reaches the strategy's `bucket_count` is invalid.
     pub const fn in_strategy_range(self, bucket_count: u16) -> Result<(), BucketNotInRange> {
-        if self.0 < bucket_count {
+        if bucket_count <= layout::MAX_BUCKET_COUNT && self.0 < bucket_count {
             Ok(())
         } else {
             Err(BucketNotInRange {
@@ -381,6 +381,13 @@ mod tests {
             })
         );
         assert!(BucketId::new(0).unwrap().in_strategy_range(0).is_err());
+        assert!(BucketId::new(4095).unwrap().in_strategy_range(4096).is_ok());
+        assert!(
+            BucketId::new(4095)
+                .unwrap()
+                .in_strategy_range(4097)
+                .is_err()
+        );
     }
 
     #[test]
