@@ -291,11 +291,11 @@ pub fn parse_watch_subscription_key(key: &[u8]) -> Result<(UserId, Ulid), Conver
 
 /// Keys in the watch-interest keyspace. Per-node digests use fixed-length keys
 /// so their prefixes are unambiguous: `n/` + realm id + node id (realm first so
-/// all nodes' digests for one realm form a single scan range). Local-only dirty
-/// markers use a text prefix (`dirty/`) that never collides with the binary
-/// digest prefix.
+/// all nodes' digests for one realm form a single scan range). Local-only
+/// markers use text prefixes that never collide with the binary digest prefix.
 pub const WATCH_INTEREST_NODE_PREFIX: &[u8] = b"n/";
 pub const WATCH_INTEREST_DIRTY_PREFIX: &[u8] = b"dirty/";
+const WATCH_INTEREST_PENDING_PREFIX: &[u8] = b"pending/";
 
 /// One coalesced interest entry: the union of every subscription a node holds
 /// for a realm that shares this path prefix.
@@ -386,6 +386,13 @@ pub fn watch_interest_key_node_id(key: &[u8]) -> Option<NodeId> {
 pub fn watch_interest_dirty_key(realm_id: RealmId) -> Vec<u8> {
     let mut key = Vec::with_capacity(WATCH_INTEREST_DIRTY_PREFIX.len() + 32);
     key.extend_from_slice(WATCH_INTEREST_DIRTY_PREFIX);
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+pub fn watch_interest_pending_key(realm_id: RealmId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WATCH_INTEREST_PENDING_PREFIX.len() + 32);
+    key.extend_from_slice(WATCH_INTEREST_PENDING_PREFIX);
     key.extend_from_slice(realm_id.as_bytes());
     key
 }
