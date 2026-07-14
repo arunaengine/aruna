@@ -1,4 +1,8 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::{sys::time::TimeValLike, time::ClockId};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,20 +25,29 @@ pub enum ClockHealthError {
 pub trait IdEnvironment {
     /// Validated wall-clock time as Unix milliseconds.
     fn now_ms(&self) -> u64;
-    /// Milliseconds from a monotonic clock with an arbitrary but fixed origin.
+    /// Milliseconds from a suspend-aware monotonic clock with an arbitrary but
+    /// fixed origin.
     fn monotonic_ms(&self) -> u64;
+    /// Waits until the wall clock advances beyond `timestamp_ms`.
+    fn wait_next_ms(&self, timestamp_ms: u64) {
+        while self.now_ms() <= timestamp_ms {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     /// A fresh 48-bit nonce drawn from a cryptographically secure source.
     fn random_nonce(&self) -> u64;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct SystemEnvironment {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     origin: Instant,
 }
 
 impl SystemEnvironment {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             origin: Instant::now(),
         }
     }
@@ -55,7 +68,22 @@ impl IdEnvironment for SystemEnvironment {
     }
 
     fn monotonic_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(target_os = "linux")]
+            let clock = ClockId::CLOCK_BOOTTIME;
+            #[cfg(target_os = "macos")]
+            let clock = ClockId::from_raw(nix::libc::CLOCK_MONOTONIC_RAW);
+
+            clock
+                .now()
+                .expect("suspend-aware monotonic clock is available")
+                .num_milliseconds() as u64
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            self.origin.elapsed().as_millis() as u64
+        }
     }
 
     fn random_nonce(&self) -> u64 {
@@ -66,14 +94,12 @@ impl IdEnvironment for SystemEnvironment {
 #[derive(Clone, Copy)]
 struct LastMint {
     timestamp_ms: u64,
-    handle: u32,
-    bucket: u16,
     nonce: u64,
 }
 
-/// Paired wall/monotonic reading from the most recent mint attempt. The wall
-/// clock is expected to advance in step with the monotonic clock; divergence
-/// beyond the skew bound is a forward jump.
+/// Paired wall/monotonic reading from the most recent validated clock sample.
+/// The wall clock is expected to advance in step with the monotonic clock;
+/// divergence beyond the skew bound is a forward jump.
 #[derive(Clone, Copy)]
 struct ClockAnchor {
     wall_ms: u64,
@@ -82,9 +108,9 @@ struct ClockAnchor {
 
 /// Structured-ID generator: a monotonic ULID timestamp with a forward-clock-
 /// jump guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). The nonce
-/// increments only across consecutive mints of the same
-/// `(timestamp_ms, handle, bucket)`; any other mint draws a fresh random
-/// nonce, so uniqueness rests on the 48 random bits, not on monotonicity.
+/// starts from a fresh random value for each timestamp and increments across
+/// every subsequent mint at that timestamp, including interleaved handles and
+/// buckets.
 /// It never emits a generic ULID, so the structured fields are always
 /// preserved.
 pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
@@ -127,17 +153,17 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
         Ok(T::from_ulid(Ulid(value), super::sealed::new()))
     }
 
-    fn next_value(&mut self, handle: u32, bucket: u16) -> Result<u128, ClockHealthError> {
-        let now = self.env.now_ms();
-        let monotonic = self.env.monotonic_ms();
+    fn validated_now_ms(&mut self) -> Result<u64, ClockHealthError> {
+        let (now, monotonic) = loop {
+            let monotonic_before = self.env.monotonic_ms();
+            let now = self.env.now_ms();
+            let monotonic = self.env.monotonic_ms();
+            if monotonic.saturating_sub(monotonic_before) <= self.max_skew_ms {
+                break (now, monotonic);
+            }
+        };
 
-        // Re-anchoring on every attempt keeps the guard non-sticky: idle time
-        // is covered by the monotonic delta, and a refused jump accepts the
-        // new wall clock as reality on the next mint.
-        if let Some(anchor) = self.anchor.replace(ClockAnchor {
-            wall_ms: now,
-            monotonic_ms: monotonic,
-        }) {
+        if let Some(anchor) = self.anchor {
             let expected = anchor
                 .wall_ms
                 .saturating_add(monotonic.saturating_sub(anchor.monotonic_ms));
@@ -149,24 +175,31 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
             }
         }
 
+        self.anchor = Some(ClockAnchor {
+            wall_ms: now,
+            monotonic_ms: monotonic,
+        });
+        Ok(now)
+    }
+
+    fn next_value(&mut self, handle: u32, bucket: u16) -> Result<u128, ClockHealthError> {
+        let now = self.validated_now_ms()?;
+
         let mut timestamp_ms = match self.last {
             Some(last) => now.max(last.timestamp_ms),
             None => now,
         };
 
+        while let Some(last) = self.last
+            && last.timestamp_ms == timestamp_ms
+            && last.nonce >= layout::MAX_NONCE
+        {
+            self.env.wait_next_ms(last.timestamp_ms);
+            timestamp_ms = self.validated_now_ms()?.max(last.timestamp_ms);
+        }
+
         let nonce = match self.last {
-            Some(last)
-                if last.timestamp_ms == timestamp_ms
-                    && last.handle == handle
-                    && last.bucket == bucket =>
-            {
-                if last.nonce >= layout::MAX_NONCE {
-                    timestamp_ms += 1;
-                    self.env.random_nonce() & layout::NONCE_MASK
-                } else {
-                    last.nonce + 1
-                }
-            }
+            Some(last) if last.timestamp_ms == timestamp_ms => last.nonce + 1,
             _ => self.env.random_nonce() & layout::NONCE_MASK,
         };
 
@@ -176,8 +209,6 @@ impl<E: IdEnvironment> StructuredIdGenerator<E> {
 
         self.last = Some(LastMint {
             timestamp_ms,
-            handle,
-            bucket,
             nonce,
         });
         Ok(layout::pack(timestamp_ms, handle, bucket, nonce))
@@ -195,6 +226,7 @@ mod tests {
     struct MockEnv {
         now: Cell<u64>,
         monotonic: Cell<u64>,
+        suspend_on_now: Cell<u64>,
         nonces: RefCell<VecDeque<u64>>,
     }
 
@@ -203,6 +235,7 @@ mod tests {
             Self {
                 now: Cell::new(now),
                 monotonic: Cell::new(0),
+                suspend_on_now: Cell::new(0),
                 nonces: RefCell::new(nonces.into_iter().collect()),
             }
         }
@@ -215,15 +248,26 @@ mod tests {
             self.now.set(self.now.get() + wall_ms);
             self.monotonic.set(self.monotonic.get() + monotonic_ms);
         }
+
+        fn suspend_on_next_now(&self, elapsed_ms: u64) {
+            self.suspend_on_now.set(elapsed_ms);
+        }
     }
 
     impl IdEnvironment for MockEnv {
         fn now_ms(&self) -> u64 {
+            let suspended_ms = self.suspend_on_now.replace(0);
+            self.advance(suspended_ms, suspended_ms);
             self.now.get()
         }
 
         fn monotonic_ms(&self) -> u64 {
             self.monotonic.get()
+        }
+
+        fn wait_next_ms(&self, timestamp_ms: u64) {
+            self.now.set(timestamp_ms + 1);
+            self.monotonic.set(self.monotonic.get() + 1);
         }
 
         fn random_nonce(&self) -> u64 {
@@ -237,9 +281,7 @@ mod tests {
 
     #[test]
     fn nonce_monotonic() {
-        // Consecutive mints in the same millisecond for the same
-        // (handle, bucket) increment the nonce by one; any interleaved mint
-        // for another key would reset it to a fresh random nonce.
+        // Consecutive mints in the same millisecond increment the nonce by one.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [100, 200]), 300_000);
         let (handle, bucket) = handle_bucket();
@@ -260,6 +302,7 @@ mod tests {
         let first: MetaResourceId = generator.mint(handle, bucket).unwrap();
         let second: MetaResourceId = generator.mint(handle, bucket).unwrap();
         assert_eq!(first.timestamp_ms() + 1, second.timestamp_ms());
+        assert_eq!(generator.env.now.get(), second.timestamp_ms());
         assert_eq!(second.nonce(), 42);
     }
 
@@ -284,16 +327,32 @@ mod tests {
     }
 
     #[test]
-    fn jump_recovers() {
-        // A refused jump re-anchors: the next mint accepts the new wall clock.
+    fn jump_remains_blocked() {
+        // A refused jump does not become the new trusted clock anchor.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
         let (handle, bucket) = handle_bucket();
         let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
         generator.env.advance(600_000, 0);
-        assert!(generator.mint::<MetaResourceId>(handle, bucket).is_err());
+        let expected = ClockHealthError::ForwardJump {
+            jump_ms: 600_000,
+            max_skew_ms: 300_000,
+        };
+        assert_eq!(
+            generator
+                .mint::<MetaResourceId>(handle, bucket)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            generator
+                .mint::<MetaResourceId>(handle, bucket)
+                .unwrap_err(),
+            expected
+        );
+        generator.env.set_now(1001);
         let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
-        assert_eq!(id.timestamp_ms(), 601_000);
+        assert_eq!(id.timestamp_ms(), 1001);
     }
 
     #[test]
@@ -310,6 +369,17 @@ mod tests {
         generator.env.advance(3_600_000, 3_600_000);
         let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
         assert_eq!(id.timestamp_ms(), 7_201_000);
+    }
+
+    #[test]
+    fn suspend_during_clock_sample_retries() {
+        let mut generator =
+            StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
+        let (handle, bucket) = handle_bucket();
+        let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        generator.env.suspend_on_next_now(600_000);
+        let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
+        assert_eq!(id.timestamp_ms(), 601_000);
     }
 
     #[test]
@@ -338,15 +408,18 @@ mod tests {
     }
 
     #[test]
-    fn distinct_bucket_fresh() {
-        // A different bucket in the same ms draws a fresh random nonce.
+    fn interleaved_bucket_does_not_collide() {
+        // Returning to a bucket in the same ms continues the shared nonce sequence.
         let mut generator =
-            StructuredIdGenerator::with_environment(MockEnv::new(1000, [10, 20]), 300_000);
+            StructuredIdGenerator::with_environment(MockEnv::new(1000, [10, 20, 10]), 300_000);
         let handle = PlacementHandle::new(7).unwrap();
         let first: MetaResourceId = generator.mint(handle, BucketId::new(1).unwrap()).unwrap();
         let second: MetaResourceId = generator.mint(handle, BucketId::new(2).unwrap()).unwrap();
+        let third: MetaResourceId = generator.mint(handle, BucketId::new(1).unwrap()).unwrap();
         assert_eq!(first.nonce(), 10);
-        assert_eq!(second.nonce(), 20);
+        assert_eq!(second.nonce(), 11);
+        assert_eq!(third.nonce(), 12);
+        assert_ne!(first, third);
     }
 
     #[test]
@@ -369,7 +442,7 @@ mod tests {
 
     #[test]
     fn overflow_bump_errs() {
-        // The nonce-overflow +1 ms bump past the cap refuses as well.
+        // Waiting past the timestamp cap refuses rather than truncating.
         let mut generator = StructuredIdGenerator::with_environment(
             MockEnv::new(layout::MAX_TIMESTAMP_MS, [layout::MAX_NONCE, 1]),
             300_000,
