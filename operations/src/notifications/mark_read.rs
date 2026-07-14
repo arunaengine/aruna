@@ -4,7 +4,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::notification_inbox_update_entry;
-use aruna_core::structs::{NotificationRecord, invert_timestamp_ms, notification_inbox_prefix};
+use aruna_core::structs::{
+    NotificationRecord, invert_timestamp_ms, notification_inbox_prefix,
+    parse_notification_inbox_key,
+};
 use aruna_core::types::{Effects, Key, KeySpace, UserId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -134,11 +137,31 @@ impl MarkReadOperation {
         };
 
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
-        for (_, value) in values {
+        for (key, value) in values {
+            let (recipient, created_at_ms, notification_id) =
+                match parse_notification_inbox_key(&key) {
+                    Ok(identity) => identity,
+                    Err(error) => return self.fail(error.into()),
+                };
             let mut record = match NotificationRecord::from_bytes(&value) {
                 Ok(record) => record,
                 Err(error) => return self.fail(error.into()),
             };
+            if recipient != self.input.recipient
+                || (recipient, created_at_ms, notification_id)
+                    != (
+                        record.recipient,
+                        record.created_at_ms,
+                        record.notification_id,
+                    )
+            {
+                return self.fail(
+                    ConversionError::FromStrError(
+                        "notification inbox key does not match payload identity".to_string(),
+                    )
+                    .into(),
+                );
+            }
             let by_id = self
                 .input
                 .ids
@@ -257,7 +280,9 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::notifications::inbox::upsert_inbox_records;
     use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
-    use aruna_core::structs::{NotificationClass, NotificationKind, RealmId};
+    use aruna_core::structs::{
+        NotificationClass, NotificationKind, RealmId, notification_inbox_key,
+    };
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use tempfile::{TempDir, tempdir};
 
@@ -538,6 +563,45 @@ mod tests {
         assert_eq!(alice_stored[0].read_at_ms, Some(5));
         let bob_stored = read_all(&context.storage_handle, bob).await;
         assert_eq!(bob_stored[0].read_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn mark_rejects_key_payload_identity_mismatch() {
+        let (_tempdir, context) = context_with_storage();
+        let recipient = user(1, 1);
+        let original = record(recipient, 10);
+        let mut mismatched = original.clone();
+        mismatched.created_at_ms = 20;
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                    key: notification_inbox_key(
+                        recipient,
+                        original.created_at_ms,
+                        original.notification_id,
+                    ),
+                    value: mismatched.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert!(matches!(
+            drive(
+                MarkReadOperation::new(MarkReadInput {
+                    recipient,
+                    ids: vec![original.notification_id],
+                    up_to_ms: None,
+                    now_ms: 30,
+                }),
+                &context,
+            )
+            .await,
+            Err(MarkReadError::ConversionError(_))
+        ));
     }
 
     #[tokio::test]
