@@ -4,6 +4,7 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
     NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
@@ -18,7 +19,7 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
-    is_watch_authorized, watch_permission_path,
+    WatchAuthorization, evaluate_watch_authorization, watch_permission_path,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -210,6 +211,19 @@ fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
     }
 }
 
+fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
+    if let Some(net_handle) = state.get_ctx().net_handle.as_ref() {
+        net_handle
+            .notification_watch_metrics()
+            .record_creation_denial(reason);
+    }
+    warn!(
+        parent: None,
+        reason = reason.as_str(),
+        "Notification watch creation denied"
+    );
+}
+
 /// Watch subscriptions cannot retain token-only path restrictions on their
 /// holder, so path-restricted (delegated) tokens must not reach notification
 /// endpoints even though create performs a resource permission check.
@@ -335,9 +349,10 @@ async fn authorize_watch(
     authorization: &WatchAuthorizationBinding,
 ) -> ServerResult<()> {
     if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
+        record_watch_creation_denial(state, WatchAuthorizationMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
-    match is_watch_authorized(
+    match evaluate_watch_authorization(
         &state.get_ctx(),
         state.get_realm_id(),
         auth.user_id,
@@ -347,9 +362,25 @@ async fn authorize_watch(
     )
     .await
     {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::Forbidden),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Ok(WatchAuthorization::Authorized) => Ok(()),
+        Ok(WatchAuthorization::Denied(reason)) => {
+            record_watch_creation_denial(state, reason.metric_reason());
+            Err(ServerError::Forbidden)
+        }
+        Ok(WatchAuthorization::Unavailable(_)) => {
+            record_watch_creation_denial(
+                state,
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            );
+            Err(ServerError::Forbidden)
+        }
+        Err(error) => {
+            record_watch_creation_denial(
+                state,
+                WatchAuthorizationMetricReason::AuthorizationUnavailable,
+            );
+            Err(ServerError::InternalError(error))
+        }
     }
 }
 
@@ -749,11 +780,15 @@ pub async fn create_watch(
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
         || request.events.is_empty()
     {
+        record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
         return Err(ServerError::BadRequest);
     }
     let mut event_mask = WatchEventMask::empty();
     for name in &request.events {
-        let kind = WatchEventKind::from_name(name).ok_or(ServerError::BadRequest)?;
+        let Some(kind) = WatchEventKind::from_name(name) else {
+            record_watch_creation_denial(&state, WatchAuthorizationMetricReason::InvalidResource);
+            return Err(ServerError::BadRequest);
+        };
         event_mask.insert(kind);
     }
     let authorization = WatchAuthorizationBinding {
@@ -781,7 +816,12 @@ pub async fn create_watch(
         authorization,
     )
     .await
-    .map_err(|error| map_watch_dispatch_error(error, "create_watch"))?;
+    .map_err(|error| {
+        if matches!(error, WatchDispatchError::Unauthorized) {
+            record_watch_creation_denial(&state, WatchAuthorizationMetricReason::PermissionDenied);
+        }
+        map_watch_dispatch_error(error, "create_watch")
+    })?;
 
     Ok((StatusCode::CREATED, Json(watch_response(&subscription))))
 }
@@ -829,6 +869,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, Permission,
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -1542,8 +1583,10 @@ mod tests {
     #[tokio::test]
     async fn create_watch_requires_metadata_group_read_permission() {
         let realm_id = realm_id(15);
-        let holder = node(15);
-        let (_dir, state) = build_state(realm_id, holder).await;
+        let (_dir, state, net) = build_state_with_net(realm_id, [15u8; 32]).await;
+        let holder = net.node_id();
+        let metrics = NodeMetrics::new();
+        net.notification_watch_metrics().register(&metrics).await;
         install_local_holder_config(&state, realm_id, holder).await;
         let authorized = UserId::new(Ulid::r#gen(), realm_id);
         let unauthorized = UserId::new(Ulid::r#gen(), realm_id);
@@ -1563,6 +1606,9 @@ mod tests {
         .await
         .expect_err("user without metadata READ must be rejected");
         assert!(matches!(error, ServerError::Forbidden));
+        assert!(metrics.render().await.contains(
+            "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
+        ));
 
         let (status, created) = create_watch(
             State(state),

@@ -7,6 +7,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, NotificationKind, Permission, RealmId,
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
@@ -33,10 +34,24 @@ pub struct AuthorizedWatchSubscriptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchAuthorizationDenial {
     InvalidState,
+    InvalidOwner,
     TokenExpired,
     TokenRevoked,
     TokenRestricted,
     PermissionDenied,
+}
+
+impl WatchAuthorizationDenial {
+    pub const fn metric_reason(self) -> WatchAuthorizationMetricReason {
+        match self {
+            Self::InvalidState => WatchAuthorizationMetricReason::InvalidState,
+            Self::InvalidOwner => WatchAuthorizationMetricReason::InvalidOwner,
+            Self::TokenExpired => WatchAuthorizationMetricReason::TokenExpired,
+            Self::TokenRevoked => WatchAuthorizationMetricReason::TokenRevoked,
+            Self::TokenRestricted => WatchAuthorizationMetricReason::TokenRestricted,
+            Self::PermissionDenied => WatchAuthorizationMetricReason::PermissionDenied,
+        }
+    }
 }
 
 pub enum WatchAuthorization {
@@ -108,7 +123,7 @@ pub async fn is_watch_authorized(
     ))
 }
 
-async fn evaluate_watch_authorization(
+pub async fn evaluate_watch_authorization(
     context: &DriverContext,
     realm_id: RealmId,
     owner: UserId,
@@ -131,7 +146,12 @@ async fn evaluate_permission_path(
     permission_path: String,
     authorization: &WatchAuthorizationBinding,
 ) -> Result<WatchAuthorization, String> {
-    if owner.is_nil() || owner.realm_id != realm_id || !authorization.is_valid() {
+    if owner.is_nil() || owner.realm_id != realm_id {
+        return Ok(WatchAuthorization::Denied(
+            WatchAuthorizationDenial::InvalidOwner,
+        ));
+    }
+    if !authorization.is_valid() {
         return Ok(WatchAuthorization::Denied(
             WatchAuthorizationDenial::InvalidState,
         ));
@@ -386,7 +406,7 @@ pub async fn list_authorized_watch_subscriptions(
         .map_err(|error| error.to_string())?;
     let mut authorized = Vec::with_capacity(subscriptions.len());
     for mut subscription in subscriptions {
-        if !is_watch_authorized(
+        match evaluate_watch_authorization(
             context,
             owner.realm_id,
             subscription.owner,
@@ -396,9 +416,13 @@ pub async fn list_authorized_watch_subscriptions(
         )
         .await?
         {
-            subscription.path_prefix.clear();
-            subscription.event_mask = WatchEventMask::empty();
-            subscription.created_at_ms = 0;
+            WatchAuthorization::Authorized => {}
+            WatchAuthorization::Denied(_) => {
+                subscription.path_prefix.clear();
+                subscription.event_mask = WatchEventMask::empty();
+                subscription.created_at_ms = 0;
+            }
+            WatchAuthorization::Unavailable(error) => return Err(error),
         }
         authorized.push(subscription);
     }
@@ -432,14 +456,13 @@ pub async fn filter_authorized_watch_subscriptions(
         {
             Ok(WatchAuthorization::Authorized) => authorized.push(subscription),
             Ok(WatchAuthorization::Denied(_)) => dropped = true,
-            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
+            Ok(WatchAuthorization::Unavailable(_)) | Err(_) => {
                 dropped = true;
                 check_failed = true;
                 warn!(
-                    owner = %subscription.owner,
-                    path = %subscription.path_prefix,
-                    %error,
-                    "Watch permission re-check failed closed"
+                    parent: None,
+                    reason = WatchAuthorizationMetricReason::AuthorizationUnavailable.as_str(),
+                    "Notification watch authorization check failed"
                 );
             }
         }
@@ -674,7 +697,7 @@ mod tests {
                 document_id,
             ))
         );
-        metadata.path.push_str("/mismatch");
+        metadata.path = format!("meta/{}/datasets/project", Ulid::from_bytes([8u8; 16]));
         assert!(watch_event_permission_path(&metadata).is_none());
     }
 

@@ -5,19 +5,22 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
+use aruna_core::metrics::WatchAuthorizationMetricReason;
 use aruna_core::structs::{
     NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchSubscription,
     watch_subscription_key,
 };
 use aruna_core::types::{Key, KeySpace, TxnId};
+use tracing::warn;
 
 use crate::driver::DriverContext;
 use crate::notifications::inbox::{
     InboxWriteOutcome, UpsertFailure, upsert_inbox_records_in_transaction,
 };
+use crate::notifications::placement::filter_locally_held_watch_subscriptions;
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_event_authorization, filter_authorized_watch_subscriptions,
+    WatchAuthorization, evaluate_watch_authorization, evaluate_watch_event_authorization,
 };
 use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
@@ -70,21 +73,15 @@ async fn expand_watch_events_once(
     let subscriptions = list_realm_watch_subscriptions(&context.storage_handle, realm_id)
         .await
         .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
-    let filtered = filter_authorized_watch_subscriptions(
-        context,
-        realm_id,
-        realm_config,
-        local_node_id,
-        subscriptions,
-    )
-    .await
-    .map_err(UpsertFailure::Fatal)?;
-    if filtered.subscriptions.is_empty() {
-        return Ok((InboxWriteOutcome::default(), filtered.dropped));
+    let (subscriptions, found_stale) =
+        filter_locally_held_watch_subscriptions(subscriptions, realm_config, local_node_id)
+            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+    if subscriptions.is_empty() {
+        return Ok((InboxWriteOutcome::default(), found_stale));
     }
     let mut candidates = Vec::new();
     for event in events {
-        for subscription in &filtered.subscriptions {
+        for subscription in &subscriptions {
             let routed = route_watch_event(event, std::slice::from_ref(subscription));
             if !routed.is_empty() {
                 candidates.push((subscription, event, routed));
@@ -92,29 +89,29 @@ async fn expand_watch_events_once(
         }
     }
     if candidates.is_empty() {
-        return Ok((InboxWriteOutcome::default(), filtered.dropped));
+        return Ok((InboxWriteOutcome::default(), found_stale));
     }
 
     let txn_id = start_write_transaction(context).await?;
-    let outcome = match stage_watch_expansion(context, realm_id, txn_id, candidates).await {
+    let (outcome, denied) = match stage_watch_expansion(context, realm_id, txn_id, candidates).await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             abort_transaction(context, txn_id).await;
             return Err(error);
         }
     };
+    let dropped = found_stale || denied;
     if outcome.written == 0 {
         abort_transaction(context, txn_id).await;
-        return Ok((outcome, filtered.dropped));
+        return Ok((outcome, dropped));
     }
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            Ok((outcome, filtered.dropped))
-        }
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok((outcome, dropped)),
         Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
         other => Err(UpsertFailure::Fatal(format!(
             "unexpected storage event: {other:?}"
@@ -127,7 +124,7 @@ async fn stage_watch_expansion(
     realm_id: RealmId,
     txn_id: TxnId,
     candidates: Vec<WatchCandidate<'_>>,
-) -> Result<InboxWriteOutcome, UpsertFailure> {
+) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let mut subscriptions = Vec::new();
     for (subscription, _, _) in &candidates {
         if !subscriptions
@@ -205,7 +202,32 @@ async fn stage_watch_expansion(
     }
 
     let mut records = Vec::new();
+    let mut dropped = false;
     for (subscription, event, routed) in candidates {
+        match evaluate_watch_authorization(
+            context,
+            realm_id,
+            subscription.owner,
+            &subscription.path_prefix,
+            subscription.event_mask,
+            &subscription.authorization,
+        )
+        .await
+        {
+            Ok(WatchAuthorization::Authorized) => {}
+            Ok(WatchAuthorization::Denied(reason)) => {
+                record_delivery_suppression(context, reason.metric_reason());
+                dropped = true;
+                continue;
+            }
+            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
+                record_delivery_suppression(
+                    context,
+                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
+                );
+                return Err(UpsertFailure::Fatal(error));
+            }
+        }
         match evaluate_watch_event_authorization(
             context,
             subscription.owner,
@@ -213,17 +235,26 @@ async fn stage_watch_expansion(
             event,
         )
         .await
-        .map_err(UpsertFailure::Fatal)?
         {
-            WatchAuthorization::Authorized => records.extend(routed),
-            WatchAuthorization::Denied(_) => {}
-            WatchAuthorization::Unavailable(error) => return Err(UpsertFailure::Fatal(error)),
+            Ok(WatchAuthorization::Authorized) => records.extend(routed),
+            Ok(WatchAuthorization::Denied(reason)) => {
+                record_delivery_suppression(context, reason.metric_reason());
+            }
+            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
+                record_delivery_suppression(
+                    context,
+                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
+                );
+                return Err(UpsertFailure::Fatal(error));
+            }
         }
     }
     if records.is_empty() {
-        return Ok(InboxWriteOutcome::default());
+        return Ok((InboxWriteOutcome::default(), dropped));
     }
-    upsert_inbox_records_in_transaction(&context.storage_handle, &records, txn_id).await
+    upsert_inbox_records_in_transaction(&context.storage_handle, &records, txn_id)
+        .await
+        .map(|outcome| (outcome, dropped))
 }
 
 async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, UpsertFailure> {
@@ -253,6 +284,19 @@ async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
         .storage_handle
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await;
+}
+
+fn record_delivery_suppression(context: &DriverContext, reason: WatchAuthorizationMetricReason) {
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        net_handle
+            .notification_watch_metrics()
+            .record_delivery_suppression(reason);
+    }
+    warn!(
+        parent: None,
+        reason = reason.as_str(),
+        "Notification watch delivery suppressed"
+    );
 }
 
 #[cfg(test)]
@@ -536,7 +580,7 @@ mod tests {
         )
         .await
         .expect("stage authorized event");
-        assert_eq!(staged.written, 1);
+        assert_eq!(staged.0.written, 1);
 
         let replacement =
             GroupAuthorizationDocument::new_default_group_doc(replacement_owner, realm, group_id);
