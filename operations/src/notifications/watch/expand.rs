@@ -1,7 +1,20 @@
-use aruna_core::structs::{RealmId, WatchEvent};
+use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+};
+use aruna_core::structs::{
+    NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchSubscription,
+    watch_subscription_key,
+};
+use aruna_core::types::{Key, KeySpace, TxnId};
 
 use crate::driver::DriverContext;
-use crate::notifications::inbox::{InboxWriteOutcome, upsert_inbox_records_reporting};
+use crate::notifications::inbox::{
+    InboxWriteOutcome, UpsertFailure, upsert_inbox_records_in_transaction,
+};
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_event_authorization, filter_authorized_watch_subscriptions,
@@ -27,9 +40,36 @@ pub async fn expand_watch_events(
     if events.is_empty() {
         return Ok((InboxWriteOutcome::default(), false));
     }
+    for attempt in 0..2 {
+        match expand_watch_events_once(context, realm_id, realm_config, local_node_id, events).await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(UpsertFailure::Conflict) if attempt == 0 => {}
+            Err(UpsertFailure::Conflict) => {
+                return Err("watch event expansion conflicted twice".to_string());
+            }
+            Err(UpsertFailure::Fatal(error)) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+type WatchCandidate<'a> = (
+    &'a WatchSubscription,
+    &'a WatchEvent,
+    Vec<NotificationRecord>,
+);
+
+async fn expand_watch_events_once(
+    context: &DriverContext,
+    realm_id: RealmId,
+    realm_config: &aruna_core::structs::RealmConfigDocument,
+    local_node_id: aruna_core::NodeId,
+    events: &[WatchEvent],
+) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let subscriptions = list_realm_watch_subscriptions(&context.storage_handle, realm_id)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
     let filtered = filter_authorized_watch_subscriptions(
         context,
         realm_id,
@@ -37,34 +77,182 @@ pub async fn expand_watch_events(
         local_node_id,
         subscriptions,
     )
-    .await?;
+    .await
+    .map_err(UpsertFailure::Fatal)?;
     if filtered.subscriptions.is_empty() {
         return Ok((InboxWriteOutcome::default(), filtered.dropped));
     }
-    let mut records = Vec::new();
+    let mut candidates = Vec::new();
     for event in events {
         for subscription in &filtered.subscriptions {
             let routed = route_watch_event(event, std::slice::from_ref(subscription));
-            if routed.is_empty() {
-                continue;
-            }
-            match evaluate_watch_event_authorization(
-                context,
-                subscription.owner,
-                &subscription.authorization,
-                event,
-            )
-            .await?
-            {
-                WatchAuthorization::Authorized => records.extend(routed),
-                WatchAuthorization::Denied(_) => {}
-                WatchAuthorization::Unavailable(error) => return Err(error),
+            if !routed.is_empty() {
+                candidates.push((subscription, event, routed));
             }
         }
     }
-    upsert_inbox_records_reporting(&context.storage_handle, &records)
+    if candidates.is_empty() {
+        return Ok((InboxWriteOutcome::default(), filtered.dropped));
+    }
+
+    let txn_id = start_write_transaction(context).await?;
+    let outcome = match stage_watch_expansion(context, realm_id, txn_id, candidates).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            abort_transaction(context, txn_id).await;
+            return Err(error);
+        }
+    };
+    if outcome.written == 0 {
+        abort_transaction(context, txn_id).await;
+        return Ok((outcome, filtered.dropped));
+    }
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
-        .map(|outcome| (outcome, filtered.dropped))
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            Ok((outcome, filtered.dropped))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
+        other => Err(UpsertFailure::Fatal(format!(
+            "unexpected storage event: {other:?}"
+        ))),
+    }
+}
+
+async fn stage_watch_expansion(
+    context: &DriverContext,
+    realm_id: RealmId,
+    txn_id: TxnId,
+    candidates: Vec<WatchCandidate<'_>>,
+) -> Result<InboxWriteOutcome, UpsertFailure> {
+    let mut subscriptions = Vec::new();
+    for (subscription, _, _) in &candidates {
+        if !subscriptions
+            .iter()
+            .any(|current: &&WatchSubscription| current.watch_id == subscription.watch_id)
+        {
+            subscriptions.push(*subscription);
+        }
+    }
+    let mut reads: Vec<(KeySpace, Key)> = subscriptions
+        .iter()
+        .map(|subscription| {
+            (
+                NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                watch_subscription_key(subscription.owner, subscription.watch_id),
+            )
+        })
+        .collect();
+    let subscription_count = reads.len();
+    reads.push((
+        AUTH_KEYSPACE.to_string(),
+        realm_id.as_bytes().to_vec().into(),
+    ));
+    for (_, event, _) in &candidates {
+        let group_id = match &event.detail {
+            WatchEventDetail::MetadataCreated { group_id, .. }
+            | WatchEventDetail::DataUploaded { group_id, .. } => *group_id,
+        };
+        let key: Key = group_id.to_bytes().to_vec().into();
+        if !reads
+            .iter()
+            .any(|(key_space, current)| key_space == AUTH_KEYSPACE && current == &key)
+        {
+            reads.push((AUTH_KEYSPACE.to_string(), key));
+        }
+    }
+    reads.push((
+        API_STATE_KEYSPACE.to_string(),
+        TOKEN_REVOCATION_LIST_KEY.into(),
+    ));
+    let expected_count = reads.len();
+    let guarded = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(classify_storage_error(error));
+        }
+        other => {
+            return Err(UpsertFailure::Fatal(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    };
+    if guarded.len() != expected_count {
+        return Err(UpsertFailure::Fatal(
+            "watch authorization guard returned the wrong result count".to_string(),
+        ));
+    }
+    for (subscription, (_, stored)) in subscriptions
+        .iter()
+        .zip(guarded.into_iter().take(subscription_count))
+    {
+        let expected = subscription
+            .to_bytes()
+            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+        if stored.as_deref() != Some(expected.as_slice()) {
+            return Err(UpsertFailure::Conflict);
+        }
+    }
+
+    let mut records = Vec::new();
+    for (subscription, event, routed) in candidates {
+        match evaluate_watch_event_authorization(
+            context,
+            subscription.owner,
+            &subscription.authorization,
+            event,
+        )
+        .await
+        .map_err(UpsertFailure::Fatal)?
+        {
+            WatchAuthorization::Authorized => records.extend(routed),
+            WatchAuthorization::Denied(_) => {}
+            WatchAuthorization::Unavailable(error) => return Err(UpsertFailure::Fatal(error)),
+        }
+    }
+    if records.is_empty() {
+        return Ok(InboxWriteOutcome::default());
+    }
+    upsert_inbox_records_in_transaction(&context.storage_handle, &records, txn_id).await
+}
+
+async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, UpsertFailure> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
+        other => Err(UpsertFailure::Fatal(format!(
+            "unexpected storage event: {other:?}"
+        ))),
+    }
+}
+
+fn classify_storage_error(error: StorageError) -> UpsertFailure {
+    if matches!(error, StorageError::TransactionConflict) {
+        UpsertFailure::Conflict
+    } else {
+        UpsertFailure::Fatal(error.to_string())
+    }
+}
+
+async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 #[cfg(test)]
@@ -303,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expansion_stops_after_bucket_read_is_revoked() {
+    async fn concurrent_revocation_prevents_watch_delivery_commit() {
         let (_dir, context) = temp_context();
         let realm = RealmId([2u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -312,7 +500,7 @@ mod tests {
         let replacement_owner = user(realm, 3);
         let group_id = Ulid::from_bytes([4u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        create_watch_subscription(
+        let subscription = create_watch_subscription(
             &context.storage_handle,
             owner,
             data_watch_resource_path(group_id, local_node_id, "bucket", ""),
@@ -334,6 +522,22 @@ mod tests {
         .expect("first delivery");
         assert_eq!(first.0.written, 1);
 
+        let mut second_event = first_event;
+        second_event.event_id = Ulid::from_bytes([8u8; 16]);
+        let txn_id = start_write_transaction(&context)
+            .await
+            .expect("start transaction");
+        let routed = route_watch_event(&second_event, std::slice::from_ref(&subscription));
+        let staged = stage_watch_expansion(
+            &context,
+            realm,
+            txn_id,
+            vec![(&subscription, &second_event, routed)],
+        )
+        .await
+        .expect("stage authorized event");
+        assert_eq!(staged.written, 1);
+
         let replacement =
             GroupAuthorizationDocument::new_default_group_doc(replacement_owner, realm, group_id);
         let actor_record = Actor {
@@ -353,9 +557,17 @@ mod tests {
                 .await,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict
+            })
+        ));
+        assert_eq!(count_inbox(&context.storage_handle).await, 1);
 
-        let mut second_event = first_event;
-        second_event.event_id = Ulid::from_bytes([8u8; 16]);
         let second = expand_watch_events(&context, realm, &config, local_node_id, &[second_event])
             .await
             .expect("revoked delivery fails closed");
