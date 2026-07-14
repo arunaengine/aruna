@@ -157,8 +157,10 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
-    /// Append-only, immutable Placement Binding set. The alpha RealmReplicated
-    /// bridge: the derived binding directory is rebuilt from this (spec 6.3.4).
+    /// Append-only local Placement Binding record intended to become the alpha
+    /// RealmReplicated bridge. Cross-node replication via an admin operation and
+    /// reducer materialization is not yet implemented; do not rely on this field
+    /// for cross-node convergence until it is.
     pub placement_bindings: Vec<PlacementBinding>,
 }
 
