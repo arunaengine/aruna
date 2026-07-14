@@ -104,10 +104,13 @@ impl fmt::Debug for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        let bytes = unsafe { self.0.as_bytes_mut() };
-        for b in bytes.iter_mut() {
-            let p: *mut u8 = b;
-            unsafe { std::ptr::write_volatile(p, 0) };
+        // Zero the whole capacity, not just the live length: a String that grew leaves
+        // secret bytes behind in the slack past `len`.
+        let bytes = unsafe { self.0.as_mut_vec() };
+        let capacity = bytes.capacity();
+        let ptr = bytes.as_mut_ptr();
+        for i in 0..capacity {
+            unsafe { std::ptr::write_volatile(ptr.add(i), 0) };
         }
     }
 }

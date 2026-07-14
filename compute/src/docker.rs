@@ -248,7 +248,10 @@ impl ExecutorBackend for DockerBackend {
             .create_container(Some(create_opts), build_config(&self.config, spec))
             .await
         {
-            Ok(_) => {
+            Ok(response) => {
+                for warning in &response.warnings {
+                    tracing::warn!(container = %name, warning = %warning, "Docker create warning");
+                }
                 self.start_by_name(&name).await?;
                 self.status(&spec.attempt).await
             }
@@ -277,6 +280,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
         Ok(inspect_to_status(self.inspect(attempt).await?))
     }
 
@@ -285,6 +289,7 @@ impl ExecutorBackend for DockerBackend {
         attempt: &AttemptRef,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
         // The daemon's wait endpoint (condition "not-running") answers instantly
         // for a created-but-never-started container, which would surface a
         // non-terminal status and break the wait contract. Poll inspect to
@@ -317,6 +322,14 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
+        // A container that had already exited on its own must keep its real exit evidence:
+        // reporting Cancelled over it would fabricate a cancellation that never happened.
+        let was_running = match self.status(attempt).await {
+            Ok(status) => matches!(status.phase, AttemptPhase::Running),
+            Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
+            Err(other) => return Err(other),
+        };
         let name = attempt.external_name();
         let opts = StopContainerOptionsBuilder::new()
             .t(self.config.stop_grace_secs)
@@ -325,17 +338,21 @@ impl ExecutorBackend for DockerBackend {
             Ok(()) => {}
             Err(e) => match classify(&e) {
                 BackendError::NotFound(_) => return Ok(CancelEvidence::AlreadyGone),
-                // 304: already stopped. Fall through to gather evidence.
+                // 304: already stopped or never started. Fall through for evidence.
                 BackendError::Conflict(_) => {}
                 other => return Err(other),
             },
         }
         let status = self.status(attempt).await?;
         if status.is_terminal() {
-            Ok(CancelEvidence::Stopped(AttemptStatus {
-                phase: AttemptPhase::Cancelled,
-                ..status
-            }))
+            if was_running {
+                Ok(CancelEvidence::Stopped(AttemptStatus {
+                    phase: AttemptPhase::Cancelled,
+                    ..status
+                }))
+            } else {
+                Ok(CancelEvidence::Stopped(status))
+            }
         } else {
             Ok(CancelEvidence::Requested)
         }
@@ -347,6 +364,7 @@ impl ExecutorBackend for DockerBackend {
         limits: &LogLimits,
         sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
         let name = attempt.external_name();
         let opts = LogsOptionsBuilder::new()
             .stdout(true)
@@ -397,6 +415,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
         if self.config.keep_failed {
             return Ok(());
         }
@@ -411,7 +430,11 @@ impl ExecutorBackend for DockerBackend {
                 "refusing to remove foreign container `{name}`"
             )));
         }
-        let opts = RemoveContainerOptionsBuilder::new().force(true).build();
+        // `.v(true)`: drop the anonymous volumes too, or every job leaks one.
+        let opts = RemoveContainerOptionsBuilder::new()
+            .v(true)
+            .force(true)
+            .build();
         match self.docker.remove_container(&name, Some(opts)).await {
             Ok(()) => Ok(()),
             Err(e) => match classify(&e) {
@@ -480,7 +503,9 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
     let state = inspect.state.unwrap_or_default();
     let started_at_ms = state.started_at.as_deref().and_then(parse_rfc3339_ms);
     let finished_at_ms = state.finished_at.as_deref().and_then(parse_rfc3339_ms);
-    let exit_code = state.exit_code.unwrap_or_default() as i32;
+    // An absent exit code is NOT a zero exit code: defaulting it would report a container
+    // that died without ever reporting status as a clean success.
+    let exit_code = state.exit_code.map(|code| code as i32);
 
     let phase = match state.status.unwrap_or(ContainerStateStatusEnum::EMPTY) {
         ContainerStateStatusEnum::RUNNING
@@ -490,9 +515,24 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
         ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EMPTY => {
             AttemptPhase::Submitted
         }
-        ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD => {
-            AttemptPhase::Exited { code: exit_code }
+        ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD
+            if state.oom_killed == Some(true) =>
+        {
+            AttemptPhase::Failed {
+                reason: "oom-killed".to_string(),
+            }
         }
+        ContainerStateStatusEnum::EXITED => AttemptPhase::Exited {
+            code: exit_code.unwrap_or_default(),
+        },
+        ContainerStateStatusEnum::DEAD => match exit_code {
+            Some(code) => AttemptPhase::Exited { code },
+            None => AttemptPhase::Failed {
+                reason: state
+                    .error
+                    .unwrap_or_else(|| "container died without an exit code".to_string()),
+            },
+        },
     };
 
     AttemptStatus {
@@ -592,7 +632,15 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
     let hour: i64 = s.get(11..13)?.parse().ok()?;
     let minute: i64 = s.get(14..16)?.parse().ok()?;
     let second: i64 = s.get(17..19)?.parse().ok()?;
-    if year <= 1 {
+    // Range-check the whole calendar, not just the year: a malformed daemon timestamp
+    // would otherwise produce a garbage epoch rather than being rejected.
+    if year <= 1
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
         return None;
     }
     let mut millis: i64 = 0;
@@ -831,5 +879,62 @@ mod tests {
         );
         assert_eq!(parse_rfc3339_ms("0001-01-01T00:00:00Z"), None);
         assert_eq!(parse_rfc3339_ms("garbage"), None);
+    }
+
+    // A malformed calendar field must be rejected, not folded into a garbage epoch.
+    #[test]
+    fn rfc3339_calendar() {
+        assert_eq!(parse_rfc3339_ms("2024-13-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-00-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-01-32T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-01-01T24:00:00Z"), None);
+        assert_eq!(parse_rfc3339_ms("2024-01-01T00:60:00Z"), None);
+    }
+
+    fn inspect_with(state: bollard::models::ContainerState) -> ContainerInspectResponse {
+        ContainerInspectResponse {
+            id: Some("abc".to_string()),
+            state: Some(state),
+            ..Default::default()
+        }
+    }
+
+    // A container that died without an exit code is NOT a clean success.
+    #[test]
+    fn dead_without_code() {
+        let status = inspect_to_status(inspect_with(bollard::models::ContainerState {
+            status: Some(ContainerStateStatusEnum::DEAD),
+            exit_code: None,
+            ..Default::default()
+        }));
+        assert!(
+            matches!(status.phase, AttemptPhase::Failed { .. }),
+            "dead-without-exit-code must be Failed, got {:?}",
+            status.phase
+        );
+
+        // A real exit code still reports as a genuine exit, zero included.
+        let status = inspect_to_status(inspect_with(bollard::models::ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            exit_code: Some(0),
+            ..Default::default()
+        }));
+        assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+    }
+
+    // An OOM kill is a backend failure, not the exit code the kernel left behind.
+    #[test]
+    fn oom_is_failed() {
+        let status = inspect_to_status(inspect_with(bollard::models::ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            exit_code: Some(0),
+            oom_killed: Some(true),
+            ..Default::default()
+        }));
+        assert!(
+            matches!(status.phase, AttemptPhase::Failed { .. }),
+            "oom-killed must be Failed, got {:?}",
+            status.phase
+        );
     }
 }
