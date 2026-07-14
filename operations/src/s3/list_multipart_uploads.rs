@@ -1,18 +1,18 @@
 //! List multipart uploads for a bucket.
 //!
 //! The multipart upload keyspace is not indexed by bucket, so this operation
-//! performs a single capped scan (up to [`ListMultipartUploadsOperation::SCAN_LIMIT`])
-//! over the whole keyspace and filters/sorts/paginates in memory. This is an
-//! accepted tradeoff for the current keyspace layout: multipart upload counts
-//! are small and short-lived, so no dedicated per-bucket index is maintained.
+//! performs bounded scan rounds over the whole keyspace and filters/sorts/paginates
+//! in memory. This is an accepted tradeoff for the current keyspace layout:
+//! multipart upload counts are small and short-lived, so no dedicated per-bucket
+//! index is maintained.
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -71,20 +71,40 @@ pub struct ListMultipartUploadsOperation {
     input: ListMultipartUploadsInput,
     state: ListMultipartUploadsState,
     txn_id: Option<Ulid>,
+    uploads: Vec<MultipartUpload>,
+    scan_cursor: Option<Key>,
+    scan_rounds: usize,
+    scan_round_limit: usize,
+    max_scan_rounds: usize,
+    scan_incomplete: bool,
     output: Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>,
 }
 
 impl ListMultipartUploadsOperation {
     pub const DEFAULT_MAX_UPLOADS: usize = 1_000;
-    const SCAN_LIMIT: usize = 10_000;
+    const SCAN_ROUND_LIMIT: usize = 100;
+    const MAX_SCAN_ROUNDS: usize = 100;
 
     pub fn new(input: ListMultipartUploadsInput) -> Self {
         Self {
             input,
             state: ListMultipartUploadsState::Init,
             txn_id: None,
+            uploads: Vec::new(),
+            scan_cursor: None,
+            scan_rounds: 0,
+            scan_round_limit: Self::SCAN_ROUND_LIMIT,
+            max_scan_rounds: Self::MAX_SCAN_ROUNDS,
+            scan_incomplete: false,
             output: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_scan_limits(mut self, scan_round_limit: usize, max_scan_rounds: usize) -> Self {
+        self.scan_round_limit = scan_round_limit;
+        self.max_scan_rounds = max_scan_rounds;
+        self
     }
 
     fn emit_error(&mut self, error: ListMultipartUploadsError) -> Effects {
@@ -125,13 +145,18 @@ impl ListMultipartUploadsOperation {
         };
 
         self.txn_id = Some(txn_id);
+        self.issue_upload_round()
+    }
+
+    fn issue_upload_round(&mut self) -> Effects {
+        self.scan_rounds += 1;
         self.state = ListMultipartUploadsState::ReadUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
-            start: None,
-            limit: Self::SCAN_LIMIT,
-            txn_id: Some(txn_id),
+            start: self.scan_cursor.take().map(IterStart::After),
+            limit: self.scan_round_limit,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -143,7 +168,11 @@ impl ListMultipartUploadsOperation {
     }
 
     fn handle_uploads_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
             return self.emit_error(ListMultipartUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
@@ -151,7 +180,6 @@ impl ListMultipartUploadsOperation {
             });
         };
 
-        let mut uploads = Vec::new();
         for (_key, value) in values {
             let record = match MultipartUpload::from_bytes(value.as_ref()) {
                 Ok(record) => record,
@@ -165,8 +193,24 @@ impl ListMultipartUploadsOperation {
             {
                 continue;
             }
-            uploads.push(record);
+            self.uploads.push(record);
         }
+
+        let target = self.input.max_uploads.saturating_add(1);
+        if next_start_after.is_none() {
+            return self.finish_upload_scan();
+        }
+        if self.uploads.len() >= target || self.scan_rounds >= self.max_scan_rounds {
+            self.scan_incomplete = true;
+            return self.finish_upload_scan();
+        }
+
+        self.scan_cursor = next_start_after;
+        self.issue_upload_round()
+    }
+
+    fn finish_upload_scan(&mut self) -> Effects {
+        let mut uploads = std::mem::take(&mut self.uploads);
         uploads.sort_by(|left, right| {
             left.key
                 .cmp(&right.key)
@@ -210,7 +254,7 @@ impl ListMultipartUploadsOperation {
         let mut result_uploads = Vec::new();
         let mut common_prefixes = Vec::new();
         let mut emitted = 0usize;
-        let mut is_truncated = false;
+        let mut is_truncated = self.scan_incomplete;
         let mut next_key_marker = None;
         let mut next_upload_id_marker = None;
 
@@ -429,6 +473,79 @@ mod test {
             .collect();
         assert_eq!(keys, vec!["a", "c"]);
         assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_scans_past_foreign_bucket_rounds() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([1; 16]), "other", "a"),
+        )
+        .await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([2; 16]), "other", "b"),
+        )
+        .await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([3; 16]), "bucket", "target"),
+        )
+        .await;
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limits(2, 3),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].key, "target");
+        assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_reports_truncation_at_scan_round_cap() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([1; 16]), "other", "a"),
+        )
+        .await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([2; 16]), "other", "b"),
+        )
+        .await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(Ulid::from_bytes([3; 16]), "bucket", "target"),
+        )
+        .await;
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limits(2, 1),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(result.uploads.is_empty());
+        assert!(result.is_truncated);
     }
 
     #[tokio::test]
