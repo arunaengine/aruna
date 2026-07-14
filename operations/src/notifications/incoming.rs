@@ -642,8 +642,10 @@ mod tests {
     use crate::notifications::watch::subscriptions::{
         WATCH_SUBSCRIPTION_UNAUTHORIZED, create_watch_subscription, list_watch_subscriptions,
     };
+    use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        API_STATE_KEYSPACE, AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
@@ -654,6 +656,7 @@ mod tests {
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -841,7 +844,7 @@ mod tests {
 
     fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
         let key = format!("object-{seed}");
-        NotificationRecord::new(
+        let mut record = NotificationRecord::new(
             recipient,
             NotificationClass::Transient,
             NotificationKind::DataUploaded {
@@ -854,7 +857,9 @@ mod tests {
                 actor_user_id: recipient,
             },
             1_700_000_000_000 + seed as u64,
-        )
+        );
+        record.watch_authorization = Some(WatchAuthorizationBinding::default());
+        record
     }
 
     async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
@@ -1337,6 +1342,61 @@ mod tests {
                 .expect("same cursor retries after authorization recovers")
                 .0,
             vec![watch_two]
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_list_hides_watch_record_after_token_revocation() {
+        let realm_id = RealmId::from_bytes([82u8; 32]);
+        let a = spawn(realm_id, [82u8; 32]).await;
+        let b = spawn(realm_id, [83u8; 32]).await;
+        connect(&a, &b).await;
+        let config = install_config(
+            &b,
+            realm_id,
+            &[
+                (a.net.node_id(), RealmNodeKind::Server),
+                (b.net.node_id(), RealmNodeKind::Server),
+            ],
+        )
+        .await;
+        let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
+        install_watch_authorization(&b, realm_id, recipient, &[]).await;
+        let direct = record(recipient, 1);
+        let watch = watch_record(recipient, 2);
+        seed_inbox(&b, &[direct.clone(), watch.clone()]).await;
+
+        let revoked = HashSet::from([watch
+            .watch_authorization
+            .as_ref()
+            .expect("watch binding")
+            .token_hash
+            .clone()]);
+        assert!(matches!(
+            b.context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: API_STATE_KEYSPACE.to_string(),
+                    key: TOKEN_REVOCATION_LIST_KEY.into(),
+                    value: postcard::to_allocvec(&revoked).unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        assert_eq!(
+            list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+                .await
+                .expect("list after token revocation")
+                .0,
+            vec![direct]
+        );
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count after token revocation"),
+            (1, false)
         );
     }
 

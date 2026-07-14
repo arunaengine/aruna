@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    NotificationKind, NotificationRecord, WatchAuthorizationBinding, WatchEventKind,
+    NotificationClass, NotificationKind, NotificationRecord, WatchAuthorizationBinding,
     WatchEventMask, WatchSubscription,
 };
 use aruna_core::types::UserId;
@@ -22,7 +22,8 @@ use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::unread::{UNREAD_COUNT_CAP, UNREAD_SCAN_MAX_ROWS};
 use crate::notifications::watch::authorization::{
-    is_watch_authorized, list_authorized_watch_subscriptions,
+    WatchAuthorization, evaluate_watch_notification_authorization,
+    list_authorized_watch_subscriptions,
 };
 use crate::notifications::watch::interest::schedule_watch_interest_publish;
 use crate::notifications::watch::subscriptions::{
@@ -142,30 +143,24 @@ async fn notification_is_visible(
     recipient: UserId,
     record: &NotificationRecord,
 ) -> Result<bool, String> {
-    let watch = match &record.kind {
-        NotificationKind::MetadataCreated { path, .. } => Some((
-            path.as_str(),
-            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
-        )),
-        NotificationKind::DataUploaded { path, .. } => Some((
-            path.as_str(),
-            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-        )),
-        _ => None,
+    if !matches!(
+        record.kind,
+        NotificationKind::MetadataCreated { .. } | NotificationKind::DataUploaded { .. }
+    ) {
+        return Ok(record.watch_authorization.is_none());
+    }
+    let Some(authorization) = record.watch_authorization.as_ref() else {
+        return Ok(false);
     };
-    match watch {
-        None => Ok(true),
-        Some((path, event_mask)) => {
-            is_watch_authorized(
-                context,
-                recipient.realm_id,
-                recipient,
-                path,
-                event_mask,
-                &WatchAuthorizationBinding::default(),
-            )
-            .await
-        }
+    if record.class != NotificationClass::Transient || record.recipient != recipient {
+        return Ok(false);
+    }
+    match evaluate_watch_notification_authorization(context, recipient, &record.kind, authorization)
+        .await?
+    {
+        WatchAuthorization::Authorized => Ok(true),
+        WatchAuthorization::Denied(_) => Ok(false),
+        WatchAuthorization::Unavailable(error) => Err(error),
     }
 }
 

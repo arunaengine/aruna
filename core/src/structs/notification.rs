@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::RealmId;
+use crate::structs::{RealmId, WatchAuthorizationBinding};
 use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -98,6 +98,7 @@ pub struct NotificationRecord {
     pub kind: NotificationKind,
     pub created_at_ms: u64,
     pub read_at_ms: Option<u64>,
+    pub watch_authorization: Option<WatchAuthorizationBinding>,
 }
 
 impl NotificationRecord {
@@ -114,6 +115,7 @@ impl NotificationRecord {
             kind,
             created_at_ms,
             read_at_ms: None,
+            watch_authorization: None,
         }
     }
 

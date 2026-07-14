@@ -3,7 +3,9 @@ use aruna_core::structs::{RealmId, WatchEvent};
 use crate::driver::DriverContext;
 use crate::notifications::inbox::{InboxWriteOutcome, upsert_inbox_records_reporting};
 use crate::notifications::routing::route_watch_event;
-use crate::notifications::watch::authorization::filter_authorized_watch_subscriptions;
+use crate::notifications::watch::authorization::{
+    WatchAuthorization, evaluate_watch_event_authorization, filter_authorized_watch_subscriptions,
+};
 use crate::notifications::watch::subscriptions::list_realm_watch_subscriptions;
 
 /// Holder-side expansion of origin watch events into inbox records. Scans every
@@ -41,7 +43,24 @@ pub async fn expand_watch_events(
     }
     let mut records = Vec::new();
     for event in events {
-        records.extend(route_watch_event(event, &filtered.subscriptions));
+        for subscription in &filtered.subscriptions {
+            let routed = route_watch_event(event, std::slice::from_ref(subscription));
+            if routed.is_empty() {
+                continue;
+            }
+            match evaluate_watch_event_authorization(
+                context,
+                subscription.owner,
+                &subscription.authorization,
+                event,
+            )
+            .await?
+            {
+                WatchAuthorization::Authorized => records.extend(routed),
+                WatchAuthorization::Denied(_) => {}
+                WatchAuthorization::Unavailable(error) => return Err(error),
+            }
+        }
     }
     upsert_inbox_records_reporting(&context.storage_handle, &records)
         .await
@@ -55,8 +74,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::structs::{
-        Actor, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
-        RealmNodeKind, WatchEventDetail, WatchEventKind, WatchEventMask, data_watch_resource_path,
+        Actor, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmNodeKind, WatchEventDetail, WatchEventKind, WatchEventMask,
+        blob_object_permission_path, data_watch_resource_path,
     };
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -218,6 +238,67 @@ mod tests {
                 .expect("no subscriptions"),
             (InboxWriteOutcome::default(), false)
         );
+        assert_eq!(count_inbox(&context.storage_handle).await, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_event_deny_suppresses_nested_object() {
+        let (_dir, context) = temp_context();
+        let realm = RealmId([4u8; 32]);
+        let (local_node_id, config) = local_config(realm);
+        let owner = user(realm, 1);
+        let actor = user(realm, 2);
+        let group_id = Ulid::from_bytes([6u8; 16]);
+        install_authorization(&context, realm, local_node_id, group_id, owner).await;
+        create_watch_subscription(
+            &context.storage_handle,
+            owner,
+            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            1,
+        )
+        .await
+        .expect("create");
+
+        let mut group = GroupAuthorizationDocument::new_default_group_doc(owner, realm, group_id);
+        group
+            .roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .expect("admin role")
+            .permissions
+            .insert(
+                blob_object_permission_path(realm, group_id, local_node_id, "bucket", "object"),
+                Permission::DENY,
+            );
+        let actor_record = Actor {
+            node_id: local_node_id,
+            user_id: owner,
+            realm_id: realm,
+        };
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: group_id.to_bytes().to_vec().into(),
+                    value: group.to_bytes(&actor_record).unwrap().into(),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        let outcome = expand_watch_events(
+            &context,
+            realm,
+            &config,
+            local_node_id,
+            &[upload_event(realm, actor, group_id, local_node_id)],
+        )
+        .await
+        .expect("denied event is suppressed");
+        assert_eq!(outcome.0.written, 0);
         assert_eq!(count_inbox(&context.storage_handle).await, 0);
     }
 

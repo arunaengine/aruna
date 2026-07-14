@@ -143,6 +143,7 @@ pub fn route_watch_event(
             kind: event.notification_kind(),
             created_at_ms: event.occurred_at_ms,
             read_at_ms: None,
+            watch_authorization: Some(subscription.authorization.clone()),
         });
     }
     records
