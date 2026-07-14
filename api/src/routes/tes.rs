@@ -359,7 +359,7 @@ pub async fn create_task(
         Err(error) => return TesError::from_server(error).into_response(),
     };
 
-    let (spec, dedup_key) = match map_task_to_spec(&task) {
+    let (spec, idempotency_key) = match map_task_to_spec(&task) {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
     };
@@ -375,7 +375,7 @@ pub async fn create_task(
         spec,
         auth.user_id,
         state.get_node_id(),
-        dedup_key,
+        idempotency_key,
     )
     .await
     {
@@ -566,7 +566,7 @@ pub async fn cancel_task(
 
 /// Map a TES task onto the internal execution plan and optional dedup key.
 /// Pure and self-contained: the group-write permission check happens separately.
-fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<Vec<u8>>), TesError> {
+fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), TesError> {
     let executor = match task.executors.as_slice() {
         [executor] => executor,
         [] => {
@@ -603,7 +603,10 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<Vec<u8>>), 
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
         let input = map_input(input)?;
-        if inputs.iter().any(|existing| existing.dest_key == input.dest_key) {
+        if inputs
+            .iter()
+            .any(|existing| existing.dest_key == input.dest_key)
+        {
             return Err(TesError::bad_request("duplicate input destination"));
         }
         inputs.push(input);
@@ -642,12 +645,11 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<Vec<u8>>), 
         output_prefixes,
     };
 
-    let dedup_key = task
-        .tags
-        .get(IDEMPOTENCY_TAG_KEY)
-        .map(|key| key.clone().into_bytes());
+    // Handed over as the raw idempotency key: `submit_execution_job` applies the per-user
+    // `user/` namespacing itself, so TES inherits dedup scoping for free.
+    let idempotency_key = task.tags.get(IDEMPOTENCY_TAG_KEY).cloned();
 
-    Ok((spec, dedup_key))
+    Ok((spec, idempotency_key))
 }
 
 fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
@@ -812,8 +814,8 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
 }
 
 fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
-    let started = matches!(record.state, JobState::Running | JobState::Cancelling)
-        || record.result.is_some();
+    let started =
+        matches!(record.state, JobState::Running | JobState::Cancelling) || record.result.is_some();
     let start_time = started.then(|| rfc3339(record.created_at_ms));
     let mut executor_log = TesExecutorLog {
         start_time: start_time.clone(),
@@ -1118,7 +1120,10 @@ mod tests {
         input.url = Some("s3://src/other.csv".to_string());
         input.path.insert(0, '/');
         task.inputs.push(input);
-        assert_eq!(map_task_to_spec(&task).unwrap_err().status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            map_task_to_spec(&task).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -1126,7 +1131,10 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         for ram_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
             task.resources.as_mut().unwrap().ram_gb = Some(ram_gb);
-            assert_eq!(map_task_to_spec(&task).unwrap_err().status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                map_task_to_spec(&task).unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 
