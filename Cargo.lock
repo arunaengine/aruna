@@ -181,6 +181,7 @@ version = "3.0.0-alpha.34"
 dependencies = [
  "aruna-api",
  "aruna-blob",
+ "aruna-compute",
  "aruna-core",
  "aruna-net",
  "aruna-operations",
@@ -213,6 +214,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

@@ -7,7 +7,7 @@ use aruna_core::keyspaces::{JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key, parse_job_dedup_value};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, NodeId, UserId};
+use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -53,9 +53,21 @@ pub enum SubmitJobError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SubmitState {
     Init,
-    ReadDedup,
-    VerifyDedup { job_id: JobId, digest_matches: bool },
-    WriteJob,
+    StartTransaction,
+    ReadDedup {
+        txn_id: TxnId,
+    },
+    VerifyDedup {
+        txn_id: TxnId,
+        job_id: JobId,
+        digest_matches: bool,
+    },
+    WriteJob {
+        txn_id: Option<TxnId>,
+    },
+    CommitTransaction {
+        txn_id: TxnId,
+    },
     ScheduleDrain,
     Finish,
     Error,
@@ -65,10 +77,9 @@ enum SubmitState {
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
 /// digest), in both cases only after verifying that job's record still exists
 /// and decodes. A dangling entry (record quarantined or gone) falls through to a
-/// fresh create whose batch write repoints the dedup row, so a ghost row can
-/// neither poison its key nor conflict against a dead job. Dedup is best-effort
-/// (read-then-write, no cross-submit lock), so under a concurrent race two jobs
-/// may share a key.
+/// fresh create whose transactional batch write repoints the dedup row, so a ghost
+/// row can neither poison its key nor conflict against a dead job. Concurrent
+/// creates are serialized by the storage transaction.
 /// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
 /// the example).
 #[derive(Debug, PartialEq)]
@@ -97,46 +108,70 @@ impl SubmitJobOperation {
     }
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {
+        let txn_id = match self.state {
+            SubmitState::ReadDedup { txn_id }
+            | SubmitState::VerifyDedup { txn_id, .. }
+            | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
+            SubmitState::WriteJob { txn_id } => txn_id,
+            _ => None,
+        };
         self.state = SubmitState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
+            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        })
+    }
+
+    fn start_transaction(&mut self) -> Effects {
+        self.state = SubmitState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
+        })]
     }
 
     fn begin(&mut self) -> Effects {
         match self.record.dedup_key.clone() {
-            Some(dedup_key) => {
-                self.state = SubmitState::ReadDedup;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-                    key: job_dedup_index_key(self.record.created_by, &dedup_key),
-                    txn_id: None,
-                })]
-            }
-            None => self.write_job(),
+            Some(_) => self.start_transaction(),
+            None => self.write_job(None),
         }
     }
 
-    fn verify_dedup(&mut self, job_id: JobId, digest_matches: bool) -> Effects {
+    fn read_dedup(&mut self, txn_id: TxnId) -> Effects {
+        let Some(dedup_key) = self.record.dedup_key.clone() else {
+            return self.write_job(Some(txn_id));
+        };
+        self.state = SubmitState::ReadDedup { txn_id };
+        // Must match the key `job_insert_entries` writes, owner prefix included, or the
+        // reservation read never finds the row it is meant to be reserving against.
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            key: job_dedup_index_key(self.record.created_by, &dedup_key),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn verify_dedup(&mut self, txn_id: TxnId, job_id: JobId, digest_matches: bool) -> Effects {
         self.state = SubmitState::VerifyDedup {
+            txn_id,
             job_id,
             digest_matches,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: JOB_KEYSPACE.to_string(),
             key: job_record_key(job_id),
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
     }
 
-    fn write_job(&mut self) -> Effects {
+    fn write_job(&mut self, txn_id: Option<TxnId>) -> Effects {
         let writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = SubmitState::WriteJob;
+        self.state = SubmitState::WriteJob { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
-            txn_id: None,
+            txn_id,
         })]
     }
 
@@ -145,13 +180,13 @@ impl SubmitJobOperation {
         smallvec![schedule_job_drain_effect()]
     }
 
-    fn finish_existing(&mut self, job_id: JobId) -> Effects {
+    fn finish_existing(&mut self, txn_id: TxnId, job_id: JobId) -> Effects {
         self.state = SubmitState::Finish;
         self.output = Some(Ok(SubmitJobResult {
             job_id,
             created: false,
         }));
-        smallvec![]
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
     fn finish_created(&mut self) -> Effects {
@@ -175,7 +210,14 @@ impl Operation for SubmitJobOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             SubmitState::Init => self.begin(),
-            SubmitState::ReadDedup => match event {
+            SubmitState::StartTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.read_dedup(txn_id)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::ReadDedup { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match parse_job_dedup_value(value.as_ref()) {
@@ -185,39 +227,56 @@ impl Operation for SubmitJobOperation {
                     Ok((existing_job_id, existing_digest)) => {
                         let digest_matches =
                             self.record.plan_digest.unwrap_or_default() == existing_digest;
-                        self.verify_dedup(existing_job_id, digest_matches)
+                        self.verify_dedup(txn_id, existing_job_id, digest_matches)
                     }
-                    Err(_) => self.write_job(),
+                    Err(_) => self.write_job(Some(txn_id)),
                 },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                    self.write_job(Some(txn_id))
+                }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
             SubmitState::VerifyDedup {
+                txn_id,
                 job_id,
                 digest_matches,
             } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => match decode_job_record(&value) {
-                    Ok(_) if digest_matches => self.finish_existing(job_id),
+                    Ok(_) if digest_matches => self.finish_existing(txn_id, job_id),
                     Ok(_) => self.fail(SubmitJobError::JobPlanConflict {
                         existing_job_id: job_id,
                     }),
                     Err(error) => {
                         warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
-                        self.write_job()
+                        self.write_job(Some(txn_id))
                     }
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
                     warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
-                    self.write_job()
+                    self.write_job(Some(txn_id))
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
-            SubmitState::WriteJob => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.schedule_drain(),
+            SubmitState::WriteJob { txn_id } => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
+                    Some(txn_id) => {
+                        self.state = SubmitState::CommitTransaction { txn_id };
+                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    }
+                    None => self.schedule_drain(),
+                },
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::CommitTransaction { .. } => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) => self.start_transaction(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
@@ -247,7 +306,16 @@ impl Operation for SubmitJobOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        let txn_id = match self.state {
+            SubmitState::ReadDedup { txn_id }
+            | SubmitState::VerifyDedup { txn_id, .. }
+            | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
+            SubmitState::WriteJob { txn_id } => txn_id,
+            _ => None,
+        };
+        txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
+            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        })
     }
 }
 
@@ -487,21 +555,23 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
+        let submission = spec(Some(b"k".to_vec()));
+        let created_by = submission.created_by;
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            ByteView::from(b"k".to_vec()),
+            job_dedup_index_key(created_by, b"k"),
             ByteView::from(encode_job_dedup_value(ghost, [0xAB; 32])),
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
             .await
             .expect("ghost row must not conflict");
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, b"k", None)
+            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
