@@ -1100,6 +1100,36 @@ mod tests {
         assert_eq!(record.claim.unwrap().holder_node_id, node_id(4));
     }
 
+    // A saturated executor never drains, so a never-run job must terminalize in the store
+    // transaction itself rather than wait for a claim that is not coming.
+    #[tokio::test]
+    async fn cancel_beats_capacity() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::with_capacity(0);
+        let job_id = JobId::from_bytes([0x6C; 16]);
+        let record = probe_record(job_id, 5, 0, None);
+        let owner = record.created_by;
+        insert_job(&storage, &record).await.unwrap();
+        assert_eq!(runtime.available_slots(), 0);
+
+        let outcome = crate::jobs::service::cancel_owned_job(&ctx, &runtime, owner, job_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::jobs::service::CancelJobOutcome::Requested(_)
+        ));
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+        assert!(stored.finished_at_ms.is_some());
+        assert!(stored.claim.is_none());
+    }
+
     #[tokio::test]
     async fn wait_times_out() {
         let (_dir, storage) = temp_storage();

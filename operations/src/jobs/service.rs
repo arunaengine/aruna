@@ -75,6 +75,9 @@ pub async fn cancel_owned_job(
     };
     Ok(match outcome {
         CancelRequestOutcome::AlreadyTerminal(record) => CancelJobOutcome::AlreadyTerminal(record),
+        // Already terminalized in the store transaction: nothing runs locally to poke and
+        // no drain pass is needed.
+        CancelRequestOutcome::Cancelled(record) => CancelJobOutcome::Requested(record),
         CancelRequestOutcome::Flagged(record) => {
             runtime.request_cancel(job_id);
             kick_drain(context).await;

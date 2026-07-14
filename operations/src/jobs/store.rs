@@ -549,18 +549,37 @@ pub async fn release_job(
 }
 
 pub enum CancelRequestOutcome {
+    Cancelled(JobRecord),
     Flagged(JobRecord),
     AlreadyTerminal(JobRecord),
 }
 
-/// Idempotently set `cancel_requested`; a terminal job is a no-op.
+/// Idempotently set `cancel_requested`; a terminal job is a no-op. A queued job that never
+/// ran is terminalized right here: it owns no side effects to clean up, and leaving it for
+/// the drain would strand it `Queued` for as long as the executor stays at capacity.
 pub async fn set_cancel_requested(
     storage: &StorageHandle,
     job_id: JobId,
     now_ms: u64,
 ) -> Result<CancelRequestOutcome, JobMutationError> {
+    let mut cancelled_now = false;
     let record = mutate_job(storage, job_id, |record| {
-        if record.state.is_terminal() || record.cancel_requested {
+        cancelled_now = false;
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        // `has_run`, not `attempts == 0`: a job interrupted by a shutdown hands its lease
+        // back without spending an attempt, so attempts alone cannot prove it never ran.
+        if record.state == JobState::Queued && !record.has_run {
+            record.cancel_requested = true;
+            record.state = JobState::Cancelled;
+            record.finished_at_ms = Some(now_ms);
+            record.updated_at_ms = now_ms;
+            record.claim = None;
+            cancelled_now = true;
+            return Ok(JobMutation::Persist);
+        }
+        if record.cancel_requested {
             return Ok(JobMutation::Skip);
         }
         record.cancel_requested = true;
@@ -569,7 +588,9 @@ pub async fn set_cancel_requested(
     })
     .await?;
 
-    Ok(if record.state.is_terminal() {
+    Ok(if cancelled_now {
+        CancelRequestOutcome::Cancelled(record)
+    } else if record.state.is_terminal() {
         CancelRequestOutcome::AlreadyTerminal(record)
     } else {
         CancelRequestOutcome::Flagged(record)
