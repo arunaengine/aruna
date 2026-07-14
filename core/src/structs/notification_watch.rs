@@ -243,7 +243,10 @@ impl WatchAuthorizationBinding {
     pub fn is_valid(&self) -> bool {
         self.expires_at_secs > 0
             && self.token_hash.len() == 64
-            && self.token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && self
+                .token_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             && self
                 .path_restrictions
                 .iter()
@@ -787,6 +790,14 @@ mod tests {
             watch_notification_id(event_id, watch_id),
             watch_notification_id(Ulid::from_bytes([9u8; 16]), watch_id)
         );
+    }
+
+    #[test]
+    fn watch_authorization_hash_must_be_canonical() {
+        let mut binding = WatchAuthorizationBinding::default();
+        assert!(binding.is_valid());
+        binding.token_hash.make_ascii_uppercase();
+        assert!(!binding.is_valid());
     }
 
     #[test]
