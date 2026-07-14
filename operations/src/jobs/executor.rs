@@ -110,6 +110,9 @@ async fn run_probe(
         let _ = std::fs::write(marker, b"running");
     }
     for step in 0..steps {
+        // A zero-sleep probe never awaits otherwise, so it would starve everything else
+        // sharing its worker until the whole run finished.
+        tokio::task::yield_now().await;
         if ctx.cancel.is_cancelled() {
             return JobRunOutcome::Cancelled;
         }
