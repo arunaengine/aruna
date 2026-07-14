@@ -1,10 +1,18 @@
-//! Reusable realm fixture with more sync-eligible nodes than the placement
-//! replication factor, so holder and non-holder paths are distinguishable.
+//! Realm fixture with more sync-eligible nodes than the placement replication
+//! factor, so holder and non-holder paths are distinguishable.
 //!
-//! Fixtures sized at or below the replication factor make every node a holder
-//! of every subject, which silently collapses non-holder coverage. [`Topology`]
-//! keeps `node_count > replication_factor` and exposes exact, resolver-derived
-//! holder proofs instead of probabilistic ones.
+//! Fixtures sized at or below the replication factor make every node a holder of
+//! every bucket, which silently collapses non-holder coverage. [`Topology`] keeps
+//! `node_count > replication_factor` and derives holders the way production does:
+//! a create stamps the best-ranked bucket its origin already holds
+//! ([`choose_origin_bucket`], DECISIONS D3), so holdership is proved against that
+//! stamped [`PlacementRef`] and never against a blind document hash.
+//!
+//! Only metadata document buckets are replica-capped. Group, user, auth and
+//! registry documents are bound to the `everywhere` strategy (DECISIONS B1), so
+//! every sync-eligible node holds them and a non-holder of one is not a reachable
+//! state: this fixture cannot express it and must not pretend to. That is why
+//! every holder query here is keyed on a stamped bucket rather than on a target.
 
 #![allow(dead_code)]
 
@@ -18,7 +26,10 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{
+    Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
+    RealmNodeKind,
+};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -27,13 +38,16 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::placement::{PlacementResolutionContext, plan_target_placement};
-use aruna_operations::sync_placement::sort_node_ids;
+use aruna_operations::placement::{
+    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, resolve_shard_holders,
+    strategy_for_target,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
+use ulid::Ulid;
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -67,9 +81,9 @@ impl Topology {
     /// Spawns a meshed realm of `node_count` Management nodes whose default
     /// placement strategy replicates to `replication_factor` holders.
     ///
-    /// Panics unless `node_count > replication_factor`: a fixture at or below
-    /// the factor cannot express a non-holder and would quietly void every
-    /// assertion this module exists to make.
+    /// Panics unless `node_count > replication_factor`: a fixture at or below the
+    /// factor cannot express a non-holder and would quietly void every assertion
+    /// this module exists to make.
     pub async fn spawn(
         realm_id: RealmId,
         node_count: usize,
@@ -133,119 +147,108 @@ impl Topology {
         }
     }
 
-    /// Holder set the placement resolver assigns to `target`, sorted.
-    pub fn holders(
+    /// The bucket a create on `origin` stamps (D3): the best-ranked bucket the
+    /// origin already holds, chosen on `(realm_id, group_id, path)`. The origin is
+    /// therefore always a holder of what it creates.
+    ///
+    /// `None` when the origin holds no bucket of the governing strategy.
+    pub fn origin_placement(
         &self,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> Vec<NodeId> {
-        let mut holders = plan_target_placement(&self.config, target, context)
-            .expect("realm config resolves a placement strategy for the target")
-            .holders;
-        sort_node_ids(&mut holders);
-        holders
+        origin: &TestNode,
+        group_id: Ulid,
+        document_id: Ulid,
+        document_path: &str,
+    ) -> Option<PlacementRef> {
+        let path = MetadataRegistryRecord::normalize_document_path(document_path);
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let (strategy, _) = strategy_for_target(
+            &self.config,
+            &target,
+            PlacementResolutionContext {
+                group_id: Some(group_id),
+                metadata_path: Some(path.as_str()),
+            },
+        )?;
+        choose_origin_bucket(
+            &self.config,
+            strategy,
+            origin.node_id(),
+            &meta_bucket_subject(self.realm_id, group_id, &path),
+        )
     }
 
-    pub fn is_holder(
-        &self,
-        node_id: NodeId,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> bool {
-        self.holders(target, context).contains(&node_id)
+    /// Rank-ordered holders of `placement`, exactly as every node derives them.
+    pub fn holders(&self, placement: &PlacementRef) -> Vec<NodeId> {
+        resolve_shard_holders(&self.config, placement)
     }
 
-    pub fn non_holder_ids(
-        &self,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> Vec<NodeId> {
-        let holders = self.holders(target, context);
+    pub fn is_holder(&self, node_id: NodeId, placement: &PlacementRef) -> bool {
+        self.holders(placement).contains(&node_id)
+    }
+
+    pub fn non_holder_ids(&self, placement: &PlacementRef) -> Vec<NodeId> {
+        let holders = self.holders(placement);
         self.node_ids()
             .into_iter()
             .filter(|node_id| !holders.contains(node_id))
             .collect()
     }
 
-    /// Proves `node_id` holds nothing for `target` and returns the holder set.
+    /// Proves `node_id` holds nothing of `placement` and returns the holder set.
     ///
-    /// The proof is exact, not statistical: placement is a pure function of the
-    /// replicated realm config, so the resolver is re-run here. It also asserts
-    /// the strategy actually capped the holder set below the fixture size,
-    /// which is what makes "non-holder" a meaningful state at all.
-    pub fn assert_not_holder(
-        &self,
-        node_id: NodeId,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> Vec<NodeId> {
-        let holders = self.holders(target, context);
+    /// The proof is exact, not statistical: holders are a pure function of the
+    /// replicated realm config and the stamped bucket, so the resolver is re-run
+    /// here. It also asserts the strategy capped the holder set below the fixture
+    /// size, which is what makes "non-holder" meaningful at all.
+    pub fn assert_not_holder(&self, node_id: NodeId, placement: &PlacementRef) -> Vec<NodeId> {
+        let holders = self.holders(placement);
         assert!(
             holders.len() < self.nodes.len(),
-            "placement selected every fixture node for {target:?}; \
+            "placement selected every fixture node for {placement:?}; \
              non-holder coverage is void (holders={holders:?})"
         );
         assert!(
             !holders.contains(&node_id),
-            "node {node_id} is a holder of {target:?} (holders={holders:?})"
+            "node {node_id} is a holder of {placement:?} (holders={holders:?})"
         );
         holders
     }
 
-    pub fn assert_holder(
-        &self,
-        node_id: NodeId,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> Vec<NodeId> {
-        let holders = self.holders(target, context);
+    pub fn assert_holder(&self, node_id: NodeId, placement: &PlacementRef) -> Vec<NodeId> {
+        let holders = self.holders(placement);
         assert!(
             holders.contains(&node_id),
-            "node {node_id} is not a holder of {target:?} (holders={holders:?})"
+            "node {node_id} is not a holder of {placement:?} (holders={holders:?})"
         );
         holders
     }
 
-    /// First fixture node that holds nothing for `target`, with the proof run.
-    pub fn non_holder(
-        &self,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> &TestNode {
+    /// First fixture node that holds nothing of `placement`, with the proof run.
+    pub fn non_holder(&self, placement: &PlacementRef) -> &TestNode {
         let node_id = *self
-            .non_holder_ids(target, context)
+            .non_holder_ids(placement)
             .first()
-            .expect("fixture above the replication factor always has a non-holder");
-        self.assert_not_holder(node_id, target, context);
+            .expect("a realm above the replication factor always has a non-holder");
+        self.assert_not_holder(node_id, placement);
         self.find(node_id)
     }
 
-    pub fn holder(
-        &self,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> &TestNode {
+    /// Rank-0 holder of `placement`.
+    pub fn holder(&self, placement: &PlacementRef) -> &TestNode {
         let node_id = *self
-            .holders(target, context)
+            .holders(placement)
             .first()
             .expect("placement resolves at least one holder");
         self.find(node_id)
     }
 
-    /// Every node's own view of the holder set, for cross-node agreement checks.
-    pub async fn holder_views(
-        &self,
-        target: &DocumentSyncTarget,
-        context: PlacementResolutionContext<'_>,
-    ) -> TestResult<Vec<Vec<NodeId>>> {
+    /// Every node's own view of the holder set, from the config it replicated, for
+    /// cross-node agreement checks.
+    pub async fn holder_views(&self, placement: &PlacementRef) -> TestResult<Vec<Vec<NodeId>>> {
         let mut views = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let config = read_realm_config(node, self.realm_id).await?;
-            let mut holders = plan_target_placement(&config, target, context)
-                .expect("replicated realm config resolves the same strategy")
-                .holders;
-            sort_node_ids(&mut holders);
-            views.push(holders);
+            views.push(resolve_shard_holders(&config, placement));
         }
         Ok(views)
     }
@@ -340,25 +343,67 @@ async fn install_realm_config(
             user_id: aruna_core::UserId::nil(realm_id),
             realm_id,
         };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
+        write(
+            node,
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            config.to_bytes(&actor)?,
+        )
+        .await?;
         node.net.refresh_realm_peers_from_document(&config).await?;
     }
 
-    Ok(config)
+    // The startup hook, exactly as the binary runs it after loading the config: it
+    // joins the shared realm topics and reconciles the held shard topics. Nothing
+    // can be published onto a shard topic before its rank-0 holder has minted the
+    // genesis, so without this every write onto a bucket defers forever. A node
+    // whose rank-0 co-holder has not minted one yet leaves it for the next pass, so
+    // run until the reconciler reports clean rather than a fixed number of passes.
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        for node in nodes {
+            aruna_operations::startup::restore_shard_subscriptions(
+                &node.context,
+                node.node_id(),
+                realm_id,
+            )
+            .await;
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_operations::process_placements::process_shard_placements(
+                &node.context,
+                realm_id,
+                node.node_id(),
+            )
+            .await
+            .retry_scheduled;
+        }
+        if !retry {
+            return Ok(config);
+        }
+        if Instant::now() >= deadline {
+            return Err("shard placement reconciliation never reported clean".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn write(node: &TestNode, key_space: &str, key: Vec<u8>, value: Vec<u8>) -> TestResult<()> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected write event in `{key_space}`: {other:?}").into()),
+    }
 }
 
 async fn read_realm_config(node: &TestNode, realm_id: RealmId) -> TestResult<RealmConfigDocument> {

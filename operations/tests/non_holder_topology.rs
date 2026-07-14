@@ -1,49 +1,25 @@
 //! Holder and non-holder coverage on a realm sized above the replication factor.
 //!
 //! Every other multi-node fixture in this workspace runs at `node_count <= RF`,
-//! where every node holds every subject and non-holder behaviour is
-//! unobservable. These tests run five nodes at RF three and assert the
-//! not-a-holder precondition through the placement resolver before exercising
-//! the path, so a regression to universal holdership fails the fixture instead
-//! of quietly voiding the test.
+//! where every node holds every bucket and non-holder behaviour is unobservable.
+//! These tests run five nodes at RF three and prove holdership against the bucket
+//! a create actually stamps before exercising the path, so a regression to
+//! universal holdership fails the fixture instead of quietly voiding the test.
 
 mod topology;
 
-use std::collections::{HashMap, HashSet};
-
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::AUTH_KEYSPACE;
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId, Role,
-};
-use aruna_operations::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_core::metadata::MetadataError;
+use aruna_core::structs::{PlacementRef, RealmId};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
-use aruna_operations::delete_metadata_document::{
-    DeleteMetadataDocumentError, DeleteMetadataDocumentOperation,
-};
 use aruna_operations::driver::drive;
-use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::get_metadata_document::{
-    GetMetadataDocumentError, GetMetadataDocumentOperation,
+    GetMetadataDocumentError, GetMetadataDocumentOperation, load_metadata_record_by_document,
 };
 use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::placement::PlacementResolutionContext;
-use aruna_operations::read_user_document::ReadUserDocumentOperation;
-use aruna_operations::register_or_get_oidc_user::{
-    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-};
-use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation,
-};
+use aruna_operations::sync_placement::sort_node_ids;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_until};
@@ -55,31 +31,29 @@ const REPLICATION_FACTOR: u32 = 3;
 // degrades silently into the all-nodes-hold-everything case.
 #[tokio::test]
 async fn fixture_proves_nonholders() -> TestResult<()> {
-    let realm_id = RealmId([90u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
+    let realm = Topology::spawn(RealmId([90u8; 32]), NODE_COUNT, REPLICATION_FACTOR).await?;
 
     let group_id = Ulid::from_bytes([11; 16]);
     let document_id = Ulid::from_bytes([12; 16]);
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let context = PlacementResolutionContext {
-        group_id: Some(group_id),
-        metadata_path: Some("datasets/proof"),
-    };
+    let path = "datasets/proof";
+    let origin = realm.node(0);
 
-    let holders = realm.holders(&target, context);
-    let non_holders = realm.non_holder_ids(&target, context);
+    let placement = realm
+        .origin_placement(origin, group_id, document_id, path)
+        .expect("a Management node holds buckets of the default strategy");
+    let holders = realm.assert_holder(origin.node_id(), &placement);
     assert_eq!(holders.len(), REPLICATION_FACTOR as usize);
+
+    let non_holders = realm.non_holder_ids(&placement);
     assert_eq!(non_holders.len(), NODE_COUNT - REPLICATION_FACTOR as usize);
     for node_id in &non_holders {
-        realm.assert_not_holder(*node_id, &target, context);
-    }
-    for node_id in &holders {
-        realm.assert_holder(*node_id, &target, context);
+        realm.assert_not_holder(*node_id, &placement);
     }
 
-    // Placement is a pure function of the replicated realm config, so the proof
-    // is exact rather than probabilistic: every node must derive the same set.
-    for view in realm.holder_views(&target, context).await? {
+    // Holders are a pure function of the replicated config and the stamped bucket,
+    // so the proof is exact rather than probabilistic: every node derives the same
+    // set, in the same rank order.
+    for view in realm.holder_views(&placement).await? {
         assert_eq!(view, holders, "holder set diverged across nodes");
     }
 
@@ -87,23 +61,29 @@ async fn fixture_proves_nonholders() -> TestResult<()> {
     Ok(())
 }
 
+// D3: a create stamps the best-ranked bucket its origin already holds, so the
+// origin is always a holder of what it creates and can always publish it. A blind
+// document hash would place it anywhere, including on buckets the origin does not
+// hold - the state that makes an offline node's writes undeliverable.
 #[tokio::test]
-async fn create_off_holders() -> TestResult<()> {
-    let realm_id = RealmId([91u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
+async fn create_stamps_origin() -> TestResult<()> {
+    let realm = Topology::spawn(RealmId([91u8; 32]), NODE_COUNT, REPLICATION_FACTOR).await?;
 
     let group_id = Ulid::from_bytes([21; 16]);
     let document_id = Ulid::from_bytes([22; 16]);
-    let document_path = "datasets/created-off-holders";
-    let (target, context) = metadata_subject(group_id, document_id, document_path);
+    let path = "datasets/stamped-by-origin";
+    let origin = realm.node(0);
+    let expected = realm
+        .origin_placement(origin, group_id, document_id, path)
+        .expect("a Management node holds buckets");
+    let holders = realm.assert_holder(origin.node_id(), &expected);
 
-    let origin = realm.non_holder(&target, context);
-    let holders = realm.assert_not_holder(origin.node_id(), &target, context);
+    let created = create_document(&realm, origin, group_id, document_id, path).await?;
+    assert_eq!(
+        created, expected,
+        "create stamped a bucket it does not hold"
+    );
 
-    create_document(&realm, origin, group_id, document_id, document_path).await?;
-
-    // The write must land on every real holder even though the node that
-    // accepted it holds nothing for the document.
     for holder in &holders {
         let node = realm.find(*holder);
         wait_until("document reaches holder", node.node_id(), || {
@@ -112,47 +92,40 @@ async fn create_off_holders() -> TestResult<()> {
         .await?;
     }
 
-    wait_until("document reaches origin", origin.node_id(), || {
-        document_present(origin, group_id, document_id)
-    })
-    .await?;
     let view = drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
         origin.context.as_ref(),
     )
     .await?;
+    assert_eq!(view.record.placement, expected);
     let mut recorded = view.record.holder_node_ids.clone();
-    recorded.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut planned = holders.clone();
+    sort_node_ids(&mut recorded);
+    sort_node_ids(&mut planned);
     assert_eq!(
-        recorded, holders,
-        "origin recorded a holder set that is not the planned placement"
-    );
-    assert!(
-        !recorded.contains(&origin.node_id()),
-        "non-holder origin recorded itself as a holder"
+        recorded, planned,
+        "origin recorded a holder set that is not the stamped bucket's"
     );
 
     realm.shutdown().await;
     Ok(())
 }
 
-// A node that neither authored the document nor holds it has no copy and no
-// forwarding path on main: the miss is definitive, not an unavailability error.
+// A non-holder carries the document's registry row - the row rides the
+// everywhere-bound registry class, which is what lets it route reads and writes -
+// but it holds no bucket of the document, so it has no graph. The miss is
+// therefore the graph's, not the record's.
 #[tokio::test]
 async fn read_misses_nonholder() -> TestResult<()> {
-    let realm_id = RealmId([92u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
+    let realm = Topology::spawn(RealmId([92u8; 32]), NODE_COUNT, REPLICATION_FACTOR).await?;
 
     let group_id = Ulid::from_bytes([31; 16]);
     let document_id = Ulid::from_bytes([32; 16]);
-    let document_path = "datasets/read-off-holders";
-    let (target, context) = metadata_subject(group_id, document_id, document_path);
+    let path = "datasets/read-off-holders";
+    let origin = realm.node(0);
+    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let holders = realm.assert_holder(origin.node_id(), &placement);
 
-    let holders = realm.holders(&target, context);
-    let origin = realm.holder(&target, context);
-    realm.assert_holder(origin.node_id(), &target, context);
-
-    create_document(&realm, origin, group_id, document_id, document_path).await?;
     for holder in &holders {
         let node = realm.find(*holder);
         wait_until("document reaches holder", node.node_id(), || {
@@ -161,7 +134,14 @@ async fn read_misses_nonholder() -> TestResult<()> {
         .await?;
     }
 
-    let bystander = realm.non_holder(&target, context);
+    let bystander = realm.non_holder(&placement);
+    wait_until(
+        "registry row reaches non-holder",
+        bystander.node_id(),
+        || registry_row_present(bystander, document_id),
+    )
+    .await?;
+
     let result = drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
         bystander.context.as_ref(),
@@ -169,402 +149,60 @@ async fn read_misses_nonholder() -> TestResult<()> {
     .await;
     assert_eq!(
         result.unwrap_err(),
-        GetMetadataDocumentError::DocumentNotFound,
-        "non-holder served a document it never received"
+        GetMetadataDocumentError::MetadataError(MetadataError::GraphNotFound),
+        "non-holder served a graph it never received"
     );
 
     realm.shutdown().await;
     Ok(())
 }
 
-// What main actually pins for a bystander (no registry copy, not the author):
-// the metadata write ops carry no holdership or authorship gate, so the failure
-// is exactly the first local registry read missing (`DocumentNotFound`), the
-// same miss `read_misses_nonholder` pins. #398's forward-before-acceptance
-// routing is unimplemented: a non-holder that had acquired a registry copy
-// would accept the mutation locally (event + outbox) with no forward and no
-// holder check. Do not seed such a copy here until #398 lands.
-#[tokio::test]
-async fn bystander_writes_miss() -> TestResult<()> {
-    let realm_id = RealmId([97u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
-
-    let group_id = Ulid::from_bytes([81; 16]);
-    let document_id = Ulid::from_bytes([82; 16]);
-    let document_path = "datasets/bystander-writes";
-    let (target, context) = metadata_subject(group_id, document_id, document_path);
-
-    let holders = realm.holders(&target, context);
-    let origin = realm.holder(&target, context);
-    create_document(&realm, origin, group_id, document_id, document_path).await?;
-    for holder in &holders {
-        let node = realm.find(*holder);
-        wait_until("document reaches holder", node.node_id(), || {
-            document_present(node, group_id, document_id)
-        })
-        .await?;
-    }
-
-    let bystander = realm.non_holder(&target, context);
-    realm.assert_not_holder(bystander.node_id(), &target, context);
-    let actor = realm.actor(
-        bystander,
-        UserId::local(Ulid::from_bytes([83; 16]), realm_id),
-    );
-
-    let updated = drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: actor.clone(),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
-                jsonld: r#"{"@id":"./ghost.txt","@type":"File","name":"ghost.txt"}"#.to_string(),
-            },
-        }),
-        bystander.context.as_ref(),
-    )
-    .await;
-    assert_eq!(
-        updated.unwrap_err(),
-        UpdateMetadataDocumentError::DocumentNotFound,
-        "bystander update must fail on the local registry miss"
-    );
-
-    let deleted = drive(
-        DeleteMetadataDocumentOperation::new(actor, group_id, document_id),
-        bystander.context.as_ref(),
-    )
-    .await;
-    assert_eq!(
-        deleted.unwrap_err(),
-        DeleteMetadataDocumentError::DocumentNotFound,
-        "bystander delete must fail on the local registry miss"
-    );
-
-    // The failed writes must not have disturbed the real holders.
-    for holder in &holders {
-        let node = realm.find(*holder);
-        let view = drive(
-            GetMetadataDocumentOperation::new(group_id, document_id),
-            node.context.as_ref(),
-        )
-        .await?;
-        assert!(!view.jsonld.contains("ghost.txt"));
-    }
-
-    realm.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn mutate_off_holders() -> TestResult<()> {
-    let realm_id = RealmId([93u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
-
-    let group_id = Ulid::from_bytes([41; 16]);
-    let document_id = Ulid::from_bytes([42; 16]);
-    let document_path = "datasets/mutated-off-holders";
-    let (target, context) = metadata_subject(group_id, document_id, document_path);
-
-    let origin = realm.non_holder(&target, context);
-    let holders = realm.assert_not_holder(origin.node_id(), &target, context);
-
-    create_document(&realm, origin, group_id, document_id, document_path).await?;
-    for holder in &holders {
-        let node = realm.find(*holder);
-        wait_until("document reaches holder", node.node_id(), || {
-            document_present(node, group_id, document_id)
-        })
-        .await?;
-    }
-
-    drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
-            actor: realm.actor(origin, UserId::local(Ulid::from_bytes([43; 16]), realm_id)),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
-                jsonld: r#"{"@id":"./off-holder.txt","@type":"File","name":"off-holder.txt"}"#
-                    .to_string(),
-            },
-        }),
-        origin.context.as_ref(),
-    )
-    .await?;
-
-    for holder in &holders {
-        let node = realm.find(*holder);
-        wait_until("update reaches holder", node.node_id(), || async {
-            drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
-                node.context.as_ref(),
-            )
-            .await
-            .is_ok_and(|view| view.jsonld.contains("off-holder.txt"))
-        })
-        .await?;
-    }
-
-    drive(
-        DeleteMetadataDocumentOperation::new(
-            realm.actor(origin, UserId::local(Ulid::from_bytes([44; 16]), realm_id)),
-            group_id,
-            document_id,
-        ),
-        origin.context.as_ref(),
-    )
-    .await?;
-
-    for holder in &holders {
-        let node = realm.find(*holder);
-        wait_until("delete reaches holder", node.node_id(), || async {
-            matches!(
-                drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
-                    node.context.as_ref(),
-                )
-                .await,
-                Err(GetMetadataDocumentError::DocumentNotFound)
-            )
-        })
-        .await?;
-    }
-
-    realm.shutdown().await;
-    Ok(())
-}
-
-// Group documents are admin-class: they sync as reducer operations over the
-// group topic and never take a placement. A node the resolver would call a
-// non-holder must still accept the write and serve the group.
-#[tokio::test]
-async fn group_write_nonholder() -> TestResult<()> {
-    let realm_id = RealmId([94u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
-    let owner = UserId::local(Ulid::from_bytes([51; 16]), realm_id);
-    seed_realm_authorization(&realm, owner).await?;
-
-    let (group, _) = drive(
-        CreateGroupOperation::new(CreateGroupConfig {
-            actor: realm.actor(realm.node(0), owner),
-            display_name: "off-holder group".to_string(),
-            owner_cap: None,
-        }),
-        realm.node(0).context.as_ref(),
-    )
-    .await?;
-    let group_id = group.group_id;
-
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
-    let context = PlacementResolutionContext {
-        group_id: Some(group_id),
-        metadata_path: None,
-    };
-    let writer = realm.non_holder(&target, context);
-    realm.assert_not_holder(writer.node_id(), &target, context);
-
-    // Presence of the document is not enough: the reducer must also have applied
-    // the owner's admin assignment before the write is authorized.
-    for node in &realm.nodes {
-        wait_until("group reaches node", node.node_id(), || async {
-            drive(
-                GetGroupOperation::new(GetGroupConfig { group_id }),
-                node.context.as_ref(),
-            )
-            .await
-            .is_ok_and(|(_, auth)| {
-                auth.roles
-                    .values()
-                    .any(|role| role.name == "admin" && role.assigned_users.contains(&owner))
-            })
-        })
-        .await?;
-    }
-
-    let role_id = Ulid::from_bytes([52; 16]);
-    drive(
-        AddGroupRoleOperation::new(AddGroupRoleConfig {
-            auth_context: AuthContext {
-                user_id: owner,
-                realm_id,
-                path_restrictions: None,
-            },
-            actor: realm.actor(writer, owner),
-            realm_id,
-            group_id,
-            role: Role {
-                role_id,
-                name: "auditor".to_string(),
-                permissions: HashMap::from([(
-                    format!("/{realm_id}/g/{group_id}/**"),
-                    Permission::READ,
-                )]),
-                assigned_users: HashSet::new(),
-            },
-        }),
-        writer.context.as_ref(),
-    )
-    .await?;
-
-    // The regression this guards: a group write accepted on a node that holds
-    // nothing for the group and then never published anywhere.
-    for node in &realm.nodes {
-        wait_until("role reaches node", node.node_id(), || async {
-            drive(
-                GetGroupOperation::new(GetGroupConfig { group_id }),
-                node.context.as_ref(),
-            )
-            .await
-            .is_ok_and(|(_, auth)| auth.roles.values().any(|role| role.name == "auditor"))
-        })
-        .await?;
-    }
-
-    realm.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn user_write_nonholder() -> TestResult<()> {
-    let realm_id = RealmId([95u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
-
-    let user_id = UserId::local(Ulid::from_bytes([61; 16]), realm_id);
-    let target = DocumentSyncTarget::User { user_id };
-    let context = PlacementResolutionContext::default();
-
-    let origin = realm.non_holder(&target, context);
-    realm.assert_not_holder(origin.node_id(), &target, context);
-
-    drive(
-        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
-            actor: realm.actor(origin, user_id),
-            issuer: "https://issuer.test".to_string(),
-            subject_id: "off-holder-subject".to_string(),
-            name: "Off Holder".to_string(),
-            user_id,
-        }),
-        origin.context.as_ref(),
-    )
-    .await?;
-
-    for node in &realm.nodes {
-        wait_until("user reaches node", node.node_id(), || async {
-            drive(
-                ReadUserDocumentOperation::new(user_id),
-                node.context.as_ref(),
-            )
-            .await
-            .is_ok_and(|user| user.name == "Off Holder")
-        })
-        .await?;
-    }
-
-    realm.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn permission_check_nonholder() -> TestResult<()> {
-    let realm_id = RealmId([96u8; 32]);
-    let realm = Topology::spawn(realm_id, NODE_COUNT, REPLICATION_FACTOR).await?;
-    let owner = UserId::local(Ulid::from_bytes([71; 16]), realm_id);
-    seed_realm_authorization(&realm, owner).await?;
-
-    let (group, _) = drive(
-        CreateGroupOperation::new(CreateGroupConfig {
-            actor: realm.actor(realm.node(0), owner),
-            display_name: "authorized group".to_string(),
-            owner_cap: None,
-        }),
-        realm.node(0).context.as_ref(),
-    )
-    .await?;
-    let group_id = group.group_id;
-
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
-    let context = PlacementResolutionContext {
-        group_id: Some(group_id),
-        metadata_path: None,
-    };
-    let non_holders = realm.non_holder_ids(&target, context);
-    assert!(!non_holders.is_empty());
-
-    let path = format!("/{realm_id}/g/{group_id}/meta/document");
-    for node_id in non_holders {
-        let node = realm.find(node_id);
-        realm.assert_not_holder(node_id, &target, context);
-        wait_until("group auth reaches node", node_id, || {
-            let path = path.clone();
-            async move {
-                drive(
-                    CheckPermissionsOperation::new(CheckPermissionsConfig {
-                        auth_context: AuthContext {
-                            user_id: owner,
-                            realm_id,
-                            path_restrictions: None,
-                        },
-                        path,
-                        required_permission: Permission::READ,
-                    }),
-                    node.context.as_ref(),
-                )
-                .await
-                .is_ok_and(|granted| granted)
-            }
-        })
-        .await?;
-    }
-
-    realm.shutdown().await;
-    Ok(())
-}
-
-fn metadata_subject(
+fn document_config(
+    realm: &Topology,
+    node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> (DocumentSyncTarget, PlacementResolutionContext<'_>) {
-    (
-        DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
-        PlacementResolutionContext {
-            group_id: Some(group_id),
-            metadata_path: Some(document_path),
+) -> CreateMetadataDocumentConfig {
+    CreateMetadataDocumentConfig {
+        actor: realm.actor(
+            node,
+            UserId::local(Ulid::from_bytes([9; 16]), realm.realm_id),
+        ),
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        public: true,
+        payload: CreateMetadataDocumentPayload::Scaffold {
+            name: "Topology Dataset".to_string(),
+            description: "Written on a realm above the replication factor".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
         },
-    )
+    }
 }
 
+/// Creates locally on a bucket-holding node and returns the bucket it stamped.
 async fn create_document(
     realm: &Topology,
     node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> TestResult<()> {
-    drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: realm.actor(
-                node,
-                UserId::local(Ulid::from_bytes([9; 16]), realm.realm_id),
-            ),
+) -> TestResult<PlacementRef> {
+    let created = drive(
+        CreateMetadataDocumentOperation::new(document_config(
+            realm,
+            node,
             group_id,
             document_id,
-            document_path: document_path.to_string(),
-            public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
-                name: "Non-holder Dataset".to_string(),
-                description: "Written on a node outside the holder set".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
-            },
-        }),
+            document_path,
+        )),
         node.context.as_ref(),
     )
     .await?;
     replay_metadata_event_log(node.context.as_ref()).await?;
-    Ok(())
+    Ok(created.record.placement)
 }
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
@@ -576,28 +214,8 @@ async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) ->
     .is_ok()
 }
 
-async fn seed_realm_authorization(realm: &Topology, owner: UserId) -> TestResult<()> {
-    let document = RealmAuthorizationDocument::new_default_realm_doc(realm.realm_id);
-    for node in &realm.nodes {
-        let actor = Actor {
-            node_id: node.node_id(),
-            user_id: owner,
-            realm_id: realm.realm_id,
-        };
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: realm.realm_id.as_bytes().to_vec().into(),
-                value: document.to_bytes(&actor)?.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm auth write event: {other:?}").into()),
-        }
-    }
-    Ok(())
+async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
+    load_metadata_record_by_document(node.context.as_ref(), document_id)
+        .await
+        .is_ok_and(|record| record.is_some())
 }
