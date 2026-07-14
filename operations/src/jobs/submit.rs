@@ -8,12 +8,11 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{JobId, JobPayload, JobRecord, job_record_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, NodeId, UserId};
-use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::{decode_job_record, job_insert_entries};
+use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_job_drain_effect() -> Effect {
@@ -104,7 +103,7 @@ impl SubmitJobOperation {
                 self.state = SubmitState::ReadDedup;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-                    key: ByteView::from(dedup_key),
+                    key: job_dedup_index_key(self.record.created_by, &dedup_key),
                     txn_id: None,
                 })]
             }
@@ -242,6 +241,7 @@ mod tests {
     use aruna_core::structs::{JobState, RealmId};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
+    use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -345,6 +345,26 @@ mod tests {
         assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
     }
 
+    // Equal logical keys from different owners must not share a dedup row.
+    #[tokio::test]
+    async fn dedup_scoped() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+
+        let first = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+            .await
+            .unwrap();
+        let mut other = spec(Some(b"k".to_vec()));
+        other.created_by = UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32]));
+        let second = drive(SubmitJobOperation::new(other), &ctx).await.unwrap();
+
+        assert!(first.created);
+        assert!(second.created);
+        assert_ne!(second.job_id, first.job_id);
+        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 2);
+    }
+
     // Perf budget: a non-dedup submit is one atomic batch write of <=4 keys plus a
     // non-persisted drain kick.
     #[tokio::test]
@@ -378,21 +398,23 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
+        let submission = spec(Some(b"k".to_vec()));
+        let created_by = submission.created_by;
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            ByteView::from(b"k".to_vec()),
+            job_dedup_index_key(created_by, b"k"),
             ByteView::from(ghost.to_bytes().to_vec()),
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
             .await
             .unwrap();
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, b"k", None)
+            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -406,6 +428,8 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let ghost = JobId::from_bytes([9u8; 16]);
+        let submission = spec(Some(b"k".to_vec()));
+        let created_by = submission.created_by;
         write_raw(
             &storage,
             JOB_KEYSPACE,
@@ -416,18 +440,18 @@ mod tests {
         write_raw(
             &storage,
             JOB_DEDUP_INDEX_KEYSPACE,
-            ByteView::from(b"k".to_vec()),
+            job_dedup_index_key(created_by, b"k"),
             ByteView::from(ghost.to_bytes().to_vec()),
         )
         .await;
 
-        let result = drive(SubmitJobOperation::new(spec(Some(b"k".to_vec()))), &ctx)
+        let result = drive(SubmitJobOperation::new(submission), &ctx)
             .await
             .unwrap();
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, b"k", None)
+            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
