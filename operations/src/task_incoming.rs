@@ -599,10 +599,10 @@ impl OperationsTaskHandler {
             // records stay deferred regardless, and re-probing would only waste
             // RPCs.
             //
-            // Only buckets this node holds are pulled. Joining is not holder-gated,
-            // so a non-holder could adopt the genesis here — and would then look
-            // publishable while its publishes went nowhere. Its records belong in
-            // the forwarding path instead.
+            // Only buckets this node holds or formerly held while draining are
+            // pulled. Joining is not holder-gated, so a non-holder could adopt the
+            // genesis here — and would then look publishable while its publishes
+            // went nowhere. Its records belong in the forwarding path instead.
             let mut missing_topics: BTreeMap<
                 Vec<aruna_core::NodeId>,
                 (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
@@ -612,6 +612,10 @@ impl OperationsTaskHandler {
                     || defer_state.deferred_topics.contains(topic)
                     || !realm_config.as_ref().is_none_or(|config| {
                         crate::placement::holds_placement(
+                            config,
+                            &record.placement,
+                            net_handle.node_id(),
+                        ) || crate::placement::is_draining_former_holder(
                             config,
                             &record.placement,
                             net_handle.node_id(),
