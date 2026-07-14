@@ -15,8 +15,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::mutate_realm_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementError, MutateRealmPlacementOperation,
-    RealmPlacementMutation,
+    MutateRealmPlacementConfig, MutateRealmPlacementError, RealmPlacementMutation,
+    drive_realm_placement_mutation,
 };
 use aruna_operations::set_realm_quota::{
     SetRealmQuotaConfig, SetRealmQuotaError, SetRealmQuotaOperation,
@@ -923,8 +923,8 @@ pub async fn mutate_realm_placement(
         user_id: auth.user_id,
         realm_id: auth.realm_id,
     };
-    let document = drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig { actor, mutation }),
+    let document = drive_realm_placement_mutation(
+        MutateRealmPlacementConfig { actor, mutation },
         &state.get_ctx(),
     )
     .await

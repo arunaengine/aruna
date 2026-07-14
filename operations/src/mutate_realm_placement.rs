@@ -711,6 +711,28 @@ impl Operation for MutateRealmPlacementOperation {
     }
 }
 
+/// Drives a realm placement mutation, then — when it drains a node — flushes the
+/// local outbox synchronously (drain fence) so records this node accepted before
+/// its holdership loss reach the shard topics right away, while it is still a
+/// member, rather than waiting for the asynchronous drain timer. The flush is
+/// best-effort: `classify_deferred_record` keeps any leftovers deliverable on the
+/// retryable drain regardless, so a flush failure never strands a record.
+pub async fn drive_realm_placement_mutation(
+    config: MutateRealmPlacementConfig,
+    context: &crate::driver::DriverContext,
+) -> Result<RealmConfigDocument, MutateRealmPlacementError> {
+    let drains_node = matches!(
+        &config.mutation,
+        RealmPlacementMutation::UpsertNode(entry) if entry.draining
+    );
+    let outcome = crate::driver::drive(MutateRealmPlacementOperation::new(config), context).await;
+    if outcome.is_ok() && drains_node && context.net_handle.is_some() {
+        crate::task_incoming::drive_document_sync_outbox_drain(std::sync::Arc::new(context.clone()))
+            .await;
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

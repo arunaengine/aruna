@@ -1608,6 +1608,17 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
 }
 
+/// Runs one document sync outbox drain pass synchronously against `context`.
+/// A placement mutation that drains the local node uses this to flush the
+/// records it accepted before its holdership loss right away, narrowing the
+/// window before the asynchronous drain timer fires; the flush is best-effort,
+/// so a failure simply leaves the records for the retryable drain.
+pub async fn drive_document_sync_outbox_drain(context: Arc<DriverContext>) {
+    OperationsTaskHandler::new(context)
+        .drain_document_sync_outbox()
+        .await;
+}
+
 #[async_trait]
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
