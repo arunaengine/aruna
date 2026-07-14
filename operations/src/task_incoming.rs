@@ -317,7 +317,16 @@ fn classify_deferred_record(
     let Some(config) = config else {
         return DeferOutcome::Retry;
     };
-    if crate::placement::holds_placement(config, &record.placement, net_handle.node_id()) {
+    let node_id = net_handle.node_id();
+    // A draining former-holder still owns publish rights on the shards it held
+    // until it has flushed (flush-then-leave), so its retained records are
+    // publishable, not undeliverable. A true non-holder — one that never held the
+    // bucket, or is fully removed rather than draining — stays undeliverable
+    // (DECISIONS K3): the receiver's history cutoff bounds a departing holder to
+    // its pre-cutover ops.
+    if crate::placement::holds_placement(config, &record.placement, node_id)
+        || crate::placement::is_draining_former_holder(config, &record.placement, node_id)
+    {
         DeferOutcome::Retry
     } else {
         DeferOutcome::Undeliverable

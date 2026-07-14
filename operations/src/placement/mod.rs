@@ -263,6 +263,65 @@ pub fn holds_placement(
     *placement == PlacementRef::NIL || holders.contains(&node_id)
 }
 
+/// Whether `node_id` is a draining former-holder of `placement`: it is marked
+/// draining in the config yet would hold the shard with its own draining flag
+/// cleared. Such a node keeps publish rights on shards it previously held until
+/// its outbox has flushed (flush-then-leave), so its retained records stay
+/// deliverable. A node that was never a holder, or is fully removed from the
+/// config rather than draining, is not a former-holder and its records must
+/// remain undeliverable (DECISIONS K3): only a departing holder may flush.
+pub fn is_draining_former_holder(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+    node_id: NodeId,
+) -> bool {
+    if *placement == PlacementRef::NIL {
+        return false;
+    }
+    if !config
+        .placement_entry(node_id)
+        .is_some_and(|entry| entry.draining)
+    {
+        return false;
+    }
+    let Some(strategy) = config.strategy(&placement.strategy_id) else {
+        return false;
+    };
+    let mut view = build_view(config);
+    for node in view.nodes.iter_mut() {
+        if node.node_id == node_id {
+            node.draining = false;
+        }
+    }
+    resolve_holders(
+        &view,
+        strategy,
+        &shard_subject_bytes(placement),
+        shard_override(config, placement),
+    )
+    .contains(&node_id)
+}
+
+/// Every draining former-holder of `placement` (see [`is_draining_former_holder`]).
+/// Co-holders keep these peers in the shard topic's membership and publisher set
+/// until they leave the config, so their in-flight flush is never cut off. Cheap
+/// no-op when nothing is draining.
+pub fn draining_former_holders(
+    config: &RealmConfigDocument,
+    placement: &PlacementRef,
+) -> Vec<NodeId> {
+    if !config.placement_map.iter().any(|entry| entry.draining) {
+        return Vec::new();
+    }
+    config
+        .placement_map
+        .iter()
+        .filter(|entry| entry.draining)
+        .map(|entry| entry.node_id)
+        .filter(|node_id| is_draining_former_holder(config, placement, *node_id))
+        .collect()
+}
+
 /// Buckets of `strategy` that `node_id` is a holder of. Empty when the node is
 /// not sync-eligible, is unknown to the config, or is filtered out everywhere.
 pub fn held_buckets(
