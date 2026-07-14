@@ -234,7 +234,7 @@ async fn upload_part_copy_range_assembles_expected_object() -> TestResult<()> {
     let result = async {
         let bucket = "s3-copy-upload-part";
         let source_body = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
-        let first_part = b"first-part-data-".to_vec();
+        let first_part = vec![b'f'; 5 * 1024 * 1024];
         client.create_bucket().bucket(bucket).send().await?;
 
         client

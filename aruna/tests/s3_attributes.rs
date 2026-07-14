@@ -106,7 +106,7 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
 
         let bucket = "s3-attributes-multipart";
         let key = "docs/multipart.bin";
-        let part_one = vec![7u8; 6 * 1024];
+        let part_one = vec![7u8; 5 * 1024 * 1024];
         let part_two = vec![9u8; 4 * 1024];
         let total_size = (part_one.len() + part_two.len()) as i64;
         // AWS composite form: base64(sha256(part digests concatenated)) + "-<partCount>".

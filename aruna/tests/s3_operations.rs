@@ -558,7 +558,7 @@ async fn multipart_listing_before_and_after_complete() -> TestResult<()> {
     let result = async {
         let bucket = "s3-ops-multipart-listing";
         let key = "assembled.bin";
-        let part_one = b"multipart-part-one-".to_vec();
+        let part_one = vec![b'a'; 5 * 1024 * 1024];
         let part_two = b"multipart-part-two".to_vec();
         client.create_bucket().bucket(bucket).send().await?;
 

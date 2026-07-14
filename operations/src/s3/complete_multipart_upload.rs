@@ -91,6 +91,8 @@ pub enum CompleteMultipartUploadError {
     InvalidPartOrder,
     #[error("The provided multipart object size did not match the uploaded parts.")]
     InvalidObjectSize,
+    #[error("Your proposed upload is smaller than the minimum allowed object size.")]
+    EntityTooSmall,
     #[error("missing stored checksum for {0}")]
     MissingExpectedChecksum(&'static str),
     #[error("checksum mismatch for {0}")]
@@ -262,23 +264,24 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn validate_checksum_contract(
-        &self,
+        &mut self,
         record: &MultipartUpload,
     ) -> Result<(), CompleteMultipartUploadError> {
         let Some(hint) = record.checksum_hint.as_ref() else {
             return Ok(());
         };
 
-        if hint.checksum_type != self.input.checksum_type {
-            return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+        if !self.input.checksum_type_explicit {
+            self.input.checksum_type = hint.checksum_type;
         }
-        if hint.checksum_type == MultipartChecksumType::Composite
-            && !self.input.checksum_type_explicit
-        {
+        if self.input.checksum_type_explicit && hint.checksum_type != self.input.checksum_type {
             return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
         }
 
-        if let Some(algorithm) = hint.algorithm {
+        if let Some(algorithm) = hint.algorithm
+            && (self.input.checksum_algorithm.is_some()
+                || !self.input.expected_checksums.is_empty())
+        {
             let matching_expected = self
                 .input
                 .expected_checksums
@@ -341,7 +344,7 @@ impl CompleteMultipartUploadOperation {
             return self.emit_error(err);
         }
         if let Err(err) = self.validate_checksum_contract(&record) {
-            return self.emit_error(err);
+            return self.schedule_error(err);
         }
 
         record.status = MultipartUploadStatus::Completing;
@@ -410,6 +413,12 @@ impl CompleteMultipartUploadOperation {
 
         let mut previous = None;
         let mut resolved = Vec::with_capacity(self.input.completed_parts.len());
+        let required_checksum_algorithm = self
+            .upload_record
+            .as_ref()
+            .and_then(|upload| upload.checksum_hint.as_ref())
+            .filter(|hint| hint.checksum_type == MultipartChecksumType::Composite)
+            .and_then(|hint| hint.algorithm);
         for requested in &self.input.completed_parts {
             if previous.is_some_and(|prev| requested.part_number <= prev) {
                 return Err(CompleteMultipartUploadError::InvalidPartOrder);
@@ -419,8 +428,16 @@ impl CompleteMultipartUploadOperation {
             let Some(record) = all_parts.get(&requested.part_number).cloned() else {
                 return Err(CompleteMultipartUploadError::InvalidPart);
             };
-            validate_requested_part(requested, &record)?;
+            validate_requested_part(requested, &record, required_checksum_algorithm)?;
             resolved.push(record);
+        }
+
+        if resolved
+            .iter()
+            .take(resolved.len().saturating_sub(1))
+            .any(|part| part.location.blob_size < 5 * 1024 * 1024)
+        {
+            return Err(CompleteMultipartUploadError::EntityTooSmall);
         }
 
         if self.input.object_size.is_some_and(|size| {
@@ -1287,6 +1304,7 @@ impl Operation for CompleteMultipartUploadOperation {
 fn validate_requested_part(
     requested: &CompleteMultipartPart,
     record: &MultipartUploadPart,
+    required_checksum_algorithm: Option<ChecksumAlgorithm>,
 ) -> Result<(), CompleteMultipartUploadError> {
     if let Some(etag) = &requested.etag {
         let Some(md5) = record.location.hashes.get(HASH_MD5) else {
@@ -1295,6 +1313,17 @@ fn validate_requested_part(
         if hex::encode(md5) != *etag {
             return Err(CompleteMultipartUploadError::PartEtagMismatch);
         }
+    }
+
+    if let Some(algorithm) = required_checksum_algorithm
+        && !requested
+            .expected_checksums
+            .iter()
+            .any(|expected| expected.algorithm == algorithm)
+    {
+        return Err(CompleteMultipartUploadError::MissingExpectedChecksum(
+            algorithm.s3_name(),
+        ));
     }
 
     for expected in &requested.expected_checksums {
@@ -1356,6 +1385,7 @@ fn composite_digest_for_algorithm(algorithm: ChecksumAlgorithm, bytes: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::MultipartUploadChecksumHint;
 
     fn finalize_input() -> CompleteMultipartUploadInput {
         let realm_id = RealmId::from_bytes([3u8; 32]);
@@ -1408,6 +1438,163 @@ mod tests {
             },
             created_at: SystemTime::now(),
         }
+    }
+
+    fn part_values(
+        upload_id: Ulid,
+        parts: Vec<MultipartUploadPart>,
+    ) -> Vec<(aruna_core::types::Key, aruna_core::types::Value)> {
+        parts
+            .into_iter()
+            .map(|part| {
+                (
+                    MultipartUploadPartKey::new(upload_id, part.part_number)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    part.to_bytes().unwrap().into(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checksum_contract_failure_aborts_mark_transaction() {
+        let mut input = finalize_input();
+        input.checksum_type = MultipartChecksumType::FullObject;
+        input.checksum_type_explicit = true;
+        let mut record = open_upload_record(&input);
+        record.status = MultipartUploadStatus::Open;
+        record.checksum_hint = Some(MultipartUploadChecksumHint {
+            algorithm: Some(ChecksumAlgorithm::Sha256),
+            checksum_type: MultipartChecksumType::Composite,
+        });
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        let txn_id = TxnId::r#gen();
+        op.txn_id = Some(txn_id);
+        op.state = CompleteMultipartUploadState::ReadUploadForMark;
+
+        let effects = op.handle_upload_read_for_mark(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
+                if *aborted == txn_id
+        ));
+        assert_eq!(op.txn_id, None);
+    }
+
+    #[test]
+    fn composite_checksum_contract_allows_only_per_part_checksums() {
+        let digest = vec![7; ChecksumAlgorithm::Sha256.digest_len()];
+        let mut input = finalize_input();
+        input.completed_parts = vec![CompleteMultipartPart {
+            part_number: 1,
+            etag: None,
+            expected_checksums: vec![ExpectedChecksum {
+                algorithm: ChecksumAlgorithm::Sha256,
+                digest: digest.clone(),
+            }],
+        }];
+        input.object_size = Some(1);
+        let mut upload = open_upload_record(&input);
+        upload.checksum_hint = Some(MultipartUploadChecksumHint {
+            algorithm: Some(ChecksumAlgorithm::Sha256),
+            checksum_type: MultipartChecksumType::Composite,
+        });
+        let mut part = part_record(1, 1);
+        part.location
+            .hashes
+            .insert(ChecksumAlgorithm::Sha256.hash_key().to_string(), digest);
+        let values = part_values(input.upload_id, vec![part]);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+
+        assert_eq!(op.validate_checksum_contract(&upload), Ok(()));
+        assert_eq!(op.input.checksum_type, MultipartChecksumType::Composite);
+        op.upload_record = Some(upload);
+        assert!(op.extract_requested_parts(values).is_ok());
+    }
+
+    #[test]
+    fn composite_checksum_contract_requires_each_part_checksum() {
+        let mut input = finalize_input();
+        input.completed_parts = vec![CompleteMultipartPart {
+            part_number: 1,
+            etag: None,
+            expected_checksums: vec![],
+        }];
+        input.object_size = Some(1);
+        let mut upload = open_upload_record(&input);
+        upload.checksum_hint = Some(MultipartUploadChecksumHint {
+            algorithm: Some(ChecksumAlgorithm::Sha256),
+            checksum_type: MultipartChecksumType::Composite,
+        });
+        let values = part_values(input.upload_id, vec![part_record(1, 1)]);
+        let mut op = CompleteMultipartUploadOperation::new(input);
+        op.upload_record = Some(upload);
+
+        assert_eq!(
+            op.extract_requested_parts(values),
+            Err(CompleteMultipartUploadError::MissingExpectedChecksum(
+                "SHA256"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_undersized_non_final_part() {
+        let mut input = finalize_input();
+        input.completed_parts = vec![
+            CompleteMultipartPart {
+                part_number: 1,
+                etag: None,
+                expected_checksums: vec![],
+            },
+            CompleteMultipartPart {
+                part_number: 2,
+                etag: None,
+                expected_checksums: vec![],
+            },
+        ];
+        input.object_size = None;
+        let values = part_values(
+            input.upload_id,
+            vec![part_record(1, 5 * 1024 * 1024 - 1), part_record(2, 1)],
+        );
+        let op = CompleteMultipartUploadOperation::new(input);
+
+        assert_eq!(
+            op.extract_requested_parts(values),
+            Err(CompleteMultipartUploadError::EntityTooSmall)
+        );
+    }
+
+    #[test]
+    fn allows_undersized_final_part() {
+        let mut input = finalize_input();
+        input.completed_parts = vec![
+            CompleteMultipartPart {
+                part_number: 1,
+                etag: None,
+                expected_checksums: vec![],
+            },
+            CompleteMultipartPart {
+                part_number: 2,
+                etag: None,
+                expected_checksums: vec![],
+            },
+        ];
+        input.object_size = None;
+        let values = part_values(
+            input.upload_id,
+            vec![part_record(1, 5 * 1024 * 1024), part_record(2, 1)],
+        );
+        let op = CompleteMultipartUploadOperation::new(input);
+
+        assert!(op.extract_requested_parts(values).is_ok());
     }
 
     #[test]

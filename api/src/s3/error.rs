@@ -218,6 +218,10 @@ impl IntoS3Error for CompleteMultipartUploadError {
                 InvalidRequest,
                 "The provided object size does not match the uploaded parts."
             ),
+            CompleteMultipartUploadError::EntityTooSmall => s3_error!(
+                EntityTooSmall,
+                "Your proposed upload is smaller than the minimum allowed object size."
+            ),
             CompleteMultipartUploadError::MissingPartEtag => {
                 s3_error!(InvalidPart, "The part ETag could not be validated.")
             }
@@ -454,6 +458,12 @@ mod tests {
                 .into_s3_error()
                 .code(),
             S3ErrorCode::InvalidPart
+        );
+        let entity_too_small = CompleteMultipartUploadError::EntityTooSmall.into_s3_error();
+        assert_eq!(*entity_too_small.code(), S3ErrorCode::EntityTooSmall);
+        assert_eq!(
+            entity_too_small.status_code(),
+            Some(http::StatusCode::BAD_REQUEST)
         );
     }
 }

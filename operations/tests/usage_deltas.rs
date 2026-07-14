@@ -525,10 +525,10 @@ async fn multipart_staging_counts_nothing_until_completion() {
     let group_id = Ulid::r#gen();
     create_bucket(&h, "bucket", group_id).await;
 
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; 5 * 1024 * 1024];
     let part2 = b"world!!";
     let upload_id = create_upload(&h, "bucket", "big.bin", group_id).await;
-    upload_part(&h, "bucket", "big.bin", upload_id, 1, part1).await;
+    upload_part(&h, "bucket", "big.bin", upload_id, 1, &part1).await;
     upload_part(&h, "bucket", "big.bin", upload_id, 2, part2).await;
 
     // Staged parts live outside the content-addressed blob keyspace: an initiated
@@ -542,7 +542,7 @@ async fn multipart_staging_counts_nothing_until_completion() {
     assert_matches_rebuild(&h.driver).await;
 
     // Completion charges the object exactly once, for the assembled blob.
-    let part1_result = upload_part(&h, "bucket", "big.bin", upload_id, 1, part1).await;
+    let part1_result = upload_part(&h, "bucket", "big.bin", upload_id, 1, &part1).await;
     let part2_result = upload_part(&h, "bucket", "big.bin", upload_id, 2, part2).await;
     let size = (part1.len() + part2.len()) as u64;
     complete_upload(
