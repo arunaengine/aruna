@@ -5,7 +5,7 @@ use std::time::Duration;
 use aruna_core::UserId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentSyncTarget, shard_topic_id,
 };
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -36,6 +36,7 @@ use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
+use aruna_operations::document_sync_outbox::read_outbox_records;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -53,7 +54,7 @@ use aruna_operations::placement::{
     strategy_for_target, subject_bytes,
 };
 use aruna_operations::sync_placement::sort_node_ids;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::task_incoming::{drive_document_sync_outbox_drain, initialize_task_incoming};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
@@ -263,6 +264,281 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     ));
 
     shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// Black-hole ordering, pinned deterministically: the origin's update drain runs
+// only AFTER the replan marks the origin draining, so the drain classifies a
+// draining former-holder. It must still flush its accepted-before-drain records;
+// none is left undeliverable and the update reaches the replacement holder.
+#[tokio::test]
+async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([47u8; 32]);
+    let (nodes, _config, refreshers) =
+        build_pinned_realm(&realm_id, &[11, 12, 13, 14], &[false, true, true, true]).await?;
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
+    let (placement, initial_holders, update_event_id) = seed_and_update(
+        &nodes,
+        realm_id,
+        group_id,
+        document_id,
+        "datasets/flush-after-drain",
+    )
+    .await?;
+
+    // The update's two records sit undrained on the hand-driven origin.
+    let pending = read_outbox_records(&nodes[0].context.storage_handle, &[], None, 16).await?;
+    assert_eq!(
+        pending.records.len(),
+        2,
+        "update enqueues two outbox records"
+    );
+
+    // Drain the origin first, then release its outbox drain into that config. An
+    // undeliverable (black-holed) record is retained forever, so a fully emptied
+    // outbox is the deterministic proof that none was classified undeliverable.
+    let replacement = drain_origin(&nodes, realm_id, &placement, &initial_holders).await?;
+    drain_until_empty(&nodes[0]).await?;
+
+    assert_update_reaches(
+        &nodes,
+        realm_id,
+        replacement,
+        group_id,
+        document_id,
+        update_event_id,
+        &placement,
+    )
+    .await?;
+    for refresher in refreshers {
+        refresher.abort();
+    }
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// Opposite ordering: the origin publishes the update while still a holder, THEN
+// it is drained. The replacement pulls the canonical topic history, update
+// included, and adopts the original genesis rather than forking one.
+#[tokio::test]
+async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([48u8; 32]);
+    let (nodes, _config, refreshers) =
+        build_pinned_realm(&realm_id, &[21, 22, 23, 24], &[false, true, true, true]).await?;
+    let group_id = Ulid::r#gen();
+    let document_id = Ulid::r#gen();
+    let (placement, initial_holders, update_event_id) = seed_and_update(
+        &nodes,
+        realm_id,
+        group_id,
+        document_id,
+        "datasets/publish-before-drain",
+    )
+    .await?;
+
+    // Publish the update while the origin is still a holder.
+    drain_until_empty(&nodes[0]).await?;
+
+    // Now drain the origin and flush the config change out.
+    let replacement = drain_origin(&nodes, realm_id, &placement, &initial_holders).await?;
+    drain_until_empty(&nodes[0]).await?;
+
+    assert_update_reaches(
+        &nodes,
+        realm_id,
+        replacement,
+        group_id,
+        document_id,
+        update_event_id,
+        &placement,
+    )
+    .await?;
+    for refresher in refreshers {
+        refresher.abort();
+    }
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+// Drives the hand-driven node's outbox drain until it is empty. The drain
+// deletes a record only once its holders acknowledge the sync, so a one-shot
+// push that loses a race under load is retried instead of stranding the record;
+// an undeliverable record is retained forever and trips the deadline.
+async fn drain_until_empty(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        drive_document_sync_outbox_drain(node.context.clone()).await;
+        let remaining = read_outbox_records(&node.context.storage_handle, &[], None, 16).await?;
+        if remaining.records.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "outbox never drained: {} records remain",
+                remaining.records.len()
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// Creates a document on the hand-driven origin (index 0), replicates the create
+// to its holders, then commits an update. Returns the bucket placement, the
+// initial holder set, and the update's revision id (taken from the returned
+// record, which the revision-id fix makes authoritative).
+async fn seed_and_update(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+) -> Result<(PlacementRef, Vec<aruna_core::NodeId>, Ulid), Box<dyn std::error::Error>> {
+    let created = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            public: true,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Draining Flush".to_string(),
+                description: "Draining flush regression".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?
+    .record;
+    // Origin runs no auto loop: project the create into the local index (so the
+    // update can read it) and publish it to the holders, both by hand.
+    replay_metadata_event_log(nodes[0].context.as_ref()).await?;
+    drain_until_empty(&nodes[0]).await?;
+
+    let config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let placement = created.placement;
+    let mut initial_holders = resolve_shard_holders(&config, &placement);
+    sort_node_ids(&mut initial_holders);
+    assert!(initial_holders.contains(&nodes[0].net.node_id()));
+    wait_for_persisted_holder_set(
+        nodes,
+        &initial_holders,
+        group_id,
+        document_id,
+        &initial_holders,
+    )
+    .await?;
+    assert!(
+        nodes[0]
+            .net
+            .document_sync_topic_exists(shard_topic_id(realm_id, &placement))
+            .unwrap_or(false),
+        "origin holds the shard genesis"
+    );
+
+    let updated = drive(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            public: true,
+            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    Ok((placement, initial_holders, updated.last_event_id))
+}
+
+// Marks the origin draining and returns the replacement holder the replan pulls
+// into the bucket's holder set.
+async fn drain_origin(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    placement: &PlacementRef,
+    initial_holders: &[aruna_core::NodeId],
+) -> Result<aruna_core::NodeId, Box<dyn std::error::Error>> {
+    let obsolete = nodes[0].net.node_id();
+    let updated_config = drive(
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            mutation: RealmPlacementMutation::UpsertNode(NodePlacementEntry {
+                node_id: obsolete,
+                location: String::new(),
+                weight: 100,
+                full: false,
+                draining: true,
+                labels: Default::default(),
+            }),
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let mut final_holders = resolve_shard_holders(&updated_config, placement);
+    sort_node_ids(&mut final_holders);
+    assert!(
+        !final_holders.contains(&obsolete),
+        "drained origin left holders"
+    );
+    final_holders
+        .into_iter()
+        .find(|node_id| !initial_holders.contains(node_id))
+        .ok_or_else(|| "replan selects a replacement holder".into())
+}
+
+// Waits for the update to converge on the replacement: the everywhere-bound
+// registry pointer, then the bucket's own event content, and confirms the
+// replacement adopted the original shard genesis instead of forking one.
+async fn assert_update_reaches(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    replacement: aruna_core::NodeId,
+    group_id: Ulid,
+    document_id: Ulid,
+    update_event_id: Ulid,
+    placement: &PlacementRef,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let replacement_node = nodes
+        .iter()
+        .find(|node| node.net.node_id() == replacement)
+        .ok_or("replacement fixture node exists")?;
+    let registry =
+        wait_for_persisted_update(replacement_node, group_id, document_id, update_event_id).await?;
+    assert_eq!(registry.last_event_id, update_event_id);
+    let event = wait_for_event_log_value(replacement_node, document_id, update_event_id).await?;
+    let event: MetadataCreateEventRecord = postcard::from_bytes(&event)?;
+    assert!(matches!(
+        event.payload,
+        MetadataCreateEventPayload::UpsertDataEntity { .. }
+    ));
+    assert!(
+        replacement_node
+            .net
+            .document_sync_topic_exists(shard_topic_id(realm_id, placement))
+            .unwrap_or(false),
+        "replacement adopted the original genesis, not a fork"
+    );
     Ok(())
 }
 
@@ -686,7 +962,64 @@ async fn build_realm_nodes(
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
     }
+    let config = finish_realm_setup(&nodes, realm_id).await?;
+    Ok((nodes, config))
+}
 
+// Fixed identities and per-node task-handler control: pinning node ids makes
+// holder roles a chosen schedule, and withholding the auto task loop from a node
+// lets a test drive that node's outbox drain by hand at a precise boundary.
+async fn build_pinned_realm(
+    realm_id: &RealmId,
+    secret_seeds: &[u8],
+    start_tasks: &[bool],
+) -> Result<
+    (
+        Vec<TestNode>,
+        RealmConfigDocument,
+        Vec<tokio::task::JoinHandle<()>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut nodes = Vec::with_capacity(secret_seeds.len());
+    for (index, seed) in secret_seeds.iter().enumerate() {
+        let secret = iroh::SecretKey::from_bytes(&[*seed; 32]);
+        nodes.push(spawn_node_configured(*realm_id, Some(secret), start_tasks[index]).await?);
+    }
+    // A node with no auto loop cannot refresh its own realm presence, which
+    // expires after REALM_PRESENCE_TTL; keep it alive with a background
+    // re-announce so setup convergence never stalls on an expired presence.
+    let mut refreshers = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if start_tasks[index] {
+            continue;
+        }
+        let context = node.context.clone();
+        let node_id = node.net.node_id();
+        let realm_id = *realm_id;
+        refreshers.push(tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                let _ = drive(
+                    AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                        realm_id,
+                        node_id,
+                        schedule_refresh: false,
+                    }),
+                    context.as_ref(),
+                )
+                .await;
+            }
+        }));
+    }
+    let config = finish_realm_setup(&nodes, realm_id).await?;
+    Ok((nodes, config, refreshers))
+}
+
+async fn finish_realm_setup(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
             nodes[i]
@@ -700,7 +1033,7 @@ async fn build_realm_nodes(
         }
     }
 
-    for node in &nodes {
+    for node in nodes {
         drive(
             AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
                 realm_id: *realm_id,
@@ -712,18 +1045,26 @@ async fn build_realm_nodes(
         .await?;
     }
 
-    wait_for_realm_node_convergence(&nodes, realm_id).await?;
-    let config = install_realm_config(&nodes, realm_id).await?;
-    Ok((nodes, config))
+    wait_for_realm_node_convergence(nodes, realm_id).await?;
+    install_realm_config(nodes, realm_id).await
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
+    spawn_node_configured(realm_id, None, true).await
+}
+
+async fn spawn_node_configured(
+    realm_id: RealmId,
+    secret_key: Option<iroh::SecretKey>,
+    start_tasks: bool,
+) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
+            secret_key,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
             ..NetConfig::default()
@@ -750,7 +1091,11 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    // A node without the auto task loop leaves its outbox drain (and every other
+    // timer) for the test to drive by hand.
+    if start_tasks {
+        initialize_task_incoming(context.clone(), task_handle).await;
+    }
 
     Ok(TestNode {
         _temp_dir: temp_dir,

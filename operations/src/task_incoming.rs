@@ -79,6 +79,12 @@ use crate::usage_stats::{
     refresh_realm_usage_summary_for_targets, restore_usage_snapshot_publish_timer,
 };
 
+/// Process-wide tally of document sync outbox records ever classified
+/// undeliverable. The drain already error-logs each one; this exposes the count
+/// so a test can assert the draining-flush path never black-holes a record.
+pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 const DRAIN_SUBBATCH_RECORDS: usize = 512;
 const DURABLE_QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 /// How long a record may wait for its shard topic's genesis before the drain
@@ -355,6 +361,10 @@ impl OperationsTaskHandler {
     /// rare rebalance race: a node that held the bucket when it accepted the
     /// write and lost holdership before draining.
     fn report_undeliverable_records(&self, undeliverable: &[DrainRecord]) {
+        UNDELIVERABLE_RECORD_COUNT.fetch_add(
+            undeliverable.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for (_, record, topic) in undeliverable {
             error!(
                 event = "pipeline.drain.undeliverable",
