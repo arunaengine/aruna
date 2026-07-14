@@ -108,6 +108,12 @@ impl OpsState {
     ) -> Arc<Self> {
         register_storage_source(&metrics, ctx.clone()).await;
         register_queue_metrics(&metrics, ctx.clone()).await;
+        if let Some(net_handle) = &ctx.net_handle {
+            net_handle
+                .notification_watch_metrics()
+                .register(&metrics)
+                .await;
+        }
         Arc::new(Self {
             ctx,
             metrics,
