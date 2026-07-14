@@ -12,9 +12,9 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::{
     Actor, GroupAuthorizationDocument, NOTIFICATION_WATCH_PER_USER_CAP, NotificationClass,
     NotificationKind, NotificationRecord, PlacementRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
-    WatchEventMask, WatchInterestDigest, WatchSubscription, data_watch_resource_path,
-    watch_interest_node_key, watch_notification_id,
+    RealmConfigDocument, RealmId, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
+    WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription,
+    data_watch_resource_path, watch_interest_node_key, watch_notification_id,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, NodeId, UserId};
@@ -374,6 +374,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
             owner,
             data_watch_resource_path(group_id, data_node_id, "bucket", &format!("{index}/")),
             mask,
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect("remote create under cap succeeds");
@@ -385,6 +386,7 @@ async fn remote_create_surfaces_cap_conflict_over_the_wire()
         owner,
         data_watch_resource_path(group_id, data_node_id, "bucket", "overflow/"),
         mask,
+        WatchAuthorizationBinding::default(),
     )
     .await
     .expect_err("cap must be enforced over the wire");
@@ -570,6 +572,7 @@ async fn create_watch_via(
         owner,
         path_prefix.to_string(),
         event_mask,
+        WatchAuthorizationBinding::default(),
     )
     .await?)
 }

@@ -1,12 +1,19 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use aruna_core::NodeId;
+use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::AuthorizationError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmId, WatchEventMask, WatchSubscription,
-    blob_bucket_permission_path, parse_data_watch_resource_path,
+    AuthContext, MetadataRegistryRecord, Permission, RealmId, WatchAuthorizationBinding,
+    WatchEventMask, WatchSubscription, blob_object_permission_path, parse_data_watch_resource_path,
 };
 use aruna_core::types::UserId;
+use aruna_core::util::unix_timestamp_secs;
+use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -44,15 +51,18 @@ pub fn watch_permission_path(
             {
                 return None;
             }
-            Some(format!("/{realm_id}/g/{group_id}/meta/**"))
+            Some(format!(
+                "/{realm_id}/g/{group_id}/meta/{document_path_prefix}"
+            ))
         }
         WatchEventMask::DATA_UPLOADED => {
             let resource = parse_data_watch_resource_path(path_prefix)?;
-            Some(blob_bucket_permission_path(
+            Some(blob_object_permission_path(
                 realm_id,
                 resource.group_id,
                 resource.node_id,
                 resource.bucket,
+                resource.key_prefix,
             ))
         }
         _ => None,
@@ -70,9 +80,18 @@ pub async fn is_watch_authorized(
     owner: UserId,
     path_prefix: &str,
     event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
 ) -> Result<bool, String> {
     Ok(matches!(
-        evaluate_watch_authorization(context, realm_id, owner, path_prefix, event_mask).await?,
+        evaluate_watch_authorization(
+            context,
+            realm_id,
+            owner,
+            path_prefix,
+            event_mask,
+            authorization,
+        )
+        .await?,
         WatchAuthorization::Authorized
     ))
 }
@@ -83,11 +102,17 @@ async fn evaluate_watch_authorization(
     owner: UserId,
     path_prefix: &str,
     event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
 ) -> Result<WatchAuthorization, String> {
     let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
         return Ok(WatchAuthorization::Denied);
     };
-    if owner.is_nil() || owner.realm_id != realm_id {
+    if owner.is_nil()
+        || owner.realm_id != realm_id
+        || !authorization.is_valid()
+        || unix_timestamp_secs() > authorization.expires_at_secs
+        || token_is_revoked(context, &authorization.token_hash).await?
+    {
         return Ok(WatchAuthorization::Denied);
     }
     match drive(
@@ -95,7 +120,7 @@ async fn evaluate_watch_authorization(
             auth_context: AuthContext {
                 user_id: owner,
                 realm_id,
-                path_restrictions: None,
+                path_restrictions: authorization.path_restrictions.clone(),
             },
             path: permission_path,
             required_permission: Permission::READ,
@@ -121,6 +146,27 @@ async fn evaluate_watch_authorization(
     }
 }
 
+async fn token_is_revoked(context: &DriverContext, token_hash: &str) -> Result<bool, String> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(TOKEN_REVOCATION_LIST_KEY),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => postcard::from_bytes::<HashSet<String>>(&bytes)
+            .map(|revoked| revoked.contains(token_hash))
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
 /// Holder-side enumeration of one user's watches through the same authorization
 /// result delivery uses. Revoked watches retain only their opaque deletion id;
 /// protected watch details are redacted so the owner can still release quota.
@@ -139,6 +185,7 @@ pub async fn list_authorized_watch_subscriptions(
             subscription.owner,
             &subscription.path_prefix,
             subscription.event_mask,
+            &subscription.authorization,
         )
         .await?
         {
@@ -172,6 +219,7 @@ pub async fn filter_authorized_watch_subscriptions(
             subscription.owner,
             &subscription.path_prefix,
             subscription.event_mask,
+            &subscription.authorization,
         )
         .await
         {
@@ -282,6 +330,7 @@ mod tests {
                 UserId::nil(realm_id),
                 &prefix,
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                &WatchAuthorizationBinding::default(),
             )
             .await,
             Ok(false)
@@ -311,7 +360,15 @@ mod tests {
         };
 
         assert_eq!(
-            is_watch_authorized(&context, realm_id, owner, &path, event_mask).await,
+            is_watch_authorized(
+                &context,
+                realm_id,
+                owner,
+                &path,
+                event_mask,
+                &subscription.authorization,
+            )
+            .await,
             Ok(false),
             "external callers still fail closed without exposing missing state"
         );
@@ -342,8 +399,8 @@ mod tests {
                 &data_prefix,
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             ),
-            Some(blob_bucket_permission_path(
-                realm_id, group_id, node_id, "bucket"
+            Some(blob_object_permission_path(
+                realm_id, group_id, node_id, "bucket", "reports/"
             ))
         );
         assert_eq!(
@@ -352,7 +409,7 @@ mod tests {
                 &format!("meta/{group_id}/datasets/project"),
                 WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
             ),
-            Some(format!("/{realm_id}/g/{group_id}/meta/**"))
+            Some(format!("/{realm_id}/g/{group_id}/meta/datasets/project"))
         );
     }
 

@@ -1,6 +1,7 @@
 use aruna_core::NodeId;
 use aruna_core::structs::{
-    NotificationKind, NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
+    NotificationKind, NotificationRecord, WatchAuthorizationBinding, WatchEventKind,
+    WatchEventMask, WatchSubscription,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -155,7 +156,15 @@ async fn notification_is_visible(
     match watch {
         None => Ok(true),
         Some((path, event_mask)) => {
-            is_watch_authorized(context, recipient.realm_id, recipient, path, event_mask).await
+            is_watch_authorized(
+                context,
+                recipient.realm_id,
+                recipient,
+                path,
+                event_mask,
+                &WatchAuthorizationBinding::default(),
+            )
+            .await
         }
     }
 }
@@ -303,6 +312,7 @@ pub async fn create_watch_for_user(
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
+    authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, WatchDispatchError> {
     let holder = resolve_holder(context, owner).await?;
     if holder == local_node_id {
@@ -312,6 +322,7 @@ pub async fn create_watch_for_user(
             owner,
             path_prefix,
             event_mask,
+            authorization.clone(),
             unix_timestamp_millis(),
         )
         .await
@@ -327,17 +338,24 @@ pub async fn create_watch_for_user(
             .net_handle
             .as_ref()
             .ok_or(WatchDispatchError::Unavailable)?;
-        create_watch_remote(net_handle, holder, owner, path_prefix, event_mask)
-            .await
-            .map_err(|reason| {
-                if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
-                    WatchDispatchError::CapExceeded
-                } else if reason == WATCH_SUBSCRIPTION_UNAUTHORIZED {
-                    WatchDispatchError::Unauthorized
-                } else {
-                    WatchDispatchError::Remote(reason)
-                }
-            })
+        create_watch_remote(
+            net_handle,
+            holder,
+            owner,
+            path_prefix,
+            event_mask,
+            authorization,
+        )
+        .await
+        .map_err(|reason| {
+            if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
+                WatchDispatchError::CapExceeded
+            } else if reason == WATCH_SUBSCRIPTION_UNAUTHORIZED {
+                WatchDispatchError::Unauthorized
+            } else {
+                WatchDispatchError::Remote(reason)
+            }
+        })
     }
 }
 

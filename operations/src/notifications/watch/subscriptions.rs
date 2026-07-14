@@ -13,7 +13,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef, RealmId,
-    WatchEventMask, WatchSubscription, parse_watch_subscription_key, watch_subscription_prefix,
+    WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_subscription_key,
+    watch_subscription_prefix,
 };
 use aruna_core::types::{TxnId, UserId};
 use aruna_storage::StorageHandle;
@@ -79,7 +80,13 @@ pub async fn create_watch_subscription(
     event_mask: WatchEventMask,
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    let subscription = validated_subscription(
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+        WatchAuthorizationBinding::default(),
+    )?;
     create_subscription(storage, subscription, None).await
 }
 
@@ -93,15 +100,18 @@ pub async fn create_replicated_watch_subscription(
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
+    authorization: WatchAuthorizationBinding,
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(owner, path_prefix, event_mask, now_ms)?;
+    let subscription =
+        validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
     if !is_watch_authorized(
         context,
         owner.realm_id,
         owner,
         &subscription.path_prefix,
         subscription.event_mask,
+        &subscription.authorization,
     )
     .await
     .map_err(WatchSubscriptionError::Storage)?
@@ -120,14 +130,19 @@ fn validated_subscription(
     path_prefix: String,
     event_mask: WatchEventMask,
     now_ms: u64,
+    authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
     validate_subscription_fields(&path_prefix, event_mask)?;
+    if !authorization.is_valid() {
+        return Err(WatchSubscriptionError::Unauthorized);
+    }
 
-    Ok(WatchSubscription::new(
+    Ok(WatchSubscription::new_with_authorization(
         owner,
         path_prefix,
         event_mask,
         now_ms,
+        authorization,
     ))
 }
 
@@ -565,6 +580,11 @@ fn decode_stored_subscription(
             ))
         },
     )?;
+    if !subscription.authorization.is_valid() {
+        return Err(WatchSubscriptionError::Storage(
+            "stored watch subscription has invalid authorization binding".to_string(),
+        ));
+    }
     Ok(subscription)
 }
 
@@ -882,6 +902,7 @@ mod tests {
                 owner,
                 authorized_prefix,
                 data_mask(),
+                WatchAuthorizationBinding::default(),
                 9_999,
             )
             .await,

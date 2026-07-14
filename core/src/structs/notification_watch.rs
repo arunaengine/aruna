@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::{NotificationKind, RealmId};
+use crate::structs::{NotificationKind, PathRestriction, RealmId};
 use crate::types::{GroupId, Key, UserId};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
@@ -233,12 +233,43 @@ pub fn watch_notification_id(event_id: Ulid, watch_id: Ulid) -> Ulid {
 /// Durable watch subscription row on the owner's inbox-holder node. Placed and
 /// proxied exactly like a notification inbox record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchAuthorizationBinding {
+    pub token_hash: String,
+    pub expires_at_secs: u64,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+}
+
+impl WatchAuthorizationBinding {
+    pub fn is_valid(&self) -> bool {
+        self.expires_at_secs > 0
+            && self.token_hash.len() == 64
+            && self.token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && self
+                .path_restrictions
+                .iter()
+                .flatten()
+                .all(|restriction| globset::Glob::new(&restriction.pattern).is_ok())
+    }
+}
+
+impl Default for WatchAuthorizationBinding {
+    fn default() -> Self {
+        Self {
+            token_hash: blake3::hash(b"internal-watch").to_hex().to_string(),
+            expires_at_secs: u64::MAX,
+            path_restrictions: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchSubscription {
     pub watch_id: Ulid,
     pub owner: UserId,
     pub path_prefix: String,
     pub event_mask: WatchEventMask,
     pub created_at_ms: u64,
+    pub authorization: WatchAuthorizationBinding,
 }
 
 impl WatchSubscription {
@@ -248,12 +279,29 @@ impl WatchSubscription {
         event_mask: WatchEventMask,
         created_at_ms: u64,
     ) -> Self {
+        Self::new_with_authorization(
+            owner,
+            path_prefix,
+            event_mask,
+            created_at_ms,
+            WatchAuthorizationBinding::default(),
+        )
+    }
+
+    pub fn new_with_authorization(
+        owner: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+        created_at_ms: u64,
+        authorization: WatchAuthorizationBinding,
+    ) -> Self {
         Self {
             watch_id: Ulid::r#gen(),
             owner,
             path_prefix,
             event_mask,
             created_at_ms,
+            authorization,
         }
     }
 

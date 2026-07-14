@@ -1,11 +1,13 @@
-use crate::auth::require_realm_auth;
+use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::auth::bearer_token_hash;
 use aruna_core::structs::{
     AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NotificationClass, NotificationKind,
-    NotificationRecord, WatchEventKind, WatchEventMask, WatchSubscription,
+    NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
+    WatchSubscription,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
@@ -330,6 +332,7 @@ async fn authorize_watch(
     auth: &AuthContext,
     path_prefix: &str,
     event_mask: WatchEventMask,
+    authorization: &WatchAuthorizationBinding,
 ) -> ServerResult<()> {
     if watch_permission_path(state.get_realm_id(), path_prefix, event_mask).is_none() {
         return Err(ServerError::BadRequest);
@@ -340,6 +343,7 @@ async fn authorize_watch(
         auth.user_id,
         path_prefix,
         event_mask,
+        authorization,
     )
     .await
     {
@@ -735,9 +739,11 @@ pub async fn list_watches(
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_realm_auth(&state, auth)?;
+    let bearer_token = bearer_token.ok_or(ServerError::Unauthorized)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
@@ -750,9 +756,21 @@ pub async fn create_watch(
         let kind = WatchEventKind::from_name(name).ok_or(ServerError::BadRequest)?;
         event_mask.insert(kind);
     }
+    let authorization = WatchAuthorizationBinding {
+        token_hash: bearer_token_hash(bearer_token.as_str()),
+        expires_at_secs: bearer_token.expires_at_secs(),
+        path_restrictions: auth.path_restrictions.clone(),
+    };
     // A remote holder receives only the durable subscription, not this request's
     // AuthContext. Authorize the immutable canonical identity before dispatch.
-    authorize_watch(&state, &auth, &request.path_prefix, event_mask).await?;
+    authorize_watch(
+        &state,
+        &auth,
+        &request.path_prefix,
+        event_mask,
+        &authorization,
+    )
+    .await?;
 
     let subscription = create_watch_for_user(
         &state.get_ctx(),
@@ -760,6 +778,7 @@ pub async fn create_watch(
         auth.user_id,
         request.path_prefix,
         event_mask,
+        authorization,
     )
     .await
     .map_err(|error| map_watch_dispatch_error(error, "create_watch"))?;
@@ -999,6 +1018,12 @@ mod tests {
             realm_id,
             path_restrictions: None,
         }
+    }
+
+    fn bearer() -> Extension<Option<ValidatedArunaBearerTokenCarrier>> {
+        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+            "notification-watch-test-token",
+        )))
     }
 
     #[tokio::test]
@@ -1478,6 +1503,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1528,6 +1554,7 @@ mod tests {
         let error = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(unauthorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["metadata_created".to_string()],
@@ -1540,6 +1567,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state),
             Extension(Some(auth_for(authorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["metadata_created".to_string()],
@@ -1568,6 +1596,7 @@ mod tests {
         let error = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(unauthorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1580,6 +1609,7 @@ mod tests {
         let (status, created) = create_watch(
             State(state),
             Extension(Some(auth_for(authorized, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: path_prefix.clone(),
                 events: vec!["data_uploaded".to_string()],
@@ -1613,6 +1643,7 @@ mod tests {
         let missing = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(caller, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{}/datasets", Ulid::r#gen()),
                 events: vec!["metadata_created".to_string()],
@@ -1625,6 +1656,7 @@ mod tests {
         let unreadable = create_watch(
             State(state),
             Extension(Some(auth_for(caller, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{existing_group}/datasets"),
                 events: vec!["metadata_created".to_string()],
@@ -1648,6 +1680,7 @@ mod tests {
         let error = create_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix,
                 events,
@@ -1667,6 +1700,7 @@ mod tests {
         let empty_prefix = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: String::new(),
                 events: vec!["metadata_created".to_string()],
@@ -1679,6 +1713,7 @@ mod tests {
         let leading_slash = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "/bucket".to_string(),
                 events: vec!["metadata_created".to_string()],
@@ -1691,6 +1726,7 @@ mod tests {
         let empty_events = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: Vec::new(),
@@ -1703,6 +1739,7 @@ mod tests {
         let unknown_event = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "bucket".to_string(),
                 events: vec!["not_an_event".to_string()],
@@ -1715,6 +1752,7 @@ mod tests {
         let unscoped_data = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: "reports".to_string(),
                 events: vec!["data_uploaded".to_string()],
@@ -1728,6 +1766,7 @@ mod tests {
         let unscoped_metadata = create_watch(
             State(state.clone()),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{group_id}"),
                 events: vec!["metadata_created".to_string()],
@@ -1740,6 +1779,7 @@ mod tests {
         let noncanonical_metadata = create_watch(
             State(state),
             Extension(Some(auth_for(user_id, realm_id))),
+            bearer(),
             Json(CreateWatchRequest {
                 path_prefix: format!("meta/{group_id}/datasets/proteomics/"),
                 events: vec!["metadata_created".to_string()],
@@ -1766,13 +1806,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_endpoints_reject_path_restricted_token() {
+    async fn watch_creation_honors_path_restricted_token() {
         let realm_id = realm_id(9);
-        let (_dir, state) = build_state(realm_id, node(9)).await;
+        let holder = node(9);
+        let (_dir, state) = build_state(realm_id, holder).await;
+        install_local_holder_config(&state, realm_id, holder).await;
         let user_id = UserId::new(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
+        install_group_authorization(&state, realm_id, group_id, user_id, &[]).await;
         let mut auth = auth_for(user_id, realm_id);
         auth.path_restrictions = Some(vec![PathRestriction {
-            pattern: "/bucket/**".to_string(),
+            pattern: format!("/{realm_id}/g/{group_id}/data/{holder}/bucket/allowed/**"),
             permission: Permission::READ,
         }]);
 
@@ -1781,16 +1825,29 @@ mod tests {
             .expect_err("delegated token must be rejected");
         assert!(matches!(list_err, ServerError::Forbidden));
 
-        let create_err = create_watch(
+        let _ = create_watch(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            bearer(),
             Json(CreateWatchRequest {
-                path_prefix: "bucket".to_string(),
-                events: vec!["metadata_created".to_string()],
+                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "allowed/"),
+                events: vec!["data_uploaded".to_string()],
             }),
         )
         .await
-        .expect_err("delegated token must be rejected");
+        .expect("delegated token may watch its allowed prefix");
+
+        let create_err = create_watch(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            bearer(),
+            Json(CreateWatchRequest {
+                path_prefix: data_watch_resource_path(group_id, holder, "bucket", "private/"),
+                events: vec!["data_uploaded".to_string()],
+            }),
+        )
+        .await
+        .expect_err("delegated token must not watch outside its prefix");
         assert!(matches!(create_err, ServerError::Forbidden));
 
         let delete_err = delete_watch(

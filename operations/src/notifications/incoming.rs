@@ -178,6 +178,7 @@ async fn build_response(
             owner,
             path_prefix,
             event_mask,
+            authorization,
         } => {
             if let Err(reason) = verify_recipient_local_holder(&owner, &realm_config, local_node_id)
             {
@@ -190,6 +191,7 @@ async fn build_response(
                 owner,
                 path_prefix,
                 event_mask,
+                authorization,
                 unix_timestamp_millis(),
             )
             .await
@@ -645,8 +647,9 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
-        RealmAuthorizationDocument, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
-        WatchEventMask, data_watch_resource_path, watch_interest_dirty_key,
+        RealmAuthorizationDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEvent,
+        WatchEventDetail, WatchEventKind, WatchEventMask, data_watch_resource_path,
+        watch_interest_dirty_key,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -1543,9 +1546,16 @@ mod tests {
         install_watch_authorization(&b, realm_id, owner, &[]).await;
         let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
         let prefix = data_path("prefix");
-        let created = create_watch_remote(&a.net, b.net.node_id(), owner, prefix.clone(), mask)
-            .await
-            .expect("create succeeds");
+        let created = create_watch_remote(
+            &a.net,
+            b.net.node_id(),
+            owner,
+            prefix.clone(),
+            mask,
+            WatchAuthorizationBinding::default(),
+        )
+        .await
+        .expect("create succeeds");
         assert_eq!(created.owner, owner);
         assert_eq!(created.path_prefix, prefix);
         assert_eq!(created.event_mask, mask);
@@ -1589,6 +1599,7 @@ mod tests {
             owner,
             data_path(""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect_err("create on non-holder must be rejected");
@@ -1649,6 +1660,7 @@ mod tests {
             owner,
             data_path("prefix"),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect_err("an owner without READ must be refused by the holder");
@@ -1688,6 +1700,7 @@ mod tests {
             owner,
             data_path("prefix"),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect("authorized create succeeds");
@@ -2094,6 +2107,7 @@ mod tests {
             owner,
             "bucket".to_string(),
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            WatchAuthorizationBinding::default(),
         )
         .await
         .expect_err("non-eligible peer must be rejected");
