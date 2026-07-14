@@ -128,10 +128,16 @@ fn decode_canonical(input: &str) -> Result<u128, ParseError> {
 mod sealed {
     use ulid::Ulid;
 
+    pub struct Token(());
+
+    pub(super) fn new() -> Token {
+        Token(())
+    }
+
     /// The raw constructor lives here so no code outside this module can
     /// wrap an unvalidated ULID (e.g. one carrying the reserved handle 0).
     pub trait Sealed {
-        fn from_ulid(ulid: Ulid) -> Self;
+        fn from_ulid(ulid: Ulid, _token: Token) -> Self;
     }
 }
 
@@ -155,12 +161,15 @@ pub trait StructuredId: Sized + Copy + sealed::Sealed {
         if nonce > layout::MAX_NONCE {
             return Err(FieldError::NonceOutOfRange(nonce));
         }
-        Ok(Self::from_ulid(Ulid(layout::pack(
-            timestamp_ms,
-            handle.get(),
-            bucket.get(),
-            nonce,
-        ))))
+        Ok(Self::from_ulid(
+            Ulid(layout::pack(
+                timestamp_ms,
+                handle.get(),
+                bucket.get(),
+                nonce,
+            )),
+            sealed::new(),
+        ))
     }
 
     /// Parses the canonical 26-character form, normalizing lowercase and
@@ -170,7 +179,7 @@ pub trait StructuredId: Sized + Copy + sealed::Sealed {
         if layout::unpack(value).handle == layout::RESERVED_HANDLE {
             return Err(ParseError::ReservedHandle);
         }
-        Ok(Self::from_ulid(Ulid(value)))
+        Ok(Self::from_ulid(Ulid(value), sealed::new()))
     }
 
     fn timestamp_ms(&self) -> u64 {
@@ -210,7 +219,7 @@ macro_rules! structured_id_newtype {
         pub struct $name(Ulid);
 
         impl sealed::Sealed for $name {
-            fn from_ulid(ulid: Ulid) -> Self {
+            fn from_ulid(ulid: Ulid, _token: sealed::Token) -> Self {
                 Self(ulid)
             }
         }
