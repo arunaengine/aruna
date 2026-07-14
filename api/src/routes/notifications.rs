@@ -14,7 +14,8 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
     delete_watch_for_user, list_notifications_for_user, list_watches_for_user, mark_read_for_user,
-    resolve_inbox_holder_for_user, subscribe_inbox_wakes, unread_count_for_user,
+    record_watch_creation_denial_metric, resolve_inbox_holder_for_user, subscribe_inbox_wakes,
+    unread_count_for_user,
 };
 use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
@@ -212,11 +213,7 @@ fn watch_response(subscription: &WatchSubscription) -> WatchResponse {
 }
 
 fn record_watch_creation_denial(state: &ServerState, reason: WatchAuthorizationMetricReason) {
-    if let Some(net_handle) = state.get_ctx().net_handle.as_ref() {
-        net_handle
-            .notification_watch_metrics()
-            .record_creation_denial(reason);
-    }
+    record_watch_creation_denial_metric(state.get_ctx().as_ref(), reason);
     warn!(
         parent: None,
         reason = reason.as_str(),

@@ -87,6 +87,17 @@ pub async fn resolve_inbox_holder_for_user(
 /// names the net handle's channel type directly.
 pub type InboxWakeReceiver = broadcast::Receiver<UserId>;
 
+pub fn record_watch_creation_denial_metric(
+    context: &DriverContext,
+    reason: WatchAuthorizationMetricReason,
+) {
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        net_handle
+            .notification_watch_metrics()
+            .record_creation_denial(reason);
+    }
+}
+
 /// Subscribes to local inbox-delivery wakes. `Unavailable` when the node runs
 /// without a net handle, matching the other dispatch paths.
 pub fn subscribe_inbox_wakes(
