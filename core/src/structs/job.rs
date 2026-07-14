@@ -606,7 +606,11 @@ mod tests {
                 for to in [
                     JobState::Queued,
                     JobState::Claimed,
+                    JobState::Preparing,
+                    JobState::Ready,
                     JobState::Running,
+                    JobState::Cancelling,
+                    JobState::Indeterminate,
                     JobState::Succeeded,
                     JobState::Failed,
                     JobState::Cancelled,
