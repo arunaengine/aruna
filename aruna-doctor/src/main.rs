@@ -78,7 +78,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: PortalCommands,
     },
-    Info,
+    Info {
+        /// Realm token used to read node topology and backend detail. Falls back
+        /// to ARUNA_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -123,6 +128,9 @@ pub enum IrohCommands {
         info_url: Option<String>,
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
+        /// Realm token used to read node topology. Falls back to ARUNA_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -197,7 +205,8 @@ pub async fn main() -> Result<(), CliError> {
             IrohCommands::Check {
                 info_url,
                 timeout_secs,
-            } => print_iroh_check(info_url, timeout_secs).await?,
+                token,
+            } => print_iroh_check(info_url, timeout_secs, token).await?,
         },
         Commands::Portal { command } => match command {
             PortalCommands::Update {
@@ -215,7 +224,7 @@ pub async fn main() -> Result<(), CliError> {
                 .await?
             }
         },
-        Commands::Info => print_info().await?,
+        Commands::Info { token } => print_info(token).await?,
     };
 
     Ok(())

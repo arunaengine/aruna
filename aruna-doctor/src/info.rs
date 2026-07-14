@@ -46,10 +46,10 @@ struct OidcProviderView {
     discovery_url: String,
 }
 
-pub async fn print_info() -> Result<(), CliError> {
+pub async fn print_info(token: Option<String>) -> Result<(), CliError> {
     let _ = dotenvy::dotenv();
     let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
-    let endpoint_info = fetch_info(http_socket_addr).await?;
+    let endpoint_info = fetch_info(http_socket_addr, resolve_token(token).as_deref()).await?;
     let output = DoctorInfoOutput {
         config: ConfigView::from_env(http_socket_addr)?,
         endpoint_info,
@@ -59,30 +59,43 @@ pub async fn print_info() -> Result<(), CliError> {
     Ok(())
 }
 
+/// `/info` only reports topology to a realm token and backend detail to a realm
+/// admin, so the operator passes one via `--token` or `ARUNA_TOKEN`.
+pub(crate) fn resolve_token(token: Option<String>) -> Option<String> {
+    token
+        .or_else(|| dotenvy::var("ARUNA_TOKEN").ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 pub(crate) fn default_info_url_from_env() -> Result<String, CliError> {
     let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
     Ok(info_url(http_socket_addr))
 }
 
-pub(crate) async fn fetch_info(http_socket_addr: SocketAddr) -> Result<InfoResponse, CliError> {
-    fetch_info_url(&info_url(http_socket_addr)).await
-}
-
-pub(crate) async fn fetch_info_url(url: &str) -> Result<InfoResponse, CliError> {
-    fetch_info_url_with_timeout(url, Duration::from_secs(10)).await
+pub(crate) async fn fetch_info(
+    http_socket_addr: SocketAddr,
+    token: Option<&str>,
+) -> Result<InfoResponse, CliError> {
+    fetch_info_url_with_timeout(&info_url(http_socket_addr), Duration::from_secs(10), token).await
 }
 
 pub(crate) async fn fetch_info_url_with_timeout(
     url: &str,
     timeout: Duration,
+    token: Option<&str>,
 ) -> Result<InfoResponse, CliError> {
     let timeout = nonzero_timeout(timeout);
     let connect_timeout = nonzero_timeout(timeout.min(Duration::from_secs(2)));
-    let response = Client::builder()
+    let mut request = Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(timeout)
         .build()?
-        .get(url)
+        .get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|source| CliError::InfoRequest {
@@ -453,19 +466,20 @@ mod tests {
         );
     }
 
+    /// Without a token the node reports health, version and public interface
+    /// urls, but no node identity or backend topology.
     #[tokio::test]
     async fn live_info() {
         let _guard = env_lock().lock().await;
         let node = spawn_test_node().await;
 
-        let info = fetch_info(node.http_addr).await.unwrap();
+        let info = fetch_info(node.http_addr, None).await.unwrap();
 
         assert_eq!(
-            info.services.network.status,
+            info.node.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
-        assert!(info.services.network.discovery.is_empty());
-        assert_eq!(info.services.network.relay.as_deref(), Some("none"));
+        assert!(!info.api_version.is_empty());
         assert_eq!(
             info.services.interfaces.rest.status,
             aruna_api::routes::info::ServiceStatus::Available
@@ -475,6 +489,8 @@ mod tests {
             info.services.interfaces.rest.url.as_deref(),
             Some(api_url.as_str())
         );
+        assert!(info.node.peer_id.is_none());
+        assert!(info.services.network.is_none());
         node.shutdown().await;
     }
 }

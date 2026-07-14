@@ -1,5 +1,5 @@
 use crate::error::CliError;
-use crate::info::{default_info_url_from_env, fetch_info_url_with_timeout};
+use crate::info::{default_info_url_from_env, fetch_info_url_with_timeout, resolve_token};
 use aruna_api::routes::info::{
     InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
 };
@@ -68,32 +68,48 @@ struct IrohCheckStep {
     duration_ms: u64,
 }
 
-pub async fn print_iroh_check(info_url: Option<String>, timeout_secs: u64) -> Result<(), CliError> {
+pub async fn print_iroh_check(
+    info_url: Option<String>,
+    timeout_secs: u64,
+    token: Option<String>,
+) -> Result<(), CliError> {
     let _ = dotenvy::dotenv();
     let info_url = match info_url {
         Some(info_url) => info_url,
         None => default_info_url_from_env()?,
     };
-    let output = run_iroh_check(info_url, Duration::from_secs(timeout_secs)).await?;
+    let output = run_iroh_check(
+        info_url,
+        Duration::from_secs(timeout_secs),
+        resolve_token(token),
+    )
+    .await?;
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
-async fn run_iroh_check(info_url: String, timeout: Duration) -> Result<IrohCheckOutput, CliError> {
+async fn run_iroh_check(
+    info_url: String,
+    timeout: Duration,
+    token: Option<String>,
+) -> Result<IrohCheckOutput, CliError> {
     let mut checks = Vec::new();
 
     let info_started = Instant::now();
-    let endpoint_info = fetch_info_url_with_timeout(&info_url, timeout).await?;
+    let endpoint_info = fetch_info_url_with_timeout(&info_url, timeout, token.as_deref()).await?;
     checks.push(ok_step("info", info_started.elapsed()));
 
-    if endpoint_info.services.network.status != ServiceStatus::Available {
+    let network = endpoint_info.services.network.as_ref().ok_or_else(|| {
+        iroh_check_error(
+            "info",
+            "node reports no topology: pass a realm token via --token or ARUNA_TOKEN",
+        )
+    })?;
+    if network.status != ServiceStatus::Available {
         return Err(iroh_check_error(
             "info",
-            format!(
-                "network state is {:?}",
-                endpoint_info.services.network.status
-            ),
+            format!("network state is {:?}", network.status),
         ));
     }
 
@@ -108,7 +124,7 @@ async fn run_iroh_check(info_url: String, timeout: Duration) -> Result<IrohCheck
         status: "ok",
         info_url,
         target: target_output(&endpoint_info, &endpoint_addr),
-        reported: reported_diagnostics(&endpoint_info),
+        reported: reported_diagnostics(network, &endpoint_info),
         active,
         checks,
     })
@@ -118,6 +134,13 @@ fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr,
     let peer_id = endpoint_info
         .node
         .peer_id
+        .as_deref()
+        .ok_or_else(|| {
+            iroh_check_error(
+                "endpoint_addr",
+                "node reports no peer id: pass a realm token via --token or ARUNA_TOKEN",
+            )
+        })?
         .parse::<iroh::PublicKey>()
         .map_err(|error| iroh_check_error("endpoint_addr", error))?;
     let addresses = endpoint_info
@@ -292,7 +315,7 @@ where
 fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> IrohCheckTarget {
     IrohCheckTarget {
         realm_id: Some(endpoint_info.node.realm_id.clone()),
-        node_id: Some(endpoint_info.node.peer_id.clone()),
+        node_id: endpoint_info.node.peer_id.clone(),
         endpoint_addr: serde_json::to_value(endpoint_addr).unwrap_or(serde_json::Value::Null),
         addresses: endpoint_addr
             .addrs
@@ -304,9 +327,12 @@ fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> 
     }
 }
 
-fn reported_diagnostics(endpoint_info: &InfoResponse) -> ReportedNetDiagnostics {
+fn reported_diagnostics(
+    network: &NetworkServiceStatus,
+    endpoint_info: &InfoResponse,
+) -> ReportedNetDiagnostics {
     ReportedNetDiagnostics {
-        network: endpoint_info.services.network.clone(),
+        network: network.clone(),
         connections: endpoint_info.connections.clone(),
         warnings: endpoint_info.warnings.clone(),
     }
@@ -385,9 +411,7 @@ fn iroh_check_error(step: &'static str, message: impl std::fmt::Display) -> CliE
 mod tests {
     use super::*;
     use aruna_api::routes::info::{
-        BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
-        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, PortalStatus,
-        RequestSummary, ServicesStatus,
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };
     use aruna_core::structs::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -408,41 +432,24 @@ mod tests {
             node: NodeStatus {
                 status: ServiceStatus::Available,
                 realm_id: RealmId::from_bytes([1u8; 32]).to_string(),
-                peer_id: node_id.to_string(),
-                capabilities: NodeCapabilityKind::Management,
+                peer_id: Some(node_id.to_string()),
+                capabilities: Some(NodeCapabilityKind::Management),
             },
             api_version: "test".to_string(),
-            portal: PortalStatus::default(),
+            portal: None,
             my_addresses,
             connections: Vec::new(),
             services: ServicesStatus {
-                network: NetworkServiceStatus {
+                network: Some(NetworkServiceStatus {
                     status: ServiceStatus::Available,
                     discovery: Vec::new(),
                     relay: Some("none".to_string()),
                     relay_urls: Vec::new(),
                     routing_table_size: None,
-                    requests: RequestSummary {
-                        total: 0,
-                        failure_rate: 0.0,
-                        last_error: None,
-                    },
-                },
-                blob: BlobServiceStatus {
-                    status: ServiceStatus::NotConfigured,
-                    backend: None,
-                    max_bucket_size: None,
-                    multipart_bucket: None,
-                    timeouts_secs: None,
-                },
-                database: DatabaseServiceStatus {
-                    status: ServiceStatus::Available,
-                    requests: RequestSummary {
-                        total: 0,
-                        failure_rate: 0.0,
-                        last_error: None,
-                    },
-                },
+                    requests: None,
+                }),
+                blob: None,
+                database: None,
                 interfaces: InterfaceServicesStatus {
                     rest: InterfaceStatus {
                         status: ServiceStatus::Available,
