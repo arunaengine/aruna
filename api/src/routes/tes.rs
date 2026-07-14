@@ -592,19 +592,31 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<Vec<u8>>), 
     let group_id = Ulid::from_string(group_raw)
         .map_err(|_| TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id")))?;
 
-    let mut inputs = Vec::with_capacity(task.inputs.len());
+    let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
-        inputs.push(map_input(input)?);
+        let input = map_input(input)?;
+        if inputs.iter().any(|existing| existing.dest_key == input.dest_key) {
+            return Err(TesError::bad_request("duplicate input destination"));
+        }
+        inputs.push(input);
     }
     let output_prefixes = task.outputs.iter().map(map_output).collect();
 
+    let ram_bytes = task
+        .resources
+        .as_ref()
+        .and_then(|r| r.ram_gb)
+        .map(|gb| {
+            let bytes = (gb * 1_000_000_000.0) as u64;
+            if !gb.is_finite() || gb <= 0.0 || bytes == 0 || bytes > i64::MAX as u64 {
+                return Err(TesError::bad_request("invalid ram_gb"));
+            }
+            Ok(bytes)
+        })
+        .transpose()?;
     let resources = ComputeResources {
         cpu_cores: task.resources.as_ref().and_then(|r| r.cpu_cores),
-        ram_bytes: task
-            .resources
-            .as_ref()
-            .and_then(|r| r.ram_gb)
-            .map(|gb| (gb * 1_000_000_000.0) as u64),
+        ram_bytes,
         max_walltime_ms: None,
     };
 
@@ -1084,6 +1096,25 @@ mod tests {
         assert_eq!(spec.inputs[0].dest_key, "in/data.csv");
         assert_eq!(spec.output_prefixes, vec!["out/".to_string()]);
         assert!(dedup.is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_inputs() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        let mut input = task.inputs[0].clone();
+        input.url = Some("s3://src/other.csv".to_string());
+        input.path.insert(0, '/');
+        task.inputs.push(input);
+        assert_eq!(map_task_to_spec(&task).unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_invalid_ram() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        for ram_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
+            task.resources.as_mut().unwrap().ram_gb = Some(ram_gb);
+            assert_eq!(map_task_to_spec(&task).unwrap_err().status, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
