@@ -48,7 +48,8 @@ pub async fn process_job_queue_batch(
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    let (due_ready, _) = scan_ready(storage, JOB_DUE_INDEX_PREFIX, now_ms, capacity).await?;
+    let (due_ready, _, _) =
+        scan_ready(storage, JOB_DUE_INDEX_PREFIX, now_ms, capacity, None).await?;
     for (ts, job_id) in due_ready {
         match claim_job(storage, job_id, holder_node_id, now_ms).await {
             Ok(ClaimOutcome::Claimed(record)) => result.claimed.push(record),
@@ -78,67 +79,77 @@ pub async fn process_job_queue_batch(
     }
 
     if !result.retry_after_error {
-        match scan_ready(
-            storage,
-            JOB_LEASE_INDEX_PREFIX,
-            now_ms,
-            JOB_DRAIN_BATCH_SIZE,
-        )
-        .await
-        {
-            Ok((expired_leases, _)) => {
-                for (ts, job_id) in expired_leases {
-                    match requeue_job(
-                        storage,
-                        job_id,
-                        None,
-                        now_ms,
-                        Some(now_ms),
-                        Some(JobError::retryable("lease expired")),
-                    )
-                    .await
-                    {
-                        Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                            if let Some(reconciler) = reconciler {
-                                reconciler.reconcile_lost_attempt(storage, record).await;
+        let mut start_after = None;
+        for _ in 0..2 {
+            match scan_ready(
+                storage,
+                JOB_LEASE_INDEX_PREFIX,
+                now_ms,
+                JOB_DRAIN_BATCH_SIZE,
+                start_after.take(),
+            )
+            .await
+            {
+                Ok((expired_leases, _, next)) => {
+                    let expired_count = expired_leases.len();
+                    let reconciled_before = result.reconciled;
+                    for (ts, job_id) in expired_leases {
+                        match requeue_job(
+                            storage,
+                            job_id,
+                            None,
+                            now_ms,
+                            Some(now_ms),
+                            Some(JobError::retryable("lease expired")),
+                        )
+                        .await
+                        {
+                            Ok(RequeueOutcome::NeedsReconcile(record)) => {
+                                if let Some(reconciler) = reconciler {
+                                    reconciler.reconcile_lost_attempt(storage, record).await;
+                                }
+                                result.reconciled = result.reconciled.saturating_add(1);
                             }
-                            result.reconciled = result.reconciled.saturating_add(1);
-                        }
-                        Ok(_) => result.swept = result.swept.saturating_add(1),
-                        Err(JobMutationError::NotFound) => {
-                            if let Err(error) =
-                                delete_schedule_row(storage, job_lease_index_key(ts, job_id)).await
-                            {
-                                warn!(error = %error, "Failed to drop orphaned job lease index row");
+                            Ok(_) => result.swept = result.swept.saturating_add(1),
+                            Err(JobMutationError::NotFound) => {
+                                if let Err(error) =
+                                    delete_schedule_row(storage, job_lease_index_key(ts, job_id))
+                                        .await
+                                {
+                                    warn!(error = %error, "Failed to drop orphaned job lease index row");
+                                    result.retry_after_error = true;
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                warn!(job_id = %job_id, error = %error, "Failed to requeue expired lease");
                                 result.retry_after_error = true;
                                 break;
                             }
                         }
-                        Err(error) => {
-                            warn!(job_id = %job_id, error = %error, "Failed to requeue expired lease");
-                            result.retry_after_error = true;
-                            break;
-                        }
                     }
+                    if result.retry_after_error
+                        || expired_count != JOB_DRAIN_BATCH_SIZE
+                        || result.reconciled.saturating_sub(reconciled_before) != expired_count
+                    {
+                        break;
+                    }
+                    let Some(next) = next else {
+                        break;
+                    };
+                    start_after = Some(next);
                 }
-            }
-            Err(error) => {
-                warn!(error = %error, "Failed to scan expired job leases");
-                result.retry_after_error = true;
+                Err(error) => {
+                    warn!(error = %error, "Failed to scan expired job leases");
+                    result.retry_after_error = true;
+                    break;
+                }
             }
         }
     }
 
     match next_drain_delays(storage).await {
         Ok((due, lease)) => {
-            // A reconciled attempt keeps its expired lease row in place by design, which
-            // would pin the lease head at zero and busy-loop the drain; floor the lease
-            // side to a non-zero re-arm so the next reconcile pass waits its turn.
-            let lease = if result.reconciled > 0 {
-                lease.map(|after| after.max(JOB_RECONCILE_REARM))
-            } else {
-                lease
-            };
             result.next_due_after = min_delay(due, lease);
         }
         Err(error) => {
@@ -158,7 +169,8 @@ async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), St
     .await
 }
 
-/// Earliest `due/` and `lease/` heads as delays from now; `ZERO` when work is due.
+/// Earliest `due/` and `lease/` heads as delays from now; lease delays observe the
+/// reconcile re-arm floor.
 async fn next_drain_delays(
     storage: &StorageHandle,
 ) -> Result<(Option<Duration>, Option<Duration>), String> {
@@ -166,7 +178,20 @@ async fn next_drain_delays(
     let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
     let due = first_schedule_entry(storage, JOB_DUE_INDEX_PREFIX).await?;
     let lease = first_schedule_entry(storage, JOB_LEASE_INDEX_PREFIX).await?;
-    Ok((due.map(|(ts, _)| delay(ts)), lease.map(|(ts, _)| delay(ts))))
+    // A reconciled attempt keeps its expired lease row in place by design, which
+    // would otherwise pin the lease head at zero and busy-loop the drain; only an
+    // already-due head needs the floor, a still-future one must still fire on time.
+    Ok((
+        due.map(|(ts, _)| delay(ts)),
+        lease.map(|(ts, _)| {
+            let raw = delay(ts);
+            if raw.is_zero() {
+                JOB_RECONCILE_REARM
+            } else {
+                raw
+            }
+        }),
+    ))
 }
 
 fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration> {
@@ -177,7 +202,7 @@ fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration>
     }
 }
 
-/// Earliest `due/`/`lease/` head as a delay from now; `ZERO` when work is due.
+/// Earliest `due/`/`lease/` head as a delay from now, with the lease re-arm floor.
 pub async fn next_job_drain_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, String> {
@@ -211,15 +236,16 @@ async fn scan_ready(
     prefix: &[u8],
     now_ms: u64,
     limit: usize,
-) -> Result<(Vec<(u64, JobId)>, Option<u64>), String> {
+    start_after: Option<Key>,
+) -> Result<(Vec<(u64, JobId)>, Option<u64>, Option<Key>), String> {
     if limit == 0 {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, None));
     }
-    let (values, _) = iter_prefix_page(
+    let (values, next) = iter_prefix_page(
         storage,
         JOB_SCHEDULE_INDEX_KEYSPACE,
         Some(ByteView::from(prefix.to_vec())),
-        None,
+        start_after,
         limit,
         None,
     )
@@ -243,7 +269,7 @@ async fn scan_ready(
             }
         }
     }
-    Ok((ready, next_at))
+    Ok((ready, next_at, next))
 }
 
 #[cfg(test)]
