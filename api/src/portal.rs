@@ -1,7 +1,9 @@
+use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
 use crate::server_state::{PortalRuntimeState, ServerState};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -16,10 +18,12 @@ const ASSETS_PREFIX: &str = "/assets/";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const NO_CACHE: &str = "no-cache";
 
-pub fn router(state: Arc<ServerState>) -> Router {
+pub fn router(state: Arc<ServerState>, csp: PortalCspConfig) -> Router {
+    let security = PortalSecurity::new(state.clone(), csp);
     Router::new()
         .route("/portal-config.json", get(portal_config))
         .fallback(serve_portal)
+        .layer(from_fn_with_state(security, portal_security_headers))
         .with_state(state)
 }
 
@@ -155,16 +159,27 @@ impl IntoResponse for PortalServeError {
 #[cfg(test)]
 mod tests {
     use super::{IMMUTABLE_CACHE, NO_CACHE, serve_portal_request};
+    use crate::cors::CorsConfig;
+    use crate::csp::PortalCspConfig;
+    use crate::server::{DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig};
     use crate::server_state::{PortalStatus, ServerState};
-    use aruna_core::structs::{NodeCapabilities, RealmId};
-    use aruna_operations::driver::DriverContext;
+    use aruna_core::UserId;
+    use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, RealmId};
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use axum::body::{Body, to_bytes};
     use axum::extract::Request;
     use axum::http::{Method, StatusCode, header};
+    use axum::routing::get;
+    use axum::{Json, Router};
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+    use ulid::Ulid;
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
@@ -174,7 +189,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
-            task_handle: None,
+            task_handle: Some(TaskHandle::new()),
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -195,6 +210,70 @@ mod tests {
         );
 
         (state, tempdir)
+    }
+
+    /// Realm config with an OIDC provider, an S3 interface and an installed
+    /// portal: everything the served policy derives its origins from.
+    async fn setup_serving_node(portal_dir: &std::path::Path) -> (Router, TempDir, String) {
+        let (state, tempdir) = setup_state().await;
+        let realm_id = state.get_realm_id();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_origin = format!("http://{}", listener.local_addr().unwrap());
+        let discovery_url = format!("{discovery_origin}/.well-known/openid-configuration");
+        let discovery_router = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(|| async {
+                Json(serde_json::json!({
+                    "token_endpoint": "https://tokens.test/oauth2/token"
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, discovery_router).await.unwrap();
+        });
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id: state.get_node_id(),
+                    user_id: UserId::local(Ulid::r#gen(), realm_id),
+                    realm_id,
+                },
+                realm_description: "Realm".to_string(),
+                oidc_providers: vec![OidcProviderConfig {
+                    id: "main".to_string(),
+                    issuer: "https://issuer.test/realms/aruna".to_string(),
+                    audience: "aruna".to_string(),
+                    discovery_url,
+                }],
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &state.get_ctx(),
+        )
+        .await
+        .unwrap();
+        state
+            .register_s3_interface("127.0.0.1:9000".parse().unwrap(), "https://s3.test")
+            .await;
+
+        std::fs::create_dir_all(portal_dir.join("assets")).unwrap();
+        std::fs::write(portal_dir.join("index.html"), "<html>portal</html>").unwrap();
+        std::fs::write(portal_dir.join("assets/app.js"), "console.log('portal');").unwrap();
+        enable_portal(&state, portal_dir).await;
+
+        let router = Server::new(
+            state,
+            ServerConfig {
+                http_addr: "127.0.0.1:0".parse().unwrap(),
+                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: CorsConfig::default(),
+                portal_csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
+            },
+        )
+        .build_router();
+
+        (router, tempdir, discovery_origin)
     }
 
     async fn enable_portal(state: &ServerState, dir: &std::path::Path) {
@@ -358,5 +437,124 @@ mod tests {
 
         let response = serve_portal_request(&state, request(Method::POST, "/api/v1/missing")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn portal_sets_security_headers() {
+        let tempdir = tempdir().unwrap();
+        let (router, _state_dir, _discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
+
+        for path in [
+            "/",
+            "/groups/test-group",
+            "/assets/app.js",
+            "/portal-config.json",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request(Method::GET, path))
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let headers = response.headers();
+            let policy = headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("{path} has no policy"))
+                .to_str()
+                .unwrap();
+            assert!(policy.contains("default-src 'self'"), "{path}: {policy}");
+            assert!(
+                policy.contains("script-src 'self' 'wasm-unsafe-eval'"),
+                "{path}: {policy}"
+            );
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path}: {policy}"
+            );
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff"
+            );
+            assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+            assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+            assert_eq!(
+                headers.get("cross-origin-opener-policy").unwrap(),
+                "same-origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_src_lists_node_origins() {
+        let tempdir = tempdir().unwrap();
+        let (router, _state_dir, discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
+
+        let response = router.oneshot(request(Method::GET, "/")).await.unwrap();
+
+        let policy = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let connect_src = policy
+            .split("; ")
+            .find(|directive| directive.starts_with("connect-src "))
+            .unwrap();
+        assert!(connect_src.contains("'self'"), "{connect_src}");
+        assert!(connect_src.contains("https://s3.test"), "{connect_src}");
+        assert!(connect_src.contains("https://issuer.test"), "{connect_src}");
+        assert!(connect_src.contains(&discovery_origin), "{connect_src}");
+        assert!(connect_src.contains("https://tokens.test"), "{connect_src}");
+        assert!(connect_src.contains("https://peer.test"), "{connect_src}");
+
+        let img_src = policy
+            .split("; ")
+            .find(|directive| directive.starts_with("img-src "))
+            .unwrap();
+        assert!(img_src.contains("blob:"), "{img_src}");
+        assert!(img_src.contains("https://s3.test"), "{img_src}");
+    }
+
+    #[tokio::test]
+    async fn api_routes_baseline() {
+        // API and swagger get the anti-clickjacking baseline, but not the strict portal CSP.
+        let tempdir = tempdir().unwrap();
+        let (router, _state_dir, _discovery_origin) =
+            setup_serving_node(&tempdir.path().join("portal")).await;
+
+        for path in ["/api/v1/info", "/api-docs/openapi.json"] {
+            let response = router
+                .clone()
+                .oneshot(request(Method::GET, path))
+                .await
+                .unwrap();
+
+            let headers = response.headers();
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{path}"
+            );
+            assert_eq!(
+                headers.get(header::X_FRAME_OPTIONS).unwrap(),
+                "DENY",
+                "{path}"
+            );
+            let policy = headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("{path} has no policy"))
+                .to_str()
+                .unwrap();
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path}: {policy}"
+            );
+            assert!(!policy.contains("script-src"), "{path}: {policy}");
+        }
     }
 }

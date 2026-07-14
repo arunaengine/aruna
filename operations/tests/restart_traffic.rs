@@ -112,14 +112,17 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
         .take(40)
         .map(|(group_id, document_id)| (*group_id, *document_id))
         .collect();
-    wait_for_visibility(
-        std::slice::from_ref(&nodes[2].context),
+    wait_for_any_visibility(
+        &nodes[2].context,
         &sample,
         Duration::from_millis(200),
         CONVERGENCE_TIMEOUT,
     )
     .await?;
-    println!("seeded {} docs, node 2 caught up", created.len());
+    println!(
+        "seeded {} docs, node 2 holds replicated state",
+        created.len()
+    );
 
     // Restart node 2's whole stack.
     let node2 = nodes.pop().expect("node 2 present");
@@ -336,6 +339,32 @@ async fn wait_for_visibility(
         if t0.elapsed() > timeout {
             let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
             return Err(format!("visibility timeout; missing per node: {counts:?}").into());
+        }
+        sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_any_visibility(
+    context: &Arc<DriverContext>,
+    pairs: &[(GroupId, Ulid)],
+    poll_interval: Duration,
+    timeout: Duration,
+) -> Result<(), BoxError> {
+    let t0 = Instant::now();
+    loop {
+        for &(group_id, document_id) in pairs {
+            if drive(
+                GetMetadataDocumentOperation::new(group_id, document_id),
+                context.as_ref(),
+            )
+            .await
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        if t0.elapsed() > timeout {
+            return Err("visibility timeout; no sampled documents visible".into());
         }
         sleep(poll_interval).await;
     }
