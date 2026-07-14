@@ -52,9 +52,9 @@ async fn ensure_held_shard_topics(
     local_node_id: NodeId,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> HeldTopicOutcome {
-    type ShardGroup = (Vec<::irokle::TopicId>, BTreeSet<NodeId>);
-    let mut rank0_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
-    let mut member_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
+    type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
+    let mut rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut member_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
     for strategy in &config.strategies {
         for shard in 0..strategy.shard_count {
             let placement = PlacementRef {
@@ -72,19 +72,22 @@ async fn ensure_held_shard_topics(
                 .filter(|candidate| *candidate != local_node_id)
                 .collect();
             sort_node_ids(&mut co_holders);
-            let retained = draining_former_holders(config, &placement);
+            let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
+                .into_iter()
+                .collect();
             let groups = if local_is_rank0 {
                 &mut rank0_groups
             } else {
                 &mut member_groups
             };
-            let entry = groups.entry(co_holders).or_default();
-            entry.0.push(shard_topic_id(realm_id, &placement));
-            entry.1.extend(retained);
+            groups
+                .entry((co_holders, retained))
+                .or_default()
+                .push(shard_topic_id(realm_id, &placement));
         }
     }
     let mut outcome = HeldTopicOutcome::default();
-    for (co_holders, (topics, retained)) in rank0_groups {
+    for ((co_holders, retained), topics) in rank0_groups {
         debug!(
             event = "placement.genesis.ensure",
             topics = topics.len(),
@@ -110,7 +113,7 @@ async fn ensure_held_shard_topics(
     // origin is drained out of the holder set, nobody does.
     // Topics already known are topped up with the current co-holder set, which
     // is what admits a freshly added holder on the pushing side.
-    for (co_holders, (topics, retained)) in member_groups {
+    for ((co_holders, retained), topics) in member_groups {
         if co_holders.is_empty() {
             continue;
         }

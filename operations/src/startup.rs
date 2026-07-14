@@ -78,10 +78,10 @@ impl RestoreShardSummary {
 /// resolves into a holder of, ensures the shard sync topic with its co-holders
 /// and runs one anti-entropy pass against them (digest exchange, not a
 /// per-document re-announce). The fixed shared realm topics are restored the
-/// same way. Topics that share a co-holder set are batched into one ensure and
-/// one sync so a restart costs O(held shards), not O(stored documents). The
-/// returned [`RestoreShardSummary`] reports the (small) topic count for callers
-/// and the restart-traffic gate.
+/// same way. Shard topics sharing co-holder and retained sets are batched into
+/// one ensure and one sync so a restart costs O(held shards), not O(stored
+/// documents). The returned [`RestoreShardSummary`] reports the (small) topic
+/// count for callers and the restart-traffic gate.
 pub async fn restore_shard_subscriptions(
     context: &Arc<DriverContext>,
     node_id: NodeId,
@@ -96,17 +96,17 @@ pub async fn restore_shard_subscriptions(
         return summary;
     };
 
-    // Group topics by their co-holder peer set so co-located shards ride one
-    // ensure + one sync instead of one round trip each. Shared realm topics are
-    // ensured directly. Shards the local node is rank-0 holder of go through the
-    // join-before-create gate (a fresh genesis only with positive co-holder
-    // confirmation); the rest are join-only — synced if their genesis is known
-    // or bootstrappable from a co-holder, otherwise left for the rank-0 holder's
-    // gossip to deliver.
-    type ShardGroup = (Vec<::irokle::TopicId>, BTreeSet<NodeId>);
+    // Group shard topics by co-holder and retained peer sets so matching shards
+    // ride one ensure + one sync instead of one round trip each. Shared realm
+    // topics are ensured directly. Shards where the local node is rank-0 go
+    // through the join-before-create gate (a fresh genesis only with positive
+    // co-holder confirmation); the rest are join-only — synced if their genesis
+    // is known or bootstrappable from a co-holder, otherwise left for the rank-0
+    // holder's gossip to deliver.
+    type ShardGroup = (Vec<NodeId>, BTreeSet<NodeId>);
     let mut shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>> = BTreeMap::new();
-    let mut rank0_shard_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
-    let mut join_groups: BTreeMap<Vec<NodeId>, ShardGroup> = BTreeMap::new();
+    let mut rank0_shard_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
+    let mut join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>> = BTreeMap::new();
 
     let mut shared_peers = shared_topic_peers(&config, node_id);
     shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -141,15 +141,18 @@ pub async fn restore_shard_subscriptions(
                 continue;
             }
             let topic = shard_topic_id(realm_id, &placement);
-            let retained = draining_former_holders(&config, &placement);
+            let retained: BTreeSet<NodeId> = draining_former_holders(&config, &placement)
+                .into_iter()
+                .collect();
             let groups = if local_is_rank0 {
                 &mut rank0_shard_groups
             } else {
                 &mut join_groups
             };
-            let entry = groups.entry(co_holders).or_default();
-            entry.0.push(topic);
-            entry.1.extend(retained);
+            groups
+                .entry((co_holders, retained))
+                .or_default()
+                .push(topic);
             summary.shard_topics += 1;
         }
     }
@@ -189,8 +192,8 @@ async fn restore_held_shard_topics(
     net_handle: &aruna_net::NetHandle,
     node_id: NodeId,
     shared_ensure_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    rank0_shard_groups: BTreeMap<Vec<NodeId>, (Vec<::irokle::TopicId>, BTreeSet<NodeId>)>,
-    join_groups: BTreeMap<Vec<NodeId>, (Vec<::irokle::TopicId>, BTreeSet<NodeId>)>,
+    rank0_shard_groups: BTreeMap<(Vec<NodeId>, BTreeSet<NodeId>), Vec<::irokle::TopicId>>,
+    join_groups: BTreeMap<(Vec<NodeId>, BTreeSet<NodeId>), Vec<::irokle::TopicId>>,
     verified: &BTreeSet<::irokle::TopicId>,
 ) -> bool {
     // Shared realm topics: ensured directly (every node's genesis of a shared
@@ -226,7 +229,7 @@ async fn restore_held_shard_topics(
     // just moved rank-0 onto this node, so an unreachable co-holder that might
     // still hold the genesis withholds creation rather than forking one.
     let mut withheld = false;
-    for (co_holders, (topics, retained)) in rank0_shard_groups {
+    for ((co_holders, retained), topics) in rank0_shard_groups {
         if co_holders.is_empty() || topics.is_empty() {
             continue;
         }
@@ -257,7 +260,7 @@ async fn restore_held_shard_topics(
     }
 
     // Non-rank-0 held shards: join-only, synced if bootstrappable.
-    for (peers, (topics, retained)) in join_groups {
+    for ((peers, retained), topics) in join_groups {
         if peers.is_empty() || topics.is_empty() {
             continue;
         }
