@@ -19,7 +19,7 @@ use crate::notifications::list::{
 };
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
+use crate::notifications::unread::{UNREAD_COUNT_CAP, UNREAD_SCAN_MAX_ROWS};
 use crate::notifications::watch::authorization::{
     is_watch_authorized, list_authorized_watch_subscriptions,
 };
@@ -197,6 +197,48 @@ pub(crate) async fn list_notifications_on_holder(
     }
 }
 
+pub(crate) async fn unread_count_on_holder(
+    context: &DriverContext,
+    recipient: UserId,
+) -> Result<(u32, bool), String> {
+    let mut cursor = None;
+    let mut count = 0usize;
+    let mut examined = 0usize;
+
+    loop {
+        let output = drive(
+            ListNotificationsOperation::new(ListNotificationsInput {
+                recipient,
+                cursor,
+                limit: UNREAD_COUNT_CAP.min(UNREAD_SCAN_MAX_ROWS - examined),
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        examined += output.records.len();
+
+        for record in output.records {
+            if record.read_at_ms.is_none()
+                && notification_is_visible(context, recipient, &record).await?
+            {
+                if count == UNREAD_COUNT_CAP {
+                    return Ok((count as u32, true));
+                }
+                count += 1;
+            }
+        }
+
+        if examined >= UNREAD_SCAN_MAX_ROWS && output.next_cursor.is_some() {
+            return Ok((count as u32, true));
+        }
+        match output.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok((count as u32, false)),
+        }
+    }
+}
+
 pub async fn unread_count_for_user(
     context: &DriverContext,
     local_node_id: NodeId,
@@ -204,13 +246,9 @@ pub async fn unread_count_for_user(
 ) -> Result<(u32, bool), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        let output = drive(
-            UnreadCountOperation::new(UnreadCountInput { recipient }),
-            context,
-        )
-        .await
-        .map_err(|error| NotificationDispatchError::Internal(error.to_string()))?;
-        Ok((output.count as u32, output.capped))
+        unread_count_on_holder(context, recipient)
+            .await
+            .map_err(NotificationDispatchError::Internal)
     } else {
         let net_handle = context
             .net_handle

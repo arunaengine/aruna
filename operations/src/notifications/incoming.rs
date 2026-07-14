@@ -18,13 +18,12 @@ use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
-use crate::notifications::dispatch::list_notifications_on_holder;
+use crate::notifications::dispatch::{list_notifications_on_holder, unread_count_on_holder};
 use crate::notifications::inbox::upsert_inbox_records_reporting;
 use crate::notifications::mark_read::{MARK_READ_MAX_IDS, MarkReadInput, MarkReadOperation};
 use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{NotificationTransportMessage, notification_message_kind};
-use crate::notifications::unread::{UnreadCountInput, UnreadCountOperation};
 use crate::notifications::watch::authorization::list_authorized_watch_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{
@@ -130,17 +129,11 @@ async fn build_response(
             {
                 return NotificationTransportMessage::Reject(reason);
             }
-            match drive(
-                UnreadCountOperation::new(UnreadCountInput { recipient }),
-                context,
-            )
-            .await
-            {
-                Ok(output) => NotificationTransportMessage::UnreadCountResult {
-                    count: output.count as u32,
-                    capped: output.capped,
-                },
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
+            match unread_count_on_holder(context, recipient).await {
+                Ok((count, capped)) => {
+                    NotificationTransportMessage::UnreadCountResult { count, capped }
+                }
+                Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
         NotificationTransportMessage::MarkRead {
@@ -1288,6 +1281,12 @@ mod tests {
                 .len(),
             3
         );
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("authorized unread count"),
+            (3, false)
+        );
         let (first_page, retry_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
             .await
             .expect("first authorized page");
@@ -1300,6 +1299,13 @@ mod tests {
             .expect("list after revocation");
         assert_eq!(listed, vec![direct]);
         assert_eq!(next_cursor, None);
+        assert_eq!(
+            unread_count_remote(&a.net, b.net.node_id(), recipient)
+                .await
+                .expect("unread count after revocation"),
+            (1, false)
+        );
+
         assert!(matches!(
             b.context
                 .storage_handle
