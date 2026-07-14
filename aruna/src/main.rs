@@ -30,6 +30,7 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
@@ -412,6 +413,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.net_handle.as_ref(),
         driver_ctx.metadata_handle.as_ref(),
         &driver_ctx.storage_handle,
+        jobs_runtime.clone(),
     )
     .await;
 
@@ -436,8 +438,13 @@ async fn shutdown_runtime(
     net_handle: Option<&NetHandle>,
     metadata_handle: Option<&MetadataHandle>,
     storage_handle: &StorageHandle,
+    jobs_runtime: Arc<JobsRuntime>,
 ) {
     readiness.begin_drain();
+
+    jobs_runtime
+        .shutdown(storage_handle, JOB_SHUTDOWN_GRACE)
+        .await;
 
     if let Some(net_handle) = net_handle {
         info!("Shutting down network services");
@@ -541,7 +548,7 @@ mod tests {
             response_tx.send(StorageEvent::SyncAllFinished);
         });
 
-        shutdown_runtime(&readiness, None, None, &storage_handle).await;
+        shutdown_runtime(&readiness, None, None, &storage_handle, JobsRuntime::new()).await;
 
         assert!(readiness.is_draining());
         worker.join().expect("storage responder should finish");
