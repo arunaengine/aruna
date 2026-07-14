@@ -498,6 +498,12 @@ pub async fn refresh_watch_interest_for_targets(
             DocumentSyncTarget::WatchSubscription { owner, .. } => {
                 dirty_realms.insert(owner.realm_id);
             }
+            DocumentSyncTarget::GroupAuthorization { .. } => {
+                dirty_realms.insert(*net_handle.realm_id());
+            }
+            DocumentSyncTarget::RealmAuthorization { realm_id } => {
+                dirty_realms.insert(*realm_id);
+            }
             DocumentSyncTarget::RealmConfig { realm_id } => {
                 realms.insert(*realm_id);
                 dirty_realms.insert(*realm_id);
@@ -1101,6 +1107,65 @@ mod tests {
             vec![holder]
         );
         assert_eq!(table.nodes(realm_id).map(|nodes| nodes.len()), Some(1));
+    }
+
+    // A consumed empty digest must be re-dirtied by group authorization
+    // reconciliation so a later READ grant restores remote interest.
+    #[tokio::test]
+    async fn regrant_restores_digest() {
+        let realm_id = RealmId([6u8; 32]);
+        let (_dir, ctx, net) = ctx_with_net(realm_id, [72u8; 32]).await;
+        let node_id = net.node_id();
+        install_realm_config(&ctx, realm_id, &[node_id]).await;
+        let group_id = Ulid::r#gen();
+        let auth_owner = user(6, 3);
+        let watch_owner = user(6, 2);
+        let prefix = metadata_prefix(group_id, "a");
+        install_authorization(&ctx, realm_id, node_id, group_id, auth_owner, &[]).await;
+        create_watch_subscription(&ctx.storage_handle, watch_owner, prefix.clone(), mask(), 1)
+            .await
+            .expect("create");
+
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("publish")
+        );
+        assert!(
+            read_digest(&ctx, realm_id, node_id)
+                .await
+                .expect("empty digest")
+                .entries
+                .is_empty()
+        );
+        assert!(read_marker(&ctx, realm_id).await.is_none());
+
+        install_authorization(
+            &ctx,
+            realm_id,
+            node_id,
+            group_id,
+            auth_owner,
+            &[watch_owner],
+        )
+        .await;
+        refresh_watch_interest_for_targets(
+            &ctx,
+            &[DocumentSyncTarget::GroupAuthorization { group_id }],
+        )
+        .await;
+
+        assert!(read_marker(&ctx, realm_id).await.is_some());
+        assert!(
+            publish_watch_interest(&ctx, node_id)
+                .await
+                .expect("republish")
+        );
+        let digest = read_digest(&ctx, realm_id, node_id)
+            .await
+            .expect("restored digest");
+        assert_eq!(digest.entries.len(), 1);
+        assert_eq!(digest.entries[0].path_prefix, prefix);
     }
 
     #[tokio::test]
