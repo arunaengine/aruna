@@ -20,8 +20,9 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingScope, MetadataRegistryRecord, NodePlacementEntry, PlacementOverride,
-    PlacementRef, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    Actor, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, MetadataRegistryRecord,
+    NodePlacementEntry, PlacementOverride, PlacementRef, PlacementStrategy, RealmConfigDocument,
+    StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -96,6 +97,27 @@ impl RealmPlacementMutation {
 
     fn validate(&self, document: &RealmConfigDocument) -> Result<(), MutateRealmPlacementError> {
         match self {
+            Self::UpsertNode(entry) if entry.draining => {
+                let unchanged = if let Some(current) = document.placement_entry(entry.node_id) {
+                    entry.effective_location() == current.effective_location()
+                        && entry.weight == current.weight
+                        && entry.full == current.full
+                        && entry.labels == current.labels
+                } else {
+                    entry.effective_location() == DEFAULT_LOCATION
+                        && entry.weight == DEFAULT_NODE_WEIGHT
+                        && !entry.full
+                        && entry.labels.is_empty()
+                };
+                if unchanged {
+                    Ok(())
+                } else {
+                    Err(MutateRealmPlacementError::InvalidInput(
+                        "draining freezes placement attributes until the node un-drains or is removed"
+                            .to_string(),
+                    ))
+                }
+            }
             Self::UpsertStrategy(strategy) if strategy.replica_count == Some(0) => {
                 Err(MutateRealmPlacementError::InvalidInput(
                     "placement strategy replica_count must not be zero".to_string(),
@@ -1268,6 +1290,38 @@ mod tests {
             draining: true,
             labels: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn draining_change_rejected() {
+        let node_id = node(1);
+        // Selection inputs stay frozen on transition and later draining upserts.
+        for already_draining in [false, true] {
+            let mut document =
+                RealmConfigDocument::new(RealmId::from_bytes([24; 32]), Vec::new(), 3);
+            let mut current = draining_entry(node_id);
+            current.draining = already_draining;
+            document.placement_map.push(current);
+            let mut changed = draining_entry(node_id);
+            changed.weight = 0;
+
+            assert!(matches!(
+                RealmPlacementMutation::UpsertNode(changed).validate(&document),
+                Err(MutateRealmPlacementError::InvalidInput(reason))
+                    if reason.contains("draining freezes")
+            ));
+        }
+    }
+
+    #[test]
+    fn unmapped_drain_allowed() {
+        let document = RealmConfigDocument::new(RealmId::from_bytes([25; 32]), Vec::new(), 3);
+        // Resolver defaults make a draining-only upsert valid for an unmapped node.
+        assert!(
+            RealmPlacementMutation::UpsertNode(draining_entry(node(1)))
+                .validate(&document)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
