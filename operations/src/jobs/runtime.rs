@@ -426,6 +426,12 @@ async fn run_job(
 ) {
     let storage = &context.storage_handle;
     let job_id = record.job_id;
+    // An external attempt is driven by the reconciler, not by an in-process payload: leave
+    // it claimed rather than walking it through the in-process transition graph.
+    if record.execution_class == JobExecutionClass::ExternalAttempt {
+        info!(job_id = %job_id, "External attempt has no in-process executor; leaving claimed for reconciliation");
+        return;
+    }
 
     if record.cancel_requested {
         run_cleanup(&record.payload);
@@ -490,6 +496,7 @@ async fn run_job(
         }
         SuperviseResult::Outcome(JobRunOutcome::Failed(error)) => {
             if error.kind == JobErrorKind::Retryable {
+                // External attempts return before supervision and cannot reach this requeue.
                 if let Err(error) = requeue_job(
                     storage,
                     job_id,
