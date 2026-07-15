@@ -49,6 +49,10 @@ impl Modify for SecurityAddon {
                 "bearer_auth",
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
             );
+            components.add_security_scheme(
+                "basic_auth",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+            );
         }
     }
 }

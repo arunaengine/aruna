@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
@@ -13,13 +14,14 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{
     CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_owned_job, submit_execution_job,
 };
+use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -30,12 +32,12 @@ use crate::server_state::ServerState;
 
 /// GA4GH TES version this facade implements.
 const TES_VERSION: &str = "1.1.0";
-/// Required tag naming the workspace parent group a task writes into.
-const GROUP_TAG_KEY: &str = "aruna.io/group";
+/// Optional tag overriding the caller credential's workspace parent group.
+const GROUP_TAG_KEY: &str = "aruna-engine.org/group";
 /// Optional tag pinning a backend executor kind.
-const EXECUTOR_TAG_KEY: &str = "aruna.io/executor";
+const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
 /// Optional tag carrying the submission idempotency key.
-const IDEMPOTENCY_TAG_KEY: &str = "aruna.io/idempotency-key";
+const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
@@ -420,33 +422,34 @@ pub async fn service_info(State(state): State<Arc<ServerState>>, headers: Header
         (status = 401, body = TesErrorPayload),
         (status = 403, body = TesErrorPayload)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn create_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
     Json(task): Json<TesTask>,
 ) -> Response {
-    let auth = match require_unrestricted_realm_auth(&state, auth) {
-        Ok(auth) => auth,
-        Err(error) => return TesError::from_server(error).into_response(),
+    let caller = match authenticate_tes(&state, auth, &headers).await {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
     };
 
-    let (spec, idempotency_key) = match map_task_to_spec(&task) {
+    let (spec, idempotency_key) = match map_task_to_spec(&task, caller.credential_group) {
         Ok(mapped) => mapped,
         Err(error) => return error.into_response(),
     };
 
     // Group-write authorization at the facade boundary (the raw internal POST /jobs/
     // path does not yet check this; see #420). Rejecting here never widens that gap.
-    if let Err(error) = ensure_group_write(&state, &auth, spec.group_id).await {
+    if let Err(error) = ensure_group_write(&state, &caller.auth, spec.group_id).await {
         return error.into_response();
     }
 
     match submit_execution_job(
         &state.get_ctx(),
         spec,
-        auth.user_id,
+        caller.auth.user_id,
         state.get_node_id(),
         idempotency_key,
     )
@@ -480,7 +483,7 @@ pub async fn create_task(
         (status = 200, body = TesTask),
         (status = 404, body = TesErrorPayload)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn get_task(
     State(state): State<Arc<ServerState>>,
@@ -489,9 +492,9 @@ pub async fn get_task(
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
 ) -> Response {
-    let auth = match require_unrestricted_realm_auth(&state, auth) {
-        Ok(auth) => auth,
-        Err(error) => return TesError::from_server(error).into_response(),
+    let caller = match authenticate_tes(&state, auth, &headers).await {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
     };
     let view = match TesView::parse(query.view.as_deref()) {
         Ok(view) => view,
@@ -502,13 +505,13 @@ pub async fn get_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
 
-    let record = match read_owned_job(&state.get_ctx(), auth.user_id, job_id).await {
+    let record = match read_owned_job(&state.get_ctx(), caller.auth.user_id, job_id).await {
         Ok(Some(record)) => record,
         Ok(None) => return TesError::not_found("TES task not found").into_response(),
         Err(error) => return TesError::internal(error).into_response(),
     };
     // Only execution jobs are TES tasks; other job kinds are not addressable here.
-    if !matches!(record.payload, JobPayload::Execution(_)) {
+    if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
     }
 
@@ -534,7 +537,7 @@ pub async fn get_task(
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn list_tasks(
     State(state): State<Arc<ServerState>>,
@@ -543,9 +546,9 @@ pub async fn list_tasks(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
 ) -> Response {
-    let auth = match require_unrestricted_realm_auth(&state, auth) {
-        Ok(auth) => auth,
-        Err(error) => return TesError::from_server(error).into_response(),
+    let caller = match authenticate_tes(&state, auth, &headers).await {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
     };
     let view = match TesView::parse(query.view.as_deref()) {
         Ok(view) => view,
@@ -565,9 +568,13 @@ pub async fn list_tasks(
         .min(MAX_PAGE_SIZE);
 
     let (records, next_cursor) =
-        match list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, |record| {
-            filters.matches(record)
-        })
+        match list_owned_jobs(
+            &state.get_ctx(),
+            caller.auth.user_id,
+            cursor,
+            limit,
+            |record| filters.matches(record) && task_in_group(record, caller.credential_group),
+        )
         .await
         {
             Ok(page) => page,
@@ -598,16 +605,17 @@ pub async fn list_tasks(
         (status = 200, description = "Cancellation requested"),
         (status = 404, body = TesErrorPayload)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ("basic_auth" = []))
 )]
 pub async fn cancel_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let auth = match require_unrestricted_realm_auth(&state, auth) {
-        Ok(auth) => auth,
-        Err(error) => return TesError::from_server(error).into_response(),
+    let caller = match authenticate_tes(&state, auth, &headers).await {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
     };
     // TES addresses cancellation as `POST /tasks/{id}:cancel`; the `:cancel` action
     // suffix rides on the final path segment, so strip it here.
@@ -618,19 +626,19 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
-    let record = match read_owned_job(&state.get_ctx(), auth.user_id, job_id).await {
+    let record = match read_owned_job(&state.get_ctx(), caller.auth.user_id, job_id).await {
         Ok(Some(record)) => record,
         Ok(None) => return TesError::not_found("TES task not found").into_response(),
         Err(error) => return TesError::internal(error).into_response(),
     };
-    if !matches!(record.payload, JobPayload::Execution(_)) {
+    if !task_in_group(&record, caller.credential_group) {
         return TesError::not_found("TES task not found").into_response();
     }
 
     match cancel_owned_job(
         &state.get_ctx(),
         &state.jobs_runtime(),
-        auth.user_id,
+        caller.auth.user_id,
         job_id,
     )
     .await
@@ -649,7 +657,10 @@ pub async fn cancel_task(
 
 /// Map a TES task onto the internal execution plan and optional dedup key.
 /// Pure and self-contained: the group-write permission check happens separately.
-fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), TesError> {
+fn map_task_to_spec(
+    task: &TesTask,
+    credential_group: Option<Ulid>,
+) -> Result<(ExecutionSpec, Option<String>), TesError> {
     if task.id.is_some()
         || task.state.is_some()
         || !task.logs.is_empty()
@@ -691,12 +702,21 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
         return Err(TesError::bad_request("task volumes are not supported"));
     }
 
-    let group_raw = task
-        .tags
-        .get(GROUP_TAG_KEY)
-        .ok_or_else(|| TesError::bad_request(format!("a `{GROUP_TAG_KEY}` tag is required")))?;
-    let group_id = Ulid::from_string(group_raw)
-        .map_err(|_| TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id")))?;
+    let group_id = match task.tags.get(GROUP_TAG_KEY) {
+        Some(group) => Ulid::from_string(group).map_err(|_| {
+            TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id"))
+        })?,
+        None => credential_group.ok_or_else(|| {
+            TesError::bad_request(format!(
+                "a `{GROUP_TAG_KEY}` tag is required for bearer authentication"
+            ))
+        })?,
+    };
+    if credential_group.is_some_and(|credential_group| credential_group != group_id) {
+        return Err(TesError::forbidden(
+            "group tag does not match the caller credential",
+        ));
+    }
 
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
     for input in &task.inputs {
@@ -1079,6 +1099,103 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct TesCaller {
+    auth: AuthContext,
+    credential_group: Option<Ulid>,
+}
+
+async fn authenticate_tes(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    headers: &HeaderMap,
+) -> Result<TesCaller, TesError> {
+    if let Some(auth) = auth {
+        let auth =
+            require_unrestricted_realm_auth(state, Some(auth)).map_err(TesError::from_server)?;
+        return Ok(TesCaller {
+            auth,
+            credential_group: None,
+        });
+    }
+
+    let (access_key, provided_secret) = parse_basic(headers)?;
+    let access = match drive(
+        GetUserAccessOperation::new(access_key.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(Some(Ok(access))) => access,
+        Ok(None)
+        | Ok(Some(Err(GetUserAccessError::NotFound)))
+        | Err(GetUserAccessError::NotFound) => return Err(TesError::unauthorized()),
+        Ok(Some(Err(error))) | Err(error) => return Err(TesError::internal(error.to_string())),
+    };
+    let secret_matches =
+        blake3::hash(provided_secret.as_slice()) == blake3::hash(access.secret.as_bytes());
+    if access.access_key != access_key
+        || access.user_identity.realm_id != state.get_realm_id()
+        || access.issued_by != *state.get_node_id().as_bytes()
+        || access.is_revoked()
+        || access.is_expired(SystemTime::now())
+        || !secret_matches
+    {
+        return Err(TesError::unauthorized());
+    }
+
+    let credential_group = access.group_id;
+    let auth = require_unrestricted_realm_auth(
+        state,
+        Some(AuthContext {
+            user_id: access.user_identity,
+            realm_id: access.user_identity.realm_id,
+            path_restrictions: access.path_restrictions,
+        }),
+    )
+    .map_err(TesError::from_server)?;
+    Ok(TesCaller {
+        auth,
+        credential_group: Some(credential_group),
+    })
+}
+
+fn parse_basic(headers: &HeaderMap) -> Result<(String, Vec<u8>), TesError> {
+    let value = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(TesError::unauthorized)?;
+    let mut parts = value.split_ascii_whitespace();
+    let (Some(scheme), Some(encoded), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(TesError::unauthorized());
+    };
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return Err(TesError::unauthorized());
+    }
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| TesError::unauthorized())?;
+    // Aruna access keys contain a colon, while generated access secrets do not.
+    let Some(separator) = decoded.iter().rposition(|byte| *byte == b':') else {
+        return Err(TesError::unauthorized());
+    };
+    let access_key = std::str::from_utf8(&decoded[..separator])
+        .map_err(|_| TesError::unauthorized())?
+        .to_string();
+    let secret = decoded[separator + 1..].to_vec();
+    if access_key.is_empty() || secret.is_empty() {
+        return Err(TesError::unauthorized());
+    }
+    Ok((access_key, secret))
+}
+
+fn task_in_group(record: &JobRecord, credential_group: Option<Ulid>) -> bool {
+    let JobPayload::Execution(spec) = &record.payload else {
+        return false;
+    };
+    credential_group.is_none_or(|credential_group| credential_group == spec.group_id)
+}
+
 async fn ensure_group_write(
     state: &ServerState,
     auth: &AuthContext,
@@ -1159,6 +1276,13 @@ struct TesError {
 }
 
 impl TesError {
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "unauthorized".to_string(),
+        }
+    }
+
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -1196,10 +1320,7 @@ impl TesError {
 
     fn from_server(error: ServerError) -> Self {
         match error {
-            ServerError::Unauthorized => Self {
-                status: StatusCode::UNAUTHORIZED,
-                message: "unauthorized".to_string(),
-            },
+            ServerError::Unauthorized => Self::unauthorized(),
             ServerError::Forbidden => Self::forbidden("forbidden"),
             ServerError::NotFound => Self::not_found("TES task not found"),
             other => Self::internal(other.to_string()),
@@ -1222,7 +1343,14 @@ impl IntoResponse for TesError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{JobError, NodeCapabilities, OutputObject, RealmId};
+    use std::time::Duration;
+
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_ACCESS_KEYSPACE};
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, JobError, NodeCapabilities, OutputObject,
+        RealmAuthorizationDocument, RealmId, UserAccess,
+    };
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -1248,6 +1376,72 @@ mod tests {
             realm_id: realm(),
             path_restrictions: None,
         })
+    }
+
+    fn credential(group_id: Ulid) -> UserAccess {
+        let user_identity = user(2);
+        UserAccess {
+            access_key: UserAccess::build_access_key(&user_identity, "tes").unwrap(),
+            user_identity,
+            group_id,
+            secret: "tes-secret".to_string(),
+            expiry: SystemTime::now() + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: *node_id().as_bytes(),
+            revoked_at: None,
+        }
+    }
+
+    fn basic_headers(access: &UserAccess, secret: &str) -> HeaderMap {
+        let encoded = STANDARD.encode(format!("{}:{secret}", access.access_key));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Basic {encoded}").parse().unwrap(),
+        );
+        headers
+    }
+
+    async fn write_credential(state: &ServerState, access: &UserAccess) {
+        let _ = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
+                key: access.access_key.as_bytes().into(),
+                value: access.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn write_auth(state: &ServerState, group_id: Ulid, owner: UserId) {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id: realm(),
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm());
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(owner, realm(), group_id);
+        for (key, value) in [
+            (
+                realm().as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (group_id.to_bytes().to_vec(), group_auth.to_bytes(&actor).unwrap()),
+        ] {
+            let _ = state
+                .get_ctx()
+                .storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
     }
 
     async fn build_state() -> (TempDir, Arc<ServerState>) {
@@ -1330,7 +1524,7 @@ mod tests {
     #[test]
     fn maps_task() {
         let group = Ulid::from_bytes([5u8; 16]);
-        let (spec, dedup) = map_task_to_spec(&sample_task(group)).unwrap();
+        let (spec, dedup) = map_task_to_spec(&sample_task(group), None).unwrap();
         assert_eq!(spec.group_id, group);
         assert_eq!(spec.name.as_deref(), Some("align reads"));
         assert_eq!(spec.description.as_deref(), Some("sample task"));
@@ -1374,10 +1568,10 @@ mod tests {
     #[test]
     fn filters_tasks() {
         let group = Ulid::from_bytes([5u8; 16]);
-        let (spec, _) = map_task_to_spec(&sample_task(group)).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
         let mut record = execution_record(JobId::from_bytes([6u8; 16]), user(2), spec);
         record.state = JobState::Running;
-        let uri: axum::http::Uri = "/ga4gh/tes/v1/tasks?state=RUNNING&name_prefix=align&tag_key=project&tag_key=aruna.io%2Fgroup&tag_value=alpha"
+        let uri: axum::http::Uri = "/ga4gh/tes/v1/tasks?state=RUNNING&name_prefix=align&tag_key=project&tag_key=aruna-engine.org%2Fgroup&tag_value=alpha"
             .parse()
             .unwrap();
         let Query(query) = Query::<ListTasksQuery>::try_from_uri(&uri).unwrap();
@@ -1446,7 +1640,7 @@ mod tests {
         input.url = Some("s3://src/other.csv".to_string());
         task.inputs.push(input);
         assert_eq!(
-            map_task_to_spec(&task).unwrap_err().status,
+            map_task_to_spec(&task, None).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -1457,13 +1651,13 @@ mod tests {
         for size_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
             task.resources.as_mut().unwrap().ram_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task).unwrap_err().status,
+                map_task_to_spec(&task, None).unwrap_err().status,
                 StatusCode::BAD_REQUEST
             );
             task.resources.as_mut().unwrap().ram_gb = Some(4.0);
             task.resources.as_mut().unwrap().disk_gb = Some(size_gb);
             assert_eq!(
-                map_task_to_spec(&task).unwrap_err().status,
+                map_task_to_spec(&task, None).unwrap_err().status,
                 StatusCode::BAD_REQUEST
             );
             task.resources.as_mut().unwrap().disk_gb = Some(8.0);
@@ -1474,7 +1668,7 @@ mod tests {
     fn rejects_multi_executor() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors.push(task.executors[0].clone());
-        let error = map_task_to_spec(&task).unwrap_err();
+        let error = map_task_to_spec(&task, None).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("single executor"));
     }
@@ -1483,9 +1677,26 @@ mod tests {
     fn rejects_missing_group() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.tags.clear();
-        let error = map_task_to_spec(&task).unwrap_err();
+        let error = map_task_to_spec(&task, None).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains(GROUP_TAG_KEY));
+    }
+
+    #[test]
+    fn defaults_group() {
+        let group = Ulid::from_bytes([5u8; 16]);
+        let mut task = sample_task(group);
+        task.tags.remove(GROUP_TAG_KEY);
+        let (spec, _) = map_task_to_spec(&task, Some(group)).unwrap();
+        assert_eq!(spec.group_id, group);
+    }
+
+    #[test]
+    fn rejects_group_override() {
+        let group = Ulid::from_bytes([5u8; 16]);
+        let credential_group = Ulid::from_bytes([6u8; 16]);
+        let error = map_task_to_spec(&sample_task(group), Some(credential_group)).unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -1493,19 +1704,19 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.executors[0].workdir = Some("work".to_string());
         assert_eq!(
-            map_task_to_spec(&task).unwrap_err().status,
+            map_task_to_spec(&task, None).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
         task.executors[0].workdir = Some("/work".to_string());
         task.inputs[0].path = "/in/../data.csv".to_string();
         assert_eq!(
-            map_task_to_spec(&task).unwrap_err().status,
+            map_task_to_spec(&task, None).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
         task.inputs[0].path = "/in/data.csv".to_string();
         task.outputs[0].path = "/out//report.txt".to_string();
         assert_eq!(
-            map_task_to_spec(&task).unwrap_err().status,
+            map_task_to_spec(&task, None).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -1514,26 +1725,26 @@ mod tests {
     fn rejects_unsupported_fields() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         task.id = Some("server-owned".to_string());
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
         task.id = None;
         task.inputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
         task.inputs[0].kind = TesFileType::File;
         task.outputs[0].kind = TesFileType::Directory;
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
         task.outputs[0].kind = TesFileType::File;
         task.executors[0].stdout = Some("/logs/out".to_string());
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
         task.executors[0].stdout = None;
         task.volumes.push("/data".to_string());
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
         task.volumes.clear();
         task.resources
             .as_mut()
             .unwrap()
             .zones
             .push("zone-a".to_string());
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
     }
 
     #[test]
@@ -1542,15 +1753,15 @@ mod tests {
         let mut output = task.outputs[0].clone();
         output.url = Some("s3://dest/out/other.txt".to_string());
         task.outputs.push(output);
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
 
         task.outputs[1].path = "/out/other.txt".to_string();
         task.outputs[1].url = task.outputs[0].url.clone();
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
 
         task.outputs.truncate(1);
         task.outputs[0].path = task.inputs[0].path.clone();
-        assert!(map_task_to_spec(&task).is_err());
+        assert!(map_task_to_spec(&task, None).is_err());
     }
 
     #[test]
@@ -1611,7 +1822,8 @@ mod tests {
 
     #[test]
     fn view_projections() {
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16]))).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
         let queued = project_task(&record, TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
@@ -1690,10 +1902,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_basic() {
+        let (_dir, state) = build_state().await;
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = credential(group);
+        let mut revoked = access.clone();
+        revoked.revoked_at = Some(SystemTime::now());
+        let mut expired = access.clone();
+        expired.expiry = SystemTime::UNIX_EPOCH;
+        let mut foreign_issuer = access.clone();
+        foreign_issuer.issued_by = [0u8; 32];
+
+        for (access, secret) in [
+            (access, "wrong-secret"),
+            (revoked, "tes-secret"),
+            (expired, "tes-secret"),
+            (foreign_issuer, "tes-secret"),
+        ] {
+            write_credential(&state, &access).await;
+            let error = authenticate_tes(&state, None, &basic_headers(&access, secret))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_restricted_basic() {
+        let (_dir, state) = build_state().await;
+        let mut access = credential(Ulid::from_bytes([5u8; 16]));
+        access.path_restrictions = Some(Vec::new());
+        write_credential(&state, &access).await;
+
+        let error = authenticate_tes(
+            &state,
+            None,
+            &basic_headers(&access, access.secret.as_str()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn creates_tagless_basic() {
+        let (_dir, state) = build_state().await;
+        let group = Ulid::from_bytes([5u8; 16]);
+        let access = credential(group);
+        write_credential(&state, &access).await;
+        write_auth(&state, group, access.user_identity).await;
+        let mut task = sample_task(group);
+        task.tags.remove(GROUP_TAG_KEY);
+
+        let response = create_task(
+            State(state.clone()),
+            Extension(None),
+            basic_headers(&access, access.secret.as_str()),
+            Json(task),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: TesCreateTaskResponse = serde_json::from_slice(&body).unwrap();
+        let record = read_owned_job(
+            &state.get_ctx(),
+            access.user_identity,
+            JobId::from_str(&created.id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let JobPayload::Execution(spec) = record.payload else {
+            panic!("TES created a non-execution job");
+        };
+        assert_eq!(spec.group_id, group);
+    }
+
+    #[tokio::test]
+    async fn basic_scopes_tasks() {
+        let (_dir, state) = build_state().await;
+        let owner = user(2);
+        let group = Ulid::from_bytes([5u8; 16]);
+        let sibling = Ulid::from_bytes([6u8; 16]);
+        let access = credential(group);
+        write_credential(&state, &access).await;
+        let headers = basic_headers(&access, access.secret.as_str());
+        let caller = authenticate_tes(&state, None, &headers).await.unwrap();
+        assert_eq!(caller.auth.user_id, owner);
+        assert_eq!(caller.credential_group, Some(group));
+
+        let visible_id = JobId::from_bytes([9u8; 16]);
+        let hidden_id = JobId::from_bytes([10u8; 16]);
+        for (job_id, group_id) in [(visible_id, group), (hidden_id, sibling)] {
+            let (spec, _) = map_task_to_spec(&sample_task(group_id), None).unwrap();
+            insert_job(
+                &state.get_ctx().storage_handle,
+                &execution_record(job_id, owner, spec),
+            )
+            .await
+            .unwrap();
+        }
+
+        let visible = get_task(
+            State(state.clone()),
+            Extension(None),
+            headers.clone(),
+            Path(visible_id.to_string()),
+            Query(ViewQuery::default()),
+        )
+        .await;
+        assert_eq!(visible.status(), StatusCode::OK);
+        let hidden = get_task(
+            State(state.clone()),
+            Extension(None),
+            headers.clone(),
+            Path(hidden_id.to_string()),
+            Query(ViewQuery::default()),
+        )
+        .await;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let hidden_cancel = cancel_task(
+            State(state.clone()),
+            Extension(None),
+            headers.clone(),
+            Path(format!("{hidden_id}:cancel")),
+        )
+        .await;
+        assert_eq!(hidden_cancel.status(), StatusCode::NOT_FOUND);
+        let visible_cancel = cancel_task(
+            State(state.clone()),
+            Extension(None),
+            headers.clone(),
+            Path(format!("{visible_id}:cancel")),
+        )
+        .await;
+        assert_eq!(visible_cancel.status(), StatusCode::OK);
+
+        let listed = list_tasks(
+            State(state),
+            Extension(None),
+            headers,
+            RawQuery(None),
+            Query(ListTasksQuery::default()),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.tasks[0].id, Some(visible_id.to_string()));
+    }
+
+    #[tokio::test]
     async fn get_resolves() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16]))).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
@@ -1730,7 +2100,8 @@ mod tests {
     async fn cancel_maps_through() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16]))).unwrap();
+        let (spec, _) =
+            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
@@ -1742,6 +2113,7 @@ mod tests {
         let ok = cancel_task(
             State(state.clone()),
             Extension(auth_for(owner)),
+            HeaderMap::new(),
             Path(format!("{job_id}:cancel")),
         )
         .await;
@@ -1751,6 +2123,7 @@ mod tests {
         let bad = cancel_task(
             State(state.clone()),
             Extension(auth_for(owner)),
+            HeaderMap::new(),
             Path(job_id.to_string()),
         )
         .await;
@@ -1779,5 +2152,10 @@ mod tests {
         );
         assert!(openapi.paths.paths.contains_key("/ga4gh/tes/v1/tasks"));
         assert!(openapi.paths.paths.contains_key("/ga4gh/tes/v1/tasks/{id}"));
+        assert!(
+            openapi
+                .components
+                .is_some_and(|components| components.security_schemes.contains_key("basic_auth"))
+        );
     }
 }
