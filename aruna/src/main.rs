@@ -39,6 +39,7 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -432,7 +433,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the executor registry from config. The Docker backend is opt-in via
-/// `ARUNA_COMPUTE_DOCKER=true`; an unreachable daemon leaves the node compute-less.
+/// `ARUNA_COMPUTE_DOCKER=true`; registration requires a container-reachable S3 endpoint.
 fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
     let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
@@ -440,15 +441,27 @@ fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Executor
     if !docker_enabled {
         return None;
     }
+    let Some(endpoint) = config.s3_public_url.clone() else {
+        warn!("Docker executor requires S3_PUBLIC_URL; running without compute");
+        return None;
+    };
+    if container_local_endpoint(&endpoint) {
+        warn!(endpoint = %endpoint, "Docker executor requires a container-reachable S3_PUBLIC_URL; running without compute");
+        return None;
+    }
+    if !config
+        .s3_address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| !address.ip().is_loopback())
+    {
+        warn!(address = %config.s3_address, "Docker executor requires a non-loopback S3_ADDRESS; running without compute");
+        return None;
+    }
     match aruna_compute::docker::DockerBackend::connect() {
         Ok(backend) => {
-            let endpoint = config
-                .s3_public_url
-                .clone()
-                .or_else(|| Some(format!("http://{}", config.s3_host)));
             let registry = aruna_compute::ExecutorRegistry::new()
                 .with_backend(Arc::new(backend))
-                .with_workspace_endpoint(endpoint, "eu-central-1".to_string());
+                .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string());
             info!("Docker executor backend enabled");
             Some(Arc::new(registry))
         }
@@ -500,6 +513,19 @@ async fn shutdown_runtime(
     if let Err(error) = storage_handle.sync_all().await {
         error!(error = %error, "Failed to sync storage during shutdown");
     }
+}
+
+fn container_local_endpoint(endpoint: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return true;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
 }
 
 /// Ensures the maintained usage counter shards exist before background writes start.
