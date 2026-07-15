@@ -125,6 +125,9 @@ pub trait ExecutorBackend: Send + Sync {
         sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError>;
 
+    async fn fetch_output(&self, attempt: &AttemptRef, path: &str)
+    -> Result<Vec<u8>, BackendError>;
+
     /// Query by deterministic name after restart / lease loss. Never mutates.
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome;
 

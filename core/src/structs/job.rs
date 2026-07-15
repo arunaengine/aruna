@@ -144,6 +144,23 @@ pub struct InputSelection {
     /// Destination key inside the workspace bucket (16.4 non-overlapping).
     pub dest_key: String,
     pub mode: InputMode,
+    /// Absolute path exposed to a TES executor; native workspace inputs omit it.
+    pub container_path: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputDestination {
+    S3 { bucket: String, key: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputSelection {
+    pub container_path: String,
+    pub destination: OutputDestination,
+    pub name: Option<String>,
+    pub description: Option<String>,
 }
 
 /// Resource ceilings requested for the container. `None` fills from backend defaults.
@@ -151,7 +168,9 @@ pub struct InputSelection {
 pub struct ComputeResources {
     pub cpu_cores: Option<u32>,
     pub ram_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
     pub max_walltime_ms: Option<u64>,
+    pub preemptible: bool,
 }
 
 /// The container plan carried by a `JobPayload::Execution`. Bounded per spec 16.2.
@@ -166,11 +185,13 @@ pub struct ExecutionSpec {
     /// Overrides the image ENTRYPOINT when set.
     pub entrypoint: Option<Vec<String>>,
     pub command: Vec<String>,
+    pub workdir: Option<String>,
     pub env: BTreeMap<String, String>,
     pub resources: ComputeResources,
     /// Pin a backend wire kind (`docker`); `None` runs on any enabled backend.
     pub executor_constraint: Option<String>,
     pub inputs: Vec<InputSelection>,
+    pub file_outputs: Vec<OutputSelection>,
     /// Declared output prefixes in the workspace, inventoried at completion.
     pub output_prefixes: Vec<String>,
 }
@@ -285,10 +306,12 @@ pub fn parse_job_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), Conversi
     Ok((job_id, plan_digest))
 }
 
-/// One output object inventoried in the workspace at completion.
+/// One output object captured at completion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputObject {
+    pub bucket: String,
     pub key: String,
+    pub container_path: String,
     pub size: u64,
     /// Hex BLAKE3 digest when known.
     pub digest: Option<String>,
@@ -344,7 +367,9 @@ impl JobResultPayload {
                 "outputs": outputs
                     .iter()
                     .map(|output| serde_json::json!({
+                        "bucket": output.bucket,
                         "key": output.key,
+                        "container_path": output.container_path,
                         "size": output.size,
                         "digest": output.digest,
                     }))

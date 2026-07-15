@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aruna_compute::backend::ExecutorBackend;
 use aruna_compute::docker::{DockerBackend, DockerConfig};
 use aruna_compute::logs::{LogSink, LogStream};
-use aruna_compute::spec::{AttemptRef, LogLimits, TaskSpec};
+use aruna_compute::spec::{AttemptRef, LogLimits, TaskInput, TaskSpec};
 use aruna_compute::status::{AttemptPhase, CancelEvidence, ReconcileOutcome};
 use tokio_util::sync::CancellationToken;
 
@@ -113,6 +113,35 @@ async fn exit_code_capture() {
 
     let _ = backend.cleanup(&ok_attempt).await;
     let _ = backend.cleanup(&bad_attempt).await;
+}
+
+#[tokio::test]
+async fn file_transfer() {
+    let backend = backend_or_skip!();
+    let cancel = CancellationToken::new();
+    let mut spec = sh(
+        &unique("files"),
+        "test \"$(stat -c %a /tmp)\" = 1777 && cat /tmp/aruna-input.txt > /tmp/aruna-output.txt",
+    );
+    spec.inputs.push(TaskInput {
+        path: "/tmp/aruna-input.txt".to_string(),
+        contents: b"hello from aruna".to_vec(),
+    });
+    spec.output_paths.push("/tmp/aruna-output.txt".to_string());
+    let attempt = spec.attempt.clone();
+
+    backend.submit(&spec).await.unwrap();
+    let status = backend.wait(&attempt, &cancel).await.unwrap();
+    assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+    assert_eq!(
+        backend
+            .fetch_output(&attempt, "/tmp/aruna-output.txt")
+            .await
+            .unwrap(),
+        b"hello from aruna"
+    );
+
+    let _ = backend.cleanup(&attempt).await;
 }
 
 #[tokio::test]

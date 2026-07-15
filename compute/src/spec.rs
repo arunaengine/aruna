@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Aggregate ceiling for in-memory task file-transfer payloads.
+pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+
 /// Fence identity of one attempt. Deterministically names the external object
 /// via [`AttemptRef::external_name`]; that name is the reconciliation key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +83,12 @@ pub struct WorkspaceBinding {
     pub region: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInput {
+    pub path: String,
+    pub contents: Vec<u8>,
+}
+
 /// Zeroized secret wrapper. Redacts on `Debug`; serializes transparently so a
 /// caller that owns the plan can persist it, and round-trips in tests.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +153,8 @@ pub struct TaskSpec {
     pub entrypoint: Option<Vec<String>>,
     pub command: Vec<String>,
     pub workdir: Option<String>,
+    pub inputs: Vec<TaskInput>,
+    pub output_paths: Vec<String>,
     /// Non-secret environment.
     pub env: BTreeMap<String, String>,
     /// Secret environment (workflow S3 credentials); zeroized wrapper.
@@ -161,6 +172,8 @@ impl TaskSpec {
             entrypoint: None,
             command: Vec::new(),
             workdir: None,
+            inputs: Vec::new(),
+            output_paths: Vec::new(),
             env: BTreeMap::new(),
             secret_env: BTreeMap::new(),
             resources: ResourceRequest::default(),

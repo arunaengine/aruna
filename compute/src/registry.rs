@@ -113,6 +113,13 @@ mod tests {
         ) -> Result<LogTails, BackendError> {
             unimplemented!()
         }
+        async fn fetch_output(
+            &self,
+            _attempt: &AttemptRef,
+            _path: &str,
+        ) -> Result<Vec<u8>, BackendError> {
+            unimplemented!()
+        }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
             ReconcileOutcome::NotFound
         }

@@ -2,7 +2,7 @@ use std::sync::{Arc, Weak};
 
 use aruna_compute::spec::AttemptRef;
 use aruna_compute::status::{AttemptPhase, ReconcileOutcome};
-use aruna_core::structs::{ExecutionSpec, JobError, JobPayload, JobRecord, JobState};
+use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use tokio_util::sync::CancellationToken;
@@ -14,8 +14,11 @@ use super::super::store::{
     AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
     record_attempt_started, release_job, transition_external_to_running,
 };
-use super::workspace::mint_workspace_credential;
-use super::{build_task_spec, finalize_attempt, resolve_backend, supervise_and_finalize};
+use super::workspace::{load_inputs, mint_workspace_credential};
+use super::{
+    build_task_spec, fail_and_crate, finalize_attempt, resolve_backend, supervise_and_finalize,
+    with_execution_heartbeat,
+};
 use crate::driver::DriverContext;
 
 /// The real Stage-0 reconcile seam: a lost external attempt is adopted by name and
@@ -95,8 +98,11 @@ impl ExternalReconciler for ComputeReconciler {
             warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
             return;
         }
-        if matches!(&outcome, ReconcileOutcome::Found(_))
-            && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
+        if matches!(
+            &outcome,
+            ReconcileOutcome::Found(status)
+                if !matches!(status.phase, AttemptPhase::Submitted)
+        ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
             && transition_external_to_running(
                 storage,
                 job_id,
@@ -137,17 +143,26 @@ impl ExternalReconciler for ComputeReconciler {
                         reason: "walltime limit exceeded while unobserved".to_string(),
                     };
                 }
-                finalize_attempt(
-                    &self.context,
+                let finalized = with_execution_heartbeat(
+                    storage.clone(),
                     job_id,
                     token,
-                    &backend,
-                    &attempt,
-                    &spec,
-                    &bucket,
-                    Ok(status),
+                    CancellationToken::new(),
+                    finalize_attempt(
+                        &self.context,
+                        job_id,
+                        token,
+                        &backend,
+                        &attempt,
+                        &spec,
+                        &bucket,
+                        Ok(status),
+                    ),
                 )
                 .await;
+                if finalized.is_none() {
+                    info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning");
+                }
             }
             // Post-submit absence is ambiguous: never requeue, park in Indeterminate.
             ReconcileOutcome::NotFound => {
@@ -235,50 +250,99 @@ async fn resume_attempt(
     cancel: CancellationToken,
 ) {
     if matches!(phase, AttemptPhase::Submitted) {
-        let node_id = holder(&context);
-        let credential =
-            match mint_workspace_credential(&context, &spec, &record, node_id, &bucket).await {
-                Ok(credential) => credential,
-                Err(error) => {
-                    let _ = mark_indeterminate(
-                        &context.storage_handle,
-                        job_id,
-                        token,
-                        error,
-                        unix_timestamp_millis(),
-                    )
-                    .await;
-                    return;
-                }
-            };
-        let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
-        match backend.submit(&task_spec).await {
-            Ok(status) => {
+        let resumed = with_execution_heartbeat(
+            context.storage_handle.clone(),
+            job_id,
+            token,
+            cancel.clone(),
+            async {
+                let node_id = holder(&context);
+                let credential =
+                    match mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+                        .await
+                    {
+                        Ok(credential) => credential,
+                        Err(error) => {
+                            fail_or_park(&context, job_id, token, &record, error).await;
+                            return false;
+                        }
+                    };
+                let inputs = match load_inputs(&context, &spec, &record, &bucket).await {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        fail_or_park(&context, job_id, token, &record, error).await;
+                        return false;
+                    }
+                };
+                let task_spec = build_task_spec(
+                    &context,
+                    &spec,
+                    &attempt,
+                    &credential,
+                    &bucket,
+                    node_id,
+                    inputs,
+                );
+                let status = match backend.submit(&task_spec).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let error = if error.retryable() {
+                            JobError::retryable(format!("resubmit failed: {error}"))
+                        } else {
+                            JobError::permanent(format!("resubmit failed: {error}"))
+                        };
+                        fail_or_park(&context, job_id, token, &record, error).await;
+                        return false;
+                    }
+                };
                 if let Some(started_at_ms) = status.started_at_ms
                     && record_attempt_started(&context.storage_handle, job_id, token, started_at_ms)
                         .await
                         .is_err()
                 {
-                    return;
+                    return false;
                 }
-            }
-            Err(error) => {
-                let _ = mark_indeterminate(
+                transition_external_to_running(
                     &context.storage_handle,
                     job_id,
                     token,
-                    JobError::retryable(format!("resubmit failed: {error}")),
+                    status.started_at_ms,
                     unix_timestamp_millis(),
                 )
-                .await;
-                return;
-            }
+                .await
+                .is_ok()
+            },
+        )
+        .await;
+        if resumed != Some(true) {
+            return;
         }
     }
     supervise_and_finalize(
         context, job_id, token, backend, attempt, spec, bucket, cancel,
     )
     .await;
+}
+
+async fn fail_or_park(
+    context: &Arc<DriverContext>,
+    job_id: aruna_core::structs::JobId,
+    token: ulid::Ulid,
+    record: &JobRecord,
+    error: JobError,
+) {
+    if error.kind == JobErrorKind::Permanent {
+        fail_and_crate(context, job_id, token, record, error).await;
+    } else {
+        let _ = mark_indeterminate(
+            &context.storage_handle,
+            job_id,
+            token,
+            error,
+            unix_timestamp_millis(),
+        )
+        .await;
+    }
 }
 
 fn holder(context: &DriverContext) -> aruna_core::types::NodeId {

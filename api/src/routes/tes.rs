@@ -5,7 +5,8 @@ use std::sync::Arc;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, blob_group_permission_path,
+    JobPayload, JobRecord, JobResultPayload, JobState, OutputDestination, OutputSelection,
+    blob_group_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
@@ -649,6 +650,15 @@ pub async fn cancel_task(
 /// Map a TES task onto the internal execution plan and optional dedup key.
 /// Pure and self-contained: the group-write permission check happens separately.
 fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), TesError> {
+    if task.id.is_some()
+        || task.state.is_some()
+        || !task.logs.is_empty()
+        || task.creation_time.is_some()
+    {
+        return Err(TesError::bad_request(
+            "task id, state, logs, and creation_time are read-only",
+        ));
+    }
     let executor = match task.executors.as_slice() {
         [executor] => executor,
         [] => {
@@ -669,10 +679,16 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
     if executor.command.is_empty() {
         return Err(TesError::bad_request("executor command is required"));
     }
-    if executor.workdir.as_deref().is_some_and(|w| !w.is_empty()) {
+    if let Some(workdir) = executor.workdir.as_deref() {
+        validate_path(workdir, "executor workdir", true)?;
+    }
+    if executor.stdin.is_some() || executor.stdout.is_some() || executor.stderr.is_some() {
         return Err(TesError::bad_request(
-            "executor workdir is not supported by the internal execution model",
+            "executor stdin, stdout, and stderr paths are not supported",
         ));
+    }
+    if !task.volumes.is_empty() {
+        return Err(TesError::bad_request("task volumes are not supported"));
     }
 
     let group_raw = task
@@ -687,42 +703,71 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
         let input = map_input(input)?;
         if inputs
             .iter()
-            .any(|existing| existing.dest_key == input.dest_key)
+            .any(|existing| existing.container_path == input.container_path)
         {
-            return Err(TesError::bad_request("duplicate input destination"));
+            return Err(TesError::bad_request("duplicate input path"));
         }
         inputs.push(input);
     }
-    let output_prefixes = task
-        .outputs
-        .iter()
-        .map(map_output)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
+    for output in &task.outputs {
+        let output = map_output(output)?;
+        if file_outputs
+            .iter()
+            .any(|existing| existing.container_path == output.container_path)
+        {
+            return Err(TesError::bad_request("duplicate output path"));
+        }
+        if file_outputs
+            .iter()
+            .any(|existing| existing.destination == output.destination)
+        {
+            return Err(TesError::bad_request("duplicate output destination"));
+        }
+        file_outputs.push(output);
+    }
+    if file_outputs.iter().any(|output| {
+        inputs
+            .iter()
+            .any(|input| input.container_path.as_deref() == Some(output.container_path.as_str()))
+    }) {
+        return Err(TesError::bad_request("input and output paths overlap"));
+    }
 
     let cpu_cores = task.resources.as_ref().and_then(|r| r.cpu_cores);
     if cpu_cores == Some(0) {
         return Err(TesError::bad_request("invalid cpu_cores"));
     }
-    if task.resources.as_ref().and_then(|r| r.disk_gb).is_some() {
-        return Err(TesError::bad_request("disk_gb is not supported"));
+    if task
+        .resources
+        .as_ref()
+        .is_some_and(|resources| !resources.zones.is_empty())
+    {
+        return Err(TesError::bad_request("resource zones are not supported"));
     }
 
     let ram_bytes = task
         .resources
         .as_ref()
         .and_then(|r| r.ram_gb)
-        .map(|gb| {
-            let bytes = (gb * 1_000_000_000.0) as u64;
-            if !gb.is_finite() || gb <= 0.0 || bytes == 0 || bytes > i64::MAX as u64 {
-                return Err(TesError::bad_request("invalid ram_gb"));
-            }
-            Ok(bytes)
-        })
+        .map(|gb| gb_to_bytes(gb, "ram_gb"))
+        .transpose()?;
+    let disk_bytes = task
+        .resources
+        .as_ref()
+        .and_then(|r| r.disk_gb)
+        .map(|gb| gb_to_bytes(gb, "disk_gb"))
         .transpose()?;
     let resources = ComputeResources {
         cpu_cores,
         ram_bytes,
+        disk_bytes,
         max_walltime_ms: None,
+        preemptible: task
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.preemptible)
+            .unwrap_or(false),
     };
 
     let spec = ExecutionSpec {
@@ -735,11 +780,13 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
         // leave the image CMD unset so exactly the requested argv runs.
         entrypoint: Some(executor.command.clone()),
         command: Vec::new(),
+        workdir: executor.workdir.clone(),
         env: executor.env.clone(),
         resources,
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
         inputs,
-        output_prefixes,
+        file_outputs,
+        output_prefixes: Vec::new(),
     };
 
     // Handed over as the raw idempotency key: `submit_execution_job` applies the per-user
@@ -750,6 +797,9 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
 }
 
 fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
+    if input.kind != TesFileType::File {
+        return Err(TesError::bad_request("directory inputs are not supported"));
+    }
     if input.content.is_some() {
         return Err(TesError::bad_request(
             "inline input content is not supported",
@@ -759,38 +809,78 @@ fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
-    let rest = url
-        .strip_prefix("s3://")
-        .ok_or_else(|| TesError::bad_request("only s3:// input urls are supported"))?;
-    let (bucket, key) = rest
-        .split_once('/')
-        .ok_or_else(|| TesError::bad_request("s3 input url must be s3://bucket/key"))?;
-    if bucket.is_empty() || key.is_empty() {
-        return Err(TesError::bad_request(
-            "s3 input url must be s3://bucket/key",
-        ));
-    }
-    let dest_key = if input.path.is_empty() {
-        key.to_string()
-    } else {
-        input.path.trim_start_matches('/').to_string()
-    };
+    let (bucket, key) = parse_s3_url(url, "input")?;
+    validate_path(&input.path, "input path", false)?;
     Ok(InputSelection {
         source: InputSource::S3 {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket,
+            key,
             version_id: None,
         },
-        dest_key,
+        dest_key: input.path[1..].to_string(),
         mode: InputMode::Snapshot,
+        container_path: Some(input.path.clone()),
+        name: input.name.clone(),
+        description: input.description.clone(),
     })
 }
 
-fn map_output(output: &TesOutput) -> Result<String, TesError> {
-    if output.url.is_some() {
-        return Err(TesError::bad_request("output url is not supported"));
+fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
+    if output.kind != TesFileType::File {
+        return Err(TesError::bad_request("directory outputs are not supported"));
     }
-    Ok(output.path.trim_start_matches('/').to_string())
+    validate_path(&output.path, "output path", false)?;
+    let url = output
+        .url
+        .as_deref()
+        .ok_or_else(|| TesError::bad_request("output url is required"))?;
+    let (bucket, key) = parse_s3_url(url, "output")?;
+    Ok(OutputSelection {
+        container_path: output.path.clone(),
+        destination: OutputDestination::S3 { bucket, key },
+        name: output.name.clone(),
+        description: output.description.clone(),
+    })
+}
+
+fn parse_s3_url(url: &str, role: &str) -> Result<(String, String), TesError> {
+    let rest = url
+        .strip_prefix("s3://")
+        .ok_or_else(|| TesError::bad_request(format!("only s3:// {role} urls are supported")))?;
+    let (bucket, key) = rest
+        .split_once('/')
+        .ok_or_else(|| TesError::bad_request(format!("s3 {role} url must be s3://bucket/key")))?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(TesError::bad_request(format!(
+            "s3 {role} url must be s3://bucket/key"
+        )));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+fn validate_path(value: &str, role: &str, allow_root: bool) -> Result<(), TesError> {
+    let invalid = !value.starts_with('/')
+        || value.contains('\0')
+        || (!allow_root && value == "/")
+        || (value != "/"
+            && value
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || component == "." || component == ".."));
+    if invalid {
+        return Err(TesError::bad_request(format!(
+            "{role} must be an absolute canonical path"
+        )));
+    }
+    Ok(())
+}
+
+fn gb_to_bytes(gb: f64, field: &str) -> Result<u64, TesError> {
+    let bytes = (gb * 1_000_000_000.0) as u64;
+    if !gb.is_finite() || gb <= 0.0 || bytes == 0 || bytes > i64::MAX as u64 {
+        return Err(TesError::bad_request(format!("invalid {field}")));
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -798,8 +888,8 @@ fn map_output(output: &TesOutput) -> Result<String, TesError> {
 // ---------------------------------------------------------------------------
 
 /// Map an internal job state onto its TES external state. `Failed` splits on
-/// evidence: a captured container exit code is an executor error, an evidence-free
-/// failure is a system error. `Indeterminate` maps to TES `UNKNOWN`.
+/// evidence: a non-zero container exit is an executor error; post-processing and
+/// evidence-free failures are system errors. `Indeterminate` maps to TES `UNKNOWN`.
 fn tes_state(record: &JobRecord) -> TesState {
     if record.cancel_requested && !record.state.is_terminal() {
         return TesState::Canceling;
@@ -813,8 +903,9 @@ fn tes_state(record: &JobRecord) -> TesState {
         JobState::Succeeded => TesState::Complete,
         JobState::Failed => match &record.result {
             Some(JobResultPayload::Execution {
-                exit_code: Some(_), ..
-            }) => TesState::ExecutorError,
+                exit_code: Some(code),
+                ..
+            }) if *code != 0 => TesState::ExecutorError,
             _ => TesState::SystemError,
         },
         JobState::Cancelled => TesState::Canceled,
@@ -848,6 +939,7 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
     let executors = vec![TesExecutor {
         image: spec.image.clone(),
         command,
+        workdir: spec.workdir.clone(),
         env: spec.env.clone(),
         ..Default::default()
     }];
@@ -855,28 +947,32 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
     let inputs = spec
         .inputs
         .iter()
-        .map(|input| {
+        .filter_map(|input| {
+            let container_path = input.container_path.as_ref()?;
             let InputSource::S3 { bucket, key, .. } = &input.source;
-            TesInput {
+            Some(TesInput {
+                name: input.name.clone(),
+                description: input.description.clone(),
                 url: Some(format!("s3://{bucket}/{key}")),
-                path: input.dest_key.clone(),
+                path: container_path.clone(),
                 kind: TesFileType::File,
                 ..Default::default()
-            }
+            })
         })
         .collect();
 
-    let workspace = record.workspace_bucket.clone();
     let outputs = spec
-        .output_prefixes
+        .file_outputs
         .iter()
-        .map(|prefix| TesOutput {
-            url: workspace
-                .as_ref()
-                .map(|bucket| format!("s3://{bucket}/{prefix}")),
-            path: prefix.clone(),
-            kind: TesFileType::File,
-            ..Default::default()
+        .map(|output| {
+            let OutputDestination::S3 { bucket, key } = &output.destination;
+            TesOutput {
+                name: output.name.clone(),
+                description: output.description.clone(),
+                url: Some(format!("s3://{bucket}/{key}")),
+                path: output.container_path.clone(),
+                kind: TesFileType::File,
+            }
         })
         .collect();
 
@@ -886,6 +982,11 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
             .resources
             .ram_bytes
             .map(|bytes| bytes as f64 / 1_000_000_000.0),
+        disk_gb: spec
+            .resources
+            .disk_bytes
+            .map(|bytes| bytes as f64 / 1_000_000_000.0),
+        preemptible: Some(spec.resources.preemptible),
         ..Default::default()
     });
 
@@ -937,10 +1038,10 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
     let mut outputs = Vec::new();
     if let Some(JobResultPayload::Execution {
         exit_code,
-        workspace_bucket,
         outputs: captured,
         stdout,
         stderr,
+        ..
     }) = &record.result
     {
         executor_log.exit_code = *exit_code;
@@ -949,8 +1050,12 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         outputs = captured
             .iter()
             .map(|output| TesOutputFileLog {
-                url: format!("s3://{workspace_bucket}/{}", output.key),
-                path: output.key.clone(),
+                url: format!("s3://{}/{}", output.bucket, output.key),
+                path: if output.container_path.is_empty() {
+                    output.key.clone()
+                } else {
+                    output.container_path.clone()
+                },
                 size_bytes: output.size.to_string(),
             })
             .collect();
@@ -1176,22 +1281,30 @@ mod tests {
             executors: vec![TesExecutor {
                 image: "alpine:3".to_string(),
                 command: vec!["echo".to_string(), "hi".to_string()],
+                workdir: Some("/work".to_string()),
                 env: BTreeMap::from([("K".to_string(), "V".to_string())]),
                 ..Default::default()
             }],
             inputs: vec![TesInput {
+                name: Some("reads".to_string()),
+                description: Some("input reads".to_string()),
                 url: Some("s3://src/data.csv".to_string()),
-                path: "in/data.csv".to_string(),
+                path: "/in/data.csv".to_string(),
                 kind: TesFileType::File,
                 ..Default::default()
             }],
             outputs: vec![TesOutput {
-                path: "out/".to_string(),
+                name: Some("report".to_string()),
+                description: Some("output report".to_string()),
+                url: Some("s3://dest/out/report.txt".to_string()),
+                path: "/out/report.txt".to_string(),
                 ..Default::default()
             }],
             resources: Some(TesResources {
                 cpu_cores: Some(2),
                 ram_gb: Some(4.0),
+                disk_gb: Some(8.0),
+                preemptible: Some(true),
                 ..Default::default()
             }),
             tags: BTreeMap::from([
@@ -1226,12 +1339,35 @@ mod tests {
         // TES command becomes the entrypoint override; image CMD stays empty.
         assert_eq!(spec.entrypoint, Some(vec!["echo".into(), "hi".into()]));
         assert!(spec.command.is_empty());
+        assert_eq!(spec.workdir.as_deref(), Some("/work"));
         assert_eq!(spec.env.get("K").map(String::as_str), Some("V"));
         assert_eq!(spec.resources.cpu_cores, Some(2));
         assert_eq!(spec.resources.ram_bytes, Some(4_000_000_000));
+        assert_eq!(spec.resources.disk_bytes, Some(8_000_000_000));
+        assert!(spec.resources.preemptible);
         assert_eq!(spec.inputs.len(), 1);
         assert_eq!(spec.inputs[0].dest_key, "in/data.csv");
-        assert_eq!(spec.output_prefixes, vec!["out/".to_string()]);
+        assert_eq!(
+            spec.inputs[0].container_path.as_deref(),
+            Some("/in/data.csv")
+        );
+        assert_eq!(spec.inputs[0].name.as_deref(), Some("reads"));
+        assert_eq!(spec.inputs[0].description.as_deref(), Some("input reads"));
+        assert_eq!(spec.file_outputs.len(), 1);
+        assert_eq!(spec.file_outputs[0].container_path, "/out/report.txt");
+        assert_eq!(spec.file_outputs[0].name.as_deref(), Some("report"));
+        assert_eq!(
+            spec.file_outputs[0].description.as_deref(),
+            Some("output report")
+        );
+        assert_eq!(
+            spec.file_outputs[0].destination,
+            OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "out/report.txt".to_string(),
+            }
+        );
+        assert!(spec.output_prefixes.is_empty());
         assert!(dedup.is_none());
     }
 
@@ -1308,7 +1444,6 @@ mod tests {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
         let mut input = task.inputs[0].clone();
         input.url = Some("s3://src/other.csv".to_string());
-        input.path.insert(0, '/');
         task.inputs.push(input);
         assert_eq!(
             map_task_to_spec(&task).unwrap_err().status,
@@ -1317,14 +1452,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_ram() {
+    fn rejects_invalid_size() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
-        for ram_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
-            task.resources.as_mut().unwrap().ram_gb = Some(ram_gb);
+        for size_gb in [-1.0, 0.0, f64::NAN, 1e-10, f64::MAX] {
+            task.resources.as_mut().unwrap().ram_gb = Some(size_gb);
             assert_eq!(
                 map_task_to_spec(&task).unwrap_err().status,
                 StatusCode::BAD_REQUEST
             );
+            task.resources.as_mut().unwrap().ram_gb = Some(4.0);
+            task.resources.as_mut().unwrap().disk_gb = Some(size_gb);
+            assert_eq!(
+                map_task_to_spec(&task).unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+            task.resources.as_mut().unwrap().disk_gb = Some(8.0);
         }
     }
 
@@ -1347,13 +1489,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workdir() {
+    fn rejects_invalid_paths() {
         let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
-        task.executors[0].workdir = Some("/work".to_string());
+        task.executors[0].workdir = Some("work".to_string());
         assert_eq!(
             map_task_to_spec(&task).unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
+        task.executors[0].workdir = Some("/work".to_string());
+        task.inputs[0].path = "/in/../data.csv".to_string();
+        assert_eq!(
+            map_task_to_spec(&task).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        task.inputs[0].path = "/in/data.csv".to_string();
+        task.outputs[0].path = "/out//report.txt".to_string();
+        assert_eq!(
+            map_task_to_spec(&task).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_fields() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.id = Some("server-owned".to_string());
+        assert!(map_task_to_spec(&task).is_err());
+        task.id = None;
+        task.inputs[0].kind = TesFileType::Directory;
+        assert!(map_task_to_spec(&task).is_err());
+        task.inputs[0].kind = TesFileType::File;
+        task.outputs[0].kind = TesFileType::Directory;
+        assert!(map_task_to_spec(&task).is_err());
+        task.outputs[0].kind = TesFileType::File;
+        task.executors[0].stdout = Some("/logs/out".to_string());
+        assert!(map_task_to_spec(&task).is_err());
+        task.executors[0].stdout = None;
+        task.volumes.push("/data".to_string());
+        assert!(map_task_to_spec(&task).is_err());
+        task.volumes.clear();
+        task.resources
+            .as_mut()
+            .unwrap()
+            .zones
+            .push("zone-a".to_string());
+        assert!(map_task_to_spec(&task).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_outputs() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        let mut output = task.outputs[0].clone();
+        output.url = Some("s3://dest/out/other.txt".to_string());
+        task.outputs.push(output);
+        assert!(map_task_to_spec(&task).is_err());
+
+        task.outputs[1].path = "/out/other.txt".to_string();
+        task.outputs[1].url = task.outputs[0].url.clone();
+        assert!(map_task_to_spec(&task).is_err());
+
+        task.outputs.truncate(1);
+        task.outputs[0].path = task.inputs[0].path.clone();
+        assert!(map_task_to_spec(&task).is_err());
     }
 
     #[test]
@@ -1366,10 +1563,12 @@ mod tests {
             image: "img".to_string(),
             entrypoint: None,
             command: vec!["run".to_string()],
+            workdir: None,
             env: BTreeMap::new(),
             resources: ComputeResources::default(),
             executor_constraint: None,
             inputs: Vec::new(),
+            file_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         };
         let mut record = execution_record(JobId::from_bytes([1u8; 16]), user(2), spec());
@@ -1404,6 +1603,10 @@ mod tests {
             stderr: String::new(),
         });
         assert_eq!(tes_state(&record), TesState::ExecutorError);
+        if let Some(JobResultPayload::Execution { exit_code, .. }) = &mut record.result {
+            *exit_code = Some(0);
+        }
+        assert_eq!(tes_state(&record), TesState::SystemError);
     }
 
     #[test]
@@ -1416,12 +1619,30 @@ mod tests {
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(2_000);
         record.workspace_bucket = Some("ws-x".to_string());
+        let JobPayload::Execution(spec) = &mut record.payload else {
+            unreachable!();
+        };
+        spec.inputs.push(InputSelection {
+            source: InputSource::S3 {
+                bucket: "native".to_string(),
+                key: "workspace-only".to_string(),
+                version_id: None,
+            },
+            dest_key: "native/input".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
+        });
+        spec.output_prefixes.push("native/".to_string());
         record.last_error = Some(JobError::permanent("prior failure"));
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
             workspace_bucket: "ws-x".to_string(),
             outputs: vec![OutputObject {
+                bucket: "dest".to_string(),
                 key: "out/r.txt".to_string(),
+                container_path: "/out/report.txt".to_string(),
                 size: 12,
                 digest: None,
             }],
@@ -1440,11 +1661,22 @@ mod tests {
         assert_eq!(basic.tags.get("project").map(String::as_str), Some("alpha"));
         assert_eq!(basic.executors.len(), 1);
         assert_eq!(basic.executors[0].command, vec!["echo", "hi"]);
+        assert_eq!(basic.executors[0].workdir.as_deref(), Some("/work"));
         assert_eq!(basic.logs.len(), 1);
         assert!(basic.logs[0].system_logs.is_empty());
         assert!(basic.logs[0].logs[0].stdout.is_none());
         assert!(basic.logs[0].logs[0].stderr.is_none());
         assert_eq!(basic.inputs.len(), 1);
+        assert_eq!(basic.inputs[0].path, "/in/data.csv");
+        assert_eq!(basic.inputs[0].name.as_deref(), Some("reads"));
+        assert_eq!(basic.outputs.len(), 1);
+        assert_eq!(basic.outputs[0].path, "/out/report.txt");
+        assert_eq!(
+            basic.outputs[0].url.as_deref(),
+            Some("s3://dest/out/report.txt")
+        );
+        assert_eq!(basic.resources.as_ref().unwrap().disk_gb, Some(8.0));
+        assert_eq!(basic.resources.as_ref().unwrap().preemptible, Some(true));
 
         let full = project_task(&record, TesView::Full, "http://x");
         assert_eq!(full.logs.len(), 1);
@@ -1453,7 +1685,8 @@ mod tests {
         assert_eq!(full.logs[0].logs[0].stderr.as_deref(), Some("error"));
         assert_eq!(full.logs[0].system_logs, vec!["prior failure"]);
         assert_eq!(full.logs[0].outputs.len(), 1);
-        assert_eq!(full.logs[0].outputs[0].url, "s3://ws-x/out/r.txt");
+        assert_eq!(full.logs[0].outputs[0].url, "s3://dest/out/r.txt");
+        assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
     }
 
     #[tokio::test]

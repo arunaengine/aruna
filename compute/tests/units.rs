@@ -33,6 +33,8 @@ fn spec_roundtrip() {
         entrypoint: Some(vec!["/bin/sh".into()]),
         command: vec!["sh".into(), "-c".into(), "true".into()],
         workdir: Some("/work".to_string()),
+        inputs: Vec::new(),
+        output_paths: Vec::new(),
         env,
         secret_env,
         resources: ResourceRequest {

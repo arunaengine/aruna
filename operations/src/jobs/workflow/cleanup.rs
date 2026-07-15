@@ -170,6 +170,14 @@ mod tests {
             Err(BackendError::Unavailable("unused".to_string()))
         }
 
+        async fn fetch_output(
+            &self,
+            _attempt: &AttemptRef,
+            _path: &str,
+        ) -> Result<Vec<u8>, BackendError> {
+            Err(BackendError::InvalidSpec("no output".to_string()))
+        }
+
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
             ReconcileOutcome::NotFound
         }

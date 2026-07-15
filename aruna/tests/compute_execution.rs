@@ -12,7 +12,7 @@ use aruna_compute::backend::ExecutorBackend;
 use aruna_compute::docker::{DockerBackend, DockerConfig};
 use aruna_core::structs::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, JobState, RunCrateStatus,
+    JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::reconcile::ExternalReconciler;
@@ -127,11 +127,14 @@ fn execution_spec(
         image: image.to_string(),
         entrypoint,
         command,
+        workdir: None,
         env: Default::default(),
         resources: ComputeResources {
             cpu_cores: Some(1),
             ram_bytes: Some(512 * 1024 * 1024),
+            disk_bytes: None,
             max_walltime_ms: Some(120_000),
+            preemptible: false,
         },
         executor_constraint: Some("docker".to_string()),
         inputs: vec![InputSelection {
@@ -142,7 +145,11 @@ fn execution_spec(
             },
             dest_key: "inputs/data.txt".to_string(),
             mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
         }],
+        file_outputs: Vec::new(),
         output_prefixes: vec!["outputs/".to_string()],
     }
 }
@@ -247,26 +254,24 @@ async fn execution_end_to_end() -> TestResult<()> {
     };
     let fixture = setup(backend).await?;
 
-    // aws-cli reads the staged input and writes an output back, both via the
-    // injected workspace credentials against the node's S3 endpoint.
-    // The security baseline drops all caps, so only /tmp is writable; keep aws
-    // config and HOME there and force path-style addressing.
-    let script = "\
-set -e
-export HOME=/tmp
-export AWS_CONFIG_FILE=/tmp/awscfg
-export AWS_EC2_METADATA_DISABLED=true
-printf '[default]\\ns3 =\\n    addressing_style = path\\n' > /tmp/awscfg
-aws --endpoint-url \"$AWS_ENDPOINT_URL\" s3 cp \"s3://$ARUNA_WORKSPACE_BUCKET/inputs/data.txt\" /tmp/in
-tr a-z A-Z < /tmp/in > /tmp/out
-aws --endpoint-url \"$AWS_ENDPOINT_URL\" s3 cp /tmp/out \"s3://$ARUNA_WORKSPACE_BUCKET/outputs/result.txt\"
-";
-    let spec = execution_spec(
+    let script = "tr a-z A-Z < /data/input.txt > /data/result.txt";
+    let mut spec = execution_spec(
         &fixture,
-        "amazon/aws-cli:latest",
+        "busybox:latest",
         Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
         vec![script.to_string()],
     );
+    spec.inputs[0].container_path = Some("/data/input.txt".to_string());
+    spec.file_outputs = vec![OutputSelection {
+        container_path: "/data/result.txt".to_string(),
+        destination: OutputDestination::S3 {
+            bucket: fixture.source_bucket.clone(),
+            key: "outputs/result.txt".to_string(),
+        },
+        name: None,
+        description: None,
+    }];
+    spec.output_prefixes.clear();
     let (job_id, record) = claim_execution(&fixture, spec).await;
 
     run_execution_job(
@@ -303,12 +308,12 @@ aws --endpoint-url \"$AWS_ENDPOINT_URL\" s3 cp /tmp/out \"s3://$ARUNA_WORKSPACE_
     }
     assert_eq!(state, JobState::Succeeded, "container job must succeed");
 
-    // The output the container wrote is durable in the run bucket.
+    // The output copied from the container is durable at its declared URL.
     let bucket = JobRecord::workspace_bucket_name(job_id);
     let client = s3_client(&fixture.endpoint, &fixture.s3);
     let output = client
         .get_object()
-        .bucket(&bucket)
+        .bucket(&fixture.source_bucket)
         .key("outputs/result.txt")
         .send()
         .await

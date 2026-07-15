@@ -306,6 +306,9 @@ pub async fn submit_job(
             },
             dest_key: input.dest_key,
             mode: InputMode::Snapshot,
+            container_path: None,
+            name: None,
+            description: None,
         };
         if inputs
             .iter()
@@ -324,14 +327,18 @@ pub async fn submit_job(
         image: request.image,
         entrypoint: request.entrypoint,
         command: request.command,
+        workdir: None,
         env: request.env,
         resources: ComputeResources {
             cpu_cores: request.cpu_cores,
             ram_bytes: request.ram_bytes,
+            disk_bytes: None,
             max_walltime_ms: request.max_walltime_ms,
+            preemptible: false,
         },
         executor_constraint: request.executor_constraint,
         inputs,
+        file_outputs: Vec::new(),
         output_prefixes: request.output_prefixes,
     };
     let result = submit_execution_job(

@@ -34,8 +34,8 @@ use super::store::{
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 use workspace::{
-    collect_outputs, ensure_group_write, ensure_workspace_bucket, mint_workspace_credential,
-    stage_inputs,
+    capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
+    mint_workspace_credential, stage_inputs,
 };
 
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
@@ -109,9 +109,9 @@ pub async fn run_execution_job(
 
     let prepare_and_submit = async {
         let bucket = JobRecord::workspace_bucket_name(job_id);
-        let credential =
+        let (credential, inputs) =
             match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
-                Ok(credential) => credential,
+                Ok(prepared) => prepared,
                 Err(error) => {
                     requeue_or_fail_pre_submit(&context, job_id, token, &record, error).await;
                     return None;
@@ -129,7 +129,15 @@ pub async fn run_execution_job(
         let attempt_no = record.attempts;
         // Lowercased: attempt ids must be injective under the backend name mapping.
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
-        let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
+        let task_spec = build_task_spec(
+            &context,
+            &spec,
+            &attempt,
+            &credential,
+            &bucket,
+            node_id,
+            inputs,
+        );
 
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
@@ -182,39 +190,61 @@ pub async fn run_execution_job(
     tokio::pin!(prepare_and_submit);
 
     let prepared = tokio::select! {
-        result = &mut prepare_and_submit => {
-            stop.cancel();
-            let _ = (&mut heartbeat).await;
-            result
-        }
-        _ = &mut heartbeat => None,
+        result = &mut prepare_and_submit => result,
+        _ = &mut heartbeat => return,
     };
     let Some(prepared) = prepared else {
+        stop.cancel();
+        let _ = (&mut heartbeat).await;
         return;
     };
-    let (backend, attempt, spec, bucket, cancel) = match prepared {
-        Ok(prepared) => prepared,
-        Err((backend, attempt, task_spec, spec, bucket, cancel, error)) => {
-            recover_failed_submit(
-                &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket, &record,
-                cancel, error,
+    match prepared {
+        Ok((backend, attempt, spec, bucket, cancel)) => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            supervise_and_finalize(
+                context.clone(),
+                job_id,
+                token,
+                backend,
+                attempt,
+                spec,
+                bucket,
+                cancel,
             )
             .await;
-            return;
         }
-    };
-
-    supervise_and_finalize(
-        context.clone(),
-        job_id,
-        token,
-        backend,
-        attempt,
-        spec,
-        bucket,
-        cancel,
-    )
-    .await;
+        Err((backend, attempt, task_spec, spec, bucket, cancel, error)) => {
+            let resumed = {
+                let recovery = recover_failed_submit(
+                    &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket,
+                    &record, error,
+                );
+                tokio::pin!(recovery);
+                tokio::select! {
+                    result = &mut recovery => {
+                        stop.cancel();
+                        let _ = (&mut heartbeat).await;
+                        Some(result)
+                    }
+                    _ = &mut heartbeat => None,
+                }
+            };
+            if resumed == Some(true) {
+                supervise_and_finalize(
+                    context.clone(),
+                    job_id,
+                    token,
+                    backend,
+                    attempt,
+                    spec,
+                    bucket,
+                    cancel,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Resolve the backend for a spec, or a permanent error when none is eligible.
@@ -242,7 +272,13 @@ async fn prepare_workspace(
     node_id: NodeId,
     bucket: &str,
     token: ulid::Ulid,
-) -> Result<workspace::WorkspaceCredential, JobError> {
+) -> Result<
+    (
+        workspace::WorkspaceCredential,
+        Vec<aruna_compute::spec::TaskInput>,
+    ),
+    JobError,
+> {
     ensure_group_write(context, spec, record, node_id).await?;
     ensure_workspace_bucket(context, spec, record, bucket).await?;
     set_workspace_bucket(
@@ -255,7 +291,9 @@ async fn prepare_workspace(
     .await
     .map_err(|error| JobError::retryable(format!("workspace bucket record failed: {error}")))?;
     stage_inputs(context, spec, record, bucket, node_id).await?;
-    mint_workspace_credential(context, spec, record, node_id, bucket).await
+    let inputs = load_inputs(context, spec, record, bucket).await?;
+    let credential = mint_workspace_credential(context, spec, record, node_id, bucket).await?;
+    Ok((credential, inputs))
 }
 
 fn build_task_spec(
@@ -265,6 +303,7 @@ fn build_task_spec(
     credential: &workspace::WorkspaceCredential,
     bucket: &str,
     _node_id: NodeId,
+    inputs: Vec<aruna_compute::spec::TaskInput>,
 ) -> TaskSpec {
     let mut env = spec.env.clone();
     env.insert("ARUNA_WORKSPACE_BUCKET".to_string(), bucket.to_string());
@@ -288,9 +327,9 @@ fn build_task_spec(
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
         ram_bytes: spec.resources.ram_bytes,
-        disk_bytes: None,
+        disk_bytes: spec.resources.disk_bytes,
         max_walltime: spec.resources.max_walltime_ms.map(Duration::from_millis),
-        preemptible: false,
+        preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
     TaskSpec {
@@ -298,12 +337,18 @@ fn build_task_spec(
         image: spec.image.clone(),
         entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
-        workdir: None,
+        workdir: spec.workdir.clone(),
         env,
         secret_env,
         resources,
         workspace: workspace_binding,
         log_limits: Default::default(),
+        inputs,
+        output_paths: spec
+            .file_outputs
+            .iter()
+            .map(|output| output.container_path.clone())
+            .collect(),
     }
 }
 
@@ -322,9 +367,8 @@ async fn recover_failed_submit(
     spec: &ExecutionSpec,
     bucket: &str,
     record: &JobRecord,
-    cancel: CancellationToken,
     error: BackendError,
-) {
+) -> bool {
     let storage = &context.storage_handle;
     match backend.reconcile(attempt).await {
         // Confirmed absent: the submit failed before a container could exist, so
@@ -336,6 +380,7 @@ async fn recover_failed_submit(
                 JobError::permanent(format!("submit failed: {error}"))
             };
             requeue_or_fail_pre_submit(context, job_id, token, record, job_error).await;
+            false
         }
         // The attempt already finished: commit its evidence.
         ReconcileOutcome::Found(status) if status.is_terminal() => {
@@ -349,7 +394,7 @@ async fn recover_failed_submit(
             .await
             .is_err()
             {
-                return;
+                return false;
             }
             finalize_attempt(
                 context,
@@ -362,6 +407,7 @@ async fn recover_failed_submit(
                 Ok(status),
             )
             .await;
+            false
         }
         // The container exists and is live: adopt it, never launch a second one.
         // A created-but-never-started container is completed in place; the name
@@ -371,9 +417,20 @@ async fn recover_failed_submit(
             if matches!(&status.phase, AttemptPhase::Submitted) {
                 match backend.submit(task_spec).await {
                     Ok(resubmitted) => started_at_ms = resubmitted.started_at_ms.or(started_at_ms),
-                    Err(_) => {
-                        park_failed_submit(context, job_id, token, &error).await;
-                        return;
+                    Err(resubmit_error) if resubmit_error.retryable() => {
+                        park_failed_submit(context, job_id, token, &resubmit_error).await;
+                        return false;
+                    }
+                    Err(resubmit_error) => {
+                        fail_and_crate(
+                            context,
+                            job_id,
+                            token,
+                            record,
+                            JobError::permanent(format!("resubmit failed: {resubmit_error}")),
+                        )
+                        .await;
+                        return false;
                     }
                 }
             }
@@ -387,24 +444,15 @@ async fn recover_failed_submit(
             .await
             .is_err()
             {
-                return;
+                return false;
             }
-            supervise_and_finalize(
-                context.clone(),
-                job_id,
-                token,
-                backend.clone(),
-                attempt.clone(),
-                spec.clone(),
-                bucket.to_string(),
-                cancel,
-            )
-            .await;
+            true
         }
         // Backend unobservable: park; the retained intent keeps the attempt
         // adoptable when the lease sweep routes the job to the reconciler.
         ReconcileOutcome::Unavailable(_) => {
             park_failed_submit(context, job_id, token, &error).await;
+            false
         }
     }
 }
@@ -439,37 +487,46 @@ pub async fn supervise_and_finalize(
     cancel: CancellationToken,
 ) {
     let storage = context.storage_handle.clone();
+    let wait_and_finalize = async {
+        let result = backend.wait(&attempt, &cancel).await;
+        finalize_attempt(
+            &context, job_id, token, &backend, &attempt, &spec, &bucket, result,
+        )
+        .await;
+    };
+    if with_execution_heartbeat(storage, job_id, token, cancel.clone(), wait_and_finalize)
+        .await
+        .is_none()
+    {
+        info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
+    }
+}
+
+pub(super) async fn with_execution_heartbeat<T>(
+    storage: aruna_storage::StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    cancel: CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
-        storage.clone(),
+        storage,
         job_id,
         token,
-        cancel.clone(),
+        cancel,
         stop.clone(),
     ));
     tokio::pin!(heartbeat);
-
-    let wait = backend.wait(&attempt, &cancel);
-    tokio::pin!(wait);
-
-    let outcome = tokio::select! {
-        result = &mut wait => Some(result),
-        // Heartbeat returned first: the claim was lost to an adopter. Abandon
-        // without writing, exactly like the in-process zombie guard.
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            Some(result)
+        }
         _ = &mut heartbeat => None,
-    };
-
-    let Some(result) = outcome else {
-        info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
-        return;
-    };
-
-    finalize_attempt(
-        &context, job_id, token, &backend, &attempt, &spec, &bucket, result,
-    )
-    .await;
-    stop.cancel();
-    let _ = (&mut heartbeat).await;
+    }
 }
 
 /// Renew the lease and surface `cancel_requested`. Returns on a lost token so the
@@ -550,9 +607,16 @@ pub(crate) async fn finalize_attempt(
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
+            let Some(mut outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+            else {
                 return;
             };
+            let Some(captured) =
+                export_or_park(context, job_id, token, backend, attempt, spec, bucket).await
+            else {
+                return;
+            };
+            outputs.extend(captured);
             let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
                 return;
             };
@@ -629,10 +693,18 @@ async fn finalize_cancel(
             };
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
-                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    let Some(mut outputs) =
+                        collect_or_park(context, job_id, token, spec, bucket).await
                     else {
                         return;
                     };
+                    let Some(captured) =
+                        export_or_park(context, job_id, token, backend, attempt, spec, bucket)
+                            .await
+                    else {
+                        return;
+                    };
+                    outputs.extend(captured);
                     let result = execution_result_for(bucket, Some(0), outputs, logs);
                     let record = terminal_complete(storage, job_id, token, result).await;
                     cleanup_and_crate(context, job_id, record).await;
@@ -854,6 +926,64 @@ async fn collect_or_park(
     }
 }
 
+async fn export_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) -> Option<Vec<OutputObject>> {
+    if spec.file_outputs.is_empty() {
+        return Some(Vec::new());
+    }
+    let record = match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return None,
+        Err(error) => {
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                JobError::retryable(format!("output job lookup failed: {error}")),
+                unix_timestamp_millis(),
+            )
+            .await;
+            return None;
+        }
+    };
+    let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        let error = JobError::permanent("output capture needs a net handle");
+        let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
+        let terminal = terminal_fail(&context.storage_handle, job_id, token, error, result).await;
+        cleanup_and_crate(context, job_id, terminal).await;
+        return None;
+    };
+    match capture_outputs(context, backend, attempt, spec, &record, node_id).await {
+        Ok(outputs) => Some(outputs),
+        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Retryable => {
+            warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                error,
+                unix_timestamp_millis(),
+            )
+            .await;
+            None
+        }
+        Err(error) => {
+            let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
+            let terminal =
+                terminal_fail(&context.storage_handle, job_id, token, error, result).await;
+            cleanup_and_crate(context, job_id, terminal).await;
+            None
+        }
+    }
+}
+
 fn execution_result(
     record: &JobRecord,
     exit_code: Option<i32>,
@@ -1003,6 +1133,13 @@ mod tests {
             self.logs_release.notified().await;
             Ok(LogTails::default())
         }
+        async fn fetch_output(
+            &self,
+            _attempt: &AttemptRef,
+            _path: &str,
+        ) -> Result<Vec<u8>, BackendError> {
+            Err(BackendError::InvalidSpec("no output".to_string()))
+        }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
             match self.reconcile {
                 StubReconcile::NotFound => ReconcileOutcome::NotFound,
@@ -1042,14 +1179,18 @@ mod tests {
             image: "alpine:3".to_string(),
             entrypoint: None,
             command: vec!["true".to_string()],
+            workdir: None,
             env: Default::default(),
             resources: ComputeResources {
                 cpu_cores: None,
                 ram_bytes: None,
+                disk_bytes: None,
                 max_walltime_ms: None,
+                preemptible: false,
             },
             executor_constraint: None,
             inputs: Vec::new(),
+            file_outputs: Vec::new(),
             output_prefixes: Vec::new(),
         }
     }
@@ -1160,7 +1301,6 @@ mod tests {
             &execution_spec(),
             "ws-test",
             &record,
-            CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
         .await;
@@ -1313,7 +1453,6 @@ mod tests {
             &execution_spec(),
             "ws-test",
             &record,
-            CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
         .await;

@@ -1,13 +1,20 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::errors::AuthorizationError;
+use aruna_compute::backend::ExecutorBackend;
+use aruna_compute::spec::{AttemptRef, MAX_TRANSFER_BYTES, TaskInput};
+use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError,
-    JobRecord, OutputObject, PathRestriction, Permission, UserAccess, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path, workspace_credential_id,
+    JobRecord, OutputDestination, OutputObject, OutputSelection, PathRestriction, Permission,
+    UserAccess, blob_bucket_permission_path, blob_group_permission_path,
+    blob_object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -15,12 +22,12 @@ use crate::driver::{DriverContext, drive};
 use crate::get_realm_config::GetRealmConfigOperation;
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
-use crate::s3::get_bucket_info::GetBucketInfoOperation;
-use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
@@ -192,6 +199,205 @@ pub async fn stage_inputs(
     Ok(())
 }
 
+pub async fn load_inputs(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    bucket: &str,
+) -> Result<Vec<TaskInput>, JobError> {
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+    for input in &spec.inputs {
+        let Some(path) = input.container_path.clone() else {
+            continue;
+        };
+        let get = drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: bucket.to_string(),
+                key: input.dest_key.clone(),
+                version_id: None,
+                range: None,
+                group_id: spec.group_id,
+                user_identity: record.created_by,
+            }),
+            context,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(staged_input_error)?
+        .ok_or_else(|| JobError::permanent(format!("staged input {} missing", input.dest_key)))?;
+        let mut contents = Vec::new();
+        let mut body = get.blob;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                JobError::retryable(format!("staged input stream failed: {error}"))
+            })?;
+            total_bytes = total_bytes
+                .checked_add(chunk.len())
+                .filter(|total| *total <= MAX_TRANSFER_BYTES)
+                .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
+            contents.extend_from_slice(&chunk);
+        }
+        files.push(TaskInput { path, contents });
+    }
+    Ok(files)
+}
+
+pub async fn capture_outputs(
+    context: &DriverContext,
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> Result<Vec<OutputObject>, JobError> {
+    let mut outputs = Vec::with_capacity(spec.file_outputs.len());
+    for output in &spec.file_outputs {
+        let contents = backend
+            .fetch_output(attempt, &output.container_path)
+            .await
+            .map_err(|error| {
+                if error.retryable() {
+                    JobError::retryable(format!("container output read failed: {error}"))
+                } else {
+                    JobError::permanent(format!("container output read failed: {error}"))
+                }
+            })?;
+        outputs.push(put_file_output(context, spec, record, node_id, output, contents).await?);
+    }
+    Ok(outputs)
+}
+
+async fn put_file_output(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    output: &OutputSelection,
+    contents: Vec<u8>,
+) -> Result<OutputObject, JobError> {
+    let OutputDestination::S3 { bucket, key } = &output.destination;
+    let bucket_info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(|error| bucket_lookup_error("output", error))?
+        .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
+    if bucket_info.group_id != spec.group_id {
+        return Err(JobError::permanent(
+            "output bucket is outside the execution group",
+        ));
+    }
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+            },
+            path: blob_object_permission_path(
+                record.created_by.realm_id,
+                spec.group_id,
+                node_id,
+                bucket,
+                key,
+            ),
+            required_permission: Permission::WRITE,
+        }),
+        context,
+    )
+    .await
+    .map_err(|error| authorization_error("output", error))?;
+    if !allowed {
+        return Err(JobError::permanent(format!(
+            "output {bucket}/{key} access denied"
+        )));
+    }
+
+    let expected_hash = blake3::hash(&contents);
+    let existing = match drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: None,
+        }),
+        context,
+    )
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(result)) => result.location,
+        Ok(None)
+        | Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => None,
+        Err(error) => {
+            return Err(JobError::retryable(format!(
+                "output destination lookup failed: {error}"
+            )));
+        }
+    };
+    if existing.as_ref().is_some_and(|location| {
+        location.blob_size == contents.len() as u64
+            && location.get_blake3() == Some(expected_hash.as_bytes().as_slice())
+    }) {
+        return Ok(output_object(output, bucket, key, &contents));
+    }
+
+    let realm_config = drive(
+        GetRealmConfigOperation::new(record.created_by.realm_id),
+        context,
+    )
+    .await
+    .map_err(|error| JobError::retryable(format!("output quota lookup failed: {error}")))?;
+    let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
+    let output_object = output_object(output, bucket, key, &contents);
+    let content_length = contents.len() as u64;
+    let body = BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
+        Bytes::from(contents),
+    )]));
+    drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: record.created_by,
+            group_id: spec.group_id,
+            realm_id: record.created_by.realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                content_length: Some(content_length),
+                body: Some(body),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            quota_ceiling,
+        }),
+        context,
+    )
+    .await
+    .and_then(|result| result.transpose())
+    .map_err(|error| put_object_error("output write", error))?;
+    Ok(output_object)
+}
+
+fn output_object(
+    output: &OutputSelection,
+    bucket: &str,
+    key: &str,
+    contents: &[u8],
+) -> OutputObject {
+    OutputObject {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        container_path: output.container_path.clone(),
+        size: contents.len() as u64,
+        digest: Some(blake3::hash(contents).to_hex().to_string()),
+    }
+}
+
 async fn stage_one_input(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -217,7 +423,7 @@ async fn stage_one_input(
     let bucket_info = drive(GetBucketInfoOperation::new(src_bucket.clone()), context)
         .await
         .and_then(|result| result.transpose())
-        .map_err(|error| JobError::permanent(format!("input bucket lookup failed: {error}")))?
+        .map_err(|error| bucket_lookup_error("input", error))?
         .ok_or_else(|| JobError::permanent(format!("input bucket {src_bucket} not found")))?;
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -238,7 +444,7 @@ async fn stage_one_input(
         context,
     )
     .await
-    .map_err(|error| JobError::permanent(format!("input authorization failed: {error}")))?;
+    .map_err(|error| authorization_error("input", error))?;
     if !allowed {
         return Err(JobError::permanent(format!(
             "input {src_bucket}/{src_key} access denied"
@@ -321,8 +527,58 @@ async fn stage_one_input(
     )
     .await
     .and_then(|result| result.transpose())
-    .map_err(|error| JobError::retryable(format!("input stage failed: {error}")))?;
+    .map_err(|error| put_object_error("input stage", error))?;
     Ok(())
+}
+
+fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
+    let message = format!("{scope} bucket lookup failed: {error}");
+    if matches!(&error, GetBucketInfoError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn staged_input_error(error: GetObjectError) -> JobError {
+    let message = format!("staged input read failed: {error}");
+    if matches!(&error, GetObjectError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn authorization_error(scope: &str, error: AuthorizationError) -> JobError {
+    let message = format!("{scope} authorization failed: {error}");
+    if matches!(&error, AuthorizationError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn put_object_error(scope: &str, error: PutObjectError) -> JobError {
+    let message = format!("{scope} failed: {error}");
+    if matches!(&error, PutObjectError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn storage_retryable(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::TransactionConflict
+            | StorageError::ReadError
+            | StorageError::WriteError
+            | StorageError::DeleteError
+            | StorageError::PersistError(_)
+            | StorageError::ChannelClosed
+            | StorageError::QueueFull
+            | StorageError::Timeout
+    )
 }
 
 fn blob_identity(location: &BackendLocation) -> (u64, Option<&[u8]>) {
@@ -383,7 +639,9 @@ pub async fn collect_outputs(
                     &mut outputs,
                     &mut keys,
                     OutputObject {
+                        bucket: bucket.to_string(),
                         key: object.head.key,
+                        container_path: String::new(),
                         size,
                         digest,
                     },
@@ -400,10 +658,10 @@ pub async fn collect_outputs(
 
 fn insert_output(
     outputs: &mut Vec<OutputObject>,
-    keys: &mut HashSet<String>,
+    keys: &mut HashSet<(String, String)>,
     output: OutputObject,
 ) -> Result<(), JobError> {
-    if !keys.insert(output.key.clone()) {
+    if !keys.insert((output.bucket.clone(), output.key.clone())) {
         return Ok(());
     }
     if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
@@ -448,17 +706,21 @@ mod tests {
             image: "alpine".to_string(),
             entrypoint: None,
             command: Vec::new(),
+            workdir: None,
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
             inputs: Vec::new(),
+            file_outputs: Vec::new(),
             output_prefixes,
         }
     }
 
     fn output(key: &str) -> OutputObject {
         OutputObject {
+            bucket: "workspace".to_string(),
             key: key.to_string(),
+            container_path: key.to_string(),
             size: 0,
             digest: None,
         }

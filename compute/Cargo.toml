@@ -13,8 +13,10 @@ docker = ["dep:bollard"]
 [dependencies]
 async-trait = { workspace = true }
 bollard = { workspace = true, optional = true, features = ["ssl"] }
+bytes = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

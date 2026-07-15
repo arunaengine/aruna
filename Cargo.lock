@@ -307,9 +307,11 @@ version = "3.0.0-alpha.34"
 dependencies = [
  "async-trait",
  "bollard",
+ "bytes",
  "futures-util",
  "serde",
  "serde_json",
+ "tar",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

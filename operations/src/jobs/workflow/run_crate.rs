@@ -212,7 +212,9 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         .collect();
     let result_ids: Vec<serde_json::Value> = outputs
         .iter()
-        .map(|output: &OutputObject| json!({ "@id": format!("workspace/{}", output.key) }))
+        .map(|output: &OutputObject| {
+            json!({ "@id": format!("s3://{}/{}", output.bucket, output.key) })
+        })
         .collect();
 
     let mut graph = vec![
@@ -257,7 +259,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
     ];
     for output in &outputs {
         graph.push(json!({
-            "@id": format!("workspace/{}", output.key),
+            "@id": format!("s3://{}/{}", output.bucket, output.key),
             "@type": "File",
             "name": output.key,
             "contentSize": output.size.to_string()
