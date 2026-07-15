@@ -5,7 +5,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Aggregate ceiling for in-memory task file-transfer payloads.
-pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+// Real-file streaming is a follow-up; transfers remain memory-buffered for now.
+pub const MAX_TRANSFER_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Fence identity of one attempt. Deterministically names the external object
 /// via [`AttemptRef::external_name`]; that name is the reconciliation key.
