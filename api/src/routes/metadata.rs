@@ -252,7 +252,10 @@ pub struct MetadataRoCrateExportParams {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchParams {
+    #[serde(default)]
     pub q: String,
+    #[serde(default)]
+    pub conforms_to: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -293,11 +296,19 @@ pub struct SparqlQueryRequest {
     /// `local` runs only against metadata indexed on the current node.
     /// `distributed` fans out to all known realm nodes for all-metadata queries,
     /// or to the document's registry replica nodes for document-scoped queries,
-    /// and merges the results.
+    /// and returns one complete replica result.
     /// Distributed mode is best-effort and may return partial results if realm
     /// node discovery or remote requests fail.
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
+    /// Keep successful partitions when distributed execution is incomplete.
+    /// Defaults to `true` for compatibility with the existing best-effort API.
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+}
+
+fn default_allow_partial() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -305,7 +316,7 @@ pub struct SparqlQueryRequest {
 pub enum MetadataQueryMode {
     /// Run the query only on the current node.
     Local,
-    /// Run the query across all known realm nodes and merge the results.
+    /// Run the query across the selected metadata partitions.
     /// This is best-effort and may return partial results if discovery or
     /// remote requests fail.
     Distributed,
@@ -320,6 +331,10 @@ pub struct MetadataQueryResponse {
     /// Number of node partitions that failed or timed out; a non-zero value
     /// means the result is partial.
     pub nodes_failed: usize,
+    /// Whether every selected partition completed successfully.
+    pub complete: bool,
+    /// Node partitions that failed, timed out, or exceeded the fan-out bound.
+    pub failed_partitions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1033,7 +1048,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replica nodes and merges the results. Distributed mode is best-effort and may return partial results if replica requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry replicas and returns the first successful complete result. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any selected replica fails.",
         examples(
             (
                 "DocumentAsk" = (
@@ -1081,6 +1096,7 @@ pub async fn query_metadata_document(
             bearer_token: bearer_token_to_string(bearer_token),
             query: request.query,
             mode: map_query_mode(request.mode),
+            allow_partial: request.allow_partial,
         },
     )
     .await
@@ -1097,13 +1113,13 @@ pub async fn query_metadata_document(
     tag = "metadata",
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries and merges partition sets. Distributed mode is best-effort by default; set `allow_partial=false` to fail if any partition is unavailable.",
         examples(
             (
                 "SelectDatasets" = (
                     summary = "List dataset names across visible metadata graphs",
                     value = json!({
-                        "query": "SELECT ?dataset ?name WHERE { ?dataset a <http://schema.org/Dataset> ; <http://schema.org/name> ?name . } LIMIT 25"
+                        "query": "SELECT DISTINCT ?dataset WHERE { ?dataset a <http://schema.org/Dataset> } LIMIT 25"
                     })
                 )
             ),
@@ -1142,6 +1158,7 @@ pub async fn query_all_metadata(
             query: request.query,
             mode: map_query_mode(request.mode),
             target_nodes: None,
+            allow_partial: request.allow_partial,
         },
     )
     .await
@@ -1157,7 +1174,8 @@ pub async fn query_all_metadata(
     path = "/metadata/search",
     tag = "metadata",
     params(
-        ("q" = String, Query, description = "Search query"),
+        ("q" = Option<String>, Query, description = "Search query; optional when conforms_to is set"),
+        ("conforms_to" = Option<String>, Query, description = "Exact schema.org conformsTo profile IRI"),
         ("limit" = Option<usize>, Query, description = "Maximum number of hits"),
         ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail")
     ),
@@ -1183,6 +1201,7 @@ pub async fn search_metadata(
             bearer_token: bearer_token_to_string(bearer_token),
             graph_iris: None,
             query: params.q,
+            conforms_to: params.conforms_to,
             limit: params.limit,
             mode: map_query_mode(params.mode),
             target_nodes: None,
@@ -1576,10 +1595,20 @@ fn map_query_results(
         MetadataQueryResults::Boolean(value) => MetadataQueryResult::Boolean(value),
         MetadataQueryResults::Graph(_) => return Err(ServerError::BadRequest),
     };
+    let mut failed_partitions = fanout_stats
+        .failed_partitions
+        .into_iter()
+        .map(|node_id| node_id.to_string())
+        .collect::<Vec<_>>();
+    if fanout_stats.discovery_failed {
+        failed_partitions.push("partition-discovery".to_string());
+    }
     Ok(MetadataQueryResponse {
         result,
         nodes_queried: fanout_stats.nodes_queried,
         nodes_failed: fanout_stats.nodes_failed,
+        complete: fanout_stats.nodes_failed == 0,
+        failed_partitions,
     })
 }
 
@@ -1839,6 +1868,7 @@ mod tests {
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s <http://schema.org/name> \"Public Dataset\" }".to_string(),
                 mode: None,
+                allow_partial: true,
             }),
         )
         .await
@@ -1859,6 +1889,7 @@ mod tests {
             Extension(None),
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
+                conforms_to: None,
                 limit: Some(10),
                 mode: None,
             }),
@@ -1868,6 +1899,37 @@ mod tests {
         assert!(!search.hits.is_empty());
         assert_eq!(search.nodes_queried, 1);
         assert_eq!(search.nodes_failed, 0);
+
+        let (_, Json(conforming)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: String::new(),
+                conforms_to: Some("https://w3id.org/ro/crate/1.2".to_string()),
+                limit: Some(10),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conforming.hits.len(), 1);
+        assert_eq!(conforming.hits[0].document_id, document_id);
+
+        let (_, Json(nonconforming)) = search_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            Query(MetadataSearchParams {
+                q: "Public".to_string(),
+                conforms_to: Some("https://w3id.org/ro/crate/1.1".to_string()),
+                limit: Some(10),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(nonconforming.hits.is_empty());
     }
 
     #[tokio::test]
@@ -2192,6 +2254,7 @@ mod tests {
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
                 mode: None,
+                allow_partial: true,
             }),
         )
         .await;
@@ -2626,12 +2689,16 @@ mod tests {
             result: MetadataQueryResult::Boolean(true),
             nodes_queried: 3,
             nodes_failed: 1,
+            complete: false,
+            failed_partitions: vec!["partition-a".to_string()],
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["kind"], json!("Boolean"));
         assert_eq!(value["value"], json!(true));
         assert_eq!(value["nodes_queried"], json!(3));
         assert_eq!(value["nodes_failed"], json!(1));
+        assert_eq!(value["complete"], json!(false));
+        assert_eq!(value["failed_partitions"], json!(["partition-a"]));
 
         let roundtrip: MetadataQueryResponse = serde_json::from_value(value).unwrap();
         assert!(matches!(
@@ -2640,6 +2707,8 @@ mod tests {
         ));
         assert_eq!(roundtrip.nodes_queried, 3);
         assert_eq!(roundtrip.nodes_failed, 1);
+        assert!(!roundtrip.complete);
+        assert_eq!(roundtrip.failed_partitions, vec!["partition-a"]);
     }
 
     #[tokio::test]
@@ -2674,9 +2743,10 @@ mod tests {
             Extension(None),
             Extension(None),
             Json(SparqlQueryRequest {
-                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
                     .to_string(),
                 mode: Some(MetadataQueryMode::Distributed),
+                allow_partial: true,
             }),
         )
         .await
@@ -2730,6 +2800,7 @@ mod tests {
                 Json(SparqlQueryRequest {
                     query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
                     mode: Some(MetadataQueryMode::Local),
+                    allow_partial: true,
                 }),
             )
             .await
@@ -2823,8 +2894,31 @@ mod tests {
         .await;
         assert_eq!(invalid_forwarded_token.nodes_queried, 1);
         assert_eq!(invalid_forwarded_token.nodes_failed, 1);
+        assert_eq!(
+            invalid_forwarded_token.failed_partitions,
+            vec![test.remote.net.node_id()]
+        );
         assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Public Dataset");
         assert_excludes_dataset_name(&invalid_forwarded_token.names, "Remote Private Dataset");
+
+        let ctx = test.coordinator.state.get_ctx();
+        let strict = run_query_metadata(
+            ctx.as_ref(),
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth: None,
+                bearer_token: Some("not-a-jwt".to_string()),
+                graph_iris: None,
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
+                mode: Some(MetadataApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: false,
+            },
+        )
+        .await;
+        assert!(matches!(strict, Err(MetadataApiError::ServiceUnavailable)));
 
         test.shutdown().await;
     }
@@ -2943,6 +3037,7 @@ mod tests {
         names: Vec<String>,
         nodes_queried: usize,
         nodes_failed: usize,
+        failed_partitions: Vec<aruna_core::NodeId>,
     }
 
     struct SearchPathsResult {
@@ -3179,9 +3274,11 @@ mod tests {
                 auth,
                 bearer_token: bearer_token_to_string(bearer_token),
                 graph_iris: None,
-                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
                 mode: Some(MetadataApiQueryMode::Distributed),
                 target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: true,
             },
         )
         .await
@@ -3193,6 +3290,7 @@ mod tests {
             names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
             nodes_queried: result.fanout_stats.nodes_queried,
             nodes_failed: result.fanout_stats.nodes_failed,
+            failed_partitions: result.fanout_stats.failed_partitions,
         }
     }
 
@@ -3211,6 +3309,7 @@ mod tests {
                 bearer_token: bearer_token_to_string(bearer_token),
                 graph_iris: None,
                 query: "Remote".to_string(),
+                conforms_to: None,
                 limit: Some(10),
                 mode: Some(MetadataApiQueryMode::Distributed),
                 target_nodes: Some(vec![test.remote.net.node_id()]),
