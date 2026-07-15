@@ -138,15 +138,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
-    // A compute-enabled node reconciles lost external attempts (never a blind
-    // requeue) via the registered reconciler.
-    let jobs_runtime = if compute_handle.is_some() {
-        JobsRuntime::with_reconciler(
-            aruna_operations::jobs::workflow::reconcile::ComputeReconciler::new(driver_ctx.clone()),
-        )
-    } else {
-        JobsRuntime::new()
-    };
+    // Task initialization binds the compute reconciler before startup recovery.
+    let jobs_runtime = JobsRuntime::new();
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle, jobs_runtime.clone()).await;
 

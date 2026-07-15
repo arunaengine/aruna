@@ -16,6 +16,7 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::reconcile::ExternalReconciler;
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
     ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_job_record,
     read_run_crate_status,
@@ -441,7 +442,8 @@ async fn execution_restart_adopts() -> TestResult<()> {
         .await
         .unwrap()
         .unwrap();
-    let reconciler = ComputeReconciler::new(fixture.compute_ctx.clone());
+    let runtime = JobsRuntime::new();
+    let reconciler = ComputeReconciler::new(fixture.compute_ctx.clone(), Arc::downgrade(&runtime));
     reconciler
         .reconcile_lost_attempt(&fixture.compute_ctx.storage_handle, lost)
         .await;

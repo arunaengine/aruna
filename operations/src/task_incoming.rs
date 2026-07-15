@@ -1581,11 +1581,12 @@ impl OperationsTaskHandler {
                     .available_slots_for(JobExecutionClass::ExternalAttempt),
             );
 
+        let reconciler = self.jobs_runtime.reconciler();
         let result = match process_job_queue_batch(
             &self.context.storage_handle,
             node_id,
             capacity,
-            self.jobs_runtime.reconciler(),
+            reconciler.as_ref(),
         )
         .await
         {
@@ -1714,6 +1715,12 @@ pub async fn initialize_task_incoming(
     jobs_runtime: Arc<JobsRuntime>,
 ) {
     let handler_context = context.clone();
+    if context.compute_handle.is_some() {
+        jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
+            context.clone(),
+            Arc::downgrade(&jobs_runtime),
+        ));
+    }
     if let Err(error) = jobs_runtime
         .recover_stale_jobs(&context.storage_handle)
         .await

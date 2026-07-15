@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aruna_compute::spec::AttemptRef;
 use aruna_compute::status::{AttemptPhase, ReconcileOutcome};
@@ -9,9 +9,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::super::reconcile::ExternalReconciler;
+use super::super::runtime::JobsRuntime;
 use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, mark_indeterminate, requeue_before_attempt,
-    transition_external_to_running,
+    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
+    requeue_before_attempt, transition_external_to_running,
 };
 use super::workspace::mint_workspace_credential;
 use super::{build_task_spec, finalize_attempt, resolve_backend, supervise_and_finalize};
@@ -22,11 +23,12 @@ use crate::driver::DriverContext;
 /// submits a new attempt name, so a container is never double-run.
 pub struct ComputeReconciler {
     context: Arc<DriverContext>,
+    runtime: Weak<JobsRuntime>,
 }
 
 impl ComputeReconciler {
-    pub fn new(context: Arc<DriverContext>) -> Arc<Self> {
-        Arc::new(Self { context })
+    pub fn new(context: Arc<DriverContext>, runtime: Weak<JobsRuntime>) -> Arc<Self> {
+        Arc::new(Self { context, runtime })
     }
 }
 
@@ -165,8 +167,8 @@ impl ExternalReconciler for ComputeReconciler {
 }
 
 impl ComputeReconciler {
-    /// Adopt a live container and resume supervision on a detached task so the drain
-    /// loop is never blocked.
+    /// Adopt a live container without blocking the drain loop, registering its
+    /// supervisor with `JobsRuntime` for caps, cancellation, and shutdown.
     #[allow(clippy::too_many_arguments)]
     async fn resume(
         &self,
@@ -179,60 +181,84 @@ impl ComputeReconciler {
         bucket: String,
         record: JobRecord,
     ) {
-        if matches!(phase, AttemptPhase::Submitted) {
-            let node_id = holder(&self.context);
-            let credential =
-                match mint_workspace_credential(&self.context, &spec, &record, node_id, &bucket)
-                    .await
-                {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        let _ = mark_indeterminate(
-                            &self.context.storage_handle,
-                            job_id,
-                            token,
-                            error,
-                            unix_timestamp_millis(),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let task_spec = build_task_spec(
-                &self.context,
-                &spec,
-                &attempt,
-                &credential,
-                &bucket,
-                node_id,
-            );
-            if let Err(error) = backend.submit(&task_spec).await {
-                let _ = mark_indeterminate(
-                    &self.context.storage_handle,
-                    job_id,
-                    token,
-                    JobError::retryable(format!("resubmit failed: {error}")),
-                    unix_timestamp_millis(),
-                )
-                .await;
-                return;
-            }
-        }
         let context = self.context.clone();
-        tokio::spawn(async move {
-            supervise_and_finalize(
+        let supervisor_record = record.clone();
+        let supervisor = move |cancel| {
+            resume_attempt(
                 context,
                 job_id,
                 token,
                 backend,
                 attempt,
+                phase,
                 spec,
                 bucket,
-                CancellationToken::new(),
+                supervisor_record,
+                cancel,
+            )
+        };
+        if !self.runtime.upgrade().is_some_and(|runtime| {
+            runtime.spawn_recovered(self.context.clone(), &record, supervisor)
+        }) && let Err(error) = handoff_external_attempt(
+            &self.context.storage_handle,
+            job_id,
+            token,
+            unix_timestamp_millis(),
+        )
+        .await
+        {
+            warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_attempt(
+    context: Arc<DriverContext>,
+    job_id: aruna_core::structs::JobId,
+    token: ulid::Ulid,
+    backend: Arc<dyn aruna_compute::backend::ExecutorBackend>,
+    attempt: AttemptRef,
+    phase: AttemptPhase,
+    spec: ExecutionSpec,
+    bucket: String,
+    record: JobRecord,
+    cancel: CancellationToken,
+) {
+    if matches!(phase, AttemptPhase::Submitted) {
+        let node_id = holder(&context);
+        let credential =
+            match mint_workspace_credential(&context, &spec, &record, node_id, &bucket).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    let _ = mark_indeterminate(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        error,
+                        unix_timestamp_millis(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+        let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
+        if let Err(error) = backend.submit(&task_spec).await {
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                JobError::retryable(format!("resubmit failed: {error}")),
+                unix_timestamp_millis(),
             )
             .await;
-        });
+            return;
+        }
     }
+    supervise_and_finalize(
+        context, job_id, token, backend, attempt, spec, bucket, cancel,
+    )
+    .await;
 }
 
 fn holder(context: &DriverContext) -> aruna_core::types::NodeId {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,7 +74,7 @@ pub struct JobsRuntime {
     next_nonce: AtomicU64,
     internal_cap: usize,
     external_cap: usize,
-    reconciler: Option<Arc<dyn ExternalReconciler>>,
+    reconciler: Mutex<Option<Arc<dyn ExternalReconciler>>>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
@@ -118,7 +119,7 @@ impl JobsRuntime {
             next_nonce: AtomicU64::new(0),
             internal_cap,
             external_cap,
-            reconciler,
+            reconciler: Mutex::new(reconciler),
             shutdown: CancellationToken::new(),
         })
     }
@@ -127,8 +128,15 @@ impl JobsRuntime {
         self.state.lock().expect("runtime mutex poisoned")
     }
 
-    pub fn reconciler(&self) -> Option<&Arc<dyn ExternalReconciler>> {
-        self.reconciler.as_ref()
+    pub fn reconciler(&self) -> Option<Arc<dyn ExternalReconciler>> {
+        self.reconciler
+            .lock()
+            .expect("reconciler mutex poisoned")
+            .clone()
+    }
+
+    pub(crate) fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
+        *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
     }
 
     pub fn running_count(&self) -> usize {
@@ -223,6 +231,67 @@ impl JobsRuntime {
             .await;
             runtime.finish(&context, job_id, nonce).await;
         });
+    }
+
+    /// Register an adopted external supervisor under the normal cap, cancellation,
+    /// completion, and shutdown accounting. `false` leaves handoff to the caller.
+    pub(crate) fn spawn_recovered<F, Fut>(
+        self: &Arc<Self>,
+        context: Arc<DriverContext>,
+        record: &JobRecord,
+        supervisor: F,
+    ) -> bool
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let job_id = record.job_id;
+        let Some(claim_token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+            warn!(job_id = %job_id, "Recovered job has no claim token; skipping");
+            return false;
+        };
+        let class = record.execution_class;
+        let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+        let (completion, _) = watch::channel(false);
+        {
+            let mut state = self.state();
+            if state.draining {
+                return false;
+            }
+            if state
+                .running
+                .get(&job_id)
+                .is_some_and(|job| job.claim_token == claim_token)
+            {
+                return true;
+            }
+            let replacing = state.running.contains_key(&job_id);
+            let running = state
+                .running
+                .values()
+                .filter(|job| job.class == class)
+                .count();
+            if !replacing && running >= self.cap_for(class) {
+                return false;
+            }
+            state.running.insert(
+                job_id,
+                RunningJob {
+                    nonce,
+                    class,
+                    cancel: cancel.clone(),
+                    completion,
+                    claim_token,
+                },
+            );
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let _ = AssertUnwindSafe(supervisor(cancel)).catch_unwind().await;
+            runtime.finish(&context, job_id, nonce).await;
+        });
+        true
     }
 
     /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
@@ -412,7 +481,7 @@ impl JobsRuntime {
             .await
             {
                 Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                    if let Some(reconciler) = self.reconciler.as_ref() {
+                    if let Some(reconciler) = self.reconciler() {
                         reconciler.reconcile_lost_attempt(storage, record).await;
                     }
                 }
