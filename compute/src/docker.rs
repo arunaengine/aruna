@@ -522,8 +522,13 @@ fn inspect_to_status(inspect: ContainerInspectResponse) -> AttemptStatus {
                 reason: "oom-killed".to_string(),
             }
         }
-        ContainerStateStatusEnum::EXITED => AttemptPhase::Exited {
-            code: exit_code.unwrap_or_default(),
+        ContainerStateStatusEnum::EXITED => match exit_code {
+            Some(code) => AttemptPhase::Exited { code },
+            None => AttemptPhase::Failed {
+                reason: state
+                    .error
+                    .unwrap_or_else(|| "container exited without an exit code".to_string()),
+            },
         },
         ContainerStateStatusEnum::DEAD => match exit_code {
             Some(code) => AttemptPhase::Exited { code },
