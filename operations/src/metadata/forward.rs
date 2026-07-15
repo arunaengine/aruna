@@ -14,7 +14,7 @@ use ulid::Ulid;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentResult, create_metadata_document,
+    CreateMetadataDocumentResult, create_metadata_document, mint_forward_create_id,
 };
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
@@ -116,6 +116,9 @@ pub async fn create_metadata_document_routed(
         Err(error) => return Err(error.into()),
     }
 
+    // Mint the forwarded id at the origin with the blind-hash bucket of the D8
+    // subject, so every candidate holder stamps the same bucket (D3/D4).
+    let document_id = mint_forward_create_id(&context, &config).await?;
     let holders = create_forward_holders(&context, &config).await;
     let response = forward_to_holders(
         &context,
@@ -123,7 +126,7 @@ pub async fn create_metadata_document_routed(
         MetadataTransportMessage::ForwardCreateDocument {
             auth_token,
             group_id: config.group_id,
-            document_id: config.document_id,
+            document_id,
             document_path: config.document_path.clone(),
             public: config.public,
             payload: config.payload.clone(),

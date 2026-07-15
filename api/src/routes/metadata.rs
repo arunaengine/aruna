@@ -485,7 +485,9 @@ pub async fn create_metadata_document(
                     realm_id: state.get_realm_id(),
                 },
                 group_id,
-                document_id: Ulid::r#gen(),
+                // Placeholder: the routed create mints the structured
+                // `MetaResourceId` (ts|handle|bucket|nonce) before driving.
+                document_id: Ulid::nil(),
                 document_path: path,
                 public,
                 payload,

@@ -15,7 +15,11 @@ use aruna_core::storage_entries::{
     metadata_create_acceptance_key, metadata_create_acceptance_write_entry,
 };
 use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, shard_for_subject,
+    Actor, DocumentClass, MetadataRegistryRecord, PlacementRef, PlacementScope, PlacementStrategy,
+    RealmConfigDocument, RealmId, shard_for_subject,
+};
+use aruna_core::structured_id::{
+    BucketId, MetaResourceId, PlacementHandle, StructuredId, StructuredIdGenerator,
 };
 use aruna_core::types::{Effects, GroupId, TxnId, Value};
 use chrono::Utc;
@@ -31,7 +35,7 @@ use crate::metadata::repository::{
 };
 use crate::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
-    strategy_for_target, subject_bytes,
+    strategy_for_target,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +119,14 @@ pub enum CreateMetadataDocumentError {
     /// never publish this document. The caller forwards the create to a holder.
     #[error("create-receiving node holds no bucket of the governing strategy")]
     OriginHoldsNoBucket,
+    /// No pre-provisioned placement binding exists for the create's scope, so no
+    /// handle can be minted into the id. A shared create MUST NOT allocate a
+    /// handle on the hot path (#398/#403): the scope must be provisioned first.
+    #[error("placement binding unavailable for shared create: {0}")]
+    PlacementBindingUnavailable(String),
+    /// The clock is unhealthy enough that a monotonic id cannot be minted.
+    #[error(transparent)]
+    ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("topic announcement failed: {0}")]
@@ -182,69 +194,46 @@ impl CreateMetadataDocumentOperation {
         vec![self.config.actor.node_id]
     }
 
-    fn lifecycle_target(&self) -> DocumentSyncTarget {
-        DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: self.config.document_id,
-        }
-    }
-
-    /// The document's bucket, chosen once here by the receiving node. Stamped at
-    /// event-append time only: the projector re-runs on replay, and re-choosing
-    /// under a changed config would fork the document across two topics.
+    /// The document's recorded bucket, resolved from the minted id itself
+    /// (D7: `id → handle → binding → strategy`, resolved locally). The id already
+    /// carries the bucket the origin chose at mint time — a held bucket for a
+    /// local create, the blind-hash bucket for a forwarded one — so re-deriving
+    /// it here records the identical choice on every holder and never re-chooses
+    /// under a changed config (D4: recorded once, never re-derived).
     ///
-    /// A locally-originated create picks the best-ranked of the buckets this node
-    /// already holds, so the origin can always publish onto the bucket it stamps.
-    /// A *forwarded* create instead takes the document's blind-hashed bucket: the
-    /// forwarder only ever offers the create to holders of that one bucket, so
-    /// every candidate holder stamps the same bucket and a retry after a timed-out
-    /// response can never fork the document onto a second topic.
-    ///
-    /// `Err` when a strategy governs the target but this node holds no usable
-    /// bucket for it: it could never publish the document onto the bucket's
-    /// topic, so the create must go to a holder rather than be accepted onto a
-    /// bucket it cannot replicate.
-    fn choose_placement(
+    /// `Err(OriginHoldsNoBucket)` when this node does not hold the id's bucket:
+    /// it could never publish onto that topic, so the create must go to a holder.
+    /// `Err(PlacementBindingUnavailable)` when the id's handle resolves to no
+    /// binding — the create fails closed rather than guessing a placement.
+    fn placement_from_id(
         &self,
         config: Option<&RealmConfigDocument>,
     ) -> Result<PlacementRef, CreateMetadataDocumentError> {
         let Some(config) = config else {
-            return Ok(PlacementRef::NIL);
+            return Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
+                "realm config unavailable".to_string(),
+            ));
         };
-        let target = self.lifecycle_target();
-        let document_path =
-            MetadataRegistryRecord::normalize_document_path(&self.config.document_path);
-        let context = PlacementResolutionContext {
-            group_id: Some(self.config.group_id),
-            metadata_path: Some(document_path.as_str()),
+        let id = MetaResourceId::try_from(self.config.document_id.0).map_err(|error| {
+            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+                "document id is not a structured MetaResourceId: {error}"
+            ))
+        })?;
+        let tuple = config
+            .binding_directory()
+            .resolve(id.placement_handle())
+            .map_err(|error| {
+                CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string())
+            })?;
+        let placement = PlacementRef {
+            strategy_id: tuple.strategy_id,
+            epoch: 0,
+            shard: u32::from(id.bucket().get()),
         };
-        let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
-            return Ok(PlacementRef::NIL);
-        };
-        if self.forwarded {
-            let placement = PlacementRef {
-                strategy_id: strategy.strategy_id,
-                epoch: 0,
-                shard: shard_for_subject(&subject_bytes(&target), strategy.shard_count),
-            };
-            if !holds_placement(config, &placement, self.config.actor.node_id) {
-                return Err(CreateMetadataDocumentError::OriginHoldsNoBucket);
-            }
-            return Ok(placement);
+        if !holds_placement(config, &placement, self.config.actor.node_id) {
+            return Err(CreateMetadataDocumentError::OriginHoldsNoBucket);
         }
-        // Bucket-choice subject is the canonical `(realm_id, group_id, path)`
-        // tuple (spec 6.3.6), never the document id: the id must not steer the
-        // bucket it embeds.
-        choose_origin_bucket(
-            config,
-            strategy,
-            self.config.actor.node_id,
-            &meta_bucket_subject(
-                self.config.actor.realm_id,
-                self.config.group_id,
-                &document_path,
-            ),
-        )
-        .ok_or(CreateMetadataDocumentError::OriginHoldsNoBucket)
+        Ok(placement)
     }
 
     fn build_record(
@@ -433,7 +422,7 @@ impl CreateMetadataDocumentOperation {
             },
             None => None,
         };
-        match self.choose_placement(config.as_ref()) {
+        match self.placement_from_id(config.as_ref()) {
             Ok(placement) => self.append_create_event_effect(placement, realm_config_value),
             Err(error) => self.fail(error),
         }
@@ -508,14 +497,172 @@ impl CreateMetadataDocumentOperation {
 }
 
 pub async fn create_metadata_document(
-    operation: CreateMetadataDocumentOperation,
+    mut operation: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
 ) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
+    // Mint the structured id for a locally-originated create before driving:
+    // the handle comes from the pre-provisioned binding and the bucket from the
+    // node's held set, so the id carries `ts|handle|bucket|nonce`. A forwarded
+    // create keeps the id the origin already minted (never re-minted downstream).
+    if !operation.forwarded {
+        let document_id = mint_local_create_id(context.as_ref(), &operation.config).await?;
+        operation.config.document_id = document_id;
+    }
     let created = drive(operation, context.as_ref()).await?;
     schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(created)
+}
+
+/// Mints the id for a locally-originated create: a held bucket via
+/// [`choose_origin_bucket`]. `OriginHoldsNoBucket` when the node holds no bucket
+/// (the routed caller forwards); `PlacementBindingUnavailable` when the scope is
+/// not provisioned (fail loud — never allocate a handle on the hot path).
+pub async fn mint_local_create_id(
+    context: &DriverContext,
+    config: &CreateMetadataDocumentConfig,
+    ) -> Result<Ulid, CreateMetadataDocumentError> {
+    mint_create_id(context, config, false).await
+}
+
+/// Mints the id a non-holder forwards: the deterministic blind-hash bucket of the
+/// D8 subject `(realm, group, path)`, so every candidate holder the forwarder
+/// tries stamps the same bucket and a retry can never fork the document.
+pub async fn mint_forward_create_id(
+    context: &DriverContext,
+    config: &CreateMetadataDocumentConfig,
+) -> Result<Ulid, CreateMetadataDocumentError> {
+    mint_create_id(context, config, true).await
+}
+
+async fn mint_create_id(
+    context: &DriverContext,
+    config: &CreateMetadataDocumentConfig,
+    forward_blind: bool,
+) -> Result<Ulid, CreateMetadataDocumentError> {
+    let realm_config = load_realm_config_for_create(context, config.actor.realm_id).await?;
+    let normalized = MetadataRegistryRecord::normalize_document_path(&config.document_path);
+    let (handle, placement) = resolve_create_placement(
+        &realm_config,
+        &config.actor,
+        config.group_id,
+        &normalized,
+        forward_blind,
+    )?;
+    Ok(Ulid::from(mint_document_id(handle, &placement)?))
+}
+
+/// Resolves the `(handle, placement)` a create's id must embed. The handle comes
+/// from the pre-provisioned binding for `(scope, Metadata, strategy)` — group
+/// scope preferred, realm scope as fallback — and is never allocated here.
+fn resolve_create_placement(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    normalized_path: &str,
+    forward_blind: bool,
+) -> Result<(PlacementHandle, PlacementRef), CreateMetadataDocumentError> {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: Ulid::nil(),
+    };
+    let context = PlacementResolutionContext {
+        group_id: Some(group_id),
+        metadata_path: Some(normalized_path),
+    };
+    let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
+        return Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
+            "no strategy governs the metadata create target".to_string(),
+        ));
+    };
+    let handle = create_handle(config, actor.realm_id, group_id, strategy)?;
+    let subject = meta_bucket_subject(actor.realm_id, group_id, normalized_path);
+    let placement = if forward_blind {
+        PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard: shard_for_subject(&subject, strategy.shard_count),
+        }
+    } else {
+        choose_origin_bucket(config, strategy, actor.node_id, &subject)
+            .ok_or(CreateMetadataDocumentError::OriginHoldsNoBucket)?
+    };
+    Ok((handle, placement))
+}
+
+/// The pre-provisioned handle for `(scope, Metadata, strategy)`, group scope
+/// preferred over realm. Fail loud when neither is provisioned.
+fn create_handle(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    group_id: GroupId,
+    strategy: &PlacementStrategy,
+) -> Result<PlacementHandle, CreateMetadataDocumentError> {
+    let directory = config.binding_directory();
+    directory
+        .handle_for(
+            PlacementScope::Group(group_id),
+            DocumentClass::Metadata,
+            strategy.strategy_id,
+        )
+        .or_else(|| {
+            directory.handle_for(
+                PlacementScope::Realm(realm_id),
+                DocumentClass::Metadata,
+                strategy.strategy_id,
+            )
+        })
+        .ok_or_else(|| {
+            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+                "no metadata binding for strategy {} in group {group_id} or realm {realm_id}",
+                strategy.strategy_id
+            ))
+        })
+}
+
+fn mint_document_id(
+    handle: PlacementHandle,
+    placement: &PlacementRef,
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
+    let shard = u16::try_from(placement.shard).map_err(|_| {
+        CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
+            "bucket {} exceeds the 12-bit id field",
+            placement.shard
+        ))
+    })?;
+    let bucket = BucketId::new(shard).map_err(|error| {
+        CreateMetadataDocumentError::PlacementBindingUnavailable(error.to_string())
+    })?;
+    Ok(StructuredIdGenerator::new().mint(handle, bucket)?)
+}
+
+async fn load_realm_config_for_create(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> Result<RealmConfigDocument, CreateMetadataDocumentError> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
+            CreateMetadataDocumentError::PlacementBindingUnavailable(
+                "realm config document missing".to_string(),
+            ),
+        ),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
+            format!("unexpected storage event reading realm config: {other:?}"),
+        )),
+    }
 }
 
 impl Operation for CreateMetadataDocumentOperation {
@@ -672,11 +819,26 @@ mod tests {
     use aruna_core::storage_entries::{
         metadata_create_acceptance_key, metadata_event_log_prefix, metadata_pending_projection_key,
     };
-    use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::{
+        Actor, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, shard_for_subject,
+    };
+    use aruna_core::structured_id::{MetaResourceId, PlacementHandle, StructuredId};
     use aruna_core::types::{Effects, GroupId, Key};
     use ulid::Ulid;
 
-    use crate::placement::resolve_shard_holders;
+    use crate::placement::{choose_origin_bucket, meta_bucket_subject, resolve_shard_holders};
+
+    const PATH: &str = "datasets/fast-create";
+
+    /// Mints the structured id a locally-originated create would, exactly like
+    /// the production path (`resolve_create_placement` + `mint_document_id`), so
+    /// the driven state machine receives an id whose handle/bucket resolve.
+    fn minted_document_id(config: &RealmConfigDocument, actor: &Actor, group_id: GroupId) -> Ulid {
+        let (handle, placement) =
+            super::resolve_create_placement(config, actor, group_id, PATH, false)
+                .expect("binding provisioned and origin holds a bucket");
+        Ulid::from(super::mint_document_id(handle, &placement).expect("mint succeeds"))
+    }
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
@@ -755,11 +917,12 @@ mod tests {
     fn create_conflict_fence() {
         let realm_id = RealmId([31u8; 32]);
         let actor = actor(realm_id, 9);
-        let document_id = Ulid::from_bytes([31; 16]);
         let realm_config = realm_config(&actor);
+        let group_id = GroupId::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
-            GroupId::r#gen(),
+            group_id,
             document_id,
         ));
 
@@ -877,7 +1040,7 @@ mod tests {
             actor,
             group_id,
             document_id,
-            document_path: "datasets/fast-create".to_string(),
+            document_path: PATH.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
                 name: "Fast Create".to_string(),
@@ -926,7 +1089,9 @@ mod tests {
             panic!("expected metadata create event append");
         };
         assert!(txn_id.is_some());
-        assert_eq!(writes.len(), 3);
+        // event log + pending projection + create acceptance, plus the realm
+        // config pin when the fence read returned a config.
+        assert!(matches!(writes.len(), 3 | 4));
         let (_, key, value) = writes
             .iter()
             .find(|(key_space, _, _)| key_space == METADATA_EVENT_LOG_KEYSPACE)
@@ -983,8 +1148,9 @@ mod tests {
     fn generated_document_id_validates_then_appends_without_existing_read() {
         let realm_id = RealmId([11u8; 32]);
         let actor = actor(realm_id, 6);
+        let realm_config = realm_config(&actor);
         let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
             group_id,
@@ -996,7 +1162,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, document_id));
+        let effects = operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
         assert_create_event_append(effects.as_slice(), document_id, &actor);
     }
 
@@ -1007,10 +1173,11 @@ mod tests {
         let realm_id = RealmId([21u8; 32]);
         let actor = actor(realm_id, 4);
         let realm_config = realm_config(&actor);
-        let document_id = Ulid::r#gen();
+        let group_id = GroupId::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
-            GroupId::r#gen(),
+            group_id,
             document_id,
         ));
 
@@ -1032,8 +1199,9 @@ mod tests {
     fn create_checks_existing_after_validation_and_uses_local_holder() {
         let realm_id = RealmId([8u8; 32]);
         let actor = actor(realm_id, 1);
+        let realm_config = realm_config(&actor);
         let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor.clone(), group_id, document_id));
 
@@ -1047,7 +1215,7 @@ mod tests {
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, document_id));
+        let effects = operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         assert_eq!(
             operation
@@ -1076,8 +1244,9 @@ mod tests {
     fn create_returns_after_event_append_without_persistent_effects() {
         let realm_id = RealmId([12u8; 32]);
         let actor = actor(realm_id, 7);
+        let realm_config = realm_config(&actor);
         let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation = CreateMetadataDocumentOperation::new_for_generated_document_id(config(
             actor.clone(),
             group_id,
@@ -1088,7 +1257,7 @@ mod tests {
         let effects = operation.step(validation_result(document_id));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        let effects = operation.step(realm_config_read(None, &actor, document_id));
+        let effects = operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
         let create_event_key = assert_create_event_append(effects.as_slice(), document_id, &actor);
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: vec![(METADATA_EVENT_LOG_KEYSPACE.to_string(), create_event_key)],
@@ -1136,8 +1305,9 @@ mod tests {
     fn create_event_append_failure_fails_without_projection_cleanup() {
         let realm_id = RealmId([10u8; 32]);
         let actor = actor(realm_id, 5);
+        let realm_config = realm_config(&actor);
         let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = minted_document_id(&realm_config, &actor, group_id);
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor.clone(), group_id, document_id));
 
@@ -1149,7 +1319,7 @@ mod tests {
         }));
         let config_read = begin_transaction(&mut operation, config_read.as_slice());
         assert_realm_config_read(config_read.as_slice());
-        let append = operation.step(realm_config_read(None, &actor, document_id));
+        let append = operation.step(realm_config_read(Some(&realm_config), &actor, document_id));
         assert_create_event_append(append.as_slice(), document_id, &actor);
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -1166,5 +1336,113 @@ mod tests {
                 aruna_core::errors::StorageError::WriteError,
             ))
         );
+    }
+
+    #[test]
+    fn create_mints_structured_id() {
+        // The handle comes from the pre-provisioned binding (seeded handle 1),
+        // the bucket from `choose_origin_bucket`, and the id round-trips through
+        // `MetaResourceId` carrying exactly those fields.
+        let realm_id = RealmId([40u8; 32]);
+        let actor = actor(realm_id, 3);
+        let realm_config = realm_config(&actor);
+        let group_id = GroupId::r#gen();
+        let strategy = realm_config
+            .strategy(&realm_config.default_strategy_id.unwrap())
+            .unwrap();
+
+        let (handle, placement) =
+            super::resolve_create_placement(&realm_config, &actor, group_id, PATH, false).unwrap();
+        assert_eq!(handle, PlacementHandle::new(1).unwrap());
+        let expected = choose_origin_bucket(
+            &realm_config,
+            strategy,
+            actor.node_id,
+            &meta_bucket_subject(realm_id, group_id, PATH),
+        )
+        .unwrap();
+        assert_eq!(placement, expected);
+
+        let id = super::mint_document_id(handle, &placement).unwrap();
+        assert_eq!(id.placement_handle(), handle);
+        assert_eq!(u32::from(id.bucket().get()), placement.shard);
+        assert_eq!(MetaResourceId::parse(&id.to_string()).unwrap(), id);
+
+        // A scope with no pre-provisioned binding fails loud, never allocating.
+        let mut unprovisioned = realm_config.clone();
+        unprovisioned.placement_bindings.clear();
+        assert!(matches!(
+            super::resolve_create_placement(&unprovisioned, &actor, group_id, PATH, false),
+            Err(CreateMetadataDocumentError::PlacementBindingUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn forwarded_create_stamps_blind_bucket() {
+        // A forwarded create takes the deterministic blind-hash bucket of the D8
+        // subject, so every candidate holder stamps the SAME bucket regardless of
+        // which node resolves it (D3/D4), and the id records that bucket once.
+        let realm_id = RealmId([41u8; 32]);
+        let base = actor(realm_id, 2);
+        let realm_config = realm_config(&base);
+        let group_id = GroupId::r#gen();
+        let strategy = realm_config
+            .strategy(&realm_config.default_strategy_id.unwrap())
+            .unwrap();
+        let blind = PlacementRef {
+            strategy_id: strategy.strategy_id,
+            epoch: 0,
+            shard: shard_for_subject(
+                &meta_bucket_subject(realm_id, group_id, PATH),
+                strategy.shard_count,
+            ),
+        };
+        let holders = resolve_shard_holders(&realm_config, &blind);
+        assert!(!holders.is_empty());
+
+        for holder in &holders {
+            let holder_actor = Actor {
+                node_id: *holder,
+                user_id: base.user_id,
+                realm_id,
+            };
+            let (_, placement) =
+                super::resolve_create_placement(&realm_config, &holder_actor, group_id, PATH, true)
+                    .unwrap();
+            assert_eq!(placement, blind);
+        }
+
+        // Drive a forwarded create on a holder: the recorded bucket is the id's
+        // stamped bucket, derived once from the id, never re-chosen.
+        let holder_actor = Actor {
+            node_id: holders[0],
+            user_id: base.user_id,
+            realm_id,
+        };
+        let (handle, placement) =
+            super::resolve_create_placement(&realm_config, &holder_actor, group_id, PATH, true)
+                .unwrap();
+        let forwarded_id = Ulid::from(super::mint_document_id(handle, &placement).unwrap());
+        let mut operation = CreateMetadataDocumentOperation::new_forwarded(config(
+            holder_actor.clone(),
+            group_id,
+            forwarded_id,
+        ));
+
+        operation.start();
+        let effects = operation.step(validation_result(forwarded_id));
+        assert_existing_read(effects.as_slice());
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: forwarded_id.to_bytes().to_vec().into(),
+            value: None,
+        }));
+        let effects = begin_transaction(&mut operation, effects.as_slice());
+        assert_realm_config_read(effects.as_slice());
+        operation.step(realm_config_read(Some(&realm_config), &holder_actor, forwarded_id));
+
+        let recorded = operation.record.as_ref().expect("record built").placement;
+        assert_eq!(recorded.shard, blind.shard);
+        let id = MetaResourceId::try_from(forwarded_id.0).unwrap();
+        assert_eq!(u32::from(id.bucket().get()), blind.shard);
     }
 }
