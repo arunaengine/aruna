@@ -14,6 +14,8 @@ use crate::create_metadata_document::{
     CreateMetadataDocumentPayload,
 };
 use crate::driver::drive;
+use crate::metadata::MetadataAuthToken;
+use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -22,13 +24,17 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     let context = ctx.driver.as_ref();
     let storage = &context.storage_handle;
 
-    // A re-driven crate job must not mint a second document_id and write a duplicate
-    // metadata document; the durable status is the idempotency record, not the dedup key.
+    // A re-driven crate job returns a previously recorded outcome without recreating it.
     match read_run_crate_status(storage, for_job).await {
         Ok(Some(RunCrateStatus::Written { resource })) => {
             return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
         }
-        Ok(_) => {}
+        Ok(Some(RunCrateStatus::Pending)) | Ok(None) => {}
+        Ok(Some(status)) => {
+            return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
+                resource: status.name().to_string(),
+            });
+        }
         Err(error) => {
             return JobRunOutcome::Failed(JobError::retryable(format!(
                 "run crate read status failed: {error}"
@@ -116,7 +122,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
 
     let jsonld = build_run_crate_jsonld(&parent, spec, document_id);
 
-    match drive(
+    let (status, resource) = match create_metadata_document_routed(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
             CreateMetadataDocumentConfig {
                 actor,
@@ -127,28 +133,24 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                 payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
             },
         ),
-        context,
+        ctx.driver.clone(),
+        Some(MetadataAuthToken::internal(
+            parent.created_by,
+            parent.created_by.realm_id,
+        )),
     )
     .await
     {
         Ok(result) => {
             let resource = result.record.document_id.to_string();
-            if let Err(error) = put_run_crate_status(
-                storage,
-                for_job,
-                &RunCrateStatus::Written {
+            (
+                RunCrateStatus::Written {
                     resource: resource.clone(),
                 },
+                resource,
             )
-            .await
-            {
-                return JobRunOutcome::Failed(JobError::retryable(format!(
-                    "run crate status write failed: {error}"
-                )));
-            }
-            JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
         }
-        // A denial or invalid crate is permanent: record it and discharge the
+        // An invalid crate is permanent: record it and discharge the
         // obligation so it is not retried forever. Transient errors retry.
         Err(error) => {
             if is_transient(&error) {
@@ -156,40 +158,29 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                     "run crate write failed: {error}"
                 )));
             }
-            let status = if is_denial(&error) {
-                RunCrateStatus::Denied {
-                    message: error.to_string(),
-                }
-            } else {
-                RunCrateStatus::Failed {
-                    message: error.to_string(),
-                }
+            let status = RunCrateStatus::Failed {
+                message: error.to_string(),
             };
-            if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
-                return JobRunOutcome::Failed(JobError::retryable(format!(
-                    "run crate status write failed: {error}"
-                )));
-            }
-            JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-                resource: status.name().to_string(),
-            })
+            let resource = status.name().to_string();
+            (status, resource)
         }
+    };
+    if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
+        return JobRunOutcome::Failed(JobError::retryable(format!(
+            "run crate status write failed: {error}"
+        )));
     }
+    JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
 }
 
-fn is_transient(error: &CreateMetadataDocumentError) -> bool {
+fn is_transient(error: &MetadataWriteError) -> bool {
     matches!(
         error,
-        CreateMetadataDocumentError::StorageError(_)
-            | CreateMetadataDocumentError::MetadataError(_)
+        MetadataWriteError::Create(
+            CreateMetadataDocumentError::StorageError(_)
+                | CreateMetadataDocumentError::MetadataError(_)
+        ) | MetadataWriteError::Undeliverable(_)
     )
-}
-
-fn is_denial(error: &CreateMetadataDocumentError) -> bool {
-    // The create operation records the actor but does not itself enforce
-    // permissions; a genuine denial surfaces from the metadata plane. Treat an
-    // already-existing document as idempotent success handled by the caller.
-    matches!(error, CreateMetadataDocumentError::DocumentAlreadyExists)
 }
 
 /// Hand-rolled RO-Crate JSON-LD (D12): a metadata descriptor, the run Dataset, and

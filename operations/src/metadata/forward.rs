@@ -266,7 +266,12 @@ pub(crate) async fn apply_forwarded_write(
             if normalized_document_path.is_empty() {
                 return reject("forwarded metadata create has an empty document path");
             }
-            let path = format!("/{realm_id}/g/{group_id}/meta/**");
+            let path = MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &normalized_document_path,
+                document_id,
+            );
             if let Err(error) = authorize_write(context, auth.clone(), path).await {
                 return reject(error);
             }

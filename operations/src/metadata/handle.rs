@@ -22,7 +22,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use aruna_core::types::GroupId;
@@ -1009,6 +1009,7 @@ impl MetadataHandle {
                 peer,
                 self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
                 auth_token,
+                false,
             )
             .await
             {
@@ -1033,6 +1034,7 @@ impl MetadataHandle {
                 peer,
                 self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
                 auth_token,
+                false,
             )
             .await
             {
@@ -1092,6 +1094,7 @@ impl MetadataHandle {
             peer,
             self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
             auth_token,
+            true,
         )
         .await
     }
@@ -1346,7 +1349,11 @@ where
     let Some(auth_token) = auth_token else {
         return Ok(None);
     };
-    let MetadataAuthToken::Bearer(token) = auth_token;
+    let MetadataAuthToken::Bearer(token) = auth_token else {
+        return Err(MetadataError::Backend(
+            "internal metadata auth requires the remote peer gate".to_string(),
+        ));
+    };
     validate_aruna_bearer_token(state, token.as_str())
         .await
         .map(Some)
@@ -1359,11 +1366,43 @@ async fn authorize_remote_metadata_peer<S>(
     peer: NodeId,
     local_realm_id: Option<RealmId>,
     auth_token: Option<MetadataAuthToken>,
+    allow_internal: bool,
 ) -> Result<Option<AuthContext>, MetadataError>
 where
     S: ArunaBearerTokenValidationState + ?Sized,
 {
-    let auth_context = remote_metadata_auth_context(state, auth_token).await?;
+    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal { .. }));
+    let auth_context = match auth_token {
+        Some(MetadataAuthToken::Internal { user_id, realm_id }) if allow_internal => {
+            let local_realm_id = local_realm_id.ok_or_else(|| {
+                MetadataError::InvalidInput(
+                    "internal metadata auth requires a local serving realm".to_string(),
+                )
+            })?;
+            if realm_id != local_realm_id {
+                return Err(MetadataError::InvalidInput(format!(
+                    "internal metadata auth realm `{realm_id}` does not match local realm `{local_realm_id}`"
+                )));
+            }
+            if user_id.realm_id != realm_id {
+                return Err(MetadataError::InvalidInput(format!(
+                    "internal metadata auth user realm `{}` does not match token realm `{realm_id}`",
+                    user_id.realm_id
+                )));
+            }
+            Some(AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+            })
+        }
+        Some(MetadataAuthToken::Internal { .. }) => {
+            return Err(MetadataError::Backend(
+                "internal metadata auth is limited to forwarded writes".to_string(),
+            ));
+        }
+        auth_token => remote_metadata_auth_context(state, auth_token).await?,
+    };
     // Authenticated metadata requests are bound to the token's realm. Anonymous
     // requests can only read public metadata, but still must come from a peer
     // configured in this node's local serving realm.
@@ -1375,8 +1414,13 @@ where
             )
         })?,
     };
-    ensure_remote_metadata_peer_is_configured_for_realm(storage_handle, peer, peer_realm_id)
-        .await?;
+    ensure_remote_metadata_peer_is_configured_for_realm(
+        storage_handle,
+        peer,
+        peer_realm_id,
+        internal_auth,
+    )
+    .await?;
     Ok(auth_context)
 }
 
@@ -1384,6 +1428,7 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
     storage_handle: &StorageHandle,
     peer: NodeId,
     realm_id: RealmId,
+    require_internal_trust: bool,
 ) -> Result<(), MetadataError> {
     match storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -1398,13 +1443,33 @@ async fn ensure_remote_metadata_peer_is_configured_for_realm(
         }) => {
             let document = RealmConfigDocument::from_bytes(&bytes)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            if document.has_node(peer) {
-                Ok(())
-            } else {
-                Err(MetadataError::InvalidInput(format!(
-                    "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
-                )))
+            if document.realm_id != realm_id {
+                return Err(MetadataError::InvalidInput(format!(
+                    "realm config `{}` does not match remote metadata realm `{realm_id}`",
+                    document.realm_id
+                )));
             }
+            let peer_id = peer.to_string();
+            let node = document
+                .nodes
+                .iter()
+                .find(|node| node.node_id == peer_id)
+                .ok_or_else(|| {
+                    MetadataError::InvalidInput(format!(
+                        "remote metadata peer `{peer}` is not configured in realm `{realm_id}`"
+                    ))
+                })?;
+            if require_internal_trust
+                && !matches!(
+                    &node.kind,
+                    RealmNodeKind::Management | RealmNodeKind::Server
+                )
+            {
+                return Err(MetadataError::InvalidInput(format!(
+                    "remote metadata peer `{peer}` is not trusted for internal auth in realm `{realm_id}`"
+                )));
+            }
+            Ok(())
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
             Err(MetadataError::InvalidInput(format!(
@@ -4592,6 +4657,7 @@ mod tests {
             configured_peer,
             Some(RealmId([99u8; 32])),
             Some(MetadataAuthToken::bearer(token).unwrap()),
+            false,
         )
         .await
         .expect("configured peer accepted");
@@ -4625,6 +4691,7 @@ mod tests {
             wrong_realm_peer,
             Some(wrong_realm_id),
             Some(MetadataAuthToken::bearer(token).unwrap()),
+            false,
         )
         .await
         .expect_err("wrong realm peer rejected");
@@ -4651,6 +4718,7 @@ mod tests {
             local_peer,
             Some(local_realm_id),
             None,
+            false,
         )
         .await
         .expect("anonymous local-realm peer accepted");
@@ -4673,6 +4741,7 @@ mod tests {
             wrong_realm_peer,
             Some(local_realm_id),
             None,
+            false,
         )
         .await
         .expect_err("anonymous wrong-realm peer rejected");
