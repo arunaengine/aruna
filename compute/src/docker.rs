@@ -101,6 +101,20 @@ impl DockerBackend {
             .map_err(|e| classify(&e))
     }
 
+    async fn inspect_matching_attempt(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<ContainerInspectResponse, BackendError> {
+        let inspect = self.inspect(attempt).await?;
+        if !labels_match(&inspect, attempt) {
+            return Err(BackendError::Conflict(format!(
+                "container `{}` exists but is not this attempt",
+                attempt.external_name()
+            )));
+        }
+        Ok(inspect)
+    }
+
     async fn ensure_image(&self, image: &str) -> Result<(), BackendError> {
         match self.docker.inspect_image(image).await {
             Ok(_) => Ok(()),
@@ -131,15 +145,19 @@ impl DockerBackend {
         Ok(())
     }
 
-    /// Stop tolerant of already-stopped (304) and already-gone (404).
-    async fn stop_by_name(&self, name: &str) -> Result<(), BackendError> {
+    /// Stop a matching attempt by ID, tolerating 304 or removal after inspection.
+    async fn stop_attempt(&self, attempt: &AttemptRef) -> Result<bool, BackendError> {
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        let container_id = inspect.id.as_deref().ok_or_else(|| {
+            BackendError::Api("Docker inspect response omitted the container ID".to_string())
+        })?;
         let opts = StopContainerOptionsBuilder::new()
             .t(self.config.stop_grace_secs)
             .build();
-        match self.docker.stop_container(name, Some(opts)).await {
-            Ok(()) => Ok(()),
+        match self.docker.stop_container(container_id, Some(opts)).await {
+            Ok(()) => Ok(true),
             Err(e) => match classify(&e) {
-                BackendError::NotFound(_) | BackendError::Conflict(_) => Ok(()),
+                BackendError::NotFound(_) | BackendError::Conflict(_) => Ok(false),
                 other => Err(other),
             },
         }
@@ -281,7 +299,9 @@ impl ExecutorBackend for DockerBackend {
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
         attempt.validate().map_err(BackendError::InvalidSpec)?;
-        Ok(inspect_to_status(self.inspect(attempt).await?))
+        Ok(inspect_to_status(
+            self.inspect_matching_attempt(attempt).await?,
+        ))
     }
 
     async fn wait(
@@ -295,7 +315,7 @@ impl ExecutorBackend for DockerBackend {
         // non-terminal status and break the wait contract. Poll inspect to
         // terminal evidence or the cancel token, like the trait default.
         loop {
-            let inspect = self.inspect(attempt).await?;
+            let inspect = self.inspect_matching_attempt(attempt).await?;
             let deadline_ms = walltime_deadline_ms(&inspect);
             let status = inspect_to_status(inspect);
             if status.is_terminal() {
@@ -305,7 +325,7 @@ impl ExecutorBackend for DockerBackend {
             if let Some(deadline_ms) = deadline_ms
                 && now_ms() >= deadline_ms
             {
-                self.stop_by_name(&attempt.external_name()).await?;
+                let _ = self.stop_attempt(attempt).await?;
                 let stopped = self.status(attempt).await?;
                 return Ok(AttemptStatus {
                     phase: AttemptPhase::Failed {
@@ -330,22 +350,22 @@ impl ExecutorBackend for DockerBackend {
             Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
             Err(other) => return Err(other),
         };
-        let name = attempt.external_name();
-        let opts = StopContainerOptionsBuilder::new()
-            .t(self.config.stop_grace_secs)
-            .build();
-        match self.docker.stop_container(&name, Some(opts)).await {
-            Ok(()) => {}
-            Err(e) => match classify(&e) {
-                BackendError::NotFound(_) => return Ok(CancelEvidence::AlreadyGone),
-                // 304: already stopped or never started. Fall through for evidence.
-                BackendError::Conflict(_) => {}
-                other => return Err(other),
-            },
-        }
-        let status = self.status(attempt).await?;
+        let stop_effective = match self.stop_attempt(attempt).await {
+            Ok(stop_effective) => stop_effective,
+            Err(error) => {
+                return match error {
+                    BackendError::NotFound(_) => Ok(CancelEvidence::AlreadyGone),
+                    other => Err(other),
+                };
+            }
+        };
+        let status = match self.status(attempt).await {
+            Ok(status) => status,
+            Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
+            Err(other) => return Err(other),
+        };
         if status.is_terminal() {
-            if was_running {
+            if was_running && stop_effective {
                 Ok(CancelEvidence::Stopped(AttemptStatus {
                     phase: AttemptPhase::Cancelled,
                     ..status
@@ -365,13 +385,16 @@ impl ExecutorBackend for DockerBackend {
         sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
         attempt.validate().map_err(BackendError::InvalidSpec)?;
-        let name = attempt.external_name();
+        let inspect = self.inspect_matching_attempt(attempt).await?;
+        let container_id = inspect.id.as_deref().ok_or_else(|| {
+            BackendError::Api("Docker inspect response omitted the container ID".to_string())
+        })?;
         let opts = LogsOptionsBuilder::new()
             .stdout(true)
             .stderr(true)
             .follow(false)
             .build();
-        let mut stream = self.docker.logs(&name, Some(opts));
+        let mut stream = self.docker.logs(container_id, Some(opts));
         let mut stdout = BoundedTail::new(limits.max_bytes_per_stream);
         let mut stderr = BoundedTail::new(limits.max_bytes_per_stream);
         while let Some(item) = stream.next().await {
