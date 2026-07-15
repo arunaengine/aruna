@@ -33,7 +33,8 @@ use super::store::{
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
 use workspace::{
-    collect_outputs, ensure_workspace_bucket, mint_workspace_credential, stage_inputs,
+    collect_outputs, ensure_group_write, ensure_workspace_bucket, mint_workspace_credential,
+    stage_inputs,
 };
 
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
@@ -241,6 +242,7 @@ async fn prepare_workspace(
     bucket: &str,
     token: ulid::Ulid,
 ) -> Result<workspace::WorkspaceCredential, JobError> {
+    ensure_group_write(context, spec, record, node_id).await?;
     ensure_workspace_bucket(context, spec, record, bucket).await?;
     set_workspace_bucket(
         &context.storage_handle,
@@ -930,11 +932,13 @@ fn log_tail(bytes: Vec<u8>, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
     use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
     use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, put_run_crate_status};
+    use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::logs::{LogSink, LogTails};
     use aruna_compute::spec::LogLimits;
-    use aruna_core::structs::{ComputeResources, JobState, RealmId};
+    use aruna_core::structs::{ComputeResources, JobErrorKind, JobState, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
@@ -1055,6 +1059,52 @@ mod tests {
             inputs: Vec::new(),
             output_prefixes: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn denied_write_blocks() {
+        // Queued execution must not outlive the submitter's group write access.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = context(storage);
+        let spec = execution_spec();
+        let job_id = JobId::new();
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(spec.clone()),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        let bucket = JobRecord::workspace_bucket_name(job_id);
+
+        let Err(error) =
+            prepare_workspace(&context, &spec, &record, node_id(7), &bucket, Ulid::r#gen()).await
+        else {
+            panic!("workspace preparation unexpectedly succeeded");
+        };
+        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert!(
+            matches!(
+                drive(
+                    GetBucketInfoOperation::new(bucket.clone()),
+                    context.as_ref()
+                )
+                .await
+                .unwrap(),
+                Some(Err(GetBucketInfoError::NotFound))
+            ),
+            "authorization must fail before workspace creation"
+        );
+
+        let Err(error) =
+            mint_workspace_credential(&context, &spec, &record, node_id(7), &bucket).await
+        else {
+            panic!("workspace credential mint unexpectedly succeeded");
+        };
+        assert_eq!(error.kind, JobErrorKind::Permanent);
     }
 
     /// A claimed execution job in `Ready` with its attempt intent written, i.e.

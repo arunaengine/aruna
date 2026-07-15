@@ -1,9 +1,10 @@
 use std::time::{Duration, SystemTime};
 
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
     OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
-    blob_object_permission_path,
+    blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::types::NodeId;
 use ulid::Ulid;
@@ -26,6 +27,41 @@ const MAX_OUTPUT_MANIFEST_OBJECTS: usize = 10_000;
 pub struct WorkspaceCredential {
     pub access_key: String,
     pub secret: String,
+}
+
+pub async fn ensure_group_write(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> Result<(), JobError> {
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: record.created_by,
+                realm_id: record.created_by.realm_id,
+                path_restrictions: None,
+            },
+            path: blob_group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
+            required_permission: Permission::WRITE,
+        }),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => {
+            JobError::permanent("workspace write access denied")
+        }
+        other => JobError::retryable(format!("workspace authorization failed: {other}")),
+    })?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(JobError::permanent("workspace write access denied"))
+    }
 }
 
 /// Create the durable run bucket `ws-{jobid}` under the job's group. Idempotent
@@ -65,6 +101,7 @@ pub async fn mint_workspace_credential(
     node_id: NodeId,
     bucket: &str,
 ) -> Result<WorkspaceCredential, JobError> {
+    ensure_group_write(context, spec, record, node_id).await?;
     let realm_id = record.created_by.realm_id;
     // A single WRITE restriction over the bucket subtree; WRITE also satisfies READ.
     let pattern = format!(
