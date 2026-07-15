@@ -3563,6 +3563,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: None,
             task_handle: None,
+            compute_handle: None,
         });
         let realm_id = RealmId([36u8; 32]);
         let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
