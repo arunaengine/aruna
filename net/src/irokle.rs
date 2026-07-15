@@ -5050,6 +5050,17 @@ async fn validate_replicated_admin_event(
     if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
         return reject("admin event target and actor realms do not match");
     }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+            if matches!(
+                binding.scope,
+                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
+                    if binding_realm_id != event.actor.realm_id
+            )
+    ) {
+        return reject("placement binding realm does not match the admin event target");
+    }
 
     match &event.op {
         AdminDocumentOperation::GroupCreated {
@@ -5223,8 +5234,15 @@ async fn validate_realm_config_admin_authority(
         }
         return Ok(
             if matches!(
-                configured_node_kind(config, &event.origin_node_id),
-                Some(RealmNodeKind::Management)
+                (
+                    configured_node_kind(config, &event.origin_node_id),
+                    &event.op
+                ),
+                (Some(RealmNodeKind::Management), _)
+                    | (
+                        Some(RealmNodeKind::Server),
+                        AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+                    )
             ) {
                 AdminEventValidation::Accepted
             } else {
@@ -7151,32 +7169,29 @@ mod tests {
     async fn inbound_validation_accepts_binding_and_rejects_target_mismatch() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([75; 32]);
-        let nil_actor = test_actor(75, UserId::nil(realm_id), realm_id);
+        let server_actor = test_actor(76, UserId::nil(realm_id), realm_id);
         let config_target = DocumentSyncTarget::RealmConfig { realm_id };
         let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        let publisher =
-            irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&nil_actor.node_id));
-
-        // Management self-ensure authorizes the rest of config genesis.
-        let ensure = test_admin_event(
-            Ulid::from_parts(1_650, 1),
-            AdminDocumentTarget::RealmConfig { realm_id },
-            &nil_actor,
-            1,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
-                node_id: nil_actor.node_id,
-                kind: RealmNodeKind::Management,
-            },
-        );
-        apply_admin_document_operation_to_storage(&storage, config_target.clone(), ensure)
-            .await
-            .expect("management self-ensure applies");
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(server_actor.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&server_actor)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
 
         let mut append = test_admin_event(
             Ulid::from_parts(1_652, 1),
             AdminDocumentTarget::RealmConfig { realm_id },
-            &nil_actor,
-            2,
+            &server_actor,
+            1,
             AdminDocumentOperation::RealmConfigPlacementBindingAppended {
                 binding: PlacementBinding {
                     handle: PlacementHandle::new(5).unwrap(),
@@ -7189,13 +7204,14 @@ mod tests {
                 },
             },
         );
-        append.observed.advance(nil_actor.node_id, 1);
+        let server_publisher =
+            irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&server_actor.node_id));
 
         assert_eq!(
             validate_replicated_admin_event(
                 &storage,
                 config_topic,
-                publisher,
+                server_publisher,
                 &config_target,
                 &append,
                 realm_id,
@@ -7206,13 +7222,34 @@ mod tests {
             AdminEventValidation::Accepted
         );
 
+        match &mut append.op {
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
+                binding.scope = PlacementScope::Realm(RealmId::from_bytes([76; 32]));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                server_publisher,
+                &config_target,
+                &append,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
+
         // The same RealmConfig op is rejected when routed under a User target.
         let user_id = UserId::local(Ulid::from_parts(1_653, 1), realm_id);
         let user_target = DocumentSyncTarget::User { user_id };
         let placement = admin_test_placement();
         let user_topic = user_target.sync_topic_id(realm_id, &placement);
         let user_publisher =
-            irokle_crate::actor_id_for(user_topic, node_id_to_peer_id(&nil_actor.node_id));
+            irokle_crate::actor_id_for(user_topic, node_id_to_peer_id(&server_actor.node_id));
         assert!(matches!(
             validate_replicated_admin_event(
                 &storage,

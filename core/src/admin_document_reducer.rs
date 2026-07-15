@@ -327,7 +327,10 @@ impl AdminDocumentReducerState {
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminDocumentApplyStatus::Duplicate);
         }
-        let stale_on_all_paths = operation_paths(&event.op)
+        let stale_on_all_paths = !matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_is_stale_for_path(event, path));
 
@@ -596,11 +599,7 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::RealmConfig { .. },
                 AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
             ) => {
-                self.apply_realm_config_placement_field(
-                    event,
-                    realm_config_placement_binding_path(binding.handle),
-                    Some(placement_binding_value(binding)),
-                );
+                self.apply_realm_config_placement_binding(event, binding);
             }
             _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
         }
@@ -1213,6 +1212,38 @@ impl AdminDocumentReducerState {
                 self.user_subject_ids.remove(&path);
             }
         }
+    }
+
+    fn apply_realm_config_placement_binding(
+        &mut self,
+        event: &AdminDocumentEvent,
+        binding: &PlacementBinding,
+    ) {
+        let path = realm_config_placement_binding_path(binding.handle);
+        let value = Some(placement_binding_value(binding));
+        if self.conflicts.contains_key(&path) {
+            self.record_conflict_value(&path, value, event.dot());
+            return;
+        }
+
+        let Some(current) = self.user_subject_ids.get(&path).cloned() else {
+            let version = self.version_with_dots(&path, value, BTreeSet::from([event.dot()]));
+            self.user_subject_ids.insert(path, version);
+            return;
+        };
+        let mut dots = self.take_version_dots(&path, &current);
+        if current.value != value {
+            for dot in dots {
+                self.record_conflict_value(&path, current.value.clone(), dot);
+            }
+            self.record_conflict_value(&path, value, event.dot());
+            self.user_subject_ids.remove(&path);
+            return;
+        }
+
+        dots.insert(event.dot());
+        let version = self.version_with_dots(&path, value, dots);
+        self.user_subject_ids.insert(path, version);
     }
 
     fn reduce_value(
@@ -4879,6 +4910,15 @@ mod tests {
         let handle = PlacementHandle::new(7).unwrap();
         let first = append_placement_binding(1, 1, placement_binding(7, 1));
         let second = append_placement_binding(2, 2, placement_binding(7, 2));
+        let observed_second = realm_config_event(
+            2,
+            node(1),
+            2,
+            AdminDocumentClock::default().with_observed(node(1), 1),
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: placement_binding(7, 2),
+            },
+        );
 
         let mut left = realm_config_state();
         left.apply(&first).unwrap();
@@ -4888,9 +4928,22 @@ mod tests {
         right.apply(&second).unwrap();
         right.apply(&first).unwrap();
 
+        let mut observed = realm_config_state();
+        observed.apply(&first).unwrap();
+        observed.apply(&observed_second).unwrap();
+
+        let mut observed_reversed = realm_config_state();
+        observed_reversed.apply(&observed_second).unwrap();
+        assert_eq!(
+            observed_reversed.apply(&first),
+            Ok(AdminDocumentApplyStatus::Applied)
+        );
+
         assert_eq!(left.conflicts, right.conflicts);
         let path = realm_config_placement_binding_path(handle);
         assert!(left.conflicts.contains_key(&path));
+        assert_eq!(observed.conflicts, observed_reversed.conflicts);
+        assert!(observed.conflicts.contains_key(&path));
         assert!(
             left.materialized_realm_config_placement_bindings()
                 .is_empty()

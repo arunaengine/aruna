@@ -227,6 +227,10 @@ pub fn first_empty_referenced_shard(config: &RealmConfigDocument) -> Option<Plac
                 .iter()
                 .any(|binding| binding.strategy_id == id)
             || config
+                .placement_bindings
+                .iter()
+                .any(|binding| binding.strategy_id == id)
+            || config
                 .placement_overrides
                 .iter()
                 .any(|record| record.strategy_id == Some(id));

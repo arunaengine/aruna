@@ -22,7 +22,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::{
     Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT,
     MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -137,6 +137,15 @@ impl RealmPlacementMutation {
             }
             Self::AppendPlacementBinding(binding) => {
                 require_strategy(document, &binding.strategy_id, "placement binding")?;
+                if matches!(
+                    binding.scope,
+                    PlacementScope::Realm(binding_realm_id)
+                        if binding_realm_id != document.realm_id
+                ) {
+                    return Err(MutateRealmPlacementError::InvalidInput(
+                        "placement binding realm does not match the realm config".to_string(),
+                    ));
+                }
                 match document.binding_directory().resolve(binding.handle) {
                     Ok(existing) if existing != binding.tuple() => {
                         Err(MutateRealmPlacementError::InvalidInput(format!(
@@ -1382,6 +1391,12 @@ mod tests {
             RealmPlacementMutation::AppendPlacementBinding(divergent).validate(&document),
             Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("different tuple")
         ));
+
+        let foreign = placement_binding(RealmId::from_bytes([33; 32]), 6, strategy_a);
+        assert!(matches!(
+            RealmPlacementMutation::AppendPlacementBinding(foreign).validate(&document),
+            Err(MutateRealmPlacementError::InvalidInput(reason)) if reason.contains("does not match")
+        ));
     }
 
     #[tokio::test]
@@ -1613,7 +1628,33 @@ mod tests {
             mutate(
                 &context,
                 &actor,
-                RealmPlacementMutation::UpsertStrategy(filtered)
+                RealmPlacementMutation::UpsertStrategy(filtered.clone())
+            )
+            .await,
+            Err(MutateRealmPlacementError::EmptyShardHolders { .. })
+        ));
+
+        let strategy_id = Ulid::from_bytes([23; 16]);
+        let mut unreferenced = filtered;
+        unreferenced.strategy_id = strategy_id;
+        unreferenced.name = "binding-only".to_string();
+        mutate(
+            &context,
+            &actor,
+            RealmPlacementMutation::UpsertStrategy(unreferenced),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            mutate(
+                &context,
+                &actor,
+                RealmPlacementMutation::AppendPlacementBinding(placement_binding(
+                    realm_id,
+                    23,
+                    strategy_id,
+                ))
             )
             .await,
             Err(MutateRealmPlacementError::EmptyShardHolders { .. })
