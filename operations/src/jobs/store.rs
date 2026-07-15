@@ -790,15 +790,37 @@ pub async fn transition_external_to_running(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,
+    started_at_ms: Option<u64>,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
     mutate_job(storage, job_id, |record| {
         guard_token(record, token)?;
+        if let Some(started_at_ms) = started_at_ms {
+            record.started_at_ms.get_or_insert(started_at_ms);
+        }
         record.state = JobState::Running;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
+/// Persist backend start evidence without changing execution state or timestamps.
+pub async fn record_attempt_started(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    started_at_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        if record.started_at_ms.is_some() {
+            return Ok(JobMutation::Skip);
+        }
+        record.started_at_ms = Some(started_at_ms);
         Ok(JobMutation::Persist)
     })
     .await

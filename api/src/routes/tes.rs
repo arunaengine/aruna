@@ -829,9 +829,7 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
 }
 
 fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
-    let started =
-        matches!(record.state, JobState::Running | JobState::Cancelling) || record.result.is_some();
-    let start_time = started.then(|| rfc3339(record.created_at_ms));
+    let start_time = record.started_at_ms.map(rfc3339);
     let mut executor_log = TesExecutorLog {
         start_time: start_time.clone(),
         end_time: record.finished_at_ms.map(rfc3339),

@@ -26,8 +26,8 @@ use tracing::{info, warn};
 use super::JOB_HEARTBEAT_MS;
 use super::store::{
     JobMutationError, cancel_execution, cancel_running_job, complete_job, fail_execution,
-    mark_indeterminate, read_job_record, record_attempt_intent, renew_lease,
-    requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
+    mark_indeterminate, read_job_record, record_attempt_intent, record_attempt_started,
+    renew_lease, requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
     transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
@@ -142,16 +142,25 @@ pub async fn run_execution_job(
             return None;
         }
 
-        if let Err(error) = backend.submit(&task_spec).await {
-            return Some(Err((
-                backend, attempt, task_spec, spec, bucket, cancel, error,
-            )));
-        }
+        let submitted = match backend.submit(&task_spec).await {
+            Ok(status) => status,
+            Err(error) => {
+                return Some(Err((
+                    backend, attempt, task_spec, spec, bucket, cancel, error,
+                )));
+            }
+        };
 
         // Ready -> Running only after the backend accepted the fenced attempt.
-        if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
-            .await
-            .is_err()
+        if transition_external_to_running(
+            storage,
+            job_id,
+            token,
+            submitted.started_at_ms,
+            unix_timestamp_millis(),
+        )
+        .await
+        .is_err()
         {
             return None;
         }
@@ -317,9 +326,15 @@ async fn recover_failed_submit(
         }
         // The attempt already finished: commit its evidence.
         ReconcileOutcome::Found(status) if status.is_terminal() => {
-            if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
-                .await
-                .is_err()
+            if transition_external_to_running(
+                storage,
+                job_id,
+                token,
+                status.started_at_ms,
+                unix_timestamp_millis(),
+            )
+            .await
+            .is_err()
             {
                 return;
             }
@@ -339,15 +354,25 @@ async fn recover_failed_submit(
         // A created-but-never-started container is completed in place; the name
         // collision makes the re-submit idempotent.
         ReconcileOutcome::Found(status) => {
-            if matches!(status.phase, AttemptPhase::Submitted)
-                && backend.submit(task_spec).await.is_err()
-            {
-                park_failed_submit(context, job_id, token, &error).await;
-                return;
+            let mut started_at_ms = status.started_at_ms;
+            if matches!(&status.phase, AttemptPhase::Submitted) {
+                match backend.submit(task_spec).await {
+                    Ok(resubmitted) => started_at_ms = resubmitted.started_at_ms.or(started_at_ms),
+                    Err(_) => {
+                        park_failed_submit(context, job_id, token, &error).await;
+                        return;
+                    }
+                }
             }
-            if transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
-                .await
-                .is_err()
+            if transition_external_to_running(
+                storage,
+                job_id,
+                token,
+                started_at_ms,
+                unix_timestamp_millis(),
+            )
+            .await
+            .is_err()
             {
                 return;
             }
@@ -499,6 +524,13 @@ pub(crate) async fn finalize_attempt(
             return;
         }
     };
+
+    if let Some(started_at_ms) = status.started_at_ms
+        && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
+    {
+        warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed");
+        return;
+    }
 
     if cancel_requested {
         finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
@@ -1087,7 +1119,7 @@ mod tests {
         let ctx = context(storage.clone());
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
-        transition_external_to_running(&storage, job_id, token, 6)
+        transition_external_to_running(&storage, job_id, token, None, 6)
             .await
             .unwrap();
 

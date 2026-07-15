@@ -12,7 +12,7 @@ use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
     AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    requeue_before_attempt, transition_external_to_running,
+    record_attempt_started, requeue_before_attempt, transition_external_to_running,
 };
 use super::workspace::mint_workspace_credential;
 use super::{build_task_spec, finalize_attempt, resolve_backend, supervise_and_finalize};
@@ -92,11 +92,27 @@ impl ExternalReconciler for ComputeReconciler {
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
 
         let outcome = backend.reconcile(&attempt).await;
-        if matches!(outcome, ReconcileOutcome::Found(_))
+        let started_at_ms = match &outcome {
+            ReconcileOutcome::Found(status) => status.started_at_ms,
+            _ => None,
+        };
+        if let Some(started_at_ms) = started_at_ms
+            && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
+        {
+            warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
+            return;
+        }
+        if matches!(&outcome, ReconcileOutcome::Found(_))
             && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
-            && transition_external_to_running(storage, job_id, token, unix_timestamp_millis())
-                .await
-                .is_err()
+            && transition_external_to_running(
+                storage,
+                job_id,
+                token,
+                started_at_ms,
+                unix_timestamp_millis(),
+            )
+            .await
+            .is_err()
         {
             return;
         }
@@ -243,16 +259,27 @@ async fn resume_attempt(
                 }
             };
         let task_spec = build_task_spec(&context, &spec, &attempt, &credential, &bucket, node_id);
-        if let Err(error) = backend.submit(&task_spec).await {
-            let _ = mark_indeterminate(
-                &context.storage_handle,
-                job_id,
-                token,
-                JobError::retryable(format!("resubmit failed: {error}")),
-                unix_timestamp_millis(),
-            )
-            .await;
-            return;
+        match backend.submit(&task_spec).await {
+            Ok(status) => {
+                if let Some(started_at_ms) = status.started_at_ms
+                    && record_attempt_started(&context.storage_handle, job_id, token, started_at_ms)
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = mark_indeterminate(
+                    &context.storage_handle,
+                    job_id,
+                    token,
+                    JobError::retryable(format!("resubmit failed: {error}")),
+                    unix_timestamp_millis(),
+                )
+                .await;
+                return;
+            }
         }
     }
     supervise_and_finalize(
