@@ -291,10 +291,9 @@ pub async fn submit_job(
     )
     .await?;
 
-    let inputs = request
-        .inputs
-        .into_iter()
-        .map(|input| InputSelection {
+    let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
+    for input in request.inputs {
+        let input = InputSelection {
             source: InputSource::S3 {
                 bucket: input.bucket,
                 key: input.key,
@@ -302,8 +301,15 @@ pub async fn submit_job(
             },
             dest_key: input.dest_key,
             mode: InputMode::Snapshot,
-        })
-        .collect();
+        };
+        if inputs
+            .iter()
+            .any(|existing| existing.dest_key == input.dest_key)
+        {
+            return Err(ServerError::BadRequest);
+        }
+        inputs.push(input);
+    }
 
     let spec = ExecutionSpec {
         group_id,
