@@ -17,7 +17,8 @@ use aruna_core::structs::{
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, insert_job, read_job_record, read_run_crate_status,
+    ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_job_record,
+    read_run_crate_status,
 };
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
@@ -422,6 +423,18 @@ async fn execution_restart_adopts() -> TestResult<()> {
         1,
         "exactly one container before adopt"
     );
+
+    // In production the reconciler is only handed a job after the lease sweep
+    // observes its expired lease; a live lease means the holder is still alive and
+    // must not be adopted. Simulate the sweep by expiring the crashed holder's lease.
+    mutate_job(&fixture.compute_ctx.storage_handle, job_id, |record| {
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_at_ms = 1;
+        }
+        Ok(JobMutation::Persist)
+    })
+    .await
+    .expect("expire crashed lease");
 
     // The reconciler adopts the still-running container.
     let lost = read_job_record(&fixture.compute_ctx.storage_handle, job_id, None)
