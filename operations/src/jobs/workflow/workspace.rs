@@ -394,6 +394,9 @@ mod tests {
     fn spec(output_prefixes: Vec<String>) -> ExecutionSpec {
         ExecutionSpec {
             group_id: Ulid::from_bytes([2; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
             image: "alpine".to_string(),
             entrypoint: None,
             command: Vec::new(),

@@ -121,6 +121,9 @@ fn execution_spec(
 ) -> ExecutionSpec {
     ExecutionSpec {
         group_id: fixture.group_id,
+        name: None,
+        description: None,
+        tags: Default::default(),
         image: image.to_string(),
         entrypoint,
         command,

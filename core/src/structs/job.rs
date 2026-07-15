@@ -159,6 +159,9 @@ pub struct ComputeResources {
 pub struct ExecutionSpec {
     /// Workspace parent group; also the credential/crate authorization scope.
     pub group_id: GroupId,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
     pub image: String,
     /// Overrides the image ENTRYPOINT when set.
     pub entrypoint: Option<Vec<String>>,

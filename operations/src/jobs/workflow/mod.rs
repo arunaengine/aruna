@@ -1046,6 +1046,9 @@ mod tests {
     fn execution_spec() -> ExecutionSpec {
         ExecutionSpec {
             group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
             image: "alpine:3".to_string(),
             entrypoint: None,
             command: vec!["true".to_string()],

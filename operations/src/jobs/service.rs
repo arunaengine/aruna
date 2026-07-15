@@ -1,7 +1,7 @@
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RunCrateStatus, user_dedup_key,
+    ExecutionSpec, JobId, JobPayload, JobRecord, RunCrateStatus, user_dedup_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{NodeId, UserId};
@@ -57,16 +57,9 @@ pub async fn list_owned_jobs(
     user_id: UserId,
     cursor: Option<Vec<u8>>,
     limit: usize,
-    state_filter: Option<JobState>,
+    filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_jobs_for_user(
-        &context.storage_handle,
-        user_id,
-        cursor,
-        limit,
-        state_filter,
-    )
-    .await
+    list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
 }
 
 pub async fn read_owned_job(
@@ -145,7 +138,7 @@ async fn kick_drain(context: &DriverContext) {
 mod tests {
     use super::super::store::{insert_job, read_job_record};
     use super::*;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{JobState, RealmId};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

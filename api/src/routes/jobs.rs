@@ -241,10 +241,15 @@ pub async fn list_jobs(
         .min(MAX_LIST_LIMIT);
     let state_filter = query.state.as_deref().map(parse_state).transpose()?;
 
-    let (records, next_cursor) =
-        list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, state_filter)
-            .await
-            .map_err(ServerError::InternalError)?;
+    let (records, next_cursor) = list_owned_jobs(
+        &state.get_ctx(),
+        auth.user_id,
+        cursor,
+        limit,
+        move |record| state_filter.is_none_or(|state| record.state == state),
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
 
     let jobs = records.iter().map(job_status_response).collect();
     Ok((
@@ -313,6 +318,9 @@ pub async fn submit_job(
 
     let spec = ExecutionSpec {
         group_id,
+        name: None,
+        description: None,
+        tags: BTreeMap::new(),
         image: request.image,
         entrypoint: request.entrypoint,
         command: request.command,

@@ -1081,7 +1081,7 @@ pub async fn set_cancel_requested(
     })
 }
 
-/// Owner-scoped listing, newest first, with an opaque cursor and optional state filter.
+/// Owner-scoped listing, newest first, with an opaque cursor and record filter.
 /// Scans across owner-index pages for `limit` records plus one matching live lookahead,
 /// so a filtered page never returns empty with a dangling `next_cursor`.
 pub async fn list_jobs_for_user(
@@ -1089,7 +1089,7 @@ pub async fn list_jobs_for_user(
     user_id: UserId,
     cursor: Option<Vec<u8>>,
     limit: usize,
-    state_filter: Option<JobState>,
+    filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
     if limit == 0 {
         return Ok((Vec::new(), None));
@@ -1123,7 +1123,7 @@ pub async fn list_jobs_for_user(
             resume = Some(key);
             if let Some(record) = read_job_record(storage, job_id, None).await?
                 && !matches!(&record.payload, JobPayload::WriteRunCrate { .. })
-                && state_filter.is_none_or(|state| record.state == state)
+                && filter(&record)
             {
                 if records.len() == limit {
                     return Ok((records, page_cursor));
@@ -1894,9 +1894,11 @@ mod tests {
         .await
         .unwrap();
 
-        let (page, cursor) = list_jobs_for_user(&storage, owner, None, 1, Some(JobState::Failed))
-            .await
-            .unwrap();
+        let (page, cursor) = list_jobs_for_user(&storage, owner, None, 1, |record| {
+            record.state == JobState::Failed
+        })
+        .await
+        .unwrap();
         assert_eq!(page.len(), 1, "the older Failed job is found across pages");
         assert_eq!(page[0].state, JobState::Failed);
         assert!(
@@ -1946,7 +1948,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (listed, cursor) = list_jobs_for_user(&storage, owner, None, 1, None)
+        let (listed, cursor) = list_jobs_for_user(&storage, owner, None, 1, |_| true)
             .await
             .unwrap();
         assert!(listed.is_empty(), "stale owner entries stay hidden");

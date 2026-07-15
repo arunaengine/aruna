@@ -12,7 +12,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{
     CancelJobOutcome, cancel_owned_job, list_owned_jobs, read_owned_job, submit_execution_job,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -278,7 +278,44 @@ pub struct ListTasksQuery {
     view: Option<String>,
     page_size: Option<usize>,
     page_token: Option<String>,
+    state: Option<String>,
     name_prefix: Option<String>,
+}
+
+struct TaskFilters {
+    state: Option<TesState>,
+    name_prefix: Option<String>,
+    tags: Vec<(String, String)>,
+}
+
+impl TaskFilters {
+    fn from_query(query: &ListTasksQuery, raw_query: Option<&str>) -> Result<Self, TesError> {
+        Ok(Self {
+            state: query.state.as_deref().map(TesState::parse).transpose()?,
+            name_prefix: query
+                .name_prefix
+                .clone()
+                .filter(|prefix| !prefix.is_empty()),
+            tags: parse_tag_filters(raw_query),
+        })
+    }
+
+    fn matches(&self, record: &JobRecord) -> bool {
+        let JobPayload::Execution(spec) = &record.payload else {
+            return false;
+        };
+        let tags = project_tags(spec);
+        self.state.is_none_or(|state| tes_state(record) == state)
+            && self.name_prefix.as_deref().is_none_or(|prefix| {
+                spec.name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            && self.tags.iter().all(|(key, value)| {
+                tags.get(key)
+                    .is_some_and(|stored| value.is_empty() || stored == value)
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +334,41 @@ impl TesView {
             other => Err(TesError::bad_request(format!("unknown view `{other}`"))),
         }
     }
+}
+
+impl TesState {
+    fn parse(value: &str) -> Result<Self, TesError> {
+        match value {
+            "UNKNOWN" => Ok(Self::Unknown),
+            "QUEUED" => Ok(Self::Queued),
+            "INITIALIZING" => Ok(Self::Initializing),
+            "RUNNING" => Ok(Self::Running),
+            "PAUSED" => Ok(Self::Paused),
+            "COMPLETE" => Ok(Self::Complete),
+            "EXECUTOR_ERROR" => Ok(Self::ExecutorError),
+            "SYSTEM_ERROR" => Ok(Self::SystemError),
+            "CANCELED" => Ok(Self::Canceled),
+            "CANCELING" => Ok(Self::Canceling),
+            "PREEMPTED" => Ok(Self::Preempted),
+            other => Err(TesError::bad_request(format!("unknown state `{other}`"))),
+        }
+    }
+}
+
+fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    for (field, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match field.as_ref() {
+            "tag_key" => keys.push(value.into_owned()),
+            "tag_value" => values.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(index, key)| (key, values.get(index).cloned().unwrap_or_default()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +523,10 @@ pub async fn get_task(
         ("view" = Option<String>, Query, description = "MINIMAL | BASIC | FULL"),
         ("page_size" = Option<usize>, Query, description = "Max tasks per page"),
         ("page_token" = Option<String>, Query, description = "Opaque page token"),
-        ("name_prefix" = Option<String>, Query, description = "Ignored; accepted for TES compatibility")
+        ("state" = Option<String>, Query, description = "TES task state"),
+        ("name_prefix" = Option<String>, Query, description = "Task name prefix"),
+        ("tag_key" = Vec<String>, Query, description = "Repeated tag keys"),
+        ("tag_value" = Vec<String>, Query, description = "Repeated tag values")
     ),
     responses(
         (status = 200, body = TesListTasksResponse),
@@ -464,6 +539,7 @@ pub async fn list_tasks(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
 ) -> Response {
     let auth = match require_unrestricted_realm_auth(&state, auth) {
@@ -474,7 +550,10 @@ pub async fn list_tasks(
         Ok(view) => view,
         Err(error) => return error.into_response(),
     };
-    let _ = query.name_prefix;
+    let filters = match TaskFilters::from_query(&query, raw_query.as_deref()) {
+        Ok(filters) => filters,
+        Err(error) => return error.into_response(),
+    };
     let cursor = match decode_page_token(query.page_token.as_deref()) {
         Ok(cursor) => cursor,
         Err(error) => return error.into_response(),
@@ -485,7 +564,11 @@ pub async fn list_tasks(
         .min(MAX_PAGE_SIZE);
 
     let (records, next_cursor) =
-        match list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, None).await {
+        match list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, |record| {
+            filters.matches(record)
+        })
+        .await
+        {
             Ok(page) => page,
             Err(error) => return TesError::internal(error).into_response(),
         };
@@ -493,7 +576,6 @@ pub async fn list_tasks(
     let base_url = external_base_url(&headers);
     let tasks = records
         .iter()
-        .filter(|record| matches!(record.payload, JobPayload::Execution(_)))
         .map(|record| project_task(record, view, &base_url))
         .collect();
 
@@ -645,6 +727,9 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
 
     let spec = ExecutionSpec {
         group_id,
+        name: task.name.clone(),
+        description: task.description.clone(),
+        tags: task.tags.clone(),
         image: executor.image.clone(),
         // TES `command` is the full argv; override the image ENTRYPOINT with it and
         // leave the image CMD unset so exactly the requested argv runs.
@@ -804,10 +889,7 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         ..Default::default()
     });
 
-    let mut tags = BTreeMap::from([(GROUP_TAG_KEY.to_string(), spec.group_id.to_string())]);
-    if let Some(constraint) = &spec.executor_constraint {
-        tags.insert(EXECUTOR_TAG_KEY.to_string(), constraint.clone());
-    }
+    let tags = project_tags(spec);
 
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {
@@ -821,6 +903,8 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
     TesTask {
         id: Some(id),
         state: Some(state),
+        name: spec.name.clone(),
+        description: spec.description.clone(),
         executors,
         inputs,
         outputs,
@@ -830,6 +914,17 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         creation_time: Some(rfc3339(record.created_at_ms)),
         ..Default::default()
     }
+}
+
+fn project_tags(spec: &ExecutionSpec) -> BTreeMap<String, String> {
+    let mut tags = spec.tags.clone();
+    tags.entry(GROUP_TAG_KEY.to_string())
+        .or_insert_with(|| spec.group_id.to_string());
+    if let Some(constraint) = &spec.executor_constraint {
+        tags.entry(EXECUTOR_TAG_KEY.to_string())
+            .or_insert_with(|| constraint.clone());
+    }
+    tags
 }
 
 fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
@@ -1076,6 +1171,8 @@ mod tests {
 
     fn sample_task(group: Ulid) -> TesTask {
         TesTask {
+            name: Some("align reads".to_string()),
+            description: Some("sample task".to_string()),
             executors: vec![TesExecutor {
                 image: "alpine:3".to_string(),
                 command: vec!["echo".to_string(), "hi".to_string()],
@@ -1097,7 +1194,10 @@ mod tests {
                 ram_gb: Some(4.0),
                 ..Default::default()
             }),
-            tags: BTreeMap::from([(GROUP_TAG_KEY.to_string(), group.to_string())]),
+            tags: BTreeMap::from([
+                (GROUP_TAG_KEY.to_string(), group.to_string()),
+                ("project".to_string(), "alpha".to_string()),
+            ]),
             ..Default::default()
         }
     }
@@ -1119,6 +1219,9 @@ mod tests {
         let group = Ulid::from_bytes([5u8; 16]);
         let (spec, dedup) = map_task_to_spec(&sample_task(group)).unwrap();
         assert_eq!(spec.group_id, group);
+        assert_eq!(spec.name.as_deref(), Some("align reads"));
+        assert_eq!(spec.description.as_deref(), Some("sample task"));
+        assert_eq!(spec.tags.get("project").map(String::as_str), Some("alpha"));
         assert_eq!(spec.image, "alpine:3");
         // TES command becomes the entrypoint override; image CMD stays empty.
         assert_eq!(spec.entrypoint, Some(vec!["echo".into(), "hi".into()]));
@@ -1130,6 +1233,74 @@ mod tests {
         assert_eq!(spec.inputs[0].dest_key, "in/data.csv");
         assert_eq!(spec.output_prefixes, vec!["out/".to_string()]);
         assert!(dedup.is_none());
+    }
+
+    #[test]
+    fn filters_tasks() {
+        let group = Ulid::from_bytes([5u8; 16]);
+        let (spec, _) = map_task_to_spec(&sample_task(group)).unwrap();
+        let mut record = execution_record(JobId::from_bytes([6u8; 16]), user(2), spec);
+        record.state = JobState::Running;
+        let uri: axum::http::Uri = "/ga4gh/tes/v1/tasks?state=RUNNING&name_prefix=align&tag_key=project&tag_key=aruna.io%2Fgroup&tag_value=alpha"
+            .parse()
+            .unwrap();
+        let Query(query) = Query::<ListTasksQuery>::try_from_uri(&uri).unwrap();
+        let filters = TaskFilters::from_query(&query, uri.query()).unwrap();
+        assert!(filters.matches(&record));
+
+        let wrong_name = ListTasksQuery {
+            name_prefix: Some("other".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !TaskFilters::from_query(&wrong_name, None)
+                .unwrap()
+                .matches(&record)
+        );
+        assert!(
+            !TaskFilters::from_query(
+                &ListTasksQuery::default(),
+                Some("tag_key=project&tag_value=beta"),
+            )
+            .unwrap()
+            .matches(&record)
+        );
+        assert!(
+            !TaskFilters::from_query(&ListTasksQuery::default(), Some("tag_key=missing"),)
+                .unwrap()
+                .matches(&record)
+        );
+        assert!(
+            TaskFilters::from_query(
+                &ListTasksQuery {
+                    state: Some("INVALID".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .is_err()
+        );
+
+        let probe = JobRecord::new(
+            JobId::from_bytes([7u8; 16]),
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            user(2),
+            node_id(),
+            1_000,
+            1_000,
+            None,
+        );
+        assert!(
+            !TaskFilters::from_query(&ListTasksQuery::default(), None)
+                .unwrap()
+                .matches(&probe)
+        );
     }
 
     #[test]
@@ -1189,6 +1360,9 @@ mod tests {
     fn maps_states() {
         let spec = || ExecutionSpec {
             group_id: Ulid::from_bytes([5u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
             image: "img".to_string(),
             entrypoint: None,
             command: vec!["run".to_string()],
@@ -1261,6 +1435,9 @@ mod tests {
         assert_eq!(minimal.state, Some(TesState::Complete));
 
         let basic = project_task(&record, TesView::Basic, "http://x");
+        assert_eq!(basic.name.as_deref(), Some("align reads"));
+        assert_eq!(basic.description.as_deref(), Some("sample task"));
+        assert_eq!(basic.tags.get("project").map(String::as_str), Some("alpha"));
         assert_eq!(basic.executors.len(), 1);
         assert_eq!(basic.executors[0].command, vec!["echo", "hi"]);
         assert_eq!(basic.logs.len(), 1);
