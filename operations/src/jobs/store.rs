@@ -1077,8 +1077,8 @@ pub async fn set_cancel_requested(
 }
 
 /// Owner-scoped listing, newest first, with an opaque cursor and optional state filter.
-/// Scans across owner-index pages until `limit` records match the filter or the index is
-/// exhausted, so a filtered page never returns empty with a dangling `next_cursor`.
+/// Scans across owner-index pages for `limit` records plus one matching live lookahead,
+/// so a filtered page never returns empty with a dangling `next_cursor`.
 pub async fn list_jobs_for_user(
     storage: &StorageHandle,
     user_id: UserId,
@@ -1096,6 +1096,7 @@ pub async fn list_jobs_for_user(
         ByteView::from(key)
     });
     let mut records = Vec::new();
+    let mut page_cursor = None;
     loop {
         let (values, _) = iter_prefix_page(
             storage,
@@ -1118,21 +1119,12 @@ pub async fn list_jobs_for_user(
             if let Some(record) = read_job_record(storage, job_id, None).await?
                 && state_filter.is_none_or(|state| record.state == state)
             {
+                if records.len() == limit {
+                    return Ok((records, page_cursor));
+                }
                 records.push(record);
                 if records.len() == limit {
-                    let next = job_owner_cursor(created_at_ms, job_id);
-                    let mut resume_key = user_id.to_storage_key();
-                    resume_key.extend_from_slice(&next);
-                    let (peek, _) = iter_prefix_page(
-                        storage,
-                        JOB_OWNER_INDEX_KEYSPACE,
-                        Some(prefix.clone()),
-                        Some(ByteView::from(resume_key)),
-                        1,
-                        None,
-                    )
-                    .await?;
-                    return Ok((records, if peek.is_empty() { None } else { Some(next) }));
+                    page_cursor = Some(job_owner_cursor(created_at_ms, job_id));
                 }
             }
         }
@@ -1878,12 +1870,23 @@ mod tests {
             record
         };
         for record in [
+            make(5, JobState::Queued),
+            make(4, JobState::Failed),
             make(3, JobState::Queued),
-            make(2, JobState::Queued),
-            make(1, JobState::Failed),
         ] {
             insert_job(&storage, &record).await.unwrap();
         }
+        batch_write(
+            &storage,
+            vec![(
+                JOB_OWNER_INDEX_KEYSPACE.to_string(),
+                job_owner_index_key(owner, 2_000, JobId(Ulid::from_parts(2, 0))),
+                empty_value(),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
 
         let (page, cursor) = list_jobs_for_user(&storage, owner, None, 1, Some(JobState::Failed))
             .await
