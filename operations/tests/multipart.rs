@@ -1,5 +1,4 @@
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -22,7 +21,8 @@ use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput, AbortMultipartUploadOperation,
 };
 use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartPart, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
+    CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOperation,
 };
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
@@ -32,7 +32,7 @@ use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjec
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
 use std::collections::HashMap;
-use std::fs::{create_dir_all, exists, read_dir, read_to_string};
+use std::fs::{create_dir_all, exists, read_dir};
 use std::path::Path;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -42,6 +42,8 @@ struct TestContext {
     blob_root: String,
     driver: DriverContext,
 }
+
+const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -206,7 +208,9 @@ async fn complete_upload(
                 })
                 .collect(),
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type,
+            checksum_type_explicit: false,
             object_size,
             created_by,
             quota_ceiling: None,
@@ -217,14 +221,6 @@ async fn complete_upload(
     .unwrap()
     .unwrap()
     .unwrap()
-}
-
-fn composite_sha256(parts: &[&[u8]]) -> Vec<u8> {
-    let mut combined = Vec::new();
-    for part in parts {
-        combined.extend_from_slice(&Hasher::new_with_bytes(part).finalize().sha256);
-    }
-    Hasher::new_with_bytes(&combined).finalize().sha256.to_vec()
 }
 
 #[tokio::test]
@@ -253,7 +249,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -263,7 +259,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             upload_id,
             part_number: 1,
             content_length: Some(part1.len() as u64),
-            body: Some(stream_from_bytes(part1)),
+            body: Some(stream_from_bytes(&part1)),
             created_by,
             compressed: false,
             encrypted: false,
@@ -309,21 +305,36 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
                     etag: Some(hex::encode(
                         uploaded_part1.location.hashes.get("md5").unwrap(),
                     )),
-                    expected_checksums: vec![],
+                    expected_checksums: vec![ExpectedChecksum {
+                        algorithm: ChecksumAlgorithm::Sha256,
+                        digest: uploaded_part1
+                            .location
+                            .hashes
+                            .get("sha256")
+                            .unwrap()
+                            .clone(),
+                    }],
                 },
                 CompleteMultipartPart {
                     part_number: 2,
                     etag: Some(hex::encode(
                         uploaded_part2.location.hashes.get("md5").unwrap(),
                     )),
-                    expected_checksums: vec![],
+                    expected_checksums: vec![ExpectedChecksum {
+                        algorithm: ChecksumAlgorithm::Sha256,
+                        digest: uploaded_part2
+                            .location
+                            .hashes
+                            .get("sha256")
+                            .unwrap()
+                            .clone(),
+                    }],
                 },
             ],
-            expected_checksums: vec![ExpectedChecksum {
-                algorithm: ChecksumAlgorithm::Sha256,
-                digest: composite_sha256(&[part1, part2]),
-            }],
-            checksum_type: MultipartChecksumType::Composite,
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
@@ -337,10 +348,11 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 
     assert!(exists(complete.location.get_full_path().unwrap()).unwrap());
     assert_eq!(
-        read_to_string(complete.location.get_full_path().unwrap()).unwrap(),
-        "hello world"
+        std::fs::read(complete.location.get_full_path().unwrap()).unwrap(),
+        [part1.as_slice(), part2].concat()
     );
     assert_eq!(complete.checksum_type, MultipartChecksumType::Composite);
+    assert_eq!(complete.part_count, 2);
 
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec())
@@ -507,6 +519,71 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 }
 
 #[tokio::test]
+async fn rejects_missing_checksum() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let created_by = UserId::local(Ulid::r#gen(), realm_id);
+    let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
+    let created = drive(
+        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "contract.bin".to_string(),
+            group_id: Ulid::r#gen(),
+            created_by,
+            checksum_hint: Some(MultipartUploadChecksumHint {
+                algorithm: Some(ChecksumAlgorithm::Sha256),
+                checksum_type: MultipartChecksumType::Composite,
+            }),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let upload_id = created.record.upload_id;
+    let uploaded_part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "contract.bin",
+        upload_id,
+        1,
+        b"part-one",
+        created_by,
+    )
+    .await;
+
+    let err = drive(
+        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "contract.bin".to_string(),
+            upload_id,
+            realm_id,
+            node_id,
+            completed_parts: vec![CompleteMultipartPart {
+                part_number: 1,
+                etag: Some(hex::encode(
+                    uploaded_part.location.hashes.get("md5").unwrap(),
+                )),
+                expected_checksums: vec![],
+            }],
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
+            object_size: Some(8),
+            created_by,
+            quota_ceiling: None,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err, CompleteMultipartUploadError::ChecksumContractMismatch);
+}
+
+#[tokio::test]
 async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::r#gen(), RealmId::from_bytes([7u8; 32]));
@@ -621,7 +698,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -631,7 +708,7 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             upload_id,
             part_number: 1,
             content_length: Some(part1.len() as u64),
-            body: Some(stream_from_bytes(part1)),
+            body: Some(stream_from_bytes(&part1)),
             created_by,
             compressed: false,
             encrypted: false,
@@ -688,7 +765,9 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
                 },
             ],
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
@@ -764,7 +843,7 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
     let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::r#gen();
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
     let part2 = b"world";
 
     let first_upload = create_upload(&context, "bucket-a", "first.bin", group_id, created_by).await;
@@ -774,7 +853,7 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
         "first.bin",
         first_upload.upload_id,
         1,
-        part1,
+        &part1,
         created_by,
     )
     .await;
@@ -810,7 +889,7 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
         "second.bin",
         second_upload.upload_id,
         1,
-        part1,
+        &part1,
         created_by,
     )
     .await;
@@ -840,8 +919,8 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
 
     assert_eq!(second_complete.location, first_complete.location);
     assert_eq!(
-        read_to_string(second_complete.location.get_full_path().unwrap()).unwrap(),
-        "hello world"
+        std::fs::read(second_complete.location.get_full_path().unwrap()).unwrap(),
+        [part1.as_slice(), part2].concat()
     );
     assert!(!exists(second_part1.location.get_full_path().unwrap()).unwrap());
     assert!(!exists(second_part2.location.get_full_path().unwrap()).unwrap());
@@ -869,7 +948,9 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
     let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::r#gen();
-    let content = b"hello world";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part2 = b"world";
+    let content = [part1.as_slice(), part2].concat();
 
     let put = drive(
         PutObjectOperation::new(PutObjectConfig {
@@ -881,7 +962,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
                 bucket: "bucket-a".to_string(),
                 key: "put.bin".to_string(),
                 content_length: Some(content.len() as u64),
-                body: Some(stream_from_bytes(content)),
+                body: Some(stream_from_bytes(&content)),
             },
             expected_checksums: vec![],
             checksum_type: None,
@@ -903,7 +984,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
         "multipart.bin",
         upload.upload_id,
         1,
-        b"hello ",
+        &part1,
         created_by,
     )
     .await;
@@ -913,7 +994,7 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
         "multipart.bin",
         upload.upload_id,
         2,
-        b"world",
+        part2,
         created_by,
     )
     .await;
@@ -958,7 +1039,7 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
     let created_by = UserId::local(Ulid::r#gen(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::r#gen();
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
     let part2 = b"world";
 
     let initial_upload =
@@ -969,7 +1050,7 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
         "same.bin",
         initial_upload.upload_id,
         1,
-        part1,
+        &part1,
         created_by,
     )
     .await;
@@ -1005,7 +1086,7 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
         "same.bin",
         replacement_upload.upload_id,
         1,
-        part1,
+        &part1,
         created_by,
     )
     .await;
@@ -1238,7 +1319,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = b"hello ";
+    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -1248,7 +1329,7 @@ async fn delete_object_removes_completed_multipart_metadata() {
             upload_id,
             part_number: 1,
             content_length: Some(part1.len() as u64),
-            body: Some(stream_from_bytes(part1)),
+            body: Some(stream_from_bytes(&part1)),
             created_by,
             compressed: false,
             encrypted: false,
@@ -1305,7 +1386,9 @@ async fn delete_object_removes_completed_multipart_metadata() {
                 },
             ],
             expected_checksums: vec![],
+            checksum_algorithm: None,
             checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,

@@ -21,6 +21,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
 use smallvec::smallvec;
+use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -421,6 +422,7 @@ impl PutObjectOperation {
             let Some(blake3_hash) = output.get_blake3() else {
                 return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
             };
+            let version_created_at = UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms());
             let version = BlobVersion::materialized(
                 match blake3_hash.try_into() {
                     Ok(hash) => hash,
@@ -428,7 +430,7 @@ impl PutObjectOperation {
                         return self.emit_error(PutObjectError::ConversionError(err.into()));
                     }
                 },
-                output.created_at,
+                version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),
             );

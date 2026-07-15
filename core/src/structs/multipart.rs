@@ -129,7 +129,8 @@ impl MultipartObjectMetadataKey {
             part_number: 0,
         }
         .to_bytes()?;
-        prefix.truncate(prefix.len().saturating_sub(std::mem::size_of::<u16>()));
+        let part_number_len = postcard::to_allocvec(&0u16)?.len();
+        prefix.truncate(prefix.len().saturating_sub(part_number_len));
         Ok(prefix)
     }
 
@@ -146,15 +147,42 @@ impl MultipartObjectMetadataKey {
 pub struct MultipartObjectSummary {
     pub checksum_type: MultipartChecksumType,
     pub part_count: usize,
+    #[serde(skip)]
+    pub composite_hashes: HashMap<String, Vec<u8>>,
 }
 
 impl MultipartObjectSummary {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        #[derive(Serialize)]
+        struct StoredSummary<'a> {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: &'a HashMap<String, Vec<u8>>,
+        }
+
+        Ok(postcard::to_allocvec(&StoredSummary {
+            checksum_type: self.checksum_type,
+            part_count: self.part_count,
+            composite_hashes: &self.composite_hashes,
+        })?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        #[derive(Deserialize)]
+        struct StoredSummary {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: HashMap<String, Vec<u8>>,
+        }
+
+        match postcard::from_bytes::<StoredSummary>(bytes) {
+            Ok(summary) => Ok(Self {
+                checksum_type: summary.checksum_type,
+                part_count: summary.part_count,
+                composite_hashes: summary.composite_hashes,
+            }),
+            Err(_) => Ok(postcard::from_bytes(bytes)?),
+        }
     }
 }
 
@@ -172,5 +200,177 @@ impl MultipartObjectPart {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    // Prefix keeps the whole version id, spans all part numbers, excludes the summary.
+    #[test]
+    fn prefix_covers_version() {
+        let version_id = Ulid::r#gen();
+        let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
+
+        // The prefix must be the part key with the fixed part-number suffix stripped.
+        let zero_part = MultipartObjectMetadataKey::part(version_id, 0)
+            .to_bytes()
+            .unwrap();
+        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 1]);
+
+        // Every part key for this version shares the prefix, across part numbers.
+        for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
+            let part_key = MultipartObjectMetadataKey::part(version_id, part_number)
+                .to_bytes()
+                .unwrap();
+            assert!(
+                part_key.starts_with(&prefix),
+                "part {part_number} key does not start with prefix",
+            );
+        }
+
+        // The summary key must not be captured by the part prefix.
+        let summary_key = MultipartObjectMetadataKey::summary(version_id)
+            .to_bytes()
+            .unwrap();
+        assert!(!summary_key.starts_with(&prefix));
+
+        // A different version must not be captured by this version's prefix.
+        let other_key = MultipartObjectMetadataKey::part(Ulid::r#gen(), 0)
+            .to_bytes()
+            .unwrap();
+        assert!(!other_key.starts_with(&prefix));
+    }
+
+    // Two versions differing only in the last ULID byte must not share a part scan.
+    #[test]
+    fn prefix_isolates_versions() {
+        let mut first_bytes = [7u8; 16];
+        let mut second_bytes = [7u8; 16];
+        first_bytes[15] = 0xAA;
+        second_bytes[15] = 0xAB;
+        let first = Ulid::from_bytes(first_bytes);
+        let second = Ulid::from_bytes(second_bytes);
+
+        let first_prefix = MultipartObjectMetadataKey::part_prefix(first).unwrap();
+        let second_prefix = MultipartObjectMetadataKey::part_prefix(second).unwrap();
+        assert_ne!(first_prefix, second_prefix);
+
+        let second_part = MultipartObjectMetadataKey::part(second, 1)
+            .to_bytes()
+            .unwrap();
+        assert!(!second_part.starts_with(&first_prefix));
+        let second_summary = MultipartObjectMetadataKey::summary(second)
+            .to_bytes()
+            .unwrap();
+        assert!(!second_summary.starts_with(&first_prefix));
+    }
+
+    #[test]
+    fn prefix_spans_parts() {
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
+        for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
+            let key = MultipartObjectMetadataKey::part(version_id, part_number)
+                .to_bytes()
+                .unwrap();
+            assert!(
+                key.starts_with(&prefix),
+                "part {part_number} missing prefix"
+            );
+        }
+        let summary = MultipartObjectMetadataKey::summary(version_id)
+            .to_bytes()
+            .unwrap();
+        assert!(!summary.starts_with(&prefix));
+    }
+
+    #[test]
+    fn key_round_trips() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let summary = MultipartObjectMetadataKey::summary(version_id);
+        assert_eq!(
+            MultipartObjectMetadataKey::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
+        for part_number in [0u16, 1, 65535] {
+            let part = MultipartObjectMetadataKey::part(version_id, part_number);
+            assert_eq!(
+                MultipartObjectMetadataKey::from_bytes(&part.to_bytes().unwrap()).unwrap(),
+                part
+            );
+        }
+        assert!(MultipartObjectMetadataKey::from_bytes(&[]).is_err());
+        assert!(MultipartObjectMetadataKey::from_bytes(&[9u8; 5]).is_err());
+    }
+
+    #[test]
+    fn keys_keep_legacy() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        for key in [
+            MultipartObjectMetadataKey::summary(version_id),
+            MultipartObjectMetadataKey::part(version_id, 256),
+        ] {
+            let legacy_bytes = postcard::to_allocvec(&key).unwrap();
+            assert_eq!(key.to_bytes().unwrap(), legacy_bytes);
+            assert_eq!(
+                MultipartObjectMetadataKey::from_bytes(&legacy_bytes).unwrap(),
+                key
+            );
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+    struct LegacySummary {
+        checksum_type: MultipartChecksumType,
+        part_count: usize,
+    }
+
+    #[test]
+    fn decodes_legacy_summary() {
+        let legacy = LegacySummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 3,
+        };
+
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&postcard::to_allocvec(&legacy).unwrap()).unwrap(),
+            MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 3,
+                composite_hashes: HashMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn retains_summary_hashes() {
+        let summary = MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 2,
+            composite_hashes: HashMap::from([("sha256".to_string(), vec![7u8; 32])]),
+        };
+        let legacy = LegacySummary {
+            checksum_type: summary.checksum_type,
+            part_count: summary.part_count,
+        };
+
+        assert_eq!(
+            postcard::to_allocvec(&summary).unwrap(),
+            postcard::to_allocvec(&legacy).unwrap()
+        );
+        assert_eq!(
+            postcard::from_bytes::<LegacySummary>(&postcard::to_allocvec(&summary).unwrap())
+                .unwrap(),
+            legacy
+        );
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
     }
 }

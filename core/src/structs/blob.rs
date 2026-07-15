@@ -644,6 +644,35 @@ mod tests {
     use std::time::SystemTime;
     use ulid::Ulid;
 
+    // The S3 auth layer rejects revoked/expired credentials via these predicates.
+    #[test]
+    fn access_status_predicates() {
+        use super::UserAccess;
+        use std::time::Duration;
+
+        let now = SystemTime::now();
+        let base = UserAccess {
+            access_key: "access".into(),
+            user_identity: UserId::local(Ulid::r#gen(), RealmId::from_bytes([1u8; 32])),
+            group_id: Ulid::r#gen(),
+            secret: "secret".into(),
+            expiry: now + Duration::from_secs(60),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
+        };
+        assert!(!base.is_expired(now));
+        assert!(!base.is_revoked());
+
+        let mut expired = base.clone();
+        expired.expiry = now - Duration::from_secs(1);
+        assert!(expired.is_expired(now));
+
+        let mut revoked = base.clone();
+        revoked.revoked_at = Some(now);
+        assert!(revoked.is_revoked());
+    }
+
     #[test]
     fn current_version_pointer_roundtrip_preserves_fields() {
         let pointer = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([7u8; 16]), 42);

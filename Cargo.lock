@@ -224,6 +224,7 @@ name = "aruna-api"
 version = "3.0.0-alpha.34"
 dependencies = [
  "ahash",
+ "aruna-blob",
  "aruna-core",
  "aruna-net",
  "aruna-operations",

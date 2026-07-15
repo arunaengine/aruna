@@ -26,7 +26,9 @@ use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -39,6 +41,55 @@ use tracing::{Instrument, error, info, trace};
 /// operation is known.
 #[derive(Clone)]
 pub struct S3OpLabel(Arc<OnceLock<String>>);
+
+#[derive(Clone, Default)]
+pub(crate) struct DeleteObjectsBody(Arc<Mutex<Vec<u8>>>);
+
+impl DeleteObjectsBody {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct CaptureDeleteObjectsBody {
+    inner: Pin<Box<Incoming>>,
+    captured: DeleteObjectsBody,
+}
+
+impl hyper::body::Body for CaptureDeleteObjectsBody {
+    type Data = hyper::body::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match self.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.captured
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(data);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 impl S3OpLabel {
     fn new() -> Self {
@@ -231,7 +282,21 @@ impl Service<Request<Incoming>> for WrappingService {
             .and_then(|value| value.to_str().ok())
             .map(parse_requested_headers)
             .unwrap_or_default();
-        let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
+        let delete_objects = method == Method::POST
+            && parts.uri.query().is_some_and(|query| {
+                url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == "delete")
+            });
+        let body = if delete_objects {
+            let captured = DeleteObjectsBody::default();
+            parts.extensions.insert(captured.clone());
+            s3s::Body::http_body_unsync(CaptureDeleteObjectsBody {
+                inner: Box::pin(body),
+                captured,
+            })
+        } else {
+            body.into()
+        };
+        let s3s_request = s3s::HttpRequest::from_parts(parts, body);
         let shared = self.shared.clone();
         let cors = self.cors.clone();
         let driver_ctx = self.driver_ctx.clone();

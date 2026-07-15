@@ -237,9 +237,11 @@ impl Operation for CreateBucketOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 
@@ -282,5 +284,46 @@ mod test {
         .unwrap();
 
         assert_eq!(result, bucket_info);
+    }
+
+    #[tokio::test]
+    async fn drive_duplicate_bucket_returns_already_exists() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let bucket_info = BucketInfo {
+            group_id: Ulid::r#gen(),
+            created_at: SystemTime::now(),
+            created_by: Default::default(),
+            cors_configuration: None,
+        };
+
+        drive(
+            CreateBucketOperation::new("bucket-a".to_string(), bucket_info.clone()),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let result = drive(
+            CreateBucketOperation::new("bucket-a".to_string(), bucket_info),
+            &driver_ctx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CreateBucketError::BucketAlreadyExists)
+        ));
     }
 }

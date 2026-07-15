@@ -5,11 +5,12 @@ use aruna_core::structs::{
     MultipartChecksumType, MultipartUploadChecksumHint, ensure_confined_relative_path,
 };
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
+use aruna_operations::s3::get_object::ObjectRangeRequest;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
 use s3s::dto::{
-    ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
+    ChecksumType, CompletedPart, CopySource, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::path::Path;
@@ -138,13 +139,34 @@ pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
 pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
     match input.body.take() {
         None => Err(s3_error!(InvalidRequest, "Missing body")),
-        Some(stream) => Ok(BlobPutObjectInput {
-            bucket: input.bucket,
-            key: input.key,
-            content_length: input.content_length.map(|l| l as u64),
-            body: Some(BackendStream::new_from_boxed(stream)),
-        }),
+        Some(stream) => {
+            let content_length = input.content_length.map(checked_size).transpose()?;
+            Ok(BlobPutObjectInput {
+                bucket: input.bucket,
+                key: input.key,
+                content_length,
+                body: Some(BackendStream::new_from_boxed(stream)),
+            })
+        }
     }
+}
+
+/// Rejects negative S3 size headers before an `i64 -> u64` cast can wrap them.
+pub(crate) fn checked_size(value: i64) -> S3Result<u64> {
+    u64::try_from(value).map_err(|_| s3_error!(InvalidArgument, "Size must not be negative"))
+}
+
+/// Server-side encryption is not implemented; SSE/SSE-C request headers must be
+/// rejected rather than silently ignored so a client is never told its data is
+/// encrypted while it is stored as plaintext (real SSE-C support is tracked in #387).
+pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
+    if requested {
+        return Err(s3_error!(
+            NotImplemented,
+            "Server-side encryption is not supported"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_multipart_checksum_hint(
@@ -232,6 +254,46 @@ pub(crate) fn parse_upload_id(upload_id: &str) -> S3Result<Ulid> {
         .map_err(|_| s3_error!(NoSuchUpload, "The specified upload does not exist."))
 }
 
+pub(crate) fn parse_copy_source(
+    copy_source: &CopySource,
+) -> S3Result<(String, String, Option<Ulid>)> {
+    match copy_source {
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id,
+        } => {
+            let version_id = version_id
+                .as_ref()
+                .map(|version_id| {
+                    Ulid::from_string(version_id)
+                        .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+                })
+                .transpose()?;
+            Ok((bucket.to_string(), key.to_string(), version_id))
+        }
+        _ => Err(s3_error!(
+            InvalidArgument,
+            "Unsupported copy source; only bucket/key sources are supported"
+        )),
+    }
+}
+
+pub(crate) fn parse_copy_source_range(range: Option<&str>) -> S3Result<Option<ObjectRangeRequest>> {
+    let Some(range) = range else {
+        return Ok(None);
+    };
+    let invalid = || s3_error!(InvalidArgument, "Invalid copy source range");
+    let spec = range.strip_prefix("bytes=").ok_or_else(invalid)?;
+    let (start, end) = spec.split_once('-').ok_or_else(invalid)?;
+    let start: u64 = start.parse().map_err(|_| invalid())?;
+    let end: u64 = end.parse().map_err(|_| invalid())?;
+    if start > end {
+        return Err(invalid());
+    }
+    Ok(Some(ObjectRangeRequest::StartEnd { start, end }))
+}
+
 pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ulid>> {
     version_id
         .map(|version_id| {
@@ -259,6 +321,17 @@ pub(crate) fn s3_checksum_type_from_multipart(
     }
 }
 
+pub(crate) fn checksum_response_hashes<'a>(
+    checksum_type: MultipartChecksumType,
+    location_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+    composite_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+) -> &'a std::collections::HashMap<String, Vec<u8>> {
+    match checksum_type {
+        MultipartChecksumType::Composite if !composite_hashes.is_empty() => composite_hashes,
+        _ => location_hashes,
+    }
+}
+
 pub(crate) fn checksum_algorithm_from_s3(
     algorithm: &S3ChecksumAlgorithm,
 ) -> S3Result<ChecksumAlgorithm> {
@@ -272,14 +345,160 @@ pub(crate) fn checksum_algorithm_from_s3(
     }
 }
 
+pub(crate) fn s3_checksum_algorithm_from_core(
+    algorithm: ChecksumAlgorithm,
+) -> Option<S3ChecksumAlgorithm> {
+    match algorithm {
+        ChecksumAlgorithm::Crc32 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32))
+        }
+        ChecksumAlgorithm::Crc32c => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC32C,
+        )),
+        ChecksumAlgorithm::Crc64Nvme => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC64NVME,
+        )),
+        ChecksumAlgorithm::Sha1 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::SHA1))
+        }
+        ChecksumAlgorithm::Sha256 => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::SHA256,
+        )),
+        ChecksumAlgorithm::Md5 => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        get_s3_operation_permission, is_anonymous_object_read_operation,
-        parse_multipart_part_number, validate_object_key,
+        checksum_response_hashes, get_s3_operation_permission, is_anonymous_object_read_operation,
+        parse_copy_source, parse_copy_source_range, parse_multipart_part_number,
+        validate_object_key,
     };
     use crate::s3::auth::Action;
+    use aruna_core::structs::MultipartChecksumType;
+    use aruna_operations::s3::get_object::ObjectRangeRequest;
     use s3s::S3ErrorCode;
+    use s3s::dto::CopySource;
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    #[test]
+    fn composite_uploads_surface_composite_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &composite
+        );
+    }
+
+    #[test]
+    fn full_object_uploads_surface_location_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::FullObject, &location, &composite),
+            &location
+        );
+    }
+
+    #[test]
+    fn empty_composite_hashes_fall_back_to_location() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::new();
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &location
+        );
+    }
+
+    #[test]
+    fn parses_bounded_copy_source_range() {
+        assert_eq!(
+            parse_copy_source_range(Some("bytes=0-99")).unwrap(),
+            Some(ObjectRangeRequest::StartEnd { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn parses_absent_copy_source_range() {
+        assert_eq!(parse_copy_source_range(None).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_copy_source_ranges() {
+        for value in ["0-99", "bytes=2-", "bytes=-5", "bytes=abc-def", "bytes=5-2"] {
+            assert_eq!(
+                *parse_copy_source_range(Some(value)).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "expected InvalidArgument for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_bucket_copy_source_without_version() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "folder/object.txt".into(),
+            version_id: None,
+        };
+
+        let (bucket, key, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(bucket, "src-bucket");
+        assert_eq!(key, "folder/object.txt");
+        assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn parses_bucket_copy_source_with_version() {
+        let version = Ulid::r#gen();
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some(version.to_string().into()),
+        };
+
+        let (_, _, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(version_id, Some(version));
+    }
+
+    #[test]
+    fn rejects_invalid_copy_source_version() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some("not-a-ulid".into()),
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn rejects_non_bucket_copy_source() {
+        let source = CopySource::AccessPoint {
+            partition: "aws".into(),
+            region: "eu-central-1".into(),
+            account_id: "123456789012".into(),
+            access_point_name: "my-access-point".into(),
+            key: "object.txt".into(),
+            version_id: None,
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
 
     #[test]
     fn validate_object_key_accepts_ordinary_keys() {
@@ -347,6 +566,16 @@ mod tests {
             get_s3_operation_permission("ListObjectsV2"),
             Some(Action::Read)
         );
+    }
+
+    #[test]
+    fn rejects_negative_size() {
+        assert_eq!(
+            *super::checked_size(-1).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+        assert_eq!(super::checked_size(0).unwrap(), 0);
+        assert_eq!(super::checked_size(i64::MAX).unwrap(), i64::MAX as u64);
     }
 
     #[test]

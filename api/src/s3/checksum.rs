@@ -1,10 +1,11 @@
+use aruna_blob::hash::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use http::HeaderMap;
 use s3s::dto::{
-    ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, GetObjectOutput, HeadObjectOutput,
-    PutObjectOutput, UploadPartOutput,
+    ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, CopyObjectResult, CopyPartResult,
+    GetObjectOutput, HeadObjectOutput, PutObjectOutput, UploadPartOutput,
 };
 use s3s::{S3Error, S3Result, s3_error};
 use std::collections::HashMap;
@@ -25,6 +26,8 @@ pub struct UploadChecksumRequest {
     pub expected: Vec<ExpectedChecksum>,
     pub response_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: ChecksumType,
+    pub checksum_type_declared: bool,
+    pub composite_part_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -95,15 +98,51 @@ impl ApplyChecksums for UploadPartOutput {
     }
 }
 
+impl ApplyChecksums for CopyObjectResult {
+    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
+        self.checksum_crc32 = checksums.checksum_crc32;
+        self.checksum_crc32c = checksums.checksum_crc32c;
+        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
+        self.checksum_sha1 = checksums.checksum_sha1;
+        self.checksum_sha256 = checksums.checksum_sha256;
+        self.checksum_type = checksums.checksum_type;
+    }
+}
+
+impl ApplyChecksums for CopyPartResult {
+    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
+        self.checksum_crc32 = checksums.checksum_crc32;
+        self.checksum_crc32c = checksums.checksum_crc32c;
+        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
+        self.checksum_sha1 = checksums.checksum_sha1;
+        self.checksum_sha256 = checksums.checksum_sha256;
+    }
+}
+
 pub enum ChecksumSelection {
     Requested(Option<ChecksumAlgorithm>),
     AllStored,
 }
 
 pub fn parse_upload_checksum_request(headers: &HeaderMap) -> S3Result<UploadChecksumRequest> {
-    let expected = parse_expected_checksums(headers)?;
+    parse_checksum_request(headers, true)
+}
+
+pub fn parse_complete_multipart_checksum_request(
+    headers: &HeaderMap,
+) -> S3Result<UploadChecksumRequest> {
+    parse_checksum_request(headers, false)
+}
+
+fn parse_checksum_request(
+    headers: &HeaderMap,
+    include_content_md5: bool,
+) -> S3Result<UploadChecksumRequest> {
+    let (checksum_type, checksum_type_declared) = parse_checksum_type(headers)?;
+    let composite = checksum_type.as_str() == ChecksumType::COMPOSITE;
+    let (expected, composite_part_count) =
+        parse_expected_checksums(headers, composite, include_content_md5)?;
     let declared = parse_declared_algorithm(headers)?;
-    let checksum_type = parse_checksum_type(headers)?;
 
     if declared.is_some() && expected.is_empty() {
         return Err(s3_error!(
@@ -128,7 +167,46 @@ pub fn parse_upload_checksum_request(headers: &HeaderMap) -> S3Result<UploadChec
             .or_else(|| expected.first().map(|checksum| checksum.algorithm)),
         expected,
         checksum_type,
+        checksum_type_declared,
+        composite_part_count,
     })
+}
+
+pub fn validate_composite_part_count(
+    request: &UploadChecksumRequest,
+    actual_part_count: usize,
+) -> S3Result<()> {
+    match request.composite_part_count {
+        Some(count) if count != actual_part_count => Err(checksum_mismatch_error()),
+        _ => Ok(()),
+    }
+}
+
+pub fn validate_delete_checksum(headers: &HeaderMap, body: &[u8]) -> S3Result<()> {
+    let request = parse_upload_checksum_request(headers)?;
+    if request.expected.is_empty() {
+        return Err(s3_error!(
+            MissingSecurityHeader,
+            "Missing required Content-MD5 or checksum header"
+        ));
+    }
+
+    let hashes = Hasher::new_with_bytes(body).finalize();
+    for expected in request.expected {
+        let actual: &[u8] = match expected.algorithm {
+            ChecksumAlgorithm::Md5 => &hashes.md5,
+            ChecksumAlgorithm::Sha1 => &hashes.sha1,
+            ChecksumAlgorithm::Sha256 => &hashes.sha256,
+            ChecksumAlgorithm::Crc32 => &hashes.crc32,
+            ChecksumAlgorithm::Crc32c => &hashes.crc32c,
+            ChecksumAlgorithm::Crc64Nvme => &hashes.crc64nvme,
+        };
+        if expected.digest != actual {
+            return Err(checksum_mismatch_error());
+        }
+    }
+
+    Ok(())
 }
 
 pub fn checksum_mode_enabled(headers: &HeaderMap) -> bool {
@@ -142,7 +220,9 @@ pub fn encode_checksums(
     hashes: &HashMap<String, Vec<u8>>,
     selection: ChecksumSelection,
     checksum_type: ChecksumType,
+    part_count: Option<usize>,
 ) -> EncodedChecksums {
+    let composite = checksum_type.as_str() == ChecksumType::COMPOSITE;
     let mut encoded = EncodedChecksums {
         checksum_type: Some(checksum_type),
         ..Default::default()
@@ -168,11 +248,33 @@ pub fn encode_checksums(
         }
     }
 
+    // AWS returns composite checksums as "<base64>-<partCount>".
+    if composite && let Some(part_count) = part_count {
+        let suffix = format!("-{part_count}");
+        for value in [
+            &mut encoded.checksum_crc32,
+            &mut encoded.checksum_crc32c,
+            &mut encoded.checksum_crc64nvme,
+            &mut encoded.checksum_sha1,
+            &mut encoded.checksum_sha256,
+        ]
+        .into_iter()
+        .filter_map(|value| value.as_mut())
+        {
+            value.push_str(&suffix);
+        }
+    }
+
     encoded
 }
 
-fn parse_expected_checksums(headers: &HeaderMap) -> S3Result<Vec<ExpectedChecksum>> {
+fn parse_expected_checksums(
+    headers: &HeaderMap,
+    composite: bool,
+    include_content_md5: bool,
+) -> S3Result<(Vec<ExpectedChecksum>, Option<usize>)> {
     let mut expected = Vec::new();
+    let mut part_count = None;
 
     for (name, algorithm) in [
         (CONTENT_MD5, ChecksumAlgorithm::Md5),
@@ -182,7 +284,21 @@ fn parse_expected_checksums(headers: &HeaderMap) -> S3Result<Vec<ExpectedChecksu
         (X_AMZ_CHECKSUM_SHA1, ChecksumAlgorithm::Sha1),
         (X_AMZ_CHECKSUM_SHA256, ChecksumAlgorithm::Sha256),
     ] {
+        if algorithm == ChecksumAlgorithm::Md5 && !include_content_md5 {
+            continue;
+        }
         if let Some(value) = header_str(headers, name)? {
+            let (value, parsed_count) = if composite && algorithm != ChecksumAlgorithm::Md5 {
+                split_composite_part_count(algorithm, value)?
+            } else {
+                (value, None)
+            };
+            if let (Some(existing), Some(parsed)) = (part_count, parsed_count)
+                && existing != parsed
+            {
+                return Err(checksum_mismatch_error());
+            }
+            part_count = parsed_count.or(part_count);
             expected.push(ExpectedChecksum {
                 algorithm,
                 digest: decode_digest(algorithm, value)?,
@@ -190,7 +306,33 @@ fn parse_expected_checksums(headers: &HeaderMap) -> S3Result<Vec<ExpectedChecksu
         }
     }
 
-    Ok(expected)
+    Ok((expected, part_count))
+}
+
+// AWS clients send composite checksums as "<base64>-<partCount>"; '-' is not in
+// the base64 alphabet, so it can only introduce the part-count suffix.
+fn split_composite_part_count(
+    algorithm: ChecksumAlgorithm,
+    value: &str,
+) -> S3Result<(&str, Option<usize>)> {
+    let Some((digest, count)) = value.rsplit_once('-') else {
+        return Ok((value, None));
+    };
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(s3_error!(
+            InvalidDigest,
+            "The {} checksum you specified is not valid.",
+            algorithm.hash_key()
+        ));
+    }
+    let count = count.parse::<usize>().map_err(|_| {
+        s3_error!(
+            InvalidDigest,
+            "The {} checksum you specified is not valid.",
+            algorithm.hash_key()
+        )
+    })?;
+    Ok((digest, Some(count)))
 }
 
 fn parse_declared_algorithm(headers: &HeaderMap) -> S3Result<Option<ChecksumAlgorithm>> {
@@ -213,14 +355,16 @@ fn parse_declared_algorithm(headers: &HeaderMap) -> S3Result<Option<ChecksumAlgo
     Ok(Some(parsed))
 }
 
-fn parse_checksum_type(headers: &HeaderMap) -> S3Result<ChecksumType> {
+fn parse_checksum_type(headers: &HeaderMap) -> S3Result<(ChecksumType, bool)> {
     let Some(value) = header_str(headers, X_AMZ_CHECKSUM_TYPE)? else {
-        return Ok(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
+        return Ok((ChecksumType::from_static(ChecksumType::FULL_OBJECT), false));
     };
 
     match value {
-        ChecksumType::FULL_OBJECT => Ok(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
-        ChecksumType::COMPOSITE => Ok(ChecksumType::from_static(ChecksumType::COMPOSITE)),
+        ChecksumType::FULL_OBJECT => {
+            Ok((ChecksumType::from_static(ChecksumType::FULL_OBJECT), true))
+        }
+        ChecksumType::COMPOSITE => Ok((ChecksumType::from_static(ChecksumType::COMPOSITE), true)),
         _ => Err(s3_error!(InvalidRequest, "Unsupported checksum type")),
     }
 }
@@ -290,9 +434,13 @@ mod tests {
     use super::{
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
         X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
-        parse_upload_checksum_request,
+        parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+        validate_composite_part_count, validate_delete_checksum,
     };
+    use aruna_blob::hash::Hasher;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use http::HeaderMap;
     use s3s::dto::{ChecksumType, PutObjectOutput};
     use std::collections::HashMap;
@@ -309,6 +457,38 @@ mod tests {
         assert_eq!(request.expected.len(), 2);
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
+        assert!(!request.checksum_type_declared);
+    }
+
+    #[test]
+    fn validates_delete_checksum() {
+        let body = b"<Delete><Object><Key>key</Key></Object></Delete>";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_AMZ_CHECKSUM_CRC32,
+            STANDARD
+                .encode(Hasher::new_with_bytes(body).finalize().crc32)
+                .parse()
+                .unwrap(),
+        );
+
+        validate_delete_checksum(&headers, body).unwrap();
+
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "AAAAAA==".parse().unwrap());
+        assert_eq!(
+            validate_delete_checksum(&headers, body)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "BadDigest"
+        );
+        assert_eq!(
+            validate_delete_checksum(&HeaderMap::new(), body)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "MissingSecurityHeader"
+        );
     }
 
     #[test]
@@ -316,6 +496,7 @@ mod tests {
         let request = parse_upload_checksum_request(&HeaderMap::new()).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
+        assert!(!request.checksum_type_declared);
     }
 
     #[test]
@@ -326,6 +507,19 @@ mod tests {
         let request = parse_upload_checksum_request(&headers).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::COMPOSITE);
+        assert!(request.checksum_type_declared);
+    }
+
+    #[test]
+    fn complete_multipart_does_not_treat_content_md5_as_object_checksum() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_MD5, "XrY7u+Ae7tCTyyK7j1rNww==".parse().unwrap());
+
+        let request = parse_complete_multipart_checksum_request(&headers).unwrap();
+
+        assert!(request.expected.is_empty());
+        assert_eq!(request.response_algorithm, None);
+        assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
     }
 
     #[test]
@@ -365,6 +559,7 @@ mod tests {
             &hashes,
             ChecksumSelection::Requested(Some(ChecksumAlgorithm::Crc32)),
             ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            None,
         );
 
         let mut output = PutObjectOutput::default();
@@ -375,5 +570,90 @@ mod tests {
             output.checksum_type.as_ref().map(|value| value.as_str()),
             Some(ChecksumType::FULL_OBJECT)
         );
+    }
+
+    #[test]
+    fn suffixes_composite_checksums_with_part_count() {
+        let mut hashes = HashMap::new();
+        hashes.insert(HASH_CRC32.to_string(), vec![0xcb, 0xf4, 0x39, 0x26]);
+
+        let composite = encode_checksums(
+            &hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::COMPOSITE),
+            Some(3),
+        );
+        assert_eq!(composite.checksum_crc32.as_deref(), Some("y/Q5Jg==-3"));
+
+        let full_object = encode_checksums(
+            &hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            Some(3),
+        );
+        assert_eq!(full_object.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
+
+        let no_count = encode_checksums(
+            &hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::COMPOSITE),
+            None,
+        );
+        assert_eq!(no_count.checksum_crc32.as_deref(), Some("y/Q5Jg=="));
+    }
+
+    #[test]
+    fn parses_suffixed_composite_checksum_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
+
+        let request = parse_upload_checksum_request(&headers).unwrap();
+
+        assert_eq!(request.expected.len(), 1);
+        assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
+        assert_eq!(request.composite_part_count, Some(2));
+        assert!(validate_composite_part_count(&request, 2).is_ok());
+        assert_eq!(
+            validate_composite_part_count(&request, 3)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "BadDigest"
+        );
+    }
+
+    #[test]
+    fn accepts_unsuffixed_composite_checksum_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
+
+        let request = parse_upload_checksum_request(&headers).unwrap();
+
+        assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
+        assert_eq!(request.composite_part_count, None);
+        assert!(validate_composite_part_count(&request, 7).is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_composite_part_count() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-x".parse().unwrap());
+
+        let err = parse_upload_checksum_request(&headers).unwrap_err();
+
+        assert_eq!(err.code().as_str(), "InvalidDigest");
+    }
+
+    #[test]
+    fn rejects_suffixed_checksum_without_composite_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
+
+        let err = parse_upload_checksum_request(&headers).unwrap_err();
+
+        assert_eq!(err.code().as_str(), "InvalidRequest");
     }
 }

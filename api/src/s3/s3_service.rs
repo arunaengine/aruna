@@ -2,21 +2,26 @@
 
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
-    encode_checksums, parse_upload_checksum_request,
+    encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+    validate_composite_part_count, validate_delete_checksum,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
+use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
-    convert_input, multipart_checksum_type_from_s3, parse_completed_part,
+    checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
+    parse_completed_part, parse_copy_source, parse_copy_source_range,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_type_from_multipart, validate_object_key,
+    reject_sse, s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart,
+    validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
     AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, data_watch_resource_path,
+    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    data_watch_resource_path,
 };
 use aruna_core::types::UserId;
 use aruna_core::util::unix_timestamp_millis;
@@ -37,22 +42,39 @@ use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
     CompleteMultipartUploadResult,
 };
+use aruna_operations::s3::copy_object::{
+    CopyObjectInput as CopyObjectData, CopySourceConditions, copy_object,
+};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput as CMPI, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
-    DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
+    DeleteObjectError, DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
+use aruna_operations::s3::delete_objects::{
+    DeleteObjectsEntry, DeleteObjectsInput as DOSI, delete_objects,
+};
+use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
 use aruna_operations::s3::get_object::{
     GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
+use aruna_operations::s3::get_object_attributes::{
+    GetObjectAttributesInput as GOAI, GetObjectAttributesOperation,
+};
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
+use aruna_operations::s3::list_multipart_uploads::{
+    ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
+};
+use aruna_operations::s3::list_object_versions::{
+    ListObjectVersionsInput as LOVI, ListObjectVersionsItem, ListObjectVersionsOperation,
+};
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
+use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
@@ -61,23 +83,35 @@ use aruna_operations::s3::refresh_reference_metadata::{
     QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
 };
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
+use aruna_operations::s3::upload_part_copy::{
+    UploadPartCopyInput as UploadPartCopyData, upload_part_copy,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
-    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
-    EncodingType, GetBucketCorsInput, GetBucketCorsOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetObjectAttributesInput, GetObjectAttributesOutput,
-    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, LastModified,
-    ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, Owner,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
+    Checksum, ChecksumType, CommonPrefix, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, CopyObjectResult,
+    CopyPartResult, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
+    DeleteMarkerEntry, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, Destination, ETag,
+    ETagCondition, EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
+    GetBucketLocationInput, GetBucketLocationOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts, GetObjectInput,
+    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
+    ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
+    MultipartUpload as S3MultipartUpload, Object, ObjectAttributes, ObjectPart, ObjectVersion,
+    ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, StorageClass, StreamingBlob, Timestamp,
+    TimestampFormat, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -109,6 +143,58 @@ fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
         },
         s3s::dto::Range::Suffix { length } => ObjectRangeRequest::Suffix { length },
     }
+}
+
+fn etag_condition_value(condition: &ETagCondition) -> String {
+    match condition {
+        ETagCondition::Any => "*".to_string(),
+        ETagCondition::ETag(etag) => etag.value().to_string(),
+    }
+}
+
+fn timestamp_to_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
+    let mut rendered = Vec::new();
+    timestamp
+        .format(TimestampFormat::DateTime, &mut rendered)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    let rendered =
+        String::from_utf8(rendered).map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(&rendered)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp"))?;
+    Ok(parsed.with_timezone(&chrono::Utc).into())
+}
+
+fn copy_source_conditions(
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+    if_unmodified_since: Option<&Timestamp>,
+) -> S3Result<CopySourceConditions> {
+    Ok(CopySourceConditions {
+        if_match: if_match.map(etag_condition_value),
+        if_none_match: if_none_match.map(etag_condition_value),
+        if_modified_since: if_modified_since
+            .map(timestamp_to_system_time)
+            .transpose()?,
+        if_unmodified_since: if_unmodified_since
+            .map(timestamp_to_system_time)
+            .transpose()?,
+    })
+}
+
+fn parse_upload_id_marker(
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> S3Result<Option<ulid::Ulid>> {
+    let Some(_) = key_marker.filter(|marker| !marker.is_empty()) else {
+        return Ok(None);
+    };
+    upload_id_marker
+        .map(|marker| {
+            ulid::Ulid::from_string(marker)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid upload-id-marker"))
+        })
+        .transpose()
 }
 
 #[derive(Clone)]
@@ -352,6 +438,13 @@ impl ArunaS3Service {
         emit_resource_watch_event(self.state.as_ref(), event).await;
     }
 
+    /// Deviates from AWS S3 by returning the true full-object MD5 hex as the
+    /// multipart ETag, without the AWS `-<partCount>` suffix. AWS derives its
+    /// multipart ETag from the concatenated part digests, so its value is opaque
+    /// and cannot be recomputed from the object bytes. Aruna composes the parts
+    /// into a single blob and hashes it, so the ETag is a real content MD5 that
+    /// clients such as rclone can verify end-to-end; aws-cli and boto3 treat
+    /// ETags as opaque tokens and are unaffected by the missing suffix.
     async fn complete_multipart_upload_response(
         &self,
         group_id: ulid::Ulid,
@@ -379,6 +472,7 @@ impl ArunaS3Service {
             &result.response_hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             s3_checksum_type_from_multipart(result.checksum_type),
+            Some(result.part_count),
         ));
 
         let watch_actor = replication_auth.user_id;
@@ -423,6 +517,7 @@ impl ArunaS3Service {
             &result.location.hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
+            None,
         ));
         let watch_actor = replication_auth.user_id;
         let watch_bucket = replication_bucket.clone();
@@ -505,6 +600,7 @@ impl ArunaS3Service {
         location: Option<&aruna_core::structs::BackendLocation>,
         source_metadata: Option<&aruna_core::structs::SourceMetadata>,
         last_refresh: Option<SystemTime>,
+        version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
         ObjectResponseFields {
             content_length: location
@@ -526,8 +622,9 @@ impl ArunaS3Service {
                             .and_then(|etag| ETag::from_str(etag).ok())
                     })
                 }),
-            last_modified: location
-                .map(|location| location.created_at.into())
+            last_modified: version_created_at
+                .map(Into::into)
+                .or_else(|| location.map(|location| location.created_at.into()))
                 .or_else(|| {
                     source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
                 }),
@@ -629,7 +726,7 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
-        debug!("Received CREATE BUCKET Request: {:#?}", req);
+        debug!(bucket = %req.input.bucket, "Received CREATE BUCKET Request");
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -656,11 +753,103 @@ impl S3 for ArunaS3Service {
     }
 
     #[tracing::instrument(err, skip(self, req))]
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to head bucket"))?;
+
+        Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        debug!(bucket = %req.input.bucket, "Received GET BUCKET LOCATION Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        drive(GetBucketInfoOperation::new(req.input.bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to get bucket location"))?;
+
+        // No region is configured for the node, so report the default location
+        // constraint (an empty constraint denotes the us-east-1 default region).
+        Ok(S3Response::new(GetBucketLocationOutput {
+            location_constraint: None,
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        debug!(bucket = %req.input.bucket, "Received GET BUCKET VERSIONING Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status: Some(BucketVersioningStatus::from_static(
+                BucketVersioningStatus::ENABLED,
+            )),
+            mfa_delete: None,
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        debug!(bucket = %req.input.bucket, "Received PUT BUCKET VERSIONING Request");
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        match req
+            .input
+            .versioning_configuration
+            .status
+            .as_ref()
+            .map(BucketVersioningStatus::as_str)
+        {
+            Some(BucketVersioningStatus::ENABLED) => {
+                Ok(S3Response::new(PutBucketVersioningOutput::default()))
+            }
+            _ => Err(s3_error!(NotImplemented, "Versioning cannot be suspended")),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
     async fn list_buckets(
         &self,
         req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        debug!("Received LIST BUCKETS Request: {:#?}", req);
+        debug!("Received LIST BUCKETS Request");
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -783,7 +972,12 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        debug!("Received LIST OBJECTS V2 Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            max_keys = ?req.input.max_keys,
+            "Received LIST OBJECTS V2 Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -852,6 +1046,7 @@ impl S3 for ArunaS3Service {
                     object.location.as_ref(),
                     object.source_metadata.as_ref(),
                     object.last_refresh,
+                    object.version_created_at,
                 );
                 Object {
                     e_tag: response_fields.e_tag,
@@ -898,13 +1093,27 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        debug!("Received PUT Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            content_length = ?req.input.content_length,
+            "Received PUT Request"
+        );
 
         // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
@@ -955,16 +1164,196 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
-    async fn create_multipart_upload(
+    async fn copy_object(
         &self,
-        req: S3Request<CreateMultipartUploadInput>,
-    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        debug!("Received CREATE MULTIPART Request: {:#?}", req);
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received COPY OBJECT Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some()
+                || req.input.copy_source_sse_customer_algorithm.is_some()
+                || req.input.copy_source_sse_customer_key.is_some()
+                || req.input.copy_source_sse_customer_key_md5.is_some(),
+        )?;
+        validate_object_key(&req.input.key)?;
+        let dest_bucket_info = req.extensions.get::<BucketInfo>().cloned();
+
+        let (source_bucket, source_key, source_version_id) =
+            parse_copy_source(&req.input.copy_source)?;
+
+        // The auth layer only authorized the destination path; authorize the source here.
+        let source_bucket_info = drive(
+            GetBucketInfoOperation::new(source_bucket.clone()),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
+
+        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
+            AuthContext {
+                user_id: user_access.user_identity,
+                realm_id: user_access.user_identity.realm_id,
+                path_restrictions: user_access.path_restrictions.clone(),
+            }
+        } else {
+            AuthContext::anonymous(self.realm_id)
+        };
+        let source_allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: source_auth_context,
+                path: blob_object_permission_path(
+                    self.realm_id,
+                    source_bucket_info.group_id,
+                    self.node_id,
+                    &source_bucket,
+                    &source_key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            &self.state,
+        )
+        .await
+        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+        if !source_allowed {
+            return Err(s3_error!(AccessDenied, "Permission denied"));
+        }
+
+        let dest_bucket = req.input.bucket.clone();
+        let dest_key = req.input.key.clone();
+
+        let metadata_replace = req
+            .input
+            .metadata_directive
+            .as_ref()
+            .map(MetadataDirective::as_str)
+            == Some(MetadataDirective::REPLACE);
+        if metadata_replace {
+            return Err(s3_error!(
+                NotImplemented,
+                "MetadataDirective=REPLACE is not supported until object metadata is persisted."
+            ));
+        }
+        if source_bucket == dest_bucket && source_key == dest_key && source_version_id.is_none() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."
+            ));
+        }
+
+        let dest_group_id = dest_bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let quota_ceiling = self.resolve_quota_ceiling(dest_group_id).await?;
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
+        let conditions = copy_source_conditions(
+            req.input.copy_source_if_match.as_ref(),
+            req.input.copy_source_if_none_match.as_ref(),
+            req.input.copy_source_if_modified_since.as_ref(),
+            req.input.copy_source_if_unmodified_since.as_ref(),
+        )?;
+
+        let result = copy_object(
+            &self.state,
+            CopyObjectData {
+                source_bucket,
+                source_key,
+                source_version_id,
+                source_group_id: source_bucket_info.group_id,
+                dest_bucket: dest_bucket.clone(),
+                dest_key: dest_key.clone(),
+                user_id: user_access.user_identity,
+                group_id: dest_group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                quota_ceiling,
+                conditions,
+            },
+        )
+        .await
+        .map_err(IntoS3Error::into_s3_error)?;
+
+        self.queue_live_version_replication(
+            replication_auth,
+            dest_bucket,
+            dest_key,
+            result.version_id,
+            false,
+        )
+        .await;
+
+        let mut copy_object_result = CopyObjectResult {
+            e_tag: result
+                .location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(hex::encode(value))),
+            last_modified: Some(result.created_at.into()),
+            ..Default::default()
+        };
+        copy_object_result.apply_checksums(encode_checksums(
+            &result.location.hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            None,
+        ));
+
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(copy_object_result),
+            version_id: Some(result.version_id.to_string()),
+            copy_source_version_id: result
+                .source_version_id
+                .map(|version_id| version_id.to_string()),
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received CREATE MULTIPART Request"
+        );
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        reject_sse(
+            req.input.server_side_encryption.is_some()
+                || req.input.ssekms_key_id.is_some()
+                || req.input.ssekms_encryption_context.is_some()
+                || req.input.bucket_key_enabled.is_some()
+                || req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_hint = parse_multipart_checksum_hint(&req.input)?;
@@ -1003,12 +1392,23 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        debug!("Received UPLOAD PART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            part_number = req.input.part_number,
+            content_length = ?req.input.content_length,
+            "Received UPLOAD PART Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
@@ -1026,13 +1426,11 @@ impl S3 for ArunaS3Service {
                 req.input.part_number,
                 S3ErrorCode::InvalidArgument,
             )?,
-            content_length: req.input.content_length.map(|length| length as u64),
+            content_length: req.input.content_length.map(checked_size).transpose()?,
             body: Some(body),
             created_by: user_access.user_identity,
             compressed: false,
-            encrypted: req.input.sse_customer_algorithm.is_some()
-                || req.input.sse_customer_key.is_some()
-                || req.input.sse_customer_key_md5.is_some(),
+            encrypted: false,
             expected_checksums: checksum_request.expected.clone(),
         });
 
@@ -1054,9 +1452,134 @@ impl S3 for ArunaS3Service {
             &result.location.hashes,
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type,
+            None,
         ));
 
         Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            part_number = req.input.part_number,
+            "Received UPLOAD PART COPY Request"
+        );
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some()
+                || req.input.copy_source_sse_customer_algorithm.is_some()
+                || req.input.copy_source_sse_customer_key.is_some()
+                || req.input.copy_source_sse_customer_key_md5.is_some(),
+        )?;
+        validate_object_key(&req.input.key)?;
+
+        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let part_number =
+            parse_multipart_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?;
+        let range = parse_copy_source_range(req.input.copy_source_range.as_deref())?;
+        let conditions = copy_source_conditions(
+            req.input.copy_source_if_match.as_ref(),
+            req.input.copy_source_if_none_match.as_ref(),
+            req.input.copy_source_if_modified_since.as_ref(),
+            req.input.copy_source_if_unmodified_since.as_ref(),
+        )?;
+
+        let (source_bucket, source_key, source_version_id) =
+            parse_copy_source(&req.input.copy_source)?;
+
+        // The auth layer only authorized the destination path; authorize the source here.
+        let source_bucket_info = drive(
+            GetBucketInfoOperation::new(source_bucket.clone()),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
+
+        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
+            AuthContext {
+                user_id: user_access.user_identity,
+                realm_id: user_access.user_identity.realm_id,
+                path_restrictions: user_access.path_restrictions.clone(),
+            }
+        } else {
+            AuthContext::anonymous(self.realm_id)
+        };
+        let source_allowed = drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: source_auth_context,
+                path: blob_object_permission_path(
+                    self.realm_id,
+                    source_bucket_info.group_id,
+                    self.node_id,
+                    &source_bucket,
+                    &source_key,
+                ),
+                required_permission: Permission::READ,
+            }),
+            &self.state,
+        )
+        .await
+        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+        if !source_allowed {
+            return Err(s3_error!(AccessDenied, "Permission denied"));
+        }
+
+        let result = upload_part_copy(
+            &self.state,
+            UploadPartCopyData {
+                source_bucket,
+                source_key,
+                source_version_id,
+                source_group_id: source_bucket_info.group_id,
+                dest_bucket: req.input.bucket,
+                dest_key: req.input.key,
+                upload_id,
+                part_number,
+                range,
+                user_id: user_access.user_identity,
+                conditions,
+            },
+        )
+        .await
+        .map_err(IntoS3Error::into_s3_error)?;
+
+        let mut copy_part_result = CopyPartResult {
+            e_tag: result
+                .part_location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(hex::encode(value))),
+            last_modified: Some(result.part_location.created_at.into()),
+            ..Default::default()
+        };
+        copy_part_result.apply_checksums(encode_checksums(
+            &result.part_location.hashes,
+            ChecksumSelection::AllStored,
+            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            None,
+        ));
+
+        Ok(S3Response::new(UploadPartCopyOutput {
+            copy_part_result: Some(copy_part_result),
+            copy_source_version_id: result
+                .source_version_id
+                .map(|version_id| version_id.to_string()),
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1065,12 +1588,21 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        debug!("Received COMPLETE MULTIPART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received COMPLETE MULTIPART Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let group_id = bucket_info
@@ -1078,7 +1610,7 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let checksum_request = parse_complete_multipart_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
@@ -1098,6 +1630,7 @@ impl S3 for ArunaS3Service {
             })
             .transpose()?
             .unwrap_or_default();
+        validate_composite_part_count(&checksum_request, completed_parts.len())?;
 
         let operation = CompleteMultipartUploadOperation::new(CMUI {
             bucket: req.input.bucket.clone(),
@@ -1107,8 +1640,10 @@ impl S3 for ArunaS3Service {
             node_id: self.node_id,
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),
+            checksum_algorithm: checksum_request.response_algorithm,
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
-            object_size: req.input.mpu_object_size.map(|size| size as u64),
+            checksum_type_explicit: checksum_request.checksum_type_declared,
+            object_size: req.input.mpu_object_size.map(checked_size).transpose()?,
             created_by: user_access.user_identity,
             quota_ceiling,
         });
@@ -1136,7 +1671,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        debug!("Received ABORT MULTIPART Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received ABORT MULTIPART Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1164,13 +1703,22 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        debug!("Received GET Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received GET Request"
+        );
 
         // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let requested_range = req.input.range;
         let version_id = parse_version_id(req.input.version_id)?;
@@ -1206,6 +1754,7 @@ impl S3 for ArunaS3Service {
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             result.last_refresh,
+            result.version_created_at,
         );
         let blob = if let Some(refresh) = reference_refresh {
             attach_reference_metadata_refresh(result.blob, self.state.clone(), refresh)
@@ -1234,9 +1783,14 @@ impl S3 for ArunaS3Service {
             && let Some(location) = result.location.as_ref()
         {
             output.apply_checksums(encode_checksums(
-                &location.hashes,
+                checksum_response_hashes(
+                    result.checksum_type,
+                    &location.hashes,
+                    &result.composite_hashes,
+                ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
+                result.part_count,
             ));
         }
 
@@ -1247,16 +1801,187 @@ impl S3 for ArunaS3Service {
         })
     }
 
-    #[tracing::instrument(err, skip(self, _req))]
+    #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn get_object_attributes(
         &self,
-        _req: S3Request<GetObjectAttributesInput>,
+        req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        Err(s3_error!(
-            NotImplemented,
-            "GetObjectAttributes is not implemented"
-        ))
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received GET OBJECT ATTRIBUTES Request"
+        );
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
+
+        let mut want_etag = false;
+        let mut want_checksum = false;
+        let mut want_object_parts = false;
+        let mut want_object_size = false;
+        let mut want_storage_class = false;
+        for attribute in req.input.object_attributes.iter() {
+            match attribute.as_str() {
+                ObjectAttributes::ETAG => want_etag = true,
+                ObjectAttributes::CHECKSUM => want_checksum = true,
+                ObjectAttributes::OBJECT_PARTS => want_object_parts = true,
+                ObjectAttributes::OBJECT_SIZE => want_object_size = true,
+                ObjectAttributes::STORAGE_CLASS => want_storage_class = true,
+                _ => {}
+            }
+        }
+        if !(want_etag
+            || want_checksum
+            || want_object_parts
+            || want_object_size
+            || want_storage_class)
+        {
+            return Err(s3_error!(
+                InvalidArgument,
+                "At least one object attribute must be specified"
+            ));
+        }
+
+        let requested_part_number_marker = req.input.part_number_marker;
+        let part_number_marker = match requested_part_number_marker {
+            None => None,
+            Some(marker) if marker < 0 => {
+                return Err(s3_error!(InvalidArgument, "Invalid part-number-marker"));
+            }
+            Some(marker) => Some(u16::try_from(marker).unwrap_or(u16::MAX)),
+        };
+        let max_parts = match req.input.max_parts {
+            None => ListPartsOperation::DEFAULT_MAX_PARTS,
+            Some(max_parts) => usize::try_from(max_parts)
+                .map_err(|_| s3_error!(InvalidArgument, "max-parts must be non-negative"))?
+                .min(ListPartsOperation::DEFAULT_MAX_PARTS),
+        };
+        let version_id = parse_version_id(req.input.version_id)?;
+
+        let result = drive(
+            GetObjectAttributesOperation::new(GOAI {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                version_id,
+                include_parts: want_object_parts,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to get object attributes"))?;
+
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            None,
+            result.version_created_at,
+        );
+
+        let composite_hashes = result
+            .summary
+            .as_ref()
+            .map(|summary| summary.composite_hashes.clone())
+            .unwrap_or_default();
+        let checksum = if want_checksum {
+            result.location.as_ref().map(|location| {
+                let encoded = encode_checksums(
+                    checksum_response_hashes(
+                        result.checksum_type,
+                        &location.hashes,
+                        &composite_hashes,
+                    ),
+                    ChecksumSelection::AllStored,
+                    s3_checksum_type_from_multipart(result.checksum_type),
+                    result.summary.as_ref().map(|summary| summary.part_count),
+                );
+                Checksum {
+                    checksum_crc32: encoded.checksum_crc32,
+                    checksum_crc32c: encoded.checksum_crc32c,
+                    checksum_crc64nvme: encoded.checksum_crc64nvme,
+                    checksum_sha1: encoded.checksum_sha1,
+                    checksum_sha256: encoded.checksum_sha256,
+                    checksum_type: encoded.checksum_type,
+                }
+            })
+        } else {
+            None
+        };
+
+        let object_parts = if want_object_parts {
+            result.summary.as_ref().map(|summary| {
+                let mut parts: Vec<&aruna_core::structs::MultipartObjectPart> =
+                    result.parts.iter().collect();
+                if let Some(marker) = part_number_marker {
+                    parts.retain(|part| part.part_number > marker);
+                }
+                let is_truncated = parts.len() > max_parts;
+                parts.truncate(max_parts);
+                // With max_parts=0 the truncation empties `parts`, so fall back to
+                // the marker preceding the first unreturned part (request marker/0).
+                let next_part_number_marker = is_truncated.then(|| {
+                    parts
+                        .last()
+                        .map(|part| part.part_number)
+                        .unwrap_or(part_number_marker.unwrap_or(0))
+                });
+                let object_part_list: Vec<ObjectPart> = parts
+                    .into_iter()
+                    .map(|part| {
+                        let checksums = encode_checksums(
+                            &part.hashes,
+                            ChecksumSelection::AllStored,
+                            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                            None,
+                        );
+                        ObjectPart {
+                            part_number: Some(i32::from(part.part_number)),
+                            size: Some(part.size as i64),
+                            checksum_crc32: checksums.checksum_crc32,
+                            checksum_crc32c: checksums.checksum_crc32c,
+                            checksum_crc64nvme: checksums.checksum_crc64nvme,
+                            checksum_sha1: checksums.checksum_sha1,
+                            checksum_sha256: checksums.checksum_sha256,
+                        }
+                    })
+                    .collect();
+                GetObjectAttributesParts {
+                    total_parts_count: Some(i32::try_from(summary.part_count).unwrap_or(i32::MAX)),
+                    is_truncated: Some(is_truncated),
+                    max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
+                    part_number_marker: requested_part_number_marker,
+                    next_part_number_marker: next_part_number_marker.map(i32::from),
+                    parts: Some(object_part_list),
+                }
+            })
+        } else {
+            None
+        };
+
+        let output = GetObjectAttributesOutput {
+            e_tag: want_etag.then(|| response_fields.e_tag.clone()).flatten(),
+            last_modified: response_fields.last_modified,
+            object_size: want_object_size
+                .then_some(response_fields.content_length)
+                .flatten(),
+            storage_class: want_storage_class
+                .then(|| StorageClass::from_static(StorageClass::STANDARD)),
+            version_id: result.version_id.map(|version_id| version_id.to_string()),
+            checksum,
+            object_parts,
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1264,12 +1989,21 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        debug!("Received HEAD Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received HEAD Request"
+        );
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
         let version_id = parse_version_id(req.input.version_id)?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: req.input.bucket,
@@ -1287,6 +2021,7 @@ impl S3 for ArunaS3Service {
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             result.last_refresh,
+            result.version_created_at,
         );
         let mut output = HeadObjectOutput {
             content_length: response_fields.content_length,
@@ -1302,21 +2037,407 @@ impl S3 for ArunaS3Service {
             && let Some(location) = result.location.as_ref()
         {
             output.apply_checksums(encode_checksums(
-                &location.hashes,
+                checksum_response_hashes(
+                    result.checksum_type,
+                    &location.hashes,
+                    &result.composite_hashes,
+                ),
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
+                result.part_count,
             ));
         }
 
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            max_parts = ?req.input.max_parts,
+            "Received LIST PARTS Request"
+        );
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        reject_sse(
+            req.input.sse_customer_algorithm.is_some()
+                || req.input.sse_customer_key.is_some()
+                || req.input.sse_customer_key_md5.is_some(),
+        )?;
+        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let part_number_marker = match req.input.part_number_marker {
+            None => None,
+            Some(marker) if marker < 0 => {
+                return Err(s3_error!(InvalidArgument, "Invalid part-number-marker"));
+            }
+            Some(marker) => Some(u16::try_from(marker).unwrap_or(u16::MAX)),
+        };
+        let max_parts = match req.input.max_parts {
+            None => ListPartsOperation::DEFAULT_MAX_PARTS,
+            Some(max_parts) => usize::try_from(max_parts)
+                .map_err(|_| s3_error!(InvalidArgument, "max-parts must be non-negative"))?
+                .min(ListPartsOperation::DEFAULT_MAX_PARTS),
+        };
+
+        let result = drive(
+            ListPartsOperation::new(LPI {
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                upload_id,
+                part_number_marker,
+                max_parts,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list parts"))?;
+
+        let checksum_algorithm = result
+            .upload
+            .checksum_hint
+            .as_ref()
+            .and_then(|hint| hint.algorithm)
+            .and_then(s3_checksum_algorithm_from_core);
+        let checksum_type = result
+            .upload
+            .checksum_hint
+            .as_ref()
+            .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type));
+        let initiator = Some(Initiator {
+            display_name: None,
+            id: Some(result.upload.created_by.to_string()),
+        });
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(result.upload.group_id.to_string()),
+        });
+
+        let parts = result
+            .parts
+            .into_iter()
+            .map(|part| {
+                let checksums = encode_checksums(
+                    &part.location.hashes,
+                    ChecksumSelection::AllStored,
+                    ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+                    None,
+                );
+                Part {
+                    part_number: Some(i32::from(part.part_number)),
+                    size: Some(part.location.blob_size as i64),
+                    last_modified: Some(part.created_at.into()),
+                    e_tag: part
+                        .location
+                        .hashes
+                        .get(HASH_MD5)
+                        .map(|value| ETag::Strong(hex::encode(value))),
+                    checksum_crc32: checksums.checksum_crc32,
+                    checksum_crc32c: checksums.checksum_crc32c,
+                    checksum_crc64nvme: checksums.checksum_crc64nvme,
+                    checksum_sha1: checksums.checksum_sha1,
+                    checksum_sha256: checksums.checksum_sha256,
+                }
+            })
+            .collect();
+
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            upload_id: Some(req.input.upload_id),
+            part_number_marker: req.input.part_number_marker,
+            max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_part_number_marker: result.next_part_number_marker.map(i32::from),
+            parts: Some(parts),
+            initiator,
+            owner,
+            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+            checksum_algorithm,
+            checksum_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            "Received LIST MULTIPART UPLOADS Request"
+        );
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let key_marker = req.input.key_marker.clone();
+        let requested_upload_id_marker = req.input.upload_id_marker.clone();
+        let upload_id_marker =
+            parse_upload_id_marker(key_marker.as_deref(), requested_upload_id_marker.as_deref())?;
+        let max_uploads = match req.input.max_uploads {
+            None => ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS,
+            Some(max_uploads) => usize::try_from(max_uploads)
+                .map_err(|_| s3_error!(InvalidArgument, "max-uploads must be non-negative"))?
+                .min(ListMultipartUploadsOperation::DEFAULT_MAX_UPLOADS),
+        };
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(LMUI {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                key_marker: key_marker.clone(),
+                upload_id_marker,
+                max_uploads,
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list multipart uploads"))?;
+
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let uploads: Vec<S3MultipartUpload> = result
+            .uploads
+            .into_iter()
+            .map(|record| S3MultipartUpload {
+                key: Some(encode_field(record.key)),
+                upload_id: Some(record.upload_id.to_string()),
+                initiated: Some(record.created_at.into()),
+                initiator: Some(Initiator {
+                    display_name: None,
+                    id: Some(record.created_by.to_string()),
+                }),
+                owner: Some(Owner {
+                    display_name: None,
+                    id: Some(record.group_id.to_string()),
+                }),
+                storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                checksum_algorithm: record
+                    .checksum_hint
+                    .as_ref()
+                    .and_then(|hint| hint.algorithm)
+                    .and_then(s3_checksum_algorithm_from_core),
+                checksum_type: record
+                    .checksum_hint
+                    .as_ref()
+                    .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type)),
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(S3Response::new(ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            delimiter: delimiter.map(&encode_field),
+            key_marker: key_marker.map(&encode_field),
+            upload_id_marker: requested_upload_id_marker,
+            max_uploads: Some(i32::try_from(max_uploads).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_key_marker: result.next_key_marker.map(&encode_field),
+            next_upload_id_marker: result
+                .next_upload_id_marker
+                .map(|upload_id| upload_id.to_string()),
+            uploads: Some(uploads),
+            common_prefixes: Some(common_prefixes),
+            encoding_type: req.input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            "Received LIST OBJECT VERSIONS Request"
+        );
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let key_marker = req.input.key_marker.clone();
+        let requested_version_id_marker = req.input.version_id_marker.clone();
+        let version_id_marker = match requested_version_id_marker.as_deref() {
+            None => None,
+            Some(marker) => Some(
+                ulid::Ulid::from_string(marker)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid version-id-marker"))?,
+            ),
+        };
+        let max_keys = match req.input.max_keys {
+            None => ListObjectVersionsOperation::DEFAULT_MAX_KEYS,
+            Some(max_keys) => usize::try_from(max_keys)
+                .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
+                .min(ListObjectVersionsOperation::DEFAULT_MAX_KEYS),
+        };
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+
+        let result = drive(
+            ListObjectVersionsOperation::new(LOVI {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                key_marker: key_marker.clone(),
+                version_id_marker,
+                max_keys: Some(max_keys),
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list object versions"))?;
+
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(group_id.to_string()),
+        });
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        for item in result.items {
+            match item {
+                ListObjectVersionsItem::Version {
+                    key,
+                    version_id,
+                    is_latest,
+                    location,
+                    source_metadata,
+                    created_at,
+                } => {
+                    let response_fields = self.build_object_response_fields(
+                        location.as_ref(),
+                        source_metadata.as_ref(),
+                        None,
+                        Some(created_at),
+                    );
+                    versions.push(ObjectVersion {
+                        key: Some(encode_field(key)),
+                        version_id: Some(version_id.to_string()),
+                        is_latest: Some(is_latest),
+                        last_modified: Some(created_at.into()),
+                        e_tag: response_fields.e_tag,
+                        size: response_fields.content_length,
+                        owner: owner.clone(),
+                        storage_class: Some(ObjectVersionStorageClass::from_static(
+                            ObjectVersionStorageClass::STANDARD,
+                        )),
+                        ..Default::default()
+                    });
+                }
+                ListObjectVersionsItem::DeleteMarker {
+                    key,
+                    version_id,
+                    is_latest,
+                    created_at,
+                } => {
+                    delete_markers.push(DeleteMarkerEntry {
+                        key: Some(encode_field(key)),
+                        version_id: Some(version_id.to_string()),
+                        is_latest: Some(is_latest),
+                        last_modified: Some(created_at.into()),
+                        owner: owner.clone(),
+                    });
+                }
+            }
+        }
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(S3Response::new(ListObjectVersionsOutput {
+            name: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            delimiter: delimiter.map(&encode_field),
+            key_marker: key_marker.map(&encode_field),
+            version_id_marker: requested_version_id_marker,
+            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+            is_truncated: Some(result.is_truncated),
+            next_key_marker: result.next_key_marker.map(&encode_field),
+            next_version_id_marker: result
+                .next_version_id_marker
+                .map(|version_id| version_id.to_string()),
+            versions: Some(versions),
+            delete_markers: Some(delete_markers),
+            common_prefixes: Some(common_prefixes),
+            encoding_type: req.input.encoding_type,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        debug!("Received DELETE Request: {:#?}", req);
+        debug!(
+            bucket = %req.input.bucket,
+            key = %req.input.key,
+            "Received DELETE Request"
+        );
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -1358,12 +2479,173 @@ impl S3 for ArunaS3Service {
         .await
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(self, req))]
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            objects = req.input.delete.objects.len(),
+            "Received DELETE OBJECTS Request"
+        );
+
+        let body = req
+            .extensions
+            .get::<DeleteObjectsBody>()
+            .ok_or_else(|| s3_error!(InternalError, "Missing DeleteObjects request body"))?
+            .bytes();
+        validate_delete_checksum(&req.headers, &body)?;
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        if req.input.delete.objects.len() > 1000 {
+            return Err(s3_error!(
+                MalformedXML,
+                "The number of keys in a delete request must not exceed 1000."
+            ));
+        }
+
+        let quiet = req.input.delete.quiet.unwrap_or(false);
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
+        let bucket = req.input.bucket;
+
+        let mut entries = Vec::with_capacity(req.input.delete.objects.len());
+        let mut errors: Vec<S3DeleteError> = Vec::new();
+        for object in req.input.delete.objects {
+            let version_id = match parse_version_id(object.version_id.clone()) {
+                Ok(version_id) => version_id,
+                Err(_) => {
+                    errors.push(S3DeleteError {
+                        code: Some("NoSuchVersion".to_string()),
+                        key: Some(object.key),
+                        version_id: object.version_id,
+                        message: Some("The specified version does not exist.".to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            // DeleteObjects carries no object key in the request path, so the auth
+            // layer defers object authorization to here; check every entry.
+            let allowed = drive(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: replication_auth.clone(),
+                    path: blob_object_permission_path(
+                        self.realm_id,
+                        user_access.group_id,
+                        self.node_id,
+                        &bucket,
+                        &object.key,
+                    ),
+                    required_permission: Permission::WRITE,
+                }),
+                &self.state,
+            )
+            .await
+            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+            if !allowed {
+                errors.push(S3DeleteError {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(object.key),
+                    version_id: object.version_id,
+                    message: Some("Access Denied".to_string()),
+                });
+                continue;
+            }
+
+            entries.push(DeleteObjectsEntry {
+                key: object.key,
+                version_id,
+            });
+        }
+
+        let outcomes = delete_objects(
+            &self.state,
+            DOSI {
+                bucket: bucket.clone(),
+                entries,
+                group_id: user_access.group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                deleted_by: user_access.user_identity,
+            },
+        )
+        .await;
+
+        let mut deleted = Vec::new();
+        for outcome in outcomes {
+            match outcome.result {
+                Ok(result) => {
+                    if outcome.requested_version_id.is_none() {
+                        self.queue_live_version_replication(
+                            replication_auth.clone(),
+                            bucket.clone(),
+                            outcome.key.clone(),
+                            result.version_id,
+                            result.delete_marker,
+                        )
+                        .await;
+                    }
+                    let deleted_object = if outcome.requested_version_id.is_none() {
+                        DeletedObject {
+                            key: Some(outcome.key),
+                            delete_marker: Some(result.delete_marker),
+                            delete_marker_version_id: Some(result.version_id.to_string()),
+                            ..Default::default()
+                        }
+                    } else {
+                        DeletedObject {
+                            key: Some(outcome.key),
+                            version_id: Some(result.version_id.to_string()),
+                            delete_marker: Some(result.delete_marker),
+                            delete_marker_version_id: result
+                                .delete_marker
+                                .then(|| result.version_id.to_string()),
+                        }
+                    };
+                    deleted.push(deleted_object);
+                }
+                Err(DeleteObjectError::NoSuchVersion) => errors.push(S3DeleteError {
+                    code: Some("NoSuchVersion".to_string()),
+                    key: Some(outcome.key),
+                    version_id: outcome.requested_version_id.map(|id| id.to_string()),
+                    message: Some("The specified version does not exist.".to_string()),
+                }),
+                Err(err) => {
+                    warn!(error = %err, key = %outcome.key, "DeleteObjects entry failed");
+                    errors.push(S3DeleteError {
+                        code: Some("InternalError".to_string()),
+                        key: Some(outcome.key),
+                        version_id: outcome.requested_version_id.map(|id| id.to_string()),
+                        message: Some(
+                            "We encountered an internal error. Please try again.".to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(S3Response::new(DeleteObjectsOutput {
+            deleted: (!quiet).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
     async fn delete_bucket(
         &self,
         req: S3Request<DeleteBucketInput>,
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        debug!("Received DELETE BUCKET Request: {:#?}", req);
+        debug!(bucket = %req.input.bucket, "Received DELETE BUCKET Request");
 
         drive(DeleteBucketOperation::new(req.input.bucket), &self.state)
             .await
@@ -1454,7 +2736,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     };
     use aruna_core::structs::{
         Actor, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
@@ -1488,6 +2770,25 @@ mod tests {
         key: String,
         version_id: Ulid,
         created_by: UserId,
+    }
+
+    #[test]
+    fn upload_id_marker_is_ignored_without_key_marker() {
+        assert_eq!(
+            parse_upload_id_marker(None, Some("not-a-ulid")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_upload_id_marker(Some(""), Some("not-a-ulid")).unwrap(),
+            None
+        );
+
+        let marker = Ulid::r#gen();
+        assert_eq!(
+            parse_upload_id_marker(Some("key"), Some(&marker.to_string())).unwrap(),
+            Some(marker)
+        );
+        assert!(parse_upload_id_marker(Some("key"), Some("not-a-ulid")).is_err());
     }
 
     #[tokio::test]
@@ -1543,6 +2844,8 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
+            composite_part_count: None,
         };
         let response = service
             .put_object_response(
@@ -1719,6 +3022,8 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
+            composite_part_count: None,
         };
 
         service
@@ -1792,6 +3097,8 @@ mod tests {
             expected: Vec::new(),
             response_algorithm: None,
             checksum_type: ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+            checksum_type_declared: false,
+            composite_part_count: None,
         };
 
         service
@@ -2236,6 +3543,174 @@ mod tests {
             created_at: UNIX_EPOCH,
             created_by,
             cors_configuration: None,
+        }
+    }
+
+    async fn setup_copy_source_authorization(
+        same_group: bool,
+        public: bool,
+    ) -> (TempDir, ArunaS3Service, UserAccess, BucketInfo) {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([36u8; 32]);
+        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let credential_group_id = Ulid::r#gen();
+        let source_group_id = if same_group {
+            credential_group_id
+        } else {
+            Ulid::r#gen()
+        };
+        let user_access = test_user_access(credential_group_id, realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_access.user_identity,
+            realm_id,
+        };
+        let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_access.user_identity,
+            realm_id,
+            source_group_id,
+        );
+        if public {
+            source_auth
+                .roles
+                .values_mut()
+                .find(|role| role.name == "viewer")
+                .unwrap()
+                .assigned_users
+                .insert(UserId::nil(realm_id));
+        }
+
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+            RealmAuthorizationDocument::new_default_realm_doc(realm_id)
+                .to_bytes(&actor)
+                .unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            AUTH_KEYSPACE,
+            source_group_id.to_bytes().to_vec(),
+            source_auth.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        write_storage_value(
+            &storage_handle,
+            S3_BUCKET_KEYSPACE,
+            b"source".to_vec(),
+            test_bucket_info(source_group_id, user_access.user_identity)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await;
+
+        let destination_info = test_bucket_info(credential_group_id, user_access.user_identity);
+        (
+            storage_dir,
+            ArunaS3Service::new(context, realm_id, node_id).await,
+            user_access,
+            destination_info,
+        )
+    }
+
+    fn test_copy_request<T>(
+        input: T,
+        user_access: UserAccess,
+        bucket_info: BucketInfo,
+    ) -> S3Request<T> {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access);
+        extensions.insert(bucket_info);
+        S3Request {
+            input,
+            method: Method::PUT,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_object_scopes_source_authorization_to_credential_group() {
+        for (same_group, public, allowed) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let (_storage_dir, service, user_access, bucket_info) =
+                setup_copy_source_authorization(same_group, public).await;
+            let input = CopyObjectInput::builder()
+                .bucket("destination".to_string())
+                .key("copied".to_string())
+                .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
+                .metadata_directive(Some(MetadataDirective::from_static(
+                    MetadataDirective::REPLACE,
+                )))
+                .build()
+                .unwrap();
+            let error = service
+                .copy_object(test_copy_request(input, user_access, bucket_info))
+                .await
+                .unwrap_err();
+            let expected = if allowed {
+                S3ErrorCode::NotImplemented
+            } else {
+                S3ErrorCode::AccessDenied
+            };
+            assert_eq!(
+                *error.code(),
+                expected,
+                "same_group={same_group}, public={public}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_scopes_source_authorization_to_credential_group() {
+        for (same_group, public, allowed) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let (_storage_dir, service, user_access, bucket_info) =
+                setup_copy_source_authorization(same_group, public).await;
+            let input = UploadPartCopyInput::builder()
+                .bucket("destination".to_string())
+                .key("copied".to_string())
+                .copy_source(s3s::dto::CopySource::parse("source/object").unwrap())
+                .upload_id(Ulid::r#gen().to_string())
+                .part_number(1)
+                .build()
+                .unwrap();
+            let error = service
+                .upload_part_copy(test_copy_request(input, user_access, bucket_info))
+                .await
+                .unwrap_err();
+            let expected = if allowed {
+                S3ErrorCode::NoSuchUpload
+            } else {
+                S3ErrorCode::AccessDenied
+            };
+            assert_eq!(
+                *error.code(),
+                expected,
+                "same_group={same_group}, public={public}"
+            );
         }
     }
 

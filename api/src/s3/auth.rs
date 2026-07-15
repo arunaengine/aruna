@@ -97,19 +97,27 @@ impl S3Access for AuthProvider {
             .build_authorization_path(cx, &user_access, &action)
             .await?;
 
-        let allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path,
-                required_permission,
-            }),
-            self.driver_ctx.as_ref(),
-        )
-        .await
-        .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
+        // DeleteObjects lists its target keys in the request body rather than the
+        // URL, so the path resolves to the bucket and a bucket-level check would
+        // deny prefix-scoped tokens outright. Defer object authorization to the
+        // handler, which checks each entry individually. Credentials, issuer,
+        // expiry, revocation and bucket ownership are already validated above, so
+        // anonymous and cross-group requests still fail closed here.
+        if cx.s3_op().name() != "DeleteObjects" {
+            let allowed = drive(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context,
+                    path,
+                    required_permission,
+                }),
+                self.driver_ctx.as_ref(),
+            )
+            .await
+            .map_err(|_| s3_error!(InternalError, "Failed to check permissions"))?;
 
-        if !allowed {
-            return Err(s3_error!(AccessDenied, "Permission denied"));
+            if !allowed {
+                return Err(s3_error!(AccessDenied, "Permission denied"));
+            }
         }
 
         cx.extensions_mut().insert(user_access);

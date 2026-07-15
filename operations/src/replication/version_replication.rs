@@ -1843,6 +1843,7 @@ mod tests {
                 MultipartObjectSummary {
                     checksum_type: MultipartChecksumType::Composite,
                     part_count: 3,
+                    composite_hashes: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -1907,6 +1908,7 @@ mod tests {
                 MultipartObjectSummary {
                     checksum_type: MultipartChecksumType::Composite,
                     part_count: 2,
+                    composite_hashes: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()
