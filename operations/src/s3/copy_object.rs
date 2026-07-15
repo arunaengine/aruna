@@ -69,6 +69,13 @@ pub(crate) fn evaluate_source_conditions(
     last_modified: Option<SystemTime>,
     source_exists: bool,
 ) -> Result<(), CopyObjectError> {
+    let last_modified = last_modified.map(|last_modified| {
+        last_modified
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| UNIX_EPOCH + Duration::from_secs(duration.as_secs()))
+            .unwrap_or(last_modified)
+    });
+
     // AWS precedence: x-amz-copy-source-if-match overrides if-unmodified-since.
     match conditions.if_match.as_deref() {
         Some(expected) => {
@@ -644,7 +651,7 @@ mod test {
     }
 
     #[test]
-    fn if_unmodified_since_rejects_newer_source() {
+    fn checks_unmodified_precision() {
         let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let conditions = CopySourceConditions {
             if_unmodified_since: Some(threshold),
@@ -660,10 +667,19 @@ mod test {
             Err(CopyObjectError::PreconditionFailed)
         );
         assert!(evaluate_source_conditions(&conditions, None, Some(threshold), true).is_ok());
+        assert!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_millis(500)),
+                true,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn if_modified_since_rejects_unchanged_source() {
+    fn checks_modified_precision() {
         let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let conditions = CopySourceConditions {
             if_modified_since: Some(threshold),
@@ -671,6 +687,15 @@ mod test {
         };
         assert_eq!(
             evaluate_source_conditions(&conditions, None, Some(threshold), true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert_eq!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_millis(500)),
+                true,
+            ),
             Err(CopyObjectError::PreconditionFailed)
         );
         assert!(
