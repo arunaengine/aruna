@@ -109,7 +109,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let compute_handle = build_compute_registry(&config);
+    let compute_handle = build_compute_registry(&config).await;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
@@ -433,8 +433,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build the executor registry from config. The Docker backend is opt-in via
-/// `ARUNA_COMPUTE_DOCKER=true`; registration requires a container-reachable S3 endpoint.
-fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
+/// `ARUNA_COMPUTE_DOCKER=true`; registration requires a healthy daemon and an
+/// explicit container-reachable S3 endpoint.
+async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
     let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -459,6 +460,10 @@ fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Executor
     }
     match aruna_compute::docker::DockerBackend::connect() {
         Ok(backend) => {
+            if let Err(error) = aruna_compute::ExecutorBackend::health(&backend).await {
+                warn!(error = %error, "Docker executor requested but unavailable; running without compute");
+                return None;
+            }
             let registry = aruna_compute::ExecutorRegistry::new()
                 .with_backend(Arc::new(backend))
                 .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string());
