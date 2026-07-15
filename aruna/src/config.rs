@@ -1468,7 +1468,7 @@ mod tests {
         let _guard = env_lock().lock().await;
         let key = "ARUNA_NODE_LABELS";
         let previous = vec![(key.to_string(), std::env::var(key).ok())];
-        unsafe { std::env::set_var(key, "aruna.io/kind=Server") };
+        unsafe { std::env::set_var(key, "aruna-engine.org/kind=Server") };
 
         let error = parse_node_labels_env().expect_err("reserved key should fail");
         assert!(matches!(

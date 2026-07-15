@@ -617,6 +617,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
             api: None,
             s3: None,
         },
+        false,
     )
     .await
     .map_err(std::io::Error::other)?;
@@ -746,6 +747,7 @@ async fn spawn_joiner_node_with_mode(
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
+        false,
     )
     .await
     .map_err(std::io::Error::other)?;

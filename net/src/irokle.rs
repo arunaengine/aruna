@@ -12252,6 +12252,7 @@ mod tests {
 
         let owned = NodeInfoDocument {
             node_id,
+            compute_capable: false,
             labels: std::collections::BTreeMap::new(),
             urls: NodeUrls {
                 api: None,

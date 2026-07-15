@@ -724,7 +724,7 @@ pub struct RealmNodeInfoResponse {
     pub connection_status: RealmNodeConnectionStatus,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<RealmNodePlacementResponse>,
-    /// Latest published node info document (labels/urls/utilization) if received.
+    /// Latest published node info document (capabilities/labels/urls/utilization) if received.
     pub info: Option<RealmNodeInfoDocumentResponse>,
 }
 
@@ -738,6 +738,7 @@ pub struct RealmNodePlacementResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmNodeInfoDocumentResponse {
+    pub compute_capable: bool,
     pub labels: std::collections::BTreeMap<String, String>,
     pub urls: RealmNodeUrlsResponse,
     pub utilization: RealmNodeUtilizationResponse,
@@ -887,6 +888,7 @@ fn map_node_info_document(
     document: &aruna_core::structs::NodeInfoDocument,
 ) -> RealmNodeInfoDocumentResponse {
     RealmNodeInfoDocumentResponse {
+        compute_capable: document.compute_capable,
         labels: document.labels.clone(),
         urls: RealmNodeUrlsResponse {
             api: document.urls.api.clone(),
@@ -2555,6 +2557,7 @@ mod tests {
         // the default location/weight. Publish a node info document for it too.
         let document = NodeInfoDocument {
             node_id,
+            compute_capable: true,
             labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
             urls: NodeUrls {
                 api: None,
@@ -2597,6 +2600,7 @@ mod tests {
         assert!(!placement.draining);
 
         let node_info = node.info.as_ref().expect("node info document present");
+        assert!(node_info.compute_capable);
         assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
         assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
         assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
