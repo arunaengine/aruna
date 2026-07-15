@@ -89,7 +89,8 @@ async fn idempotent_submit() {
     let listed = list_by_name(&attempt.external_name()).await;
     assert_eq!(listed, 1, "exactly one container must exist for the name");
 
-    let _ = backend.cleanup(&attempt).await;
+    backend.cleanup(&attempt).await.unwrap();
+    backend.cleanup(&attempt).await.unwrap();
 }
 
 #[tokio::test]

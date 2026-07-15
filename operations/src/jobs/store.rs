@@ -7,11 +7,11 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::{
     AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload, JobProgress,
-    JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus, crate_job_id,
-    encode_job_dedup_value, job_due_index_key, job_lease_index_key, job_owner_cursor,
-    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
-    job_run_crate_key, parse_job_dedup_value, parse_job_owner_index_key, run_crate_dedup_key,
-    validate_transition,
+    JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus, UserAccess,
+    cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value, job_due_index_key,
+    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
+    job_prune_index_key, job_record_key, job_run_crate_key, parse_job_dedup_value,
+    parse_job_owner_index_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -91,7 +91,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
             empty_value(),
         ),
     ];
-    if !matches!(&record.payload, JobPayload::WriteRunCrate { .. }) {
+    if !record.payload.is_internal() {
         writes.push((
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
             job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
@@ -239,12 +239,45 @@ where
                 .map_err(JobMutationError::Storage)?;
             if !old.state.is_terminal() && record.state.is_terminal() {
                 insert_crate_obligation(storage, txn_id, &record).await?;
+                insert_cleanup_obligation(storage, txn_id, &record).await?;
                 mark_crate_failed(storage, txn_id, &record).await?;
             }
             cleanup_dedup_entry(storage, txn_id, &old, &record).await?;
             Ok(record)
         }
     }
+}
+
+async fn insert_cleanup_obligation(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &JobRecord,
+) -> Result<(), JobMutationError> {
+    if !matches!(&record.payload, JobPayload::Execution(_)) {
+        return Ok(());
+    }
+    let access_key =
+        UserAccess::build_access_key(&record.created_by, &workspace_credential_id(record.job_id))
+            .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    let child = JobRecord::new(
+        cleanup_job_id(record.job_id),
+        JobPayload::TerminalCleanup {
+            for_job: record.job_id,
+            attempt: record.attempt_intent.clone(),
+            access_key,
+        },
+        record.created_by,
+        record.owner_node_id,
+        now_ms,
+        now_ms,
+        Some(cleanup_dedup_key(record.job_id)),
+    );
+    let writes =
+        job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    batch_write(storage, writes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)
 }
 
 async fn insert_crate_obligation(
@@ -612,7 +645,9 @@ pub async fn requeue_job(
         record.attempts = record.attempts.saturating_add(1);
         record.updated_at_ms = now_ms;
         record.claim = None;
-        if record.attempts >= JOB_MAX_ATTEMPTS {
+        if record.attempts >= JOB_MAX_ATTEMPTS
+            && !matches!(&record.payload, JobPayload::TerminalCleanup { .. })
+        {
             record.state = JobState::Failed;
             record.finished_at_ms = Some(now_ms);
         } else {
@@ -1122,7 +1157,7 @@ pub async fn list_jobs_for_user(
                 parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
             resume = Some(key);
             if let Some(record) = read_job_record(storage, job_id, None).await?
-                && !matches!(&record.payload, JobPayload::WriteRunCrate { .. })
+                && !record.payload.is_internal()
                 && filter(&record)
             {
                 if records.len() == limit {
@@ -1347,7 +1382,8 @@ async fn delete_raw(
 mod tests {
     use super::*;
     use aruna_core::structs::{
-        JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId, parse_job_schedule_index_key,
+        ComputeResources, ExecutionSpec, JOB_LEASE_INDEX_PREFIX, JobPayload, RealmId,
+        parse_job_schedule_index_key,
     };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
@@ -1609,6 +1645,43 @@ mod tests {
         };
         assert_eq!(failed.state, JobState::Failed);
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_forever() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xC5; 16]);
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::TerminalCleanup {
+                for_job: JobId::from_bytes([0xC6; 16]),
+                attempt: None,
+                access_key: "access".to_string(),
+            },
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::r#gen(),
+            lease_expires_at_ms: 5_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let RequeueOutcome::Requeued(requeued) =
+            requeue_job(&storage, job_id, None, 6_000, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("cleanup must remain retryable");
+        };
+        assert_eq!(requeued.state, JobState::Queued);
+        assert_eq!(requeued.attempts, JOB_MAX_ATTEMPTS);
     }
 
     #[tokio::test]
@@ -1953,6 +2026,134 @@ mod tests {
             .unwrap();
         assert!(listed.is_empty(), "stale owner entries stay hidden");
         assert!(cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_jobs_hidden() {
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let job_id = JobId::from_bytes([0xC7; 16]);
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::TerminalCleanup {
+                for_job: JobId::from_bytes([0xC8; 16]),
+                attempt: None,
+                access_key: "access".to_string(),
+            },
+            owner,
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        insert_job(&storage, &record).await.unwrap();
+
+        let (indexed, _) = iter_prefix_page(
+            &storage,
+            JOB_OWNER_INDEX_KEYSPACE,
+            Some(job_owner_index_prefix(owner)),
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(indexed.is_empty());
+
+        batch_write(
+            &storage,
+            vec![(
+                JOB_OWNER_INDEX_KEYSPACE.to_string(),
+                job_owner_index_key(owner, record.created_at_ms, job_id),
+                empty_value(),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+        let (listed, cursor) = list_jobs_for_user(&storage, owner, None, 1, |_| true)
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+        assert!(cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_enqueues_cleanup() {
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let job_id = JobId::from_bytes([0xC9; 16]);
+        let token = Ulid::from_bytes([0xCA; 16]);
+        let intent = AttemptIntent {
+            attempt_no: 2,
+            external_name: aruna_core::structs::attempt_external_name(job_id, 2),
+            executor_kind: "docker".to_string(),
+        };
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                output_prefixes: Vec::new(),
+            }),
+            owner,
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = JobState::Running;
+        record.attempt_intent = Some(intent.clone());
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(7),
+            claim_token: token,
+            lease_expires_at_ms: 5_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let terminal = complete_job(
+            &storage,
+            job_id,
+            token,
+            JobResultPayload::Execution {
+                exit_code: Some(0),
+                workspace_bucket: "ws-test".to_string(),
+                outputs: Vec::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            JobProgress::new("phases"),
+            6_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(terminal.claim.is_none());
+        let child = read_job_record(&storage, cleanup_job_id(job_id), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_access =
+            UserAccess::build_access_key(&owner, &workspace_credential_id(job_id)).unwrap();
+        assert_eq!(
+            child.payload,
+            JobPayload::TerminalCleanup {
+                for_job: job_id,
+                attempt: Some(intent),
+                access_key: expected_access,
+            }
+        );
+        assert_eq!(child.state, JobState::Queued);
+        assert!(child.payload.is_internal());
     }
 
     #[tokio::test]

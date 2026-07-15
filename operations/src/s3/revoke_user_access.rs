@@ -93,6 +93,14 @@ impl RevokeUserAccessOperation {
             Ok(access) => access,
             Err(err) => return self.emit_error(err.into()),
         };
+        if access.revoked_at.is_some() {
+            let Some(txn_id) = self.txn_id else {
+                return self.emit_error(RevokeUserAccessError::NoTransactionFound);
+            };
+            self.output = Some(Ok(access));
+            self.state = RevokeUserAccessState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
         access.revoked_at = Some(SystemTime::now());
         let bytes = match access.to_bytes() {
             Ok(bytes) => bytes,
@@ -170,9 +178,11 @@ impl Operation for RevokeUserAccessOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id.map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+        self.txn_id
+            .take()
+            .map_or_else(smallvec::SmallVec::new, |txn_id| {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            })
     }
 }
 

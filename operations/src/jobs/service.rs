@@ -69,10 +69,7 @@ pub async fn read_owned_job(
 ) -> Result<Option<JobRecord>, String> {
     Ok(
         match read_job_record(&context.storage_handle, job_id, None).await? {
-            Some(record)
-                if record.created_by == user_id
-                    && !matches!(&record.payload, JobPayload::WriteRunCrate { .. }) =>
-            {
+            Some(record) if record.created_by == user_id && !record.payload.is_internal() => {
                 Some(record)
             }
             _ => None,
@@ -161,38 +158,44 @@ mod tests {
             compute_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
-        let job_id = JobId::from_bytes([0xC3; 16]);
-        let record = JobRecord::new(
-            job_id,
-            JobPayload::WriteRunCrate {
-                for_job: JobId::from_bytes([0xC4; 16]),
-            },
-            owner,
-            node_id(),
-            1_000,
-            1_000,
-            None,
-        );
-        insert_job(&storage, &record).await.unwrap();
+        let runtime = JobsRuntime::new();
+        for (job_id, payload) in [
+            (
+                JobId::from_bytes([0xC3; 16]),
+                JobPayload::WriteRunCrate {
+                    for_job: JobId::from_bytes([0xC4; 16]),
+                },
+            ),
+            (
+                JobId::from_bytes([0xC5; 16]),
+                JobPayload::TerminalCleanup {
+                    for_job: JobId::from_bytes([0xC6; 16]),
+                    attempt: None,
+                    access_key: "access".to_string(),
+                },
+            ),
+        ] {
+            let record = JobRecord::new(job_id, payload, owner, node_id(), 1_000, 1_000, None);
+            insert_job(&storage, &record).await.unwrap();
 
-        assert!(
-            read_owned_job(&context, owner, job_id)
+            assert!(
+                read_owned_job(&context, owner, job_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                cancel_owned_job(&context, &runtime, owner, job_id)
+                    .await
+                    .unwrap(),
+                CancelJobOutcome::NotFound
+            ));
+            let stored = read_job_record(&storage, job_id, None)
                 .await
                 .unwrap()
-                .is_none()
-        );
-        let runtime = JobsRuntime::new();
-        assert!(matches!(
-            cancel_owned_job(&context, &runtime, owner, job_id)
-                .await
-                .unwrap(),
-            CancelJobOutcome::NotFound
-        ));
-        let stored = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!stored.cancel_requested);
-        assert_eq!(stored.state, JobState::Queued);
+                .unwrap();
+            assert!(!stored.cancel_requested);
+            assert_eq!(stored.state, JobState::Queued);
+        }
     }
 }

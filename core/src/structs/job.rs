@@ -194,6 +194,13 @@ pub enum JobPayload {
     /// job. Idempotent by dedup key `run-crate/{JobId}`; a failure never affects
     /// the parent job.
     WriteRunCrate { for_job: JobId },
+    /// Durable internal obligation to revoke the workspace credential and remove
+    /// the terminal backend attempt.
+    TerminalCleanup {
+        for_job: JobId,
+        attempt: Option<AttemptIntent>,
+        access_key: String,
+    },
 }
 
 impl JobPayload {
@@ -203,6 +210,7 @@ impl JobPayload {
             JobPayload::Probe { .. } => "probe",
             JobPayload::Execution(_) => "execution",
             JobPayload::WriteRunCrate { .. } => "write_run_crate",
+            JobPayload::TerminalCleanup { .. } => "terminal_cleanup",
         }
     }
 
@@ -211,7 +219,7 @@ impl JobPayload {
         match self {
             JobPayload::Probe { .. } => "steps",
             JobPayload::Execution(_) => "phases",
-            JobPayload::WriteRunCrate { .. } => "steps",
+            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. } => "steps",
         }
     }
 
@@ -219,11 +227,18 @@ impl JobPayload {
     /// are not. Only `Execution` drives an external container.
     pub fn execution_class(&self) -> JobExecutionClass {
         match self {
-            JobPayload::Probe { .. } | JobPayload::WriteRunCrate { .. } => {
-                JobExecutionClass::InProcess
-            }
+            JobPayload::Probe { .. }
+            | JobPayload::WriteRunCrate { .. }
+            | JobPayload::TerminalCleanup { .. } => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
+    }
+
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. }
+        )
     }
 
     /// Canonical plan digest: BLAKE3 over the postcard encoding of the payload.
@@ -296,6 +311,7 @@ pub enum JobResultPayload {
     RunCrate {
         resource: String,
     },
+    Cleanup,
 }
 
 impl JobResultPayload {
@@ -304,6 +320,7 @@ impl JobResultPayload {
             JobResultPayload::Probe { .. } => "probe",
             JobResultPayload::Execution { .. } => "execution",
             JobResultPayload::RunCrate { .. } => "run_crate",
+            JobResultPayload::Cleanup => "cleanup",
         }
     }
 
@@ -336,6 +353,7 @@ impl JobResultPayload {
             JobResultPayload::RunCrate { resource } => {
                 serde_json::json!({ "resource": resource })
             }
+            JobResultPayload::Cleanup => serde_json::json!({}),
         }
     }
 }
@@ -641,6 +659,24 @@ pub fn crate_job_id(job_id: JobId) -> JobId {
     JobId::from_bytes(child)
 }
 
+pub fn cleanup_dedup_key(job_id: JobId) -> Vec<u8> {
+    format!("internal/terminal-cleanup/{job_id}").into_bytes()
+}
+
+pub fn cleanup_job_id(job_id: JobId) -> JobId {
+    let parent = job_id.to_bytes();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna/terminal-cleanup-job/v1");
+    hasher.update(&parent);
+    let mut child = parent;
+    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
+    JobId::from_bytes(child)
+}
+
+pub fn workspace_credential_id(job_id: JobId) -> String {
+    format!("workspace-{job_id}")
+}
+
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
 /// scoped to the submitting user (fixed-width id), so a caller can neither
 /// suppress an internal obligation nor squat another user's key.
@@ -919,6 +955,8 @@ mod tests {
         let user_b = UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32]));
 
         assert!(run_crate_dedup_key(job).starts_with(b"internal/"));
+        assert!(cleanup_dedup_key(job).starts_with(b"internal/"));
+        assert_ne!(cleanup_dedup_key(job), run_crate_dedup_key(job));
         assert!(user_dedup_key(user_a, "k").starts_with(b"user/"));
         // A caller cannot forge an internal obligation key through their
         // idempotency key, and users cannot squat each other's keys.
@@ -928,6 +966,9 @@ mod tests {
         );
         assert_ne!(user_dedup_key(user_a, "k"), user_dedup_key(user_b, "k"));
         assert_eq!(user_dedup_key(user_a, "k"), user_dedup_key(user_a, "k"));
+        assert_eq!(cleanup_job_id(job), cleanup_job_id(job));
+        assert_ne!(cleanup_job_id(job), crate_job_id(job));
+        assert_eq!(workspace_credential_id(job), format!("workspace-{job}"));
     }
 
     #[test]

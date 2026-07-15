@@ -88,6 +88,19 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::WriteRunCrate { for_job } => {
             crate::jobs::workflow::run_crate::run_write_run_crate(ctx, *for_job).await
         }
+        JobPayload::TerminalCleanup {
+            for_job,
+            attempt,
+            access_key,
+        } => {
+            crate::jobs::workflow::cleanup::run_terminal_cleanup(
+                ctx,
+                *for_job,
+                attempt.as_ref(),
+                access_key,
+            )
+            .await
+        }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -104,7 +117,9 @@ pub fn run_cleanup(payload: &JobPayload) {
                 let _ = std::fs::remove_file(marker);
             }
         }
-        JobPayload::Execution(_) | JobPayload::WriteRunCrate { .. } => {}
+        JobPayload::Execution(_)
+        | JobPayload::WriteRunCrate { .. }
+        | JobPayload::TerminalCleanup { .. } => {}
     }
 }
 

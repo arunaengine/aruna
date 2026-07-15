@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError,
-    JobRecord, OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
-    blob_group_permission_path, blob_object_permission_path,
+    JobRecord, OutputObject, PathRestriction, Permission, UserAccess, blob_bucket_permission_path,
+    blob_group_permission_path, blob_object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
 use ulid::Ulid;
@@ -17,6 +17,7 @@ use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -110,6 +111,44 @@ pub async fn mint_workspace_credential(
         "{}/**",
         blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket)
     );
+    let restriction = PathRestriction {
+        pattern,
+        permission: Permission::WRITE,
+    };
+    let key_id = workspace_credential_id(record.job_id);
+    let access_key =
+        UserAccess::build_access_key(&record.created_by, &key_id).map_err(|error| {
+            JobError::permanent(format!("workspace credential key failed: {error}"))
+        })?;
+    match drive(GetUserAccessOperation::new(access_key.clone()), context).await {
+        Ok(Some(Ok(access))) => {
+            let matches_job = access.access_key == access_key
+                && access.user_identity == record.created_by
+                && access.group_id == spec.group_id
+                && access.issued_by == *node_id.as_bytes()
+                && access.path_restrictions == Some(vec![restriction.clone()]);
+            if !matches_job || access.is_revoked() {
+                return Err(JobError::permanent("workspace credential is invalid"));
+            }
+            if !access.is_expired(SystemTime::now()) {
+                return Ok(WorkspaceCredential {
+                    access_key: access.access_key,
+                    secret: access.secret,
+                });
+            }
+            if record.attempt_intent.is_some() {
+                return Err(JobError::permanent("workspace credential expired"));
+            }
+        }
+        Ok(None)
+        | Ok(Some(Err(GetUserAccessError::NotFound)))
+        | Err(GetUserAccessError::NotFound) => {}
+        Ok(Some(Err(error))) | Err(error) => {
+            return Err(JobError::retryable(format!(
+                "workspace credential lookup failed: {error}"
+            )));
+        }
+    }
     let walltime = spec
         .resources
         .max_walltime_ms
@@ -117,16 +156,16 @@ pub async fn mint_workspace_credential(
         .unwrap_or(Duration::from_secs(24 * 60 * 60));
     let expiry = SystemTime::now() + walltime + CREDENTIAL_SLACK;
     let (_, access) = drive(
-        CreateUserAccessOperation::new(CreateUserAccessConfig {
-            user_identity: record.created_by,
-            group_id: spec.group_id,
-            expiry,
-            path_restrictions: Some(vec![PathRestriction {
-                pattern,
-                permission: Permission::WRITE,
-            }]),
-            issued_by: *node_id.as_bytes(),
-        }),
+        CreateUserAccessOperation::new_with_key(
+            CreateUserAccessConfig {
+                user_identity: record.created_by,
+                group_id: spec.group_id,
+                expiry,
+                path_restrictions: Some(vec![restriction]),
+                issued_by: *node_id.as_bytes(),
+            },
+            key_id,
+        ),
         context,
     )
     .await
@@ -386,6 +425,15 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, JobId, JobPayload, RealmAuthorizationDocument, RealmId,
+    };
+    use aruna_storage::FjallStorage;
+    use tempfile::tempdir;
+
     use super::*;
 
     const HASH_A: [u8; 32] = [1; 32];
@@ -467,6 +515,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn credential_reuses_secret() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let spec = spec(Vec::new());
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let group_doc =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, spec.group_id);
+        for (key, value) in [
+            (
+                realm_id.as_bytes().to_vec(),
+                realm_doc.to_bytes(&actor).unwrap(),
+            ),
+            (
+                spec.group_id.to_bytes().to_vec(),
+                group_doc.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            let _ = storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: AUTH_KEYSPACE.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let job_id = JobId::from_bytes([4; 16]);
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(spec.clone()),
+            user_id,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        let bucket = JobRecord::workspace_bucket_name(job_id);
+
+        let first = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+        let second = mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
+            .await
+            .unwrap();
+
+        assert_eq!(second.access_key, first.access_key);
+        assert_eq!(second.secret, first.secret);
     }
 
     #[test]

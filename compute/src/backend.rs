@@ -128,7 +128,7 @@ pub trait ExecutorBackend: Send + Sync {
     /// Query by deterministic name after restart / lease loss. Never mutates.
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome;
 
-    /// Delete the external object. Called only after terminal evidence is
-    /// durably recorded by the caller.
+    /// Idempotently delete the external object. Called only after terminal
+    /// evidence is durably recorded by the caller.
     async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError>;
 }

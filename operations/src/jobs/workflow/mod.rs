@@ -1,3 +1,4 @@
+pub mod cleanup;
 pub mod reconcile;
 pub mod run_crate;
 pub mod workspace;
@@ -557,7 +558,7 @@ pub(crate) async fn finalize_attempt(
             };
             let result = execution_result_for(bucket, Some(0), outputs, logs);
             let record = terminal_complete(storage, job_id, token, result).await;
-            cleanup_and_crate(context, job_id, backend, attempt, record).await;
+            cleanup_and_crate(context, job_id, record).await;
         }
         AttemptPhase::Exited { code } => {
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
@@ -575,7 +576,7 @@ pub(crate) async fn finalize_attempt(
                 result,
             )
             .await;
-            cleanup_and_crate(context, job_id, backend, attempt, record).await;
+            cleanup_and_crate(context, job_id, record).await;
         }
         AttemptPhase::Failed { reason } => {
             let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
@@ -590,7 +591,7 @@ pub(crate) async fn finalize_attempt(
                 result,
             )
             .await;
-            cleanup_and_crate(context, job_id, backend, attempt, record).await;
+            cleanup_and_crate(context, job_id, record).await;
         }
         AttemptPhase::Cancelled => {
             finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
@@ -634,7 +635,7 @@ async fn finalize_cancel(
                     };
                     let result = execution_result_for(bucket, Some(0), outputs, logs);
                     let record = terminal_complete(storage, job_id, token, result).await;
-                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                    cleanup_and_crate(context, job_id, record).await;
                 }
                 AttemptPhase::Exited { code } => {
                     let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
@@ -650,7 +651,7 @@ async fn finalize_cancel(
                         result,
                     )
                     .await;
-                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                    cleanup_and_crate(context, job_id, record).await;
                 }
                 AttemptPhase::Failed { reason } => {
                     let result = execution_result_for(bucket, None, Vec::new(), logs);
@@ -662,7 +663,7 @@ async fn finalize_cancel(
                         result,
                     )
                     .await;
-                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                    cleanup_and_crate(context, job_id, record).await;
                 }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
                     let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
@@ -671,7 +672,7 @@ async fn finalize_cancel(
                     };
                     let result = execution_result_for(bucket, None, outputs, logs);
                     let record = terminal_cancel(storage, job_id, token, result).await;
-                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                    cleanup_and_crate(context, job_id, record).await;
                 }
             }
         }
@@ -681,7 +682,7 @@ async fn finalize_cancel(
             };
             let result = execution_result_for(bucket, None, outputs, LogTails::default());
             let record = terminal_cancel(storage, job_id, token, result).await;
-            cleanup_and_crate(context, job_id, backend, attempt, record).await;
+            cleanup_and_crate(context, job_id, record).await;
         }
         // No definitive stop evidence yet: park in Indeterminate.
         Ok(CancelEvidence::Requested) | Err(_) => {
@@ -767,25 +768,14 @@ async fn terminal_cancel(
     }
 }
 
-/// Remove the container after terminal evidence is durable, then wake the drain
-/// for the run-crate obligation persisted with terminalization.
-async fn cleanup_and_crate(
-    context: &DriverContext,
-    job_id: JobId,
-    backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
-    record: Option<JobRecord>,
-) {
+/// Wake the drain for the terminal obligations persisted with terminalization.
+async fn cleanup_and_crate(context: &DriverContext, job_id: JobId, record: Option<JobRecord>) {
     // Only act on a terminal record WE wrote (a lost race returns None).
-    let Some(record) = record else { return };
-    if let Err(error) = backend.cleanup(attempt).await {
-        warn!(job_id = %job_id, error = %error, "Container cleanup failed");
-    }
-    let _ = record;
+    let Some(_) = record else { return };
     finalize_followups(context, job_id).await;
 }
 
-/// Wake the drain for the follow-on `WriteRunCrate` job persisted with terminalization.
+/// Wake the drain for internal jobs persisted with terminalization.
 pub(super) async fn finalize_followups(context: &DriverContext, job_id: JobId) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
