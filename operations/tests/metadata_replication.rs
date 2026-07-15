@@ -166,7 +166,13 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
     let group_id = Ulid::r#gen();
     let document_path = "datasets/replan-holder-refresh";
-    let document_id = mint_local(&config, nodes[0].net.node_id(), realm_id, group_id, document_path);
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        document_path,
+    );
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {

@@ -85,8 +85,12 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id =
-        mint_forward_document_id(&config, &actor_of(&realm, user_node), group_id, "datasets/forwarded")?;
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
     let created = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
 
     // The user node holds nothing, so the record it got back was written by a
@@ -132,8 +136,12 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
     let (nodes, config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id =
-        mint_forward_document_id(&config, &actor_of(&realm, user_node), group_id, "datasets/forwarded")?;
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
     let record = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &record.placement);
     wait_for_record_on_holders(&nodes, &holders, document_id).await?;
@@ -246,8 +254,12 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id =
-        mint_forward_document_id(&config, &actor_of(&realm, user_node), group_id, "datasets/forwarded")?;
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
 
     let first = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &first.placement);
@@ -283,8 +295,12 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let first_group = seed_group(&realm, &nodes).await?;
     let other_group = seed_group(&realm, &nodes).await?;
-    let document_id =
-        mint_forward_document_id(&config, &actor_of(&realm, user_node), first_group, "datasets/forwarded")?;
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        first_group,
+        "datasets/forwarded",
+    )?;
 
     let created = drive_forwarded_create(&realm, user_node, first_group, document_id).await?;
     let holders = resolve_shard_holders(&config, &created.placement);

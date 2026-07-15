@@ -71,11 +71,15 @@ async fn scan_path_claims(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(PathLookupError::UnexpectedStorageEvent(format!("{other:?}")));
+                return Err(PathLookupError::UnexpectedStorageEvent(format!(
+                    "{other:?}"
+                )));
             }
         };
         for (_, value) in values {
-            claims.push(postcard::from_bytes(&value).map_err(aruna_core::errors::ConversionError::from)?);
+            claims.push(
+                postcard::from_bytes(&value).map_err(aruna_core::errors::ConversionError::from)?,
+            );
         }
         match next {
             Some(cursor) => start = Some(IterStart::After(cursor)),

@@ -523,7 +523,7 @@ pub async fn create_metadata_document(
 pub async fn mint_local_create_id(
     context: &DriverContext,
     config: &CreateMetadataDocumentConfig,
-    ) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<Ulid, CreateMetadataDocumentError> {
     mint_create_id(context, config, false).await
 }
 
@@ -717,11 +717,11 @@ async fn load_realm_config_for_create(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
-            CreateMetadataDocumentError::PlacementBindingUnavailable(
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
                 "realm config document missing".to_string(),
-            ),
-        ),
+            ))
+        }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
             format!("unexpected storage event reading realm config: {other:?}"),
@@ -1502,7 +1502,11 @@ mod tests {
         }));
         let effects = begin_transaction(&mut operation, effects.as_slice());
         assert_realm_config_read(effects.as_slice());
-        operation.step(realm_config_read(Some(&realm_config), &holder_actor, forwarded_id));
+        operation.step(realm_config_read(
+            Some(&realm_config),
+            &holder_actor,
+            forwarded_id,
+        ));
 
         let recorded = operation.record.as_ref().expect("record built").placement;
         assert_eq!(recorded.shard, blind.shard);

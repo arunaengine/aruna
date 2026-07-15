@@ -65,8 +65,12 @@ struct TestContext {
 async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id =
-        mint_local_document_id(&test.config, &test.actor, group_id, "datasets/lost-response")?;
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/lost-response",
+    )?;
     let config = CreateMetadataDocumentConfig {
         actor: test.actor.clone(),
         group_id,
@@ -186,9 +190,7 @@ async fn same_path_creates_resolve_to_winner() -> Result<(), Box<dyn std::error:
             })
             .await
         {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(_), ..
-            }) => {}
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
             other => return Err(format!("record {document_id} missing by id: {other:?}").into()),
         }
     }
@@ -260,8 +262,12 @@ impl TestContext {
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::r#gen();
-    let document_id =
-        mint_local_document_id(&test.config, &test.actor, group_id, "datasets/public-dataset")?;
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/public-dataset",
+    )?;
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
