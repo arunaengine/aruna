@@ -23,7 +23,7 @@ use aruna_core::structs::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_local_document_id,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -63,7 +63,8 @@ struct TestContext {
 async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id =
+        mint_local_document_id(&test.config, &test.actor, group_id, "datasets/lost-response")?;
     let config = CreateMetadataDocumentConfig {
         actor: test.actor.clone(),
         group_id,
@@ -160,7 +161,8 @@ impl TestContext {
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id =
+        mint_local_document_id(&test.config, &test.actor, group_id, "datasets/public-dataset")?;
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -313,7 +315,12 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/generated-fast-path",
+    )?;
     let before = test
         .context
         .storage_handle
