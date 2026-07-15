@@ -1,7 +1,7 @@
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     Actor, AuthContext, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
-    OutputObject, Permission, RunCrateStatus,
+    MetadataRegistryRecord, OutputObject, Permission, RunCrateStatus,
 };
 use serde_json::json;
 use ulid::Ulid;
@@ -60,6 +60,8 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
+    let document_id = Ulid::r#gen();
+    let document_path = format!("runs/{for_job}");
     let node_id = net_handle.node_id();
     let actor = Actor {
         node_id,
@@ -73,9 +75,11 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                 realm_id: parent.created_by.realm_id,
                 path_restrictions: None,
             },
-            path: format!(
-                "/{}/g/{}/meta/**",
-                parent.created_by.realm_id, spec.group_id
+            path: MetadataRegistryRecord::permission_path_for(
+                &parent.created_by.realm_id,
+                spec.group_id,
+                &document_path,
+                document_id,
             ),
             required_permission: Permission::WRITE,
         }),
@@ -106,9 +110,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         });
     }
 
-    let document_id = Ulid::r#gen();
     let jsonld = build_run_crate_jsonld(&parent, spec, document_id);
-    let document_path = format!("runs/{for_job}");
 
     match drive(
         CreateMetadataDocumentOperation::new_for_generated_document_id(
