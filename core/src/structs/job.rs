@@ -198,6 +198,7 @@ pub struct ExecutionSpec {
 
 /// Closed job payload enum, keeping the typed-queue discipline of `TaskKey` and
 /// `DocumentSyncOutboxEvent`. Additive-only until a version envelope lands (#286).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobPayload {
     /// Test-only executor. Idempotency key: the `cleanup_marker` file, which a
