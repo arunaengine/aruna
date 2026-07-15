@@ -35,12 +35,15 @@ use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleFjallPersistMode,
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateCrateRequest,
-    CreateEntityRequest, GraphId, GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
+    CreateEntityRequest, GraphId, GraphPolicy, RoCrateError, SearchStorage, vocab,
 };
 use jsonwebtoken::DecodingKey;
-use oxrdf::{BlankNode, Literal, NamedNode, Term};
+use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
+use spareval::{CancellationToken, QueryEvaluator};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
+use spargebra::{Query, SparqlParser};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
 use ulid::Ulid;
@@ -64,6 +67,16 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
+pub(crate) const METADATA_QUERY_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const METADATA_QUERY_MAX_ROWS: usize = 10_000;
+pub(crate) const METADATA_QUERY_MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const METADATA_QUERY_DEADLINE: Duration = Duration::from_secs(10);
+const METADATA_QUERY_COMMON_PREFIXES: &str = "\
+PREFIX schema: <http://schema.org/>\n\
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+PREFIX fts: <urn:craqle:fts:>\n";
 // Unbiased per-call-kind craqle latency histograms; every backend call is
 // recorded, not just the ones above the slow-call threshold.
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
@@ -690,6 +703,19 @@ impl MetadataHandle {
         list_local_registry_records_for_group(self.inner.clone(), group_id).await
     }
 
+    pub(crate) async fn snapshot_iri_references(
+        &self,
+        graph_iri: String,
+    ) -> Result<Vec<(String, String, String)>, MetadataError> {
+        let inner = self.inner.clone();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        tokio::task::spawn_blocking(move || {
+            snapshot_iri_references(&inner.node, &GraphId::new(&graph_iri))
+        })
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    }
+
     /// Test hook: marks all visibility cache entries as expired so the next
     /// read exercises the stale-serving + background-refill path.
     #[doc(hidden)]
@@ -1046,6 +1072,39 @@ impl MetadataHandle {
                     graph_iris,
                     query,
                     clamp_remote_search_graph_limit(limit),
+                    None,
+                )
+                .await
+                {
+                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                },
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
+            MetadataTransportMessage::FilteredSearchGraphs {
+                auth_token,
+                graph_iris,
+                query,
+                limit,
+                predicate_iri,
+                object_iri,
+            } => match authorize_remote_metadata_peer(
+                &self.inner.auth_validation,
+                &self.inner.storage_handle,
+                peer,
+                self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
+                auth_token,
+                false,
+            )
+            .await
+            {
+                Ok(auth_context) => match search_local_graphs(
+                    self.inner.clone(),
+                    auth_context,
+                    graph_iris,
+                    query,
+                    clamp_remote_search_graph_limit(limit),
+                    Some((predicate_iri, object_iri)),
                 )
                 .await
                 {
@@ -1161,7 +1220,35 @@ impl MetadataHandle {
         query: String,
         limit: usize,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
-        search_local_graphs(self.inner.clone(), auth_context, graph_iris, query, limit).await
+        search_local_graphs(
+            self.inner.clone(),
+            auth_context,
+            graph_iris,
+            query,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    pub async fn search_authorized_local_filtered(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        search_local_graphs(
+            self.inner.clone(),
+            auth_context,
+            graph_iris,
+            query,
+            limit,
+            Some((predicate_iri, object_iri)),
+        )
+        .await
     }
 
     pub async fn export_rocrate_jsonld(&self, graph_iri: String) -> Result<String, MetadataError> {
@@ -1307,21 +1394,64 @@ impl MetadataHandle {
         query: String,
         limit: usize,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        self.request_remote_search_graphs_with_filter(
+            node_id, auth_token, graph_iris, query, limit, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_remote_filtered_search_graphs(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        self.request_remote_search_graphs_with_filter(
+            node_id,
+            auth_token,
+            graph_iris,
+            query,
+            limit,
+            Some((predicate_iri, object_iri)),
+        )
+        .await
+    }
+
+    async fn request_remote_search_graphs_with_filter(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        iri_filter: Option<(String, String)>,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         let started = Instant::now();
         let span = Span::current();
-        let result = match send_remote_metadata_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::SearchGraphs {
+        let message = match iri_filter {
+            Some((predicate_iri, object_iri)) => MetadataTransportMessage::FilteredSearchGraphs {
+                auth_token,
+                graph_iris,
+                query,
+                limit,
+                predicate_iri,
+                object_iri,
+            },
+            None => MetadataTransportMessage::SearchGraphs {
                 auth_token,
                 graph_iris,
                 query,
                 limit,
             },
-        )
-        .await
-        .map_err(MetadataRequestError::into_metadata_error)?
+        };
+        let result = match send_remote_metadata_request(&self.inner, &span, node_id, message)
+            .await
+            .map_err(MetadataRequestError::into_metadata_error)?
         {
             MetadataTransportMessage::SearchResults { hits } => Ok(hits),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
@@ -3403,6 +3533,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
         MetadataTransportMessage::QueryResults { .. } => "query_results",
         MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
+        MetadataTransportMessage::FilteredSearchGraphs { .. } => "filtered_search_graphs",
         MetadataTransportMessage::SearchResults { .. } => "search_results",
         MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
         MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
@@ -3490,27 +3621,6 @@ fn metadata_graph_policy_from_craqle(policy: GraphPolicy) -> MetadataGraphPolicy
     MetadataGraphPolicy {
         public: policy.public,
         permission_paths: policy.permission_paths,
-    }
-}
-
-fn metadata_query_results_from_craqle(results: QueryResults) -> MetadataQueryResults {
-    match results {
-        QueryResults::Solutions(rows) => MetadataQueryResults::Solutions(
-            rows.into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|(key, value)| (key, value.0))
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .collect(),
-        ),
-        QueryResults::Boolean(value) => MetadataQueryResults::Boolean(value),
-        QueryResults::Graph(triples) => MetadataQueryResults::Graph(
-            triples
-                .into_iter()
-                .map(|(subject, predicate, object)| (subject.0, predicate.0, object.0))
-                .collect(),
-        ),
     }
 }
 
@@ -3923,6 +4033,7 @@ async fn query_local_graphs(
 ) -> Result<MetadataQueryResults, MetadataError> {
     let span = Span::current();
     let total_started = Instant::now();
+    let query = parse_metadata_query(&sparql)?;
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
 
@@ -3930,10 +4041,16 @@ async fn query_local_graphs(
     // Document-scoped queries keep the eager per-record selection; the
     // all-metadata path defers per-graph visibility to query evaluation.
     let scope = match graph_iris {
-        Some(graph_iris) => LocalReadScope::Eager(
-            select_authorized_graphs(inner.clone(), auth_context, records, Some(graph_iris))
-                .await?,
-        ),
+        Some(graph_iris) => {
+            let requested_graphs = graph_iris.iter().collect::<HashSet<_>>().len();
+            let allowed =
+                select_authorized_graphs(inner.clone(), auth_context, records, Some(graph_iris))
+                    .await?;
+            if allowed.len() != requested_graphs {
+                return Err(MetadataError::GraphNotFound);
+            }
+            LocalReadScope::Eager(allowed)
+        }
         None => LocalReadScope::Lazy(
             resolve_graph_visibility_scope(&inner, auth_context, records).await?,
         ),
@@ -3967,26 +4084,38 @@ async fn query_local_graphs(
     let query_started = Instant::now();
     // Queries are reads: take from the read pool so they never queue behind
     // long-running materializations holding the mutation permits.
-    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
-    let result = match tokio::task::spawn_blocking(move || {
-        blocking_span.in_scope(|| {
-            match scope {
-                LocalReadScope::Eager(allowed) => {
-                    inner.node.query_graphs(&graph_ids(&allowed), &sparql)
-                }
-                LocalReadScope::Lazy(scope) => inner.node.query_graphs_with(
-                    |graph| scope.graph_visible(&inner.visibility_cache, graph.as_str()),
-                    &sparql,
-                ),
-            }
-            .map(metadata_query_results_from_craqle)
-            .map_err(|error| MetadataError::Backend(error.to_string()))
-        })
-    })
+    let query_deadline = tokio::time::Instant::now() + METADATA_QUERY_DEADLINE;
+    let permit = tokio::time::timeout_at(
+        query_deadline,
+        inner.craqle_read_permits.clone().acquire_owned(),
+    )
     .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
+    .map_err(|_| {
+        MetadataError::InvalidInput(format!(
+            "metadata query timed out after {} seconds",
+            METADATA_QUERY_DEADLINE.as_secs()
+        ))
+    })?
+    .ok();
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = MetadataQueryCancellationGuard(cancellation.clone());
+    let blocking_cancellation = cancellation.clone();
+    let mut blocking = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        blocking_span.in_scope(|| {
+            evaluate_metadata_query_snapshot(&inner, scope, &query, &blocking_cancellation)
+        })
+    });
+    let result = match tokio::time::timeout_at(query_deadline, &mut blocking).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(MetadataError::TaskJoin(error.to_string())),
+        Err(_) => {
+            cancellation.cancel();
+            Err(MetadataError::InvalidInput(format!(
+                "metadata query timed out after {} seconds",
+                METADATA_QUERY_DEADLINE.as_secs()
+            )))
+        }
     };
     let query_elapsed = query_started.elapsed();
     record_duration_ms(&query_span, "elapsed_ms", query_elapsed);
@@ -4008,10 +4137,324 @@ async fn query_local_graphs(
     result
 }
 
+struct MetadataQueryCancellationGuard(CancellationToken);
+
+impl Drop for MetadataQueryCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
+    if sparql.len() > METADATA_QUERY_MAX_BYTES {
+        return Err(MetadataError::InvalidInput(format!(
+            "SPARQL query exceeds the {METADATA_QUERY_MAX_BYTES}-byte limit"
+        )));
+    }
+    let query = SparqlParser::new()
+        .parse_query(&format!("{METADATA_QUERY_COMMON_PREFIXES}{sparql}"))
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let pattern = match &query {
+        Query::Select { pattern, .. } | Query::Ask { pattern, .. } => pattern,
+        Query::Construct { .. } | Query::Describe { .. } => {
+            return Err(MetadataError::InvalidInput(
+                "only SELECT and ASK metadata queries are supported".to_string(),
+            ));
+        }
+    };
+    if graph_pattern_has_service(pattern) {
+        return Err(MetadataError::InvalidInput(
+            "SERVICE is not supported in metadata queries".to_string(),
+        ));
+    }
+    Ok(query)
+}
+
+fn graph_pattern_has_service(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Service { .. } => true,
+        GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            graph_pattern_has_service(left) || graph_pattern_has_service(right)
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            graph_pattern_has_service(left)
+                || graph_pattern_has_service(right)
+                || expression.as_ref().is_some_and(expression_has_service)
+        }
+        GraphPattern::Filter { expr, inner } => {
+            graph_pattern_has_service(inner) || expression_has_service(expr)
+        }
+        GraphPattern::Graph { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => graph_pattern_has_service(inner),
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => graph_pattern_has_service(inner) || expression_has_service(expression),
+        GraphPattern::OrderBy { inner, expression } => {
+            graph_pattern_has_service(inner)
+                || expression.iter().any(|order| match order {
+                    OrderExpression::Asc(expr) | OrderExpression::Desc(expr) => {
+                        expression_has_service(expr)
+                    }
+                })
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            graph_pattern_has_service(inner)
+                || aggregates.iter().any(|(_, aggregate)| match aggregate {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => expression_has_service(expr),
+                })
+        }
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
+    }
+}
+
+fn expression_has_service(expression: &Expression) -> bool {
+    match expression {
+        Expression::Exists(pattern) => graph_pattern_has_service(pattern),
+        Expression::Or(left, right)
+        | Expression::And(left, right)
+        | Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            expression_has_service(left) || expression_has_service(right)
+        }
+        Expression::In(left, right) => {
+            expression_has_service(left) || right.iter().any(expression_has_service)
+        }
+        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
+            expression_has_service(inner)
+        }
+        Expression::If(condition, then, otherwise) => {
+            expression_has_service(condition)
+                || expression_has_service(then)
+                || expression_has_service(otherwise)
+        }
+        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => {
+            expressions.iter().any(expression_has_service)
+        }
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+    }
+}
+
+fn evaluate_metadata_query_snapshot(
+    inner: &MetadataInner,
+    scope: LocalReadScope<Vec<String>>,
+    query: &Query,
+    cancellation: &CancellationToken,
+) -> Result<MetadataQueryResults, MetadataError> {
+    let graphs = match scope {
+        LocalReadScope::Eager(allowed) => graph_ids(&allowed),
+        LocalReadScope::Lazy(scope) => inner
+            .node
+            .graphs()
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+            .into_iter()
+            .filter(|graph| scope.graph_visible(&inner.visibility_cache, graph.as_str()))
+            .collect(),
+    };
+    let mut dataset = Dataset::new();
+    for graph in graphs {
+        ensure_metadata_query_not_cancelled(cancellation)?;
+        if !inner
+            .node
+            .contains_graph(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+        {
+            return Err(MetadataError::GraphNotFound);
+        }
+        let snapshot = inner
+            .node
+            .graph_snapshot(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let orphaned = inner
+            .node
+            .graph_diagnostics(&graph)
+            .map_err(|error| MetadataError::Backend(error.to_string()))?
+            .orphaned_entities
+            .into_iter()
+            .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
+            .collect::<HashSet<_>>();
+        for quad in snapshot.quads {
+            ensure_metadata_query_not_cancelled(cancellation)?;
+            if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
+                continue;
+            }
+            let subject = match quad.subject.to_term() {
+                Some(Term::NamedNode(subject)) => NamedOrBlankNode::NamedNode(subject),
+                Some(Term::BlankNode(subject)) => NamedOrBlankNode::BlankNode(subject),
+                _ => return Err(invalid_snapshot_term(&quad.subject.0)),
+            };
+            let predicate = quad
+                .predicate
+                .to_named_node()
+                .ok_or_else(|| invalid_snapshot_term(&quad.predicate.0))?;
+            let object = quad
+                .object
+                .to_term()
+                .ok_or_else(|| invalid_snapshot_term(&quad.object.0))?;
+            dataset.insert(&Quad::new(
+                subject.clone(),
+                predicate.clone(),
+                object.clone(),
+                snapshot.graph.0.clone(),
+            ));
+            dataset.insert(&Quad::new(
+                subject,
+                predicate,
+                object,
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+
+    ensure_metadata_query_not_cancelled(cancellation)?;
+    let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.clone());
+    let mut prepared = evaluator.prepare(query);
+    prepared
+        .dataset_mut()
+        .set_default_graph(vec![GraphName::DefaultGraph]);
+    let evaluated = prepared
+        .execute(&dataset)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let results = collect_metadata_query_results(evaluated)?;
+    ensure_metadata_query_not_cancelled(cancellation)?;
+    let serialized =
+        serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
+    if serialized.len() > METADATA_QUERY_MAX_RESULT_BYTES {
+        return Err(MetadataError::InvalidInput(format!(
+            "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+        )));
+    }
+    Ok(results)
+}
+
+fn collect_metadata_query_results(
+    results: spareval::QueryResults<'_>,
+) -> Result<MetadataQueryResults, MetadataError> {
+    match results {
+        spareval::QueryResults::Solutions(solutions) => {
+            let mut rows = Vec::new();
+            let mut serialized_bytes = 32usize;
+            for solution in solutions {
+                let solution =
+                    solution.map_err(|error| MetadataError::Backend(error.to_string()))?;
+                if rows.len() == METADATA_QUERY_MAX_ROWS {
+                    return Err(MetadataError::InvalidInput(format!(
+                        "metadata query result exceeds the {METADATA_QUERY_MAX_ROWS}-row limit"
+                    )));
+                }
+                let row = solution
+                    .iter()
+                    .map(|(variable, term)| {
+                        (
+                            variable.as_str().to_string(),
+                            craqle::EncodedTerm::from_term(term).0,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                serialized_bytes = serialized_bytes.saturating_add(
+                    serde_json::to_vec(&row)
+                        .map_err(|error| MetadataError::Backend(error.to_string()))?
+                        .len()
+                        .saturating_add(1),
+                );
+                if serialized_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
+                    return Err(MetadataError::InvalidInput(format!(
+                        "metadata query result exceeds the {METADATA_QUERY_MAX_RESULT_BYTES}-byte limit"
+                    )));
+                }
+                rows.push(row);
+            }
+            Ok(MetadataQueryResults::Solutions(rows))
+        }
+        spareval::QueryResults::Boolean(value) => Ok(MetadataQueryResults::Boolean(value)),
+        spareval::QueryResults::Graph(_) => Err(MetadataError::InvalidInput(
+            "only SELECT and ASK metadata queries are supported".to_string(),
+        )),
+    }
+}
+
+fn ensure_metadata_query_not_cancelled(
+    cancellation: &CancellationToken,
+) -> Result<(), MetadataError> {
+    if cancellation.is_cancelled() {
+        Err(MetadataError::InvalidInput(
+            "metadata query was cancelled".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_snapshot_term(term: &str) -> MetadataError {
+    MetadataError::Backend(format!("invalid RDF term in metadata snapshot: {term}"))
+}
+
+fn snapshot_iri_references(
+    node: &CraqleNode,
+    graph: &GraphId,
+) -> Result<Vec<(String, String, String)>, MetadataError> {
+    let snapshot = node
+        .graph_snapshot(graph)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let orphaned = node
+        .graph_diagnostics(graph)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?
+        .orphaned_entities
+        .into_iter()
+        .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
+        .collect::<HashSet<_>>();
+    let mut references = Vec::new();
+    for quad in snapshot.quads {
+        if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
+            continue;
+        }
+        let subject = match quad.subject.to_term() {
+            Some(Term::NamedNode(node)) => node.as_str().to_string(),
+            Some(Term::BlankNode(node)) => format!("_:{}", node.as_str()),
+            _ => continue,
+        };
+        let Some(predicate) = quad.predicate.to_named_node() else {
+            continue;
+        };
+        let Some(Term::NamedNode(object)) = quad.object.to_term() else {
+            continue;
+        };
+        references.push((
+            subject,
+            predicate.as_str().to_string(),
+            object.as_str().to_string(),
+        ));
+    }
+    Ok(references)
+}
+
 #[tracing::instrument(
     name = "metadata.search.local",
     level = "debug",
-    skip(inner, auth_context, query),
+    skip(inner, auth_context, query, iri_filter),
     fields(
         query_len = query.len() as u64,
         limit = limit as u64,
@@ -4032,11 +4475,34 @@ async fn search_local_graphs(
     graph_iris: Option<Vec<String>>,
     query: String,
     limit: usize,
+    iri_filter: Option<(String, String)>,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let span = Span::current();
     let total_started = Instant::now();
 
     let records = list_registry_records_for_local_read(inner.clone(), &span).await?;
+    let iri_matches = match iri_filter.as_ref() {
+        Some((predicate_iri, object_iri)) => Some(
+            super::iri_index::lookup_metadata_iri_references(
+                &inner.storage_handle,
+                records.as_ref(),
+                predicate_iri,
+                object_iri,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let records = match iri_matches.as_ref() {
+        Some(matches) => Arc::new(
+            records
+                .iter()
+                .filter(|record| matches.contains_key(&record.document_id))
+                .cloned()
+                .collect(),
+        ),
+        None => records,
+    };
 
     let authorization_started = Instant::now();
     let allowed_records =
@@ -4049,6 +4515,59 @@ async fn search_local_graphs(
         span.record("hit_count", 0u64);
         record_elapsed_ms(&span, "elapsed_ms", total_started);
         return Ok(Vec::new());
+    }
+
+    if query.trim().is_empty()
+        && let Some(matches) = iri_matches
+    {
+        let allowed_graphs = allowed_records
+            .iter()
+            .map(|record| record.graph_iri.clone())
+            .collect::<HashSet<_>>();
+        let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
+        let hits = match tokio::task::spawn_blocking(move || {
+            let authorizer = AllowedGraphAuthorizer {
+                graph_iris: allowed_graphs,
+            };
+            let mut hits = allowed_records
+                .into_iter()
+                .filter_map(|record| {
+                    let subject_iri = matches.get(&record.document_id)?.first()?.clone();
+                    let properties = inner
+                        .node
+                        .describe_subject(&authorizer, &GraphId::new(&record.graph_iri), &subject_iri)
+                        .map(decode_hit_properties)
+                        .unwrap_or_default();
+                    let title = super::search_enrichment::hit_title(
+                        &properties,
+                        &record.document_path,
+                        &subject_iri,
+                    );
+                    Some(MetadataSearchHit {
+                        document_id: record.document_id.to_string(),
+                        group_id: record.group_id.to_string(),
+                        document_path: record.document_path,
+                        graph_iri: record.graph_iri,
+                        subject_iri,
+                        score: 1.0,
+                        title,
+                        snippet: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            hits.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+            hits.truncate(limit);
+            hits
+        })
+        .await
+        {
+            Ok(hits) => hits,
+            Err(error) => return Err(MetadataError::TaskJoin(error.to_string())),
+        };
+        span.record("result", "ok");
+        span.record("hit_count", hits.len() as u64);
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
+        return Ok(hits);
     }
 
     let by_graph: HashMap<_, _> = allowed_records
@@ -4591,6 +5110,36 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
+
+    #[test]
+    fn metadata_query_validation_allows_common_prefixes_and_rejects_unsafe_forms() {
+        parse_metadata_query("SELECT ?s WHERE { ?s a schema:Dataset }")
+            .expect("common metadata prefixes are available");
+        parse_metadata_query("ASK WHERE { ?s ?p ?o }").expect("ASK is supported");
+
+        for query in [
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+            "INSERT DATA { <urn:s> <urn:p> <urn:o> }",
+            "SELECT * WHERE { SERVICE <https://example.com/sparql> { ?s ?p ?o } }",
+            "SELECT * WHERE { FILTER EXISTS { SERVICE <https://example.com/sparql> { ?s ?p ?o } } }",
+        ] {
+            assert!(
+                matches!(
+                    parse_metadata_query(query),
+                    Err(MetadataError::InvalidInput(_))
+                ),
+                "query should be rejected: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_query_validation_rejects_oversize_input() {
+        assert!(matches!(
+            parse_metadata_query(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)),
+            Err(MetadataError::InvalidInput(_))
+        ));
+    }
 
     #[test]
     fn metadata_handle_options_default_to_buffered_document_sync_persist() {

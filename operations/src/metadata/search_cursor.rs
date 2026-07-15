@@ -164,6 +164,7 @@ pub fn query_fingerprint(
     query: &str,
     graph_iris: Option<&[String]>,
     mode: Option<MetadataApiQueryMode>,
+    conforms_to: Option<&str>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(query.as_bytes());
@@ -178,6 +179,16 @@ pub fn query_fingerprint(
         hasher.update(&[0x00]);
     }
     hasher.update(&[mode_byte(mode)]);
+    match conforms_to {
+        Some(iri) => {
+            hasher.update(&[0x01]);
+            hasher.update(iri.as_bytes());
+            hasher.update(&[0x00]);
+        }
+        None => {
+            hasher.update(&[0x00]);
+        }
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -507,26 +518,36 @@ mod tests {
 
     #[test]
     fn fingerprint_binds_query_graphs_and_mode() {
-        let base = query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed));
+        let base = query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed), None);
         assert_eq!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed))
+            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed), None)
         );
         assert_ne!(
             base,
-            query_fingerprint("beta", None, Some(MetadataApiQueryMode::Distributed))
+            query_fingerprint("beta", None, Some(MetadataApiQueryMode::Distributed), None)
         );
         assert_ne!(
             base,
             query_fingerprint(
                 "alpha",
                 Some(&["g".to_string()]),
-                Some(MetadataApiQueryMode::Distributed)
+                Some(MetadataApiQueryMode::Distributed),
+                None
             )
         );
         assert_ne!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local))
+            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local), None)
+        );
+        assert_ne!(
+            base,
+            query_fingerprint(
+                "alpha",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                Some("https://w3id.org/ro/crate/1.2")
+            )
         );
     }
 

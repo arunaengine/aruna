@@ -37,6 +37,9 @@ use super::search_cursor::{
     METADATA_SEARCH_MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
     SearchPageCursor, SearchWatermark, paginate, query_fingerprint, resume_fetch_limit,
 };
+use super::handle::{
+    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::{
@@ -52,7 +55,9 @@ use crate::placement::resolve_shard_holders;
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
 const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
+const METADATA_DISTRIBUTED_QUERY_MAX_NODES: usize = 32;
 const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+const METADATA_DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Error)]
 pub enum MetadataApiError {
@@ -148,6 +153,7 @@ pub struct MetadataDocumentQueryRequest {
     pub bearer_token: Option<String>,
     pub query: String,
     pub mode: Option<MetadataApiQueryMode>,
+    pub allow_partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +164,7 @@ pub struct MetadataQueryRequest {
     pub query: String,
     pub mode: Option<MetadataApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
+    pub allow_partial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +173,7 @@ pub struct MetadataSearchRequest {
     pub bearer_token: Option<String>,
     pub graph_iris: Option<Vec<String>>,
     pub query: String,
+    pub conforms_to: Option<String>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
     pub mode: Option<MetadataApiQueryMode>,
@@ -186,10 +194,12 @@ pub struct MetadataSearchExecution {
     pub fanout_stats: MetadataFanoutStats,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MetadataFanoutStats {
     pub nodes_queried: usize,
     pub nodes_failed: usize,
+    pub failed_partitions: Vec<NodeId>,
+    pub discovery_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,14 +212,20 @@ struct MetadataRealmNodeDiscovery {
 struct MetadataFanoutScope {
     mode: Option<MetadataApiQueryMode>,
     target_nodes: Option<Vec<NodeId>>,
+    allow_partial: bool,
     discovery_failed: bool,
 }
 
 impl MetadataFanoutScope {
-    fn new(mode: Option<MetadataApiQueryMode>, target_nodes: Option<Vec<NodeId>>) -> Self {
+    fn new(
+        mode: Option<MetadataApiQueryMode>,
+        target_nodes: Option<Vec<NodeId>>,
+        allow_partial: bool,
+    ) -> Self {
         Self {
             mode,
             target_nodes,
+            allow_partial,
             discovery_failed: false,
         }
     }
@@ -363,8 +379,15 @@ pub async fn query_metadata_document(
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record).await?;
     ensure_record_materialized_for_graph_read(context, &record).await?;
     let config = load_realm_config(context, realm_id).await;
+    let discovery_failed = context.net_handle.is_some()
+        && request.mode.unwrap_or(MetadataApiQueryMode::Distributed)
+            == MetadataApiQueryMode::Distributed
+        && config.is_none();
+    if discovery_failed && !request.allow_partial {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
 
-    query_metadata(
+    let mut execution = query_metadata(
         context,
         realm_id,
         local_node_id,
@@ -379,9 +402,15 @@ pub async fn query_metadata_document(
                 &record,
                 local_node_id,
             )),
+            allow_partial: request.allow_partial,
         },
     )
-    .await
+    .await?;
+    if discovery_failed {
+        execution.fanout_stats.nodes_failed += 1;
+        execution.fanout_stats.discovery_failed = true;
+    }
+    Ok(execution)
 }
 
 pub async fn query_metadata(
@@ -399,7 +428,7 @@ pub async fn query_metadata(
         request.bearer_token,
         request.graph_iris,
         request.query,
-        MetadataFanoutScope::new(request.mode, request.target_nodes),
+        MetadataFanoutScope::new(request.mode, request.target_nodes, request.allow_partial),
     )
     .await?;
     Ok(MetadataQueryExecution {
@@ -414,7 +443,14 @@ pub async fn search_metadata(
     local_node_id: NodeId,
     request: MetadataSearchRequest,
 ) -> Result<MetadataSearchExecution, MetadataApiError> {
-    if request.query.trim().is_empty() {
+    if request.query.trim().is_empty() && request.conforms_to.is_none() {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if request
+        .conforms_to
+        .as_deref()
+        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
+    {
         return Err(MetadataApiError::BadRequest);
     }
     let page_size = request
@@ -422,8 +458,12 @@ pub async fn search_metadata(
         .unwrap_or(METADATA_SEARCH_DEFAULT_PAGE_SIZE)
         .clamp(1, METADATA_SEARCH_MAX_PAGE_SIZE);
 
-    let fingerprint =
-        query_fingerprint(&request.query, request.graph_iris.as_deref(), request.mode);
+    let fingerprint = query_fingerprint(
+        &request.query,
+        request.graph_iris.as_deref(),
+        request.mode,
+        request.conforms_to.as_deref(),
+    );
     let mut cursor_discovery = None;
     let (watermark, resume) = match request.cursor.as_deref() {
         Some(raw) => {
@@ -489,10 +529,11 @@ pub async fn search_metadata(
         request.bearer_token,
         request.graph_iris,
         request.query,
+        request.conforms_to,
         resume,
         watermark,
         page_size,
-        MetadataFanoutScope::new(request.mode, target_nodes)
+        MetadataFanoutScope::new(request.mode, target_nodes, true)
             .with_discovery_failed(discovery_failed),
     )
     .await?;
@@ -553,34 +594,22 @@ async fn load_metadata_realm_nodes_with_status(
     local_node_id: NodeId,
 ) -> MetadataRealmNodeDiscovery {
     let nodes = match drive(GetRealmNodesOperation::new(realm_id), context).await {
-        Ok(nodes) => {
-            let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-            if !nodes.contains(&local_node_id) {
-                nodes.push(local_node_id);
-            }
-            nodes.sort_by_key(|node_id| node_id.to_string());
-            return MetadataRealmNodeDiscovery {
-                nodes,
-                failed: false,
-            };
-        }
+        Ok(nodes) => (nodes, false),
         Err(error) => {
             warn!(
                 error = %error,
                 "realm node discovery failed, using best-effort local-only metadata results"
             );
-            HashSet::new()
+            (HashSet::new(), context.net_handle.is_some())
         }
     };
+    let (nodes, failed) = nodes;
     let mut nodes = nodes.into_iter().collect::<Vec<_>>();
     if !nodes.contains(&local_node_id) {
         nodes.push(local_node_id);
     }
     nodes.sort_by_key(|node_id| node_id.to_string());
-    MetadataRealmNodeDiscovery {
-        nodes,
-        failed: true,
-    }
+    MetadataRealmNodeDiscovery { nodes, failed }
 }
 
 async fn load_group_metadata_records(
@@ -960,6 +989,13 @@ fn map_metadata_event_error(error: MetadataError) -> MetadataApiError {
     }
 }
 
+fn map_metadata_query_error(error: MetadataError) -> MetadataApiError {
+    match error {
+        MetadataError::InvalidInput(_) => MetadataApiError::BadRequest,
+        other => map_metadata_event_error(other),
+    }
+}
+
 fn map_metadata_internal_error(error: MetadataError) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
 }
@@ -971,9 +1007,167 @@ fn ensure_supported_query_mode(mode: &Option<MetadataApiQueryMode>) {
 }
 
 fn ensure_supported_query_form(query: &str) -> Result<(), MetadataApiError> {
-    match query_form(query) {
-        Some(MetadataQueryForm::Select | MetadataQueryForm::Ask) => Ok(()),
-        _ => Err(MetadataApiError::BadRequest),
+    if query.len() > METADATA_QUERY_MAX_BYTES {
+        return Err(MetadataApiError::BadRequest);
+    }
+    let parsed = spargebra::SparqlParser::new()
+        .parse_query(query)
+        .map_err(|_| MetadataApiError::BadRequest)?;
+    let pattern = match &parsed {
+        spargebra::Query::Select { pattern, .. } | spargebra::Query::Ask { pattern, .. } => pattern,
+        _ => return Err(MetadataApiError::BadRequest),
+    };
+    if graph_pattern_contains_service(pattern) {
+        return Err(MetadataApiError::BadRequest);
+    }
+    if matches!(
+        pattern,
+        spargebra::algebra::GraphPattern::Slice {
+            length: Some(length),
+            ..
+        } if *length > METADATA_QUERY_MAX_ROWS
+    ) {
+        return Err(MetadataApiError::BadRequest);
+    }
+    Ok(())
+}
+
+fn graph_pattern_contains_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::GraphPattern;
+
+    match pattern {
+        GraphPattern::Service { .. } => true,
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
+        GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => {
+            graph_pattern_contains_service(left) || graph_pattern_contains_service(right)
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            graph_pattern_contains_service(left)
+                || graph_pattern_contains_service(right)
+                || expression.as_ref().is_some_and(expression_contains_service)
+        }
+        GraphPattern::Filter { expr, inner } => {
+            expression_contains_service(expr) || graph_pattern_contains_service(inner)
+        }
+        GraphPattern::Graph { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => graph_pattern_contains_service(inner),
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => expression_contains_service(expression) || graph_pattern_contains_service(inner),
+        GraphPattern::OrderBy { inner, expression } => {
+            graph_pattern_contains_service(inner)
+                || expression.iter().any(|expression| match expression {
+                    spargebra::algebra::OrderExpression::Asc(expression)
+                    | spargebra::algebra::OrderExpression::Desc(expression) => {
+                        expression_contains_service(expression)
+                    }
+                })
+        }
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            graph_pattern_contains_service(inner)
+                || aggregates.iter().any(|(_, aggregate)| match aggregate {
+                    spargebra::algebra::AggregateExpression::CountSolutions { .. } => false,
+                    spargebra::algebra::AggregateExpression::FunctionCall { expr, .. } => {
+                        expression_contains_service(expr)
+                    }
+                })
+        }
+    }
+}
+
+fn expression_contains_service(expression: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression;
+
+    match expression {
+        Expression::Exists(pattern) => graph_pattern_contains_service(pattern),
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+        Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) | Expression::Not(inner) => {
+            expression_contains_service(inner)
+        }
+        Expression::Or(left, right)
+        | Expression::And(left, right)
+        | Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            expression_contains_service(left) || expression_contains_service(right)
+        }
+        Expression::In(left, right) => {
+            expression_contains_service(left) || right.iter().any(expression_contains_service)
+        }
+        Expression::If(condition, left, right) => {
+            expression_contains_service(condition)
+                || expression_contains_service(left)
+                || expression_contains_service(right)
+        }
+        Expression::Coalesce(expressions) | Expression::FunctionCall(_, expressions) => {
+            expressions.iter().any(expression_contains_service)
+        }
+    }
+}
+
+fn distributed_query_is_union_safe(query: &str) -> bool {
+    let Ok(parsed) = spargebra::SparqlParser::new().parse_query(query) else {
+        return false;
+    };
+    match parsed {
+        spargebra::Query::Select { pattern, .. } => {
+            let pattern = match pattern {
+                spargebra::algebra::GraphPattern::Slice {
+                    inner, start: 0, ..
+                } => *inner,
+                spargebra::algebra::GraphPattern::Slice { .. } => return false,
+                pattern => pattern,
+            };
+            let spargebra::algebra::GraphPattern::Distinct { inner } = pattern else {
+                return false;
+            };
+            let spargebra::algebra::GraphPattern::Project { inner, .. } = *inner else {
+                return false;
+            };
+            distributed_union_pattern_is_safe(&inner)
+        }
+        spargebra::Query::Ask { pattern, .. } => {
+            let spargebra::algebra::GraphPattern::Project { inner, .. } = pattern else {
+                return false;
+            };
+            distributed_union_pattern_is_safe(&inner)
+        }
+        _ => false,
+    }
+}
+
+fn distributed_union_pattern_is_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    match pattern {
+        spargebra::algebra::GraphPattern::Bgp { patterns } => patterns.len() <= 1,
+        spargebra::algebra::GraphPattern::Union { left, right } => {
+            distributed_union_pattern_is_safe(left) && distributed_union_pattern_is_safe(right)
+        }
+        spargebra::algebra::GraphPattern::Graph { inner, .. } => {
+            distributed_union_pattern_is_safe(inner)
+        }
+        _ => false,
     }
 }
 
@@ -1161,7 +1355,8 @@ where
     let MetadataFanoutScope {
         mode,
         target_nodes,
-        discovery_failed,
+        allow_partial,
+        discovery_failed: scope_discovery_failed,
     } = scope;
     ensure_supported_query_mode(&mode);
     match mode.unwrap_or(MetadataApiQueryMode::Distributed) {
@@ -1179,6 +1374,8 @@ where
             let fanout_stats = MetadataFanoutStats {
                 nodes_queried: 1,
                 nodes_failed: 0,
+                failed_partitions: Vec::new(),
+                discovery_failed: false,
             };
             match result {
                 Ok(result) => Ok((vec![(local_node_id, result)], fanout_stats)),
@@ -1188,15 +1385,45 @@ where
         MetadataApiQueryMode::Distributed => {
             let discovery =
                 metadata_fanout_nodes(context, realm_id, local_node_id, &span, target_nodes).await;
-            let discovery_failed = discovery_failed || discovery.failed;
-            let nodes = discovery.nodes;
+            let discovery_failed = scope_discovery_failed || discovery.failed;
+            let mut nodes = discovery.nodes;
+            if discovery_failed && !allow_partial {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            let all_nodes = nodes.clone();
+            let mut failed_partitions = Vec::new();
+            if matches!(operation, MetadataFanoutOperation::Query)
+                && nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES
+            {
+                if let Some(local_index) = nodes
+                    .iter()
+                    .position(|node_id| *node_id == local_node_id)
+                    .filter(|index| *index >= METADATA_DISTRIBUTED_QUERY_MAX_NODES)
+                {
+                    nodes.swap(local_index, METADATA_DISTRIBUTED_QUERY_MAX_NODES - 1);
+                }
+                failed_partitions.extend(nodes.drain(METADATA_DISTRIBUTED_QUERY_MAX_NODES..));
+                if !allow_partial {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+            }
             span.record("node_count", nodes.len() as u64);
             let mut fanout_stats = MetadataFanoutStats {
                 nodes_queried: nodes.len(),
-                nodes_failed: usize::from(discovery_failed),
+                nodes_failed: failed_partitions.len() + usize::from(discovery_failed),
+                failed_partitions,
+                discovery_failed,
             };
             let fanout_started = Instant::now();
             let mut node_parts = Vec::new();
+            let node_order = all_nodes
+                .into_iter()
+                .enumerate()
+                .map(|(index, node_id)| (node_id, index))
+                .collect::<HashMap<_, _>>();
+            let mut outstanding = nodes.iter().copied().collect::<HashSet<_>>();
+            let deadline = matches!(operation, MetadataFanoutOperation::Query)
+                .then(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
 
             let pending =
                 stream::iter(nodes.into_iter().enumerate().map(|(node_index, node_id)| {
@@ -1219,22 +1446,51 @@ where
                 .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
             futures_util::pin_mut!(pending);
 
-            while let Some((node_index, node_id, result)) = pending.next().await {
+            loop {
+                let next = match deadline {
+                    Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await
+                    {
+                        Ok(next) => next,
+                        Err(_) => {
+                            fanout_stats
+                                .failed_partitions
+                                .extend(outstanding.iter().copied());
+                            fanout_stats.nodes_failed = fanout_stats.failed_partitions.len()
+                                + usize::from(fanout_stats.discovery_failed);
+                            if !allow_partial {
+                                return Err(MetadataApiError::ServiceUnavailable);
+                            }
+                            break;
+                        }
+                    },
+                    None => pending.next().await,
+                };
+                let Some((node_index, node_id, result)) = next else {
+                    break;
+                };
+                outstanding.remove(&node_id);
                 match result {
                     Ok(result) => node_parts.push((node_index, node_id, result)),
                     Err(error) => {
                         fanout_stats.nodes_failed += 1;
+                        fanout_stats.failed_partitions.push(node_id);
                         warn!(
                             node_id = ?node_id,
                             operation = operation.label(),
                             error = %error,
                             "distributed metadata skipped failed node result"
                         );
+                        if !allow_partial {
+                            return Err(MetadataApiError::ServiceUnavailable);
+                        }
                     }
                 }
             }
 
             node_parts.sort_by_key(|(node_index, _, _)| *node_index);
+            fanout_stats
+                .failed_partitions
+                .sort_by_key(|node_id| node_order.get(node_id).copied().unwrap_or(usize::MAX));
             aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
             Ok((
                 node_parts
@@ -1300,6 +1556,14 @@ async fn run_query_distributed(
 ) -> Result<(MetadataQueryResults, MetadataFanoutStats), MetadataApiError> {
     let span = Span::current();
     let total_started = Instant::now();
+    let mode = scope.mode.unwrap_or(MetadataApiQueryMode::Distributed);
+    let single_dataset_result = mode == MetadataApiQueryMode::Local || graph_iris.is_some();
+    if mode == MetadataApiQueryMode::Distributed
+        && graph_iris.is_none()
+        && !distributed_query_is_union_safe(&query)
+    {
+        return Err(MetadataApiError::BadRequest);
+    }
     let handle = context
         .metadata_handle
         .clone()
@@ -1344,12 +1608,19 @@ async fn run_query_distributed(
         local_call,
         remote_call,
         record_query_node_result,
-        map_metadata_event_error,
+        map_metadata_query_error,
     )
     .await?;
 
-    let parts = parts.into_iter().map(|(_, result)| result).collect();
-    let result = aggregate_query_results(parts, query_form, select_limit);
+    let parts: Vec<_> = parts.into_iter().map(|(_, result)| result).collect();
+    let result = if single_dataset_result {
+        match parts.into_iter().next() {
+            Some(result) => Ok(result),
+            None => aggregate_query_results(Vec::new(), query_form, select_limit),
+        }
+    } else {
+        aggregate_query_results(parts, query_form, select_limit)
+    };
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     match &result {
         Ok(results) => {
@@ -1386,6 +1657,7 @@ async fn run_search_distributed(
     bearer_token: Option<String>,
     graph_iris: Option<Vec<String>>,
     query: String,
+    conforms_to: Option<String>,
     resume: HashMap<NodeId, u32>,
     watermark: Option<SearchWatermark>,
     page_size: usize,
@@ -1414,19 +1686,36 @@ async fn run_search_distributed(
             auth.clone(),
             graph_iris.clone(),
             query.clone(),
+            conforms_to.clone(),
             resume.clone(),
             page_size,
         ),
-        |(handle, auth, graph_iris, query, resume, page_size), node_id| async move {
+        |(handle, auth, graph_iris, query, conforms_to, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(
                 &resume,
                 node_id,
                 page_size,
                 METADATA_SEARCH_MAX_PAGINATION_DEPTH,
             );
-            let hits = handle
-                .search_authorized_local(auth, graph_iris, query, limit)
-                .await?;
+            let hits = match conforms_to {
+                Some(object_iri) => {
+                    handle
+                        .search_authorized_local_filtered(
+                            auth,
+                            graph_iris,
+                            query,
+                            limit,
+                            super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
+                            object_iri,
+                        )
+                        .await?
+                }
+                None => {
+                    handle
+                        .search_authorized_local(auth, graph_iris, query, limit)
+                        .await?
+                }
+            };
             Ok((hits, limit))
         },
     );
@@ -1436,19 +1725,37 @@ async fn run_search_distributed(
             remote_auth_token.clone(),
             graph_iris.clone(),
             query.clone(),
+            conforms_to,
             resume.clone(),
             page_size,
         ),
-        |(handle, auth_token, graph_iris, query, resume, page_size), node_id| async move {
+        |(handle, auth_token, graph_iris, query, conforms_to, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(
                 &resume,
                 node_id,
                 page_size,
                 METADATA_SEARCH_MAX_PAGINATION_DEPTH,
             );
-            let hits = handle
-                .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
-                .await?;
+            let hits = match conforms_to {
+                Some(object_iri) => {
+                    handle
+                        .request_remote_filtered_search_graphs(
+                            node_id,
+                            auth_token,
+                            graph_iris,
+                            query,
+                            limit,
+                            super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
+                            object_iri,
+                        )
+                        .await?
+                }
+                None => {
+                    handle
+                        .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
+                        .await?
+                }
+            };
             Ok((hits, limit))
         },
     );
@@ -1498,6 +1805,13 @@ pub fn aggregate_query_results(
         MetadataQueryForm::Select => {
             let mut seen = HashSet::new();
             let mut merged = Vec::new();
+            let mut merged_bytes = 32usize;
+            let row_limit = select_limit
+                .unwrap_or(METADATA_QUERY_MAX_ROWS)
+                .min(METADATA_QUERY_MAX_ROWS);
+            if row_limit == 0 {
+                return Ok(MetadataQueryResults::Solutions(Vec::new()));
+            }
             for result in results {
                 let MetadataQueryResults::Solutions(rows) = result else {
                     continue;
@@ -1506,12 +1820,21 @@ pub fn aggregate_query_results(
                     let key = serde_json::to_string(&row)
                         .map_err(|err| MetadataApiError::Internal(err.to_string()))?;
                     if seen.insert(key) {
+                        merged_bytes = merged_bytes.saturating_add(
+                            serde_json::to_vec(&row)
+                                .map_err(|err| MetadataApiError::Internal(err.to_string()))?
+                                .len()
+                                .saturating_add(1),
+                        );
+                        if merged_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
+                            return Err(MetadataApiError::BadRequest);
+                        }
                         merged.push(row);
+                        if merged.len() >= row_limit {
+                            return Ok(MetadataQueryResults::Solutions(merged));
+                        }
                     }
                 }
-            }
-            if let Some(limit) = select_limit {
-                merged.truncate(limit);
             }
             Ok(MetadataQueryResults::Solutions(merged))
         }
@@ -1623,6 +1946,60 @@ mod tests {
             MetadataQueryForm::Ask
         );
         assert_eq!(query_form("CONSTRUCT WHERE { ?s ?p ?o }"), None);
+    }
+
+    #[test]
+    fn query_validation_rejects_updates_and_service() {
+        assert!(ensure_supported_query_form("SELECT ?s WHERE { ?s ?p ?o }").is_ok());
+        assert!(ensure_supported_query_form("ASK WHERE { ?s ?p ?o }").is_ok());
+        assert!(ensure_supported_query_form("INSERT DATA { <urn:s> <urn:p> <urn:o> }").is_err());
+        assert!(
+            ensure_supported_query_form(
+                "SELECT ?s WHERE { SERVICE <https://example.org/sparql> { ?s ?p ?o } }"
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_supported_query_form(
+                "ASK WHERE { FILTER EXISTS { SERVICE SILENT ?endpoint { ?s ?p ?o } } }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn distributed_query_validation_accepts_only_union_safe_forms() {
+        assert!(distributed_query_is_union_safe("ASK WHERE { ?s ?p ?o }"));
+        assert!(!distributed_query_is_union_safe(
+            "ASK WHERE { ?s ?p ?o . ?s ?p2 ?o2 }"
+        ));
+        assert!(distributed_query_is_union_safe(
+            "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 10"
+        ));
+        assert!(!distributed_query_is_union_safe(
+            "SELECT ?s WHERE { ?s ?p ?o }"
+        ));
+        assert!(!distributed_query_is_union_safe(
+            "SELECT DISTINCT ?s WHERE { ?s ?p ?o . ?s ?p2 ?o2 }"
+        ));
+        assert!(!distributed_query_is_union_safe(
+            "SELECT DISTINCT ?s WHERE { ?s ?p ?o } OFFSET 1"
+        ));
+        assert!(!distributed_query_is_union_safe(
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }"
+        ));
+    }
+
+    #[test]
+    fn query_validation_enforces_byte_and_row_bounds() {
+        assert!(ensure_supported_query_form(&" ".repeat(METADATA_QUERY_MAX_BYTES + 1)).is_err());
+        assert!(
+            ensure_supported_query_form(&format!(
+                "SELECT ?s WHERE {{ ?s ?p ?o }} LIMIT {}",
+                METADATA_QUERY_MAX_ROWS + 1
+            ))
+            .is_err()
+        );
     }
 
     // Fan-out follows the live holders of the stored bucket; the event-time
