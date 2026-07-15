@@ -4,6 +4,7 @@ pub mod add_group_role;
 pub mod add_realm_role;
 pub mod add_user_to_group;
 pub mod add_user_to_realm_role;
+pub mod allocate_handle;
 pub mod announce;
 pub mod announce_realm_presence;
 pub mod auth;
