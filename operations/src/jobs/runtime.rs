@@ -480,6 +480,21 @@ impl JobsRuntime {
 
         let mut recovered = 0;
         for job_id in job_ids {
+            let Some(record) = read_job_record(storage, job_id, None).await? else {
+                continue;
+            };
+            if record.execution_class == JobExecutionClass::InProcess {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    continue;
+                };
+                match release_job(storage, job_id, token, now_ms).await {
+                    Ok(ReleaseOutcome::Released(_)) => recovered += 1,
+                    Ok(ReleaseOutcome::Skipped)
+                    | Err(JobMutationError::NotFound | JobMutationError::TokenMismatch) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                continue;
+            }
             match requeue_job(
                 storage,
                 job_id,
@@ -1072,14 +1087,19 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
-        let recovered = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.state, JobState::Queued);
-        assert_eq!(recovered.attempts, 1);
-        assert!(recovered.claim.is_none());
+        for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
+            assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
+            let recovered = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.state, JobState::Queued, "restart {restart}");
+            assert_eq!(recovered.attempts, 0, "restart {restart}");
+            assert!(recovered.claim.is_none());
+            if restart < JOB_MAX_ATTEMPTS + 1 {
+                reclaim(&storage, job_id).await;
+            }
+        }
     }
 
     // finished_at must reflect completion time, not the job's start.

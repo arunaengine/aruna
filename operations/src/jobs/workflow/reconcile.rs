@@ -12,7 +12,7 @@ use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
     AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    record_attempt_started, requeue_before_attempt, transition_external_to_running,
+    record_attempt_started, release_job, transition_external_to_running,
 };
 use super::workspace::mint_workspace_credential;
 use super::{build_task_spec, finalize_attempt, resolve_backend, supervise_and_finalize};
@@ -71,17 +71,10 @@ impl ExternalReconciler for ComputeReconciler {
             return;
         };
 
-        // No durable attempt intent means the attempt was never submitted; re-drive
-        // from scratch (no container can exist).
+        // No durable attempt intent means the attempt was never submitted; release
+        // the adopted lease without charging an attempt.
         let Some(intent) = adopted.attempt_intent.clone() else {
-            let _ = requeue_before_attempt(
-                storage,
-                job_id,
-                token,
-                unix_timestamp_millis(),
-                JobError::retryable("lost before attempt submit"),
-            )
-            .await;
+            let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
             return;
         };
 
