@@ -613,6 +613,11 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
     }
     let output_prefixes = task.outputs.iter().map(map_output).collect();
 
+    let cpu_cores = task.resources.as_ref().and_then(|r| r.cpu_cores);
+    if cpu_cores == Some(0) {
+        return Err(TesError::bad_request("invalid cpu_cores"));
+    }
+
     let ram_bytes = task
         .resources
         .as_ref()
@@ -626,7 +631,7 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
         })
         .transpose()?;
     let resources = ComputeResources {
-        cpu_cores: task.resources.as_ref().and_then(|r| r.cpu_cores),
+        cpu_cores,
         ram_bytes,
         max_walltime_ms: None,
     };
