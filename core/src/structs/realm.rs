@@ -2,10 +2,11 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, HandleRange,
-    HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, FIRST_HANDLE,
+    HandleRange, HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementScope, PlacementStrategy, StrategyBinding,
 };
+use crate::structured_id::PlacementHandle;
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -429,6 +430,19 @@ impl RealmConfigDocument {
             strategy_id: everywhere_strategy.strategy_id,
         })
         .collect();
+        // Pre-provision the realm-scoped Metadata placement binding a shared
+        // create needs to mint a structured id (DEC-ONBOARD): handle 1 is the
+        // first allocatable handle. Coordinator-granted ranges (layer 1) must
+        // therefore start above this reserved default.
+        self.placement_bindings = vec![PlacementBinding {
+            handle: PlacementHandle::new(FIRST_HANDLE).expect("handle 1 is allocatable"),
+            scope: PlacementScope::Realm(self.realm_id),
+            document_class: DocumentClass::Metadata,
+            strategy_id: default_strategy.strategy_id,
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        }];
         self.strategies = vec![default_strategy, everywhere_strategy];
     }
 
