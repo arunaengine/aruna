@@ -617,6 +617,9 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
     if cpu_cores == Some(0) {
         return Err(TesError::bad_request("invalid cpu_cores"));
     }
+    if task.resources.as_ref().and_then(|r| r.disk_gb).is_some() {
+        return Err(TesError::bad_request("disk_gb is not supported"));
+    }
 
     let ram_bytes = task
         .resources
