@@ -28,7 +28,7 @@ use crate::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcom
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.
-const WALLTIME_LABEL: &str = "aruna.io/max-walltime-ms";
+const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
 /// Docker encodes directory type with Go's `os.ModeDir` bit.
 const DIRECTORY_MODE: u32 = 1 << 31;
 
@@ -980,7 +980,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The container carries this attempt's `aruna.io/*` labels; matching by the
+/// The container carries this attempt's `aruna-engine.org/*` labels; matching by the
 /// deterministic name alone would adopt (or remove) a same-named container
 /// created by another instance.
 fn labels_match(inspect: &ContainerInspectResponse, attempt: &AttemptRef) -> bool {

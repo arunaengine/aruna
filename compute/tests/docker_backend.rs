@@ -365,7 +365,7 @@ async fn resource_limits() {
 
 #[tokio::test]
 async fn foreign_not_adopted() {
-    // A same-named container created outside Aruna (no aruna.io/* labels) is
+    // A same-named container created outside Aruna (no aruna-engine.org/* labels) is
     // neither adopted as evidence nor removed by cleanup.
     let backend = backend_or_skip!();
     // Warm the image so the bare create below cannot 404.

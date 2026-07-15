@@ -54,8 +54,8 @@ impl AttemptRef {
     /// Reconciliation/forensics labels applied to the external object.
     pub fn labels(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
-            ("aruna.io/job-id".to_string(), self.job_id.clone()),
-            ("aruna.io/attempt".to_string(), self.attempt.to_string()),
+            ("aruna-engine.org/job-id".to_string(), self.job_id.clone()),
+            ("aruna-engine.org/attempt".to_string(), self.attempt.to_string()),
         ])
     }
 }
