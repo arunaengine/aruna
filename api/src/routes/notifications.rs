@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(onboarded.node_id, Some(onboarded_node.to_string()));
         assert_eq!(onboarded.group_id, None);
 
-        let document_id = Ulid::r#gen();
+        let document_id = aruna_core::MetaResourceId::try_from((1u128 << 60) | 1).unwrap();
         let metadata_created = notification_response(&NotificationRecord::new(
             recipient,
             NotificationClass::Transient,

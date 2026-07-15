@@ -1,6 +1,7 @@
 use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::MetaResourceId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
@@ -1202,8 +1203,10 @@ pub async fn search_metadata(
     ))
 }
 
-fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
-    Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+fn parse_document_id(document_id: &str) -> ServerResult<MetaResourceId> {
+    document_id
+        .parse::<MetaResourceId>()
+        .map_err(|_| ServerError::BadRequest)
 }
 
 async fn run_list_metadata_documents(
@@ -2304,7 +2307,11 @@ mod tests {
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
 
-        let result = load_metadata_record_by_document(state.as_ref(), Ulid::r#gen()).await;
+        let result = load_metadata_record_by_document(
+            state.as_ref(),
+            aruna_core::MetaResourceId::try_from((1u128 << 60) | 1).unwrap(),
+        )
+        .await;
 
         assert!(matches!(
             result,
