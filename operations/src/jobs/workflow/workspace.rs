@@ -20,6 +20,7 @@ use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation}
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_OUTPUT_MANIFEST_OBJECTS: usize = 10_000;
 
 /// Minted workspace S3 credential handed to the container.
 pub struct WorkspaceCredential {
@@ -248,6 +249,9 @@ pub async fn collect_outputs(
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
             let Some(result) = result else { break };
             for object in result.objects {
+                if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
+                    return Ok(outputs);
+                }
                 let (size, digest) = match object.location {
                     Some(location) => (location.blob_size, location.get_blake3().map(hex_encode)),
                     None => (0, None),
