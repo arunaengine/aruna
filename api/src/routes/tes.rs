@@ -611,7 +611,11 @@ fn map_task_to_spec(task: &TesTask) -> Result<(ExecutionSpec, Option<String>), T
         }
         inputs.push(input);
     }
-    let output_prefixes = task.outputs.iter().map(map_output).collect();
+    let output_prefixes = task
+        .outputs
+        .iter()
+        .map(map_output)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let cpu_cores = task.resources.as_ref().and_then(|r| r.cpu_cores);
     if cpu_cores == Some(0) {
@@ -697,8 +701,11 @@ fn map_input(input: &TesInput) -> Result<InputSelection, TesError> {
     })
 }
 
-fn map_output(output: &TesOutput) -> String {
-    output.path.trim_start_matches('/').to_string()
+fn map_output(output: &TesOutput) -> Result<String, TesError> {
+    if output.url.is_some() {
+        return Err(TesError::bad_request("output url is not supported"));
+    }
+    Ok(output.path.trim_start_matches('/').to_string())
 }
 
 // ---------------------------------------------------------------------------
