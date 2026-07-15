@@ -17,7 +17,7 @@ use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use futures_util::future::FutureExt;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, RwLockReadGuard, watch};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -75,6 +75,7 @@ pub struct JobsRuntime {
     internal_cap: usize,
     external_cap: usize,
     reconciler: Mutex<Option<Arc<dyn ExternalReconciler>>>,
+    claim_producer_barrier: RwLock<()>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
@@ -120,6 +121,7 @@ impl JobsRuntime {
             internal_cap,
             external_cap,
             reconciler: Mutex::new(reconciler),
+            claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
         })
     }
@@ -167,6 +169,15 @@ impl JobsRuntime {
 
     pub fn available_slots(&self) -> usize {
         self.available_slots_for(JobExecutionClass::InProcess)
+    }
+
+    pub(crate) async fn claim_producer(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        let guard = self.claim_producer_barrier.read().await;
+        if self.state().draining {
+            None
+        } else {
+            Some(guard)
+        }
     }
 
     /// Poke a locally running job's cancel token; `false` if it is not running here.
@@ -349,6 +360,7 @@ impl JobsRuntime {
                 }
             }
         }
+        let _claim_producers = self.claim_producer_barrier.write().await;
         // A claim that raced the drain stop released itself on a detached task; wait for
         // those too, or the process can exit with the lease still held.
         loop {
@@ -1166,6 +1178,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(record.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_producer() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let job_id = JobId::from_bytes([0x15; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 1, 0, None)).await;
+        let runtime = JobsRuntime::new();
+        let producer = runtime.claim_producer().await.unwrap();
+
+        let mut shutdown = Box::pin(runtime.shutdown(&storage, Duration::ZERO));
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "shutdown must wait for the active claim producer"
+        );
+
+        runtime.spawn(ctx, claimed);
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(30), shutdown)
+            .await
+            .expect("shutdown waits only for the producer barrier");
+
+        let record = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, JobState::Queued);
+        assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
     }
 

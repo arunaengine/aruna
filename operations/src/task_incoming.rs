@@ -1573,6 +1573,9 @@ impl OperationsTaskHandler {
             return;
         };
         let node_id = net_handle.node_id();
+        let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
+            return;
+        };
         let capacity = self
             .jobs_runtime
             .available_slots_for(JobExecutionClass::InProcess)
@@ -1623,6 +1626,7 @@ impl OperationsTaskHandler {
             }
             self.jobs_runtime.spawn(self.context.clone(), record);
         }
+        drop(claim_producer);
 
         // A per-job error stopped the batch after handing off what was claimed; back off
         // and re-drive the remainder rather than hot-looping on the failure.
