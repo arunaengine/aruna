@@ -842,9 +842,13 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         exit_code,
         workspace_bucket,
         outputs: captured,
+        stdout,
+        stderr,
     }) = &record.result
     {
         executor_log.exit_code = *exit_code;
+        executor_log.stdout = (!stdout.is_empty()).then(|| stdout.clone());
+        executor_log.stderr = (!stderr.is_empty()).then(|| stderr.clone());
         outputs = captured
             .iter()
             .map(|output| TesOutputFileLog {
@@ -854,8 +858,6 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
             })
             .collect();
     }
-    // stdout/stderr live as node-local log chunks and are not stored on the record,
-    // so they are not surfaced inline here.
     let system_logs = record
         .last_error
         .as_ref()
@@ -1222,6 +1224,8 @@ mod tests {
             exit_code: Some(1),
             workspace_bucket: "ws".to_string(),
             outputs: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
         });
         assert_eq!(tes_state(&record), TesState::ExecutorError);
     }
@@ -1244,6 +1248,8 @@ mod tests {
                 size: 12,
                 digest: None,
             }],
+            stdout: "hello".to_string(),
+            stderr: String::new(),
         });
 
         let minimal = project_task(&record, TesView::Minimal, "http://x");

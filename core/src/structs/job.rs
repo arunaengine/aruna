@@ -287,6 +287,8 @@ pub enum JobResultPayload {
         exit_code: Option<i32>,
         workspace_bucket: String,
         outputs: Vec<OutputObject>,
+        stdout: String,
+        stderr: String,
     },
     RunCrate {
         resource: String,
@@ -312,9 +314,13 @@ impl JobResultPayload {
                 exit_code,
                 workspace_bucket,
                 outputs,
+                stdout,
+                stderr,
             } => serde_json::json!({
                 "exit_code": exit_code,
                 "workspace_bucket": workspace_bucket,
+                "stdout": stdout,
+                "stderr": stderr,
                 "outputs": outputs
                     .iter()
                     .map(|output| serde_json::json!({

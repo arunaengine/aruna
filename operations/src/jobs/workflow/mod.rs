@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::backend::{BackendError, ExecutorBackend, ExecutorKind};
-use aruna_compute::spec::{AttemptRef, ResourceRequest, Secret, TaskSpec, WorkspaceBinding};
+use aruna_compute::logs::{LogTails, NullSink};
+use aruna_compute::spec::{
+    AttemptRef, LogLimits, ResourceRequest, Secret, TaskSpec, WorkspaceBinding,
+};
 use aruna_compute::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -507,7 +510,10 @@ pub(crate) async fn finalize_attempt(
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
                 return;
             };
-            let result = execution_result_for(bucket, Some(0), outputs);
+            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+                return;
+            };
+            let result = execution_result_for(bucket, Some(0), outputs, logs);
             let record = terminal_complete(storage, job_id, token, result).await;
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
@@ -515,7 +521,10 @@ pub(crate) async fn finalize_attempt(
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
                 return;
             };
-            let result = execution_result_for(bucket, Some(code), outputs);
+            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+                return;
+            };
+            let result = execution_result_for(bucket, Some(code), outputs, logs);
             let record = terminal_fail(
                 storage,
                 job_id,
@@ -527,7 +536,10 @@ pub(crate) async fn finalize_attempt(
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
         AttemptPhase::Failed { reason } => {
-            let result = execution_result_for(bucket, None, Vec::new());
+            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+                return;
+            };
+            let result = execution_result_for(bucket, None, Vec::new(), logs);
             let record = terminal_fail(
                 storage,
                 job_id,
@@ -569,6 +581,9 @@ async fn finalize_cancel(
     let evidence = backend.cancel(attempt).await;
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+                return;
+            };
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
                 return;
             };
@@ -576,7 +591,7 @@ async fn finalize_cancel(
                 AttemptPhase::Exited { code } => Some(code),
                 _ => None,
             };
-            let result = execution_result_for(bucket, code, outputs);
+            let result = execution_result_for(bucket, code, outputs, logs);
             let record = terminal_cancel(storage, job_id, token, result).await;
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
@@ -584,7 +599,7 @@ async fn finalize_cancel(
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
                 return;
             };
-            let result = execution_result_for(bucket, None, outputs);
+            let result = execution_result_for(bucket, None, outputs, LogTails::default());
             let record = terminal_cancel(storage, job_id, token, result).await;
             cleanup_and_crate(context, job_id, backend, attempt, record).await;
         }
@@ -778,23 +793,60 @@ fn execution_result(
         .workspace_bucket
         .clone()
         .unwrap_or_else(|| JobRecord::workspace_bucket_name(record.job_id));
-    execution_result_for(&bucket, exit_code, outputs)
+    execution_result_for(&bucket, exit_code, outputs, LogTails::default())
 }
 
 fn execution_result_for(
     bucket: &str,
     exit_code: Option<i32>,
     outputs: Vec<OutputObject>,
+    logs: LogTails,
 ) -> JobResultPayload {
     JobResultPayload::Execution {
         exit_code,
         workspace_bucket: bucket.to_string(),
         outputs,
+        stdout: log_tail(logs.stdout, logs.stdout_truncated),
+        stderr: log_tail(logs.stderr, logs.stderr_truncated),
     }
 }
 
-fn default_node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[0u8; 32]).public()
+async fn capture_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
+) -> Option<LogTails> {
+    let default_limits = LogLimits::default();
+    let limits = LogLimits {
+        max_bytes_per_stream: default_limits.inline_tail_bytes,
+        ..default_limits
+    };
+    match backend.fetch_logs(attempt, &limits, &NullSink).await {
+        Ok(logs) => Some(logs),
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Container log capture failed");
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                JobError::retryable(format!("container log capture failed: {error}")),
+                unix_timestamp_millis(),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+fn log_tail(bytes: Vec<u8>, truncated: bool) -> String {
+    let tail = String::from_utf8_lossy(&bytes);
+    if truncated {
+        format!("[truncated]\n{tail}")
+    } else {
+        tail.into_owned()
+    }
 }
 
 #[cfg(test)]
