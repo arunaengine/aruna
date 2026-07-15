@@ -8,10 +8,13 @@ use std::time::Duration;
 use aruna_compute::backend::{BackendError, ExecutorBackend, ExecutorKind};
 use aruna_compute::spec::{AttemptRef, ResourceRequest, Secret, TaskSpec, WorkspaceBinding};
 use aruna_compute::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
+use aruna_core::events::Event;
+use aruna_core::handle::Handle;
 use aruna_core::structs::{
     AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobResultPayload,
-    OutputObject, run_crate_dedup_key,
+    OutputObject,
 };
+use aruna_core::task::TaskEvent;
 use aruna_core::types::NodeId;
 use aruna_core::util::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
@@ -24,8 +27,8 @@ use super::store::{
     requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
     transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
-use super::submit::{SubmitJobOperation, SubmitJobSpec};
-use crate::driver::{DriverContext, drive};
+use super::submit::schedule_job_drain_effect;
+use crate::driver::DriverContext;
 use workspace::{
     collect_outputs, ensure_workspace_bucket, mint_workspace_credential, stage_inputs,
 };
@@ -51,8 +54,12 @@ pub async fn run_execution_job(
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
     if record.cancel_requested && record.attempt_intent.is_none() {
-        let _ = cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await;
-        finalize_followups(&context, job_id).await;
+        match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
+            Ok(_) => finalize_followups(&context, job_id).await,
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Fresh cancellation write failed")
+            }
+        }
         return;
     }
 
@@ -665,8 +672,8 @@ async fn terminal_cancel(
     }
 }
 
-/// Remove the container after terminal evidence is durable, then submit the
-/// run-crate obligation. A failed cleanup or crate submit never affects the job.
+/// Remove the container after terminal evidence is durable, then wake the drain
+/// for the run-crate obligation persisted with terminalization.
 async fn cleanup_and_crate(
     context: &DriverContext,
     job_id: JobId,
@@ -683,26 +690,13 @@ async fn cleanup_and_crate(
     finalize_followups(context, job_id).await;
 }
 
-/// Submit the follow-on `WriteRunCrate` internal job (dedup `run-crate/{JobId}`).
-async fn finalize_followups(context: &DriverContext, job_id: JobId) {
-    let owner_node_id = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .unwrap_or_else(default_node_id);
-    let created_by = match read_job_record(&context.storage_handle, job_id, None).await {
-        Ok(Some(record)) => record.created_by,
-        _ => return,
-    };
-    let spec = SubmitJobSpec {
-        payload: JobPayload::WriteRunCrate { for_job: job_id },
-        created_by,
-        owner_node_id,
-        dedup_key: Some(run_crate_dedup_key(job_id)),
-        now_ms: unix_timestamp_millis(),
-    };
-    if let Err(error) = drive(SubmitJobOperation::new(spec), context).await {
-        warn!(job_id = %job_id, error = %error, "Failed to submit run-crate obligation");
+/// Wake the drain for the follow-on `WriteRunCrate` job persisted with terminalization.
+pub(super) async fn finalize_followups(context: &DriverContext, job_id: JobId) {
+    if let Some(task_handle) = context.task_handle.as_ref()
+        && let Event::Task(TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(schedule_job_drain_effect()).await
+    {
+        warn!(job_id = %job_id, message = %message, "Failed to kick run-crate drain");
     }
 }
 

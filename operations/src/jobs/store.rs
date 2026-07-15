@@ -6,11 +6,12 @@ use aruna_core::keyspaces::{
     JOB_SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord,
-    JobResultPayload, JobState, JobTransitionError, encode_job_dedup_value, job_due_index_key,
-    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
-    job_prune_index_key, job_record_key, job_run_crate_key, parse_job_dedup_value,
-    parse_job_owner_index_key, validate_transition,
+    AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload, JobProgress,
+    JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus, crate_job_id,
+    encode_job_dedup_value, job_due_index_key, job_lease_index_key, job_owner_cursor,
+    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
+    job_run_crate_key, parse_job_dedup_value, parse_job_owner_index_key, run_crate_dedup_key,
+    validate_transition,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -234,10 +235,100 @@ where
             batch_delete(storage, deletes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
+            if !old.state.is_terminal() && record.state.is_terminal() {
+                insert_crate_obligation(storage, txn_id, &record).await?;
+                mark_crate_failed(storage, txn_id, &record).await?;
+            }
             cleanup_dedup_entry(storage, txn_id, &old, &record).await?;
             Ok(record)
         }
     }
+}
+
+async fn insert_crate_obligation(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &JobRecord,
+) -> Result<(), JobMutationError> {
+    if !matches!(&record.payload, JobPayload::Execution(_)) {
+        return Ok(());
+    }
+    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    let child = JobRecord::new(
+        crate_job_id(record.job_id),
+        JobPayload::WriteRunCrate {
+            for_job: record.job_id,
+        },
+        record.created_by,
+        record.owner_node_id,
+        now_ms,
+        now_ms,
+        Some(run_crate_dedup_key(record.job_id)),
+    );
+    let mut writes =
+        job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    writes.push((
+        JOB_RUN_CRATE_KEYSPACE.to_string(),
+        job_run_crate_key(record.job_id),
+        ByteView::from(
+            RunCrateStatus::Pending
+                .to_bytes()
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+        ),
+    ));
+    batch_write(storage, writes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)
+}
+
+async fn mark_crate_failed(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &JobRecord,
+) -> Result<(), JobMutationError> {
+    let JobPayload::WriteRunCrate { for_job } = &record.payload else {
+        return Ok(());
+    };
+    if !matches!(record.state, JobState::Failed | JobState::Cancelled) {
+        return Ok(());
+    }
+    let key = job_run_crate_key(*for_job);
+    if let Some(value) = read_raw(storage, JOB_RUN_CRATE_KEYSPACE, key.clone(), Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?
+        && !matches!(
+            RunCrateStatus::from_bytes(value.as_ref())
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+            RunCrateStatus::Pending
+        )
+    {
+        return Ok(());
+    }
+    let status = RunCrateStatus::Failed {
+        message: record
+            .last_error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| match record.state {
+                JobState::Cancelled => "run-crate obligation cancelled".to_string(),
+                _ => "run-crate retries exhausted".to_string(),
+            }),
+    };
+    batch_write(
+        storage,
+        vec![(
+            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            key,
+            ByteView::from(
+                status
+                    .to_bytes()
+                    .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+            ),
+        )],
+        Some(txn_id),
+    )
+    .await
+    .map_err(JobMutationError::Storage)
 }
 
 /// Remove the dedup row only when it still references THIS job: a raced submit may

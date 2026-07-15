@@ -617,6 +617,17 @@ pub fn run_crate_dedup_key(job_id: JobId) -> Vec<u8> {
     format!("internal/run-crate/{job_id}").into_bytes()
 }
 
+/// Stable child-job identity for the durable run-crate obligation.
+pub fn crate_job_id(job_id: JobId) -> JobId {
+    let parent = job_id.to_bytes();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna/run-crate-job/v1");
+    hasher.update(&parent);
+    let mut child = parent;
+    child[6..].copy_from_slice(&hasher.finalize().as_bytes()[..10]);
+    JobId::from_bytes(child)
+}
+
 /// Dedup key of a user-supplied idempotency key: namespaced under `user/` and
 /// scoped to the submitting user (fixed-width id), so a caller can neither
 /// suppress an internal obligation nor squat another user's key.
