@@ -60,7 +60,7 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
-    let document_id = Ulid::r#gen();
+    let document_id = Ulid::from_bytes(for_job.to_bytes());
     let document_path = format!("runs/{for_job}");
     let node_id = net_handle.node_id();
     let actor = Actor {
