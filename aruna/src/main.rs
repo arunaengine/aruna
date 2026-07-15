@@ -427,7 +427,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build the executor registry from config. The Docker backend is opt-in via
 /// `ARUNA_COMPUTE_DOCKER=true`; registration requires a healthy daemon and an
-/// explicit container-reachable S3 endpoint.
+/// explicit disk ceiling and container-reachable S3 endpoint.
 async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
     let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
@@ -435,6 +435,17 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
     if !docker_enabled {
         return None;
     }
+    let disk_bytes = match parse_disk_limit(
+        dotenvy::var("ARUNA_COMPUTE_DOCKER_DISK_BYTES")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(disk_bytes) => disk_bytes,
+        Err(error) => {
+            warn!(reason = %error, "Docker executor requires ARUNA_COMPUTE_DOCKER_DISK_BYTES; running without compute");
+            return None;
+        }
+    };
     let Some(endpoint) = config.s3_public_url.clone() else {
         warn!("Docker executor requires S3_PUBLIC_URL; running without compute");
         return None;
@@ -451,7 +462,11 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
         warn!(address = %config.s3_address, "Docker executor requires a non-loopback S3_ADDRESS; running without compute");
         return None;
     }
-    match aruna_compute::docker::DockerBackend::connect() {
+    let docker_config = aruna_compute::docker::DockerConfig {
+        default_disk_bytes: Some(disk_bytes),
+        ..aruna_compute::docker::DockerConfig::default()
+    };
+    match aruna_compute::docker::DockerBackend::with_config(docker_config) {
         Ok(backend) => {
             if let Err(error) = aruna_compute::ExecutorBackend::health(&backend).await {
                 warn!(error = %error, "Docker executor requested but unavailable; running without compute");
@@ -468,6 +483,17 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
             None
         }
     }
+}
+
+fn parse_disk_limit(value: Option<&str>) -> Result<u64, &'static str> {
+    let value = value.ok_or("disk ceiling is missing")?;
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|_| "disk ceiling must be an integer byte count")?;
+    if bytes == 0 {
+        return Err("disk ceiling must be greater than zero");
+    }
+    Ok(bytes)
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
@@ -592,6 +618,18 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         }
+    }
+
+    #[test]
+    fn accepts_disk_limit() {
+        assert_eq!(parse_disk_limit(Some("10737418240")), Ok(10_737_418_240));
+    }
+
+    #[test]
+    fn rejects_disk_limit() {
+        assert!(parse_disk_limit(None).is_err());
+        assert!(parse_disk_limit(Some("invalid")).is_err());
+        assert!(parse_disk_limit(Some("0")).is_err());
     }
 
     #[tokio::test]

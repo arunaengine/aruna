@@ -36,6 +36,8 @@ pub struct DockerConfig {
     pub default_mem_bytes: Option<i64>,
     /// nano-CPU ceiling applied when a request omits one (default 2 cores).
     pub default_nano_cpus: Option<i64>,
+    /// Writable-layer ceiling applied when a request omits one.
+    pub default_disk_bytes: Option<u64>,
     /// Walltime ceiling applied when a request omits one (default 24 h);
     /// enforced by `wait`, which stops the container past the deadline.
     pub default_max_walltime: Option<Duration>,
@@ -55,6 +57,7 @@ impl Default for DockerConfig {
             keep_failed: false,
             default_mem_bytes: Some(2 * 1024 * 1024 * 1024),
             default_nano_cpus: Some(2_000_000_000),
+            default_disk_bytes: None,
             default_max_walltime: Some(Duration::from_secs(24 * 60 * 60)),
             pids_limit: 2048,
             drop_all_caps: true,
@@ -205,6 +208,7 @@ fn build_config(config: &DockerConfig, spec: &TaskSpec) -> ContainerCreateBody {
     let storage_opt = spec
         .resources
         .disk_bytes
+        .or(config.default_disk_bytes)
         .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
 
     let host_config = HostConfig {
@@ -748,7 +752,7 @@ mod tests {
 
     #[test]
     fn default_ceilings() {
-        // A request without limits is filled from config defaults, never unlimited.
+        // Portable defaults cover CPU, memory and walltime; disk is operator configured.
         let config = DockerConfig::default();
         let spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
         let body = build_config(&config, &spec);
@@ -766,6 +770,20 @@ mod tests {
     }
 
     #[test]
+    fn disk_default_applies() {
+        let config = DockerConfig {
+            default_disk_bytes: Some(2u64 << 30),
+            ..DockerConfig::default()
+        };
+        let spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        let host = build_config(&config, &spec).host_config.unwrap();
+        assert_eq!(
+            host.storage_opt.unwrap().get("size").unwrap(),
+            &(2u64 << 30).to_string()
+        );
+    }
+
+    #[test]
     fn request_ceilings() {
         // Explicit requests win over defaults; disk becomes a storage quota.
         let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
@@ -773,7 +791,11 @@ mod tests {
         spec.resources.cpu_cores = Some(1);
         spec.resources.disk_bytes = Some(1 << 30);
         spec.resources.max_walltime = Some(Duration::from_secs(600));
-        let body = build_config(&DockerConfig::default(), &spec);
+        let config = DockerConfig {
+            default_disk_bytes: Some(2u64 << 30),
+            ..DockerConfig::default()
+        };
+        let body = build_config(&config, &spec);
         let host = body.host_config.unwrap();
         assert_eq!(host.memory, Some(64 * 1024 * 1024));
         assert_eq!(host.nano_cpus, Some(1_000_000_000));
