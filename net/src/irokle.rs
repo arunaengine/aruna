@@ -4022,6 +4022,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -5003,7 +5004,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5106,7 +5108,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
             if entry.labels.contains_key(KIND_LABEL_KEY) =>
         {
@@ -6147,11 +6150,11 @@ mod tests {
     };
     use aruna_core::structs::{
         Actor, BindingError, BindingScope, DocumentClass, Group, GroupAuthorizationDocument,
-        GroupQuotaOverride, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementScope,
-        PlacementStrategy, QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument,
-        RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding,
-        UserGroupCapOverride,
+        GroupQuotaOverride, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
+        OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementRef,
+        PlacementScope, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StaticRealmEndpoint,
+        StrategyBinding, UserGroupCapOverride,
     };
     use aruna_core::structured_id::PlacementHandle;
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7164,6 +7167,89 @@ mod tests {
                 Err(BindingError::Conflicted(handle))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn replicated_handle_range_grants_converge_to_conflict() {
+        let realm_id = RealmId::from_bytes([78; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_560, 1), realm_id);
+        let actor_a = test_actor(60, user_id, realm_id);
+        let actor_b = test_actor(61, user_id, realm_id);
+        let owner = node(62);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let make_range = |range_seed: u8, start: u32, end: u32| HandleRange {
+            range_id: Ulid::from_bytes([range_seed; 16]),
+            owner,
+            start,
+            end,
+        };
+        // Two grants whose intervals overlap: distinct ids, so no reducer conflict,
+        // but the derived directory fails both closed on every node.
+        let event_a = test_admin_event(
+            Ulid::from_parts(1_561, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: make_range(10, 1, 1025),
+            },
+        );
+        let event_b = test_admin_event(
+            Ulid::from_parts(1_562, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: make_range(20, 512, 2049),
+            },
+        );
+
+        let mut configs = Vec::new();
+        for order in [[&event_a, &event_b], [&event_b, &event_a]] {
+            let (_dir, storage) = test_storage();
+            let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    document_target.clone(),
+                    seed_config
+                        .to_bytes(&actor_a)
+                        .expect("seed realm config serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("seed realm config writes");
+            for event in order {
+                apply_admin_document_operation_to_storage(
+                    &storage,
+                    document_target.clone(),
+                    event.clone(),
+                )
+                .await
+                .expect("replicated handle range applies");
+            }
+            configs.push(read_realm_config_doc(&storage, realm_id).await);
+        }
+
+        for config in &configs {
+            assert_eq!(config.placement_handle_ranges.len(), 2);
+            let directory = config.handle_range_directory();
+            assert_eq!(directory.conflicts(), 2);
+            assert!(directory.granted_to(&owner).is_empty());
+        }
+        let left: HashSet<_> = configs[0]
+            .placement_handle_ranges
+            .iter()
+            .map(|range| range.range_id)
+            .collect();
+        let right: HashSet<_> = configs[1]
+            .placement_handle_ranges
+            .iter()
+            .map(|range| range.range_id)
+            .collect();
+        assert_eq!(left, right);
     }
 
     #[tokio::test]
