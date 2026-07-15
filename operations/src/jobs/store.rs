@@ -660,6 +660,7 @@ pub async fn release_job(
         record.claim = None;
         record.due_at_ms = now_ms;
         record.updated_at_ms = now_ms;
+        record.progress = JobProgress::new(record.payload.progress_unit());
         released = true;
         Ok(JobMutation::Persist)
     })
@@ -1612,14 +1613,16 @@ mod tests {
         assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
     }
 
-    // A hand-back is not a failure: attempts stay put and the job is due immediately.
     #[tokio::test]
     async fn release_keeps_attempts() {
+        // Lease hand-back preserves attempts but resets execution progress.
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([0xA1; 16]);
         let token = Ulid::r#gen();
         let mut record = running_record(job_id, token, 60_000);
         record.attempts = 2;
+        record.progress.current = 4;
+        record.progress.total = Some(10);
         insert_job(&storage, &record).await.unwrap();
 
         let ReleaseOutcome::Released(released) =
@@ -1630,6 +1633,10 @@ mod tests {
         assert_eq!(released.state, JobState::Queued);
         assert_eq!(released.attempts, 2);
         assert_eq!(released.due_at_ms, 6_000);
+        assert_eq!(
+            released.progress,
+            JobProgress::new(released.payload.progress_unit())
+        );
         assert!(released.claim.is_none());
     }
 
