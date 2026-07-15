@@ -500,11 +500,12 @@ pub async fn create_metadata_document(
     mut operation: CreateMetadataDocumentOperation,
     context: Arc<DriverContext>,
 ) -> Result<CreateMetadataDocumentResult, CreateMetadataDocumentError> {
-    // Mint the structured id for a locally-originated create before driving:
-    // the handle comes from the pre-provisioned binding and the bucket from the
-    // node's held set, so the id carries `ts|handle|bucket|nonce`. A forwarded
-    // create keeps the id the origin already minted (never re-minted downstream).
-    if !operation.forwarded {
+    // Mint the structured id for a locally-originated create whose id is still a
+    // placeholder: the handle comes from the pre-provisioned binding and the
+    // bucket from the node's held set, so the id carries `ts|handle|bucket|nonce`.
+    // A forwarded create keeps the id the origin already minted, and a caller that
+    // already supplied a structured id (a trusted mint) keeps it too.
+    if !operation.forwarded && !is_structured_document_id(operation.config.document_id) {
         let document_id = mint_local_create_id(context.as_ref(), &operation.config).await?;
         operation.config.document_id = document_id;
     }
@@ -526,13 +527,18 @@ pub async fn mint_local_create_id(
     mint_create_id(context, config, false).await
 }
 
-/// Mints the id a non-holder forwards: the deterministic blind-hash bucket of the
-/// D8 subject `(realm, group, path)`, so every candidate holder the forwarder
-/// tries stamps the same bucket and a retry can never fork the document.
+/// The id a non-holder forwards: the deterministic blind-hash bucket of the D8
+/// subject `(realm, group, path)`, so every candidate holder the forwarder tries
+/// stamps the same bucket and a retry can never fork the document. An already
+/// structured id (a retry of the same request) is reused unchanged so forwarded
+/// creates stay idempotent; only a placeholder is freshly minted.
 pub async fn mint_forward_create_id(
     context: &DriverContext,
     config: &CreateMetadataDocumentConfig,
 ) -> Result<Ulid, CreateMetadataDocumentError> {
+    if is_structured_document_id(config.document_id) {
+        return Ok(config.document_id);
+    }
     mint_create_id(context, config, true).await
 }
 
@@ -542,14 +548,72 @@ async fn mint_create_id(
     forward_blind: bool,
 ) -> Result<Ulid, CreateMetadataDocumentError> {
     let realm_config = load_realm_config_for_create(context, config.actor.realm_id).await?;
-    let normalized = MetadataRegistryRecord::normalize_document_path(&config.document_path);
-    let (handle, placement) = resolve_create_placement(
+    mint_document_id_for(
         &realm_config,
         &config.actor,
         config.group_id,
-        &normalized,
+        &config.document_path,
         forward_blind,
-    )?;
+    )
+}
+
+/// Mints the structured id a locally-originated create embeds, given an
+/// already-loaded realm config: the pre-provisioned handle for the scope and a
+/// bucket the `actor`'s node holds. Fails loud when no binding is provisioned.
+/// Exposed so a caller that already holds the config (or a test) can mint the id
+/// a create must carry without a second config read.
+pub fn mint_local_document_id(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    document_path: &str,
+) -> Result<Ulid, CreateMetadataDocumentError> {
+    mint_document_id_for(config, actor, group_id, document_path, false)
+}
+
+/// Mints the structured id a forwarded create carries: the D8 blind-hash bucket,
+/// requiring no held bucket (the origin is a non-holder). Stable across retries,
+/// so passing it again is an idempotent retry rather than a rival claim.
+pub fn mint_forward_document_id(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    document_path: &str,
+) -> Result<Ulid, CreateMetadataDocumentError> {
+    mint_document_id_for(config, actor, group_id, document_path, true)
+}
+
+/// The blind-hash bucket a forwarded create is offered to and stamps: the D8
+/// subject `(realm, group, path)` bucket, independent of any node. The forwarder
+/// resolves this bucket's holders to pick where to offer the create, and the
+/// forwarded id embeds this exact bucket, so targeting and stamping agree.
+pub fn forward_bucket_placement(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    document_path: &str,
+) -> Result<PlacementRef, CreateMetadataDocumentError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
+    resolve_create_placement(config, actor, group_id, &normalized, true)
+        .map(|(_, placement)| placement)
+}
+
+/// Whether `document_id` already carries a valid structured id (a non-reserved
+/// handle), i.e. it was minted rather than left as a placeholder to be minted.
+fn is_structured_document_id(document_id: Ulid) -> bool {
+    MetaResourceId::try_from(document_id.0).is_ok()
+}
+
+fn mint_document_id_for(
+    config: &RealmConfigDocument,
+    actor: &Actor,
+    group_id: GroupId,
+    document_path: &str,
+    forward_blind: bool,
+) -> Result<Ulid, CreateMetadataDocumentError> {
+    let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
+    let (handle, placement) =
+        resolve_create_placement(config, actor, group_id, &normalized, forward_blind)?;
     Ok(Ulid::from(mint_document_id(handle, &placement)?))
 }
 

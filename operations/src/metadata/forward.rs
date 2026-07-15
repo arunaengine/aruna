@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
     Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef, RealmConfigDocument,
@@ -14,7 +13,8 @@ use ulid::Ulid;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentResult, create_metadata_document, mint_forward_create_id,
+    CreateMetadataDocumentResult, create_metadata_document, forward_bucket_placement,
+    mint_forward_create_id,
 };
 use crate::delete_metadata_document::{
     DeleteMetadataDocumentError, DeleteMetadataDocumentOperation, delete_metadata_document,
@@ -23,9 +23,7 @@ use crate::driver::{DriverContext, drive};
 use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::{MetadataAuthToken, MetadataTransportMessage};
-use crate::placement::{
-    PlacementResolutionContext, holds_placement, plan_target_placement, resolve_shard_holders,
-};
+use crate::placement::{holds_placement, resolve_shard_holders};
 use crate::process_placements::load_realm_config;
 use crate::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
@@ -508,20 +506,17 @@ async fn create_forward_holders(
     let Some(realm_config) = load_realm_config(context, *net_handle.realm_id()).await else {
         return Vec::new();
     };
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: config.document_id,
-    };
-    let document_path = MetadataRegistryRecord::normalize_document_path(&config.document_path);
-    plan_target_placement(
+    // Forward to the holders of the D8 blind-hash bucket the forwarded id embeds,
+    // so the candidate holders and the id's stamped bucket are the same shard.
+    match forward_bucket_placement(
         &realm_config,
-        &target,
-        PlacementResolutionContext {
-            group_id: Some(config.group_id),
-            metadata_path: Some(document_path.as_str()),
-        },
-    )
-    .map(|plan| plan.holders)
-    .unwrap_or_default()
+        &config.actor,
+        config.group_id,
+        &config.document_path,
+    ) {
+        Ok(placement) => resolve_shard_holders(&realm_config, &placement),
+        Err(_) => Vec::new(),
+    }
 }
 
 async fn forward_to_holders(
