@@ -1218,13 +1218,15 @@ mod tests {
         }
 
         let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+        let mut spec = execution_spec();
+        spec.output_prefixes = vec!["poison".to_string()];
         finalize_attempt(
             &ctx,
             job_id,
             token,
             &backend,
             &attempt,
-            &execution_spec(),
+            &spec,
             "ws-test",
             Ok(AttemptStatus {
                 phase: AttemptPhase::Exited { code: 0 },
