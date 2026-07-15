@@ -450,11 +450,7 @@ pub async fn supervise_and_finalize(
     tokio::pin!(wait);
 
     let outcome = tokio::select! {
-        result = &mut wait => {
-            stop.cancel();
-            let _ = (&mut heartbeat).await;
-            Some(result)
-        }
+        result = &mut wait => Some(result),
         // Heartbeat returned first: the claim was lost to an adopter. Abandon
         // without writing, exactly like the in-process zombie guard.
         _ = &mut heartbeat => None,
@@ -469,6 +465,8 @@ pub async fn supervise_and_finalize(
         &context, job_id, token, &backend, &attempt, &spec, &bucket, result,
     )
     .await;
+    stop.cancel();
+    let _ = (&mut heartbeat).await;
 }
 
 /// Renew the lease and surface `cancel_requested`. Returns on a lost token so the
@@ -942,6 +940,7 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use std::sync::Mutex;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
     use ulid::Ulid;
 
     enum StubReconcile {
@@ -952,6 +951,8 @@ mod tests {
     struct StubBackend {
         reconcile: StubReconcile,
         submits: Mutex<Vec<String>>,
+        logs_started: Notify,
+        logs_release: Notify,
     }
 
     impl StubBackend {
@@ -959,6 +960,8 @@ mod tests {
             Arc::new(Self {
                 reconcile,
                 submits: Mutex::new(Vec::new()),
+                logs_started: Notify::new(),
+                logs_release: Notify::new(),
             })
         }
     }
@@ -981,6 +984,18 @@ mod tests {
         async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
             Err(BackendError::Unavailable("stub status".to_string()))
         }
+        async fn wait(
+            &self,
+            _attempt: &AttemptRef,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            Ok(AttemptStatus {
+                phase: AttemptPhase::Exited { code: 0 },
+                backend_ref: "done".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+            })
+        }
         async fn cancel(&self, _attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
             Ok(CancelEvidence::AlreadyGone)
         }
@@ -990,7 +1005,9 @@ mod tests {
             _limits: &LogLimits,
             _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
-            unimplemented!()
+            self.logs_started.notify_one();
+            self.logs_release.notified().await;
+            Ok(LogTails::default())
         }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
             match self.reconcile {
@@ -1171,6 +1188,63 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, JobState::Indeterminate);
         assert!(stored.result.is_none(), "no false-empty manifest recorded");
+    }
+
+    #[tokio::test]
+    async fn finalize_renews_lease() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, 6)
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::NotFound);
+
+        let task = tokio::spawn(supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            attempt,
+            execution_spec(),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        backend.logs_started.notified().await;
+        let before = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .claim
+            .unwrap()
+            .lease_expires_at_ms;
+
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(JOB_HEARTBEAT_MS)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        let mut after = before;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            after = read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .claim
+                .unwrap()
+                .lease_expires_at_ms;
+            if after > before {
+                break;
+            }
+        }
+        assert!(after > before);
+
+        backend.logs_release.notify_one();
+        task.await.unwrap();
     }
 
     // A submit error with the container confirmed absent keeps the pre-submit
