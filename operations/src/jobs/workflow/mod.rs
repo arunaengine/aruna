@@ -26,10 +26,11 @@ use tracing::{info, warn};
 
 use super::JOB_HEARTBEAT_MS;
 use super::store::{
-    JobMutationError, cancel_execution, cancel_running_job, complete_job, fail_execution,
-    mark_indeterminate, read_job_record, record_attempt_intent, record_attempt_started,
-    renew_lease, requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
-    transition_to_cancelling, transition_to_preparing, transition_to_ready,
+    ExecutionCompleteOutcome, JobMutationError, cancel_execution, cancel_running_job,
+    complete_execution, complete_job, fail_execution, mark_indeterminate, read_job_record,
+    record_attempt_intent, record_attempt_started, renew_lease, requeue_before_attempt,
+    set_workspace_bucket, transition_external_to_running, transition_to_cancelling,
+    transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
@@ -162,8 +163,12 @@ pub async fn run_execution_job(
             return None;
         }
 
-        let submitted = match backend.submit(&task_spec).await {
+        let submitted = match backend.submit(&task_spec, &cancel).await {
             Ok(status) => status,
+            Err(BackendError::Cancelled) => {
+                finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket).await;
+                return None;
+            }
             Err(error) => {
                 return Some(Err((
                     backend, attempt, task_spec, spec, bucket, cancel, error,
@@ -172,7 +177,7 @@ pub async fn run_execution_job(
         };
 
         // Ready -> Running only after the backend accepted the fenced attempt.
-        if transition_external_to_running(
+        let running = match transition_external_to_running(
             storage,
             job_id,
             token,
@@ -180,8 +185,12 @@ pub async fn run_execution_job(
             unix_timestamp_millis(),
         )
         .await
-        .is_err()
         {
+            Ok(record) => record,
+            Err(_) => return None,
+        };
+        if running.cancel_requested {
+            finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket).await;
             return None;
         }
 
@@ -218,7 +227,7 @@ pub async fn run_execution_job(
             let resumed = {
                 let recovery = recover_failed_submit(
                     &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket,
-                    &record, error,
+                    &record, &cancel, error,
                 );
                 tokio::pin!(recovery);
                 tokio::select! {
@@ -367,9 +376,21 @@ async fn recover_failed_submit(
     spec: &ExecutionSpec,
     bucket: &str,
     record: &JobRecord,
+    cancel: &CancellationToken,
     error: BackendError,
 ) -> bool {
     let storage = &context.storage_handle;
+    if matches!(&error, BackendError::Cancelled)
+        || cancel.is_cancelled()
+        || read_job_record(storage, job_id, None)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.cancel_requested)
+    {
+        finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+        return false;
+    }
     match backend.reconcile(attempt).await {
         // Confirmed absent: the submit failed before a container could exist, so
         // the pre-submit routing (requeue with backoff, or terminal fail) is safe.
@@ -384,7 +405,7 @@ async fn recover_failed_submit(
         }
         // The attempt already finished: commit its evidence.
         ReconcileOutcome::Found(status) if status.is_terminal() => {
-            if transition_external_to_running(
+            let running = match transition_external_to_running(
                 storage,
                 job_id,
                 token,
@@ -392,8 +413,12 @@ async fn recover_failed_submit(
                 unix_timestamp_millis(),
             )
             .await
-            .is_err()
             {
+                Ok(record) => record,
+                Err(_) => return false,
+            };
+            if running.cancel_requested {
+                finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
                 return false;
             }
             finalize_attempt(
@@ -415,8 +440,13 @@ async fn recover_failed_submit(
         ReconcileOutcome::Found(status) => {
             let mut started_at_ms = status.started_at_ms;
             if matches!(&status.phase, AttemptPhase::Submitted) {
-                match backend.submit(task_spec).await {
+                match backend.submit(task_spec, cancel).await {
                     Ok(resubmitted) => started_at_ms = resubmitted.started_at_ms.or(started_at_ms),
+                    Err(BackendError::Cancelled) => {
+                        finalize_cancel(context, job_id, token, backend, attempt, spec, bucket)
+                            .await;
+                        return false;
+                    }
                     Err(resubmit_error) if resubmit_error.retryable() => {
                         park_failed_submit(context, job_id, token, &resubmit_error).await;
                         return false;
@@ -434,7 +464,7 @@ async fn recover_failed_submit(
                     }
                 }
             }
-            if transition_external_to_running(
+            let running = match transition_external_to_running(
                 storage,
                 job_id,
                 token,
@@ -442,8 +472,12 @@ async fn recover_failed_submit(
                 unix_timestamp_millis(),
             )
             .await
-            .is_err()
             {
+                Ok(record) => record,
+                Err(_) => return false,
+            };
+            if running.cancel_requested {
+                finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
                 return false;
             }
             true
@@ -621,8 +655,15 @@ pub(crate) async fn finalize_attempt(
                 return;
             };
             let result = execution_result_for(bucket, Some(0), outputs, logs);
-            let record = terminal_complete(storage, job_id, token, result).await;
-            cleanup_and_crate(context, job_id, record).await;
+            match terminal_execution(storage, job_id, token, result).await {
+                Some(ExecutionCompleteOutcome::Completed(record)) => {
+                    cleanup_and_crate(context, job_id, Some(record)).await;
+                }
+                Some(ExecutionCompleteOutcome::CancelRequested(_)) => {
+                    finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+                }
+                None => {}
+            }
         }
         AttemptPhase::Exited { code } => {
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
@@ -793,6 +834,36 @@ async fn terminal_complete(
     .await
     {
         Ok(record) => Some(record),
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Execution complete write failed");
+            None
+        }
+    }
+}
+
+async fn terminal_execution(
+    storage: &aruna_storage::StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    result: JobResultPayload,
+) -> Option<ExecutionCompleteOutcome> {
+    let progress = read_job_record(storage, job_id, None)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.progress)
+        .unwrap_or_else(|| aruna_core::structs::JobProgress::new("phases"));
+    match complete_execution(
+        storage,
+        job_id,
+        token,
+        result,
+        progress,
+        unix_timestamp_millis(),
+    )
+    .await
+    {
+        Ok(outcome) => Some(outcome),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Execution complete write failed");
             None
@@ -1054,7 +1125,9 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, put_run_crate_status};
+    use crate::jobs::store::{
+        ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
+    };
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::logs::{LogSink, LogTails};
     use aruna_compute::spec::LogLimits;
@@ -1098,7 +1171,11 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
-        async fn submit(&self, spec: &TaskSpec) -> Result<AttemptStatus, BackendError> {
+        async fn submit(
+            &self,
+            spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
             self.submits
                 .lock()
                 .unwrap()
@@ -1301,6 +1378,7 @@ mod tests {
             &execution_spec(),
             "ws-test",
             &record,
+            &CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
         .await;
@@ -1432,6 +1510,74 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn cancel_beats_success() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, None, 6)
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::NotFound);
+
+        let task = tokio::spawn(supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            attempt,
+            execution_spec(),
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        ));
+        backend.logs_started.notified().await;
+        set_cancel_requested(&storage, job_id, 7).await.unwrap();
+        backend.logs_release.notify_one();
+        task.await.unwrap();
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_submit() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        set_cancel_requested(&storage, job_id, 6).await.unwrap();
+        let backend = StubBackend::new(StubReconcile::NotFound);
+
+        reconcile::resume_attempt(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            attempt,
+            AttemptPhase::Submitted,
+            execution_spec(),
+            "ws-test".to_string(),
+            record,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(backend.submits.lock().unwrap().is_empty());
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+    }
+
     // A submit error with the container confirmed absent keeps the pre-submit
     // routing: requeue with backoff, intent cleared, attempt charged.
     #[tokio::test]
@@ -1453,6 +1599,7 @@ mod tests {
             &execution_spec(),
             "ws-test",
             &record,
+            &CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
         .await;

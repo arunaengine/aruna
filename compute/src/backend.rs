@@ -49,6 +49,8 @@ pub enum BackendError {
     ImageUnauthorized(String),
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
+    #[error("backend submission cancelled")]
+    Cancelled,
     #[error("attempt not found: {0}")]
     NotFound(String),
     #[error("backend unavailable: {0}")]
@@ -68,7 +70,8 @@ impl BackendError {
         match self {
             BackendError::ImageNotFound(_)
             | BackendError::ImageUnauthorized(_)
-            | BackendError::InvalidSpec(_) => false,
+            | BackendError::InvalidSpec(_)
+            | BackendError::Cancelled => false,
             BackendError::NotFound(_)
             | BackendError::Unavailable(_)
             | BackendError::Conflict(_)
@@ -89,7 +92,11 @@ pub trait ExecutorBackend: Send + Sync {
 
     /// Idempotent under the deterministic attempt name: a name collision MUST
     /// return the existing attempt's status, never start a second run.
-    async fn submit(&self, spec: &TaskSpec) -> Result<AttemptStatus, BackendError>;
+    async fn submit(
+        &self,
+        spec: &TaskSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError>;
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError>;
 

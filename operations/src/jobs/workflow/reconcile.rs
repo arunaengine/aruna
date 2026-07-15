@@ -12,12 +12,12 @@ use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
     AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    record_attempt_started, release_job, transition_external_to_running,
+    read_job_record, record_attempt_started, release_job, transition_external_to_running,
 };
 use super::workspace::{load_inputs, mint_workspace_credential};
 use super::{
-    build_task_spec, fail_and_crate, finalize_attempt, resolve_backend, supervise_and_finalize,
-    with_execution_heartbeat,
+    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, resolve_backend,
+    supervise_and_finalize, with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
 
@@ -87,6 +87,26 @@ impl ExternalReconciler for ComputeReconciler {
             .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
 
+        if adopted.cancel_requested {
+            let _ = with_execution_heartbeat(
+                storage.clone(),
+                job_id,
+                token,
+                CancellationToken::new(),
+                finalize_cancel(
+                    &self.context,
+                    job_id,
+                    token,
+                    &backend,
+                    &attempt,
+                    &spec,
+                    &bucket,
+                ),
+            )
+            .await;
+            return;
+        }
+
         let outcome = backend.reconcile(&attempt).await;
         let started_at_ms = match &outcome {
             ReconcileOutcome::Found(status) => status.started_at_ms,
@@ -103,7 +123,8 @@ impl ExternalReconciler for ComputeReconciler {
             ReconcileOutcome::Found(status)
                 if !matches!(status.phase, AttemptPhase::Submitted)
         ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
-            && transition_external_to_running(
+        {
+            let running = match transition_external_to_running(
                 storage,
                 job_id,
                 token,
@@ -111,9 +132,29 @@ impl ExternalReconciler for ComputeReconciler {
                 unix_timestamp_millis(),
             )
             .await
-            .is_err()
-        {
-            return;
+            {
+                Ok(record) => record,
+                Err(_) => return,
+            };
+            if running.cancel_requested {
+                let _ = with_execution_heartbeat(
+                    storage.clone(),
+                    job_id,
+                    token,
+                    CancellationToken::new(),
+                    finalize_cancel(
+                        &self.context,
+                        job_id,
+                        token,
+                        &backend,
+                        &attempt,
+                        &spec,
+                        &bucket,
+                    ),
+                )
+                .await;
+                return;
+            }
         }
 
         match outcome {
@@ -237,7 +278,7 @@ impl ComputeReconciler {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn resume_attempt(
+pub(super) async fn resume_attempt(
     context: Arc<DriverContext>,
     job_id: aruna_core::structs::JobId,
     token: ulid::Ulid,
@@ -249,6 +290,25 @@ async fn resume_attempt(
     record: JobRecord,
     cancel: CancellationToken,
 ) {
+    let current = match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Recovered job lookup failed");
+            return;
+        }
+    };
+    if current.cancel_requested {
+        let _ = with_execution_heartbeat(
+            context.storage_handle.clone(),
+            job_id,
+            token,
+            cancel,
+            finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket),
+        )
+        .await;
+        return;
+    }
     if matches!(phase, AttemptPhase::Submitted) {
         let resumed = with_execution_heartbeat(
             context.storage_handle.clone(),
@@ -283,8 +343,15 @@ async fn resume_attempt(
                     node_id,
                     inputs,
                 );
-                let status = match backend.submit(&task_spec).await {
+                let status = match backend.submit(&task_spec, &cancel).await {
                     Ok(status) => status,
+                    Err(aruna_compute::backend::BackendError::Cancelled) => {
+                        finalize_cancel(
+                            &context, job_id, token, &backend, &attempt, &spec, &bucket,
+                        )
+                        .await;
+                        return false;
+                    }
                     Err(error) => {
                         let error = if error.retryable() {
                             JobError::retryable(format!("resubmit failed: {error}"))
@@ -302,7 +369,7 @@ async fn resume_attempt(
                 {
                     return false;
                 }
-                transition_external_to_running(
+                let running = match transition_external_to_running(
                     &context.storage_handle,
                     job_id,
                     token,
@@ -310,7 +377,16 @@ async fn resume_attempt(
                     unix_timestamp_millis(),
                 )
                 .await
-                .is_ok()
+                {
+                    Ok(record) => record,
+                    Err(_) => return false,
+                };
+                if running.cancel_requested {
+                    finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket)
+                        .await;
+                    return false;
+                }
+                true
             },
         )
         .await;

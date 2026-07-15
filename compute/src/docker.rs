@@ -83,6 +83,12 @@ pub struct DockerBackend {
     config: DockerConfig,
 }
 
+enum RemoveOutcome {
+    Removed,
+    Gone,
+    Foreign,
+}
+
 impl DockerBackend {
     /// Connect using the environment's default transport (unix socket / npipe / DOCKER_HOST).
     pub fn connect() -> Result<Self, BackendError> {
@@ -127,24 +133,46 @@ impl DockerBackend {
         Ok(inspect)
     }
 
-    async fn ensure_image(&self, image: &str) -> Result<(), BackendError> {
-        match self.docker.inspect_image(image).await {
+    async fn ensure_image(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), BackendError> {
+        check_cancel(cancel)?;
+        let inspected = tokio::select! {
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            result = self.docker.inspect_image(image) => result,
+        };
+        check_cancel(cancel)?;
+        match inspected {
             Ok(_) => Ok(()),
             Err(e) => match classify(&e) {
-                BackendError::NotFound(_) => self.pull_image(image).await,
+                BackendError::NotFound(_) => self.pull_image(image, cancel).await,
                 other => Err(other),
             },
         }
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), BackendError> {
+    async fn pull_image(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), BackendError> {
         let (from_image, tag) = split_image_ref(image);
         let mut builder = CreateImageOptionsBuilder::new().from_image(&from_image);
         if let Some(tag) = &tag {
             builder = builder.tag(tag);
         }
         let mut stream = self.docker.create_image(Some(builder.build()), None, None);
-        while let Some(item) = stream.next().await {
+        loop {
+            check_cancel(cancel)?;
+            let item = tokio::select! {
+                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(info) => {
                     if let Some(err) = info.error_detail.and_then(|detail| detail.message) {
@@ -154,7 +182,55 @@ impl DockerBackend {
                 Err(e) => return Err(classify_pull(&e)),
             }
         }
-        Ok(())
+        check_cancel(cancel)
+    }
+
+    async fn force_remove(&self, attempt: &AttemptRef) -> Result<RemoveOutcome, BackendError> {
+        let inspect = match self.inspect(attempt).await {
+            Ok(inspect) => inspect,
+            Err(BackendError::NotFound(_)) => return Ok(RemoveOutcome::Gone),
+            Err(other) => return Err(other),
+        };
+        if !labels_match(&inspect, attempt) {
+            return Ok(RemoveOutcome::Foreign);
+        }
+        let container_id = inspect.id.as_deref().ok_or_else(|| {
+            BackendError::Api("Docker inspect response omitted the container ID".to_string())
+        })?;
+        let opts = RemoveContainerOptionsBuilder::new()
+            .v(true)
+            .force(true)
+            .build();
+        match self.docker.remove_container(container_id, Some(opts)).await {
+            Ok(()) => Ok(RemoveOutcome::Removed),
+            Err(e) => match classify(&e) {
+                BackendError::NotFound(_) => Ok(RemoveOutcome::Gone),
+                other => Err(other),
+            },
+        }
+    }
+
+    async fn cancel_submission(
+        &self,
+        attempt: &AttemptRef,
+        cancel: &CancellationToken,
+    ) -> Result<(), BackendError> {
+        if !cancel.is_cancelled() {
+            return Ok(());
+        }
+        match self.status(attempt).await {
+            Ok(status) if status.is_terminal() => return Ok(()),
+            Ok(_) => {}
+            Err(BackendError::NotFound(_)) => return Err(BackendError::Cancelled),
+            Err(other) => return Err(other),
+        }
+        match self.force_remove(attempt).await? {
+            RemoveOutcome::Removed | RemoveOutcome::Gone => Err(BackendError::Cancelled),
+            RemoveOutcome::Foreign => Err(BackendError::Conflict(format!(
+                "refusing to remove foreign container `{}`",
+                attempt.external_name()
+            ))),
+        }
     }
 
     /// Stop a matching attempt by ID, tolerating 304 or removal after inspection.
@@ -206,7 +282,9 @@ impl DockerBackend {
         attempt: &AttemptRef,
         plan: Option<&ArchivePlan<'_>>,
         inspect: ContainerInspectResponse,
+        cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
+        self.cancel_submission(attempt, cancel).await?;
         let status = inspect_to_status(inspect.clone());
         if !is_fresh_created(&status) {
             return Ok(status);
@@ -215,14 +293,24 @@ impl DockerBackend {
             BackendError::Api("Docker inspect response omitted the container ID".to_string())
         })?;
         if let Some(plan) = plan {
-            let directories = self.missing_dirs(container_id, &plan.directories).await?;
+            let directories = self.missing_dirs(container_id, &plan.directories).await;
+            self.cancel_submission(attempt, cancel).await?;
+            let directories = directories?;
             if !plan.inputs.is_empty() || !directories.is_empty() {
-                self.upload_archive(container_id, build_archive(plan, &directories)?)
-                    .await?;
+                let archive = build_archive(plan, &directories);
+                self.cancel_submission(attempt, cancel).await?;
+                let uploaded = self.upload_archive(container_id, archive?).await;
+                self.cancel_submission(attempt, cancel).await?;
+                uploaded?;
             }
         }
-        self.start_by_name(container_id).await?;
-        self.status(attempt).await
+        self.cancel_submission(attempt, cancel).await?;
+        let started = self.start_by_name(container_id).await;
+        self.cancel_submission(attempt, cancel).await?;
+        started?;
+        let status = self.status(attempt).await;
+        self.cancel_submission(attempt, cancel).await?;
+        status
     }
 
     async fn missing_dirs(
@@ -587,8 +675,13 @@ impl ExecutorBackend for DockerBackend {
             .map_err(|e| classify(&e))
     }
 
-    async fn submit(&self, spec: &TaskSpec) -> Result<AttemptStatus, BackendError> {
+    async fn submit(
+        &self,
+        spec: &TaskSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
         spec.attempt.validate().map_err(BackendError::InvalidSpec)?;
+        check_cancel(cancel)?;
         // Never accept a resource request this backend cannot honor.
         if let Some(extension) = spec.resources.backend_extensions.keys().next() {
             return Err(BackendError::InvalidSpec(format!(
@@ -599,30 +692,36 @@ impl ExecutorBackend for DockerBackend {
             .then(|| ArchivePlan::new(spec))
             .transpose()?;
         let name = spec.attempt.external_name();
-        self.ensure_image(&spec.image).await?;
+        self.ensure_image(&spec.image, cancel).await?;
 
         let create_opts = CreateContainerOptionsBuilder::new().name(&name).build();
-        match self
+        let created = self
             .docker
             .create_container(Some(create_opts), build_config(&self.config, spec))
-            .await
-        {
+            .await;
+        self.cancel_submission(&spec.attempt, cancel).await?;
+        match created {
             Ok(response) => {
                 for warning in &response.warnings {
                     tracing::warn!(container = %name, warning = %warning, "Docker create warning");
                 }
-                let inspect = self.inspect_matching_attempt(&spec.attempt).await?;
-                self.prepare_created(&spec.attempt, plan.as_ref(), inspect)
+                let inspect = self.inspect_matching_attempt(&spec.attempt).await;
+                self.cancel_submission(&spec.attempt, cancel).await?;
+                self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
                     .await
             }
             // Name collision: adopt the existing attempt, never start a second run.
             Err(e) => match classify(&e) {
                 BackendError::Conflict(_) => {
-                    let inspect = self.inspect_matching_attempt(&spec.attempt).await?;
-                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect)
+                    let inspect = self.inspect_matching_attempt(&spec.attempt).await;
+                    self.cancel_submission(&spec.attempt, cancel).await?;
+                    self.prepare_created(&spec.attempt, plan.as_ref(), inspect?, cancel)
                         .await
                 }
-                other => Err(other),
+                other => {
+                    self.cancel_submission(&spec.attempt, cancel).await?;
+                    Err(other)
+                }
             },
         }
     }
@@ -675,11 +774,21 @@ impl ExecutorBackend for DockerBackend {
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         // A container that had already exited on its own must keep its real exit evidence:
         // reporting Cancelled over it would fabricate a cancellation that never happened.
-        let was_running = match self.status(attempt).await {
-            Ok(status) => matches!(status.phase, AttemptPhase::Running),
+        let status = match self.status(attempt).await {
+            Ok(status) => status,
             Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
             Err(other) => return Err(other),
         };
+        if matches!(status.phase, AttemptPhase::Submitted) {
+            return match self.force_remove(attempt).await? {
+                RemoveOutcome::Removed | RemoveOutcome::Gone => Ok(CancelEvidence::AlreadyGone),
+                RemoveOutcome::Foreign => Err(BackendError::Conflict(format!(
+                    "refusing to remove foreign container `{}`",
+                    attempt.external_name()
+                ))),
+            };
+        }
+        let was_running = matches!(status.phase, AttemptPhase::Running);
         let stop_effective = match self.stop_attempt(attempt).await {
             Ok(stop_effective) => stop_effective,
             Err(error) => {
@@ -825,29 +934,21 @@ impl ExecutorBackend for DockerBackend {
         if self.config.keep_failed {
             return Ok(());
         }
-        let name = attempt.external_name();
-        let inspect = match self.inspect(attempt).await {
-            Ok(inspect) => inspect,
-            Err(BackendError::NotFound(_)) => return Ok(()),
-            Err(other) => return Err(other),
-        };
-        if !labels_match(&inspect, attempt) {
-            return Err(BackendError::Conflict(format!(
-                "refusing to remove foreign container `{name}`"
-            )));
+        match self.force_remove(attempt).await? {
+            RemoveOutcome::Removed | RemoveOutcome::Gone => Ok(()),
+            RemoveOutcome::Foreign => Err(BackendError::Conflict(format!(
+                "refusing to remove foreign container `{}`",
+                attempt.external_name()
+            ))),
         }
-        // `.v(true)`: drop the anonymous volumes too, or every job leaks one.
-        let opts = RemoveContainerOptionsBuilder::new()
-            .v(true)
-            .force(true)
-            .build();
-        match self.docker.remove_container(&name, Some(opts)).await {
-            Ok(()) => Ok(()),
-            Err(e) => match classify(&e) {
-                BackendError::NotFound(_) => Ok(()),
-                other => Err(other),
-            },
-        }
+    }
+}
+
+fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
+    if cancel.is_cancelled() {
+        Err(BackendError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

@@ -78,8 +78,14 @@ async fn idempotent_submit() {
     let spec = sh(&job, "sleep 60");
     let attempt = spec.attempt.clone();
 
-    let first = backend.submit(&spec).await.unwrap();
-    let second = backend.submit(&spec).await.unwrap();
+    let first = backend
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
+    let second = backend
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(
         first.backend_ref, second.backend_ref,
         "second submit must adopt the same container id, not start a new run"
@@ -101,13 +107,13 @@ async fn exit_code_capture() {
 
     let ok = sh(&unique("exit0"), "exit 0");
     let ok_attempt = ok.attempt.clone();
-    backend.submit(&ok).await.unwrap();
+    backend.submit(&ok, &cancel).await.unwrap();
     let ok_status = backend.wait(&ok_attempt, &cancel).await.unwrap();
     assert_eq!(ok_status.phase, AttemptPhase::Exited { code: 0 });
 
     let bad = sh(&unique("exit42"), "exit 42");
     let bad_attempt = bad.attempt.clone();
-    backend.submit(&bad).await.unwrap();
+    backend.submit(&bad, &cancel).await.unwrap();
     let bad_status = backend.wait(&bad_attempt, &cancel).await.unwrap();
     assert_eq!(bad_status.phase, AttemptPhase::Exited { code: 42 });
 
@@ -130,7 +136,7 @@ async fn file_transfer() {
     spec.output_paths.push("/tmp/aruna-output.txt".to_string());
     let attempt = spec.attempt.clone();
 
-    backend.submit(&spec).await.unwrap();
+    backend.submit(&spec, &cancel).await.unwrap();
     let status = backend.wait(&attempt, &cancel).await.unwrap();
     assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
     assert_eq!(
@@ -145,13 +151,33 @@ async fn file_transfer() {
 }
 
 #[tokio::test]
+async fn cancelled_submit() {
+    let backend = backend_or_skip!();
+    let spec = sh(&unique("cancelled-submit"), "sleep 300");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    assert!(matches!(
+        backend.submit(&spec, &cancel).await,
+        Err(aruna_compute::BackendError::Cancelled)
+    ));
+    assert!(matches!(
+        backend.reconcile(&spec.attempt).await,
+        ReconcileOutcome::NotFound
+    ));
+}
+
+#[tokio::test]
 async fn cancel_stops() {
     // A long-running container is stopped with definitive evidence.
     let backend = backend_or_skip!();
     let spec = sh(&unique("cancel"), "sleep 300");
     let attempt = spec.attempt.clone();
 
-    backend.submit(&spec).await.unwrap();
+    backend
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
     wait_running(&backend, &attempt).await;
 
     let evidence = backend.cancel(&attempt).await.unwrap();
@@ -169,12 +195,71 @@ async fn cancel_stops() {
 }
 
 #[tokio::test]
+async fn created_cancel_removes() {
+    let warm_backend = backend_or_skip!();
+    let warmup = sh(&unique("created-warmup"), "true");
+    warm_backend
+        .submit(&warmup, &CancellationToken::new())
+        .await
+        .unwrap();
+    warm_backend
+        .wait(&warmup.attempt, &CancellationToken::new())
+        .await
+        .unwrap();
+    warm_backend.cleanup(&warmup.attempt).await.unwrap();
+
+    use bollard::Docker;
+    use bollard::models::ContainerCreateBody;
+    use bollard::query_parameters::CreateContainerOptionsBuilder;
+    let spec = sh(&unique("created-cancel"), "sleep 300");
+    let attempt = spec.attempt.clone();
+    let docker = Docker::connect_with_defaults().unwrap();
+    let opts = CreateContainerOptionsBuilder::new()
+        .name(&attempt.external_name())
+        .build();
+    docker
+        .create_container(
+            Some(opts),
+            ContainerCreateBody {
+                image: Some(IMAGE.to_string()),
+                cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                labels: Some(attempt.labels().into_iter().collect()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let backend = DockerBackend::with_config(DockerConfig {
+        keep_failed: true,
+        network_mode: Some("none".to_string()),
+        ..DockerConfig::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        backend.status(&attempt).await.unwrap().phase,
+        AttemptPhase::Submitted
+    ));
+    assert!(matches!(
+        backend.cancel(&attempt).await.unwrap(),
+        CancelEvidence::AlreadyGone
+    ));
+    assert!(matches!(
+        backend.reconcile(&attempt).await,
+        ReconcileOutcome::NotFound
+    ));
+}
+
+#[tokio::test]
 async fn reconcile_adopts() {
     // A fresh backend (simulating restart) re-adopts a running container by name.
     let submitter = backend_or_skip!();
     let spec = sh(&unique("adopt"), "sleep 120");
     let attempt = spec.attempt.clone();
-    submitter.submit(&spec).await.unwrap();
+    submitter
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
     wait_running(&submitter, &attempt).await;
 
     // Drop the submitting handle; a brand-new backend has no in-memory state.
@@ -226,7 +311,7 @@ async fn log_bounds() {
     };
     let attempt = spec.attempt.clone();
 
-    backend.submit(&spec).await.unwrap();
+    backend.submit(&spec, &cancel).await.unwrap();
     backend.wait(&attempt, &cancel).await.unwrap();
 
     let sink = CountingSink::default();
@@ -264,7 +349,10 @@ async fn resource_limits() {
     spec.resources.cpu_cores = Some(1);
     let attempt = spec.attempt.clone();
 
-    backend.submit(&spec).await.unwrap();
+    backend
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
     let inspect = backend.inspect(&attempt).await.unwrap();
     let host = inspect.host_config.expect("host_config present");
     assert_eq!(host.memory, Some(64 * 1024 * 1024));
@@ -282,7 +370,10 @@ async fn foreign_not_adopted() {
     let backend = backend_or_skip!();
     // Warm the image so the bare create below cannot 404.
     let warmup = sh(&unique("warmup"), "true");
-    backend.submit(&warmup).await.unwrap();
+    backend
+        .submit(&warmup, &CancellationToken::new())
+        .await
+        .unwrap();
     backend
         .wait(&warmup.attempt, &CancellationToken::new())
         .await
@@ -315,7 +406,10 @@ async fn foreign_not_adopted() {
         other => panic!("foreign container must not reconcile, got {other:?}"),
     }
     assert!(
-        backend.submit(&spec).await.is_err(),
+        backend
+            .submit(&spec, &CancellationToken::new())
+            .await
+            .is_err(),
         "submit must not adopt a foreign name collision"
     );
     assert!(
@@ -341,7 +435,10 @@ async fn walltime_enforced() {
     spec.resources.max_walltime = Some(Duration::from_secs(1));
     let attempt = spec.attempt.clone();
 
-    backend.submit(&spec).await.unwrap();
+    backend
+        .submit(&spec, &CancellationToken::new())
+        .await
+        .unwrap();
     let status = tokio::time::timeout(
         Duration::from_secs(60),
         backend.wait(&attempt, &CancellationToken::new()),

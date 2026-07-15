@@ -149,7 +149,11 @@ mod tests {
             Ok(())
         }
 
-        async fn submit(&self, _spec: &TaskSpec) -> Result<AttemptStatus, BackendError> {
+        async fn submit(
+            &self,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
             Err(BackendError::Unavailable("unused".to_string()))
         }
 

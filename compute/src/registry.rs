@@ -85,6 +85,7 @@ mod tests {
     use crate::spec::{AttemptRef, LogLimits, TaskSpec};
     use crate::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
     use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
 
     struct StubBackend(ExecutorKind);
 
@@ -96,7 +97,11 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
-        async fn submit(&self, _spec: &TaskSpec) -> Result<AttemptStatus, BackendError> {
+        async fn submit(
+            &self,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
             unimplemented!()
         }
         async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {

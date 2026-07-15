@@ -639,6 +639,7 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Ready, Queued)
             | (Ready, Failed)
             | (Ready, Indeterminate)
+            | (Ready, Cancelling)
             | (Running, Succeeded)
             | (Running, Failed)
             | (Running, Cancelling)
@@ -907,6 +908,7 @@ mod tests {
             (JobState::Ready, JobState::Cancelled),
             // A submit with an unknowable outcome parks after the intent write.
             (JobState::Ready, JobState::Indeterminate),
+            (JobState::Ready, JobState::Cancelling),
             (JobState::Running, JobState::Cancelling),
             (JobState::Running, JobState::Indeterminate),
             (JobState::Cancelling, JobState::Cancelled),

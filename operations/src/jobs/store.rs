@@ -555,6 +555,45 @@ pub async fn complete_job(
     .await
 }
 
+pub enum ExecutionCompleteOutcome {
+    Completed(JobRecord),
+    CancelRequested(JobRecord),
+}
+
+/// Complete an execution only when cancellation has not already committed.
+pub async fn complete_execution(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+) -> Result<ExecutionCompleteOutcome, JobMutationError> {
+    let mut completed = false;
+    let record = mutate_job(storage, job_id, |record| {
+        completed = false;
+        guard_token(record, token)?;
+        if record.cancel_requested {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(now_ms);
+        record.updated_at_ms = now_ms;
+        record.progress = final_progress.clone();
+        record.result = Some(result.clone());
+        record.claim = None;
+        completed = true;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+
+    Ok(if completed {
+        ExecutionCompleteOutcome::Completed(record)
+    } else {
+        ExecutionCompleteOutcome::CancelRequested(record)
+    })
+}
+
 pub async fn fail_job(
     storage: &StorageHandle,
     job_id: JobId,
@@ -836,6 +875,9 @@ pub async fn transition_external_to_running(
 ) -> Result<JobRecord, JobMutationError> {
     mutate_job(storage, job_id, |record| {
         guard_token(record, token)?;
+        if record.cancel_requested {
+            return Ok(JobMutation::Skip);
+        }
         if let Some(started_at_ms) = started_at_ms {
             record.started_at_ms.get_or_insert(started_at_ms);
         }
@@ -1851,6 +1893,50 @@ mod tests {
         record
     }
 
+    fn execution_record(job_id: JobId, token: Ulid, state: JobState) -> JobRecord {
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+            }),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = state;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_at_ms: 10_000,
+        });
+        record
+    }
+
+    fn execution_result() -> JobResultPayload {
+        JobResultPayload::Execution {
+            exit_code: Some(0),
+            workspace_bucket: "ws-test".to_string(),
+            outputs: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn revived_lease_kept() {
         let (_dir, storage) = temp_storage();
@@ -2270,6 +2356,117 @@ mod tests {
 
         assert!(stored.cancel_requested);
         assert!(stored.attempt_intent.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_blocks_running() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA2; 16]);
+        let token = Ulid::r#gen();
+        insert_job(&storage, &execution_record(job_id, token, JobState::Ready))
+            .await
+            .unwrap();
+        let intent = AttemptIntent {
+            attempt_no: 0,
+            external_name: aruna_core::structs::attempt_external_name(job_id, 0),
+            executor_kind: "docker".to_string(),
+        };
+        record_attempt_intent(&storage, job_id, token, intent.clone(), 4_000)
+            .await
+            .unwrap();
+        set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
+
+        let stored = transition_external_to_running(&storage, job_id, token, Some(5_500), 6_000)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.state, JobState::Ready);
+        assert!(stored.cancel_requested);
+        assert_eq!(stored.attempt_intent, Some(intent));
+        assert!(stored.started_at_ms.is_none());
+        assert!(stored.claim.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_blocks_completion() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA3; 16]);
+        let token = Ulid::r#gen();
+        insert_job(
+            &storage,
+            &execution_record(job_id, token, JobState::Running),
+        )
+        .await
+        .unwrap();
+        set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
+
+        let ExecutionCompleteOutcome::CancelRequested(stored) = complete_execution(
+            &storage,
+            job_id,
+            token,
+            execution_result(),
+            JobProgress::new("phases"),
+            6_000,
+        )
+        .await
+        .unwrap() else {
+            panic!("cancellation must win completion");
+        };
+
+        assert_eq!(stored.state, JobState::Running);
+        assert!(stored.result.is_none());
+        assert!(stored.finished_at_ms.is_none());
+        assert!(stored.claim.is_some());
+        assert!(
+            read_job_record(&storage, cleanup_job_id(job_id), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn success_wins_cancel() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA4; 16]);
+        let token = Ulid::r#gen();
+        insert_job(
+            &storage,
+            &execution_record(job_id, token, JobState::Running),
+        )
+        .await
+        .unwrap();
+
+        let ExecutionCompleteOutcome::Completed(completed) = complete_execution(
+            &storage,
+            job_id,
+            token,
+            execution_result(),
+            JobProgress::new("phases"),
+            6_000,
+        )
+        .await
+        .unwrap() else {
+            panic!("success must complete without cancellation");
+        };
+        assert_eq!(completed.state, JobState::Succeeded);
+        assert!(completed.claim.is_none());
+
+        let outcome = set_cancel_requested(&storage, job_id, 7_000).await.unwrap();
+        assert!(matches!(outcome, CancelRequestOutcome::AlreadyTerminal(_)));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Succeeded);
+        assert!(!stored.cancel_requested);
+        assert!(stored.result.is_some());
+        assert!(
+            read_job_record(&storage, cleanup_job_id(job_id), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     // A live renewed external lease is a plain sweep Skip, never routed to reconcile.
