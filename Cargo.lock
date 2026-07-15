@@ -435,6 +435,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "spareval",
  "spargebra",
  "tempfile",
  "thiserror 2.0.18",

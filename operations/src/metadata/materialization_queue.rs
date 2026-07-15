@@ -63,6 +63,7 @@ struct CompletedMaterializationJob {
     job_key: Vec<u8>,
     document_job_key: Option<Vec<u8>>,
     status: Option<MetadataMaterializationStatusRecord>,
+    iri_index_writes: Vec<(String, ByteView, ByteView)>,
     sync: Option<CompletedMaterializationSync>,
 }
 
@@ -266,6 +267,7 @@ fn completed_stale_materialization_job(job_key: Vec<u8>) -> CompletedMaterializa
         job_key,
         document_job_key: None,
         status: None,
+        iri_index_writes: Vec::new(),
         sync: None,
     }
 }
@@ -455,6 +457,7 @@ async fn finish_completed_materialization_jobs_in_txn(
             let current =
                 read_materialization_status(storage, status.document_id, Some(txn_id)).await?;
             if should_write_final_materialization_status(current.as_ref(), &status) {
+                writes.extend(job.iri_index_writes);
                 writes.push(metadata_materialization_status_write_entry(&status)?);
             }
         }
@@ -792,6 +795,7 @@ async fn process_materialization_job(
                     job_key,
                     document_job_key: Some(document_job_key),
                     status: None,
+                    iri_index_writes: Vec::new(),
                     sync: None,
                 },
                 Duration::ZERO,
@@ -821,6 +825,7 @@ async fn process_materialization_job(
                     job_key,
                     document_job_key: Some(document_job_key),
                     status: None,
+                    iri_index_writes: Vec::new(),
                     sync: None,
                 },
                 Duration::ZERO,
@@ -839,6 +844,7 @@ async fn process_materialization_job(
                     "metadata graph was deleted before materialization".to_string(),
                     true,
                 )),
+                iri_index_writes: Vec::new(),
                 sync: None,
             },
             Duration::ZERO,
@@ -849,18 +855,36 @@ async fn process_materialization_job(
     let apply_result = materialize_create_event(context, &event).await;
     let craqle_elapsed = apply_started.elapsed();
     match apply_result {
-        Ok(()) => Ok(ProcessedMaterializationJob::completed(
-            CompletedMaterializationJob {
-                job_key,
-                document_job_key: Some(document_job_key),
-                status: Some(materialization_success_status(&job, &event)),
-                sync: Some(CompletedMaterializationSync {
-                    graph_iri: event.record.graph_iri.clone(),
-                    peers: event.record.holder_node_ids.clone(),
-                }),
-            },
-            craqle_elapsed,
-        )),
+        Ok(()) => {
+            let iri_index_writes = match project_materialized_iri_references(context, &event).await
+            {
+                Ok(writes) => writes,
+                Err(error) => {
+                    reschedule_materialization_job(
+                        &context.storage_handle,
+                        &job_key,
+                        &job,
+                        &event,
+                        error.to_string(),
+                    )
+                    .await?;
+                    return Ok(ProcessedMaterializationJob::rescheduled(craqle_elapsed));
+                }
+            };
+            Ok(ProcessedMaterializationJob::completed(
+                CompletedMaterializationJob {
+                    job_key,
+                    document_job_key: Some(document_job_key),
+                    status: Some(materialization_success_status(&job, &event)),
+                    iri_index_writes,
+                    sync: Some(CompletedMaterializationSync {
+                        graph_iri: event.record.graph_iri.clone(),
+                        peers: event.record.holder_node_ids.clone(),
+                    }),
+                },
+                craqle_elapsed,
+            ))
+        }
         Err(error) if is_terminal_materialization_error(&error) => {
             Ok(ProcessedMaterializationJob::completed(
                 CompletedMaterializationJob {
@@ -872,6 +896,7 @@ async fn process_materialization_job(
                         error.to_string(),
                         true,
                     )),
+                    iri_index_writes: Vec::new(),
                     sync: None,
                 },
                 craqle_elapsed,
@@ -1677,6 +1702,26 @@ async fn materialize_create_event(
     }
 }
 
+async fn project_materialized_iri_references(
+    context: &DriverContext,
+    event: &MetadataCreateEventRecord,
+) -> Result<Vec<(String, ByteView, ByteView)>, MetadataMaterializationQueueError> {
+    let metadata_handle = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(MetadataMaterializationQueueError::MetadataHandleMissing)?;
+    let references = metadata_handle
+        .snapshot_iri_references(event.record.graph_iri.clone())
+        .await?;
+    let records = super::iri_index::project_metadata_iri_references(
+        event.record.document_id,
+        event.event_id,
+        references,
+    );
+    super::iri_index::metadata_iri_reference_write_entries(&records)
+        .map_err(MetadataMaterializationQueueError::from)
+}
+
 fn graph_materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
     let policy = MetadataGraphPolicy {
         public: event.record.public,
@@ -1999,6 +2044,7 @@ async fn materialization_job_is_live(
 mod tests {
     use super::*;
     use aruna_core::NodeId;
+    use aruna_core::keyspaces::METADATA_IRI_REFERENCE_INDEX_KEYSPACE;
     use aruna_core::storage_entries::metadata_create_event_write_entry;
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -3089,6 +3135,7 @@ mod tests {
             updated_at_ms: 7,
         };
         let (_, old_job_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
+        let stale_index_key = vec![9u8; 16];
         write_entries(
             &storage,
             vec![
@@ -3111,6 +3158,11 @@ mod tests {
                     .to_vec(),
                 ),
                 status: Some(materialization_success_status(&old_job, &old_event)),
+                iri_index_writes: vec![(
+                    METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+                    ByteView::from(stale_index_key.clone()),
+                    ByteView::from(vec![1]),
+                )],
                 sync: None,
             }],
         )
@@ -3122,6 +3174,14 @@ mod tests {
                 .await
                 .unwrap(),
             Some(newer_status)
+        );
+        assert!(
+            !storage_key_exists(
+                &storage,
+                METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
+                stale_index_key,
+            )
+            .await
         );
         match storage
             .send_storage_effect(StorageEffect::Read {

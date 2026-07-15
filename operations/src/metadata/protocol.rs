@@ -123,6 +123,14 @@ pub enum MetadataTransportMessage {
     ForwardedUpdateInvalidInput {
         message: String,
     },
+    FilteredSearchGraphs {
+        auth_token: Option<MetadataAuthToken>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+        predicate_iri: String,
+        object_iri: String,
+    },
 }
 
 pub async fn write_message(
@@ -198,6 +206,14 @@ mod tests {
             query: "dataset".to_string(),
             limit: 10,
         });
+        assert_has_auth_token_field(MetadataTransportMessage::FilteredSearchGraphs {
+            auth_token: Some(MetadataAuthToken::bearer("filtered-search-token").unwrap()),
+            graph_iris: None,
+            query: String::new(),
+            limit: 10,
+            predicate_iri: "http://schema.org/conformsTo".to_string(),
+            object_iri: "https://example.com/profile".to_string(),
+        });
     }
 
     #[test]
@@ -257,6 +273,13 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&MetadataTransportMessage::Reject(String::new())).unwrap(),
             vec![9, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&MetadataTransportMessage::ForwardedUpdateInvalidInput {
+                message: String::new(),
+            })
+            .unwrap(),
+            vec![10, 0]
         );
     }
 
