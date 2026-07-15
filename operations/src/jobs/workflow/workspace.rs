@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 use aruna_core::structs::{
     AuthContext, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
     OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
 use aruna_core::types::NodeId;
 use ulid::Ulid;
@@ -146,11 +147,12 @@ async fn stage_one_input(
                 realm_id: record.created_by.realm_id,
                 path_restrictions: None,
             },
-            path: blob_bucket_permission_path(
+            path: blob_object_permission_path(
                 record.created_by.realm_id,
                 bucket_info.group_id,
                 node_id,
                 src_bucket,
+                src_key,
             ),
             required_permission: Permission::READ,
         }),
