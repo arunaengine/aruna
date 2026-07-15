@@ -113,15 +113,18 @@ pub async fn mint_workspace_credential(
 ) -> Result<WorkspaceCredential, JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
     let realm_id = record.created_by.realm_id;
-    // A single WRITE restriction over the bucket subtree; WRITE also satisfies READ.
-    let pattern = format!(
-        "{}/**",
-        blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket)
-    );
-    let restriction = PathRestriction {
-        pattern,
-        permission: Permission::WRITE,
-    };
+    // WRITE on the bucket and its subtree also satisfies READ without matching siblings.
+    let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+    let restrictions = vec![
+        PathRestriction {
+            pattern: bucket_path.clone(),
+            permission: Permission::WRITE,
+        },
+        PathRestriction {
+            pattern: format!("{bucket_path}/**"),
+            permission: Permission::WRITE,
+        },
+    ];
     let key_id = workspace_credential_id(record.job_id);
     let access_key =
         UserAccess::build_access_key(&record.created_by, &key_id).map_err(|error| {
@@ -133,7 +136,7 @@ pub async fn mint_workspace_credential(
                 && access.user_identity == record.created_by
                 && access.group_id == spec.group_id
                 && access.issued_by == *node_id.as_bytes()
-                && access.path_restrictions == Some(vec![restriction.clone()]);
+                && access.path_restrictions == Some(restrictions.clone());
             if !matches_job || access.is_revoked() {
                 return Err(JobError::permanent("workspace credential is invalid"));
             }
@@ -168,7 +171,7 @@ pub async fn mint_workspace_credential(
                 user_identity: record.created_by,
                 group_id: spec.group_id,
                 expiry,
-                path_restrictions: Some(vec![restriction]),
+                path_restrictions: Some(restrictions),
                 issued_by: *node_id.as_bytes(),
             },
             key_id,
@@ -843,6 +846,28 @@ mod tests {
 
         assert_eq!(second.access_key, first.access_key);
         assert_eq!(second.secret, first.secret);
+
+        let access = drive(
+            GetUserAccessOperation::new(first.access_key.clone()),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let restrictions = access.path_restrictions.unwrap();
+        let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
+        let permits = |path: &str| {
+            restrictions.iter().any(|restriction| {
+                globset::Glob::new(&restriction.pattern)
+                    .unwrap()
+                    .compile_matcher()
+                    .is_match(path)
+            })
+        };
+        assert!(permits(&bucket_path));
+        assert!(permits(&format!("{bucket_path}/object")));
+        assert!(!permits(&format!("{bucket_path}-sibling")));
     }
 
     #[test]
