@@ -70,9 +70,7 @@ pub enum HandleAllocationError {
     RealmConfigNotFound,
     #[error("unexpected storage event: {0}")]
     UnexpectedStorageEvent(String),
-    #[error(
-        "placement_handle_exhausted: node {node} has spent every handle in its granted ranges"
-    )]
+    #[error("placement_handle_exhausted: node {node} has spent every handle in its granted ranges")]
     PlacementHandleExhausted { node: NodeId },
     #[error(transparent)]
     Append(#[from] MutateRealmPlacementError),

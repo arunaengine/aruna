@@ -65,7 +65,9 @@ pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<
     if start >= HANDLE_SPACE_END {
         return None;
     }
-    let end = start.saturating_add(HANDLE_RANGE_SIZE).min(HANDLE_SPACE_END);
+    let end = start
+        .saturating_add(HANDLE_RANGE_SIZE)
+        .min(HANDLE_SPACE_END);
     Some(HandleRange {
         range_id: Ulid::r#gen(),
         owner,

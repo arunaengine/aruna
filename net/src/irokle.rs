@@ -6153,8 +6153,8 @@ mod tests {
         GroupQuotaOverride, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
         OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementRef,
         PlacementScope, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StaticRealmEndpoint,
-        StrategyBinding, UserGroupCapOverride,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+        StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
     };
     use aruna_core::structured_id::PlacementHandle;
     use std::collections::{BTreeMap, HashMap, HashSet};

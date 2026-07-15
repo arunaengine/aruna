@@ -3,8 +3,8 @@ use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
     Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, HandleRange,
-    HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy,
-    StrategyBinding,
+    HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementStrategy, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -373,7 +373,7 @@ impl RealmConfigDocument {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
-        placement_handle_ranges: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         }
     }
 
@@ -661,7 +661,7 @@ mod test {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
-        placement_handle_ranges: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -771,7 +771,7 @@ mod test {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
-        placement_handle_ranges: Vec::new(),
+            placement_handle_ranges: Vec::new(),
         };
 
         assert_eq!(
