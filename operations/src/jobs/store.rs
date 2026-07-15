@@ -9,8 +9,8 @@ use aruna_core::structs::{
     AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobProgress, JobRecord,
     JobResultPayload, JobState, JobTransitionError, encode_job_dedup_value, job_due_index_key,
     job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
-    job_prune_index_key, job_record_key, parse_job_dedup_value, parse_job_owner_index_key,
-    validate_transition,
+    job_prune_index_key, job_record_key, job_run_crate_key, parse_job_dedup_value,
+    parse_job_owner_index_key, validate_transition,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -112,6 +112,10 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
     vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
+        (
+            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            job_run_crate_key(record.job_id),
+        ),
         (
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
             job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
