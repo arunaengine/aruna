@@ -104,7 +104,11 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
         let status = RunCrateStatus::Denied {
             message: "metadata write access denied".to_string(),
         };
-        let _ = put_run_crate_status(storage, for_job, &status).await;
+        if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate status write failed: {error}"
+            )));
+        }
         return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
             resource: status.name().to_string(),
         });
@@ -129,14 +133,19 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
     {
         Ok(result) => {
             let resource = result.record.document_id.to_string();
-            let _ = put_run_crate_status(
+            if let Err(error) = put_run_crate_status(
                 storage,
                 for_job,
                 &RunCrateStatus::Written {
                     resource: resource.clone(),
                 },
             )
-            .await;
+            .await
+            {
+                return JobRunOutcome::Failed(JobError::retryable(format!(
+                    "run crate status write failed: {error}"
+                )));
+            }
             JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
         }
         // A denial or invalid crate is permanent: record it and discharge the
@@ -156,7 +165,11 @@ pub async fn run_write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutc
                     message: error.to_string(),
                 }
             };
-            let _ = put_run_crate_status(storage, for_job, &status).await;
+            if let Err(error) = put_run_crate_status(storage, for_job, &status).await {
+                return JobRunOutcome::Failed(JobError::retryable(format!(
+                    "run crate status write failed: {error}"
+                )));
+            }
             JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
                 resource: status.name().to_string(),
             })
