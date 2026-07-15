@@ -121,7 +121,7 @@ impl DockerBackend {
         while let Some(item) = stream.next().await {
             match item {
                 Ok(info) => {
-                    if let Some(err) = info.error {
+                    if let Some(err) = info.error_detail.and_then(|detail| detail.message) {
                         return Err(classify_pull_error(&err));
                     }
                 }
