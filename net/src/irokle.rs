@@ -4020,6 +4020,7 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -5000,7 +5001,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5091,7 +5093,8 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
             if entry.labels.contains_key(KIND_LABEL_KEY) =>
         {
@@ -6100,7 +6103,9 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
+    use aruna_core::admin_document_reducer::{
+        REALM_CONFIG_DEFAULT_STRATEGY_PATH, realm_config_placement_binding_path,
+    };
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -6122,12 +6127,14 @@ mod tests {
         subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        Actor, BindingError, BindingScope, DocumentClass, Group, GroupAuthorizationDocument,
+        GroupQuotaOverride, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
+        Permission, PlacementBinding, PlacementOverride, PlacementRef, PlacementScope,
+        PlacementStrategy, QuotaConfig, RealmAuthorizationDocument, RealmConfigDocument,
+        RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding,
+        UserGroupCapOverride,
     };
+    use aruna_core::structured_id::PlacementHandle;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
     use tempfile::TempDir;
@@ -7038,6 +7045,188 @@ mod tests {
 
         overlay_realm_config_reducer_materialization(&mut config, &state);
         assert_eq!(config.default_strategy_id, None);
+    }
+
+    #[tokio::test]
+    async fn replicated_placement_bindings_converge_to_conflict() {
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_540, 1), realm_id);
+        let actor_a = test_actor(40, user_id, realm_id);
+        let actor_b = test_actor(41, user_id, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let handle = PlacementHandle::new(5).unwrap();
+        let make_binding = |node_id, strategy_seed: u8| PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::MetadataRegistry,
+            strategy_id: Ulid::from_bytes([strategy_seed; 16]),
+            allocator_range_id: None,
+            allocated_by: Some(node_id),
+            allocated_at_ms: None,
+        };
+        let event_a = test_admin_event(
+            Ulid::from_parts(1_541, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: make_binding(actor_a.node_id, 1),
+            },
+        );
+        let event_b = test_admin_event(
+            Ulid::from_parts(1_542, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: make_binding(actor_b.node_id, 2),
+            },
+        );
+
+        let mut configs = Vec::new();
+        for order in [[&event_a, &event_b], [&event_b, &event_a]] {
+            let (_dir, storage) = test_storage();
+            let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    document_target.clone(),
+                    seed_config
+                        .to_bytes(&actor_a)
+                        .expect("seed realm config serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("seed realm config writes");
+            for event in order {
+                apply_admin_document_operation_to_storage(
+                    &storage,
+                    document_target.clone(),
+                    event.clone(),
+                )
+                .await
+                .expect("replicated placement binding applies");
+            }
+
+            // The receiver retains a conflict row for the diverging handle.
+            let conflict_value = read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(
+                    &target,
+                    &realm_config_placement_binding_path(handle),
+                ),
+            )
+            .await;
+            assert!(conflict_value.is_some(), "conflict row must persist");
+
+            configs.push(read_realm_config_doc(&storage, realm_id).await);
+        }
+
+        // Both apply orders converge to the same retained binding set and the
+        // same fail-closed verdict.
+        let left: HashSet<_> = configs[0]
+            .placement_bindings
+            .iter()
+            .map(|binding| binding.strategy_id)
+            .collect();
+        let right: HashSet<_> = configs[1]
+            .placement_bindings
+            .iter()
+            .map(|binding| binding.strategy_id)
+            .collect();
+        assert_eq!(left, right);
+        assert_eq!(configs[0].placement_bindings.len(), 2);
+        for config in &configs {
+            assert_eq!(
+                config.binding_directory().resolve(handle),
+                Err(BindingError::Conflicted(handle))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_validation_accepts_binding_and_rejects_target_mismatch() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let nil_actor = test_actor(75, UserId::nil(realm_id), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let publisher =
+            irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&nil_actor.node_id));
+
+        // Management self-ensure authorizes the rest of config genesis.
+        let ensure = test_admin_event(
+            Ulid::from_parts(1_650, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &nil_actor,
+            1,
+            AdminDocumentOperation::RealmConfigNodeEnsured {
+                node_id: nil_actor.node_id,
+                kind: RealmNodeKind::Management,
+            },
+        );
+        apply_admin_document_operation_to_storage(&storage, config_target.clone(), ensure)
+            .await
+            .expect("management self-ensure applies");
+
+        let mut append = test_admin_event(
+            Ulid::from_parts(1_652, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &nil_actor,
+            2,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: PlacementBinding {
+                    handle: PlacementHandle::new(5).unwrap(),
+                    scope: PlacementScope::Realm(realm_id),
+                    document_class: DocumentClass::MetadataRegistry,
+                    strategy_id: Ulid::from_parts(1_651, 1),
+                    allocator_range_id: None,
+                    allocated_by: None,
+                    allocated_at_ms: None,
+                },
+            },
+        );
+        append.observed.advance(nil_actor.node_id, 1);
+
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                publisher,
+                &config_target,
+                &append,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Accepted
+        );
+
+        // The same RealmConfig op is rejected when routed under a User target.
+        let user_id = UserId::local(Ulid::from_parts(1_653, 1), realm_id);
+        let user_target = DocumentSyncTarget::User { user_id };
+        let placement = admin_test_placement();
+        let user_topic = user_target.sync_topic_id(realm_id, &placement);
+        let user_publisher =
+            irokle_crate::actor_id_for(user_topic, node_id_to_peer_id(&nil_actor.node_id));
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                user_topic,
+                user_publisher,
+                &user_target,
+                &append,
+                realm_id,
+                &placement,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
     }
 
     #[tokio::test]
