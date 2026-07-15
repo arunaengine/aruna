@@ -253,7 +253,7 @@ impl Topology {
         &self,
         origin: &TestNode,
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         document_path: &str,
     ) -> Option<PlacementRef> {
         let path = MetadataRegistryRecord::normalize_document_path(document_path);

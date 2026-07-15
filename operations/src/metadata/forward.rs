@@ -413,7 +413,7 @@ fn forwarded_create_replay(
 /// The document's registry record, whatever this node's holdership of it.
 async fn existing_record(
     context: &Arc<DriverContext>,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, String> {
     load_metadata_record_by_document(context.as_ref(), document_id)
         .await
@@ -426,7 +426,7 @@ async fn held_record(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
     local_node_id: NodeId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, String> {
     let record = existing_record(context, document_id)
         .await?

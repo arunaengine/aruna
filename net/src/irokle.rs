@@ -3422,7 +3422,7 @@ async fn apply_metadata_document_lifecycle_to_storage(
 async fn apply_metadata_registry_delete_to_storage(
     storage: &StorageHandle,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<()> {
     let Some(delete) = metadata_document_delete_in_storage(storage, document_id).await? else {
         return Ok(());
@@ -3468,7 +3468,7 @@ fn metadata_document_delete_matches_graph_lifecycle(
 fn metadata_document_delete_matches_registry(
     delete: &MetadataDocumentDeleteRecord,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> bool {
     delete.tombstone.is_deleted()
         && delete.tombstone.group_id == group_id
@@ -3478,7 +3478,7 @@ fn metadata_document_delete_matches_registry(
 async fn metadata_registry_live_after_delete(
     storage: &StorageHandle,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     delete: &MetadataDocumentDeleteRecord,
 ) -> Result<bool> {
     let target = DocumentSyncTarget::MetadataRegistry {
@@ -4416,7 +4416,7 @@ async fn metadata_graph_deleted_in_storage(
 
 async fn metadata_document_delete_in_storage(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataDocumentDeleteRecord>> {
     let value = storage_read_from(
         storage,
@@ -6291,7 +6291,7 @@ mod tests {
 
     fn registry_record(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         document_path: &str,
         updated_at_ms: u64,
         last_event_id: Ulid,
@@ -6625,7 +6625,7 @@ mod tests {
     async fn assert_registry_record_deleted(
         storage: &StorageHandle,
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) {
         assert!(
             read_storage_value(
@@ -6658,7 +6658,7 @@ mod tests {
 
     fn metadata_create_event(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         updated_at_ms: u64,
         event_id: Ulid,
         actor_seed: u8,
@@ -6687,7 +6687,7 @@ mod tests {
 
     fn metadata_delete_lifecycle(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         updated_at_ms: u64,
         event_id: Ulid,
         deleted_after_event_id: Ulid,
@@ -9667,7 +9667,7 @@ mod tests {
 
     async fn read_document_lifecycle_record(
         storage: &StorageHandle,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> MetadataDocumentLifecycleRecord {
         let value = read_storage_value(
             storage,
@@ -9681,7 +9681,7 @@ mod tests {
 
     async fn read_lifecycle_revision(
         storage: &StorageHandle,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> DocumentSyncChange {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let value = read_storage_value(

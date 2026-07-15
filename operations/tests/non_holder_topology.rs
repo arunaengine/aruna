@@ -346,7 +346,7 @@ fn document_config(
     realm: &Topology,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
 ) -> CreateMetadataDocumentConfig {
     CreateMetadataDocumentConfig {
@@ -369,7 +369,7 @@ async fn create_document(
     realm: &Topology,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
 ) -> TestResult<aruna_core::structs::PlacementRef> {
     let created = drive(
@@ -387,7 +387,7 @@ async fn create_document(
     Ok(created.record.placement)
 }
 
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
+async fn document_present(node: &TestNode, group_id: Ulid, document_id: MetaResourceId) -> bool {
     drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
         node.context.as_ref(),
@@ -396,7 +396,7 @@ async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) ->
     .is_ok()
 }
 
-async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
+async fn registry_row_present(node: &TestNode, document_id: MetaResourceId) -> bool {
     load_metadata_record_by_document(node.context.as_ref(), document_id)
         .await
         .is_ok_and(|record| record.is_some())

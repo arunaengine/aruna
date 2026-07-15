@@ -96,14 +96,14 @@ pub enum MetadataTransportMessage {
     ForwardCreateDocument {
         auth_token: Option<MetadataAuthToken>,
         group_id: GroupId,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         document_path: String,
         public: bool,
         payload: CreateMetadataDocumentPayload,
     },
     ForwardUpdateDocument {
         auth_token: Option<MetadataAuthToken>,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         /// `None` leaves the holder's current visibility untouched: the origin's
         /// record copy may be stale, so only an explicit request value travels.
         public: Option<bool>,
@@ -111,7 +111,7 @@ pub enum MetadataTransportMessage {
     },
     ForwardDeleteDocument {
         auth_token: Option<MetadataAuthToken>,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     },
     ForwardedRecord {
         record: Box<MetadataRegistryRecord>,
@@ -234,7 +234,7 @@ mod tests {
         let message = MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
             group_id: Ulid::from_bytes([3u8; 16]),
-            document_id: Ulid::from_bytes([4u8; 16]),
+            document_id: MetaResourceId::from_bytes([4u8; 16]).unwrap(),
             document_path: "datasets/forwarded".to_string(),
             public: false,
             payload: CreateMetadataDocumentPayload::Scaffold {

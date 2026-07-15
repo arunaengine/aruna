@@ -358,7 +358,7 @@ mod tests {
         )
     }
 
-    fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {
+    fn metadata_event(actor: UserId, group_id: Ulid, document_id: MetaResourceId) -> WatchEvent {
         WatchEvent {
             event_id: Ulid::from_bytes([8u8; 16]),
             realm_id: REALM,

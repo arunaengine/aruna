@@ -439,7 +439,7 @@ async fn seed_and_update(
     nodes: &[TestNode],
     realm_id: RealmId,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
 ) -> Result<(PlacementRef, Vec<aruna_core::NodeId>, Ulid), Box<dyn std::error::Error>> {
     let created = drive(
@@ -562,7 +562,7 @@ async fn assert_update_reaches(
     realm_id: RealmId,
     replacement: aruna_core::NodeId,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     update_event_id: Ulid,
     placement: &PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1302,7 +1302,7 @@ fn document_change_for_publish(
 
 async fn read_metadata_event_log_value(
     node: &TestNode,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<Option<aruna_core::types::Value>, Box<dyn std::error::Error>> {
     match node
@@ -1324,7 +1324,7 @@ async fn read_metadata_event_log_value(
 async fn read_persisted_holder_set(
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::NodeId>)>, Box<dyn std::error::Error>> {
     let key = metadata_registry_key(group_id, document_id);
     match node
@@ -1361,7 +1361,7 @@ async fn read_persisted_holder_set(
 
 async fn wait_for_event_log_value(
     node: &TestNode,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<aruna_core::types::Value, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
@@ -1383,7 +1383,7 @@ async fn wait_for_event_log_value(
 async fn wait_for_persisted_update(
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     expected_event_id: Ulid,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
@@ -1409,7 +1409,7 @@ async fn wait_for_persisted_holder_set(
     nodes: &[TestNode],
     node_ids: &[aruna_core::NodeId],
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     expected_holders: &[aruna_core::NodeId],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
@@ -1498,7 +1498,7 @@ async fn wait_for_realm_node_convergence(
 async fn wait_for_metadata_convergence(
     nodes: &[TestNode],
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_metadata_state(
@@ -1515,7 +1515,7 @@ async fn wait_for_metadata_convergence(
 async fn wait_for_metadata_state(
     nodes: &[TestNode],
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     graph_iri: &str,
     expected_holder_count: usize,
     expected_text: &str,
@@ -1606,7 +1606,7 @@ async fn wait_for_metadata_state(
 async fn wait_for_metadata_absence(
     nodes: &[TestNode],
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;

@@ -364,7 +364,7 @@ fn metadata_permission_path(
     realm_id: RealmId,
     path: &str,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Option<String> {
     if group_id.is_nil() || document_id.is_nil() {
         return None;

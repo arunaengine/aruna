@@ -224,7 +224,7 @@ async fn create_metadata_document(
     node: &TestNode,
     realm_id: RealmId,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     Ok(drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {

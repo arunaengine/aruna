@@ -350,7 +350,7 @@ mod tests {
     fn metadata_record(
         realm_id: RealmId,
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         path: &str,
     ) -> MetadataRegistryRecord {
         MetadataRegistryRecord {

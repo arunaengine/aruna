@@ -21,7 +21,7 @@ use crate::metadata::repository::{
 #[derive(Debug, PartialEq)]
 pub struct GetMetadataDocumentOperation {
     group_id: GroupId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     record: Option<MetadataRegistryRecord>,
     state: GetMetadataDocumentState,
     output: Option<Result<MetadataDocumentView, GetMetadataDocumentError>>,
@@ -57,7 +57,7 @@ pub enum GetMetadataDocumentError {
 }
 
 impl GetMetadataDocumentOperation {
-    pub fn new(group_id: GroupId, document_id: Ulid) -> Self {
+    pub fn new(group_id: GroupId, document_id: MetaResourceId) -> Self {
         Self {
             group_id,
             document_id,
@@ -85,7 +85,7 @@ impl GetMetadataDocumentOperation {
 
 pub async fn load_metadata_record_by_document(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
     let event = context
         .storage_handle

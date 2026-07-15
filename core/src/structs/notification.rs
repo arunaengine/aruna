@@ -2,6 +2,7 @@ use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+use crate::MetaResourceId;
 
 use crate::NodeId;
 use crate::errors::ConversionError;
@@ -49,7 +50,7 @@ pub enum NotificationKind {
     MetadataCreated {
         path: String,
         group_id: GroupId,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         actor_user_id: UserId,
     },
     DataUploaded {
@@ -349,7 +350,7 @@ mod tests {
             NotificationKind::MetadataCreated {
                 path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
                 group_id: metadata_group_id,
-                document_id: Ulid::r#gen(),
+                document_id: MetaResourceId::from_bytes([0x5a; 16]).unwrap(),
                 actor_user_id: user(1, 5),
             },
             NotificationKind::DataUploaded {
@@ -525,7 +526,7 @@ mod tests {
         let metadata_created = NotificationKind::MetadataCreated {
             path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
             group_id: metadata_group_id,
-            document_id: Ulid::r#gen(),
+            document_id: MetaResourceId::from_bytes([0x5b; 16]).unwrap(),
             actor_user_id: user(1, 5),
         };
         let data_group_id = Ulid::r#gen();

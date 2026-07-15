@@ -42,7 +42,7 @@ use crate::placement::{
 pub struct CreateMetadataDocumentConfig {
     pub actor: Actor,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub document_path: String,
     pub public: bool,
     pub payload: CreateMetadataDocumentPayload,
@@ -600,7 +600,7 @@ pub fn forward_bucket_placement(
 
 /// Whether `document_id` already carries a valid structured id (a non-reserved
 /// handle), i.e. it was minted rather than left as a placeholder to be minted.
-fn is_structured_document_id(document_id: Ulid) -> bool {
+fn is_structured_document_id(document_id: MetaResourceId) -> bool {
     MetaResourceId::try_from(document_id.0).is_ok()
 }
 
@@ -930,7 +930,7 @@ mod tests {
     fn realm_config_read(
         config: Option<&RealmConfigDocument>,
         actor: &Actor,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -1099,7 +1099,7 @@ mod tests {
         );
     }
 
-    fn config(actor: Actor, group_id: GroupId, document_id: Ulid) -> CreateMetadataDocumentConfig {
+    fn config(actor: Actor, group_id: GroupId, document_id: MetaResourceId) -> CreateMetadataDocumentConfig {
         CreateMetadataDocumentConfig {
             actor,
             group_id,
@@ -1115,13 +1115,13 @@ mod tests {
         }
     }
 
-    fn validation_result(document_id: Ulid) -> Event {
+    fn validation_result(document_id: MetaResourceId) -> Event {
         Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
         })
     }
 
-    fn assert_validation_effect(effects: &[Effect], document_id: Ulid) {
+    fn assert_validation_effect(effects: &[Effect], document_id: MetaResourceId) {
         let [Effect::Metadata(MetadataEffect::ValidateCreateCrate { request })] = effects else {
             panic!("expected metadata validation effect");
         };
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(txn_id, &None);
     }
 
-    fn assert_create_event_append(effects: &[Effect], document_id: Ulid, actor: &Actor) -> Key {
+    fn assert_create_event_append(effects: &[Effect], document_id: MetaResourceId, actor: &Actor) -> Key {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects else {
             panic!("expected metadata create event append");
         };

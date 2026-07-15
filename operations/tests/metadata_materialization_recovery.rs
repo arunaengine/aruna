@@ -196,7 +196,7 @@ async fn materialize_entity_upsert(
 
 fn create_event(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
     name: &str,
 ) -> MetadataCreateEventRecord {
@@ -216,7 +216,7 @@ fn create_event(
 
 fn create_event_with_payload(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
     name: &str,
     payload: MetadataCreateEventPayload,
@@ -331,7 +331,7 @@ async fn write_entries(
 
 async fn read_status(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, Box<dyn std::error::Error>> {
     match storage
         .send_storage_effect(StorageEffect::Read {

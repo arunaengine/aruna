@@ -237,7 +237,7 @@ async fn same_path_creates_resolve_to_winner() -> Result<(), Box<dyn std::error:
 
 impl TestContext {
     // The bucket the create operation would have chosen on this node.
-    fn placement(&self, group_id: Ulid, document_id: Ulid, document_path: &str) -> PlacementRef {
+    fn placement(&self, group_id: Ulid, document_id: MetaResourceId, document_path: &str) -> PlacementRef {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let (strategy, _) = strategy_for_target(
             &self.config,
@@ -858,7 +858,7 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 fn build_create_event(
     test: &TestContext,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
     name: &str,
 ) -> (MetadataRegistryRecord, MetadataCreateEventRecord) {
@@ -942,7 +942,7 @@ async fn write_pending_create_event(
 
 async fn pending_projection_marker_exists(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match test
@@ -1122,7 +1122,7 @@ async fn wait_for_projected_record(
 
 async fn read_create_events(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Vec<MetadataCreateEventRecord>, Box<dyn std::error::Error>> {
     match test
         .context

@@ -514,7 +514,7 @@ impl MetadataVisibilityCache {
         entry.snapshot = None;
     }
 
-    fn remove_registry_record(&self, document_id: Ulid) {
+    fn remove_registry_record(&self, document_id: MetaResourceId) {
         let mut registry = self
             .registry
             .lock()
@@ -669,7 +669,7 @@ impl MetadataHandle {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
-    pub fn remove_cached_registry_record(&self, document_id: Ulid) {
+    pub fn remove_cached_registry_record(&self, document_id: MetaResourceId) {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);

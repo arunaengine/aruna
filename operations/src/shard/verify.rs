@@ -423,7 +423,7 @@ mod tests {
     fn entry(document: u8, generation: u64) -> ShardManifestEntry {
         ShardManifestEntry {
             target: DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: Ulid::from_bytes([document; 16]),
+                document_id: MetaResourceId::from_bytes([document; 16]).unwrap(),
             },
             revision: DocumentSyncRevision {
                 generation,

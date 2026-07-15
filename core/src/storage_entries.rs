@@ -1,5 +1,6 @@
 use byteview::ByteView;
 use ulid::Ulid;
+use crate::{MetaResourceId, StructuredId};
 
 use crate::NodeId;
 use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
@@ -80,7 +81,7 @@ pub fn stale_subject_index_deletes(
         .collect()
 }
 
-pub fn metadata_registry_key(group_id: GroupId, document_id: Ulid) -> Key {
+pub fn metadata_registry_key(group_id: GroupId, document_id: MetaResourceId) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
@@ -91,11 +92,11 @@ pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
     ByteView::from(group_id.to_bytes().to_vec())
 }
 
-pub fn metadata_document_key(document_id: Ulid) -> Key {
+pub fn metadata_document_key(document_id: MetaResourceId) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
+pub fn metadata_create_acceptance_key(document_id: MetaResourceId) -> Key {
     metadata_document_key(document_id)
 }
 
@@ -120,7 +121,7 @@ pub fn metadata_path_claim_key(
     realm_id: &RealmId,
     group_id: GroupId,
     normalized_path: &str,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Key {
     let mut bytes = metadata_path_claim_prefix(realm_id, group_id, normalized_path)
         .as_ref()
@@ -159,26 +160,26 @@ pub fn metadata_graph_lifecycle_key(graph_iri: &str) -> Key {
     ByteView::from(blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec())
 }
 
-pub fn metadata_document_lifecycle_key(document_id: Ulid) -> Key {
+pub fn metadata_document_lifecycle_key(document_id: MetaResourceId) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_event_log_prefix(document_id: Ulid) -> Key {
+pub fn metadata_event_log_prefix(document_id: MetaResourceId) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
+pub fn metadata_event_log_key(document_id: MetaResourceId, event_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
     ByteView::from(bytes)
 }
 
-pub fn metadata_pending_projection_key(document_id: Ulid, event_id: Ulid) -> Key {
+pub fn metadata_pending_projection_key(document_id: MetaResourceId, event_id: Ulid) -> Key {
     metadata_event_log_key(document_id, event_id)
 }
 
-pub fn metadata_pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
+pub fn metadata_pending_projection_target(key: &[u8]) -> Option<(MetaResourceId, Ulid)> {
     if key.len() != 32 {
         return None;
     }
@@ -186,7 +187,10 @@ pub fn metadata_pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
     document_id.copy_from_slice(&key[..16]);
     let mut event_id = [0u8; 16];
     event_id.copy_from_slice(&key[16..]);
-    Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
+    Some((
+        MetaResourceId::from_bytes(document_id).ok()?,
+        Ulid::from_bytes(event_id),
+    ))
 }
 
 pub fn document_sync_revision_key(target: &DocumentSyncTarget) -> Key {
@@ -207,15 +211,15 @@ fn document_sync_target_sidecar_key(target: &DocumentSyncTarget) -> Key {
     ByteView::from(bytes)
 }
 
-pub fn metadata_materialization_status_key(document_id: Ulid) -> Key {
+pub fn metadata_materialization_status_key(document_id: MetaResourceId) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_materialization_document_job_prefix(document_id: Ulid) -> Key {
+pub fn metadata_materialization_document_job_prefix(document_id: MetaResourceId) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_materialization_document_job_key(document_id: Ulid, event_id: Ulid) -> Key {
+pub fn metadata_materialization_document_job_key(document_id: MetaResourceId, event_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
@@ -315,7 +319,7 @@ pub fn metadata_pending_projection_write_entry(
 }
 
 pub fn metadata_pending_projection_delete_entry(
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> (KeySpace, Key) {
     (
@@ -690,7 +694,7 @@ pub fn metadata_registry_write_entries(
 
 pub fn metadata_registry_delete_entries(
     group_id: GroupId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Vec<(KeySpace, Key)> {
     vec![
         (
@@ -714,6 +718,7 @@ mod tests {
 
     use ulid::Ulid;
 
+    use crate::MetaResourceId;
     use super::{
         admin_document_conflict_write_entries, admin_document_reducer_conflict_key,
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
@@ -867,7 +872,7 @@ mod tests {
     #[test]
     fn document_sync_revision_write_entry_roundtrips() {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([7; 16]),
+            document_id: MetaResourceId::from_bytes([7; 16]).unwrap(),
         };
         let base = revision(1, 1);
         let change = DocumentSyncChange {
@@ -896,7 +901,7 @@ mod tests {
     #[test]
     fn shard_manifest_write_entry_records_upsert_revision() {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([7; 16]),
+            document_id: MetaResourceId::from_bytes([7; 16]).unwrap(),
         };
         let placement = shard_placement(3);
         let change = DocumentSyncChange {
@@ -919,7 +924,7 @@ mod tests {
     #[test]
     fn shard_manifest_delete_keeps_tombstone_revision_at_same_key() {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([7; 16]),
+            document_id: MetaResourceId::from_bytes([7; 16]).unwrap(),
         };
         let placement = shard_placement(3);
         let upsert = DocumentSyncChange {
@@ -969,7 +974,7 @@ mod tests {
 
         // A shard-classed target with a NIL placement has no governing shard yet.
         let shard_target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([7; 16]),
+            document_id: MetaResourceId::from_bytes([7; 16]).unwrap(),
         };
         let nil_change = DocumentSyncChange {
             placement: PlacementRef::NIL,
@@ -985,10 +990,10 @@ mod tests {
     #[test]
     fn shard_manifest_keys_isolate_shards_and_targets() {
         let a = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([7; 16]),
+            document_id: MetaResourceId::from_bytes([7; 16]).unwrap(),
         };
         let b = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([8; 16]),
+            document_id: MetaResourceId::from_bytes([8; 16]).unwrap(),
         };
         let shard3 = shard_placement(3);
         let shard4 = shard_placement(4);

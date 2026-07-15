@@ -43,7 +43,7 @@ use crate::placement::{registry_placement, resolve_shard_holders};
 pub struct DeleteMetadataDocumentOperation {
     actor: aruna_core::structs::Actor,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     record: Option<MetadataRegistryRecord>,
     lifecycle_record: Option<MetadataGraphLifecycleRecord>,
     document_lifecycle_record: Option<MetadataDocumentLifecycleRecord>,
@@ -106,7 +106,7 @@ pub enum DeleteMetadataDocumentError {
 }
 
 impl DeleteMetadataDocumentOperation {
-    pub fn new(actor: aruna_core::structs::Actor, group_id: Ulid, document_id: Ulid) -> Self {
+    pub fn new(actor: aruna_core::structs::Actor, group_id: Ulid, document_id: MetaResourceId) -> Self {
         Self {
             actor,
             group_id,
@@ -322,7 +322,7 @@ impl DeleteMetadataDocumentOperation {
 pub async fn delete_metadata_document(
     operation: DeleteMetadataDocumentOperation,
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<(), DeleteMetadataDocumentError> {
     drive(operation, context).await?;
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {

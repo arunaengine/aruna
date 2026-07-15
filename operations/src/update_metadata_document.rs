@@ -37,7 +37,7 @@ use crate::metadata::repository::{
 pub struct UpdateMetadataDocumentConfig {
     pub actor: aruna_core::structs::Actor,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub public: bool,
     pub mutation: UpdateMetadataDocumentMutation,
 }
@@ -558,7 +558,7 @@ mod tests {
         }
     }
 
-    fn replace_jsonld(document_id: Ulid, name: &str) -> String {
+    fn replace_jsonld(document_id: MetaResourceId, name: &str) -> String {
         format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",

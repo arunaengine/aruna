@@ -106,7 +106,7 @@ pub enum MetadataMaterializationQueueError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    MetadataCreateEventMissing { document_id: MetaResourceId, event_id: Ulid },
     #[error("unexpected event while processing metadata materialization queue: {0}")]
     UnexpectedEvent(String),
 }
@@ -893,7 +893,7 @@ async fn process_materialization_job(
 
 async fn older_materialization_job_exists(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
     advanced_event_ids: &BTreeSet<Ulid>,
 ) -> Result<bool, MetadataMaterializationQueueError> {
@@ -1035,7 +1035,7 @@ async fn older_materialization_job_exists(
 
 async fn older_global_materialization_job_exists(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
     advanced_event_ids: &BTreeSet<Ulid>,
     status: Option<&MetadataMaterializationStatusRecord>,
@@ -1123,7 +1123,7 @@ async fn older_global_materialization_job_exists(
 
 async fn read_create_event(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<MetadataCreateEventRecord, MetadataMaterializationQueueError> {
     match storage
@@ -1177,7 +1177,7 @@ async fn materialization_job_obsolescence(
 
 async fn read_materialization_status(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     txn_id: Option<Ulid>,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataMaterializationQueueError> {
     match storage
@@ -1418,7 +1418,7 @@ async fn repair_or_delete_malformed_materialization_job(
 
 async fn find_decoded_global_materialization_job(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
     skip_key: Option<&[u8]>,
 ) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
@@ -1909,7 +1909,7 @@ async fn write_materialization_document_job(
 
 async fn read_global_materialization_job(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
     if let Some(job) =
@@ -1922,7 +1922,7 @@ async fn read_global_materialization_job(
 
 async fn find_repaired_malformed_global_materialization_job(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<Option<MetadataMaterializationJobRecord>, MetadataMaterializationQueueError> {
     let mut start_after = None;
@@ -2010,7 +2010,7 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataCreateEventRecord {
+    fn create_event(document_id: MetaResourceId, event_id: Ulid, name: &str) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let group_id = Ulid::from_parts(7, 1);
         let document_path = format!("datasets/{name}");
@@ -2381,13 +2381,13 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let now_ms = unix_timestamp_millis();
         let future_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([18u8; 16]),
+            document_id: MetaResourceId::from_bytes([18u8; 16]).unwrap(),
             event_id: Ulid::from_parts(18, 1),
             due_at_ms: now_ms.saturating_add(60_000),
             attempts: 0,
         };
         let due_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([19u8; 16]),
+            document_id: MetaResourceId::from_bytes([19u8; 16]).unwrap(),
             event_id: Ulid::from_parts(19, 1),
             due_at_ms: 1,
             attempts: 0,
@@ -2444,13 +2444,13 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let now_ms = unix_timestamp_millis();
         let future_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([20u8; 16]),
+            document_id: MetaResourceId::from_bytes([20u8; 16]).unwrap(),
             event_id: Ulid::from_parts(20, 1),
             due_at_ms: now_ms.saturating_add(60_000),
             attempts: 0,
         };
         let due_job = MetadataMaterializationJobRecord {
-            document_id: Ulid::from_bytes([21u8; 16]),
+            document_id: MetaResourceId::from_bytes([21u8; 16]).unwrap(),
             event_id: Ulid::from_parts(21, 1),
             due_at_ms: 1,
             attempts: 0,

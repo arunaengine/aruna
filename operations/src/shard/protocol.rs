@@ -503,7 +503,7 @@ mod tests {
             holder,
             entries: vec![ShardManifestEntry {
                 target: DocumentSyncTarget::MetadataDocumentLifecycle {
-                    document_id: Ulid::from_bytes([4; 16]),
+                    document_id: MetaResourceId::from_bytes([4; 16]).unwrap(),
                 },
                 revision: DocumentSyncRevision {
                     generation: 3,
@@ -542,7 +542,7 @@ mod tests {
         let entries = (1..=4)
             .map(|seed| ShardManifestEntry {
                 target: DocumentSyncTarget::MetadataDocumentLifecycle {
-                    document_id: Ulid::from_bytes([seed; 16]),
+                    document_id: MetaResourceId::from_bytes([seed; 16]).unwrap(),
                 },
                 revision: DocumentSyncRevision {
                     generation: u64::from(seed),
@@ -617,7 +617,7 @@ mod tests {
         let entries = (1..=2)
             .map(|seed| ShardManifestEntry {
                 target: DocumentSyncTarget::MetadataDocumentLifecycle {
-                    document_id: Ulid::from_bytes([seed; 16]),
+                    document_id: MetaResourceId::from_bytes([seed; 16]).unwrap(),
                 },
                 revision: DocumentSyncRevision {
                     generation: u64::from(seed),

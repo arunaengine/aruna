@@ -355,7 +355,7 @@ fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncC
 async fn wait_for_record_on_holders(
     nodes: &[TestNode],
     holders: &[NodeId],
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
@@ -596,7 +596,7 @@ async fn wait_for_group(
 
 async fn registry_record(
     node: &TestNode,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
     load_metadata_record_by_document(node.context.as_ref(), document_id)
         .await
@@ -628,7 +628,7 @@ async fn drive_forwarded_create(
     realm: &Realm,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     drive_forwarded_create_at(realm, node, group_id, document_id, "datasets/forwarded").await
 }
@@ -637,7 +637,7 @@ async fn drive_forwarded_create_at(
     realm: &Realm,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let created = create_metadata_document_routed(

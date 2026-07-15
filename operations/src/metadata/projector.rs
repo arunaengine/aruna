@@ -102,7 +102,7 @@ pub enum MetadataProjectionError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    MetadataCreateEventMissing { document_id: MetaResourceId, event_id: Ulid },
     #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
     ClockSkewDeferred { deferred: usize },
     #[error("unexpected event while projecting metadata create event: {0}")]
@@ -265,7 +265,7 @@ pub async fn drain_pending_metadata_projection_queue(
 
 pub async fn project_metadata_create_event_from_log(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<(), MetadataProjectionError> {
     project_metadata_create_events_from_log(context, [(document_id, event_id)])
@@ -334,7 +334,7 @@ async fn project_metadata_create_events_from_log_inner(
 
 async fn read_create_event_from_log(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     let value = match context
@@ -958,7 +958,7 @@ async fn read_existing_registry(
 
 async fn read_materialization_status(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataProjectionError> {
     match context
         .storage_handle

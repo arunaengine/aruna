@@ -157,17 +157,8 @@ mod sealed {
 /// Shared codec for the Aruna Structured ULID family (`MetaResourceId`,
 /// `JobId`). Every constructor guarantees a non-zero handle, so extracted
 /// fields are always valid.
-pub trait StructuredId: Sized + Copy + sealed::Sealed + TryFrom<u128, Error = FieldError> {
+pub trait StructuredId: Sized + Copy + sealed::Sealed {
     fn as_ulid(&self) -> Ulid;
-
-    /// Reconstructs an id from its 16 big-endian bytes (the inverse of
-    /// [`to_bytes`](Self::to_bytes)), rejecting the reserved zero handle. This is
-    /// the explicit, fallible entry used to decode a structured id back out of a
-    /// storage key and to build fixed ids in tests; it deliberately validates so
-    /// no unstructured/zero-handle value can re-enter as a document id.
-    fn from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
-        Self::try_from(u128::from_be_bytes(bytes))
-    }
 
     /// Builds an id from its four fields, rejecting an out-of-range timestamp or
     /// nonce. The handle and bucket are already range-checked newtypes.
@@ -243,6 +234,18 @@ macro_rules! structured_id_newtype {
         impl sealed::Sealed for $name {
             fn from_ulid(ulid: Ulid, _token: sealed::Token) -> Self {
                 Self(ulid)
+            }
+        }
+
+        impl $name {
+            /// Reconstructs an id from its 16 big-endian bytes (the inverse of
+            /// [`StructuredId::to_bytes`]), rejecting the reserved zero handle.
+            /// This is the explicit, fallible entry used to decode a structured
+            /// id back out of a storage key and to build fixed ids in tests; it
+            /// deliberately validates so no unstructured/zero-handle value can
+            /// re-enter as a document id.
+            pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
+                Self::try_from(u128::from_be_bytes(bytes))
             }
         }
 

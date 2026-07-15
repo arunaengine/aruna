@@ -262,7 +262,7 @@ async fn run_sampler(
 async fn wait_until_visible_on_all(
     contexts: &[Arc<DriverContext>],
     group_id: GroupId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     t0: Instant,
 ) -> Option<Duration> {
     let mut pending: Vec<Arc<DriverContext>> = contexts.to_vec();
@@ -306,7 +306,7 @@ fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataD
     }
 }
 
-fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
+fn rocrate_payload(document_id: MetaResourceId) -> CreateMetadataDocumentPayload {
     let jsonld = format!(
         r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",

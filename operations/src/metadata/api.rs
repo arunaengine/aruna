@@ -91,7 +91,7 @@ pub struct ListVisibleMetadataDocumentsResult {
 
 #[derive(Debug, Clone)]
 pub struct GetVisibleMetadataDocumentRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
 }
 
@@ -104,7 +104,7 @@ pub enum MetadataRoCrateExportView {
 
 #[derive(Debug, Clone)]
 pub struct ExportMetadataRoCrateRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
     pub view: MetadataRoCrateExportView,
     pub limit: Option<usize>,
@@ -136,7 +136,7 @@ pub enum MetadataApiQueryMode {
 
 #[derive(Debug, Clone)]
 pub struct MetadataDocumentQueryRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
     pub query: String,
@@ -539,7 +539,7 @@ async fn load_pending_group_metadata_records(
 
 async fn read_metadata_create_event(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<Option<MetadataCreateEventRecord>, MetadataApiError> {
     let value = match context
@@ -627,7 +627,7 @@ fn merge_pending_metadata_records(
 
 async fn load_record_by_document(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     match load_metadata_record_by_document(context, document_id).await {
         Ok(Some(record)) => Ok(record),

@@ -207,7 +207,7 @@ async fn create_document(
     node: &TestNode,
     realm_id: RealmId,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(

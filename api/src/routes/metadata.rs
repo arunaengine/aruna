@@ -1423,7 +1423,7 @@ async fn ensure_permission(
 
 async fn load_metadata_record_by_document(
     state: &ServerState,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
     match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {

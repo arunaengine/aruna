@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::structs::RealmId;
+use crate::{MetaResourceId, StructuredId};
 use crate::types::GroupId;
 
 /// Domain tag separating the path-claim winner digest from every other hash in
@@ -29,7 +30,7 @@ pub struct PathClaimRecord {
     pub realm_id: RealmId,
     pub group_id: GroupId,
     /// The claiming Meta Resource id (a structured `MetaResourceId` as a `Ulid`).
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     /// The causal event that established this claim generation.
     pub establishing_event_id: Ulid,
     /// The normalized canonical path this id requested (retained for the loser's
@@ -56,7 +57,7 @@ impl PathClaimRecord {
     fn winner_order(&self) -> ([u8; 32], u128, u128) {
         (
             self.winner_digest(),
-            self.document_id.0,
+            self.document_id.as_u128(),
             self.establishing_event_id.0,
         )
     }
@@ -72,7 +73,7 @@ pub struct PathResolution {
 
 impl PathResolution {
     /// The id served for the path.
-    pub fn winner_id(&self) -> Ulid {
+    pub fn winner_id(&self) -> MetaResourceId {
         self.winner.document_id
     }
 
@@ -116,7 +117,7 @@ mod tests {
         PathClaimRecord {
             realm_id: RealmId([1u8; 32]),
             group_id: Ulid::from_bytes([2u8; 16]),
-            document_id: Ulid::from_bytes([doc; 16]),
+            document_id: MetaResourceId::from_bytes([doc; 16]).unwrap(),
             establishing_event_id: Ulid::from_bytes([event; 16]),
             requested_path: path.to_string(),
         }
@@ -130,7 +131,7 @@ mod tests {
     #[test]
     fn single_claim_wins_uncontested() {
         let resolution = resolve_path_claim(&[claim(10, 11, "datasets/x")]).unwrap();
-        assert_eq!(resolution.winner_id(), Ulid::from_bytes([10; 16]));
+        assert_eq!(resolution.winner_id(), MetaResourceId::from_bytes([10; 16]).unwrap());
         assert!(!resolution.is_conflicted());
     }
 
@@ -154,7 +155,7 @@ mod tests {
         let a = claim(10, 40, "datasets/x");
         let b = claim(20, 41, "datasets/x");
         let resolution = resolve_path_claim(&[a.clone(), b.clone()]).unwrap();
-        let mut seen: Vec<Ulid> = std::iter::once(resolution.winner_id())
+        let mut seen: Vec<MetaResourceId> = std::iter::once(resolution.winner_id())
             .chain(resolution.conflicts.iter().map(|c| c.document_id))
             .collect();
         seen.sort();

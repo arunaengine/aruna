@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+use crate::{MetaResourceId, StructuredId};
 
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
@@ -42,14 +43,14 @@ pub enum DocumentSyncTarget {
     },
     MetadataRegistry {
         group_id: GroupId,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     },
     MetadataCreateEvent {
-        document_id: Ulid,
+        document_id: MetaResourceId,
         event_id: Ulid,
     },
     MetadataDocumentLifecycle {
-        document_id: Ulid,
+        document_id: MetaResourceId,
     },
     MetadataGraphLifecycle {
         graph_iri: String,
@@ -594,11 +595,16 @@ mod tests {
     use crate::structs::PlacementRef;
     use crate::structs::RealmId;
     use crate::types::UserId;
+    use crate::{MetaResourceId, StructuredId};
     use irokle::Event as _;
     use ulid::Ulid;
 
     fn test_ulid(seed: u8) -> Ulid {
         Ulid::from_bytes([seed; 16])
+    }
+
+    fn test_doc_id(seed: u8) -> MetaResourceId {
+        MetaResourceId::from_bytes([seed; 16]).unwrap()
     }
 
     fn test_node(seed: u8) -> NodeId {
@@ -649,7 +655,7 @@ mod tests {
         let group_id = test_ulid(1);
         let realm_id = test_realm(2);
         let user_id = UserId::new(test_ulid(3), realm_id);
-        let document_id = test_ulid(4);
+        let document_id = test_doc_id(4);
         let event_id = test_ulid(5);
         let graph_iri = "https://example.com/graphs/stable";
 
@@ -710,7 +716,7 @@ mod tests {
         let group_id = test_ulid(1);
         let realm_id = test_realm(2);
         let user_id = UserId::new(test_ulid(3), realm_id);
-        let document_id = test_ulid(4);
+        let document_id = test_doc_id(4);
         let event_id = test_ulid(5);
         let graph_iri = "https://example.com/graphs/stable";
 
@@ -796,7 +802,7 @@ mod tests {
     fn shard_classed_targets_ride_shard_topics_shared_targets_ride_domain_topics() {
         let group_id = test_ulid(1);
         let realm_id = test_realm(2);
-        let document_id = test_ulid(4);
+        let document_id = test_doc_id(4);
         let event_id = test_ulid(5);
         let placement_a = PlacementRef {
             strategy_id: test_ulid(9),
@@ -1211,7 +1217,7 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_target_is_document_scoped() {
-        let document_id = test_ulid(4);
+        let document_id = test_doc_id(4);
         let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let create = DocumentSyncTarget::MetadataCreateEvent {
             document_id,
@@ -1225,7 +1231,7 @@ mod tests {
     #[test]
     fn metadata_document_lifecycle_topic_is_shared_by_upsert_and_delete() {
         let realm_id = test_realm(2);
-        let document_id = test_ulid(4);
+        let document_id = test_doc_id(4);
         let placement = PlacementRef {
             strategy_id: test_ulid(9),
             epoch: 0,

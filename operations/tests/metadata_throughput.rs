@@ -407,7 +407,7 @@ fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataD
     }
 }
 
-fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
+fn rocrate_payload(document_id: MetaResourceId) -> CreateMetadataDocumentPayload {
     let jsonld = format!(
         r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
