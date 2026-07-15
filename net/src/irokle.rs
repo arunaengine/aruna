@@ -33,6 +33,7 @@ use aruna_core::keyspaces::{
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
     REALM_CONFIG_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
+use aruna_core::MetaResourceId;
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
@@ -6128,6 +6129,13 @@ mod tests {
     use aruna_core::admin_document_reducer::{
         REALM_CONFIG_DEFAULT_STRATEGY_PATH, realm_config_placement_binding_path,
     };
+
+    /// A valid structured `MetaResourceId` (non-zero handle) carrying `seed` in
+    /// its nonce, so distinct seeds yield distinct ids for tests that formerly
+    /// used raw `Ulid::from_parts` document ids.
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -6223,7 +6231,7 @@ mod tests {
             "urn:aruna:restart-contract".to_string(),
             RealmId::from_bytes([99; 32]),
             Ulid::from_parts(99, 1),
-            Ulid::from_parts(99, 2),
+            doc_id(99),
             1,
         ))
         .expect("restart payload serializes")
@@ -9909,7 +9917,7 @@ mod tests {
     async fn metadata_registry_upsert_skips_stale_local_record() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1, 1);
-        let document_id = Ulid::from_parts(2, 2);
+        let document_id = doc_id(2);
         let local = registry_record(
             group_id,
             document_id,
@@ -9964,7 +9972,7 @@ mod tests {
     async fn registry_strategy_fenced() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(2_100, 1);
-        let document_id = Ulid::from_parts(2_101, 1);
+        let document_id = doc_id(2_101);
         let mut record = registry_record(
             group_id,
             document_id,
@@ -10071,7 +10079,7 @@ mod tests {
             shard: 5,
         };
         let registry_group_id = Ulid::from_parts(2_122, 1);
-        let registry_document_id = Ulid::from_parts(2_123, 1);
+        let registry_document_id = doc_id(2_123);
         let registry_event_id = Ulid::from_parts(2_124, 1);
         let mut registry = registry_record(
             registry_group_id,
@@ -10087,7 +10095,7 @@ mod tests {
         };
 
         let create_group_id = Ulid::from_parts(2_125, 1);
-        let create_document_id = Ulid::from_parts(2_126, 1);
+        let create_document_id = doc_id(2_126);
         let create_event_id = Ulid::from_parts(2_127, 1);
         let mut create = metadata_create_event(
             create_group_id,
@@ -10327,7 +10335,7 @@ mod tests {
             shard: 4,
         };
         let group_id = Ulid::from_parts(2_112, 1);
-        let document_id = Ulid::from_parts(2_113, 1);
+        let document_id = doc_id(2_113);
         let create_event_id = Ulid::from_parts(2_114, 1);
         let mut record = registry_record(
             group_id,
@@ -10541,7 +10549,7 @@ mod tests {
     async fn document_sync_fencing_metadata_registry_stale_delete_preserves_newer_live_indexes() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_560, 1);
-        let document_id = Ulid::from_parts(1_561, 1);
+        let document_id = doc_id(1_561);
         let live_event_id = Ulid::from_parts(1_564, 1);
         let live = registry_record(
             group_id,
@@ -10571,7 +10579,7 @@ mod tests {
     async fn document_sync_fencing_tombstone_wins_over_late_metadata_registry_upsert() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_570, 1);
-        let document_id = Ulid::from_parts(1_571, 1);
+        let document_id = doc_id(1_571);
         let stale_event_id = Ulid::from_parts(1_572, 1);
         let delete_lifecycle = metadata_delete_lifecycle(
             group_id,
@@ -10616,7 +10624,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_without_document_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(50, 1);
-        let document_id = Ulid::from_parts(51, 1);
+        let document_id = doc_id(51);
         let record = registry_record(
             group_id,
             document_id,
@@ -10655,7 +10663,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_when_document_lifecycle_is_live() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(60, 1);
-        let document_id = Ulid::from_parts(61, 1);
+        let document_id = doc_id(61);
         let live_event_id = Ulid::from_parts(62, 1);
         let record = registry_record(
             group_id,
@@ -10705,7 +10713,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_newer_live_registry_record() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(70, 1);
-        let document_id = Ulid::from_parts(71, 1);
+        let document_id = doc_id(71);
         let live_event_id = Ulid::from_parts(74, 1);
         let record = registry_record(
             group_id,
@@ -10750,7 +10758,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_applies_with_matching_document_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(80, 1);
-        let document_id = Ulid::from_parts(81, 1);
+        let document_id = doc_id(81);
         let record = registry_record(
             group_id,
             document_id,
@@ -10793,7 +10801,7 @@ mod tests {
     async fn metadata_registry_delete_skips_without_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(30, 1);
-        let document_id = Ulid::from_parts(31, 1);
+        let document_id = doc_id(31);
         let record = registry_record(
             group_id,
             document_id,
@@ -10837,7 +10845,7 @@ mod tests {
     async fn metadata_registry_delete_with_matching_lifecycle_tombstone_deletes_indexes() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(40, 1);
-        let document_id = Ulid::from_parts(41, 1);
+        let document_id = doc_id(41);
         let record = registry_record(
             group_id,
             document_id,
@@ -10900,7 +10908,7 @@ mod tests {
     async fn metadata_lifecycle_upsert_preserves_revision_and_replays_idempotently() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1, 1);
-        let document_id = Ulid::from_parts(2, 2);
+        let document_id = doc_id(2);
         let event_id = Ulid::from_parts(3, 3);
         let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
@@ -10948,7 +10956,7 @@ mod tests {
     async fn metadata_lifecycle_upsert_skips_newer_delete_sidecar() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(10, 1);
-        let document_id = Ulid::from_parts(11, 1);
+        let document_id = doc_id(11);
         let stale_event_id = Ulid::from_parts(12, 1);
         let delete_event_id = Ulid::from_parts(13, 1);
         let delete_lifecycle =
@@ -10999,7 +11007,7 @@ mod tests {
     async fn metadata_lifecycle_delete_skips_stale_and_equal_sidecars() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(20, 1);
-        let document_id = Ulid::from_parts(21, 1);
+        let document_id = doc_id(21);
         let deleted_after_event_id = Ulid::from_parts(22, 1);
         let local_delete = metadata_delete_lifecycle(
             group_id,
@@ -11052,7 +11060,7 @@ mod tests {
 
     #[test]
     fn metadata_document_delete_write_entries_include_prune_job() {
-        let document_id = Ulid::from_parts(10, 1);
+        let document_id = doc_id(10);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:deleted".to_string(),
             RealmId::from_bytes([1; 32]),
