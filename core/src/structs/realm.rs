@@ -2,8 +2,9 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, NodePlacementEntry,
-    PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, HandleRange,
+    HandleRangeDirectory, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy,
+    StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -163,6 +164,11 @@ pub struct RealmConfigDocument {
     /// same-handle bindings are all retained so the derived directory fails
     /// closed as `Conflicted`.
     pub placement_bindings: Vec<PlacementBinding>,
+    /// Append-only handle-range grants, replicated via the
+    /// `RealmConfigHandleRangeGranted` admin operation and materialized by the
+    /// reducer overlay. Overlapping grants are retained so the derived
+    /// [`HandleRangeDirectory`] fails them closed.
+    pub placement_handle_ranges: Vec<HandleRange>,
 }
 
 /// Realm-wide quota policy. Lives in the realm config (Class-1, replicated
@@ -367,6 +373,7 @@ impl RealmConfigDocument {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
+        placement_handle_ranges: Vec::new(),
         }
     }
 
@@ -492,6 +499,11 @@ impl RealmConfigDocument {
     /// Rebuilds the derived Placement Binding Directory from the stored set.
     pub fn binding_directory(&self) -> BindingDirectory {
         BindingDirectory::from_bindings(&self.placement_bindings)
+    }
+
+    /// Rebuilds the derived Handle Range Directory from the granted set.
+    pub fn handle_range_directory(&self) -> HandleRangeDirectory {
+        HandleRangeDirectory::from_ranges(&self.placement_handle_ranges)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -649,6 +661,7 @@ mod test {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
+        placement_handle_ranges: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -758,6 +771,7 @@ mod test {
             strategy_bindings: Vec::new(),
             placement_overrides: Vec::new(),
             placement_bindings: Vec::new(),
+        placement_handle_ranges: Vec::new(),
         };
 
         assert_eq!(
