@@ -3,10 +3,11 @@
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
-    validate_composite_part_count,
+    validate_composite_part_count, validate_delete_checksum,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
+use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
     parse_completed_part, parse_copy_source, parse_copy_source_range,
@@ -2488,6 +2489,13 @@ impl S3 for ArunaS3Service {
             objects = req.input.delete.objects.len(),
             "Received DELETE OBJECTS Request"
         );
+
+        let body = req
+            .extensions
+            .get::<DeleteObjectsBody>()
+            .ok_or_else(|| s3_error!(InternalError, "Missing DeleteObjects request body"))?
+            .bytes();
+        validate_delete_checksum(&req.headers, &body)?;
 
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");

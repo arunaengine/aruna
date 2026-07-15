@@ -1,3 +1,4 @@
+use aruna_blob::hash::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -179,6 +180,33 @@ pub fn validate_composite_part_count(
         Some(count) if count != actual_part_count => Err(checksum_mismatch_error()),
         _ => Ok(()),
     }
+}
+
+pub fn validate_delete_checksum(headers: &HeaderMap, body: &[u8]) -> S3Result<()> {
+    let request = parse_upload_checksum_request(headers)?;
+    if request.expected.is_empty() {
+        return Err(s3_error!(
+            MissingSecurityHeader,
+            "Missing required Content-MD5 or checksum header"
+        ));
+    }
+
+    let hashes = Hasher::new_with_bytes(body).finalize();
+    for expected in request.expected {
+        let actual: &[u8] = match expected.algorithm {
+            ChecksumAlgorithm::Md5 => &hashes.md5,
+            ChecksumAlgorithm::Sha1 => &hashes.sha1,
+            ChecksumAlgorithm::Sha256 => &hashes.sha256,
+            ChecksumAlgorithm::Crc32 => &hashes.crc32,
+            ChecksumAlgorithm::Crc32c => &hashes.crc32c,
+            ChecksumAlgorithm::Crc64Nvme => &hashes.crc64nvme,
+        };
+        if expected.digest != actual {
+            return Err(checksum_mismatch_error());
+        }
+    }
+
+    Ok(())
 }
 
 pub fn checksum_mode_enabled(headers: &HeaderMap) -> bool {
@@ -407,9 +435,12 @@ mod tests {
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
         X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
         parse_complete_multipart_checksum_request, parse_upload_checksum_request,
-        validate_composite_part_count,
+        validate_composite_part_count, validate_delete_checksum,
     };
+    use aruna_blob::hash::Hasher;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use http::HeaderMap;
     use s3s::dto::{ChecksumType, PutObjectOutput};
     use std::collections::HashMap;
@@ -427,6 +458,37 @@ mod tests {
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
         assert!(!request.checksum_type_declared);
+    }
+
+    #[test]
+    fn validates_delete_checksum() {
+        let body = b"<Delete><Object><Key>key</Key></Object></Delete>";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_AMZ_CHECKSUM_CRC32,
+            STANDARD
+                .encode(Hasher::new_with_bytes(body).finalize().crc32)
+                .parse()
+                .unwrap(),
+        );
+
+        validate_delete_checksum(&headers, body).unwrap();
+
+        headers.insert(X_AMZ_CHECKSUM_CRC32, "AAAAAA==".parse().unwrap());
+        assert_eq!(
+            validate_delete_checksum(&headers, body)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "BadDigest"
+        );
+        assert_eq!(
+            validate_delete_checksum(&HeaderMap::new(), body)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "MissingSecurityHeader"
+        );
     }
 
     #[test]

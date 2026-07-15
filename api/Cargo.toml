@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 # Aruna modules
 aruna-core = { workspace = true }
+aruna-blob = { workspace = true }
 aruna-operations = { workspace = true }
 
 # General
