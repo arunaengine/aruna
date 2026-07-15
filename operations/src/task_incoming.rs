@@ -30,6 +30,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::drain::{process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
+use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
@@ -1603,6 +1604,20 @@ impl OperationsTaskHandler {
                 .available_slots_for(record.execution_class)
                 == 0
             {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
+                    continue;
+                };
+                if let Err(error) = release_job(
+                    &self.context.storage_handle,
+                    record.job_id,
+                    token,
+                    unix_timestamp_millis(),
+                )
+                .await
+                {
+                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
+                }
                 continue;
             }
             self.jobs_runtime.spawn(self.context.clone(), record);
