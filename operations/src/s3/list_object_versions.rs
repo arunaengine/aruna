@@ -19,8 +19,7 @@ use crate::s3::listing::common_prefix_of;
 
 // A single key may accumulate more versions than one scan page holds. The
 // storage layer only iterates forward (oldest -> newest), so the version prefix
-// is scanned in full and a rolling window retains the newest VERSION_SCAN_LIMIT
-// entries, discarding older ones as the scan advances.
+// is scanned in full before response ordering and pagination are applied.
 const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,18 +438,14 @@ impl ListObjectVersionsOperation {
             self.version_window
                 .push_back((version_key.version_id, version));
         }
-        while self.version_window.len() > self.version_scan_limit {
-            self.version_window.pop_front();
-        }
-
         // Iteration yields oldest -> newest; keep scanning the prefix until it
-        // is exhausted so the rolling window settles on the newest versions.
+        // is exhausted so versions beyond one storage page remain reachable.
         if let Some(cursor) = next_start_after {
             self.version_scan_cursor = Some(cursor);
             return self.issue_version_iter(&key);
         }
 
-        // Window holds oldest -> newest; sort by the stored version timestamp
+        // Collected versions are oldest -> newest; sort by the stored version timestamp
         // so same-millisecond ULID randomness cannot put the current head behind
         // an older sibling.
         let mut versions: Vec<(Ulid, BlobVersion)> = self.version_window.drain(..).collect();
@@ -1229,14 +1224,14 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_object_versions_keeps_newest_versions_past_scan_limit() {
+    async fn keeps_all_versions() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        // Seed more versions than the scan limit; the rolling window must keep
-        // the newest ones (including the is_latest head), not the oldest page.
+        // Seed more versions than the scan limit; every storage page must
+        // remain available for response pagination.
         let versions = ordered_ulids(5);
         for (index, version_id) in versions.iter().enumerate() {
             seed_materialized(&storage_handle, "obj", *version_id, [index as u8 + 80; 32]).await;
@@ -1275,6 +1270,8 @@ mod test {
                 (versions[4], true),
                 (versions[3], false),
                 (versions[2], false),
+                (versions[1], false),
+                (versions[0], false),
             ]
         );
     }
