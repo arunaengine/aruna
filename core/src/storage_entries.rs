@@ -18,10 +18,10 @@ use crate::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PATH_CLAIM_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
-    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-    NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
-    SHARD_MANIFEST_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
+    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
@@ -102,7 +102,11 @@ pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
 /// Prefix scanned to gather every id claiming one normalized path (DEC-PATH):
 /// `realm(32) ‖ group(16) ‖ blake3(normalized_path)(32)`. The path is hashed so
 /// the key is fixed width and one path can never be a byte-prefix of another.
-pub fn metadata_path_claim_prefix(realm_id: &RealmId, group_id: GroupId, normalized_path: &str) -> Key {
+pub fn metadata_path_claim_prefix(
+    realm_id: &RealmId,
+    group_id: GroupId,
+    normalized_path: &str,
+) -> Key {
     let mut bytes = Vec::with_capacity(80);
     bytes.extend_from_slice(realm_id.as_bytes());
     bytes.extend_from_slice(&group_id.to_bytes());

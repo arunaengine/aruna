@@ -54,7 +54,11 @@ impl PathClaimRecord {
     /// document id then the establishing event id so the order is total even on
     /// an (astronomically unlikely) digest collision.
     fn winner_order(&self) -> ([u8; 32], u128, u128) {
-        (self.winner_digest(), self.document_id.0, self.establishing_event_id.0)
+        (
+            self.winner_digest(),
+            self.document_id.0,
+            self.establishing_event_id.0,
+        )
     }
 }
 
