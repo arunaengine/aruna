@@ -709,8 +709,8 @@ pub async fn handoff_external_attempt(
 }
 
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
-/// external submit so a lost attempt can be adopted by name. Token-fenced; no state
-/// change.
+/// external submit so a lost attempt can be adopted by name. A committed cancellation
+/// wins this gate, so no new attempt is submitted afterward.
 pub async fn record_attempt_intent(
     storage: &StorageHandle,
     job_id: JobId,
@@ -720,6 +720,9 @@ pub async fn record_attempt_intent(
 ) -> Result<JobRecord, JobMutationError> {
     mutate_job(storage, job_id, |record| {
         guard_token(record, token)?;
+        if record.cancel_requested {
+            return Ok(JobMutation::Skip);
+        }
         record.attempt_intent = Some(intent.clone());
         record.updated_at_ms = now_ms;
         Ok(JobMutation::Persist)
@@ -1987,6 +1990,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.attempt_intent, Some(intent));
+    }
+
+    #[tokio::test]
+    async fn cancel_blocks_intent() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0xA1; 16]);
+        let token = Ulid::r#gen();
+        let mut record = running_record(job_id, token, 10_000);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Ready;
+        insert_job(&storage, &record).await.unwrap();
+        set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
+
+        let intent = AttemptIntent {
+            attempt_no: 0,
+            external_name: aruna_core::structs::attempt_external_name(job_id, 0),
+            executor_kind: "docker".to_string(),
+        };
+        let stored = record_attempt_intent(&storage, job_id, token, intent, 6_000)
+            .await
+            .unwrap();
+
+        assert!(stored.cancel_requested);
+        assert!(stored.attempt_intent.is_none());
     }
 
     // A live renewed external lease is a plain sweep Skip, never routed to reconcile.
