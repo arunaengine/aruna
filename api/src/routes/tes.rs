@@ -812,6 +812,10 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
     let mut log = build_task_log(record, base_url);
     if view == TesView::Basic {
         log.system_logs.clear();
+        for executor in &mut log.logs {
+            executor.stdout = None;
+            executor.stderr = None;
+        }
     }
 
     TesTask {
@@ -1018,7 +1022,7 @@ impl IntoResponse for TesError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{NodeCapabilities, OutputObject, RealmId};
+    use aruna_core::structs::{JobError, NodeCapabilities, OutputObject, RealmId};
     use aruna_core::types::{NodeId, UserId};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
@@ -1238,6 +1242,7 @@ mod tests {
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(2_000);
         record.workspace_bucket = Some("ws-x".to_string());
+        record.last_error = Some(JobError::permanent("prior failure"));
         record.result = Some(JobResultPayload::Execution {
             exit_code: Some(0),
             workspace_bucket: "ws-x".to_string(),
@@ -1247,7 +1252,7 @@ mod tests {
                 digest: None,
             }],
             stdout: "hello".to_string(),
-            stderr: String::new(),
+            stderr: "error".to_string(),
         });
 
         let minimal = project_task(&record, TesView::Minimal, "http://x");
@@ -1259,11 +1264,17 @@ mod tests {
         assert_eq!(basic.executors.len(), 1);
         assert_eq!(basic.executors[0].command, vec!["echo", "hi"]);
         assert_eq!(basic.logs.len(), 1);
+        assert!(basic.logs[0].system_logs.is_empty());
+        assert!(basic.logs[0].logs[0].stdout.is_none());
+        assert!(basic.logs[0].logs[0].stderr.is_none());
         assert_eq!(basic.inputs.len(), 1);
 
         let full = project_task(&record, TesView::Full, "http://x");
         assert_eq!(full.logs.len(), 1);
         assert_eq!(full.logs[0].logs[0].exit_code, Some(0));
+        assert_eq!(full.logs[0].logs[0].stdout.as_deref(), Some("hello"));
+        assert_eq!(full.logs[0].logs[0].stderr.as_deref(), Some("error"));
+        assert_eq!(full.logs[0].system_logs, vec!["prior failure"]);
         assert_eq!(full.logs[0].outputs.len(), 1);
         assert_eq!(full.logs[0].outputs[0].url, "s3://ws-x/out/r.txt");
     }
