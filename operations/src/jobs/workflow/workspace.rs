@@ -2,8 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
-    OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
+    AuthContext, BackendLocation, BucketInfo, ExecutionSpec, InputSelection, InputSource, JobError,
+    JobRecord, OutputObject, PathRestriction, Permission, blob_bucket_permission_path,
     blob_group_permission_path, blob_object_permission_path,
 };
 use aruna_core::types::NodeId;
@@ -16,6 +16,7 @@ use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
 use crate::s3::get_bucket_info::GetBucketInfoOperation;
 use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
 use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 
@@ -219,6 +220,37 @@ async fn stage_one_input(
     .map_err(|error| JobError::permanent(format!("input read failed: {error}")))?
     .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
 
+    let destination = match drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: input.dest_key.clone(),
+            version_id: None,
+        }),
+        context,
+    )
+    .await
+    .and_then(|result| result.transpose())
+    {
+        Ok(Some(result)) => result.location,
+        Ok(None)
+        | Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => None,
+        Err(error) => {
+            return Err(JobError::retryable(format!(
+                "input destination lookup failed: {error}"
+            )));
+        }
+    };
+    if staged_content_matches(
+        get.location.as_ref().map(blob_identity),
+        destination.as_ref().map(blob_identity),
+    ) {
+        return Ok(());
+    }
+
     let content_length = get.location.as_ref().map(|location| location.blob_size);
     let realm_config = drive(
         GetRealmConfigOperation::new(record.created_by.realm_id),
@@ -251,6 +283,24 @@ async fn stage_one_input(
     .and_then(|result| result.transpose())
     .map_err(|error| JobError::retryable(format!("input stage failed: {error}")))?;
     Ok(())
+}
+
+fn blob_identity(location: &BackendLocation) -> (u64, Option<&[u8]>) {
+    (location.blob_size, location.get_blake3())
+}
+
+fn staged_content_matches(
+    source: Option<(u64, Option<&[u8]>)>,
+    destination: Option<(u64, Option<&[u8]>)>,
+) -> bool {
+    let (Some(source), Some(destination)) = (source, destination) else {
+        return false;
+    };
+    source.0 == destination.0
+        && matches!(
+            (source.1, destination.1),
+            (Some(source), Some(destination)) if source == destination
+        )
 }
 
 /// Inventory the declared output prefixes in the workspace at completion. Missing
@@ -314,4 +364,45 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH_A: [u8; 32] = [1; 32];
+    const HASH_B: [u8; 32] = [2; 32];
+
+    #[test]
+    fn matching_stage_skips() {
+        assert!(staged_content_matches(
+            Some((5, Some(&HASH_A))),
+            Some((5, Some(&HASH_A)))
+        ));
+    }
+
+    #[test]
+    fn changed_stage_writes() {
+        assert!(!staged_content_matches(
+            Some((5, Some(&HASH_A))),
+            Some((6, Some(&HASH_A)))
+        ));
+        assert!(!staged_content_matches(
+            Some((5, Some(&HASH_A))),
+            Some((5, Some(&HASH_B)))
+        ));
+    }
+
+    #[test]
+    fn unknown_stage_writes() {
+        assert!(!staged_content_matches(Some((5, Some(&HASH_A))), None));
+        assert!(!staged_content_matches(
+            Some((5, Some(&HASH_A))),
+            Some((5, None))
+        ));
+        assert!(!staged_content_matches(
+            Some((5, None)),
+            Some((5, Some(&HASH_A)))
+        ));
+    }
 }
