@@ -20,9 +20,10 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{
-    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT,
-    MetadataRegistryRecord, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementScope, PlacementStrategy, RealmConfigDocument, StrategyBinding,
+    Actor, BindingError, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, HANDLE_RANGE_SIZE,
+    HANDLE_SPACE_END, HandleRange, MetadataRegistryRecord, NodePlacementEntry, PlacementBinding,
+    PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, RealmConfigDocument,
+    StrategyBinding,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -51,6 +52,26 @@ pub enum RealmPlacementMutation {
     SetOverride(PlacementOverride),
     RemoveOverride(Vec<u8>),
     AppendPlacementBinding(PlacementBinding),
+    GrantHandleRange(HandleRange),
+}
+
+/// Builds the next disjoint handle range for `owner` from the realm's current
+/// grant set. The range starts one past the highest end already carved out, so
+/// sequential grants never overlap; concurrent grants from different
+/// coordinators are caught by the overlap conflict after replication. `None` ⇒
+/// the 20-bit handle space is fully granted.
+pub fn next_handle_range(config: &RealmConfigDocument, owner: NodeId) -> Option<HandleRange> {
+    let start = config.handle_range_directory().next_grantable_start();
+    if start >= HANDLE_SPACE_END {
+        return None;
+    }
+    let end = start.saturating_add(HANDLE_RANGE_SIZE).min(HANDLE_SPACE_END);
+    Some(HandleRange {
+        range_id: Ulid::r#gen(),
+        owner,
+        start,
+        end,
+    })
 }
 
 impl RealmPlacementMutation {
@@ -97,6 +118,9 @@ impl RealmPlacementMutation {
                 AdminDocumentOperation::RealmConfigPlacementBindingAppended {
                     binding: binding.clone(),
                 }
+            }
+            Self::GrantHandleRange(range) => {
+                AdminDocumentOperation::RealmConfigHandleRangeGranted { range: *range }
             }
         }
     }
@@ -161,6 +185,29 @@ impl RealmPlacementMutation {
                     }
                     Ok(_) | Err(_) => Ok(()),
                 }
+            }
+            Self::GrantHandleRange(range) => {
+                if !range.is_well_formed() {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "handle range [{}, {}) is not a valid sub-interval of the handle space",
+                        range.start, range.end
+                    )));
+                }
+                // Overlaps are NOT rejected here: a concurrent grant from another
+                // coordinator arrives via replication and must converge to a
+                // fail-closed conflict, not be silently dropped. Only a same-id
+                // re-grant with divergent bounds is a local error.
+                if document
+                    .placement_handle_ranges
+                    .iter()
+                    .any(|existing| existing.range_id == range.range_id && existing != range)
+                {
+                    return Err(MutateRealmPlacementError::InvalidInput(format!(
+                        "handle range id {} is already granted with different bounds",
+                        range.range_id
+                    )));
+                }
+                Ok(())
             }
             Self::SetOverride(record) => match &record.strategy_id {
                 Some(strategy_id) => require_strategy(document, strategy_id, "override"),
@@ -278,6 +325,8 @@ pub enum MutateRealmPlacementError {
     EmptyShardHolders { strategy_id: Ulid, shard: u32 },
     #[error("placement strategy {strategy_id} is currently referenced")]
     StrategyReferenced { strategy_id: Ulid },
+    #[error("realm handle space is fully granted: no disjoint range remains to grant")]
+    RealmHandleSpaceExhausted,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -804,6 +853,46 @@ pub async fn drive_realm_placement_mutation(
     outcome
 }
 
+/// Grants the next disjoint handle range to `owner`: reads the current realm
+/// config, computes the next non-overlapping range from its grant cursor, and
+/// replicates the grant as a Management-only admin op. This is the grant
+/// MECHANISM onboarding (#342) drives; it does not itself decide when to grant.
+pub async fn grant_next_handle_range(
+    actor: Actor,
+    owner: NodeId,
+    context: &crate::driver::DriverContext,
+) -> Result<HandleRange, MutateRealmPlacementError> {
+    let document_target = DocumentSyncTarget::RealmConfig {
+        realm_id: actor.realm_id,
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: document_target.storage_keyspace().to_string(),
+            key: document_target.storage_key(),
+            txn_id: None,
+        })
+        .await;
+    let config = match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => RealmConfigDocument::from_bytes(&bytes)?,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(MutateRealmPlacementError::RealmConfigNotFound),
+    };
+    let range = next_handle_range(&config, owner)
+        .ok_or(MutateRealmPlacementError::RealmHandleSpaceExhausted)?;
+    crate::driver::drive(
+        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+            actor,
+            mutation: RealmPlacementMutation::GrantHandleRange(range),
+        }),
+        context,
+    )
+    .await?;
+    Ok(range)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -819,8 +908,8 @@ mod tests {
     };
     use aruna_core::structs::{
         AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-        LabelMatch, MetadataRegistryRecord, PlacementBinding, PlacementRef, PlacementScope,
-        RealmId, RealmNodeKind,
+        FIRST_HANDLE, HANDLE_SPACE_END, HandleRange, LabelMatch, MetadataRegistryRecord,
+        PlacementBinding, PlacementRef, PlacementScope, RealmId, RealmNodeKind,
     };
     use aruna_core::structured_id::PlacementHandle;
     use aruna_core::task::{TaskEffect, TaskKey};
@@ -1351,6 +1440,74 @@ mod tests {
             AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding: appended }
                 if appended.handle == binding.handle
         )));
+    }
+
+    #[tokio::test]
+    async fn grant_writes_range_and_advances_cursor() {
+        let temp = tempdir().unwrap();
+        let context = context(temp.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([50; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+        let owner = node(2);
+
+        let range = grant_next_handle_range(actor.clone(), owner, &context)
+            .await
+            .unwrap();
+        assert_eq!(range.owner, owner);
+        assert_eq!(range.start, FIRST_HANDLE);
+        assert_eq!(range.len(), aruna_core::structs::HANDLE_RANGE_SIZE);
+
+        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+            .await
+            .unwrap();
+        let ranges = stored.handle_range_directory();
+        assert_eq!(ranges.granted_to(&owner), vec![range]);
+        assert_eq!(ranges.next_grantable_start(), range.end);
+
+        let events = read_outbox_admin_events(&context).await;
+        assert!(events.iter().any(|event| matches!(
+            &event.op,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted { range: granted }
+                if granted.range_id == range.range_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn sequential_grants_do_not_overlap() {
+        let temp = tempdir().unwrap();
+        let context = context(temp.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([51; 32]);
+        let actor = actor(realm_id);
+        seed_config(&context, &actor).await;
+
+        let first = grant_next_handle_range(actor.clone(), node(2), &context)
+            .await
+            .unwrap();
+        let second = grant_next_handle_range(actor.clone(), node(3), &context)
+            .await
+            .unwrap();
+        assert!(!first.overlaps(&second));
+        assert_eq!(second.start, first.end);
+
+        let stored = drive(GetRealmConfigOperation::new(realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(stored.handle_range_directory().conflicts(), 0);
+        assert_eq!(stored.placement_handle_ranges.len(), 2);
+    }
+
+    #[test]
+    fn realm_space_exhaustion_yields_none() {
+        let realm_id = RealmId::from_bytes([52; 32]);
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.placement_handle_ranges.push(HandleRange {
+            range_id: Ulid::r#gen(),
+            owner: node(2),
+            start: FIRST_HANDLE,
+            end: HANDLE_SPACE_END,
+        });
+        assert!(next_handle_range(&document, node(3)).is_none());
     }
 
     #[test]
