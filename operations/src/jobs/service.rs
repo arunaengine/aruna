@@ -76,7 +76,12 @@ pub async fn read_owned_job(
 ) -> Result<Option<JobRecord>, String> {
     Ok(
         match read_job_record(&context.storage_handle, job_id, None).await? {
-            Some(record) if record.created_by == user_id => Some(record),
+            Some(record)
+                if record.created_by == user_id
+                    && !matches!(&record.payload, JobPayload::WriteRunCrate { .. }) =>
+            {
+                Some(record)
+            }
             _ => None,
         },
     )
@@ -133,5 +138,68 @@ async fn kick_drain(context: &DriverContext) {
             task_handle.send_effect(schedule_job_drain_effect()).await
     {
         warn!(message = %message, "Failed to kick job drain after cancel");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::store::{insert_job, read_job_record};
+    use super::*;
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn node_id() -> NodeId {
+        iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn internal_access_hidden() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+        };
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let job_id = JobId::from_bytes([0xC3; 16]);
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::WriteRunCrate {
+                for_job: JobId::from_bytes([0xC4; 16]),
+            },
+            owner,
+            node_id(),
+            1_000,
+            1_000,
+            None,
+        );
+        insert_job(&storage, &record).await.unwrap();
+
+        assert!(
+            read_owned_job(&context, owner, job_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let runtime = JobsRuntime::new();
+        assert!(matches!(
+            cancel_owned_job(&context, &runtime, owner, job_id)
+                .await
+                .unwrap(),
+            CancelJobOutcome::NotFound
+        ));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.cancel_requested);
+        assert_eq!(stored.state, JobState::Queued);
     }
 }

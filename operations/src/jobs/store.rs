@@ -90,12 +90,14 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
             schedule_index_key_for(record),
             empty_value(),
         ),
-        (
+    ];
+    if !matches!(&record.payload, JobPayload::WriteRunCrate { .. }) {
+        writes.push((
             JOB_OWNER_INDEX_KEYSPACE.to_string(),
             job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             empty_value(),
-        ),
-    ];
+        ));
+    }
     if let Some(dedup_key) = &record.dedup_key {
         writes.push((
             JOB_DEDUP_INDEX_KEYSPACE.to_string(),
@@ -1120,6 +1122,7 @@ pub async fn list_jobs_for_user(
                 parse_job_owner_index_key(key.as_ref()).map_err(|error| error.to_string())?;
             resume = Some(key);
             if let Some(record) = read_job_record(storage, job_id, None).await?
+                && !matches!(&record.payload, JobPayload::WriteRunCrate { .. })
                 && state_filter.is_none_or(|state| record.state == state)
             {
                 if records.len() == limit {
@@ -1900,6 +1903,54 @@ mod tests {
             cursor.is_none(),
             "no dangling cursor on an exhausted filter"
         );
+    }
+
+    #[tokio::test]
+    async fn internal_jobs_hidden() {
+        let (_dir, storage) = temp_storage();
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let job_id = JobId::from_bytes([0xC1; 16]);
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::WriteRunCrate {
+                for_job: JobId::from_bytes([0xC2; 16]),
+            },
+            owner,
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        insert_job(&storage, &record).await.unwrap();
+
+        let (indexed, _) = iter_prefix_page(
+            &storage,
+            JOB_OWNER_INDEX_KEYSPACE,
+            Some(job_owner_index_prefix(owner)),
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(indexed.is_empty(), "internal jobs are not owner-indexed");
+
+        batch_write(
+            &storage,
+            vec![(
+                JOB_OWNER_INDEX_KEYSPACE.to_string(),
+                job_owner_index_key(owner, record.created_at_ms, job_id),
+                empty_value(),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+        let (listed, cursor) = list_jobs_for_user(&storage, owner, None, 1, None)
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "stale owner entries stay hidden");
+        assert!(cursor.is_none());
     }
 
     #[tokio::test]
