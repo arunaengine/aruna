@@ -341,7 +341,7 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         if let Err(err) = self.validate_upload_target(&record) {
-            return self.emit_error(err);
+            return self.schedule_error(err);
         }
         if let Err(err) = self.validate_checksum_contract(&record) {
             return self.schedule_error(err);
