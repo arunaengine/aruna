@@ -1566,6 +1566,9 @@ impl OperationsTaskHandler {
     }
 
     async fn drain_job_queue(&self) {
+        if !self.jobs_runtime.is_started() {
+            return;
+        }
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
             self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
@@ -1725,11 +1728,14 @@ pub async fn initialize_task_incoming(
             Arc::downgrade(&jobs_runtime),
         ));
     }
-    if let Err(error) = jobs_runtime
-        .recover_stale_jobs(&context.storage_handle)
-        .await
-    {
-        warn!(error = %error, "Failed to recover stale jobs at startup");
+    let jobs_started = jobs_runtime.is_started();
+    if jobs_started {
+        if let Err(error) = jobs_runtime
+            .recover_stale_jobs(&context.storage_handle)
+            .await
+        {
+            warn!(error = %error, "Failed to recover stale jobs at startup");
+        }
     }
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(
@@ -1756,7 +1762,9 @@ pub async fn initialize_task_incoming(
     restore_notification_prune_timer(&context.storage_handle, &task_handle).await;
     restore_blob_replication_timer(&context.storage_handle, &task_handle).await;
     restore_reference_metadata_refresh_timer(&context.storage_handle, &task_handle).await;
-    restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+    if jobs_started {
+        restore_job_queue_timer(&context.storage_handle, &task_handle).await;
+    }
     restore_job_prune_timer(&context.storage_handle, &task_handle).await;
 }
 
@@ -1855,6 +1863,7 @@ mod tests {
     use crate::document_sync_outbox::{
         outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
+    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, read_job_record};
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
         DocumentSyncOutboxRecord, DocumentSyncRevision,
@@ -1867,8 +1876,8 @@ mod tests {
     use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
     use aruna_core::storage_entries::notification_outbox_write_entry;
     use aruna_core::structs::{
-        Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, RealmConfigDocument,
-        RealmId, RealmNodeKind,
+        Actor, JobId, JobPayload, JobRecord, JobState, NotificationClass, NotificationKind,
+        NotificationOutboxRecord, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::types::UserId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1896,6 +1905,60 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    #[tokio::test]
+    async fn paused_runtime_waits() {
+        // Startup recovery must wait until production has made S3 reachable.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let job_id = JobId::new();
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node(7),
+            1,
+            1,
+            None,
+        );
+        insert_job(&storage, &record).await.expect("insert job");
+        assert!(matches!(
+            claim_job(&storage, job_id, node(7), 2).await,
+            Ok(ClaimOutcome::Claimed(_))
+        ));
+        let runtime = JobsRuntime::new_paused();
+
+        initialize_task_incoming(context, task_handle, runtime.clone()).await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .expect("read job")
+            .expect("job exists");
+        assert_eq!(stored.state, JobState::Claimed);
+        assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
+        runtime.start();
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .expect("read job")
+            .expect("job exists");
+        assert_eq!(stored.state, JobState::Queued);
     }
 
     fn target() -> DocumentSyncTarget {

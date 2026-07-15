@@ -31,6 +31,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
+use aruna_operations::jobs::drain::restore_job_queue_timer;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
@@ -139,9 +140,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ensure_usage_counters(driver_ctx.as_ref()).await?;
 
     // Task initialization binds the compute reconciler before startup recovery.
-    let jobs_runtime = JobsRuntime::new();
+    let jobs_runtime = JobsRuntime::new_paused();
     initialize_net_incoming(driver_ctx.clone());
-    initialize_task_incoming(driver_ctx.clone(), task_handle, jobs_runtime.clone()).await;
+    initialize_task_incoming(
+        driver_ctx.clone(),
+        task_handle.clone(),
+        jobs_runtime.clone(),
+    )
+    .await;
 
     // Republish a full set of node usage snapshots at startup so realm peers see
     // this node's totals again after a restart, dirty-marker loss, or a counter
@@ -387,6 +393,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
+    if let Err(error) = jobs_runtime
+        .recover_stale_jobs(&driver_ctx.storage_handle)
+        .await
+    {
+        warn!(error = %error, "Failed to recover stale jobs at startup");
+    }
+    jobs_runtime.start();
+    restore_job_queue_timer(&driver_ctx.storage_handle, &task_handle).await;
 
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
 

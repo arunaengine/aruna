@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,7 @@ pub struct JobShutdownReport {
 /// Registry of locally executing jobs, their cancellation tokens, and per-class caps.
 pub struct JobsRuntime {
     state: Mutex<RuntimeState>,
+    started: AtomicBool,
     next_nonce: AtomicU64,
     internal_cap: usize,
     external_cap: usize,
@@ -97,8 +98,17 @@ impl JobsRuntime {
         Self::with_capacity(JOB_CONCURRENCY_CAP)
     }
 
+    pub fn new_paused() -> Arc<Self> {
+        Self::build(
+            JOB_CONCURRENCY_CAP,
+            JOB_EXTERNAL_CONCURRENCY_CAP,
+            None,
+            false,
+        )
+    }
+
     pub fn with_capacity(cap: usize) -> Arc<Self> {
-        Self::build(cap, JOB_EXTERNAL_CONCURRENCY_CAP, None)
+        Self::build(cap, JOB_EXTERNAL_CONCURRENCY_CAP, None, true)
     }
 
     /// Wire the reconcile hook that receives lost external attempts (Stage 2).
@@ -107,6 +117,7 @@ impl JobsRuntime {
             JOB_CONCURRENCY_CAP,
             JOB_EXTERNAL_CONCURRENCY_CAP,
             Some(reconciler),
+            true,
         )
     }
 
@@ -114,9 +125,11 @@ impl JobsRuntime {
         internal_cap: usize,
         external_cap: usize,
         reconciler: Option<Arc<dyn ExternalReconciler>>,
+        started: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RuntimeState::default()),
+            started: AtomicBool::new(started),
             next_nonce: AtomicU64::new(0),
             internal_cap,
             external_cap,
@@ -145,6 +158,14 @@ impl JobsRuntime {
         self.state().running.len()
     }
 
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    pub fn start(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
     fn cap_for(&self, class: JobExecutionClass) -> usize {
         match class {
             JobExecutionClass::InProcess => self.internal_cap,
@@ -155,6 +176,9 @@ impl JobsRuntime {
     /// Free slots for a class; internal and external accounting are independent. Zero once
     /// draining, so the drain claims nothing more once a shutdown has begun.
     pub fn available_slots_for(&self, class: JobExecutionClass) -> usize {
+        if !self.is_started() {
+            return 0;
+        }
         let state = self.state();
         if state.draining {
             return 0;
@@ -172,6 +196,9 @@ impl JobsRuntime {
     }
 
     pub(crate) async fn claim_producer(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        if !self.is_started() {
+            return None;
+        }
         let guard = self.claim_producer_barrier.read().await;
         if self.state().draining {
             None
@@ -1468,6 +1495,29 @@ mod tests {
             runtime.available_slots_for(JobExecutionClass::InProcess),
             0,
             "external load never frees or consumes internal slots"
+        );
+    }
+
+    #[test]
+    fn paused_runtime_starts() {
+        let runtime = JobsRuntime::new_paused();
+        assert!(!runtime.is_started());
+        assert_eq!(runtime.available_slots_for(JobExecutionClass::InProcess), 0);
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
+            0
+        );
+
+        runtime.start();
+
+        assert!(runtime.is_started());
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::InProcess),
+            JOB_CONCURRENCY_CAP
+        );
+        assert_eq!(
+            runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
+            JOB_EXTERNAL_CONCURRENCY_CAP
         );
     }
 
