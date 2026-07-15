@@ -1,6 +1,6 @@
+use crate::{MetaResourceId, StructuredId};
 use byteview::ByteView;
 use ulid::Ulid;
-use crate::{MetaResourceId, StructuredId};
 
 use crate::NodeId;
 use crate::admin_document_reducer::{AdminDocumentConflict, AdminDocumentReducerState};
@@ -219,7 +219,10 @@ pub fn metadata_materialization_document_job_prefix(document_id: MetaResourceId)
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn metadata_materialization_document_job_key(document_id: MetaResourceId, event_id: Ulid) -> Key {
+pub fn metadata_materialization_document_job_key(
+    document_id: MetaResourceId,
+    event_id: Ulid,
+) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
@@ -718,7 +721,6 @@ mod tests {
 
     use ulid::Ulid;
 
-    use crate::MetaResourceId;
     use super::{
         admin_document_conflict_write_entries, admin_document_reducer_conflict_key,
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
@@ -727,6 +729,7 @@ mod tests {
         document_sync_revision_write_entry, shard_manifest_key, shard_manifest_prefix,
         shard_manifest_write_entry, stale_admin_document_conflict_delete_entries,
     };
+    use crate::MetaResourceId;
     use crate::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
         AdminDocumentReducerState,

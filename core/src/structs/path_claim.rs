@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::structs::RealmId;
-use crate::{MetaResourceId, StructuredId};
 use crate::types::GroupId;
+use crate::{MetaResourceId, StructuredId};
 
 /// Domain tag separating the path-claim winner digest from every other hash in
 /// the system (a MetaResourceId or event id must never be reusable as a winner
@@ -131,7 +131,10 @@ mod tests {
     #[test]
     fn single_claim_wins_uncontested() {
         let resolution = resolve_path_claim(&[claim(10, 11, "datasets/x")]).unwrap();
-        assert_eq!(resolution.winner_id(), MetaResourceId::from_bytes([10; 16]).unwrap());
+        assert_eq!(
+            resolution.winner_id(),
+            MetaResourceId::from_bytes([10; 16]).unwrap()
+        );
         assert!(!resolution.is_conflicted());
     }
 

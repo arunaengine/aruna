@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
 
+use crate::{MetaResourceId, StructuredId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use crate::{MetaResourceId, StructuredId};
 
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{

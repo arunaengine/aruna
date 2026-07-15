@@ -1,6 +1,6 @@
+use crate::MetaResourceId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use crate::MetaResourceId;
 
 use crate::NodeId;
 use crate::structs::{PlacementRef, RealmId};

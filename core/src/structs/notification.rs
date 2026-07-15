@@ -1,8 +1,8 @@
+use crate::MetaResourceId;
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use crate::MetaResourceId;
 
 use crate::NodeId;
 use crate::errors::ConversionError;

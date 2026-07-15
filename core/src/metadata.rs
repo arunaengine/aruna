@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
+use crate::MetaResourceId;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
-use crate::MetaResourceId;
 
 use crate::NodeId;
 use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
@@ -551,9 +551,9 @@ mod tests {
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
         MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
     };
+    use crate::MetaResourceId;
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
-    use crate::MetaResourceId;
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
     use ulid::Ulid;
