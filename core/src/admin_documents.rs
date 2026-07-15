@@ -5,9 +5,9 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{
-    Actor, BindingScope, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-    Permission, PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId,
-    RealmNodeKind, Role, StrategyBinding,
+    Actor, BindingScope, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
+    OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementStrategy,
+    QuotaConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 
@@ -182,6 +182,20 @@ pub enum AdminDocumentOperation {
     RealmConfigPlacementOverrideRemoved {
         subject: Vec<u8>,
     },
+    /// Appends an immutable placement binding (append-only, no remove twin). As
+    /// an admin operation it can never be relayed (K1): only Management/Server
+    /// origins may emit it, and receivers converge it through the reducer.
+    RealmConfigPlacementBindingAppended {
+        binding: PlacementBinding,
+    },
+    /// Grants a disjoint handle-allocation range to a node (append-only, no
+    /// remove twin). Management-only admin op (K1, never relayed): the coordinator
+    /// role of carving up the handle space is not a binding append, so the Server
+    /// exception does not extend to it. Overlapping grants converge to a
+    /// fail-closed conflict in the derived range directory.
+    RealmConfigHandleRangeGranted {
+        range: HandleRange,
+    },
 }
 
 #[cfg(test)]
@@ -189,11 +203,12 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget};
     use crate::NodeId;
     use crate::structs::{
-        AffinityEffect, AffinityRule, BindingScope, DocumentClass, LabelMatch,
+        AffinityEffect, AffinityRule, BindingScope, DocumentClass, HandleRange, LabelMatch,
         MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementOverride, PlacementStrategy, QuotaConfig, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, StrategyBinding,
+        PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
+        RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
     };
+    use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId, UserId};
     use std::collections::BTreeMap;
     use ulid::Ulid;
@@ -340,6 +355,25 @@ mod tests {
             },
             AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
                 subject: b"document-subject".to_vec(),
+            },
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: PlacementBinding {
+                    handle: PlacementHandle::new(7).unwrap(),
+                    scope: PlacementScope::Realm(realm_id),
+                    document_class: DocumentClass::MetadataRegistry,
+                    strategy_id: Ulid::from_bytes([4; 16]),
+                    allocator_range_id: Some(Ulid::from_bytes([5; 16])),
+                    allocated_by: Some(node(1)),
+                    allocated_at_ms: Some(1_700_000_000_000),
+                },
+            },
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: HandleRange {
+                    range_id: Ulid::from_bytes([6; 16]),
+                    owner: node(1),
+                    start: 1,
+                    end: 1025,
+                },
             },
         ];
 

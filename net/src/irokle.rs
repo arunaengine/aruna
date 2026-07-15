@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::admin_document_reducer::{
     AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
@@ -3223,6 +3224,8 @@ fn realm_config_from_reducer_materialization(
         default_strategy_id: None,
         strategy_bindings: Vec::new(),
         placement_overrides: Vec::new(),
+        placement_bindings: Vec::new(),
+        placement_handle_ranges: Vec::new(),
     };
     overlay_realm_config_reducer_materialization(&mut config, reducer_state);
     Some(config)
@@ -3420,7 +3423,7 @@ async fn apply_metadata_document_lifecycle_to_storage(
 async fn apply_metadata_registry_delete_to_storage(
     storage: &StorageHandle,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<()> {
     let Some(delete) = metadata_document_delete_in_storage(storage, document_id).await? else {
         return Ok(());
@@ -3466,7 +3469,7 @@ fn metadata_document_delete_matches_graph_lifecycle(
 fn metadata_document_delete_matches_registry(
     delete: &MetadataDocumentDeleteRecord,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> bool {
     delete.tombstone.is_deleted()
         && delete.tombstone.group_id == group_id
@@ -3476,7 +3479,7 @@ fn metadata_document_delete_matches_registry(
 async fn metadata_registry_live_after_delete(
     storage: &StorageHandle,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     delete: &MetadataDocumentDeleteRecord,
 ) -> Result<bool> {
     let target = DocumentSyncTarget::MetadataRegistry {
@@ -4019,6 +4022,8 @@ async fn apply_realm_config_admin_document_operation_to_storage(
             | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
             | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
     ) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node ensure, OIDC provider updates, settings updates, description updates, quota updates, and placement updates"
@@ -4412,7 +4417,7 @@ async fn metadata_graph_deleted_in_storage(
 
 async fn metadata_document_delete_in_storage(
     storage: &StorageHandle,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataDocumentDeleteRecord>> {
     let value = storage_read_from(
         storage,
@@ -4999,7 +5004,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {
             AdminOperationFamily::RealmConfig
         }
     };
@@ -5047,6 +5054,17 @@ async fn validate_replicated_admin_event(
     if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
         return reject("admin event target and actor realms do not match");
     }
+    if matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding }
+            if matches!(
+                binding.scope,
+                aruna_core::structs::PlacementScope::Realm(binding_realm_id)
+                    if binding_realm_id != event.actor.realm_id
+            )
+    ) {
+        return reject("placement binding realm does not match the admin event target");
+    }
 
     match &event.op {
         AdminDocumentOperation::GroupCreated {
@@ -5090,7 +5108,9 @@ async fn validate_replicated_admin_event(
         | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
         | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
         | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. } => {}
+        | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+        | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+        | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. } => {}
         AdminDocumentOperation::RealmConfigNodePlacementSet { entry }
             if entry.labels.contains_key(KIND_LABEL_KEY) =>
         {
@@ -5219,8 +5239,15 @@ async fn validate_realm_config_admin_authority(
         }
         return Ok(
             if matches!(
-                configured_node_kind(config, &event.origin_node_id),
-                Some(RealmNodeKind::Management)
+                (
+                    configured_node_kind(config, &event.origin_node_id),
+                    &event.op
+                ),
+                (Some(RealmNodeKind::Management), _)
+                    | (
+                        Some(RealmNodeKind::Server),
+                        AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+                    )
             ) {
                 AdminEventValidation::Accepted
             } else {
@@ -6099,7 +6126,16 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::admin_document_reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
+    use aruna_core::admin_document_reducer::{
+        REALM_CONFIG_DEFAULT_STRATEGY_PATH, realm_config_placement_binding_path,
+    };
+
+    /// A valid structured `MetaResourceId` (non-zero handle) carrying `seed` in
+    /// its nonce, so distinct seeds yield distinct ids for tests that formerly
+    /// used raw `Ulid::from_parts` document ids.
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentRoleDefinition, AdminDocumentTarget,
@@ -6121,12 +6157,14 @@ mod tests {
         subject_index_value,
     };
     use aruna_core::structs::{
-        Actor, BindingScope, DocumentClass, Group, GroupAuthorizationDocument, GroupQuotaOverride,
-        MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
-        RealmNodeKind, Role, StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
+        Actor, BindingError, BindingScope, DocumentClass, Group, GroupAuthorizationDocument,
+        GroupQuotaOverride, HandleRange, MetadataReplicationConfig, NodePlacementEntry,
+        OidcProviderConfig, Permission, PlacementBinding, PlacementOverride, PlacementRef,
+        PlacementScope, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
+        StaticRealmEndpoint, StrategyBinding, UserGroupCapOverride,
     };
+    use aruna_core::structured_id::PlacementHandle;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
     use tempfile::TempDir;
@@ -6193,7 +6231,7 @@ mod tests {
             "urn:aruna:restart-contract".to_string(),
             RealmId::from_bytes([99; 32]),
             Ulid::from_parts(99, 1),
-            Ulid::from_parts(99, 2),
+            doc_id(99),
             1,
         ))
         .expect("restart payload serializes")
@@ -6261,7 +6299,7 @@ mod tests {
 
     fn registry_record(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         document_path: &str,
         updated_at_ms: u64,
         last_event_id: Ulid,
@@ -6595,7 +6633,7 @@ mod tests {
     async fn assert_registry_record_deleted(
         storage: &StorageHandle,
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) {
         assert!(
             read_storage_value(
@@ -6628,7 +6666,7 @@ mod tests {
 
     fn metadata_create_event(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         updated_at_ms: u64,
         event_id: Ulid,
         actor_seed: u8,
@@ -6657,7 +6695,7 @@ mod tests {
 
     fn metadata_delete_lifecycle(
         group_id: Ulid,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         updated_at_ms: u64,
         event_id: Ulid,
         deleted_after_event_id: Ulid,
@@ -7037,6 +7075,290 @@ mod tests {
 
         overlay_realm_config_reducer_materialization(&mut config, &state);
         assert_eq!(config.default_strategy_id, None);
+    }
+
+    #[tokio::test]
+    async fn replicated_placement_bindings_converge_to_conflict() {
+        let realm_id = RealmId::from_bytes([74; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_540, 1), realm_id);
+        let actor_a = test_actor(40, user_id, realm_id);
+        let actor_b = test_actor(41, user_id, realm_id);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let handle = PlacementHandle::new(5).unwrap();
+        let make_binding = |node_id, strategy_seed: u8| PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::MetadataRegistry,
+            strategy_id: Ulid::from_bytes([strategy_seed; 16]),
+            allocator_range_id: None,
+            allocated_by: Some(node_id),
+            allocated_at_ms: None,
+        };
+        let event_a = test_admin_event(
+            Ulid::from_parts(1_541, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: make_binding(actor_a.node_id, 1),
+            },
+        );
+        let event_b = test_admin_event(
+            Ulid::from_parts(1_542, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: make_binding(actor_b.node_id, 2),
+            },
+        );
+
+        let mut configs = Vec::new();
+        for order in [[&event_a, &event_b], [&event_b, &event_a]] {
+            let (_dir, storage) = test_storage();
+            let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    document_target.clone(),
+                    seed_config
+                        .to_bytes(&actor_a)
+                        .expect("seed realm config serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("seed realm config writes");
+            for event in order {
+                apply_admin_document_operation_to_storage(
+                    &storage,
+                    document_target.clone(),
+                    event.clone(),
+                )
+                .await
+                .expect("replicated placement binding applies");
+            }
+
+            // The receiver retains a conflict row for the diverging handle.
+            let conflict_value = read_storage_value(
+                &storage,
+                ADMIN_DOCUMENT_CONFLICT_KEYSPACE,
+                admin_document_reducer_conflict_key(
+                    &target,
+                    &realm_config_placement_binding_path(handle),
+                ),
+            )
+            .await;
+            assert!(conflict_value.is_some(), "conflict row must persist");
+
+            configs.push(read_realm_config_doc(&storage, realm_id).await);
+        }
+
+        // Both apply orders converge to the same retained binding set and the
+        // same fail-closed verdict.
+        let left: HashSet<_> = configs[0]
+            .placement_bindings
+            .iter()
+            .map(|binding| binding.strategy_id)
+            .collect();
+        let right: HashSet<_> = configs[1]
+            .placement_bindings
+            .iter()
+            .map(|binding| binding.strategy_id)
+            .collect();
+        assert_eq!(left, right);
+        assert_eq!(configs[0].placement_bindings.len(), 2);
+        for config in &configs {
+            assert_eq!(
+                config.binding_directory().resolve(handle),
+                Err(BindingError::Conflicted(handle))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replicated_handle_range_grants_converge_to_conflict() {
+        let realm_id = RealmId::from_bytes([78; 32]);
+        let user_id = UserId::local(Ulid::from_parts(1_560, 1), realm_id);
+        let actor_a = test_actor(60, user_id, realm_id);
+        let actor_b = test_actor(61, user_id, realm_id);
+        let owner = node(62);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let make_range = |range_seed: u8, start: u32, end: u32| HandleRange {
+            range_id: Ulid::from_bytes([range_seed; 16]),
+            owner,
+            start,
+            end,
+        };
+        // Two grants whose intervals overlap: distinct ids, so no reducer conflict,
+        // but the derived directory fails both closed on every node.
+        let event_a = test_admin_event(
+            Ulid::from_parts(1_561, 1),
+            target.clone(),
+            &actor_a,
+            1,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: make_range(10, 1, 1025),
+            },
+        );
+        let event_b = test_admin_event(
+            Ulid::from_parts(1_562, 1),
+            target.clone(),
+            &actor_b,
+            1,
+            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                range: make_range(20, 512, 2049),
+            },
+        );
+
+        let mut configs = Vec::new();
+        for order in [[&event_a, &event_b], [&event_b, &event_a]] {
+            let (_dir, storage) = test_storage();
+            let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+            storage_batch_write_to(
+                &storage,
+                vec![target_write_entry(
+                    document_target.clone(),
+                    seed_config
+                        .to_bytes(&actor_a)
+                        .expect("seed realm config serializes")
+                        .into(),
+                )],
+            )
+            .await
+            .expect("seed realm config writes");
+            for event in order {
+                apply_admin_document_operation_to_storage(
+                    &storage,
+                    document_target.clone(),
+                    event.clone(),
+                )
+                .await
+                .expect("replicated handle range applies");
+            }
+            configs.push(read_realm_config_doc(&storage, realm_id).await);
+        }
+
+        for config in &configs {
+            assert_eq!(config.placement_handle_ranges.len(), 2);
+            let directory = config.handle_range_directory();
+            assert_eq!(directory.conflicts(), 2);
+            assert!(directory.granted_to(&owner).is_empty());
+        }
+        let left: HashSet<_> = configs[0]
+            .placement_handle_ranges
+            .iter()
+            .map(|range| range.range_id)
+            .collect();
+        let right: HashSet<_> = configs[1]
+            .placement_handle_ranges
+            .iter()
+            .map(|range| range.range_id)
+            .collect();
+        assert_eq!(left, right);
+    }
+
+    #[tokio::test]
+    async fn inbound_validation_accepts_binding_and_rejects_target_mismatch() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([75; 32]);
+        let server_actor = test_actor(76, UserId::nil(realm_id), realm_id);
+        let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+        let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(server_actor.node_id, RealmNodeKind::Server);
+        storage_batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                config_target.clone(),
+                config
+                    .to_bytes(&server_actor)
+                    .expect("config serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+
+        let mut append = test_admin_event(
+            Ulid::from_parts(1_652, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &server_actor,
+            1,
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                binding: PlacementBinding {
+                    handle: PlacementHandle::new(5).unwrap(),
+                    scope: PlacementScope::Realm(realm_id),
+                    document_class: DocumentClass::MetadataRegistry,
+                    strategy_id: Ulid::from_parts(1_651, 1),
+                    allocator_range_id: None,
+                    allocated_by: None,
+                    allocated_at_ms: None,
+                },
+            },
+        );
+        let server_publisher =
+            irokle_crate::actor_id_for(config_topic, node_id_to_peer_id(&server_actor.node_id));
+
+        assert_eq!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                server_publisher,
+                &config_target,
+                &append,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Accepted
+        );
+
+        match &mut append.op {
+            AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding } => {
+                binding.scope = PlacementScope::Realm(RealmId::from_bytes([76; 32]));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                config_topic,
+                server_publisher,
+                &config_target,
+                &append,
+                realm_id,
+                &PlacementRef::NIL,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
+
+        // The same RealmConfig op is rejected when routed under a User target.
+        let user_id = UserId::local(Ulid::from_parts(1_653, 1), realm_id);
+        let user_target = DocumentSyncTarget::User { user_id };
+        let placement = admin_test_placement();
+        let user_topic = user_target.sync_topic_id(realm_id, &placement);
+        let user_publisher =
+            irokle_crate::actor_id_for(user_topic, node_id_to_peer_id(&server_actor.node_id));
+        assert!(matches!(
+            validate_replicated_admin_event(
+                &storage,
+                user_topic,
+                user_publisher,
+                &user_target,
+                &append,
+                realm_id,
+                &placement,
+            )
+            .await
+            .expect("storage succeeds"),
+            AdminEventValidation::Rejected(_)
+        ));
     }
 
     #[tokio::test]
@@ -9353,7 +9675,7 @@ mod tests {
 
     async fn read_document_lifecycle_record(
         storage: &StorageHandle,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> MetadataDocumentLifecycleRecord {
         let value = read_storage_value(
             storage,
@@ -9367,7 +9689,7 @@ mod tests {
 
     async fn read_lifecycle_revision(
         storage: &StorageHandle,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> DocumentSyncChange {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let value = read_storage_value(
@@ -9595,7 +9917,7 @@ mod tests {
     async fn metadata_registry_upsert_skips_stale_local_record() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1, 1);
-        let document_id = Ulid::from_parts(2, 2);
+        let document_id = doc_id(2);
         let local = registry_record(
             group_id,
             document_id,
@@ -9650,7 +9972,7 @@ mod tests {
     async fn registry_strategy_fenced() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(2_100, 1);
-        let document_id = Ulid::from_parts(2_101, 1);
+        let document_id = doc_id(2_101);
         let mut record = registry_record(
             group_id,
             document_id,
@@ -9757,7 +10079,7 @@ mod tests {
             shard: 5,
         };
         let registry_group_id = Ulid::from_parts(2_122, 1);
-        let registry_document_id = Ulid::from_parts(2_123, 1);
+        let registry_document_id = doc_id(2_123);
         let registry_event_id = Ulid::from_parts(2_124, 1);
         let mut registry = registry_record(
             registry_group_id,
@@ -9773,7 +10095,7 @@ mod tests {
         };
 
         let create_group_id = Ulid::from_parts(2_125, 1);
-        let create_document_id = Ulid::from_parts(2_126, 1);
+        let create_document_id = doc_id(2_126);
         let create_event_id = Ulid::from_parts(2_127, 1);
         let mut create = metadata_create_event(
             create_group_id,
@@ -10013,7 +10335,7 @@ mod tests {
             shard: 4,
         };
         let group_id = Ulid::from_parts(2_112, 1);
-        let document_id = Ulid::from_parts(2_113, 1);
+        let document_id = doc_id(2_113);
         let create_event_id = Ulid::from_parts(2_114, 1);
         let mut record = registry_record(
             group_id,
@@ -10227,7 +10549,7 @@ mod tests {
     async fn document_sync_fencing_metadata_registry_stale_delete_preserves_newer_live_indexes() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_560, 1);
-        let document_id = Ulid::from_parts(1_561, 1);
+        let document_id = doc_id(1_561);
         let live_event_id = Ulid::from_parts(1_564, 1);
         let live = registry_record(
             group_id,
@@ -10257,7 +10579,7 @@ mod tests {
     async fn document_sync_fencing_tombstone_wins_over_late_metadata_registry_upsert() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1_570, 1);
-        let document_id = Ulid::from_parts(1_571, 1);
+        let document_id = doc_id(1_571);
         let stale_event_id = Ulid::from_parts(1_572, 1);
         let delete_lifecycle = metadata_delete_lifecycle(
             group_id,
@@ -10302,7 +10624,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_without_document_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(50, 1);
-        let document_id = Ulid::from_parts(51, 1);
+        let document_id = doc_id(51);
         let record = registry_record(
             group_id,
             document_id,
@@ -10341,7 +10663,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_when_document_lifecycle_is_live() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(60, 1);
-        let document_id = Ulid::from_parts(61, 1);
+        let document_id = doc_id(61);
         let live_event_id = Ulid::from_parts(62, 1);
         let record = registry_record(
             group_id,
@@ -10391,7 +10713,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_skips_newer_live_registry_record() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(70, 1);
-        let document_id = Ulid::from_parts(71, 1);
+        let document_id = doc_id(71);
         let live_event_id = Ulid::from_parts(74, 1);
         let record = registry_record(
             group_id,
@@ -10436,7 +10758,7 @@ mod tests {
     async fn metadata_graph_lifecycle_delete_applies_with_matching_document_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(80, 1);
-        let document_id = Ulid::from_parts(81, 1);
+        let document_id = doc_id(81);
         let record = registry_record(
             group_id,
             document_id,
@@ -10479,7 +10801,7 @@ mod tests {
     async fn metadata_registry_delete_skips_without_lifecycle_tombstone() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(30, 1);
-        let document_id = Ulid::from_parts(31, 1);
+        let document_id = doc_id(31);
         let record = registry_record(
             group_id,
             document_id,
@@ -10523,7 +10845,7 @@ mod tests {
     async fn metadata_registry_delete_with_matching_lifecycle_tombstone_deletes_indexes() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(40, 1);
-        let document_id = Ulid::from_parts(41, 1);
+        let document_id = doc_id(41);
         let record = registry_record(
             group_id,
             document_id,
@@ -10586,7 +10908,7 @@ mod tests {
     async fn metadata_lifecycle_upsert_preserves_revision_and_replays_idempotently() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(1, 1);
-        let document_id = Ulid::from_parts(2, 2);
+        let document_id = doc_id(2);
         let event_id = Ulid::from_parts(3, 3);
         let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
         let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
@@ -10634,7 +10956,7 @@ mod tests {
     async fn metadata_lifecycle_upsert_skips_newer_delete_sidecar() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(10, 1);
-        let document_id = Ulid::from_parts(11, 1);
+        let document_id = doc_id(11);
         let stale_event_id = Ulid::from_parts(12, 1);
         let delete_event_id = Ulid::from_parts(13, 1);
         let delete_lifecycle =
@@ -10685,7 +11007,7 @@ mod tests {
     async fn metadata_lifecycle_delete_skips_stale_and_equal_sidecars() {
         let (_dir, storage) = test_storage();
         let group_id = Ulid::from_parts(20, 1);
-        let document_id = Ulid::from_parts(21, 1);
+        let document_id = doc_id(21);
         let deleted_after_event_id = Ulid::from_parts(22, 1);
         let local_delete = metadata_delete_lifecycle(
             group_id,
@@ -10738,7 +11060,7 @@ mod tests {
 
     #[test]
     fn metadata_document_delete_write_entries_include_prune_job() {
-        let document_id = Ulid::from_parts(10, 1);
+        let document_id = doc_id(10);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:deleted".to_string(),
             RealmId::from_bytes([1; 32]),

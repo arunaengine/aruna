@@ -1,3 +1,4 @@
+use crate::MetaResourceId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -9,7 +10,7 @@ use crate::types::{GroupId, UserId};
 pub struct MetadataRegistryRecord {
     pub realm_id: RealmId,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub document_path: String,
     pub graph_iri: String,
     pub public: bool,
@@ -26,7 +27,7 @@ pub struct MetadataRegistryRecord {
 }
 
 impl MetadataRegistryRecord {
-    pub fn graph_iri_for(document_id: Ulid) -> String {
+    pub fn graph_iri_for(document_id: MetaResourceId) -> String {
         format!("https://w3id.org/aruna/{document_id}")
     }
 
@@ -38,7 +39,7 @@ impl MetadataRegistryRecord {
         realm_id: &RealmId,
         group_id: GroupId,
         path: &str,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     ) -> String {
         format!(
             "/{realm_id}/g/{group_id}/meta/{}@{document_id}",
@@ -62,7 +63,7 @@ pub enum MetadataAuditOperation {
 pub struct MetadataAuditRecord {
     pub realm_id: RealmId,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub graph_iri: String,
     pub user_id: UserId,
     pub node_id: NodeId,

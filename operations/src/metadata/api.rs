@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::AuthorizationError;
@@ -91,7 +92,7 @@ pub struct ListVisibleMetadataDocumentsResult {
 
 #[derive(Debug, Clone)]
 pub struct GetVisibleMetadataDocumentRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
 }
 
@@ -104,7 +105,7 @@ pub enum MetadataRoCrateExportView {
 
 #[derive(Debug, Clone)]
 pub struct ExportMetadataRoCrateRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
     pub view: MetadataRoCrateExportView,
     pub limit: Option<usize>,
@@ -136,7 +137,7 @@ pub enum MetadataApiQueryMode {
 
 #[derive(Debug, Clone)]
 pub struct MetadataDocumentQueryRequest {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
     pub query: String,
@@ -539,7 +540,7 @@ async fn load_pending_group_metadata_records(
 
 async fn read_metadata_create_event(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<Option<MetadataCreateEventRecord>, MetadataApiError> {
     let value = match context
@@ -627,7 +628,7 @@ fn merge_pending_metadata_records(
 
 async fn load_record_by_document(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     match load_metadata_record_by_document(context, document_id).await {
         Ok(Some(record)) => Ok(record),
@@ -1366,6 +1367,11 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structured_id::StructuredId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
 
     use std::collections::BTreeMap;
 
@@ -1459,7 +1465,7 @@ mod tests {
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
         let realm_id = RealmId([3u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
         config.seed_default_placement();
         config.ensure_node(local_node_id, aruna_core::structs::RealmNodeKind::Server);

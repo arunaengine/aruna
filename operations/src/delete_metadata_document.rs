@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
@@ -43,7 +44,7 @@ use crate::placement::{registry_placement, resolve_shard_holders};
 pub struct DeleteMetadataDocumentOperation {
     actor: aruna_core::structs::Actor,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     record: Option<MetadataRegistryRecord>,
     lifecycle_record: Option<MetadataGraphLifecycleRecord>,
     document_lifecycle_record: Option<MetadataDocumentLifecycleRecord>,
@@ -106,7 +107,11 @@ pub enum DeleteMetadataDocumentError {
 }
 
 impl DeleteMetadataDocumentOperation {
-    pub fn new(actor: aruna_core::structs::Actor, group_id: Ulid, document_id: Ulid) -> Self {
+    pub fn new(
+        actor: aruna_core::structs::Actor,
+        group_id: Ulid,
+        document_id: MetaResourceId,
+    ) -> Self {
         Self {
             actor,
             group_id,
@@ -322,7 +327,7 @@ impl DeleteMetadataDocumentOperation {
 pub async fn delete_metadata_document(
     operation: DeleteMetadataDocumentOperation,
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<(), DeleteMetadataDocumentError> {
     drive(operation, context).await?;
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
@@ -729,6 +734,11 @@ impl Operation for DeleteMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structured_id::StructuredId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -748,7 +758,7 @@ mod tests {
 
     fn record(actor: &aruna_core::structs::Actor) -> MetadataRegistryRecord {
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let document_path = "datasets/delete-lifecycle";
         let last_event_id = Ulid::r#gen();
         MetadataRegistryRecord {

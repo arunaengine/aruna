@@ -140,6 +140,7 @@ fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::storage_entries::shard_manifest_write_entry;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -172,7 +173,7 @@ mod tests {
 
     async fn write_manifest_row(storage: &aruna_storage::StorageHandle, shard: u32, doc: u8) {
         let target = aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([doc; 16]),
+            document_id: MetaResourceId::from_bytes([doc; 16]).unwrap(),
         };
         let (key_space, key, value) =
             shard_manifest_write_entry(&target, &lifecycle_change(placement(shard), doc))
@@ -236,7 +237,7 @@ mod tests {
         assert_eq!(shard4.len(), 1);
         assert!(shard3.iter().all(|entry| entry.target
             != aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: Ulid::from_bytes([3; 16])
+                document_id: MetaResourceId::from_bytes([3; 16]).unwrap()
             }));
     }
 
@@ -276,7 +277,7 @@ mod tests {
         let actor = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let first = ShardManifestEntry {
             target: aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
-                document_id: Ulid::from_bytes([1; 16]),
+                document_id: MetaResourceId::from_bytes([1; 16]).unwrap(),
             },
             revision: DocumentSyncRevision {
                 generation: 1,
@@ -287,7 +288,7 @@ mod tests {
         };
         let mut second = first.clone();
         second.target = aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([4; 16]),
+            document_id: MetaResourceId::from_bytes([4; 16]).unwrap(),
         };
         let mut changed = second.clone();
         changed.revision.generation += 1;

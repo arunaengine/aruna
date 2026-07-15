@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use aruna_core::MetaResourceId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -14,6 +15,10 @@ use aruna_core::types::GroupId;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
+
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,7 +52,7 @@ fn graph_iri(index: usize) -> String {
 }
 
 fn registry_record(group_id: GroupId, index: usize) -> MetadataRegistryRecord {
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(index as u64 + 1);
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::document::{DocumentSyncTarget, ShardManifest, ShardManifestEntry};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -16,6 +17,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -32,6 +34,10 @@ use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use ulid::Ulid;
+
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
 
 // Realm-node and manifest convergence poll to a condition; the ceilings only
 // bound a genuine hang. Convergence measures single-digit seconds, but a
@@ -62,7 +68,19 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     // and choose from the same subject, so their choice is the shared shard this
     // test needs.
     let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
-    let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::r#gen()).collect();
+    // Each document's structured id is minted for the holder that creates it, so
+    // its embedded bucket is the shared shard both holders choose for CONVERGE_PATH.
+    let document_ids: Vec<MetaResourceId> = (0..6)
+        .map(|index| {
+            let node = &nodes[index % 2];
+            let actor = Actor {
+                node_id: node.net.node_id(),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                realm_id,
+            };
+            mint_local_document_id(&config, &actor, group_id, CONVERGE_PATH)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {
@@ -159,7 +177,7 @@ fn shared_path_bucket(
     group_id: Ulid,
 ) -> PlacementRef {
     let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: Ulid::nil(),
+        document_id: doc_id(1),
     };
     let path = MetadataRegistryRecord::normalize_document_path(CONVERGE_PATH);
     let (strategy, _) = strategy_for_target(
@@ -194,7 +212,7 @@ async fn create_document(
     node: &TestNode,
     realm_id: RealmId,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(
@@ -205,7 +223,7 @@ async fn create_document(
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: CONVERGE_PATH.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

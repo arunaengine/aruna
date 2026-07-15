@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
 use aruna_core::effects::StorageEffect;
@@ -364,9 +365,9 @@ fn metadata_permission_path(
     realm_id: RealmId,
     path: &str,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Option<String> {
-    if group_id.is_nil() || document_id.is_nil() {
+    if group_id.is_nil() {
         return None;
     }
     let document_path = path.strip_prefix(&format!("meta/{group_id}/"))?;
@@ -677,7 +678,7 @@ mod tests {
     fn event_permission_paths_use_exact_resource_identity() {
         let realm_id = RealmId([1u8; 32]);
         let group_id = Ulid::from_bytes([2u8; 16]);
-        let document_id = Ulid::from_bytes([3u8; 16]);
+        let document_id = MetaResourceId::from_bytes([3u8; 16]).unwrap();
         let node_id = node(4);
         let actor = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
         let data = WatchEvent {

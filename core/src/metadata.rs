@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::MetaResourceId;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -127,7 +128,7 @@ pub enum MetadataDocumentLifecycleRecord {
 }
 
 impl MetadataDocumentLifecycleRecord {
-    pub fn document_id(&self) -> Ulid {
+    pub fn document_id(&self) -> MetaResourceId {
         match self {
             Self::Upsert { event } => event.record.document_id,
             Self::Delete { event } => event.tombstone.document_id,
@@ -167,7 +168,7 @@ pub enum MetadataMaterializationState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataMaterializationStatusRecord {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub event_id: Ulid,
     pub graph_iri: String,
     pub state: MetadataMaterializationState,
@@ -192,7 +193,7 @@ impl MetadataMaterializationStatusRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataMaterializationJobRecord {
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub event_id: Ulid,
     pub due_at_ms: u64,
     pub attempts: u32,
@@ -347,7 +348,7 @@ pub struct MetadataGraphLifecycleRecord {
     pub graph_iri: String,
     pub realm_id: RealmId,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub status: MetadataGraphLifecycleStatus,
     pub updated_at_ms: u64,
 }
@@ -357,7 +358,7 @@ impl MetadataGraphLifecycleRecord {
         graph_iri: String,
         realm_id: RealmId,
         group_id: GroupId,
-        document_id: Ulid,
+        document_id: MetaResourceId,
         updated_at_ms: u64,
     ) -> Self {
         Self {
@@ -550,6 +551,7 @@ mod tests {
         MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
         MetadataGraphLifecycleRecord, MetadataQueryResults, compare_metadata_clocks,
     };
+    use crate::MetaResourceId;
     use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
     use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};
@@ -595,7 +597,7 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataCreateEventRecord {
+    fn create_event(document_id: MetaResourceId, event_id: Ulid) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let group_id = Ulid::r#gen();
         let document_path = "datasets/lifecycle";
@@ -635,7 +637,7 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_upsert_wraps_create_event() {
-        let document_id = Ulid::r#gen();
+        let document_id = MetaResourceId::from_bytes([0x11; 16]).unwrap();
         let event_id = Ulid::r#gen();
         let create = create_event(document_id, event_id);
 
@@ -656,7 +658,7 @@ mod tests {
 
     #[test]
     fn metadata_document_lifecycle_delete_carries_tombstone_and_fence() {
-        let document_id = Ulid::r#gen();
+        let document_id = MetaResourceId::from_bytes([0x12; 16]).unwrap();
         let event_id = Ulid::r#gen();
         let deleted_after_event_id = Ulid::r#gen();
         let realm_id = RealmId::from_bytes([9u8; 32]);

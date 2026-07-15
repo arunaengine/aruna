@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    METADATA_PATH_CLAIM_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
@@ -15,7 +16,8 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     metadata_create_event_and_pending_projection_write_entries, metadata_create_event_write_entry,
     metadata_document_key, metadata_event_log_prefix, metadata_graph_lifecycle_write_entry,
-    metadata_pending_projection_key, metadata_registry_key, metadata_registry_write_entries,
+    metadata_path_claim_key, metadata_pending_projection_key, metadata_registry_key,
+    metadata_registry_write_entries,
 };
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -23,7 +25,7 @@ use aruna_core::structs::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload,
+    CreateMetadataDocumentPayload, mint_local_document_id,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -33,6 +35,7 @@ use aruna_operations::get_metadata_document::{
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
+use aruna_operations::metadata::path_lookup::resolve_metadata_path;
 use aruna_operations::metadata::projector::{
     drain_pending_metadata_projection_queue, project_metadata_create_event_from_log,
     project_metadata_create_events, replay_metadata_event_log,
@@ -51,6 +54,10 @@ use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
+
 struct TestContext {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
@@ -63,11 +70,16 @@ struct TestContext {
 async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/lost-response",
+    )?;
     let config = CreateMetadataDocumentConfig {
         actor: test.actor.clone(),
         group_id,
-        document_id,
+        document_id: Some(document_id),
         document_path: "datasets/lost-response".to_string(),
         public: true,
         payload: CreateMetadataDocumentPayload::Scaffold {
@@ -133,9 +145,109 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// DEC-PATH: two authorized creates for the same normalized path both commit with
+/// their own unique ids; the path resolves to one deterministic winner and the
+/// loser is surfaced as a conflict; re-pathing the loser clears the conflict.
+#[tokio::test]
+async fn same_path_creates_resolve_to_winner() -> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::r#gen();
+    let realm_id = test.actor.realm_id;
+    let path = "datasets/contended";
+
+    let id_a = mint_local_document_id(&test.config, &test.actor, group_id, path)?;
+    let id_b = mint_local_document_id(&test.config, &test.actor, group_id, path)?;
+    assert_ne!(id_a, id_b, "each same-path create keeps a unique id");
+
+    for document_id in [id_a, id_b] {
+        drive(
+            CreateMetadataDocumentOperation::new_for_generated_document_id(
+                CreateMetadataDocumentConfig {
+                    actor: test.actor.clone(),
+                    group_id,
+                    document_id: Some(document_id),
+                    document_path: path.to_string(),
+                    public: true,
+                    payload: CreateMetadataDocumentPayload::Scaffold {
+                        name: "Contended".to_string(),
+                        description: "Same path, two ids".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    },
+                },
+            ),
+            test.context.as_ref(),
+        )
+        .await?;
+    }
+    // Project both create events so the registry rows and path claims materialize.
+    replay_metadata_event_log(test.context.as_ref()).await?;
+
+    // Both records remain retrievable by id (the id-keyed index carries each).
+    for document_id in [id_a, id_b] {
+        match test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+                key: metadata_document_key(document_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
+            other => return Err(format!("record {document_id} missing by id: {other:?}").into()),
+        }
+    }
+
+    // The path resolves to a single deterministic winner; the loser is a conflict.
+    let resolution = resolve_metadata_path(test.context.as_ref(), realm_id, group_id, path)
+        .await?
+        .expect("the path is claimed");
+    assert!(resolution.is_conflicted());
+    assert_eq!(resolution.conflicts.len(), 1);
+    let winner = resolution.winner_id();
+    let loser = resolution.conflicts[0].document_id;
+    assert!([id_a, id_b].contains(&winner) && [id_a, id_b].contains(&loser));
+    assert_ne!(winner, loser);
+
+    // Re-resolving yields the same winner: order-independent and convergent.
+    let again = resolve_metadata_path(test.context.as_ref(), realm_id, group_id, path)
+        .await?
+        .expect("still claimed");
+    assert_eq!(again.winner_id(), winner);
+
+    // Re-pathing the loser (dropping its claim on this path) clears the conflict.
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: METADATA_PATH_CLAIM_KEYSPACE.to_string(),
+            key: metadata_path_claim_key(&realm_id, group_id, path, loser),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        other => return Err(format!("unexpected path-claim delete event: {other:?}").into()),
+    }
+    let resolved = resolve_metadata_path(test.context.as_ref(), realm_id, group_id, path)
+        .await?
+        .expect("winner still claims the path");
+    assert!(!resolved.is_conflicted());
+    assert_eq!(resolved.winner_id(), winner);
+
+    Ok(())
+}
+
 impl TestContext {
     // The bucket the create operation would have chosen on this node.
-    fn placement(&self, group_id: Ulid, document_id: Ulid, document_path: &str) -> PlacementRef {
+    fn placement(
+        &self,
+        group_id: Ulid,
+        document_id: MetaResourceId,
+        document_path: &str,
+    ) -> PlacementRef {
         let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
         let (strategy, _) = strategy_for_target(
             &self.config,
@@ -160,13 +272,18 @@ impl TestContext {
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/public-dataset",
+    )?;
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: test.actor.clone(),
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/public-dataset".to_string(),
             public: false,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -313,7 +430,12 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local_document_id(
+        &test.config,
+        &test.actor,
+        group_id,
+        "datasets/generated-fast-path",
+    )?;
     let before = test
         .context
         .storage_handle
@@ -325,7 +447,7 @@ async fn generated_metadata_create_foreground_storage_effect_count_is_reduced()
             CreateMetadataDocumentConfig {
                 actor: test.actor.clone(),
                 group_id,
-                document_id,
+                document_id: Some(document_id),
                 document_path: "datasets/generated-fast-path".to_string(),
                 public: true,
                 payload: CreateMetadataDocumentPayload::Scaffold {
@@ -358,7 +480,7 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let document_path = "datasets/replay-repair";
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let event_id = Ulid::r#gen();
@@ -447,7 +569,7 @@ async fn scheduled_projection_queue_recovers_event_log_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -496,7 +618,7 @@ async fn pending_projection_marker_recovers_event_log_only_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -527,7 +649,7 @@ async fn targeted_projection_deletes_pending_projection_marker()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -559,7 +681,7 @@ async fn projection_queue_replay_is_idempotent_for_already_projected_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -597,7 +719,7 @@ async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -606,7 +728,7 @@ async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
         "Targeted Dataset",
     );
     let other_group_id = Ulid::r#gen();
-    let other_document_id = Ulid::r#gen();
+    let other_document_id = doc_id(2);
     let (_, other_create_event) = build_create_event(
         &test,
         other_group_id,
@@ -656,7 +778,7 @@ async fn metadata_event_log_replay_does_not_resurrect_deleted_document()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -679,7 +801,7 @@ async fn projector_skips_stale_create_when_graph_tombstone_exists()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -706,7 +828,7 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context_without_net().await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let (record, create_event) = build_create_event(
         &test,
         group_id,
@@ -746,7 +868,7 @@ async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
 fn build_create_event(
     test: &TestContext,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
     name: &str,
 ) -> (MetadataRegistryRecord, MetadataCreateEventRecord) {
@@ -830,7 +952,7 @@ async fn write_pending_create_event(
 
 async fn pending_projection_marker_exists(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match test
@@ -1010,7 +1132,7 @@ async fn wait_for_projected_record(
 
 async fn read_create_events(
     test: &TestContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Vec<MetadataCreateEventRecord>, Box<dyn std::error::Error>> {
     match test
         .context

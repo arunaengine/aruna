@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -37,7 +38,7 @@ use crate::metadata::repository::{
 pub struct UpdateMetadataDocumentConfig {
     pub actor: aruna_core::structs::Actor,
     pub group_id: GroupId,
-    pub document_id: Ulid,
+    pub document_id: MetaResourceId,
     pub public: bool,
     pub mutation: UpdateMetadataDocumentMutation,
 }
@@ -510,6 +511,10 @@ impl Operation for UpdateMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
         DocumentSyncOutboxRecord,
@@ -535,7 +540,7 @@ mod tests {
 
     fn record(actor: &Actor) -> MetadataRegistryRecord {
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let document_path = "datasets/update-atomicity";
         MetadataRegistryRecord {
             realm_id: actor.realm_id,
@@ -558,7 +563,7 @@ mod tests {
         }
     }
 
-    fn replace_jsonld(document_id: Ulid, name: &str) -> String {
+    fn replace_jsonld(document_id: MetaResourceId, name: &str) -> String {
         format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",

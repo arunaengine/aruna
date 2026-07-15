@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -15,9 +16,11 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
@@ -106,7 +109,7 @@ async fn restart_traffic_body() -> Result<(), BoxError> {
     let created = run_writer(realm_id, group_id, SEED_DOCUMENTS, targets0).await?;
     // Wait until the restarting node holds real shard state (a recent sample is
     // visible), so the restore has something it could wrongly re-announce.
-    let sample: Vec<(GroupId, Ulid)> = created
+    let sample: Vec<(GroupId, MetaResourceId)> = created
         .iter()
         .rev()
         .take(40)
@@ -245,26 +248,37 @@ async fn run_writer(
     group_id: GroupId,
     count: usize,
     targets: Vec<(aruna_core::NodeId, Arc<DriverContext>)>,
-) -> Result<Vec<(GroupId, Ulid)>, BoxError> {
-    let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
+) -> Result<Vec<(GroupId, MetaResourceId)>, BoxError> {
+    let mut batches: Vec<Vec<(MetaResourceId, Ulid)>> =
+        targets.iter().map(|_| Vec::new()).collect();
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
+
+    let config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        targets[0].1.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("realm config load failed: {error:?}"))?;
 
     for index in 0..count {
         let slot = index % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::r#gen();
+        let actor = Actor {
+            node_id: *node_id,
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+        };
+        let document_path = format!("datasets/restart-{index}");
+        let document_id = mint_local_document_id(&config, &actor, group_id, &document_path)
+            .map_err(|error| format!("mint failed index={index}: {error:?}"))?;
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id: *node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
-                        realm_id,
-                    },
+                    actor,
                     group_id,
-                    document_id,
-                    document_path: format!("datasets/restart-{index}"),
+                    document_id: Some(document_id),
+                    document_path,
                     public: true,
                     payload: CreateMetadataDocumentPayload::Scaffold {
                         name: format!("Restart Dataset {index}"),
@@ -293,13 +307,13 @@ async fn run_writer(
 
 async fn flush_projection_batches(
     targets: &[(aruna_core::NodeId, Arc<DriverContext>)],
-    batches: &mut [Vec<(Ulid, Ulid)>],
+    batches: &mut [Vec<(MetaResourceId, Ulid)>],
 ) -> Result<(), BoxError> {
     for (slot, batch) in batches.iter_mut().enumerate() {
         if batch.is_empty() {
             continue;
         }
-        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
+        let drained: Vec<(MetaResourceId, Ulid)> = std::mem::take(batch);
         project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
@@ -309,12 +323,12 @@ async fn flush_projection_batches(
 
 async fn wait_for_visibility(
     contexts: &[Arc<DriverContext>],
-    pairs: &[(GroupId, Ulid)],
+    pairs: &[(GroupId, MetaResourceId)],
     poll_interval: Duration,
     timeout: Duration,
 ) -> Result<(), BoxError> {
     let t0 = Instant::now();
-    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
+    let mut remaining: Vec<Vec<(GroupId, MetaResourceId)>> =
         contexts.iter().map(|_| pairs.to_vec()).collect();
 
     loop {
@@ -346,7 +360,7 @@ async fn wait_for_visibility(
 
 async fn wait_for_any_visibility(
     context: &Arc<DriverContext>,
-    pairs: &[(GroupId, Ulid)],
+    pairs: &[(GroupId, MetaResourceId)],
     poll_interval: Duration,
     timeout: Duration,
 ) -> Result<(), BoxError> {

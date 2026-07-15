@@ -152,6 +152,7 @@ pub fn route_watch_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::structs::{RealmId, Role, WatchEventDetail, WatchEventKind, WatchEventMask};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -358,7 +359,7 @@ mod tests {
         )
     }
 
-    fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {
+    fn metadata_event(actor: UserId, group_id: Ulid, document_id: MetaResourceId) -> WatchEvent {
         WatchEvent {
             event_id: Ulid::from_bytes([8u8; 16]),
             realm_id: REALM,
@@ -432,7 +433,7 @@ mod tests {
         let owner = user(1);
         let actor = user(2);
         let group_id = Ulid::from_bytes([3u8; 16]);
-        let document_id = Ulid::from_bytes([4u8; 16]);
+        let document_id = MetaResourceId::from_bytes([4u8; 16]).unwrap();
         let subscription = watch_subscription(
             owner,
             &format!("meta/{group_id}/datasets/project"),

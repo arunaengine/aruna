@@ -8,6 +8,10 @@ pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
 pub const METADATA_CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";
+/// Path-keyed claim index (DEC-PATH): `realm ‖ group ‖ blake3(path) ‖ id`, one
+/// entry per committed claim of a normalized canonical path. Read as a prefix
+/// scan over `realm ‖ group ‖ blake3(path)` to resolve a path's winner/conflicts.
+pub const METADATA_PATH_CLAIM_KEYSPACE: &str = "metadata_path_claim";
 pub const METADATA_PENDING_PROJECTION_KEYSPACE: &str = "metadata_pending_projection";
 pub const METADATA_DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecycle";
 pub const METADATA_GRAPH_LIFECYCLE_KEYSPACE: &str = "metadata_graph_lifecycle";

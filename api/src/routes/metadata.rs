@@ -1,6 +1,7 @@
 use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
+use aruna_core::MetaResourceId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
@@ -485,7 +486,9 @@ pub async fn create_metadata_document(
                     realm_id: state.get_realm_id(),
                 },
                 group_id,
-                document_id: Ulid::r#gen(),
+                // The routed create mints the structured `MetaResourceId`
+                // (ts|handle|bucket|nonce) before driving; `None` requests it.
+                document_id: None,
                 document_path: path,
                 public,
                 payload,
@@ -1200,8 +1203,10 @@ pub async fn search_metadata(
     ))
 }
 
-fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
-    Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+fn parse_document_id(document_id: &str) -> ServerResult<MetaResourceId> {
+    document_id
+        .parse::<MetaResourceId>()
+        .map_err(|_| ServerError::BadRequest)
 }
 
 async fn run_list_metadata_documents(
@@ -1421,7 +1426,7 @@ async fn ensure_permission(
 
 async fn load_metadata_record_by_document(
     state: &ServerState,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
     match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
@@ -2302,7 +2307,11 @@ mod tests {
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
 
-        let result = load_metadata_record_by_document(state.as_ref(), Ulid::r#gen()).await;
+        let result = load_metadata_record_by_document(
+            state.as_ref(),
+            aruna_core::MetaResourceId::try_from((1u128 << 60) | 1).unwrap(),
+        )
+        .await;
 
         assert!(matches!(
             result,

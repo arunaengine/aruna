@@ -122,8 +122,8 @@ impl TopicId {
     }
 
     #[inline]
-    pub fn metadata(id: Ulid) -> Self {
-        Self::Metadata(id)
+    pub fn metadata(id: impl Into<Ulid>) -> Self {
+        Self::Metadata(id.into())
     }
 
     #[inline]

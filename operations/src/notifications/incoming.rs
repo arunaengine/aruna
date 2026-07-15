@@ -320,19 +320,12 @@ fn validate_inbound_watch_event(
     }
 
     match (&event.kind, &event.detail) {
-        (
-            WatchEventKind::MetadataCreated,
-            WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
-        ) => {
+        (WatchEventKind::MetadataCreated, WatchEventDetail::MetadataCreated { group_id, .. }) => {
             if group_id.is_nil() {
                 return Err("watch event has empty group_id".to_string());
             }
-            if document_id.is_nil() {
-                return Err("watch event has empty document_id".to_string());
-            }
+            // `document_id` is a `MetaResourceId`: a nil/zero-handle id can never
+            // deserialize into one, so its validity is enforced at the boundary.
             let Some(document_path) = event.path.strip_prefix(&format!("meta/{group_id}/")) else {
                 return Err("watch event metadata path does not match detail".to_string());
             };
@@ -436,8 +429,8 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
         NotificationKind::MetadataCreated {
             path,
             group_id,
-            document_id,
             actor_user_id,
+            ..
         } => {
             if path.is_empty() {
                 return Err("notification record has empty path".to_string());
@@ -445,9 +438,8 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if group_id.is_nil() {
                 return Err("notification record has empty group_id".to_string());
             }
-            if document_id.is_nil() {
-                return Err("notification record has empty document_id".to_string());
-            }
+            // `document_id` is a `MetaResourceId`; a nil id cannot deserialize
+            // into one, so its validity is guaranteed at the boundary.
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
         NotificationKind::DataUploaded {
@@ -630,6 +622,11 @@ async fn read_realm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
         create_watch_remote, delete_watch_remote, deliver_remote, deliver_watch_events_remote,
@@ -1882,7 +1879,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([79u8; 32]);
         let actor = UserId::new(Ulid::r#gen(), realm_id);
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let mut event = WatchEvent {
             event_id: Ulid::r#gen(),
             realm_id,

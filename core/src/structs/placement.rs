@@ -1,4 +1,6 @@
 use crate::NodeId;
+use crate::structs::RealmId;
+use crate::structured_id::PlacementHandle;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,8 +12,11 @@ pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 /// Default per-strategy shard fan-out. Power of two so `shard_for_subject`
 /// can mask with `shard_count - 1`.
 pub const DEFAULT_SHARD_COUNT: u32 = 64;
-/// Maximum per-strategy shard fan-out accepted from placement config.
-pub const MAX_PLACEMENT_SHARD_COUNT: u32 = 4096;
+/// Maximum per-strategy shard fan-out accepted from placement config. Aliased
+/// to the id codec's 12-bit bucket cap so the two can never drift: a strategy
+/// whose `shard_count` exceeded the bucket field would mint ids whose bucket
+/// silently truncates.
+pub const MAX_PLACEMENT_SHARD_COUNT: u32 = crate::structured_id::MAX_BUCKET_COUNT as u32;
 /// Upper bound for a configurable node weight; onboarding/config inputs clamp
 /// present values into `1..=MAX_NODE_WEIGHT`.
 pub const MAX_NODE_WEIGHT: u32 = 10_000;
@@ -109,7 +114,7 @@ pub struct PlacementOverride {
     pub strategy_id: Option<Ulid>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocumentClass {
     Admin,
     Group,
@@ -162,6 +167,124 @@ pub fn shard_for_subject(subject: &[u8], shard_count: u32) -> u32 {
     let mut head = [0u8; 4];
     head.copy_from_slice(&hash.as_bytes()[..4]);
     u32::from_be_bytes(head) & (shard_count - 1)
+}
+
+/// Discriminant of a placement binding's scope (spec 6.3.4).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PlacementScopeKind {
+    Realm,
+    Group,
+}
+
+/// A placement binding's scope: the `scope_kind`/`scope_id` pair of the spec
+/// record unified into one sum type so an impossible (kind, id) combination is
+/// unrepresentable. `JobControl` bindings are realm-scoped; `GroupBulk`
+/// bindings name the group (spec 6.3.4).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PlacementScope {
+    Realm(RealmId),
+    Group(GroupId),
+}
+
+impl PlacementScope {
+    pub fn kind(&self) -> PlacementScopeKind {
+        match self {
+            PlacementScope::Realm(_) => PlacementScopeKind::Realm,
+            PlacementScope::Group(_) => PlacementScopeKind::Group,
+        }
+    }
+}
+
+/// The immutable identity a placement handle maps to
+/// (`scope_kind, scope_id, document_class, strategy_id`). This is exactly the
+/// value compared for conflict/alias detection: it carries no handle, no
+/// provenance, no bucket, and no holder ids (REQ-META-PLACEMENT-BINDING-001).
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindingTuple {
+    pub scope: PlacementScope,
+    pub document_class: DocumentClass,
+    pub strategy_id: Ulid,
+}
+
+/// An immutable, append-only Placement Binding record
+/// (REQ-META-PLACEMENT-BINDING-001/002). It maps one handle to its base
+/// placement tuple plus allocation provenance. It MUST NOT carry a bucket (the
+/// bucket travels in the id) or any holder node ids.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PlacementBinding {
+    pub handle: PlacementHandle,
+    pub scope: PlacementScope,
+    pub document_class: DocumentClass,
+    pub strategy_id: Ulid,
+    pub allocator_range_id: Option<Ulid>,
+    pub allocated_by: Option<NodeId>,
+    pub allocated_at_ms: Option<u64>,
+}
+
+impl PlacementBinding {
+    /// The identity tuple used for conflict/alias detection; allocation
+    /// provenance is deliberately excluded.
+    pub fn tuple(&self) -> BindingTuple {
+        BindingTuple {
+            scope: self.scope,
+            document_class: self.document_class,
+            strategy_id: self.strategy_id,
+        }
+    }
+}
+
+/// First allocatable handle: handle zero is reserved by the id codec, so every
+/// grant starts at one.
+pub const FIRST_HANDLE: u32 = 1;
+/// Exclusive upper bound of the 20-bit handle space (one past the highest
+/// allocatable handle).
+pub const HANDLE_SPACE_END: u32 = crate::structured_id::MAX_PLACEMENT_HANDLE + 1;
+/// Handles carved into each coordinator grant. 1024 keeps ~1023 disjoint ranges
+/// across the 20-bit space (so ~1000 nodes can each be onboarded with their own
+/// range) while still handing every grant 1024 distinct
+/// `(scope, class, strategy)` handles — far above the number of distinct scopes
+/// a single node originates in practice (one binding is reused by every document
+/// and bucket of a scope).
+pub const HANDLE_RANGE_SIZE: u32 = 1024;
+
+/// A durable, non-overlapping slice of the 20-bit handle space granted to one
+/// node by a coordinator. The owner mints handles from `[start, end)` offline
+/// (DEC-ONBOARD); `end` is exclusive. Two grants whose intervals intersect are a
+/// fail-closed conflict resolved in the derived [`HandleRangeDirectory`].
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HandleRange {
+    pub range_id: Ulid,
+    pub owner: NodeId,
+    /// Inclusive lower bound.
+    pub start: u32,
+    /// Exclusive upper bound.
+    pub end: u32,
+}
+
+impl HandleRange {
+    pub fn contains(&self, handle: u32) -> bool {
+        self.start <= handle && handle < self.end
+    }
+
+    /// Half-open interval intersection (both ends exclusive of the other's).
+    pub fn overlaps(&self, other: &HandleRange) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    /// Number of handles the range covers.
+    pub fn len(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+
+    /// A range is well-formed when it is a non-empty sub-interval of the
+    /// allocatable handle space (`[FIRST_HANDLE, HANDLE_SPACE_END)`).
+    pub fn is_well_formed(&self) -> bool {
+        self.start >= FIRST_HANDLE && self.start < self.end && self.end <= HANDLE_SPACE_END
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +483,119 @@ mod tests {
         // Generous band around the mean; a broken mask would collapse or spike.
         assert!(min > expected / 2, "under-filled shard: {min} < {expected}");
         assert!(max < expected * 2, "over-filled shard: {max} > {expected}");
+    }
+
+    #[test]
+    fn binding_round_trips() {
+        use crate::structs::RealmId;
+        use crate::structured_id::PlacementHandle;
+
+        let binding = PlacementBinding {
+            handle: PlacementHandle::new(0x1234).unwrap(),
+            scope: PlacementScope::Group(Ulid::from_bytes([7u8; 16])),
+            document_class: DocumentClass::Metadata,
+            strategy_id: Ulid::from_bytes([8u8; 16]),
+            allocator_range_id: Some(Ulid::from_bytes([9u8; 16])),
+            allocated_by: Some(node(1)),
+            allocated_at_ms: Some(1_700_000_000_000),
+        };
+        let bytes = postcard::to_allocvec(&binding).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PlacementBinding>(&bytes).unwrap(),
+            binding
+        );
+
+        // The tuple identity drops provenance; realm scope also round-trips.
+        let realm = PlacementBinding {
+            scope: PlacementScope::Realm(RealmId([3u8; 32])),
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+            ..binding.clone()
+        };
+        assert_ne!(realm.scope, binding.scope);
+        assert_eq!(realm.tuple().document_class, DocumentClass::Metadata);
+        assert_eq!(binding.scope.kind(), PlacementScopeKind::Group);
+        assert_eq!(realm.scope.kind(), PlacementScopeKind::Realm);
+    }
+
+    #[test]
+    fn shard_count_cap_tracks_bucket_cap() {
+        // Single source of truth: raising the codec bucket cap raises the
+        // placement shard cap in lockstep, so a strategy can never declare more
+        // shards than the id's bucket field can encode.
+        assert_eq!(
+            MAX_PLACEMENT_SHARD_COUNT,
+            crate::structured_id::MAX_BUCKET_COUNT as u32
+        );
+        assert_eq!(MAX_PLACEMENT_SHARD_COUNT, 4096);
+    }
+
+    #[test]
+    fn handle_range_geometry() {
+        let a = HandleRange {
+            range_id: Ulid::from_bytes([1; 16]),
+            owner: node(1),
+            start: FIRST_HANDLE,
+            end: FIRST_HANDLE + HANDLE_RANGE_SIZE,
+        };
+        assert!(a.is_well_formed());
+        assert_eq!(a.len(), HANDLE_RANGE_SIZE);
+        assert!(a.contains(FIRST_HANDLE));
+        assert!(!a.contains(a.end));
+
+        let adjacent = HandleRange {
+            start: a.end,
+            end: a.end + HANDLE_RANGE_SIZE,
+            ..a
+        };
+        assert!(!a.overlaps(&adjacent));
+        let straddling = HandleRange {
+            start: a.end - 1,
+            end: a.end + 1,
+            ..a
+        };
+        assert!(a.overlaps(&straddling));
+
+        let zero = HandleRange {
+            start: 0,
+            end: 4,
+            ..a
+        };
+        assert!(!zero.is_well_formed());
+        let past_end = HandleRange {
+            start: HANDLE_SPACE_END - 1,
+            end: HANDLE_SPACE_END + 1,
+            ..a
+        };
+        assert!(!past_end.is_well_formed());
+    }
+
+    #[test]
+    fn binding_no_bucket() {
+        // REQ-META-PLACEMENT-BINDING-001: a binding must not carry a bucket
+        // or holders. The exhaustive pattern below has no rest pattern, so
+        // adding any field to PlacementBinding breaks this test's compilation
+        // until the addition is reviewed against the invariant.
+        use crate::structured_id::PlacementHandle;
+
+        let binding = PlacementBinding {
+            handle: PlacementHandle::new(1).unwrap(),
+            scope: PlacementScope::Group(Ulid::from_bytes([1u8; 16])),
+            document_class: DocumentClass::Metadata,
+            strategy_id: Ulid::from_bytes([2u8; 16]),
+            allocator_range_id: None,
+            allocated_by: None,
+            allocated_at_ms: None,
+        };
+        let PlacementBinding {
+            handle: _,
+            scope: _,
+            document_class: _,
+            strategy_id: _,
+            allocator_range_id: _,
+            allocated_by: _,
+            allocated_at_ms: _,
+        } = binding;
     }
 }

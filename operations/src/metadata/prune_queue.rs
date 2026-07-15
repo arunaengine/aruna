@@ -828,6 +828,11 @@ async fn transactional_batch_delete_no_txn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::storage_entries::{
         metadata_graph_lifecycle_write_entry, metadata_registry_write_entries,
     };
@@ -845,14 +850,14 @@ mod tests {
             graph_iri.to_string(),
             RealmId::from_bytes([7u8; 32]),
             Ulid::from_parts(7, 1),
-            Ulid::from_parts(7, 2),
+            doc_id(7),
             1,
         )
     }
 
     fn registry_record(group_id: Ulid, path: &str) -> MetadataRegistryRecord {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         MetadataRegistryRecord {
             realm_id,
             group_id,

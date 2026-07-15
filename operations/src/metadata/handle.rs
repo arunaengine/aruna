@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
@@ -43,7 +44,6 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug, debug_span, field, warn};
-use ulid::Ulid;
 
 use super::protocol::{
     MetadataAuthToken, MetadataTransportMessage, encode_message, read_message,
@@ -235,7 +235,7 @@ struct MetadataVisibilityCache {
 }
 
 struct RegistryCacheEntry {
-    records: BTreeMap<Ulid, MetadataRegistryRecord>,
+    records: BTreeMap<MetaResourceId, MetadataRegistryRecord>,
     snapshot: Option<Arc<Vec<MetadataRegistryRecord>>>,
     group_snapshots: HashMap<GroupId, Arc<Vec<MetadataRegistryRecord>>>,
     expires_at: Instant,
@@ -514,7 +514,7 @@ impl MetadataVisibilityCache {
         entry.snapshot = None;
     }
 
-    fn remove_registry_record(&self, document_id: Ulid) {
+    fn remove_registry_record(&self, document_id: MetaResourceId) {
         let mut registry = self
             .registry
             .lock()
@@ -669,7 +669,7 @@ impl MetadataHandle {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
-    pub fn remove_cached_registry_record(&self, document_id: Ulid) {
+    pub fn remove_cached_registry_record(&self, document_id: MetaResourceId) {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);
@@ -4272,7 +4272,7 @@ fn registry_record_for_graph<'a>(
     if let Some(document_id) = graph_iri
         .rsplit('/')
         .next()
-        .and_then(|tail| Ulid::from_string(tail).ok())
+        .and_then(|tail| tail.parse::<MetaResourceId>().ok())
         && let Ok(index) = records.binary_search_by(|record| record.document_id.cmp(&document_id))
         && records[index].graph_iri == graph_iri
     {
@@ -4467,6 +4467,11 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ulid::Ulid;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::UserId;
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -4884,7 +4889,10 @@ mod tests {
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
-        let document_id = Ulid::r#gen();
+        // A distinct valid structured id per call (a fixed seed would collapse
+        // every record onto one document-id cache key). Force a non-zero handle.
+        let document_id =
+            MetaResourceId::try_from(Ulid::r#gen().0 | (1u128 << 60)).expect("non-zero handle");
         MetadataRegistryRecord {
             realm_id: RealmId([7u8; 32]),
             group_id: Ulid::r#gen(),
@@ -5145,7 +5153,7 @@ mod tests {
         assert!(
             registry_record_for_graph(
                 &records,
-                &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
+                &MetadataRegistryRecord::graph_iri_for(doc_id(999_001))
             )
             .is_none()
         );
@@ -5182,7 +5190,7 @@ mod tests {
         assert!(!anonymous.graph_visible(&cache, &deleted_record.graph_iri));
         assert!(!anonymous.graph_visible(
             &cache,
-            &MetadataRegistryRecord::graph_iri_for(Ulid::r#gen())
+            &MetadataRegistryRecord::graph_iri_for(doc_id(999_001))
         ));
 
         let member = GraphVisibilityScope {

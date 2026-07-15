@@ -19,10 +19,11 @@ pub use aruna_core::storage_entries::{
     metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    shard_manifest_write_entry,
+    metadata_materialization_status_write_entry, metadata_path_claim_write_entry,
+    metadata_registry_key, metadata_registry_prefix, shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -33,7 +34,7 @@ pub const LIST_METADATA_PAGE_SIZE: usize = 128;
 // actor round trips low (the data volume is small, the trips dominate).
 pub const REGISTRY_FILL_PAGE_SIZE: usize = 8192;
 
-pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
+pub fn metadata_audit_key(group_id: GroupId, document_id: MetaResourceId, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
@@ -41,7 +42,11 @@ pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) 
     ByteView::from(bytes)
 }
 
-pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_registry_effect(
+    group_id: GroupId,
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         key: metadata_registry_key(group_id, document_id),
@@ -49,7 +54,10 @@ pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option
     })
 }
 
-pub fn read_registry_by_document_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_registry_by_document_effect(
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -57,7 +65,10 @@ pub fn read_registry_by_document_effect(document_id: Ulid, txn_id: Option<TxnId>
     })
 }
 
-pub fn read_materialization_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn read_materialization_status_effect(
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
         key: metadata_materialization_status_key(document_id),
@@ -87,7 +98,7 @@ pub fn write_registry_effect(
 
 pub fn delete_registry_effect(
     group_id: GroupId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Delete {
@@ -109,7 +120,7 @@ pub fn write_document_index_effect(
     }))
 }
 
-pub fn delete_document_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub fn delete_document_index_effect(document_id: MetaResourceId, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -202,7 +213,7 @@ pub fn write_document_lifecycle_with_revision_effect(
 
 pub fn delete_holders_effect(
     group_id: GroupId,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Delete {
@@ -292,6 +303,10 @@ pub fn create_records_and_outbox_write_entries(
             metadata_audit_key(record.group_id, record.document_id, audit_id),
             postcard::to_allocvec(audit)?.into(),
         ),
+        // DEC-PATH: retain this id's claim on its normalized path. Co-located
+        // with the registry row so every holder that carries the row can resolve
+        // the path's deterministic winner and surface the losers as conflicts.
+        metadata_path_claim_write_entry(record, record.last_event_id)?,
     ];
     if let Some(outbox) = outbox {
         writes.push(crate::document_sync_outbox::outbox_write_entry(outbox)?);

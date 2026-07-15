@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
@@ -22,6 +23,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_forward_document_id, mint_local_document_id,
 };
 use aruna_operations::document_sync_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, schedule_outbox_drain_effect,
@@ -55,6 +57,14 @@ use ulid::Ulid;
 // backstop is 2-3x that timeout, not the expected latency.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn actor_of(realm: &Realm, node: &TestNode) -> Actor {
+    Actor {
+        node_id: node.net.node_id(),
+        user_id: realm.user_id,
+        realm_id: realm.realm_id,
+    }
+}
+
 struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
@@ -76,7 +86,12 @@ async fn user_node_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
     let created = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
 
     // The user node holds nothing, so the record it got back was written by a
@@ -122,7 +137,12 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
     let (nodes, config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
     let record = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &record.placement);
     wait_for_record_on_holders(&nodes, &holders, document_id).await?;
@@ -235,7 +255,12 @@ async fn forwarded_create_is_idempotent() -> Result<(), Box<dyn std::error::Erro
     let user_node = nodes.last().expect("user node");
 
     let group_id = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        group_id,
+        "datasets/forwarded",
+    )?;
 
     let first = drive_forwarded_create(&realm, user_node, group_id, document_id).await?;
     let holders = resolve_shard_holders(&config, &first.placement);
@@ -271,7 +296,12 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let first_group = seed_group(&realm, &nodes).await?;
     let other_group = seed_group(&realm, &nodes).await?;
-    let document_id = Ulid::r#gen();
+    let document_id = mint_forward_document_id(
+        &config,
+        &actor_of(&realm, user_node),
+        first_group,
+        "datasets/forwarded",
+    )?;
 
     let created = drive_forwarded_create(&realm, user_node, first_group, document_id).await?;
     let holders = resolve_shard_holders(&config, &created.placement);
@@ -326,7 +356,7 @@ fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncC
 async fn wait_for_record_on_holders(
     nodes: &[TestNode],
     holders: &[NodeId],
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
@@ -365,7 +395,12 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
     let realm = Realm::new();
     let (nodes, config) = build_realm(&realm, 5, 0).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local_document_id(
+        &config,
+        &actor_of(&realm, &nodes[0]),
+        group_id,
+        "datasets/nonholder",
+    )?;
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -375,7 +410,7 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
                 realm_id: realm.realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/nonholder".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -562,7 +597,7 @@ async fn wait_for_group(
 
 async fn registry_record(
     node: &TestNode,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
     load_metadata_record_by_document(node.context.as_ref(), document_id)
         .await
@@ -594,7 +629,7 @@ async fn drive_forwarded_create(
     realm: &Realm,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     drive_forwarded_create_at(realm, node, group_id, document_id, "datasets/forwarded").await
 }
@@ -603,7 +638,7 @@ async fn drive_forwarded_create_at(
     realm: &Realm,
     node: &TestNode,
     group_id: Ulid,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     document_path: &str,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let created = create_metadata_document_routed(
@@ -614,7 +649,7 @@ async fn drive_forwarded_create_at(
                 realm_id: realm.realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

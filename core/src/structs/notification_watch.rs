@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
+use crate::MetaResourceId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -160,7 +161,7 @@ pub struct WatchEvent {
 pub enum WatchEventDetail {
     MetadataCreated {
         group_id: GroupId,
-        document_id: Ulid,
+        document_id: MetaResourceId,
     },
     DataUploaded {
         group_id: GroupId,
@@ -654,7 +655,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000,
             detail: WatchEventDetail::MetadataCreated {
                 group_id,
-                document_id: Ulid::from_bytes([4u8; 16]),
+                document_id: MetaResourceId::from_bytes([4u8; 16]).unwrap(),
             },
         }
     }
@@ -709,7 +710,7 @@ mod tests {
                     )
                 );
                 assert_eq!(group_id, Ulid::from_bytes([3u8; 16]));
-                assert_eq!(document_id, Ulid::from_bytes([4u8; 16]));
+                assert_eq!(document_id, MetaResourceId::from_bytes([4u8; 16]).unwrap());
                 assert_eq!(actor_user_id, actor);
             }
             other => panic!("unexpected kind: {other:?}"),

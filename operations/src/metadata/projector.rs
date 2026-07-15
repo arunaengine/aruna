@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
@@ -102,7 +103,10 @@ pub enum MetadataProjectionError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
+    MetadataCreateEventMissing {
+        document_id: MetaResourceId,
+        event_id: Ulid,
+    },
     #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
     ClockSkewDeferred { deferred: usize },
     #[error("unexpected event while projecting metadata create event: {0}")]
@@ -265,7 +269,7 @@ pub async fn drain_pending_metadata_projection_queue(
 
 pub async fn project_metadata_create_event_from_log(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<(), MetadataProjectionError> {
     project_metadata_create_events_from_log(context, [(document_id, event_id)])
@@ -275,7 +279,7 @@ pub async fn project_metadata_create_event_from_log(
 
 pub async fn project_metadata_create_events_from_log(
     context: &DriverContext,
-    targets: impl IntoIterator<Item = (Ulid, Ulid)>,
+    targets: impl IntoIterator<Item = (MetaResourceId, Ulid)>,
 ) -> Result<usize, MetadataProjectionError> {
     Ok(
         project_metadata_create_events_from_log_inner(context, targets, false)
@@ -291,7 +295,7 @@ struct MetadataProjectionFromLogResult {
 
 async fn project_metadata_create_events_from_log_inner(
     context: &DriverContext,
-    targets: impl IntoIterator<Item = (Ulid, Ulid)>,
+    targets: impl IntoIterator<Item = (MetaResourceId, Ulid)>,
     delete_orphan_markers: bool,
 ) -> Result<MetadataProjectionFromLogResult, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
@@ -334,7 +338,7 @@ async fn project_metadata_create_events_from_log_inner(
 
 async fn read_create_event_from_log(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
     event_id: Ulid,
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
     let value = match context
@@ -392,8 +396,9 @@ pub async fn project_metadata_create_events(
 
     let mut realm_configs = BTreeMap::new();
     let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
-    let mut registry_cache: BTreeMap<Ulid, Option<MetadataRegistryRecord>> = BTreeMap::new();
-    let mut status_cache: BTreeMap<Ulid, Option<MetadataMaterializationStatusRecord>> =
+    let mut registry_cache: BTreeMap<MetaResourceId, Option<MetadataRegistryRecord>> =
+        BTreeMap::new();
+    let mut status_cache: BTreeMap<MetaResourceId, Option<MetadataMaterializationStatusRecord>> =
         BTreeMap::new();
     let mut writes = Vec::new();
     let mut repair_deletes = Vec::new();
@@ -622,7 +627,7 @@ pub async fn project_metadata_create_events(
 
 async fn write_pending_projection_markers(
     context: &DriverContext,
-    targets: &BTreeSet<(Ulid, Ulid)>,
+    targets: &BTreeSet<(MetaResourceId, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
     if targets.is_empty() {
         return Ok(());
@@ -655,7 +660,7 @@ async fn write_pending_projection_markers(
 
 async fn delete_pending_projection_markers(
     context: &DriverContext,
-    targets: BTreeSet<(Ulid, Ulid)>,
+    targets: BTreeSet<(MetaResourceId, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
     if targets.is_empty() {
         return Ok(());
@@ -938,7 +943,7 @@ fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
 
 async fn read_existing_registry(
     context: &DriverContext,
-    document_id: ulid::Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, MetadataProjectionError> {
     match context
         .storage_handle
@@ -958,7 +963,7 @@ async fn read_existing_registry(
 
 async fn read_materialization_status(
     context: &DriverContext,
-    document_id: Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataProjectionError> {
     match context
         .storage_handle
@@ -1021,6 +1026,10 @@ async fn schedule_materialization_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
     use aruna_core::storage_entries::{
         metadata_create_event_write_entry, metadata_pending_projection_key,
@@ -1054,7 +1063,7 @@ mod tests {
     fn create_event() -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let event_id = Ulid::r#gen();
         let document_path = "datasets/outbox-lifecycle";
         let record = MetadataRegistryRecord {
@@ -1233,7 +1242,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let document_id = Ulid::from_bytes([21u8; 16]);
+        let document_id = MetaResourceId::from_bytes([21u8; 16]).unwrap();
         let event_id = Ulid::from_parts(21, 1);
         let marker_key = metadata_pending_projection_key(document_id, event_id);
         write_entries(
@@ -1618,7 +1627,7 @@ mod tests {
 
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         MetadataCreateEventRecord {
             event_id: Ulid::r#gen(),
             record: MetadataRegistryRecord {
