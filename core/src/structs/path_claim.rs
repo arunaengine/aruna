@@ -99,7 +99,7 @@ pub fn resolve_path_claim(claims: &[PathClaimRecord]) -> Option<PathResolution> 
             deduped.push(claim.clone());
         }
     }
-    deduped.sort_by(|a, b| a.winner_order().cmp(&b.winner_order()));
+    deduped.sort_by_key(|claim| claim.winner_order());
     let mut ordered = deduped.into_iter();
     let winner = ordered.next()?;
     Some(PathResolution {
