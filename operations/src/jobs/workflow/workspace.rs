@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::errors::AuthorizationError;
@@ -304,19 +305,18 @@ fn staged_content_matches(
 }
 
 /// Inventory the declared output prefixes in the workspace at completion. Missing
-/// prefixes contribute nothing; a listing failure is retryable.
+/// prefixes contribute nothing; no declarations produce an empty manifest.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     bucket: &str,
 ) -> Result<Vec<OutputObject>, JobError> {
+    if spec.output_prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut outputs = Vec::new();
-    let prefixes: Vec<Option<String>> = if spec.output_prefixes.is_empty() {
-        vec![None]
-    } else {
-        spec.output_prefixes.iter().cloned().map(Some).collect()
-    };
-    for prefix in prefixes {
+    let mut keys = HashSet::new();
+    for prefix in &spec.output_prefixes {
         let mut continuation = None;
         loop {
             let result = drive(
@@ -325,7 +325,7 @@ pub async fn collect_outputs(
                     group_id: spec.group_id,
                     continuation_token: continuation.clone(),
                     max_keys: None,
-                    prefix: prefix.clone(),
+                    prefix: Some(prefix.clone()),
                     delimiter: None,
                     start_after: None,
                 }),
@@ -336,18 +336,19 @@ pub async fn collect_outputs(
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
             let Some(result) = result else { break };
             for object in result.objects {
-                if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
-                    return Ok(outputs);
-                }
                 let (size, digest) = match object.location {
                     Some(location) => (location.blob_size, location.get_blake3().map(hex_encode)),
                     None => (0, None),
                 };
-                outputs.push(OutputObject {
-                    key: object.head.key,
-                    size,
-                    digest,
-                });
+                insert_output(
+                    &mut outputs,
+                    &mut keys,
+                    OutputObject {
+                        key: object.head.key,
+                        size,
+                        digest,
+                    },
+                )?;
             }
             match result.continuation_token {
                 Some(token) => continuation = Some(token),
@@ -356,6 +357,23 @@ pub async fn collect_outputs(
         }
     }
     Ok(outputs)
+}
+
+fn insert_output(
+    outputs: &mut Vec<OutputObject>,
+    keys: &mut HashSet<String>,
+    output: OutputObject,
+) -> Result<(), JobError> {
+    if !keys.insert(output.key.clone()) {
+        return Ok(());
+    }
+    if outputs.len() >= MAX_OUTPUT_MANIFEST_OBJECTS {
+        return Err(JobError::permanent(format!(
+            "output manifest exceeds {MAX_OUTPUT_MANIFEST_OBJECTS} objects"
+        )));
+    }
+    outputs.push(output);
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -372,6 +390,28 @@ mod tests {
 
     const HASH_A: [u8; 32] = [1; 32];
     const HASH_B: [u8; 32] = [2; 32];
+
+    fn spec(output_prefixes: Vec<String>) -> ExecutionSpec {
+        ExecutionSpec {
+            group_id: Ulid::from_bytes([2; 16]),
+            image: "alpine".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            output_prefixes,
+        }
+    }
+
+    fn output(key: &str) -> OutputObject {
+        OutputObject {
+            key: key.to_string(),
+            size: 0,
+            digest: None,
+        }
+    }
 
     #[test]
     fn matching_stage_skips() {
@@ -404,5 +444,47 @@ mod tests {
             Some((5, None)),
             Some((5, Some(&HASH_A)))
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_outputs_remain() {
+        let (storage_handle, _receiver) = aruna_storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        assert!(
+            collect_outputs(&context, &spec(Vec::new()), "workspace")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlap_deduplicates() {
+        let mut outputs = Vec::new();
+        let mut keys = HashSet::new();
+        insert_output(&mut outputs, &mut keys, output("result")).unwrap();
+        insert_output(&mut outputs, &mut keys, output("result")).unwrap();
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[test]
+    fn output_limit_errors() {
+        let mut outputs = Vec::new();
+        let mut keys = HashSet::new();
+        for index in 0..MAX_OUTPUT_MANIFEST_OBJECTS {
+            insert_output(&mut outputs, &mut keys, output(&index.to_string())).unwrap();
+        }
+        insert_output(&mut outputs, &mut keys, output("0")).unwrap();
+        let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
+        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(outputs.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
     }
 }
