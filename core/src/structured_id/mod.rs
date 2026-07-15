@@ -157,8 +157,17 @@ mod sealed {
 /// Shared codec for the Aruna Structured ULID family (`MetaResourceId`,
 /// `JobId`). Every constructor guarantees a non-zero handle, so extracted
 /// fields are always valid.
-pub trait StructuredId: Sized + Copy + sealed::Sealed {
+pub trait StructuredId: Sized + Copy + sealed::Sealed + TryFrom<u128, Error = FieldError> {
     fn as_ulid(&self) -> Ulid;
+
+    /// Reconstructs an id from its 16 big-endian bytes (the inverse of
+    /// [`to_bytes`](Self::to_bytes)), rejecting the reserved zero handle. This is
+    /// the explicit, fallible entry used to decode a structured id back out of a
+    /// storage key and to build fixed ids in tests; it deliberately validates so
+    /// no unstructured/zero-handle value can re-enter as a document id.
+    fn from_bytes(bytes: [u8; 16]) -> Result<Self, FieldError> {
+        Self::try_from(u128::from_be_bytes(bytes))
+    }
 
     /// Builds an id from its four fields, rejecting an out-of-range timestamp or
     /// nonce. The handle and bucket are already range-checked newtypes.
@@ -491,6 +500,31 @@ mod tests {
 
         let zero = Ulid(layout::pack(1, 0, 1, 1)).to_string();
         assert!(serde_json::from_str::<MetaResourceId>(&format!("\"{zero}\"")).is_err());
+    }
+
+    #[test]
+    fn serde_bytes_match_raw_ulid() {
+        // The typed id must serialize to the exact same bytes a raw `Ulid` would,
+        // so migrating a `document_id` field never changes the on-the-wire or
+        // on-disk record layout (postcard is the record codec; JSON the API one).
+        let id = MetaResourceId::parse(KAT_STRING).unwrap();
+        let ulid = id.as_ulid();
+        assert_eq!(
+            postcard::to_allocvec(&id).unwrap(),
+            postcard::to_allocvec(&ulid).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&id).unwrap(),
+            serde_json::to_vec(&ulid).unwrap(),
+        );
+        // The storage-key bytes (`to_bytes`) also match, and `from_bytes` inverts
+        // them under the zero-handle guard.
+        assert_eq!(id.to_bytes(), ulid.to_bytes());
+        assert_eq!(MetaResourceId::from_bytes(ulid.to_bytes()).unwrap(), id);
+        assert_eq!(
+            MetaResourceId::from_bytes(Ulid(layout::pack(1, 0, 1, 1)).to_bytes()),
+            Err(FieldError::ReservedHandle),
+        );
     }
 
     #[test]
