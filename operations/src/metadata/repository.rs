@@ -19,8 +19,8 @@ pub use aruna_core::storage_entries::{
     metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
     metadata_materialization_document_job_write_entry, metadata_materialization_job_key,
     metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
-    shard_manifest_write_entry,
+    metadata_materialization_status_write_entry, metadata_path_claim_write_entry,
+    metadata_registry_key, metadata_registry_prefix, shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -292,6 +292,10 @@ pub fn create_records_and_outbox_write_entries(
             metadata_audit_key(record.group_id, record.document_id, audit_id),
             postcard::to_allocvec(audit)?.into(),
         ),
+        // DEC-PATH: retain this id's claim on its normalized path. Co-located
+        // with the registry row so every holder that carries the row can resolve
+        // the path's deterministic winner and surface the losers as conflicts.
+        metadata_path_claim_write_entry(record, record.last_event_id)?,
     ];
     if let Some(outbox) = outbox {
         writes.push(crate::document_sync_outbox::outbox_write_entry(outbox)?);

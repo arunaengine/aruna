@@ -17,7 +17,8 @@ use crate::keyspaces::{
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
-    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PATH_CLAIM_KEYSPACE,
+    METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
     SHARD_MANIFEST_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
@@ -28,9 +29,9 @@ use crate::metadata::{
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PlacementRef, User,
-    WatchSubscription, notification_inbox_key, notification_outbox_key,
-    notification_prune_index_key, watch_subscription_key,
+    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PathClaimRecord,
+    PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
+    notification_outbox_key, notification_prune_index_key, watch_subscription_key,
 };
 use crate::types::{GroupId, Key, KeySpace, UserId, Value};
 
@@ -96,6 +97,58 @@ pub fn metadata_document_key(document_id: Ulid) -> Key {
 
 pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
     metadata_document_key(document_id)
+}
+
+/// Prefix scanned to gather every id claiming one normalized path (DEC-PATH):
+/// `realm(32) ‖ group(16) ‖ blake3(normalized_path)(32)`. The path is hashed so
+/// the key is fixed width and one path can never be a byte-prefix of another.
+pub fn metadata_path_claim_prefix(realm_id: &RealmId, group_id: GroupId, normalized_path: &str) -> Key {
+    let mut bytes = Vec::with_capacity(80);
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes.extend_from_slice(blake3::hash(normalized_path.as_bytes()).as_bytes());
+    ByteView::from(bytes)
+}
+
+/// One claim's key: the path prefix followed by the claiming id, so all claims
+/// of a path sort together and each id has exactly one entry.
+pub fn metadata_path_claim_key(
+    realm_id: &RealmId,
+    group_id: GroupId,
+    normalized_path: &str,
+    document_id: Ulid,
+) -> Key {
+    let mut bytes = metadata_path_claim_prefix(realm_id, group_id, normalized_path)
+        .as_ref()
+        .to_vec();
+    bytes.extend_from_slice(&document_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// Write entry recording `record`'s claim on its normalized path, established by
+/// `establishing_event_id`. Co-located with the registry row so it lands on
+/// every node that materializes the row.
+pub fn metadata_path_claim_write_entry(
+    record: &MetadataRegistryRecord,
+    establishing_event_id: Ulid,
+) -> Result<(String, ByteView, ByteView), ConversionError> {
+    let claim = PathClaimRecord {
+        realm_id: record.realm_id,
+        group_id: record.group_id,
+        document_id: record.document_id,
+        establishing_event_id,
+        requested_path: record.document_path.clone(),
+    };
+    Ok((
+        METADATA_PATH_CLAIM_KEYSPACE.to_string(),
+        metadata_path_claim_key(
+            &record.realm_id,
+            record.group_id,
+            &record.document_path,
+            record.document_id,
+        ),
+        postcard::to_allocvec(&claim)?.into(),
+    ))
 }
 
 pub fn metadata_graph_lifecycle_key(graph_iri: &str) -> Key {
