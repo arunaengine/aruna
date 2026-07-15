@@ -16,6 +16,7 @@ use super::store::{
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, schedule_job_drain_effect,
 };
+use super::workflow::finalize_followups;
 use crate::driver::{DriverContext, drive};
 
 /// Submit a container execution job on behalf of `created_by`. The drain claims it
@@ -111,9 +112,13 @@ pub async fn cancel_owned_job(
     };
     Ok(match outcome {
         CancelRequestOutcome::AlreadyTerminal(record) => CancelJobOutcome::AlreadyTerminal(record),
-        // Already terminalized in the store transaction: nothing runs locally to poke and
-        // no drain pass is needed.
-        CancelRequestOutcome::Cancelled(record) => CancelJobOutcome::Requested(record),
+        // Already terminalized in the store transaction: wake the durable run-crate child.
+        CancelRequestOutcome::Cancelled(record) => {
+            if matches!(&record.payload, JobPayload::Execution(_)) {
+                finalize_followups(context, job_id).await;
+            }
+            CancelJobOutcome::Requested(record)
+        }
         CancelRequestOutcome::Flagged(record) => {
             runtime.request_cancel(job_id);
             kick_drain(context).await;
