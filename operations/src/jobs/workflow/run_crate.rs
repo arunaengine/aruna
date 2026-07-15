@@ -196,6 +196,8 @@ fn is_denial(error: &CreateMetadataDocumentError) -> bool {
 /// a `CreateAction` binding agent/instrument/object/result. No secrets (spec 16.10).
 fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
+    let date_published = rfc3339(record.created_at_ms);
+    let end_time = record.finished_at_ms.map(rfc3339).unwrap_or_default();
     let workspace = record
         .workspace_bucket
         .clone()
@@ -237,7 +239,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
                 "Aruna execution run for job {} in workspace {}",
                 record.job_id, workspace
             ),
-            "datePublished": "2026-01-01",
+            "datePublished": date_published,
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
             "mentions": {"@id": format!("#run-{}", record.job_id)}
         }),
@@ -250,7 +252,7 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
             "object": object_ids,
             "result": result_ids,
             "actionStatus": action_status,
-            "endTime": "2026-01-01",
+            "endTime": end_time,
             "error": exit_code
                 .filter(|code| *code != 0)
                 .map(|code| format!("exit code {code}"))
@@ -277,4 +279,10 @@ fn build_run_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id:
         "@graph": graph
     })
     .to_string()
+}
+
+fn rfc3339(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_default()
 }
