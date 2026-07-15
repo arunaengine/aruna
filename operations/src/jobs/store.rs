@@ -309,7 +309,7 @@ pub async fn claim_job(
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
-        if record.cancel_requested && !record.has_run {
+        if record.cancel_requested && !record.has_run && record.attempt_intent.is_none() {
             record.state = JobState::Cancelled;
             record.finished_at_ms = Some(now_ms);
             record.claim = None;
@@ -896,7 +896,7 @@ pub async fn set_cancel_requested(
         }
         // `has_run`, not `attempts == 0`: a job interrupted by a shutdown hands its lease
         // back without spending an attempt, so attempts alone cannot prove it never ran.
-        if record.state == JobState::Queued && !record.has_run {
+        if record.state == JobState::Queued && !record.has_run && record.attempt_intent.is_none() {
             record.cancel_requested = true;
             record.state = JobState::Cancelled;
             record.finished_at_ms = Some(now_ms);
