@@ -519,7 +519,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 }
 
 #[tokio::test]
-async fn complete_multipart_upload_rejects_missing_required_part_checksum() {
+async fn rejects_missing_checksum() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::r#gen(), realm_id);
@@ -580,10 +580,7 @@ async fn complete_multipart_upload_rejects_missing_required_part_checksum() {
     .await
     .unwrap_err();
 
-    assert_eq!(
-        err,
-        CompleteMultipartUploadError::MissingExpectedChecksum("SHA256")
-    );
+    assert_eq!(err, CompleteMultipartUploadError::ChecksumContractMismatch);
 }
 
 #[tokio::test]

@@ -1321,9 +1321,7 @@ fn validate_requested_part(
             .iter()
             .any(|expected| expected.algorithm == algorithm)
     {
-        return Err(CompleteMultipartUploadError::MissingExpectedChecksum(
-            algorithm.s3_name(),
-        ));
+        return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
     }
 
     for expected in &requested.expected_checksums {
@@ -1519,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_checksum_contract_requires_each_part_checksum() {
+    fn requires_part_checksum() {
         let mut input = finalize_input();
         input.completed_parts = vec![CompleteMultipartPart {
             part_number: 1,
@@ -1538,9 +1536,7 @@ mod tests {
 
         assert_eq!(
             op.extract_requested_parts(values),
-            Err(CompleteMultipartUploadError::MissingExpectedChecksum(
-                "SHA256"
-            ))
+            Err(CompleteMultipartUploadError::ChecksumContractMismatch)
         );
     }
 
