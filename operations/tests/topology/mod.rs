@@ -402,7 +402,12 @@ async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNo
     });
 
     initialize_net_incoming(context.clone());
-    initialize_task_incoming(context.clone(), task_handle).await;
+    initialize_task_incoming(
+        context.clone(),
+        task_handle,
+        aruna_operations::jobs::runtime::JobsRuntime::new(),
+    )
+    .await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
