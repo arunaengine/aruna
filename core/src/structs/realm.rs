@@ -2,8 +2,8 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::structs::{Permission, Role};
 use crate::structs::{
-    Actor, BindingAppend, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass,
-    NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
+    Actor, BindingDirectory, BindingScope, DEFAULT_SHARD_COUNT, DocumentClass, NodePlacementEntry,
+    PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
 };
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
@@ -157,10 +157,11 @@ pub struct RealmConfigDocument {
     pub default_strategy_id: Option<Ulid>,
     pub strategy_bindings: Vec<StrategyBinding>,
     pub placement_overrides: Vec<PlacementOverride>,
-    /// Append-only local Placement Binding record intended to become the alpha
-    /// RealmReplicated bridge. Cross-node replication via an admin operation and
-    /// reducer materialization is not yet implemented; do not rely on this field
-    /// for cross-node convergence until it is.
+    /// Append-only Placement Binding set, replicated across nodes via the
+    /// `RealmConfigPlacementBindingAppended` admin operation and materialized by
+    /// the reducer overlay. The reducer/overlay is the sole writer: divergent
+    /// same-handle bindings are all retained so the derived directory fails
+    /// closed as `Conflicted`.
     pub placement_bindings: Vec<PlacementBinding>,
 }
 
@@ -486,27 +487,6 @@ impl RealmConfigDocument {
         self.strategies
             .iter()
             .find(|strategy| strategy.strategy_id == *strategy_id)
-    }
-
-    /// Appends a Placement Binding to the append-only set. Identical entries
-    /// collapse; a same-handle entry with a different tuple is retained
-    /// (never overwritten) and reported as a fail-closed conflict
-    /// (REQ-META-PLACEMENT-BINDING-002/CONFLICT-001).
-    pub fn append_placement_binding(&mut self, binding: PlacementBinding) -> BindingAppend {
-        if self.placement_bindings.contains(&binding) {
-            return BindingAppend::Duplicate;
-        }
-        let tuple = binding.tuple();
-        let conflict = self
-            .placement_bindings
-            .iter()
-            .any(|existing| existing.handle == binding.handle && existing.tuple() != tuple);
-        self.placement_bindings.push(binding);
-        if conflict {
-            BindingAppend::Conflict
-        } else {
-            BindingAppend::Added
-        }
     }
 
     /// Rebuilds the derived Placement Binding Directory from the stored set.
@@ -888,8 +868,8 @@ mod test {
     }
 
     #[test]
-    fn binding_append_and_rebuild() {
-        use crate::structs::{BindingAppend, DocumentClass, PlacementBinding, PlacementScope};
+    fn binding_directory_rebuilds_from_stored_set() {
+        use crate::structs::{DocumentClass, PlacementBinding, PlacementScope};
         use crate::structured_id::PlacementHandle;
 
         fn binding(handle: u32, seed: u8) -> PlacementBinding {
@@ -906,16 +886,8 @@ mod test {
 
         let mut config = RealmConfigDocument::new(RealmId([2u8; 32]), Vec::new(), 3);
         let first = binding(10, 1);
-        assert_eq!(
-            config.append_placement_binding(first.clone()),
-            BindingAppend::Added
-        );
-        assert_eq!(
-            config.append_placement_binding(first.clone()),
-            BindingAppend::Duplicate
-        );
+        config.placement_bindings.push(first.clone());
 
-        // The derived directory indexes the stored set.
         let directory = config.binding_directory();
         assert_eq!(
             directory.resolve(first.handle).map(|t| t.strategy_id),
@@ -923,12 +895,8 @@ mod test {
         );
         assert_eq!(directory.allocated(), 1);
 
-        // A same-handle, different-tuple append is retained and flagged.
-        assert_eq!(
-            config.append_placement_binding(binding(10, 2)),
-            BindingAppend::Conflict
-        );
-        assert_eq!(config.placement_bindings.len(), 2);
+        // A same-handle, different-tuple entry fails closed as conflicted.
+        config.placement_bindings.push(binding(10, 2));
         assert!(config.binding_directory().resolve(first.handle).is_err());
         assert_eq!(config.binding_directory().conflicted(), 1);
     }

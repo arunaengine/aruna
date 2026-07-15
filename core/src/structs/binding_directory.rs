@@ -46,18 +46,6 @@ pub struct ResolvedBinding {
     pub bucket: BucketId,
 }
 
-/// Outcome of appending a binding to the authoritative set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingAppend {
-    /// A new, non-conflicting binding was stored.
-    Added,
-    /// An identical binding was already present (idempotent no-op).
-    Duplicate,
-    /// Stored, but it introduces a same-handle tuple conflict. It is retained
-    /// (append-only) and its handle resolves fail-closed.
-    Conflict,
-}
-
 #[derive(Debug, Clone)]
 enum HandleState {
     Bound(BindingTuple),
