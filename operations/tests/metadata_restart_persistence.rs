@@ -117,7 +117,7 @@ async fn create_and_materialize_document(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor,
             group_id: group_id(),
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/restart-persistence".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

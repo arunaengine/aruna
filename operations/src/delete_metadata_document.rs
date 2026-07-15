@@ -107,7 +107,11 @@ pub enum DeleteMetadataDocumentError {
 }
 
 impl DeleteMetadataDocumentOperation {
-    pub fn new(actor: aruna_core::structs::Actor, group_id: Ulid, document_id: MetaResourceId) -> Self {
+    pub fn new(
+        actor: aruna_core::structs::Actor,
+        group_id: Ulid,
+        document_id: MetaResourceId,
+    ) -> Self {
         Self {
             actor,
             group_id,
@@ -730,6 +734,11 @@ impl Operation for DeleteMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structured_id::StructuredId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind};
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -749,7 +758,7 @@ mod tests {
 
     fn record(actor: &aruna_core::structs::Actor) -> MetadataRegistryRecord {
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let document_path = "datasets/delete-lifecycle";
         let last_event_id = Ulid::r#gen();
         MetadataRegistryRecord {

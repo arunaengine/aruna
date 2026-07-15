@@ -6,7 +6,6 @@ use aruna_net::streams::BiStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use tokio::io::AsyncWriteExt;
-use ulid::Ulid;
 
 use crate::create_metadata_document::CreateMetadataDocumentPayload;
 use crate::update_metadata_document::UpdateMetadataDocumentMutation;
@@ -185,6 +184,11 @@ pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ulid::Ulid;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
 
     #[test]
     fn transport_messages_use_auth_token_fields() {
@@ -209,7 +213,7 @@ mod tests {
         assert_has_auth_token_field(MetadataTransportMessage::ForwardCreateDocument {
             auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
             group_id: Ulid::nil(),
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
             document_path: "datasets/forwarded".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::RoCrate {
@@ -218,7 +222,7 @@ mod tests {
         });
         assert_has_auth_token_field(MetadataTransportMessage::ForwardUpdateDocument {
             auth_token: Some(MetadataAuthToken::bearer("update-token").unwrap()),
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
             public: None,
             mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
                 jsonld: "{}".to_string(),
@@ -226,7 +230,7 @@ mod tests {
         });
         assert_has_auth_token_field(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
         });
     }
 

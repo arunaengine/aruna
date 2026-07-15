@@ -1708,6 +1708,11 @@ impl InboundTaskHandler for OperationsTaskHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use crate::document_sync_outbox::{
         outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
@@ -2072,7 +2077,7 @@ mod tests {
         };
         let deferred_target = DocumentSyncTarget::MetadataRegistry {
             group_id: Ulid::from_parts(1, 1),
-            document_id: Ulid::from_parts(2, 2),
+            document_id: doc_id(2),
         };
         let mut writes = Vec::with_capacity(OUTBOX_DRAIN_BATCH_SIZE + 1);
         for index in 0..OUTBOX_DRAIN_BATCH_SIZE {
@@ -2329,7 +2334,7 @@ mod tests {
         };
         let target = DocumentSyncTarget::MetadataRegistry {
             group_id: Ulid::from_parts(1, 1),
-            document_id: Ulid::from_parts(2, 2),
+            document_id: doc_id(2),
         };
         let topic = target.sync_topic_id(realm_id, &placement);
 
@@ -2585,7 +2590,7 @@ mod tests {
             task_handle: None,
         });
         let handler = OperationsTaskHandler::new(context);
-        let document_id = Ulid::from_parts(17, 1);
+        let document_id = doc_id(17);
         let tombstone = MetadataGraphLifecycleRecord::deleted(
             "urn:graph:tombstone-before-retry".to_string(),
             RealmId::from_bytes([3; 32]),

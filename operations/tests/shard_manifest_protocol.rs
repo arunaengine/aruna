@@ -139,7 +139,7 @@ async fn new_holder_verifies_shard_against_co_holder() -> Result<(), Box<dyn std
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: actor.clone(),
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/verify-canary".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

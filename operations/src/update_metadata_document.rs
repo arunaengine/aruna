@@ -511,6 +511,10 @@ impl Operation for UpdateMetadataDocumentOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::document::{
         DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
         DocumentSyncOutboxRecord,
@@ -536,7 +540,7 @@ mod tests {
 
     fn record(actor: &Actor) -> MetadataRegistryRecord {
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let document_path = "datasets/update-atomicity";
         MetadataRegistryRecord {
             realm_id: actor.realm_id,

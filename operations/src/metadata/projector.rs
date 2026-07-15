@@ -103,7 +103,10 @@ pub enum MetadataProjectionError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: MetaResourceId, event_id: Ulid },
+    MetadataCreateEventMissing {
+        document_id: MetaResourceId,
+        event_id: Ulid,
+    },
     #[error("deferred {deferred} metadata create event(s) stamped too far in the future")]
     ClockSkewDeferred { deferred: usize },
     #[error("unexpected event while projecting metadata create event: {0}")]
@@ -393,7 +396,8 @@ pub async fn project_metadata_create_events(
 
     let mut realm_configs = BTreeMap::new();
     let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
-    let mut registry_cache: BTreeMap<MetaResourceId, Option<MetadataRegistryRecord>> = BTreeMap::new();
+    let mut registry_cache: BTreeMap<MetaResourceId, Option<MetadataRegistryRecord>> =
+        BTreeMap::new();
     let mut status_cache: BTreeMap<MetaResourceId, Option<MetadataMaterializationStatusRecord>> =
         BTreeMap::new();
     let mut writes = Vec::new();
@@ -1022,6 +1026,10 @@ async fn schedule_materialization_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
     use aruna_core::storage_entries::{
         metadata_create_event_write_entry, metadata_pending_projection_key,
@@ -1055,7 +1063,7 @@ mod tests {
     fn create_event() -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let event_id = Ulid::r#gen();
         let document_path = "datasets/outbox-lifecycle";
         let record = MetadataRegistryRecord {
@@ -1234,7 +1242,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        let document_id = Ulid::from_bytes([21u8; 16]);
+        let document_id = MetaResourceId::from_bytes([21u8; 16]).unwrap();
         let event_id = Ulid::from_parts(21, 1);
         let marker_key = metadata_pending_projection_key(document_id, event_id);
         write_entries(
@@ -1619,7 +1627,7 @@ mod tests {
 
     fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([1u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         MetadataCreateEventRecord {
             event_id: Ulid::r#gen(),
             record: MetadataRegistryRecord {

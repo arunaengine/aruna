@@ -6,12 +6,12 @@ use std::str::FromStr;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::structured_id::StructuredId;
 use aruna_core::structs::{
     AffinityEffect, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass,
     KIND_LABEL_KEY, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
     RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 
 use crate::placement::selector::{ROLE_LOCATION, ROLE_NODE, rank_weighted};
@@ -177,13 +177,17 @@ pub fn strategy_for_target<'a>(
         .iter()
         .find(|over| over.subject == subject);
 
-    let strategy =
-        match resolve_strategy(config, document_class(target), group_id_of(target), context, override_)
-        {
-            Ok(Some(strategy)) => strategy,
-            Ok(None) => config.strategies.first()?,
-            Err(()) => return None,
-        };
+    let strategy = match resolve_strategy(
+        config,
+        document_class(target),
+        group_id_of(target),
+        context,
+        override_,
+    ) {
+        Ok(Some(strategy)) => strategy,
+        Ok(None) => config.strategies.first()?,
+        Err(()) => return None,
+    };
     Some((strategy, override_))
 }
 
@@ -200,7 +204,13 @@ pub fn strategy_for_metadata_create<'a>(
         group_id: Some(group_id),
         metadata_path: Some(normalized_path),
     };
-    match resolve_strategy(config, DocumentClass::Metadata, Some(group_id), context, None) {
+    match resolve_strategy(
+        config,
+        DocumentClass::Metadata,
+        Some(group_id),
+        context,
+        None,
+    ) {
         Ok(Some(strategy)) => Some(strategy),
         Ok(None) => config.strategies.first(),
         Err(()) => None,
@@ -488,6 +498,7 @@ fn binding_strategy<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::admin_document_reducer::{
         AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
     };
@@ -558,6 +569,10 @@ mod tests {
 
     fn sid(seed: u8) -> Ulid {
         Ulid::from_bytes([seed; 16])
+    }
+
+    fn doc_sid(seed: u8) -> MetaResourceId {
+        MetaResourceId::from_bytes([seed; 16]).unwrap()
     }
 
     fn strat(seed: u8) -> PlacementStrategy {
@@ -887,7 +902,7 @@ mod tests {
     fn strategy_for_target_precedence() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
-        let document_id = sid(3);
+        let document_id = doc_sid(3);
         let target = DocumentSyncTarget::MetadataRegistry {
             group_id,
             document_id,
@@ -964,7 +979,7 @@ mod tests {
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataRegistry {
             group_id,
-            document_id: sid(3),
+            document_id: doc_sid(3),
         };
         let missing = sid(99);
 
@@ -1064,7 +1079,7 @@ mod tests {
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataRegistry {
             group_id,
-            document_id: sid(3),
+            document_id: doc_sid(3),
         };
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1102,7 +1117,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: sid(3),
+            document_id: doc_sid(3),
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.strategies = vec![strat(10), strat(11), strat(12)];
@@ -1140,7 +1155,7 @@ mod tests {
 
     #[test]
     fn subject_bytes_groups_document_variants() {
-        let document_id = sid(4);
+        let document_id = doc_sid(4);
         let registry = DocumentSyncTarget::MetadataRegistry {
             group_id: sid(5),
             document_id,
@@ -1157,7 +1172,7 @@ mod tests {
         assert_eq!(subject_bytes(&lifecycle), expected);
 
         let other = DocumentSyncTarget::MetadataDocumentLifecycle {
-            document_id: sid(7),
+            document_id: doc_sid(7),
         };
         assert_ne!(subject_bytes(&other), expected);
     }
@@ -1180,7 +1195,7 @@ mod tests {
     fn all_document_variants_share_one_shard() {
         use aruna_core::structs::shard_for_subject;
 
-        let document_id = sid(4);
+        let document_id = doc_sid(4);
         let variants = [
             DocumentSyncTarget::MetadataRegistry {
                 group_id: sid(5),
@@ -1223,20 +1238,20 @@ mod tests {
             (
                 DocumentSyncTarget::MetadataRegistry {
                     group_id: sid(1),
-                    document_id: sid(2),
+                    document_id: doc_sid(2),
                 },
                 DocumentClass::MetadataRegistry,
             ),
             (
                 DocumentSyncTarget::MetadataCreateEvent {
-                    document_id: sid(2),
+                    document_id: doc_sid(2),
                     event_id: sid(3),
                 },
                 DocumentClass::Metadata,
             ),
             (
                 DocumentSyncTarget::MetadataDocumentLifecycle {
-                    document_id: sid(2),
+                    document_id: doc_sid(2),
                 },
                 DocumentClass::Metadata,
             ),

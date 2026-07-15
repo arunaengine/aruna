@@ -1367,6 +1367,11 @@ pub fn query_form(query: &str) -> Option<MetadataQueryForm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structured_id::StructuredId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
 
     use std::collections::BTreeMap;
 
@@ -1460,7 +1465,7 @@ mod tests {
         let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
         let stale_node_id = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
         let realm_id = RealmId([3u8; 32]);
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
         config.seed_default_placement();
         config.ensure_node(local_node_id, aruna_core::structs::RealmNodeKind::Server);

@@ -1,4 +1,3 @@
-use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -321,10 +320,7 @@ fn validate_inbound_watch_event(
     }
 
     match (&event.kind, &event.detail) {
-        (
-            WatchEventKind::MetadataCreated,
-            WatchEventDetail::MetadataCreated { group_id, .. },
-        ) => {
+        (WatchEventKind::MetadataCreated, WatchEventDetail::MetadataCreated { group_id, .. }) => {
             if group_id.is_nil() {
                 return Err("watch event has empty group_id".to_string());
             }
@@ -626,6 +622,11 @@ async fn read_realm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use crate::incoming::initialize_net_incoming;
     use crate::notifications::client::{
         create_watch_remote, delete_watch_remote, deliver_remote, deliver_watch_events_remote,
@@ -1878,7 +1879,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([79u8; 32]);
         let actor = UserId::new(Ulid::r#gen(), realm_id);
         let group_id = Ulid::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let mut event = WatchEvent {
             event_id: Ulid::r#gen(),
             realm_id,

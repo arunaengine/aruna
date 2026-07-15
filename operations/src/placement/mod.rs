@@ -437,9 +437,11 @@ fn resolve_shard_holders_from_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::structs::{
         BindingScope, MetadataRegistryRecord, RealmId, RealmNodeKind, StrategyBinding,
     };
+    use aruna_core::structured_id::StructuredId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -485,7 +487,7 @@ mod tests {
     fn registry_uses_class() {
         let (mut config, _) = config_and_placement();
         let group_id = Ulid::from_bytes([6u8; 16]);
-        let document_id = Ulid::from_bytes([7u8; 16]);
+        let document_id = MetaResourceId::from_bytes([7u8; 16]).unwrap();
         let general_strategy_id = config.default_strategy_id.unwrap();
         let class_strategy = PlacementStrategy {
             strategy_id: Ulid::from_bytes([8u8; 16]),

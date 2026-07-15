@@ -921,6 +921,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::get_realm_config::GetRealmConfigOperation;
+    use aruna_core::MetaResourceId;
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -997,7 +998,7 @@ mod tests {
         strategy_id: Ulid,
         document_seed: u8,
     ) -> MetadataCreateEventRecord {
-        let document_id = Ulid::from_bytes([document_seed; 16]);
+        let document_id = MetaResourceId::from_bytes([document_seed; 16]).unwrap();
         let event_id = Ulid::from_bytes([document_seed.wrapping_add(1); 16]);
         MetadataCreateEventRecord {
             event_id,

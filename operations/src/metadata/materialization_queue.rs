@@ -107,7 +107,10 @@ pub enum MetadataMaterializationQueueError {
     #[error("metadata handle missing")]
     MetadataHandleMissing,
     #[error("metadata create event log record not found for {document_id}/{event_id}")]
-    MetadataCreateEventMissing { document_id: MetaResourceId, event_id: Ulid },
+    MetadataCreateEventMissing {
+        document_id: MetaResourceId,
+        event_id: Ulid,
+    },
     #[error("unexpected event while processing metadata materialization queue: {0}")]
     UnexpectedEvent(String),
 }
@@ -2005,6 +2008,7 @@ mod tests {
     use aruna_core::NodeId;
     use aruna_core::storage_entries::metadata_create_event_write_entry;
     use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use aruna_core::structured_id::StructuredId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::collections::BTreeSet;
     use std::thread;
@@ -2014,7 +2018,11 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn create_event(document_id: MetaResourceId, event_id: Ulid, name: &str) -> MetadataCreateEventRecord {
+    fn create_event(
+        document_id: MetaResourceId,
+        event_id: Ulid,
+        name: &str,
+    ) -> MetadataCreateEventRecord {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let group_id = Ulid::from_parts(7, 1);
         let document_path = format!("datasets/{name}");
@@ -2163,7 +2171,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let corrupt_key = vec![0];
         let event = create_event(
-            Ulid::from_bytes([12u8; 16]),
+            MetaResourceId::from_bytes([12u8; 16]).unwrap(),
             Ulid::from_parts(12, 1),
             "valid",
         );
@@ -2192,7 +2200,7 @@ mod tests {
     async fn corrupt_global_materialization_job_deletes_document_sidecar() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([14u8; 16]);
+        let document_id = MetaResourceId::from_bytes([14u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(14, 1);
         let newer_event_id = Ulid::from_parts(14, 2);
         let old_job = MetadataMaterializationJobRecord {
@@ -2260,7 +2268,7 @@ mod tests {
     async fn malformed_document_sidecar_repairs_from_valid_global_job_and_blocks_newer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([15u8; 16]);
+        let document_id = MetaResourceId::from_bytes([15u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(15, 1);
         let newer_event_id = Ulid::from_parts(15, 2);
         let old_job = MetadataMaterializationJobRecord {
@@ -2305,7 +2313,7 @@ mod tests {
     async fn orphan_malformed_document_sidecar_is_deleted_while_checking_predecessors() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([16u8; 16]);
+        let document_id = MetaResourceId::from_bytes([16u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(16, 1);
         let newer_event_id = Ulid::from_parts(16, 2);
         let document_key = metadata_materialization_document_job_key(document_id, old_event_id);
@@ -2343,7 +2351,7 @@ mod tests {
     async fn orphan_valid_document_sidecar_is_deleted_while_checking_predecessors() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([17u8; 16]);
+        let document_id = MetaResourceId::from_bytes([17u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(17, 1);
         let newer_event_id = Ulid::from_parts(17, 2);
         let old_job = MetadataMaterializationJobRecord {
@@ -2502,7 +2510,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([26u8; 16]);
+        let document_id = MetaResourceId::from_bytes([26u8; 16]).unwrap();
         let event_id = Ulid::from_parts(26, 1);
         let event = create_event(document_id, event_id, "malformed-future-retry");
         let future_job = MetadataMaterializationJobRecord {
@@ -2554,7 +2562,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([27u8; 16]);
+        let document_id = MetaResourceId::from_bytes([27u8; 16]).unwrap();
         let event_id = Ulid::from_parts(27, 1);
         let event = create_event(document_id, event_id, "noncanonical-future-retry");
         let future_job = MetadataMaterializationJobRecord {
@@ -2611,7 +2619,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let now_ms = unix_timestamp_millis();
-        let document_id = Ulid::from_bytes([28u8; 16]);
+        let document_id = MetaResourceId::from_bytes([28u8; 16]).unwrap();
         let event_id = Ulid::from_parts(28, 1);
         let event = create_event(document_id, event_id, "canonical-future-retry");
         let future_job = MetadataMaterializationJobRecord {
@@ -2668,7 +2676,7 @@ mod tests {
     async fn orphan_global_materialization_job_is_deleted() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([22u8; 16]);
+        let document_id = MetaResourceId::from_bytes([22u8; 16]).unwrap();
         let event_id = Ulid::from_parts(22, 1);
         let job = MetadataMaterializationJobRecord {
             document_id,
@@ -2721,7 +2729,7 @@ mod tests {
     async fn noncanonical_decodable_document_sidecar_repairs_from_global_job() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([23u8; 16]);
+        let document_id = MetaResourceId::from_bytes([23u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(23, 1);
         let newer_event_id = Ulid::from_parts(23, 2);
         let old_job = MetadataMaterializationJobRecord {
@@ -2770,7 +2778,7 @@ mod tests {
     async fn missing_document_sidecar_repairs_from_global_job_and_blocks_newer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([24u8; 16]);
+        let document_id = MetaResourceId::from_bytes([24u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(24, 1);
         let newer_event_id = Ulid::from_parts(24, 2);
         let event = create_event(document_id, old_event_id, "missing-sidecar");
@@ -2810,7 +2818,7 @@ mod tests {
     async fn future_orphan_global_materialization_job_is_deleted_during_predecessor_check() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([25u8; 16]);
+        let document_id = MetaResourceId::from_bytes([25u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(25, 1);
         let newer_event_id = Ulid::from_parts(25, 2);
         let old_job = MetadataMaterializationJobRecord {
@@ -2850,7 +2858,7 @@ mod tests {
     async fn corrupt_materialization_document_job_is_deleted_while_checking_predecessors() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([13u8; 16]);
+        let document_id = MetaResourceId::from_bytes([13u8; 16]).unwrap();
         let event_id = Ulid::from_bytes([255u8; 16]);
         let mut corrupt_key = document_id.to_bytes().to_vec();
         corrupt_key.push(0);
@@ -2881,7 +2889,7 @@ mod tests {
 
     #[test]
     fn graph_materialization_effect_uses_event_id_actor_and_wal_durability() {
-        let document_id = Ulid::from_bytes([1u8; 16]);
+        let document_id = MetaResourceId::from_bytes([1u8; 16]).unwrap();
         let event_id = Ulid::from_parts(1, 1);
         let event = create_event(document_id, event_id, "deterministic");
         let deterministic_actor = Some(deterministic_materialization_actor(event_id));
@@ -2951,7 +2959,7 @@ mod tests {
 
     #[test]
     fn replaying_same_materialization_event_is_graph_idempotent() {
-        let document_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = MetaResourceId::from_bytes([2u8; 16]).unwrap();
         let event_id = Ulid::from_parts(2, 1);
         let event = create_event(document_id, event_id, "replay");
         let data = with_payload(
@@ -2971,7 +2979,7 @@ mod tests {
 
     #[test]
     fn newer_pending_status_does_not_obsolete_older_job() {
-        let document_id = Ulid::from_bytes([8u8; 16]);
+        let document_id = MetaResourceId::from_bytes([8u8; 16]).unwrap();
         let older_event_id = Ulid::from_parts(8, 1);
         let newer_event_id = Ulid::from_parts(8, 2);
         let older_job = MetadataMaterializationJobRecord {
@@ -3006,7 +3014,7 @@ mod tests {
 
     #[test]
     fn older_retry_status_does_not_regress_newer_pending_status() {
-        let document_id = Ulid::from_bytes([9u8; 16]);
+        let document_id = MetaResourceId::from_bytes([9u8; 16]).unwrap();
         let older_event_id = Ulid::from_parts(9, 1);
         let newer_event_id = Ulid::from_parts(9, 2);
         let older_retry = MetadataMaterializationStatusRecord {
@@ -3037,7 +3045,7 @@ mod tests {
 
     #[test]
     fn stale_final_status_does_not_overwrite_same_event_retry_status() {
-        let document_id = Ulid::from_bytes([29u8; 16]);
+        let document_id = MetaResourceId::from_bytes([29u8; 16]).unwrap();
         let event_id = Ulid::from_parts(29, 1);
         let retry_status = MetadataMaterializationStatusRecord {
             document_id,
@@ -3073,7 +3081,7 @@ mod tests {
     async fn finish_does_not_regress_newer_status() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([3u8; 16]);
+        let document_id = MetaResourceId::from_bytes([3u8; 16]).unwrap();
         let old_event_id = Ulid::from_parts(3, 1);
         let newer_event_id = Ulid::from_parts(4, 1);
         let old_event = create_event(document_id, old_event_id, "old");
@@ -3157,7 +3165,7 @@ mod tests {
     #[tokio::test]
     async fn unrelated_jobs_do_not_force_global_predecessor_scan() {
         let (storage, receiver) = StorageHandle::new();
-        let document_id = Ulid::from_bytes([11u8; 16]);
+        let document_id = MetaResourceId::from_bytes([11u8; 16]).unwrap();
         let event_id = Ulid::from_parts(11, 2);
         let scripted = thread::spawn(move || {
             let (effect, response_tx, _span, _enqueued_at, _in_flight) =
@@ -3239,7 +3247,7 @@ mod tests {
     async fn older_queued_job_blocks_later_materialization_until_advanced() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let document_id = Ulid::from_bytes([10u8; 16]);
+        let document_id = MetaResourceId::from_bytes([10u8; 16]).unwrap();
         let older_event_id = Ulid::from_parts(10, 1);
         let newer_event_id = Ulid::from_parts(10, 2);
         let older_job = MetadataMaterializationJobRecord {
@@ -3297,7 +3305,7 @@ mod tests {
     async fn retry_reschedule_is_atomic() {
         let (storage, receiver) = StorageHandle::new();
         let txn_id = Ulid::from_parts(5, 1);
-        let document_id = Ulid::from_bytes([4u8; 16]);
+        let document_id = MetaResourceId::from_bytes([4u8; 16]).unwrap();
         let event_id = Ulid::from_parts(5, 2);
         let event = create_event(document_id, event_id, "retry");
         let job = MetadataMaterializationJobRecord {

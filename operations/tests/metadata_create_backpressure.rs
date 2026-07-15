@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::UserId;
 use aruna_core::structs::{Actor, RealmId};
 use aruna_core::types::GroupId;
@@ -20,6 +21,10 @@ use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
+
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -111,7 +116,7 @@ async fn run_writer(
     let mut latencies = Vec::with_capacity(PER_WRITER);
     let mut batch = Vec::new();
     for index in 0..PER_WRITER {
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(1);
         let payload = if index % 2 == 0 {
             scaffold_payload(writer, index)
         } else {
@@ -127,7 +132,7 @@ async fn run_writer(
                         realm_id,
                     },
                     group_id,
-                    document_id,
+                    document_id: Some(document_id),
                     document_path: format!("datasets/probe-{writer}-{index}"),
                     public: true,
                     payload,

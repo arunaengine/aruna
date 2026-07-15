@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
@@ -409,7 +410,7 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
                 realm_id: realm.realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/nonholder".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -648,7 +649,7 @@ async fn drive_forwarded_create_at(
                 realm_id: realm.realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

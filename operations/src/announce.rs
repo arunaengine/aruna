@@ -507,6 +507,11 @@ impl Operation for AnnounceTopicOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
 
     use aruna_core::document::DocumentSyncOutboxRecord;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -550,7 +555,7 @@ mod tests {
                 "urn:graph:announce".to_string(),
                 RealmId::from_bytes([2u8; 32]),
                 GroupId::r#gen(),
-                Ulid::r#gen(),
+                doc_id(1),
                 42,
             );
             let document = DocumentSyncTarget::MetadataGraphLifecycle {
@@ -590,7 +595,7 @@ mod tests {
             "urn:graph:placed-announce".to_string(),
             RealmId::from_bytes([2u8; 32]),
             GroupId::r#gen(),
-            Ulid::r#gen(),
+            doc_id(2),
             42,
         );
         let document = DocumentSyncTarget::MetadataGraphLifecycle {

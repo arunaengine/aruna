@@ -740,10 +740,7 @@ impl Operation for CreateMetadataDocumentOperation {
                         return self.start_transaction_effect();
                     }
                     self.state = CreateMetadataDocumentState::CheckExisting;
-                    smallvec![read_registry_by_document_effect(
-                        self.document_id(),
-                        None
-                    )]
+                    smallvec![read_registry_by_document_effect(self.document_id(), None)]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
@@ -892,11 +889,19 @@ mod tests {
     /// Mints the structured id a locally-originated create would, exactly like
     /// the production path (`resolve_create_placement` + `mint_document_id`), so
     /// the driven state machine receives an id whose handle/bucket resolve.
-    fn minted_document_id(config: &RealmConfigDocument, actor: &Actor, group_id: GroupId) -> Ulid {
+    fn minted_document_id(
+        config: &RealmConfigDocument,
+        actor: &Actor,
+        group_id: GroupId,
+    ) -> MetaResourceId {
         let (handle, placement) =
             super::resolve_create_placement(config, actor, group_id, PATH, false)
                 .expect("binding provisioned and origin holds a bucket");
-        Ulid::from(super::mint_document_id(handle, &placement).expect("mint succeeds"))
+        super::mint_document_id(handle, &placement).expect("mint succeeds")
+    }
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
     }
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
@@ -1094,11 +1099,15 @@ mod tests {
         );
     }
 
-    fn config(actor: Actor, group_id: GroupId, document_id: MetaResourceId) -> CreateMetadataDocumentConfig {
+    fn config(
+        actor: Actor,
+        group_id: GroupId,
+        document_id: MetaResourceId,
+    ) -> CreateMetadataDocumentConfig {
         CreateMetadataDocumentConfig {
             actor,
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: PATH.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -1143,7 +1152,11 @@ mod tests {
         assert_eq!(txn_id, &None);
     }
 
-    fn assert_create_event_append(effects: &[Effect], document_id: MetaResourceId, actor: &Actor) -> Key {
+    fn assert_create_event_append(
+        effects: &[Effect],
+        document_id: MetaResourceId,
+        actor: &Actor,
+    ) -> Key {
         let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects else {
             panic!("expected metadata create event append");
         };
@@ -1339,7 +1352,7 @@ mod tests {
         let realm_id = RealmId([13u8; 32]);
         let actor = actor(realm_id, 8);
         let group_id = GroupId::r#gen();
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(13);
         let mut operation =
             CreateMetadataDocumentOperation::new(config(actor, group_id, document_id));
 
@@ -1481,7 +1494,7 @@ mod tests {
         let (handle, placement) =
             super::resolve_create_placement(&realm_config, &holder_actor, group_id, PATH, true)
                 .unwrap();
-        let forwarded_id = Ulid::from(super::mint_document_id(handle, &placement).unwrap());
+        let forwarded_id = super::mint_document_id(handle, &placement).unwrap();
         let mut operation = CreateMetadataDocumentOperation::new_forwarded(config(
             holder_actor.clone(),
             group_id,
@@ -1505,7 +1518,7 @@ mod tests {
 
         let recorded = operation.record.as_ref().expect("record built").placement;
         assert_eq!(recorded.shard, blind.shard);
-        let id = MetaResourceId::try_from(forwarded_id.0).unwrap();
+        let id = forwarded_id;
         assert_eq!(u32::from(id.bucket().get()), blind.shard);
     }
 }

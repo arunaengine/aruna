@@ -3,7 +3,6 @@ pub mod incoming;
 pub mod protocol;
 pub mod verify;
 
-use aruna_core::MetaResourceId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -141,6 +140,7 @@ fn topic_digest_and_cursor(net_handle: &NetHandle, topic: irokle::TopicId) -> ([
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::storage_entries::shard_manifest_write_entry;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};

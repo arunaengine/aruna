@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::UserId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
@@ -65,6 +66,10 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
+
 // Every wait below polls to a condition; the ceiling only bounds a genuine
 // hang. Post-replan convergence measures ~1s (registry row) to ~10s (event
 // log behind a holder-transition graph sync) under tenfold contention, but a
@@ -86,7 +91,7 @@ fn mint_local(
     realm_id: RealmId,
     group_id: Ulid,
     path: &str,
-) -> Ulid {
+) -> MetaResourceId {
     mint_local_document_id(
         config,
         &Actor {
@@ -129,7 +134,7 @@ async fn metadata_creation_replicates_to_all_three_holders()
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/bootstrap".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -182,7 +187,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -450,7 +455,7 @@ async fn seed_and_update(
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -605,7 +610,7 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
         metadata_path: Some(document_path),
     };
     let sample = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: Ulid::r#gen(),
+        document_id: doc_id(1),
     };
     let (strategy, _) =
         strategy_for_target(&config, &sample, context).expect("metadata strategy resolves");
@@ -624,7 +629,7 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: document_path.to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -674,7 +679,7 @@ async fn metadata_updates_and_deletes_apply_to_local_holder()
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/propagation".to_string(),
             public: false,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -788,7 +793,7 @@ async fn batched_metadata_create_projection_materializes_many_documents()
     let mut events = Vec::new();
 
     for index in 0..8u8 {
-        let document_id = Ulid::r#gen();
+        let document_id = doc_id(u64::from(index) + 1);
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
@@ -881,7 +886,7 @@ async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
     let realm_id = RealmId([44u8; 32]);
     let (nodes, realm_config) = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(1);
     let document_path = "datasets/reordered-delete";
     let event_id = Ulid::r#gen();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);

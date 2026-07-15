@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
@@ -234,7 +235,7 @@ async fn create_metadata_document(
                 realm_id,
             },
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/issue-261".to_string(),
             public: false,
             payload: CreateMetadataDocumentPayload::Scaffold {

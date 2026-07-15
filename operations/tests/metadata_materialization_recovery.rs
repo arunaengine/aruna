@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aruna_core::MetaResourceId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -36,7 +37,7 @@ struct TestContext {
 async fn crash_after_craqle_apply_before_finish_retries_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(true).await?;
-    let document_id = Ulid::from_bytes([1u8; 16]);
+    let document_id = MetaResourceId::from_bytes([1u8; 16]).unwrap();
     let event_id = Ulid::from_parts(10, 1);
     let event = create_event(&test, document_id, event_id, "crash-window");
     let status = new_pending_materialization_status(&event, 1);
@@ -81,7 +82,7 @@ async fn crash_after_craqle_apply_before_finish_retries_idempotently()
 async fn final_status_with_leftover_job_is_cleaned_without_reapply()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
-    let document_id = Ulid::from_bytes([2u8; 16]);
+    let document_id = MetaResourceId::from_bytes([2u8; 16]).unwrap();
     let event_id = Ulid::from_parts(20, 1);
     let event = create_event(&test, document_id, event_id, "final-leftover");
     let job = new_materialization_job(&event, 1);
@@ -118,7 +119,7 @@ async fn final_status_with_leftover_job_is_cleaned_without_reapply()
 async fn entity_upsert_materialization_replay_is_idempotent()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(true).await?;
-    let document_id = Ulid::from_bytes([3u8; 16]);
+    let document_id = MetaResourceId::from_bytes([3u8; 16]).unwrap();
     let create_event = create_event(&test, document_id, Ulid::from_parts(30, 1), "entity-replay");
     let metadata_handle = test
         .context

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -104,7 +105,7 @@ fn propagation_tail_under_sustained_load() -> Result<(), BoxError> {
                     .await
             }));
         }
-        let mut created: Vec<(GroupId, Ulid, Instant)> = Vec::new();
+        let mut created: Vec<(GroupId, MetaResourceId, Instant)> = Vec::new();
         for handle in handles {
             created.extend(handle.await??);
         }
@@ -114,7 +115,7 @@ fn propagation_tail_under_sustained_load() -> Result<(), BoxError> {
         let _ = done_tx.send(true);
         println!("ingest done: docs={total} ingest_seconds={ingest_seconds:.3} ingest_docs_per_sec={ingest_rate:.1}");
 
-        let pairs: Vec<(GroupId, Ulid)> = created
+        let pairs: Vec<(GroupId, MetaResourceId)> = created
             .iter()
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
@@ -223,7 +224,7 @@ async fn run_sampler(
                 CreateMetadataDocumentConfig {
                     actor,
                     group_id,
-                    document_id,
+                    document_id: Some(document_id),
                     document_path,
                     public: true,
                     payload: scaffold_payload("probe", 0, index),
@@ -340,9 +341,10 @@ async fn run_paced_writer(
     writer: usize,
     count: usize,
     targets: Vec<(NodeId, Arc<DriverContext>)>,
-) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
+) -> Result<Vec<(GroupId, MetaResourceId, Instant)>, BoxError> {
     let mut ticker = tokio::time::interval(WRITER_PERIOD);
-    let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
+    let mut batches: Vec<Vec<(MetaResourceId, Ulid)>> =
+        targets.iter().map(|_| Vec::new()).collect();
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
 
@@ -375,7 +377,7 @@ async fn run_paced_writer(
                 CreateMetadataDocumentConfig {
                     actor,
                     group_id,
-                    document_id,
+                    document_id: Some(document_id),
                     document_path,
                     public: true,
                     payload,
@@ -400,13 +402,13 @@ async fn run_paced_writer(
 
 async fn flush_projection_batches(
     targets: &[(NodeId, Arc<DriverContext>)],
-    batches: &mut [Vec<(Ulid, Ulid)>],
+    batches: &mut [Vec<(MetaResourceId, Ulid)>],
 ) -> Result<(), BoxError> {
     for (slot, batch) in batches.iter_mut().enumerate() {
         if batch.is_empty() {
             continue;
         }
-        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
+        let drained: Vec<(MetaResourceId, Ulid)> = std::mem::take(batch);
         project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;
@@ -416,12 +418,12 @@ async fn flush_projection_batches(
 
 async fn wait_for_visibility(
     contexts: &[Arc<DriverContext>],
-    pairs: &[(GroupId, Ulid)],
+    pairs: &[(GroupId, MetaResourceId)],
     poll_interval: Duration,
     timeout: Duration,
     t0: Instant,
 ) -> Result<f64, BoxError> {
-    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
+    let mut remaining: Vec<Vec<(GroupId, MetaResourceId)>> =
         contexts.iter().map(|_| pairs.to_vec()).collect();
 
     loop {

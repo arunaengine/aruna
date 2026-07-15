@@ -606,6 +606,10 @@ fn reject(error: impl Into<String>) -> MetadataTransportMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
 
     fn node(seed: u8) -> NodeId {
@@ -712,7 +716,7 @@ mod tests {
     fn ambiguous_mutations_stop() {
         let update = MetadataTransportMessage::ForwardUpdateDocument {
             auth_token: None,
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
             public: None,
             mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
                 jsonld: "{}".to_string(),
@@ -720,12 +724,12 @@ mod tests {
         };
         let delete = MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: None,
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
         };
         let create = MetadataTransportMessage::ForwardCreateDocument {
             auth_token: None,
             group_id: Ulid::nil(),
-            document_id: Ulid::nil(),
+            document_id: doc_id(1),
             document_path: "datasets/forwarded".to_string(),
             public: false,
             payload: crate::create_metadata_document::CreateMetadataDocumentPayload::RoCrate {

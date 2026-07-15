@@ -56,7 +56,7 @@ async fn document_manifest_row_lands_on_origin_and_receiver_with_matching_digest
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: actor.clone(),
             group_id,
-            document_id,
+            document_id: Some(document_id),
             document_path: "datasets/manifest-canary".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {

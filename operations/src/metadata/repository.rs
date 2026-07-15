@@ -1,6 +1,5 @@
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -24,6 +23,7 @@ pub use aruna_core::storage_entries::{
     metadata_registry_key, metadata_registry_prefix, shard_manifest_write_entry,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -42,7 +42,11 @@ pub fn metadata_audit_key(group_id: GroupId, document_id: MetaResourceId, audit_
     ByteView::from(bytes)
 }
 
-pub fn read_registry_effect(group_id: GroupId, document_id: MetaResourceId, txn_id: Option<TxnId>) -> Effect {
+pub fn read_registry_effect(
+    group_id: GroupId,
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         key: metadata_registry_key(group_id, document_id),
@@ -50,7 +54,10 @@ pub fn read_registry_effect(group_id: GroupId, document_id: MetaResourceId, txn_
     })
 }
 
-pub fn read_registry_by_document_effect(document_id: MetaResourceId, txn_id: Option<TxnId>) -> Effect {
+pub fn read_registry_by_document_effect(
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -58,7 +65,10 @@ pub fn read_registry_by_document_effect(document_id: MetaResourceId, txn_id: Opt
     })
 }
 
-pub fn read_materialization_status_effect(document_id: MetaResourceId, txn_id: Option<TxnId>) -> Effect {
+pub fn read_materialization_status_effect(
+    document_id: MetaResourceId,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
         key: metadata_materialization_status_key(document_id),

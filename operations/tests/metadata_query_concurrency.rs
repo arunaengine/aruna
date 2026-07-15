@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -21,6 +22,10 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, Metadata
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
+
+fn doc_id(seed: u64) -> MetaResourceId {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -76,7 +81,7 @@ fn registry_record(
     index: usize,
     graph_iri: Option<String>,
 ) -> MetadataRegistryRecord {
-    let document_id = Ulid::r#gen();
+    let document_id = doc_id(index as u64 + 1);
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,
@@ -287,7 +292,10 @@ async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Re
 }
 
 fn visibility_record(group_id: GroupId, path: &str, public: bool) -> MetadataRegistryRecord {
-    let document_id = Ulid::r#gen();
+    // Each call is a distinct document; a fixed seed would collapse them onto one
+    // document-id key. A random non-zero handle matches the original fresh id.
+    let document_id =
+        MetaResourceId::try_from(Ulid::r#gen().0 | (1u128 << 60)).expect("non-zero handle");
     MetadataRegistryRecord {
         realm_id: REALM,
         group_id,
@@ -416,7 +424,7 @@ async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Res
         deleted_records.push(deleted.clone());
         records.push(deleted);
 
-        let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::r#gen());
+        let unregistered_iri = MetadataRegistryRecord::graph_iri_for(doc_id(999_001));
         let unregistered_name =
             repeated_search_name(marker, &format!("unregistered-{index:02}"), 32);
         create_crate(&harness, &unregistered_iri, &unregistered_name).await?;
@@ -528,7 +536,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
     let public_record = visibility_record(group_id, "datasets/probe-public", true);
     let private_record = visibility_record(group_id, "datasets/probe-private", false);
     let deleted_record = visibility_record(group_id, "datasets/probe-deleted", true);
-    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::r#gen());
+    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(doc_id(999_001));
     create_crate(&harness, &public_record.graph_iri, "probe public").await?;
     create_crate(&harness, &private_record.graph_iri, "probe private").await?;
     create_crate(&harness, &deleted_record.graph_iri, "probe deleted").await?;

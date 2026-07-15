@@ -550,6 +550,11 @@ async fn run_metadata_document_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
     use aruna_blob::blob::BlobHandler;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
@@ -655,7 +660,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
         };
-        let document_id = ulid::Ulid::r#gen();
+        let document_id = doc_id(1);
         let event_id = ulid::Ulid::r#gen();
 
         project_inbound_metadata_create_events(

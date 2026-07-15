@@ -678,7 +678,7 @@ mod tests {
     fn event_permission_paths_use_exact_resource_identity() {
         let realm_id = RealmId([1u8; 32]);
         let group_id = Ulid::from_bytes([2u8; 16]);
-        let document_id = Ulid::from_bytes([3u8; 16]);
+        let document_id = MetaResourceId::from_bytes([3u8; 16]).unwrap();
         let node_id = node(4);
         let actor = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
         let data = WatchEvent {

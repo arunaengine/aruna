@@ -10,7 +10,6 @@ use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::repository::{

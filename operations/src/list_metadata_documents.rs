@@ -167,6 +167,11 @@ impl Operation for ListMetadataDocumentsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
+
+    fn doc_id(seed: u64) -> MetaResourceId {
+        MetaResourceId::try_from((1u128 << 60) | u128::from(seed)).unwrap()
+    }
 
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
@@ -187,7 +192,7 @@ mod tests {
         let group_id = Ulid::r#gen();
 
         for idx in 0..(crate::metadata::repository::LIST_METADATA_PAGE_SIZE + 5) {
-            let document_id = Ulid::r#gen();
+            let document_id = doc_id(idx as u64);
             let now = idx as u64;
             let record = MetadataRegistryRecord {
                 realm_id: RealmId([4u8; 32]),
@@ -242,8 +247,8 @@ mod tests {
         let storage_handle = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId([5u8; 32]);
         let group_id = Ulid::r#gen();
-        let active_id = Ulid::r#gen();
-        let deleted_id = Ulid::r#gen();
+        let active_id = doc_id(1);
+        let deleted_id = doc_id(2);
 
         let active = metadata_record(realm_id, group_id, active_id, "docs/active");
         let deleted = metadata_record(realm_id, group_id, deleted_id, "docs/deleted");
@@ -294,8 +299,8 @@ mod tests {
     fn filters_deleted_documents_without_per_record_reads() {
         let realm_id = RealmId([6u8; 32]);
         let group_id = Ulid::r#gen();
-        let active = metadata_record(realm_id, group_id, Ulid::r#gen(), "docs/active");
-        let deleted = metadata_record(realm_id, group_id, Ulid::r#gen(), "docs/deleted");
+        let active = metadata_record(realm_id, group_id, doc_id(3), "docs/active");
+        let deleted = metadata_record(realm_id, group_id, doc_id(4), "docs/deleted");
         let lifecycle = MetadataGraphLifecycleRecord::deleted(
             deleted.graph_iri.clone(),
             realm_id,

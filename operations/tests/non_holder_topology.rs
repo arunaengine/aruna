@@ -9,6 +9,7 @@
 
 mod topology;
 
+use aruna_core::MetaResourceId;
 use aruna_core::metadata::MetadataError;
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
@@ -40,7 +41,7 @@ async fn fixture_proves_nonholders() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
 
     let group_id = Ulid::from_bytes([11; 16]);
-    let document_id = Ulid::from_bytes([12; 16]);
+    let document_id = MetaResourceId::from_bytes([12; 16]).unwrap();
     let path = "datasets/proof";
     let origin = realm.node(0);
 
@@ -352,7 +353,7 @@ fn document_config(
     CreateMetadataDocumentConfig {
         actor: realm.actor(node),
         group_id,
-        document_id,
+        document_id: Some(document_id),
         document_path: document_path.to_string(),
         public: true,
         payload: CreateMetadataDocumentPayload::Scaffold {

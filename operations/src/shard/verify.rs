@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::shard_topic_id;
 use aruna_core::effects::{IterStart, StorageEffect};
@@ -404,6 +403,7 @@ async fn load_realm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::MetaResourceId;
     use aruna_core::document::{
         DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,
     };
