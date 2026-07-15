@@ -15,9 +15,11 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
@@ -250,21 +252,31 @@ async fn run_writer(
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
 
+    let config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        targets[0].1.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+
     for index in 0..count {
         let slot = index % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::r#gen();
+        let actor = Actor {
+            node_id: *node_id,
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+        };
+        let document_path = format!("datasets/restart-{index}");
+        let document_id = mint_local_document_id(&config, &actor, group_id, &document_path)
+            .map_err(|error| format!("mint failed index={index}: {error:?}"))?;
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id: *node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
-                        realm_id,
-                    },
+                    actor,
                     group_id,
                     document_id,
-                    document_path: format!("datasets/restart-{index}"),
+                    document_path,
                     public: true,
                     payload: CreateMetadataDocumentPayload::Scaffold {
                         name: format!("Restart Dataset {index}"),

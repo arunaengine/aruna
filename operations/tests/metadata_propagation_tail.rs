@@ -17,9 +17,11 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
@@ -191,6 +193,12 @@ async fn run_sampler(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut index = 0usize;
     let mut waiters = Vec::new();
+    let config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        targets[0].1.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("realm config load failed: {error:?}"))?;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -201,19 +209,22 @@ async fn run_sampler(
         }
         let slot = index % targets.len();
         let (node_id, context) = targets[slot].clone();
-        let document_id = Ulid::r#gen();
+        let actor = Actor {
+            node_id,
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+        };
+        let document_path = format!("probe/tail-{index}");
+        let document_id = mint_local_document_id(&config, &actor, group_id, &document_path)
+            .map_err(|error| format!("probe mint failed index={index}: {error:?}"))?;
         let t0 = Instant::now();
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
-                        realm_id,
-                    },
+                    actor,
                     group_id,
                     document_id,
-                    document_path: format!("probe/tail-{index}"),
+                    document_path,
                     public: true,
                     payload: scaffold_payload("probe", 0, index),
                 },
@@ -335,11 +346,25 @@ async fn run_paced_writer(
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
 
+    let config = drive(
+        GetRealmConfigOperation::new(realm_id),
+        targets[0].1.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+
     for index in 0..count {
         ticker.tick().await;
         let slot = (writer + index) % targets.len();
         let (node_id, context) = &targets[slot];
-        let document_id = Ulid::r#gen();
+        let actor = Actor {
+            node_id: *node_id,
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+        };
+        let document_path = format!("datasets/bench-{label}-{writer}-{index}");
+        let document_id = mint_local_document_id(&config, &actor, group_id, &document_path)
+            .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?;
         let payload = if index % 2 == 0 {
             scaffold_payload(label, writer, index)
         } else {
@@ -348,14 +373,10 @@ async fn run_paced_writer(
         let result = drive(
             CreateMetadataDocumentOperation::new_for_generated_document_id(
                 CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id: *node_id,
-                        user_id: UserId::local(Ulid::r#gen(), realm_id),
-                        realm_id,
-                    },
+                    actor,
                     group_id,
                     document_id,
-                    document_path: format!("datasets/bench-{label}-{writer}-{index}"),
+                    document_path,
                     public: true,
                     payload,
                 },

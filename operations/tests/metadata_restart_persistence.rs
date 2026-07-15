@@ -3,16 +3,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
-use aruna_core::structs::{Actor, RealmId};
+use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
+use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::replay_metadata_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
@@ -50,16 +53,28 @@ async fn metadata_backend_restart_persists_after_child_flush_without_destructors
         .into());
     }
 
-    let (context, _) = build_context(storage_dir.path(), metadata_dir.path())?;
-    let graph_iri = graph_iri();
-    assert_graph_exists(&context, &graph_iri).await?;
+    let (context, _actor, _config) = build_context(storage_dir.path(), metadata_dir.path())?;
 
-    let document = drive(
-        GetMetadataDocumentOperation::new(group_id(), document_id()),
+    // The child mints a structured document id at create time, so the parent
+    // rediscovers it from the persisted registry rather than assuming a fixed id.
+    let documents = drive(
+        ListMetadataDocumentsOperation::new(group_id()),
         context.as_ref(),
     )
     .await?;
-    assert_eq!(document.record.document_id, document_id());
+    let record = documents
+        .first()
+        .ok_or("no metadata document survived the restart")?;
+    let document_id = record.document_id;
+    let graph_iri = record.graph_iri.clone();
+    assert_graph_exists(&context, &graph_iri).await?;
+
+    let document = drive(
+        GetMetadataDocumentOperation::new(group_id(), document_id),
+        context.as_ref(),
+    )
+    .await?;
+    assert_eq!(document.record.document_id, document_id);
     assert_eq!(document.record.graph_iri, graph_iri);
     assert!(document.jsonld.contains(document_name()));
     assert!(document.jsonld.contains(&document.record.graph_iri));
@@ -77,8 +92,9 @@ async fn metadata_backend_restart_child_writes_and_flushes()
 
     let storage_path = child_path(CHILD_STORAGE_PATH_ENV)?;
     let metadata_path = child_path(CHILD_METADATA_PATH_ENV)?;
-    let (context, actor) = build_context(&storage_path, &metadata_path)?;
-    create_and_materialize_document(&context, actor).await?;
+    let (context, actor, config) = build_context(&storage_path, &metadata_path)?;
+    seed_realm_config(&context, &actor, &config).await?;
+    create_and_materialize_document(&context, actor, &config).await?;
     context
         .metadata_handle
         .as_ref()
@@ -93,12 +109,15 @@ async fn metadata_backend_restart_child_writes_and_flushes()
 async fn create_and_materialize_document(
     context: &Arc<DriverContext>,
     actor: Actor,
+    config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let document_id =
+        mint_local_document_id(config, &actor, group_id(), "datasets/restart-persistence")?;
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor,
             group_id: group_id(),
-            document_id: document_id(),
+            document_id,
             document_path: "datasets/restart-persistence".to_string(),
             public: true,
             payload: CreateMetadataDocumentPayload::Scaffold {
@@ -111,7 +130,7 @@ async fn create_and_materialize_document(
         context.as_ref(),
     )
     .await?;
-    assert_eq!(created.record.document_id, document_id());
+    assert_eq!(created.record.document_id, document_id);
 
     let replayed = replay_metadata_event_log(context.as_ref()).await?;
     assert_eq!(replayed, 1);
@@ -147,7 +166,7 @@ async fn assert_graph_exists(
 fn build_context(
     storage_path: &Path,
     metadata_path: &Path,
-) -> Result<(Arc<DriverContext>, Actor), Box<dyn std::error::Error>> {
+) -> Result<(Arc<DriverContext>, Actor, RealmConfigDocument), Box<dyn std::error::Error>> {
     let storage_handle = FjallStorage::open_with_persist_policy(
         storage_path.to_str().ok_or("invalid storage path")?,
         FjallPersistPolicy::SyncAll,
@@ -164,6 +183,9 @@ fn build_context(
             .with_search_storage(MetadataSearchStorage::Disk)
             .with_document_sync_persist_policy(FjallPersistPolicy::SyncAll),
     )?;
+    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(actor.node_id, RealmNodeKind::Server);
     Ok((
         Arc::new(DriverContext {
             storage_handle,
@@ -173,7 +195,28 @@ fn build_context(
             task_handle: None,
         }),
         actor,
+        config,
     ))
+}
+
+async fn seed_realm_config(
+    context: &Arc<DriverContext>,
+    actor: &Actor,
+    config: &RealmConfigDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*actor.realm_id.as_bytes()).into(),
+            value: config.to_bytes(actor)?.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected realm config write event: {other:?}").into()),
+    }
 }
 
 fn child_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -193,14 +236,6 @@ fn actor() -> Actor {
 
 fn group_id() -> Ulid {
     Ulid::from_parts(9, 1)
-}
-
-fn document_id() -> Ulid {
-    Ulid::from_parts(9, 2)
-}
-
-fn graph_iri() -> String {
-    format!("https://w3id.org/aruna/{}", document_id())
 }
 
 fn document_name() -> &'static str {

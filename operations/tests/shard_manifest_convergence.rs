@@ -16,6 +16,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -62,7 +63,19 @@ async fn interleaved_writes_to_one_shard_converge_on_both_holders()
     // and choose from the same subject, so their choice is the shared shard this
     // test needs.
     let placement = shared_path_bucket(&config, &holders, realm_id, group_id);
-    let document_ids: Vec<Ulid> = (0..6).map(|_| Ulid::r#gen()).collect();
+    // Each document's structured id is minted for the holder that creates it, so
+    // its embedded bucket is the shared shard both holders choose for CONVERGE_PATH.
+    let document_ids: Vec<Ulid> = (0..6)
+        .map(|index| {
+            let node = &nodes[index % 2];
+            let actor = Actor {
+                node_id: node.net.node_id(),
+                user_id: UserId::local(Ulid::r#gen(), realm_id),
+                realm_id,
+            };
+            mint_local_document_id(&config, &actor, group_id, CONVERGE_PATH)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Interleave the creates across the two holders.
     for (index, document_id) in document_ids.iter().enumerate() {

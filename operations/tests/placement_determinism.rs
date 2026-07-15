@@ -17,6 +17,7 @@ use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
@@ -55,7 +56,6 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     let nodes = build_realm_nodes(&realm_id, 4).await?;
     let actor = test_actor(&nodes[0], realm_id);
     let group_id = Ulid::from_bytes([71; 16]);
-    let document_id = Ulid::from_bytes([72; 16]);
 
     let initial_config = drive(
         GetRealmConfigOperation::new(realm_id),
@@ -63,6 +63,8 @@ async fn placement_policy_converges_and_replans_completed_inventory()
     )
     .await?;
     assert_weighted_distinct_resolution(&nodes, &initial_config);
+    let document_id =
+        mint_local_document_id(&initial_config, &actor, group_id, "datasets/issue-261")?;
 
     // The create-receiving node chooses the document's bucket out of the ones
     // it holds; every record of the document rides that bucket.
