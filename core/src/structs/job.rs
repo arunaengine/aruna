@@ -596,6 +596,8 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Running, Cancelling)
             | (Running, Indeterminate)
             | (Cancelling, Cancelled)
+            | (Cancelling, Succeeded)
+            | (Cancelling, Failed)
             | (Cancelling, Indeterminate)
             | (Indeterminate, Running)
             | (Indeterminate, Cancelling)
@@ -842,6 +844,8 @@ mod tests {
             (JobState::Running, JobState::Cancelling),
             (JobState::Running, JobState::Indeterminate),
             (JobState::Cancelling, JobState::Cancelled),
+            (JobState::Cancelling, JobState::Succeeded),
+            (JobState::Cancelling, JobState::Failed),
             (JobState::Cancelling, JobState::Indeterminate),
             (JobState::Indeterminate, JobState::Running),
             (JobState::Indeterminate, JobState::Succeeded),

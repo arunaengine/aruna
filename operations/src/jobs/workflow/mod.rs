@@ -584,16 +584,54 @@ async fn finalize_cancel(
             let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
                 return;
             };
-            let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
-                return;
-            };
-            let code = match status.phase {
-                AttemptPhase::Exited { code } => Some(code),
-                _ => None,
-            };
-            let result = execution_result_for(bucket, code, outputs, logs);
-            let record = terminal_cancel(storage, job_id, token, result).await;
-            cleanup_and_crate(context, job_id, backend, attempt, record).await;
+            match status.phase {
+                AttemptPhase::Exited { code: 0 } => {
+                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    else {
+                        return;
+                    };
+                    let result = execution_result_for(bucket, Some(0), outputs, logs);
+                    let record = terminal_complete(storage, job_id, token, result).await;
+                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                }
+                AttemptPhase::Exited { code } => {
+                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    else {
+                        return;
+                    };
+                    let result = execution_result_for(bucket, Some(code), outputs, logs);
+                    let record = terminal_fail(
+                        storage,
+                        job_id,
+                        token,
+                        JobError::permanent(format!("container exited with code {code}")),
+                        result,
+                    )
+                    .await;
+                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                }
+                AttemptPhase::Failed { reason } => {
+                    let result = execution_result_for(bucket, None, Vec::new(), logs);
+                    let record = terminal_fail(
+                        storage,
+                        job_id,
+                        token,
+                        JobError::permanent(format!("backend failure: {reason}")),
+                        result,
+                    )
+                    .await;
+                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                }
+                AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
+                    let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+                    else {
+                        return;
+                    };
+                    let result = execution_result_for(bucket, None, outputs, logs);
+                    let record = terminal_cancel(storage, job_id, token, result).await;
+                    cleanup_and_crate(context, job_id, backend, attempt, record).await;
+                }
+            }
         }
         Ok(CancelEvidence::AlreadyGone) => {
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
