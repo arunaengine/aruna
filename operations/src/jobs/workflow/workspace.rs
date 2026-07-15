@@ -66,7 +66,7 @@ pub async fn mint_workspace_credential(
     let realm_id = record.created_by.realm_id;
     // A single WRITE restriction over the bucket subtree; WRITE also satisfies READ.
     let pattern = format!(
-        "{}**",
+        "{}/**",
         blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket)
     );
     let walltime = spec
