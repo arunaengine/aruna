@@ -1729,13 +1729,12 @@ pub async fn initialize_task_incoming(
         ));
     }
     let jobs_started = jobs_runtime.is_started();
-    if jobs_started {
-        if let Err(error) = jobs_runtime
+    if jobs_started
+        && let Err(error) = jobs_runtime
             .recover_stale_jobs(&context.storage_handle)
             .await
-        {
-            warn!(error = %error, "Failed to recover stale jobs at startup");
-        }
+    {
+        warn!(error = %error, "Failed to recover stale jobs at startup");
     }
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(
