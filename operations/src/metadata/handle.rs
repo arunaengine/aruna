@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
@@ -235,7 +236,7 @@ struct MetadataVisibilityCache {
 }
 
 struct RegistryCacheEntry {
-    records: BTreeMap<Ulid, MetadataRegistryRecord>,
+    records: BTreeMap<MetaResourceId, MetadataRegistryRecord>,
     snapshot: Option<Arc<Vec<MetadataRegistryRecord>>>,
     group_snapshots: HashMap<GroupId, Arc<Vec<MetadataRegistryRecord>>>,
     expires_at: Instant,
@@ -4272,7 +4273,7 @@ fn registry_record_for_graph<'a>(
     if let Some(document_id) = graph_iri
         .rsplit('/')
         .next()
-        .and_then(|tail| Ulid::from_string(tail).ok())
+        .and_then(|tail| tail.parse::<MetaResourceId>().ok())
         && let Ok(index) = records.binary_search_by(|record| record.document_id.cmp(&document_id))
         && records[index].graph_iri == graph_iri
     {

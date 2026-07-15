@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -306,7 +307,7 @@ async fn process_materialization_job_groups(
     context: &DriverContext,
     jobs: Vec<(Vec<u8>, MetadataMaterializationJobRecord)>,
 ) -> Result<MaterializationBatchTimings, MetadataMaterializationQueueError> {
-    let mut groups: BTreeMap<Ulid, Vec<(Vec<u8>, MetadataMaterializationJobRecord)>> =
+    let mut groups: BTreeMap<MetaResourceId, Vec<(Vec<u8>, MetadataMaterializationJobRecord)>> =
         BTreeMap::new();
     for (job_key, job) in jobs {
         groups
@@ -1585,11 +1586,11 @@ async fn repair_materialization_job_key(
     }
 }
 
-fn materialization_job_key_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
+fn materialization_job_key_target(key: &[u8]) -> Option<(MetaResourceId, Ulid)> {
     materialization_job_key_parts(key).map(|(_, document_id, event_id)| (document_id, event_id))
 }
 
-fn materialization_job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
+fn materialization_job_key_parts(key: &[u8]) -> Option<(u64, MetaResourceId, Ulid)> {
     if key.len() != 40 {
         return None;
     }
@@ -1601,7 +1602,7 @@ fn materialization_job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
     event_id.copy_from_slice(&key[24..40]);
     Some((
         u64::from_be_bytes(due_at_ms),
-        Ulid::from_bytes(document_id),
+        MetaResourceId::from_bytes(document_id).ok()?,
         Ulid::from_bytes(event_id),
     ))
 }
@@ -1610,7 +1611,7 @@ fn materialization_job_key_matches(key: &[u8], job: &MetadataMaterializationJobR
     metadata_materialization_job_key(job).as_ref() == key
 }
 
-fn materialization_document_job_key_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
+fn materialization_document_job_key_target(key: &[u8]) -> Option<(MetaResourceId, Ulid)> {
     if key.len() != 32 {
         return None;
     }
@@ -1618,7 +1619,10 @@ fn materialization_document_job_key_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
     document_id.copy_from_slice(&key[..16]);
     let mut event_id = [0u8; 16];
     event_id.copy_from_slice(&key[16..32]);
-    Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
+    Some((
+        MetaResourceId::from_bytes(document_id).ok()?,
+        Ulid::from_bytes(event_id),
+    ))
 }
 
 fn materialization_document_job_key_matches(

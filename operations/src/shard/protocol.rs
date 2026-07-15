@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
 use aruna_core::structs::{PlacementRef, RealmId};

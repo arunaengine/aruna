@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,

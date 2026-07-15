@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -322,17 +323,13 @@ fn validate_inbound_watch_event(
     match (&event.kind, &event.detail) {
         (
             WatchEventKind::MetadataCreated,
-            WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
+            WatchEventDetail::MetadataCreated { group_id, .. },
         ) => {
             if group_id.is_nil() {
                 return Err("watch event has empty group_id".to_string());
             }
-            if document_id.is_nil() {
-                return Err("watch event has empty document_id".to_string());
-            }
+            // `document_id` is a `MetaResourceId`: a nil/zero-handle id can never
+            // deserialize into one, so its validity is enforced at the boundary.
             let Some(document_path) = event.path.strip_prefix(&format!("meta/{group_id}/")) else {
                 return Err("watch event metadata path does not match detail".to_string());
             };
@@ -436,8 +433,8 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
         NotificationKind::MetadataCreated {
             path,
             group_id,
-            document_id,
             actor_user_id,
+            ..
         } => {
             if path.is_empty() {
                 return Err("notification record has empty path".to_string());
@@ -445,9 +442,8 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             if group_id.is_nil() {
                 return Err("notification record has empty group_id".to_string());
             }
-            if document_id.is_nil() {
-                return Err("notification record has empty document_id".to_string());
-            }
+            // `document_id` is a `MetaResourceId`; a nil id cannot deserialize
+            // into one, so its validity is guaranteed at the boundary.
             validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
         }
         NotificationKind::DataUploaded {

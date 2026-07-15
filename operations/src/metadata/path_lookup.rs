@@ -7,6 +7,7 @@
 //! causally complete holder converges on the same answer regardless of arrival
 //! order.
 
+use aruna_core::MetaResourceId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

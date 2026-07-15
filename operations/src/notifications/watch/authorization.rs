@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::auth::TOKEN_REVOCATION_LIST_KEY;
 use aruna_core::effects::StorageEffect;
@@ -366,7 +367,7 @@ fn metadata_permission_path(
     group_id: Ulid,
     document_id: MetaResourceId,
 ) -> Option<String> {
-    if group_id.is_nil() || document_id.is_nil() {
+    if group_id.is_nil() {
         return None;
     }
     let document_path = path.strip_prefix(&format!("meta/{group_id}/"))?;

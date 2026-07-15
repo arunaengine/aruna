@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::GroupId;

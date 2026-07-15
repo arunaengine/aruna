@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::structs::{
     GroupAuthorizationDocument, NotificationClass, NotificationKind, NotificationRecord,
     RealmAuthorizationDocument, ResourceEvent, WatchEvent, WatchSubscription,

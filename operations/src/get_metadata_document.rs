@@ -1,3 +1,4 @@
+use aruna_core::MetaResourceId;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{

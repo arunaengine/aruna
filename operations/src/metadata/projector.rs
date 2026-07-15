@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
@@ -275,7 +276,7 @@ pub async fn project_metadata_create_event_from_log(
 
 pub async fn project_metadata_create_events_from_log(
     context: &DriverContext,
-    targets: impl IntoIterator<Item = (Ulid, Ulid)>,
+    targets: impl IntoIterator<Item = (MetaResourceId, Ulid)>,
 ) -> Result<usize, MetadataProjectionError> {
     Ok(
         project_metadata_create_events_from_log_inner(context, targets, false)
@@ -291,7 +292,7 @@ struct MetadataProjectionFromLogResult {
 
 async fn project_metadata_create_events_from_log_inner(
     context: &DriverContext,
-    targets: impl IntoIterator<Item = (Ulid, Ulid)>,
+    targets: impl IntoIterator<Item = (MetaResourceId, Ulid)>,
     delete_orphan_markers: bool,
 ) -> Result<MetadataProjectionFromLogResult, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
@@ -392,8 +393,8 @@ pub async fn project_metadata_create_events(
 
     let mut realm_configs = BTreeMap::new();
     let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
-    let mut registry_cache: BTreeMap<Ulid, Option<MetadataRegistryRecord>> = BTreeMap::new();
-    let mut status_cache: BTreeMap<Ulid, Option<MetadataMaterializationStatusRecord>> =
+    let mut registry_cache: BTreeMap<MetaResourceId, Option<MetadataRegistryRecord>> = BTreeMap::new();
+    let mut status_cache: BTreeMap<MetaResourceId, Option<MetadataMaterializationStatusRecord>> =
         BTreeMap::new();
     let mut writes = Vec::new();
     let mut repair_deletes = Vec::new();
@@ -622,7 +623,7 @@ pub async fn project_metadata_create_events(
 
 async fn write_pending_projection_markers(
     context: &DriverContext,
-    targets: &BTreeSet<(Ulid, Ulid)>,
+    targets: &BTreeSet<(MetaResourceId, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
     if targets.is_empty() {
         return Ok(());
@@ -655,7 +656,7 @@ async fn write_pending_projection_markers(
 
 async fn delete_pending_projection_markers(
     context: &DriverContext,
-    targets: BTreeSet<(Ulid, Ulid)>,
+    targets: BTreeSet<(MetaResourceId, Ulid)>,
 ) -> Result<(), MetadataProjectionError> {
     if targets.is_empty() {
         return Ok(());
@@ -938,7 +939,7 @@ fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
 
 async fn read_existing_registry(
     context: &DriverContext,
-    document_id: ulid::Ulid,
+    document_id: MetaResourceId,
 ) -> Result<Option<MetadataRegistryRecord>, MetadataProjectionError> {
     match context
         .storage_handle

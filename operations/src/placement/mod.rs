@@ -14,7 +14,8 @@ use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
 pub use resolver::{
     PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes,
+    meta_bucket_subject, resolve_holders, strategy_for_metadata_create, strategy_for_target,
+    subject_bytes,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:

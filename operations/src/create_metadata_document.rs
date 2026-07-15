@@ -34,15 +34,17 @@ use crate::metadata::repository::{
     metadata_create_event_and_pending_projection_write_entries, read_registry_by_document_effect,
 };
 use crate::placement::{
-    PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
-    strategy_for_target,
+    choose_origin_bucket, holds_placement, meta_bucket_subject, strategy_for_metadata_create,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
     pub actor: Actor,
     pub group_id: GroupId,
-    pub document_id: MetaResourceId,
+    /// The structured id the create must carry, or `None` for a locally
+    /// originated create whose id this node mints from its held bucket. A
+    /// forwarded create (and any trusted caller-supplied mint) is `Some`.
+    pub document_id: Option<MetaResourceId>,
     pub document_path: String,
     pub public: bool,
     pub payload: CreateMetadataDocumentPayload,
@@ -173,8 +175,16 @@ impl CreateMetadataDocumentOperation {
         &self.config
     }
 
+    /// The resolved structured id. `create_metadata_document` mints and stores it
+    /// before `drive` runs, so every driven code path observes a `Some`.
+    fn document_id(&self) -> MetaResourceId {
+        self.config
+            .document_id
+            .expect("document id resolved before drive")
+    }
+
     fn graph_iri(&self) -> String {
-        MetadataRegistryRecord::graph_iri_for(self.config.document_id)
+        MetadataRegistryRecord::graph_iri_for(self.document_id())
     }
 
     fn permission_path(&self) -> String {
@@ -182,7 +192,7 @@ impl CreateMetadataDocumentOperation {
             &self.config.actor.realm_id,
             self.config.group_id,
             &self.config.document_path,
-            self.config.document_id,
+            self.document_id(),
         )
     }
 
@@ -214,11 +224,7 @@ impl CreateMetadataDocumentOperation {
                 "realm config unavailable".to_string(),
             ));
         };
-        let id = MetaResourceId::try_from(self.config.document_id.0).map_err(|error| {
-            CreateMetadataDocumentError::PlacementBindingUnavailable(format!(
-                "document id is not a structured MetaResourceId: {error}"
-            ))
-        })?;
+        let id = self.document_id();
         let tuple = config
             .binding_directory()
             .resolve(id.placement_handle())
@@ -245,7 +251,7 @@ impl CreateMetadataDocumentOperation {
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
-            document_id: self.config.document_id,
+            document_id: self.document_id(),
             document_path: MetadataRegistryRecord::normalize_document_path(
                 &self.config.document_path,
             ),
@@ -361,7 +367,7 @@ impl CreateMetadataDocumentOperation {
             reads: vec![
                 (
                     METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                    metadata_create_acceptance_key(self.config.document_id),
+                    metadata_create_acceptance_key(self.document_id()),
                 ),
                 (
                     realm_target.storage_keyspace().to_string(),
@@ -505,9 +511,9 @@ pub async fn create_metadata_document(
     // bucket from the node's held set, so the id carries `ts|handle|bucket|nonce`.
     // A forwarded create keeps the id the origin already minted, and a caller that
     // already supplied a structured id (a trusted mint) keeps it too.
-    if !operation.forwarded && !is_structured_document_id(operation.config.document_id) {
+    if !operation.forwarded && operation.config.document_id.is_none() {
         let document_id = mint_local_create_id(context.as_ref(), &operation.config).await?;
-        operation.config.document_id = document_id;
+        operation.config.document_id = Some(document_id);
     }
     let created = drive(operation, context.as_ref()).await?;
     schedule_pending_metadata_projection_drain(context.as_ref(), std::time::Duration::ZERO)
@@ -523,7 +529,7 @@ pub async fn create_metadata_document(
 pub async fn mint_local_create_id(
     context: &DriverContext,
     config: &CreateMetadataDocumentConfig,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     mint_create_id(context, config, false).await
 }
 
@@ -535,9 +541,9 @@ pub async fn mint_local_create_id(
 pub async fn mint_forward_create_id(
     context: &DriverContext,
     config: &CreateMetadataDocumentConfig,
-) -> Result<Ulid, CreateMetadataDocumentError> {
-    if is_structured_document_id(config.document_id) {
-        return Ok(config.document_id);
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
+    if let Some(document_id) = config.document_id {
+        return Ok(document_id);
     }
     mint_create_id(context, config, true).await
 }
@@ -546,7 +552,7 @@ async fn mint_create_id(
     context: &DriverContext,
     config: &CreateMetadataDocumentConfig,
     forward_blind: bool,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     let realm_config = load_realm_config_for_create(context, config.actor.realm_id).await?;
     mint_document_id_for(
         &realm_config,
@@ -567,7 +573,7 @@ pub fn mint_local_document_id(
     actor: &Actor,
     group_id: GroupId,
     document_path: &str,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     mint_document_id_for(config, actor, group_id, document_path, false)
 }
 
@@ -579,7 +585,7 @@ pub fn mint_forward_document_id(
     actor: &Actor,
     group_id: GroupId,
     document_path: &str,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     mint_document_id_for(config, actor, group_id, document_path, true)
 }
 
@@ -598,23 +604,17 @@ pub fn forward_bucket_placement(
         .map(|(_, placement)| placement)
 }
 
-/// Whether `document_id` already carries a valid structured id (a non-reserved
-/// handle), i.e. it was minted rather than left as a placeholder to be minted.
-fn is_structured_document_id(document_id: MetaResourceId) -> bool {
-    MetaResourceId::try_from(document_id.0).is_ok()
-}
-
 fn mint_document_id_for(
     config: &RealmConfigDocument,
     actor: &Actor,
     group_id: GroupId,
     document_path: &str,
     forward_blind: bool,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+) -> Result<MetaResourceId, CreateMetadataDocumentError> {
     let normalized = MetadataRegistryRecord::normalize_document_path(document_path);
     let (handle, placement) =
         resolve_create_placement(config, actor, group_id, &normalized, forward_blind)?;
-    Ok(Ulid::from(mint_document_id(handle, &placement)?))
+    mint_document_id(handle, &placement)
 }
 
 /// Resolves the `(handle, placement)` a create's id must embed. The handle comes
@@ -627,14 +627,9 @@ fn resolve_create_placement(
     normalized_path: &str,
     forward_blind: bool,
 ) -> Result<(PlacementHandle, PlacementRef), CreateMetadataDocumentError> {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
-        document_id: Ulid::nil(),
-    };
-    let context = PlacementResolutionContext {
-        group_id: Some(group_id),
-        metadata_path: Some(normalized_path),
-    };
-    let Some((strategy, _)) = strategy_for_target(config, &target, context) else {
+    // A create has no minted id yet, so placement resolves by class/path/group
+    // rather than a per-document override subject (there is no document to key on).
+    let Some(strategy) = strategy_for_metadata_create(config, group_id, normalized_path) else {
         return Err(CreateMetadataDocumentError::PlacementBindingUnavailable(
             "no strategy governs the metadata create target".to_string(),
         ));
@@ -746,7 +741,7 @@ impl Operation for CreateMetadataDocumentOperation {
                     }
                     self.state = CreateMetadataDocumentState::CheckExisting;
                     smallvec![read_registry_by_document_effect(
-                        self.config.document_id,
+                        self.document_id(),
                         None
                     )]
                 }

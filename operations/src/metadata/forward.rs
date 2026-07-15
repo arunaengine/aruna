@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::{
@@ -295,7 +296,7 @@ pub(crate) async fn apply_forwarded_write(
                         realm_id,
                     },
                     group_id,
-                    document_id,
+                    document_id: Some(document_id),
                     document_path,
                     public,
                     payload,
