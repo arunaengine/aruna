@@ -15,7 +15,7 @@ use crate::keyspaces::{
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
     METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_IRI_REFERENCE_INDEX_KEYSPACE,
     METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_MATERIALIZATION_STATUS_KEYSPACE, METADATA_PENDING_PROJECTION_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
@@ -24,7 +24,7 @@ use crate::keyspaces::{
 };
 use crate::metadata::{
     MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
-    MetadataGraphPruneJobRecord, MetadataMaterializationJobRecord,
+    MetadataGraphPruneJobRecord, MetadataIriReferenceIndexRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{
@@ -92,6 +92,27 @@ pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
 
 pub fn metadata_document_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn metadata_iri_reference_prefix(predicate_iri: &str, object_iri: &str) -> Key {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(blake3::hash(predicate_iri.as_bytes()).as_bytes());
+    bytes.extend_from_slice(blake3::hash(object_iri.as_bytes()).as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn metadata_iri_reference_key(
+    predicate_iri: &str,
+    object_iri: &str,
+    document_id: Ulid,
+    document_cursor: Ulid,
+) -> Key {
+    let mut bytes = metadata_iri_reference_prefix(predicate_iri, object_iri)
+        .as_ref()
+        .to_vec();
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&document_cursor.to_bytes());
+    ByteView::from(bytes)
 }
 
 pub fn metadata_create_acceptance_key(document_id: Ulid) -> Key {
@@ -429,6 +450,21 @@ pub fn metadata_materialization_status_write_entry(
     ))
 }
 
+pub fn metadata_iri_reference_write_entry(
+    record: &MetadataIriReferenceIndexRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_IRI_REFERENCE_INDEX_KEYSPACE.to_string(),
+        metadata_iri_reference_key(
+            &record.predicate_iri,
+            &record.object_iri,
+            record.document_id,
+            record.document_cursor,
+        ),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
 pub fn metadata_materialization_job_write_entry(
     record: &MetadataMaterializationJobRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
@@ -662,8 +698,10 @@ mod tests {
         admin_document_reducer_conflict_prefix, admin_document_reducer_state_key,
         admin_document_reducer_state_write_entry, document_sync_conflict_key,
         document_sync_conflict_write_entry, document_sync_revision_key,
-        document_sync_revision_write_entry, shard_manifest_key, shard_manifest_prefix,
-        shard_manifest_write_entry, stale_admin_document_conflict_delete_entries,
+        document_sync_revision_write_entry, metadata_iri_reference_key,
+        metadata_iri_reference_prefix, metadata_iri_reference_write_entry, shard_manifest_key,
+        shard_manifest_prefix, shard_manifest_write_entry,
+        stale_admin_document_conflict_delete_entries,
     };
     use crate::admin_document_reducer::{
         AdminDocumentAttributeVersion, AdminDocumentConflict, AdminDocumentConflictValue,
@@ -677,8 +715,10 @@ mod tests {
     };
     use crate::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+        DOCUMENT_SYNC_CONFLICT_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
+        METADATA_IRI_REFERENCE_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
     };
+    use crate::metadata::MetadataIriReferenceIndexRecord;
     use crate::structs::{PlacementRef, RealmId};
     use crate::{NodeId, UserId};
 
@@ -698,6 +738,47 @@ mod tests {
         AdminDocumentTarget::User {
             user_id: user_id(seed),
         }
+    }
+
+    #[test]
+    fn metadata_iri_reference_write_entry_roundtrips_exact_iris() {
+        let document_id = Ulid::from_bytes([7; 16]);
+        let record = MetadataIriReferenceIndexRecord {
+            document_id,
+            document_cursor: Ulid::from_bytes([8; 16]),
+            predicate_iri: "http://schema.org/conformsTo".to_string(),
+            object_iri: "https://example.test/profiles/one".to_string(),
+            subject_iris: vec!["https://example.test/dataset".to_string()],
+        };
+
+        let (keyspace, key, value) = metadata_iri_reference_write_entry(&record).unwrap();
+        let prefix = metadata_iri_reference_prefix(&record.predicate_iri, &record.object_iri);
+        let decoded: MetadataIriReferenceIndexRecord =
+            postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, METADATA_IRI_REFERENCE_INDEX_KEYSPACE);
+        assert_eq!(prefix.as_ref().len(), 64);
+        assert_eq!(key.as_ref().len(), 96);
+        assert!(key.as_ref().starts_with(prefix.as_ref()));
+        assert_eq!(
+            key,
+            metadata_iri_reference_key(
+                &record.predicate_iri,
+                &record.object_iri,
+                document_id,
+                record.document_cursor,
+            )
+        );
+        assert_ne!(
+            key,
+            metadata_iri_reference_key(
+                &record.predicate_iri,
+                &record.object_iri,
+                document_id,
+                Ulid::from_bytes([9; 16]),
+            )
+        );
+        assert_eq!(decoded, record);
     }
 
     fn realm_target(seed: u8) -> AdminDocumentTarget {

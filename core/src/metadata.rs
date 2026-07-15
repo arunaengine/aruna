@@ -176,6 +176,15 @@ pub struct MetadataMaterializationStatusRecord {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataIriReferenceIndexRecord {
+    pub document_id: Ulid,
+    pub document_cursor: Ulid,
+    pub predicate_iri: String,
+    pub object_iri: String,
+    pub subject_iris: Vec<String>,
+}
+
 impl MetadataMaterializationStatusRecord {
     pub fn pending(event: &MetadataCreateEventRecord, updated_at_ms: u64) -> Self {
         Self {
