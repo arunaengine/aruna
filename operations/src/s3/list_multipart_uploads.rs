@@ -1,10 +1,7 @@
 //! List multipart uploads for a bucket.
 //!
-//! The multipart upload keyspace is not indexed by bucket, so this operation
-//! performs bounded scan rounds over the whole keyspace and filters/sorts/paginates
-//! in memory. This is an accepted tradeoff for the current keyspace layout:
-//! multipart upload counts are small and short-lived, so no dedicated per-bucket
-//! index is maintained.
+//! Scans the global multipart keyspace and filters, sorts, and paginates in
+//! memory because no per-bucket index exists.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -73,17 +70,13 @@ pub struct ListMultipartUploadsOperation {
     txn_id: Option<Ulid>,
     uploads: Vec<MultipartUpload>,
     scan_cursor: Option<Key>,
-    scan_rounds: usize,
     scan_round_limit: usize,
-    max_scan_rounds: usize,
-    scan_incomplete: bool,
     output: Option<Result<ListMultipartUploadsResult, ListMultipartUploadsError>>,
 }
 
 impl ListMultipartUploadsOperation {
     pub const DEFAULT_MAX_UPLOADS: usize = 1_000;
     const SCAN_ROUND_LIMIT: usize = 100;
-    const MAX_SCAN_ROUNDS: usize = 100;
 
     pub fn new(input: ListMultipartUploadsInput) -> Self {
         Self {
@@ -92,18 +85,14 @@ impl ListMultipartUploadsOperation {
             txn_id: None,
             uploads: Vec::new(),
             scan_cursor: None,
-            scan_rounds: 0,
             scan_round_limit: Self::SCAN_ROUND_LIMIT,
-            max_scan_rounds: Self::MAX_SCAN_ROUNDS,
-            scan_incomplete: false,
             output: None,
         }
     }
 
     #[cfg(test)]
-    fn with_scan_limits(mut self, scan_round_limit: usize, max_scan_rounds: usize) -> Self {
+    fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
         self.scan_round_limit = scan_round_limit;
-        self.max_scan_rounds = max_scan_rounds;
         self
     }
 
@@ -149,7 +138,6 @@ impl ListMultipartUploadsOperation {
     }
 
     fn issue_upload_round(&mut self) -> Effects {
-        self.scan_rounds += 1;
         self.state = ListMultipartUploadsState::ReadUploads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
@@ -196,12 +184,7 @@ impl ListMultipartUploadsOperation {
             self.uploads.push(record);
         }
 
-        let target = self.input.max_uploads.saturating_add(1);
         if next_start_after.is_none() {
-            return self.finish_upload_scan();
-        }
-        if self.uploads.len() >= target || self.scan_rounds >= self.max_scan_rounds {
-            self.scan_incomplete = true;
             return self.finish_upload_scan();
         }
 
@@ -214,7 +197,6 @@ impl ListMultipartUploadsOperation {
         uploads.sort_by(|left, right| {
             left.key
                 .cmp(&right.key)
-                .then_with(|| left.created_at.cmp(&right.created_at))
                 .then_with(|| left.upload_id.cmp(&right.upload_id))
         });
         self.apply_marker(&mut uploads);
@@ -227,17 +209,12 @@ impl ListMultipartUploadsOperation {
             return;
         };
         let upload_id_marker = self.input.upload_id_marker;
-        let mut marker_seen = upload_id_marker.is_none();
 
         uploads.retain(|upload| match upload.key.as_str().cmp(key_marker) {
             std::cmp::Ordering::Less => false,
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Equal => {
-                let keep = marker_seen;
-                if Some(upload.upload_id) == upload_id_marker {
-                    marker_seen = true;
-                }
-                keep && upload_id_marker.is_some()
+                upload_id_marker.is_some_and(|marker| upload.upload_id > marker)
             }
         });
     }
@@ -254,7 +231,7 @@ impl ListMultipartUploadsOperation {
         let mut result_uploads = Vec::new();
         let mut common_prefixes = Vec::new();
         let mut emitted = 0usize;
-        let mut is_truncated = self.scan_incomplete;
+        let mut is_truncated = false;
         let mut next_key_marker = None;
         let mut next_upload_id_marker = None;
 
@@ -476,7 +453,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_scans_past_foreign_bucket_rounds() {
+    async fn scans_foreign_rounds() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -499,7 +476,7 @@ mod test {
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limits(2, 3),
+            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limit(1),
             &driver_ctx,
         )
         .await
@@ -513,7 +490,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_reports_truncation_at_scan_round_cap() {
+    async fn sorts_before_cutoff() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -521,22 +498,22 @@ mod test {
 
         seed_upload(
             &storage_handle,
-            &upload_record(Ulid::from_bytes([1; 16]), "other", "a"),
+            &upload_record(Ulid::from_bytes([1; 16]), "bucket", "z"),
         )
         .await;
         seed_upload(
             &storage_handle,
-            &upload_record(Ulid::from_bytes([2; 16]), "other", "b"),
+            &upload_record(Ulid::from_bytes([2; 16]), "bucket", "y"),
         )
         .await;
         seed_upload(
             &storage_handle,
-            &upload_record(Ulid::from_bytes([3; 16]), "bucket", "target"),
+            &upload_record(Ulid::from_bytes([3; 16]), "bucket", "a"),
         )
         .await;
 
         let result = drive(
-            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limits(2, 1),
+            ListMultipartUploadsOperation::new(input("bucket", 1)).with_scan_limit(2),
             &driver_ctx,
         )
         .await
@@ -544,7 +521,8 @@ mod test {
         .unwrap()
         .unwrap();
 
-        assert!(result.uploads.is_empty());
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].key, "a");
         assert!(result.is_truncated);
     }
 
@@ -627,7 +605,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_orders_same_key_by_initiation_time() {
+    async fn orders_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
@@ -682,7 +660,7 @@ mod test {
             .iter()
             .map(|upload| upload.upload_id)
             .collect();
-        assert_eq!(ordered, vec![older_higher_upload_id, newer_lower_upload_id]);
+        assert_eq!(ordered, vec![newer_lower_upload_id, older_higher_upload_id]);
     }
 
     #[tokio::test]
@@ -734,13 +712,17 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_multipart_uploads_resumes_same_key_after_upload_marker() {
+    async fn resumes_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = driver_context(storage_handle.clone());
 
-        let ids = [Ulid::r#gen(), Ulid::r#gen(), Ulid::r#gen()];
+        let ids = [
+            Ulid::from_bytes([1; 16]),
+            Ulid::from_bytes([2; 16]),
+            Ulid::from_bytes([3; 16]),
+        ];
         for (index, upload_id) in ids.iter().enumerate() {
             seed_upload(
                 &storage_handle,
@@ -748,7 +730,7 @@ mod test {
                     *upload_id,
                     "bucket",
                     "same-key",
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(index as u64),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs((ids.len() - index) as u64),
                 ),
             )
             .await;
@@ -770,7 +752,14 @@ mod test {
         .unwrap()
         .unwrap();
         assert!(first.is_truncated);
-        assert_eq!(first.uploads.len(), 2);
+        assert_eq!(
+            first
+                .uploads
+                .iter()
+                .map(|upload| upload.upload_id)
+                .collect::<Vec<_>>(),
+            ids[..2]
+        );
 
         let second = drive(
             ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
@@ -791,6 +780,50 @@ mod test {
         assert_eq!(second.uploads.len(), 1);
         assert_eq!(second.uploads[0].upload_id, ids[2]);
         assert!(!second.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn resumes_missing_marker() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+
+        let lower = Ulid::from_bytes([1; 16]);
+        let marker = Ulid::from_bytes([2; 16]);
+        let higher = Ulid::from_bytes([3; 16]);
+        seed_upload(&storage_handle, &upload_record(lower, "bucket", "same-key")).await;
+        seed_upload(
+            &storage_handle,
+            &upload_record(higher, "bucket", "same-key"),
+        )
+        .await;
+
+        let result = drive(
+            ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+                bucket: "bucket".to_string(),
+                prefix: None,
+                delimiter: None,
+                key_marker: Some("same-key".to_string()),
+                upload_id_marker: Some(marker),
+                max_uploads: 2,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            result
+                .uploads
+                .iter()
+                .map(|upload| upload.upload_id)
+                .collect::<Vec<_>>(),
+            vec![higher]
+        );
+        assert!(!result.is_truncated);
     }
 
     #[tokio::test]
