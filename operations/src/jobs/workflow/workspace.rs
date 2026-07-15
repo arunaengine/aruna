@@ -127,7 +127,13 @@ async fn stage_one_input(
     } = &input.source;
     let version = version_id
         .as_deref()
-        .and_then(|v| Ulid::from_string(v).ok());
+        .map(Ulid::from_string)
+        .transpose()
+        .map_err(|_| {
+            JobError::permanent(format!(
+                "invalid input version_id for {src_bucket}/{src_key}"
+            ))
+        })?;
     let bucket_info = drive(GetBucketInfoOperation::new(src_bucket.clone()), context)
         .await
         .and_then(|result| result.transpose())
