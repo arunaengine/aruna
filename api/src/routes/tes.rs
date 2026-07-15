@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState,
+    JobPayload, JobRecord, JobResultPayload, JobState, blob_group_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
@@ -883,7 +883,7 @@ async fn ensure_group_write(
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth.clone(),
-            path: format!("/{}/g/{group_id}/data/**", state.get_realm_id()),
+            path: blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
             required_permission: aruna_core::structs::Permission::WRITE,
         }),
         &state.get_ctx(),
