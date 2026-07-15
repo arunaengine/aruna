@@ -112,11 +112,6 @@ pub enum MultipartObjectMetadataKey {
 }
 
 impl MultipartObjectMetadataKey {
-    const SUMMARY_TAG: u8 = 0;
-    const PART_TAG: u8 = 1;
-    const VERSION_LEN: usize = 16;
-    const PART_LEN: usize = 2;
-
     pub fn summary(version_id: Ulid) -> Self {
         Self::Summary { version_id }
     }
@@ -129,49 +124,22 @@ impl MultipartObjectMetadataKey {
     }
 
     pub fn part_prefix(version_id: Ulid) -> Result<Vec<u8>, ConversionError> {
-        let mut prefix = Vec::with_capacity(1 + Self::VERSION_LEN);
-        prefix.push(Self::PART_TAG);
-        prefix.extend_from_slice(&version_id.to_bytes());
+        let mut prefix = Self::Part {
+            version_id,
+            part_number: 0,
+        }
+        .to_bytes()?;
+        let part_number_len = postcard::to_allocvec(&0u16)?.len();
+        prefix.truncate(prefix.len().saturating_sub(part_number_len));
         Ok(prefix)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(match self {
-            Self::Summary { version_id } => {
-                let mut bytes = Vec::with_capacity(1 + Self::VERSION_LEN);
-                bytes.push(Self::SUMMARY_TAG);
-                bytes.extend_from_slice(&version_id.to_bytes());
-                bytes
-            }
-            Self::Part {
-                version_id,
-                part_number,
-            } => {
-                let mut bytes = Vec::with_capacity(1 + Self::VERSION_LEN + Self::PART_LEN);
-                bytes.push(Self::PART_TAG);
-                bytes.extend_from_slice(&version_id.to_bytes());
-                bytes.extend_from_slice(&part_number.to_be_bytes());
-                bytes
-            }
-        })
+        Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let (&tag, rest) = bytes
-            .split_first()
-            .ok_or_else(|| ConversionError::InvalidLength("empty multipart metadata key".into()))?;
-        match tag {
-            Self::SUMMARY_TAG if rest.len() == Self::VERSION_LEN => Ok(Self::Summary {
-                version_id: Ulid::from_bytes(rest.try_into()?),
-            }),
-            Self::PART_TAG if rest.len() == Self::VERSION_LEN + Self::PART_LEN => Ok(Self::Part {
-                version_id: Ulid::from_bytes(rest[..Self::VERSION_LEN].try_into()?),
-                part_number: u16::from_be_bytes(rest[Self::VERSION_LEN..].try_into()?),
-            }),
-            _ => Err(ConversionError::InvalidLength(
-                "malformed multipart metadata key".into(),
-            )),
-        }
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -179,16 +147,42 @@ impl MultipartObjectMetadataKey {
 pub struct MultipartObjectSummary {
     pub checksum_type: MultipartChecksumType,
     pub part_count: usize,
+    #[serde(skip)]
     pub composite_hashes: HashMap<String, Vec<u8>>,
 }
 
 impl MultipartObjectSummary {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        #[derive(Serialize)]
+        struct StoredSummary<'a> {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: &'a HashMap<String, Vec<u8>>,
+        }
+
+        Ok(postcard::to_allocvec(&StoredSummary {
+            checksum_type: self.checksum_type,
+            part_count: self.part_count,
+            composite_hashes: &self.composite_hashes,
+        })?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        #[derive(Deserialize)]
+        struct StoredSummary {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: HashMap<String, Vec<u8>>,
+        }
+
+        match postcard::from_bytes::<StoredSummary>(bytes) {
+            Ok(summary) => Ok(Self {
+                checksum_type: summary.checksum_type,
+                part_count: summary.part_count,
+                composite_hashes: summary.composite_hashes,
+            }),
+            Err(_) => Ok(postcard::from_bytes(bytes)?),
+        }
     }
 }
 
@@ -211,7 +205,9 @@ impl MultipartObjectPart {
 
 #[cfg(test)]
 mod test {
-    use super::MultipartObjectMetadataKey;
+    use super::{MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use ulid::Ulid;
 
     // Prefix keeps the whole version id, spans all part numbers, excludes the summary.
@@ -224,7 +220,7 @@ mod test {
         let zero_part = MultipartObjectMetadataKey::part(version_id, 0)
             .to_bytes()
             .unwrap();
-        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 2]);
+        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 1]);
 
         // Every part key for this version shares the prefix, across part numbers.
         for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
@@ -310,5 +306,71 @@ mod test {
         }
         assert!(MultipartObjectMetadataKey::from_bytes(&[]).is_err());
         assert!(MultipartObjectMetadataKey::from_bytes(&[9u8; 5]).is_err());
+    }
+
+    #[test]
+    fn keys_keep_legacy() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        for key in [
+            MultipartObjectMetadataKey::summary(version_id),
+            MultipartObjectMetadataKey::part(version_id, 256),
+        ] {
+            let legacy_bytes = postcard::to_allocvec(&key).unwrap();
+            assert_eq!(key.to_bytes().unwrap(), legacy_bytes);
+            assert_eq!(
+                MultipartObjectMetadataKey::from_bytes(&legacy_bytes).unwrap(),
+                key
+            );
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+    struct LegacySummary {
+        checksum_type: MultipartChecksumType,
+        part_count: usize,
+    }
+
+    #[test]
+    fn decodes_legacy_summary() {
+        let legacy = LegacySummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 3,
+        };
+
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&postcard::to_allocvec(&legacy).unwrap()).unwrap(),
+            MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 3,
+                composite_hashes: HashMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn retains_summary_hashes() {
+        let summary = MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 2,
+            composite_hashes: HashMap::from([("sha256".to_string(), vec![7u8; 32])]),
+        };
+        let legacy = LegacySummary {
+            checksum_type: summary.checksum_type,
+            part_count: summary.part_count,
+        };
+
+        assert_eq!(
+            postcard::to_allocvec(&summary).unwrap(),
+            postcard::to_allocvec(&legacy).unwrap()
+        );
+        assert_eq!(
+            postcard::from_bytes::<LegacySummary>(&postcard::to_allocvec(&summary).unwrap())
+                .unwrap(),
+            legacy
+        );
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
     }
 }
