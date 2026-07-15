@@ -24,7 +24,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind, shard_for_subject,
+    RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
@@ -34,6 +34,7 @@ use aruna_operations::announce_realm_presence::{
 };
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    mint_local_document_id,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::document_sync_outbox::read_outbox_records;
@@ -77,13 +78,41 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
+/// Mints the structured id a create on `node_id` must carry, from the realm
+/// config's pre-provisioned binding and a bucket that node holds.
+fn mint_local(
+    config: &RealmConfigDocument,
+    node_id: aruna_core::NodeId,
+    realm_id: RealmId,
+    group_id: Ulid,
+    path: &str,
+) -> Ulid {
+    mint_local_document_id(
+        config,
+        &Actor {
+            node_id,
+            user_id: UserId::local(Ulid::r#gen(), realm_id),
+            realm_id,
+        },
+        group_id,
+        path,
+    )
+    .expect("mint local structured id")
+}
+
 #[tokio::test]
 async fn metadata_creation_replicates_to_all_three_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/bootstrap",
+    );
 
     let visible_nodes = drive(
         GetRealmNodesOperation::new(realm_id),
@@ -134,10 +163,10 @@ async fn metadata_creation_replicates_to_all_three_holders()
 #[tokio::test]
 async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([46u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 4).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 4).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
     let document_path = "datasets/replan-holder-refresh";
+    let document_id = mint_local(&config, nodes[0].net.node_id(), realm_id, group_id, document_path);
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -274,10 +303,16 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([47u8; 32]);
-    let (nodes, _config, refreshers) =
+    let (nodes, config, refreshers) =
         build_pinned_realm(&realm_id, &[11, 12, 13, 14], &[false, true, true, true]).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/flush-after-drain",
+    );
     let (placement, initial_holders, update_event_id) = seed_and_update(
         &nodes,
         realm_id,
@@ -324,10 +359,16 @@ async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([48u8; 32]);
-    let (nodes, _config, refreshers) =
+    let (nodes, config, refreshers) =
         build_pinned_realm(&realm_id, &[21, 22, 23, 24], &[false, true, true, true]).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/publish-before-drain",
+    );
     let (placement, initial_holders, update_event_id) = seed_and_update(
         &nodes,
         realm_id,
@@ -565,12 +606,9 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
     let held = held_buckets(&config, strategy, origin);
     assert!(!held.is_empty() && held.len() < strategy.shard_count as usize);
 
-    let hashed_shard =
-        |document_id: Ulid| shard_for_subject(&document_id.to_bytes(), strategy.shard_count);
-    let mut document_id = Ulid::r#gen();
-    while held.contains(&hashed_shard(document_id)) {
-        document_id = Ulid::r#gen();
-    }
+    // The bucket is chosen from the origin's held set and embedded in the id, so
+    // the id never hashes the origin out of its own bucket: the create converges.
+    let document_id = mint_local(&config, origin, realm_id, group_id, document_path);
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -595,7 +633,8 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .record;
 
-    assert!(!held.contains(&hashed_shard(document_id)));
+    // The stamped bucket is one the origin holds (chosen from its held set),
+    // never a blind hash of the id, so the origin can always publish it.
     assert!(held.contains(&created.placement.shard));
 
     let mut holders = resolve_shard_holders(&config, &created.placement);
@@ -611,9 +650,15 @@ async fn origin_off_hash_converges() -> Result<(), Box<dyn std::error::Error>> {
 async fn metadata_updates_and_deletes_apply_to_local_holder()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
-    let (nodes, _config) = build_realm_nodes(&realm_id, 3).await?;
+    let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::r#gen();
-    let document_id = Ulid::r#gen();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/propagation",
+    );
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
