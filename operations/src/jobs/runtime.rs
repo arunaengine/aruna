@@ -25,8 +25,8 @@ use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payl
 use super::reconcile::ExternalReconciler;
 use super::store::{
     JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, fail_job,
-    flush_progress, iter_prefix_page, read_job_record, release_job, renew_lease, requeue_job,
-    transition_to_running,
+    flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record, release_job,
+    renew_lease, requeue_job, transition_to_running,
 };
 use super::submit::schedule_job_drain_effect;
 use super::{
@@ -76,7 +76,7 @@ pub struct JobsRuntime {
     reconciler: Option<Arc<dyn ExternalReconciler>>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
-    /// means "stop here, the lease goes back to the queue and the job runs again".
+    /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
 }
 
@@ -235,14 +235,21 @@ impl JobsRuntime {
             state
                 .running
                 .iter()
-                .map(|(job_id, job)| (*job_id, job.claim_token, job.completion.subscribe()))
+                .map(|(job_id, job)| {
+                    (
+                        *job_id,
+                        job.class,
+                        job.claim_token,
+                        job.completion.subscribe(),
+                    )
+                })
                 .collect()
         };
         self.shutdown.cancel();
 
         let deadline = Instant::now() + grace;
         let mut report = JobShutdownReport::default();
-        for (job_id, claim_token, mut completion) in waiters {
+        for (job_id, class, claim_token, mut completion) in waiters {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
                 let _ = tokio::time::timeout(remaining, completion.changed()).await;
@@ -251,7 +258,16 @@ impl JobsRuntime {
                 report.finished += 1;
                 continue;
             }
-            match release_job(storage, job_id, claim_token, unix_timestamp_millis()).await {
+            let released = match class {
+                JobExecutionClass::InProcess => {
+                    release_job(storage, job_id, claim_token, unix_timestamp_millis()).await
+                }
+                JobExecutionClass::ExternalAttempt => {
+                    handoff_external_attempt(storage, job_id, claim_token, unix_timestamp_millis())
+                        .await
+                }
+            };
+            match released {
                 Ok(ReleaseOutcome::Released(_)) => report.released += 1,
                 Ok(ReleaseOutcome::Skipped) => report.skipped += 1,
                 Err(JobMutationError::TokenMismatch) => {

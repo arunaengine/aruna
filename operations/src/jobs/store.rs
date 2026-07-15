@@ -581,6 +581,41 @@ pub async fn release_job(
     })
 }
 
+/// Hand an external execution to reconciliation without re-queuing it.
+/// Rotating the token fences the old supervisor; the expired replacement claim keeps
+/// the unchanged state and attempt intent discoverable by the lease sweep.
+pub async fn handoff_external_attempt(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    let mut released = false;
+    let record = mutate_job(storage, job_id, |record| {
+        released = false;
+        guard_token(record, token)?;
+        if record.execution_class != JobExecutionClass::ExternalAttempt
+            || record.state.is_terminal()
+        {
+            return Ok(JobMutation::Skip);
+        }
+        if let Some(claim) = record.claim.as_mut() {
+            claim.claim_token = Ulid::r#gen();
+            claim.lease_expires_at_ms = now_ms;
+        }
+        record.updated_at_ms = now_ms;
+        released = true;
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+
+    Ok(if released {
+        ReleaseOutcome::Released(record)
+    } else {
+        ReleaseOutcome::Skipped
+    })
+}
+
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
 /// external submit so a lost attempt can be adopted by name. Token-fenced; no state
 /// change.
