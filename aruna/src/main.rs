@@ -456,20 +456,41 @@ async fn build_compute_registry(
         "docker" => build_docker(config).await,
         "apptainer" => build_apptainer(config).await,
         "kubernetes" => build_kubernetes(config).await,
-        other => Err(format!("unknown ARUNA_COMPUTE_EXECUTOR `{other}`")),
+        other => Err(ComputeBuildError::Config(format!(
+            "unknown ARUNA_COMPUTE_EXECUTOR `{other}`"
+        ))),
     };
     match result {
         Ok(registry) => Ok(Some(Arc::new(registry))),
-        Err(error) if env_true("ARUNA_COMPUTE_OPTIONAL") => {
+        Err(ComputeBuildError::Unavailable(error)) if env_true("ARUNA_COMPUTE_OPTIONAL") => {
             warn!(executor = %selected, reason = %error, "Compute executor unavailable; running without compute");
             Ok(None)
         }
-        Err(error) => Err(error),
+        Err(ComputeBuildError::Config(error) | ComputeBuildError::Unavailable(error)) => Err(error),
+    }
+}
+
+enum ComputeBuildError {
+    Config(String),
+    Unavailable(String),
+}
+
+impl From<String> for ComputeBuildError {
+    fn from(error: String) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<&'static str> for ComputeBuildError {
+    fn from(error: &'static str) -> Self {
+        Self::Config(error.to_string())
     }
 }
 
 #[cfg(feature = "docker")]
-async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+async fn build_docker(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
     let disk_bytes = parse_disk_limit(
         dotenvy::var("ARUNA_COMPUTE_DOCKER_DISK_BYTES")
             .ok()
@@ -480,14 +501,22 @@ async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry
         .clone()
         .ok_or_else(|| "Docker executor requires S3_PUBLIC_URL".to_string())?;
     if container_local_endpoint(&endpoint) {
-        return Err("Docker executor requires a container-reachable S3_PUBLIC_URL".to_string());
+        return Err(
+            "Docker executor requires a container-reachable S3_PUBLIC_URL"
+                .to_string()
+                .into(),
+        );
     }
     if !config
         .s3_address
         .parse::<std::net::SocketAddr>()
         .is_ok_and(|address| !address.ip().is_loopback())
     {
-        return Err("Docker executor requires a non-loopback S3_ADDRESS".to_string());
+        return Err(
+            "Docker executor requires a non-loopback S3_ADDRESS"
+                .to_string()
+                .into(),
+        );
     }
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
@@ -497,7 +526,7 @@ async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry
         .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Docker executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
@@ -505,12 +534,16 @@ async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry
 }
 
 #[cfg(not(feature = "docker"))]
-async fn build_docker(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
-    Err("Docker executor feature is not compiled".to_string())
+async fn build_docker(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Docker executor feature is not compiled".to_string().into())
 }
 
 #[cfg(feature = "apptainer")]
-async fn build_apptainer(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+async fn build_apptainer(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
     let cgroup_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
         .map(std::path::PathBuf::from)
         .map_err(|_| {
@@ -534,7 +567,7 @@ async fn build_apptainer(config: &Config) -> Result<aruna_compute::ExecutorRegis
     .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Apptainer executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
@@ -542,12 +575,16 @@ async fn build_apptainer(config: &Config) -> Result<aruna_compute::ExecutorRegis
 }
 
 #[cfg(not(feature = "apptainer"))]
-async fn build_apptainer(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
-    Err("Apptainer executor feature is not compiled".to_string())
+async fn build_apptainer(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Apptainer executor feature is not compiled".to_string().into())
 }
 
 #[cfg(feature = "kubernetes")]
-async fn build_kubernetes(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+async fn build_kubernetes(
+    config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
     let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS")
         .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string())?;
     let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE")
@@ -580,7 +617,7 @@ async fn build_kubernetes(config: &Config) -> Result<aruna_compute::ExecutorRegi
     .map_err(|error| error.to_string())?;
     aruna_compute::ExecutorBackend::health(&backend)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Kubernetes executor backend enabled");
     Ok(aruna_compute::ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
@@ -588,8 +625,10 @@ async fn build_kubernetes(config: &Config) -> Result<aruna_compute::ExecutorRegi
 }
 
 #[cfg(not(feature = "kubernetes"))]
-async fn build_kubernetes(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
-    Err("Kubernetes executor feature is not compiled".to_string())
+async fn build_kubernetes(
+    _config: &Config,
+) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
+    Err("Kubernetes executor feature is not compiled".to_string().into())
 }
 
 fn env_true(name: &str) -> bool {
