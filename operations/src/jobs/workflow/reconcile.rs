@@ -1,5 +1,6 @@
 use std::sync::{Arc, Weak};
 
+use aruna_compute::backend::ExecutorKind;
 use aruna_compute::spec::AttemptRef;
 use aruna_compute::status::{AttemptPhase, ReconcileOutcome};
 use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
@@ -16,8 +17,8 @@ use super::super::store::{
 };
 use super::workspace::{load_inputs, mint_workspace_credential};
 use super::{
-    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, resolve_backend,
-    supervise_and_finalize, with_execution_heartbeat,
+    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, supervise_and_finalize,
+    with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
 
@@ -41,14 +42,6 @@ impl ExternalReconciler for ComputeReconciler {
         let job_id = record.job_id;
         let JobPayload::Execution(spec) = record.payload.clone() else {
             return;
-        };
-
-        let backend = match resolve_backend(&self.context, &spec) {
-            Ok(backend) => backend,
-            Err(error) => {
-                warn!(job_id = %job_id, error = ?error, "Reconcile has no backend for job");
-                return;
-            }
         };
 
         // Take over with a fresh claim token, but only if the old holder is really gone.
@@ -77,6 +70,21 @@ impl ExternalReconciler for ComputeReconciler {
         // No durable attempt intent means the attempt was never submitted; release
         // the adopted lease without charging an attempt.
         let Some(intent) = adopted.attempt_intent.clone() else {
+            let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
+            return;
+        };
+
+        // Query the executor persisted in the intent: registry-first selection
+        // could ask the wrong backend and park a live attempt as absent.
+        let kind = ExecutorKind::from_wire(&intent.executor_kind);
+        let Some(backend) = self
+            .context
+            .compute_handle
+            .as_ref()
+            .and_then(|registry| registry.get(&kind))
+            .cloned()
+        else {
+            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; releasing");
             let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
             return;
         };
