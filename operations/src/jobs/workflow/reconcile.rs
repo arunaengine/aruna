@@ -13,12 +13,13 @@ use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
     AdoptOutcome, adopt_external_attempt, handoff_external_attempt, mark_indeterminate,
-    read_job_record, record_attempt_started, release_job, transition_external_to_running,
+    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
+    transition_external_to_running,
 };
 use super::workspace::{load_inputs, mint_workspace_credential};
 use super::{
-    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, supervise_and_finalize,
-    with_execution_heartbeat,
+    build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, requeue_after_tombstone,
+    supervise_and_finalize, with_execution_heartbeat,
 };
 use crate::driver::DriverContext;
 
@@ -225,13 +226,15 @@ impl ExternalReconciler for ComputeReconciler {
             }
             // Post-submit absence is ambiguous: never requeue, park in Indeterminate.
             ReconcileEvidence::Absent => {
-                info!(job_id = %job_id, "Adopted attempt not found; parking Indeterminate");
-                let _ = mark_indeterminate(
-                    storage,
+                self.resume(
                     job_id,
                     token,
-                    JobError::retryable("adopted attempt not found"),
-                    unix_timestamp_millis(),
+                    backend,
+                    fence,
+                    AttemptPhase::Submitted,
+                    spec,
+                    bucket,
+                    adopted,
                 )
                 .await;
             }
@@ -245,7 +248,10 @@ impl ExternalReconciler for ComputeReconciler {
                 )
                 .await;
             }
-            ReconcileEvidence::Unadoptable(_) | ReconcileEvidence::Tombstoned(_) => {
+            ReconcileEvidence::Unadoptable(artifact) => {
+                if artifact.exact_identity {
+                    let _ = backend.cancel(&fence).await;
+                }
                 let _ = mark_indeterminate(
                     storage,
                     job_id,
@@ -254,6 +260,29 @@ impl ExternalReconciler for ComputeReconciler {
                     unix_timestamp_millis(),
                 )
                 .await;
+            }
+            ReconcileEvidence::Tombstoned(tombstone) => {
+                if record_attempt_tombstone(
+                    storage,
+                    job_id,
+                    token,
+                    fence.attempt_epoch,
+                    tombstone.backend_ref,
+                )
+                .await
+                .is_ok()
+                {
+                    requeue_after_tombstone(
+                        &self.context,
+                        job_id,
+                        token,
+                        &adopted,
+                        &aruna_core::compute::BackendError::Unavailable(
+                            "attempt tombstoned".to_string(),
+                        ),
+                    )
+                    .await;
+                }
             }
         }
     }

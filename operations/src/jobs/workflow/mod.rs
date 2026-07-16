@@ -12,7 +12,7 @@ use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
     FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, Secret, TaskInput,
-    TaskSpec, WorkspaceBinding,
+    TaskSpec, TombstoneSpec, WorkspaceBinding,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -30,12 +30,13 @@ use super::JOB_HEARTBEAT_MS;
 use super::store::{
     ExecutionCompleteOutcome, JobMutationError, cancel_execution, cancel_running_job,
     complete_execution, complete_job, fail_execution, mark_indeterminate, read_job_record,
-    record_attempt_intent, record_attempt_started, renew_lease, requeue_before_attempt,
-    set_workspace_bucket, transition_external_to_running, transition_to_cancelling,
-    transition_to_preparing, transition_to_ready,
+    record_attempt_intent, record_attempt_started, record_attempt_tombstone, renew_lease,
+    requeue_before_attempt, set_workspace_bucket, transition_external_to_running,
+    transition_to_cancelling, transition_to_preparing, transition_to_ready,
 };
 use super::submit::schedule_job_drain_effect;
 use crate::driver::DriverContext;
+use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
     mint_workspace_credential, stage_inputs,
@@ -182,9 +183,7 @@ pub async fn run_execution_job(
                 return None;
             }
             Err(error) => {
-                return Some(Err((
-                    backend, fence, task_spec, spec, bucket, cancel, error,
-                )));
+                return Some(Err((backend, fence, spec, bucket, cancel, error)));
             }
         };
 
@@ -235,11 +234,11 @@ pub async fn run_execution_job(
             )
             .await;
         }
-        Err((backend, fence, task_spec, spec, bucket, cancel, error)) => {
+        Err((backend, fence, spec, bucket, cancel, error)) => {
             let resumed = {
                 let recovery = recover_failed_submit(
-                    &context, job_id, token, &backend, &fence, &task_spec, &spec, &bucket, &record,
-                    &cancel, error,
+                    &context, job_id, token, &backend, &fence, &spec, &bucket, &record, &cancel,
+                    error,
                 );
                 tokio::pin!(recovery);
                 tokio::select! {
@@ -378,7 +377,6 @@ async fn recover_failed_submit(
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
     fence: &FenceContext,
-    task_spec: &TaskSpec,
     spec: &ExecutionSpec,
     bucket: &str,
     record: &JobRecord,
@@ -397,16 +395,43 @@ async fn recover_failed_submit(
         finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
         return false;
     }
-    match backend.reconcile(fence).await {
-        // Confirmed absent: the submit failed before a container could exist, so
-        // the pre-submit routing (requeue with backoff, or terminal fail) is safe.
-        ReconcileEvidence::Absent => {
-            park_failed_submit(context, job_id, token, &error).await;
-            false
-        }
-        // The attempt already finished: commit its evidence.
-        ReconcileEvidence::Adoptable(evidence) if evidence.status.is_terminal() => {
+    let evidence = backend.reconcile(fence).await;
+    match recovery_action(&evidence) {
+        RecoveryAction::Observe => {
+            let ReconcileEvidence::Adoptable(evidence) = evidence else {
+                return false;
+            };
             let status = evidence.status;
+            if status.is_terminal() {
+                let running = match transition_external_to_running(
+                    storage,
+                    job_id,
+                    token,
+                    status.started_at_ms,
+                    unix_timestamp_millis(),
+                )
+                .await
+                {
+                    Ok(record) => record,
+                    Err(_) => return false,
+                };
+                if running.cancel_requested {
+                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                    return false;
+                }
+                finalize_attempt(
+                    context,
+                    job_id,
+                    token,
+                    backend,
+                    fence,
+                    spec,
+                    bucket,
+                    Ok(status),
+                )
+                .await;
+                return false;
+            }
             let running = match transition_external_to_running(
                 storage,
                 job_id,
@@ -423,54 +448,42 @@ async fn recover_failed_submit(
                 finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
                 return false;
             }
-            finalize_attempt(
-                context,
-                job_id,
-                token,
-                backend,
-                fence,
-                spec,
-                bucket,
-                Ok(status),
-            )
-            .await;
-            false
+            true
         }
-        // The container exists and is live: adopt it, never launch a second one.
-        // A created-but-never-started container is completed in place; the name
-        // collision makes the re-submit idempotent.
-        ReconcileEvidence::Adoptable(evidence) => {
-            let status = evidence.status;
-            let mut started_at_ms = status.started_at_ms;
-            if matches!(&status.phase, AttemptPhase::Submitted) {
-                match backend.submit(fence, task_spec, cancel).await {
-                    Ok(resubmitted) => started_at_ms = resubmitted.started_at_ms.or(started_at_ms),
-                    Err(BackendError::Cancelled) => {
-                        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
-                        return false;
-                    }
-                    Err(resubmit_error) if resubmit_error.retryable() => {
-                        park_failed_submit(context, job_id, token, &resubmit_error).await;
-                        return false;
-                    }
-                    Err(resubmit_error) => {
-                        fail_and_crate(
-                            context,
-                            job_id,
-                            token,
-                            record,
-                            JobError::permanent(format!("resubmit failed: {resubmit_error}")),
-                        )
-                        .await;
-                        return false;
-                    }
+        RecoveryAction::RetrySame => {
+            let status = match retry_same_submit(
+                context, backend, fence, spec, bucket, record, cancel,
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(BackendError::Cancelled) => {
+                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
+                    return false;
                 }
-            }
+                Err(retry_error) if retry_error.retryable() => {
+                    park_failed_submit(context, job_id, token, &retry_error).await;
+                    return false;
+                }
+                Err(retry_error) => {
+                    retire_failed_submit(
+                        context,
+                        job_id,
+                        token,
+                        backend,
+                        fence,
+                        record,
+                        &retry_error,
+                    )
+                    .await;
+                    return false;
+                }
+            };
             let running = match transition_external_to_running(
                 storage,
                 job_id,
                 token,
-                started_at_ms,
+                status.started_at_ms,
                 unix_timestamp_millis(),
             )
             .await
@@ -484,15 +497,113 @@ async fn recover_failed_submit(
             }
             true
         }
-        // Backend unobservable: park; the retained intent keeps the attempt
-        // adoptable when the lease sweep routes the job to the reconciler.
-        ReconcileEvidence::Unavailable(_)
-        | ReconcileEvidence::Unadoptable(_)
-        | ReconcileEvidence::Tombstoned(_) => {
+        RecoveryAction::Cleanup => {
+            let _ = backend.cancel(fence).await;
+            park_failed_submit(context, job_id, token, &error).await;
+            false
+        }
+        RecoveryAction::Retire => {
+            let ReconcileEvidence::Tombstoned(tombstone) = evidence else {
+                return false;
+            };
+            if record_attempt_tombstone(
+                storage,
+                job_id,
+                token,
+                fence.attempt_epoch,
+                tombstone.backend_ref,
+            )
+            .await
+            .is_err()
+            {
+                return false;
+            }
+            requeue_after_tombstone(context, job_id, token, record, &error).await;
+            false
+        }
+        RecoveryAction::Park => {
             park_failed_submit(context, job_id, token, &error).await;
             false
         }
     }
+}
+
+async fn retry_same_submit(
+    context: &Arc<DriverContext>,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    record: &JobRecord,
+    cancel: &CancellationToken,
+) -> Result<AttemptStatus, BackendError> {
+    let node_id = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or_else(|| BackendError::Unavailable("retry needs a net handle".to_string()))?;
+    let credential = mint_workspace_credential(context, spec, record, node_id, bucket)
+        .await
+        .map_err(|error| BackendError::Unavailable(error.message))?;
+    let inputs = load_inputs(context, spec, record, bucket)
+        .await
+        .map_err(|error| BackendError::Unavailable(error.message))?;
+    let task_spec = build_task_spec(
+        context,
+        spec,
+        &fence.attempt,
+        &credential,
+        bucket,
+        node_id,
+        inputs,
+    );
+    backend.submit(fence, &task_spec, cancel).await
+}
+
+async fn retire_failed_submit(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    record: &JobRecord,
+    error: &BackendError,
+) {
+    let Ok(tombstone) = backend
+        .tombstone(fence, &TombstoneSpec { terminal_ref: None })
+        .await
+    else {
+        park_failed_submit(context, job_id, token, error).await;
+        return;
+    };
+    if record_attempt_tombstone(
+        &context.storage_handle,
+        job_id,
+        token,
+        fence.attempt_epoch,
+        tombstone.backend_ref,
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    requeue_after_tombstone(context, job_id, token, record, error).await;
+}
+
+pub(super) async fn requeue_after_tombstone(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    record: &JobRecord,
+    error: &BackendError,
+) {
+    let job_error = if error.retryable() {
+        JobError::retryable(format!("submit failed: {error}"))
+    } else {
+        JobError::permanent(format!("submit failed: {error}"))
+    };
+    requeue_or_fail_pre_submit(context, job_id, token, record, job_error).await;
 }
 
 async fn park_failed_submit(
@@ -1401,7 +1512,6 @@ mod tests {
         let ctx = context(storage.clone());
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::Unavailable);
-        let task_spec = TaskSpec::new(attempt.clone(), "alpine:3");
 
         recover_failed_submit(
             &ctx,
@@ -1409,7 +1519,6 @@ mod tests {
             token,
             &backend,
             &fence(&attempt),
-            &task_spec,
             &execution_spec(),
             "ws-test",
             &record,
@@ -1622,7 +1731,6 @@ mod tests {
         let ctx = context(storage.clone());
         let (record, token, attempt) = ready_with_intent(&storage).await;
         let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
-        let task_spec = TaskSpec::new(attempt.clone(), "alpine:3");
 
         recover_failed_submit(
             &ctx,
@@ -1630,7 +1738,6 @@ mod tests {
             token,
             &backend,
             &fence(&attempt),
-            &task_spec,
             &execution_spec(),
             "ws-test",
             &record,
