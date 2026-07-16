@@ -91,6 +91,7 @@ impl DockerTestExt for DockerBackend {
             secret_env: spec.secret_env.clone(),
             resources: spec.resources.clone(),
             workspace: spec.workspace.clone(),
+            security: spec.security.clone(),
             log_limits: spec.log_limits,
         };
         aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), &pinned, cancel).await
@@ -159,7 +160,6 @@ async fn daemon() -> Option<DockerBackend> {
         state_root: std::env::temp_dir()
             .join("aruna-compute-tests")
             .join(unique("state")),
-        network_mode: Some("none".to_string()),
         ..DockerConfig::default()
     };
     let backend = DockerBackend::with_config(config).ok()?;
@@ -268,20 +268,20 @@ async fn file_transfer() {
     let cancel = CancellationToken::new();
     let mut spec = sh(
         &unique("files"),
-        "test \"$(stat -c %a /tmp)\" = 1777 && cat /tmp/aruna-input.txt > /tmp/aruna-output.txt",
+        "test \"$(stat -c %a /output)\" = 777 && cat /input/aruna.txt > /output/aruna.txt",
     );
     spec.inputs.push(TaskInput::from_bytes(
-        "/tmp/aruna-input.txt",
+        "/input/aruna.txt",
         b"hello from aruna".to_vec(),
     ));
-    spec.output_paths.push("/tmp/aruna-output.txt".to_string());
+    spec.output_paths.push("/output/aruna.txt".to_string());
     let attempt = spec.attempt.clone();
 
     backend.submit(&spec, &cancel).await.unwrap();
     let status = backend.wait(&attempt, &cancel).await.unwrap();
     assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
     assert_eq!(
-        read_output(&backend, &attempt, "/tmp/aruna-output.txt").await,
+        read_output(&backend, &attempt, "/output/aruna.txt").await,
         b"hello from aruna"
     );
 
@@ -296,7 +296,7 @@ async fn chunked_transfer() {
     let cancel = CancellationToken::new();
     let mut spec = sh(
         &unique("chunks"),
-        "cat /tmp/aruna-input.bin > /tmp/aruna-output.bin",
+        "cat /input/aruna.bin > /output/aruna.bin",
     );
     let chunk_count = 16usize;
     let chunk_len = 64 * 1024usize;
@@ -309,18 +309,18 @@ async fn chunked_transfer() {
         })
         .collect();
     spec.inputs.push(TaskInput::from_stream(
-        "/tmp/aruna-input.bin",
+        "/input/aruna.bin",
         payload.len() as u64,
         Box::pin(futures_util::stream::iter(chunks)),
     ));
-    spec.output_paths.push("/tmp/aruna-output.bin".to_string());
+    spec.output_paths.push("/output/aruna.bin".to_string());
     let attempt = spec.attempt.clone();
 
     backend.submit(&spec, &cancel).await.unwrap();
     let status = backend.wait(&attempt, &cancel).await.unwrap();
     assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
     assert_eq!(
-        read_output(&backend, &attempt, "/tmp/aruna-output.bin").await,
+        read_output(&backend, &attempt, "/output/aruna.bin").await,
         payload
     );
 
@@ -427,7 +427,6 @@ async fn created_cancel_removes() {
             .join("aruna-compute-tests")
             .join(unique("state")),
         keep_failed: true,
-        network_mode: Some("none".to_string()),
         ..DockerConfig::default()
     })
     .unwrap();
@@ -623,31 +622,23 @@ async fn foreign_not_adopted() {
 }
 
 #[tokio::test]
-async fn walltime_enforced() {
-    // A run past its walltime ceiling is stopped and surfaces a backend failure
-    // instead of running forever.
+async fn wait_is_observational() {
+    // Operations owns walltime cancellation; backend wait only observes.
     let backend = backend_or_skip!();
-    let mut spec = sh(&unique("wall"), "sleep 300");
-    spec.resources.max_walltime = Some(Duration::from_secs(1));
+    let spec = sh(&unique("wait"), "sleep 300");
     let attempt = spec.attempt.clone();
 
     backend
         .submit(&spec, &CancellationToken::new())
         .await
         .unwrap();
-    let status = tokio::time::timeout(
-        Duration::from_secs(60),
-        backend.wait(&attempt, &CancellationToken::new()),
-    )
-    .await
-    .expect("wait must terminalize an over-walltime run")
-    .unwrap();
-    assert!(
-        matches!(status.phase, AttemptPhase::Failed { .. }),
-        "expected walltime failure, got {:?}",
-        status.phase
-    );
+    wait_running(&backend, &attempt).await;
+    let stop_wait = CancellationToken::new();
+    stop_wait.cancel();
+    let status = backend.wait(&attempt, &stop_wait).await.unwrap();
+    assert_eq!(status.phase, AttemptPhase::Running);
 
+    let _ = backend.cancel(&attempt).await;
     let _ = backend.cleanup(&attempt).await;
 }
 

@@ -19,10 +19,6 @@ pub struct DockerConfig {
     pub default_disk_bytes: Option<u64>,
     pub default_max_walltime: Option<Duration>,
     pub pids_limit: i64,
-    pub drop_all_caps: bool,
-    pub no_new_privileges: bool,
-    pub network_mode: Option<String>,
-    pub user: Option<String>,
 }
 
 impl Default for DockerConfig {
@@ -36,10 +32,6 @@ impl Default for DockerConfig {
             default_disk_bytes: None,
             default_max_walltime: Some(Duration::from_secs(24 * 60 * 60)),
             pids_limit: 2048,
-            drop_all_caps: true,
-            no_new_privileges: true,
-            network_mode: None,
-            user: None,
         }
     }
 }

@@ -8,8 +8,8 @@ use std::time::Duration;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
-    MAX_TRANSFER_BYTES, ReconcileEvidence, ResumePoint, TaskInput, TaskOutput, TaskSpec,
-    TombstoneEvidence, TombstoneSpec,
+    MAX_TRANSFER_BYTES, NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskInput,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
 };
 use async_trait::async_trait;
 use bollard::models::{
@@ -41,6 +41,8 @@ const EPOCH_LABEL: &str = "aruna-engine.org/attempt-epoch";
 const GENERATION_LABEL: &str = "aruna-engine.org/controller-generation";
 /// Docker encodes directory type with Go's `os.ModeDir` bit.
 const DIRECTORY_MODE: u32 = 1 << 31;
+const NON_REGULAR_MODES: u32 =
+    DIRECTORY_MODE | (1 << 27) | (1 << 26) | (1 << 25) | (1 << 24) | (1 << 21) | (1 << 19);
 
 mod control;
 
@@ -314,7 +316,7 @@ impl DockerBackend {
             BackendError::Api("Docker inspect response omitted the container ID".to_string())
         })?;
         if let Some(plan) = plan {
-            let directories = self.missing_dirs(container_id, &plan.directories).await;
+            let directories = self.prepare_dirs(container_id, &plan.directories).await;
             self.cancel_submission(attempt, cancel).await?;
             let directories = directories?;
             if !plan.inputs.is_empty() || !directories.is_empty() {
@@ -322,6 +324,7 @@ impl DockerBackend {
                 self.cancel_submission(attempt, cancel).await?;
                 uploaded?;
             }
+            self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
         let started = self.start_by_name(container_id).await;
@@ -332,7 +335,7 @@ impl DockerBackend {
         status
     }
 
-    async fn missing_dirs(
+    async fn prepare_dirs(
         &self,
         container: &str,
         directories: &BTreeMap<PathBuf, u32>,
@@ -348,7 +351,11 @@ impl DockerBackend {
                 .get_container_archive_info(container, Some(options))
                 .await
             {
-                Ok(stat) if stat.file_mode & DIRECTORY_MODE != 0 => {}
+                Ok(stat) if stat.file_mode & DIRECTORY_MODE != 0 => {
+                    if *mode & 0o002 != 0 && stat.file_mode & 0o002 == 0 {
+                        missing.insert(path.clone(), *mode);
+                    }
+                }
                 Ok(_) => {
                     return Err(BackendError::InvalidSpec(format!(
                         "container parent path `{absolute}` is not a directory"
@@ -363,6 +370,57 @@ impl DockerBackend {
             }
         }
         Ok(missing)
+    }
+
+    async fn verify_layout(
+        &self,
+        container: &str,
+        plan: &ArchivePlan<'_>,
+    ) -> Result<(), BackendError> {
+        for (path, mode) in &plan.directories {
+            let absolute = format!("/{}", path.display());
+            let options = ContainerArchiveInfoOptionsBuilder::new()
+                .path(&absolute)
+                .build();
+            let stat = self
+                .docker
+                .get_container_archive_info(container, Some(options))
+                .await
+                .map_err(|error| classify_archive(&error))?;
+            if stat.file_mode & DIRECTORY_MODE == 0
+                || (*mode & 0o002 != 0 && stat.file_mode & 0o002 == 0)
+            {
+                return Err(BackendError::InvalidSpec(format!(
+                    "container output parent `{absolute}` is not writable"
+                )));
+            }
+        }
+        for path in &plan.outputs {
+            let absolute = format!("/{}", path.display());
+            let options = ContainerArchiveInfoOptionsBuilder::new()
+                .path(&absolute)
+                .build();
+            match self
+                .docker
+                .get_container_archive_info(container, Some(options))
+                .await
+            {
+                Ok(stat)
+                    if stat.file_mode & NON_REGULAR_MODES == 0
+                        && stat.link_target.is_empty()
+                        && stat.file_mode & 0o002 != 0 => {}
+                Ok(_) => {
+                    return Err(BackendError::InvalidSpec(format!(
+                        "existing output `{absolute}` is not a writable regular file"
+                    )));
+                }
+                Err(error) => match classify_archive(&error) {
+                    BackendError::NotFound(_) => {}
+                    other => return Err(other),
+                },
+            }
+        }
+        Ok(())
     }
 }
 
@@ -400,6 +458,7 @@ fn add_parents(path: &Path, mode: u32, directories: &mut BTreeMap<PathBuf, u32>)
 
 struct ArchivePlan<'a> {
     inputs: BTreeMap<PathBuf, &'a TaskInput>,
+    outputs: BTreeSet<PathBuf>,
     directories: BTreeMap<PathBuf, u32>,
 }
 
@@ -455,9 +514,60 @@ impl<'a> ArchivePlan<'a> {
 
         Ok(Self {
             inputs,
+            outputs,
             directories,
         })
     }
+}
+
+fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendError> {
+    StageLayout::from_spec(spec)?;
+    let security = &spec.security;
+    if security.run_as.uid == 0 {
+        return Err(BackendError::InvalidSpec(
+            "Docker tasks must not run as uid 0".to_string(),
+        ));
+    }
+    if !security.drop_all_caps || !security.no_new_privileges || !security.seccomp_default {
+        return Err(BackendError::InvalidSpec(
+            "Docker security hardening cannot be disabled".to_string(),
+        ));
+    }
+    match (spec.staging_mode, security.network) {
+        (StagingMode::Files, NetworkAccess::Isolated)
+        | (StagingMode::DirectS3, NetworkAccess::Open) => {}
+        (StagingMode::DirectS3, NetworkAccess::S3Only) => {
+            return Err(BackendError::InvalidSpec(
+                "S3-only networking is supported only by Kubernetes".to_string(),
+            ));
+        }
+        _ => {
+            return Err(BackendError::InvalidSpec(
+                "staging mode and network access are incompatible".to_string(),
+            ));
+        }
+    }
+    let pids = security
+        .pids_limit
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| BackendError::InvalidSpec("PID limit exceeds i64".to_string()))?
+        .unwrap_or(config.pids_limit);
+    if pids <= 0
+        || spec.resources.cpu_cores == Some(0)
+        || spec.resources.ram_bytes == Some(0)
+        || spec
+            .resources
+            .ram_bytes
+            .is_some_and(|bytes| i64::try_from(bytes).is_err())
+        || spec.resources.disk_bytes == Some(0)
+        || spec.resources.max_walltime == Some(Duration::ZERO)
+    {
+        return Err(BackendError::InvalidSpec(
+            "resource ceilings must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Marker smuggled through `io::Error` when a streaming transfer passes the
@@ -808,15 +918,20 @@ fn build_config(
         memory_swap: memory,
         nano_cpus,
         storage_opt,
-        pids_limit: Some(config.pids_limit),
-        cap_drop: config.drop_all_caps.then(|| vec!["ALL".to_string()]),
-        security_opt: config
-            .no_new_privileges
-            .then(|| vec!["no-new-privileges".to_string()]),
-        network_mode: match spec.staging_mode {
-            aruna_core::compute::StagingMode::Files => Some("none".to_string()),
-            aruna_core::compute::StagingMode::DirectS3 => config.network_mode.clone(),
+        pids_limit: Some(
+            spec.security
+                .pids_limit
+                .and_then(|limit| i64::try_from(limit).ok())
+                .unwrap_or(config.pids_limit),
+        ),
+        cap_drop: Some(vec!["ALL".to_string()]),
+        security_opt: Some(vec!["no-new-privileges".to_string()]),
+        network_mode: match spec.security.network {
+            NetworkAccess::Isolated => Some("none".to_string()),
+            NetworkAccess::Open => None,
+            NetworkAccess::S3Only => None,
         },
+        readonly_rootfs: Some(spec.security.read_only_rootfs),
         auto_remove: Some(false),
         ..Default::default()
     };
@@ -827,7 +942,10 @@ fn build_config(
         cmd: (!spec.command.is_empty()).then(|| spec.command.clone()),
         env: Some(env),
         working_dir: spec.workdir.clone(),
-        user: config.user.clone(),
+        user: Some(format!(
+            "{}:{}",
+            spec.security.run_as.uid, spec.security.run_as.gid
+        )),
         labels: Some(labels),
         host_config: Some(host_config),
         ..Default::default()
@@ -886,6 +1004,7 @@ impl ExecutorBackend for DockerBackend {
                 "task image must be digest-pinned".to_string(),
             ));
         }
+        validate_spec(&self.config, spec)?;
         let guard = self.daemon_lock.control(context)?;
         if guard.tombstone().is_some() {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
@@ -1650,6 +1769,9 @@ mod tests {
         assert!(host.nano_cpus.is_some());
         assert_eq!(host.nano_cpus, config.default_nano_cpus);
         assert!(host.storage_opt.is_none());
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+        assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(body.user.as_deref(), Some("65534:65534"));
         let labels = body.labels.unwrap();
         assert_eq!(
             labels.get(WALLTIME_LABEL).unwrap(),
@@ -1669,6 +1791,23 @@ mod tests {
             host.storage_opt.unwrap().get("size").unwrap(),
             &(2u64 << 30).to_string()
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_spec() {
+        let config = DockerConfig::default();
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.security.run_as.uid = 0;
+        assert!(validate_spec(&config, &spec).is_err());
+
+        spec.security.run_as.uid = 65_534;
+        spec.security.network = NetworkAccess::Open;
+        assert!(validate_spec(&config, &spec).is_err());
+
+        spec.security.network = NetworkAccess::Isolated;
+        spec.security.read_only_rootfs = true;
+        spec.output_paths = vec!["/output/result".to_string()];
+        assert!(validate_spec(&config, &spec).is_err());
     }
 
     #[test]

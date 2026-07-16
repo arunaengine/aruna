@@ -46,6 +46,11 @@ impl StageLayout {
             }
             _ => {}
         }
+        if spec.security.read_only_rootfs && !spec.output_paths.is_empty() {
+            return Err(BackendError::InvalidSpec(
+                "file outputs require a writable root filesystem".to_string(),
+            ));
+        }
         let mut files = Vec::with_capacity(spec.inputs.len());
         let mut input_paths = BTreeSet::new();
         for input in &spec.inputs {

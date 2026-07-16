@@ -337,6 +337,7 @@ fn build_task_spec(
         secret_env: std::collections::BTreeMap::new(),
         resources,
         workspace: None,
+        security: Default::default(),
         log_limits: Default::default(),
         inputs,
         staging_mode: StagingMode::Files,

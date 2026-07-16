@@ -164,6 +164,47 @@ pub enum StagingMode {
     DirectS3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSpec {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkAccess {
+    Isolated,
+    S3Only,
+    Open,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityContext {
+    pub run_as: UserSpec,
+    pub drop_all_caps: bool,
+    pub no_new_privileges: bool,
+    pub network: NetworkAccess,
+    pub read_only_rootfs: bool,
+    pub pids_limit: Option<u64>,
+    pub seccomp_default: bool,
+}
+
+impl Default for SecurityContext {
+    fn default() -> Self {
+        Self {
+            run_as: UserSpec {
+                uid: 65_534,
+                gid: 65_534,
+            },
+            drop_all_caps: true,
+            no_new_privileges: true,
+            network: NetworkAccess::Isolated,
+            read_only_rootfs: false,
+            pids_limit: Some(2048),
+            seccomp_default: true,
+        }
+    }
+}
+
 pub struct TaskInput {
     pub path: String,
     pub workspace_key: String,
@@ -291,6 +332,7 @@ pub struct TaskSpec {
     pub secret_env: BTreeMap<String, Secret>,
     pub resources: ResourceRequest,
     pub workspace: Option<WorkspaceBinding>,
+    pub security: SecurityContext,
     pub log_limits: LogLimits,
 }
 
@@ -309,6 +351,7 @@ impl TaskSpec {
             secret_env: BTreeMap::new(),
             resources: ResourceRequest::default(),
             workspace: None,
+            security: SecurityContext::default(),
             log_limits: LogLimits::default(),
         }
     }

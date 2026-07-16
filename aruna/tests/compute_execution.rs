@@ -33,8 +33,6 @@ use ulid::Ulid;
 /// A reachable, healthy Docker daemon, or `None` (test skips).
 async fn docker_or_skip() -> Option<DockerBackend> {
     let config = DockerConfig {
-        // Host networking lets the container reach the loopback S3 endpoint.
-        network_mode: Some("host".to_string()),
         keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
         ..DockerConfig::default()
     };
@@ -92,9 +90,7 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
         .send()
         .await?;
 
-    // Compute-enabled context sharing the node's storage/net/blob/metadata. The
-    // container reaches the loopback S3 server over host networking; force IPv4 so
-    // `localhost`->`::1` cannot miss the IPv4-bound endpoint.
+    // Compute-enabled context sharing the node's storage/net/blob/metadata.
     let container_endpoint = endpoint.endpoint_url.replace("localhost", "127.0.0.1");
     let registry = ExecutorRegistry::new()
         .with_backend(Arc::new(backend))
