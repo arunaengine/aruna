@@ -5,10 +5,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aruna_compute::DockerConfig;
-use aruna_compute::backend::ExecutorBackend;
-use aruna_compute::docker::DockerBackend;
-use aruna_compute::logs::LogSink;
+use aruna_compute::executor::docker::DockerBackend;
+use aruna_compute::executor::logs::LogSink;
+use aruna_compute::{DockerConfig, ExecutorBackend};
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, BackendError, CancelEvidence, LogLimits, LogStream, ReconcileOutcome,
     TaskInput, TaskSpec,

@@ -480,7 +480,7 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
         default_disk_bytes: Some(disk_bytes),
         ..aruna_compute::DockerConfig::default()
     };
-    match aruna_compute::docker::DockerBackend::with_config(docker_config) {
+    match aruna_compute::executor::docker::DockerBackend::with_config(docker_config) {
         Ok(backend) => {
             if let Err(error) = aruna_compute::ExecutorBackend::health(&backend).await {
                 warn!(error = %error, "Docker executor requested but unavailable; running without compute");

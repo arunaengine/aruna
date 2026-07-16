@@ -7,10 +7,8 @@ mod shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_compute::DockerConfig;
-use aruna_compute::ExecutorRegistry;
-use aruna_compute::backend::ExecutorBackend;
-use aruna_compute::docker::DockerBackend;
+use aruna_compute::executor::docker::DockerBackend;
+use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
     JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,

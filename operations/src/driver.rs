@@ -1,6 +1,6 @@
 use aruna_blob::blob::BlobHandle;
 use aruna_compute::ExecutorRegistry;
-use aruna_compute::logs::NullSink;
+use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{BackendError, ComputeEffect, ComputeEvent, ExecutorKind};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;

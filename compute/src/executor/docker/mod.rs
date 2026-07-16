@@ -28,9 +28,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::ExecutorBackend;
-use crate::config::DockerConfig;
-use crate::logs::{BoundedTail, LogSink};
+use super::ExecutorBackend;
+use super::config::DockerConfig;
+use super::logs::{BoundedTail, LogSink};
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.

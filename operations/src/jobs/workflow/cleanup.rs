@@ -103,9 +103,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
+    use aruna_compute::ExecutorBackend;
     use aruna_compute::ExecutorRegistry;
-    use aruna_compute::backend::ExecutorBackend;
-    use aruna_compute::logs::LogSink;
+    use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{
         AttemptStatus, CancelEvidence, LogLimits, LogTails, ReconcileOutcome, TaskOutput, TaskSpec,
     };

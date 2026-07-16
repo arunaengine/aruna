@@ -7,8 +7,8 @@ pub mod workspace;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_compute::backend::ExecutorBackend;
-use aruna_compute::logs::NullSink;
+use aruna_compute::ExecutorBackend;
+use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits,
     LogTails, ReconcileOutcome, ResourceRequest, Secret, TaskInput, TaskSpec, WorkspaceBinding,
@@ -1143,7 +1143,7 @@ mod tests {
         ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
     };
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-    use aruna_compute::logs::LogSink;
+    use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, TaskOutput};
     use aruna_core::structs::{ComputeResources, JobErrorKind, JobState, RealmId};
     use aruna_core::types::UserId;

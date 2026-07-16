@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use aruna_core::compute::ExecutorKind;
 
-use crate::backend::ExecutorBackend;
+use crate::executor::ExecutorBackend;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
 /// the attempt env so unconfigured tooling reaches the node's S3 plane.
@@ -82,8 +82,8 @@ impl ExecutorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ExecutorBackend;
-    use crate::logs::LogSink;
+    use crate::executor::ExecutorBackend;
+    use crate::executor::logs::LogSink;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits, LogTails,
         ReconcileOutcome, TaskOutput, TaskSpec,

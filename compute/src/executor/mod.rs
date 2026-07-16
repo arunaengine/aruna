@@ -6,7 +6,13 @@ use async_trait::async_trait;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::logs::LogSink;
+pub mod config;
+pub mod logs;
+
+#[cfg(feature = "docker")]
+pub mod docker;
+
+use logs::LogSink;
 
 /// The single TES-shaped surface every backend is driven through. No backend
 /// introduces a second state machine or data model.
