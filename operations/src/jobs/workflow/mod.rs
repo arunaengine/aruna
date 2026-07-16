@@ -612,12 +612,39 @@ pub async fn supervise_and_finalize(
     cancel: CancellationToken,
 ) {
     let storage = context.storage_handle.clone();
+    let walltime_ms = spec
+        .resources
+        .max_walltime_ms
+        .unwrap_or(24 * 60 * 60 * 1_000);
+    let walltime_left = read_job_record(&storage, job_id, None)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.started_at_ms)
+        .map(|started_at_ms| {
+            Duration::from_millis(
+                started_at_ms
+                    .saturating_add(walltime_ms)
+                    .saturating_sub(unix_timestamp_millis()),
+            )
+        });
     let wait_and_finalize = async {
-        let result = backend.wait(&fence, &cancel).await;
-        finalize_attempt(
-            &context, job_id, token, &backend, &fence, &spec, &bucket, result,
-        )
-        .await;
+        let result = if let Some(walltime_left) = walltime_left {
+            tokio::select! {
+                result = backend.wait(&fence, &cancel) => Some(result),
+                _ = tokio::time::sleep(walltime_left) => None,
+            }
+        } else {
+            Some(backend.wait(&fence, &cancel).await)
+        };
+        if let Some(result) = result {
+            finalize_attempt(
+                &context, job_id, token, &backend, &fence, &spec, &bucket, result,
+            )
+            .await;
+        } else {
+            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
+        }
     };
     if with_execution_heartbeat(storage, job_id, token, cancel.clone(), wait_and_finalize)
         .await

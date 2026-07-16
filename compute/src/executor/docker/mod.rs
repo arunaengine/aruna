@@ -34,8 +34,7 @@ use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
 use super::{BackendCaps, ExecutorBackend, digest_pinned};
 
-/// Label carrying the effective walltime ceiling in milliseconds so `wait` can
-/// enforce it against the daemon-reported start time.
+/// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
 const EPOCH_LABEL: &str = "aruna-engine.org/attempt-epoch";
 const GENERATION_LABEL: &str = "aruna-engine.org/controller-generation";
