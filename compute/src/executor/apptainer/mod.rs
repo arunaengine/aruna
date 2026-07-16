@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -149,7 +150,7 @@ impl ApptainerBackend {
         Ok(directory)
     }
 
-    fn spawn_supervisor(
+    async fn spawn_supervisor(
         &self,
         directory: &Path,
         spec: &TaskSpec,
@@ -192,34 +193,41 @@ impl ApptainerBackend {
                     "Apptainer supervisor readiness timed out".to_string(),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
-    fn ensure_sif(&self, image: &str) -> Result<(PathBuf, OciMetadata), BackendError> {
+    async fn ensure_sif(&self, image: &str) -> Result<(PathBuf, OciMetadata), BackendError> {
         let digest = image
             .rsplit_once("@sha256:")
             .map(|(_, digest)| digest)
             .ok_or_else(|| BackendError::InvalidSpec("image must be digest-pinned".to_string()))?;
         let sif = self.config.sif_cache.join(format!("{digest}.sif"));
         let metadata_path = self.config.sif_cache.join(format!("{digest}.json"));
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.config.sif_cache.join(format!("{digest}.lock")))
-            .map_err(io_error)?;
-        lock.lock().map_err(io_error)?;
+        let lock_path = self.config.sif_cache.join(format!("{digest}.lock"));
+        let _lock = tokio::task::spawn_blocking(move || -> Result<File, BackendError> {
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .map_err(io_error)?;
+            lock.lock().map_err(io_error)?;
+            Ok(lock)
+        })
+        .await
+        .map_err(|error| BackendError::Api(format!("Apptainer lock task failed: {error}")))??;
         if sif.exists() && metadata_path.exists() {
             return Ok((sif, read_json(&metadata_path)?));
         }
         let temp = self.config.sif_cache.join(format!("{digest}.sif.tmp"));
-        let status = Command::new("apptainer")
+        let status = TokioCommand::new("apptainer")
             .args(["pull", "--disable-cache", "--force"])
             .arg(&temp)
             .arg(format!("docker://{image}"))
             .status()
+            .await
             .map_err(io_error)?;
         if !status.success() {
             return Err(BackendError::Api(format!(
@@ -231,7 +239,7 @@ impl ApptainerBackend {
             .map_err(io_error)?;
         std::fs::rename(&temp, &sif).map_err(io_error)?;
         sync_dir(&self.config.sif_cache)?;
-        let metadata = inspect_metadata(&sif)?;
+        let metadata = inspect_metadata(&sif).await?;
         write_json(&metadata_path, &metadata)?;
         Ok((sif, metadata))
     }
@@ -316,9 +324,9 @@ impl ExecutorBackend for ApptainerBackend {
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
         }
-        let (sif, metadata) = self.ensure_sif(&spec.image)?;
+        let (sif, metadata) = self.ensure_sif(&spec.image).await?;
         let directory = self.prepare_attempt(context, spec, sif, metadata).await?;
-        self.spawn_supervisor(&directory, spec, cancel)
+        self.spawn_supervisor(&directory, spec, cancel).await
     }
 
     async fn stage(
@@ -356,11 +364,13 @@ impl ExecutorBackend for ApptainerBackend {
         guard.mark_cancel()?;
         let directory = self.state.attempt_dir(context);
         let payload = read_optional::<PayloadRecord>(&directory.join("payload.json"))?;
-        runtime::terminate(
-            &self.cgroup_path(context),
-            payload.as_ref(),
-            self.config.stop_grace,
-        )?;
+        let cgroup = self.cgroup_path(context);
+        let grace = self.config.stop_grace;
+        tokio::task::spawn_blocking(move || runtime::terminate(&cgroup, payload.as_ref(), grace))
+            .await
+            .map_err(|error| {
+                BackendError::Api(format!("Apptainer terminate task failed: {error}"))
+            })??;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if let Some(status) = self.existing_status(context)?
@@ -705,11 +715,12 @@ fn command_argv(spec: &TaskSpec, metadata: &OciMetadata) -> Result<Vec<String>, 
     Ok(argv)
 }
 
-fn inspect_metadata(sif: &Path) -> Result<OciMetadata, BackendError> {
-    let output = Command::new("apptainer")
+async fn inspect_metadata(sif: &Path) -> Result<OciMetadata, BackendError> {
+    let output = TokioCommand::new("apptainer")
         .args(["inspect", "--json"])
         .arg(sif)
         .output()
+        .await
         .map_err(io_error)?;
     if !output.status.success() {
         return Err(BackendError::Api(format!(

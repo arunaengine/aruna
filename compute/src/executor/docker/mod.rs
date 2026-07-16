@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -45,13 +46,13 @@ const NON_REGULAR_MODES: u32 =
 
 mod control;
 
-use control::{ControlRecord, DaemonLock};
+use control::{ControlGuard, ControlRecord, DaemonLock};
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {
     docker: Docker,
     config: DockerConfig,
-    daemon_lock: DaemonLock,
+    daemon_lock: Arc<DaemonLock>,
 }
 
 enum RemoveOutcome {
@@ -72,7 +73,7 @@ impl DockerBackend {
     }
 
     pub fn from_parts(docker: Docker, config: DockerConfig) -> Result<Self, BackendError> {
-        let daemon_lock = DaemonLock::acquire(&config.state_root)?;
+        let daemon_lock = Arc::new(DaemonLock::acquire(&config.state_root)?);
         Ok(Self {
             docker,
             config,
@@ -82,6 +83,14 @@ impl DockerBackend {
 
     pub fn config(&self) -> &DockerConfig {
         &self.config
+    }
+
+    async fn control_guard(&self, context: &FenceContext) -> Result<ControlGuard, BackendError> {
+        let daemon_lock = Arc::clone(&self.daemon_lock);
+        let context = context.clone();
+        tokio::task::spawn_blocking(move || daemon_lock.control(&context))
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
     }
 
     /// Raw inspect by attempt name (backend-specific; used for resource assertions).
@@ -991,7 +1000,7 @@ impl ExecutorBackend for DockerBackend {
             .attempt
             .validate()
             .map_err(BackendError::InvalidSpec)?;
-        self.daemon_lock.control(context).map(|_| ())
+        self.control_guard(context).await.map(|_| ())
     }
 
     async fn submit(
@@ -1011,7 +1020,7 @@ impl ExecutorBackend for DockerBackend {
             ));
         }
         validate_spec(&self.config, spec)?;
-        let guard = self.daemon_lock.control(context)?;
+        let guard = self.control_guard(context).await?;
         if guard.tombstone().is_some() {
             return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
         }
@@ -1118,7 +1127,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError> {
-        let _guard = self.daemon_lock.control(context)?;
+        let _guard = self.control_guard(context).await?;
         let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         // A container that had already exited on its own must keep its real exit evidence:
@@ -1216,7 +1225,7 @@ impl ExecutorBackend for DockerBackend {
         context: &FenceContext,
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
-        let _guard = self.daemon_lock.control(context)?;
+        let _guard = self.control_guard(context).await?;
         let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         let output_path = container_path(path)?;
@@ -1356,7 +1365,7 @@ impl ExecutorBackend for DockerBackend {
         context: &FenceContext,
         _spec: &TombstoneSpec,
     ) -> Result<TombstoneEvidence, BackendError> {
-        let mut guard = self.daemon_lock.control(context)?;
+        let mut guard = self.control_guard(context).await?;
         if let Some(evidence) = guard.tombstone() {
             return Ok(evidence);
         }
@@ -1385,7 +1394,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
-        let _guard = self.daemon_lock.control(context)?;
+        let _guard = self.control_guard(context).await?;
         let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         if self.config.keep_failed {
