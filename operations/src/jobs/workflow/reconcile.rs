@@ -224,7 +224,7 @@ impl ExternalReconciler for ComputeReconciler {
                     info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning");
                 }
             }
-            // Post-submit absence is ambiguous: never requeue, park in Indeterminate.
+            // Post-submit absence retries the same attempt name.
             ReconcileEvidence::Absent => {
                 self.resume(
                     job_id,
