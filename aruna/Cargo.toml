@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["docker"]
+default = ["docker", "apptainer", "kubernetes"]
 docker = ["aruna-compute/docker"]
 apptainer = ["aruna-compute/apptainer"]
 kubernetes = ["aruna-compute/kubernetes"]

@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["docker"]
+default = ["docker", "apptainer", "kubernetes"]
 docker = ["dep:bollard"]
 apptainer = ["dep:nix", "dep:rustix"]
 kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch"]
