@@ -340,7 +340,11 @@ fn build_task_spec(
         cpu_cores: spec.resources.cpu_cores,
         ram_bytes: spec.resources.ram_bytes,
         disk_bytes: spec.resources.disk_bytes,
-        max_walltime: spec.resources.max_walltime_ms.map(Duration::from_millis),
+        max_walltime: spec
+            .resources
+            .max_walltime_ms
+            .map(Duration::from_millis)
+            .or(Some(Duration::from_secs(24 * 60 * 60))),
         preemptible: spec.resources.preemptible,
         backend_extensions: std::collections::BTreeMap::new(),
     };
@@ -1817,5 +1821,17 @@ mod tests {
             }
             _ => panic!("re-drive must return the already-written resource"),
         }
+    }
+
+    #[test]
+    fn defaults_task_walltime() {
+        let spec = build_task_spec(
+            &execution_spec(),
+            &AttemptRef::new("job", 1),
+            "alpine@sha256:digest",
+            Vec::new(),
+        );
+
+        assert_eq!(spec.resources.max_walltime, Some(Duration::from_secs(86_400)));
     }
 }
