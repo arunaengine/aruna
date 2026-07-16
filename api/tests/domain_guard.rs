@@ -9,7 +9,13 @@ fn rejects_legacy_domain() {
         .expect("api crate has workspace parent");
     let forbidden = ["aruna", ".", "io"].concat().into_bytes();
     let files = Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
         .current_dir(root)
         .output()
         .expect("git must be available for the repository guard");

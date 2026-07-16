@@ -567,19 +567,18 @@ pub async fn list_tasks(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
-    let (records, next_cursor) =
-        match list_owned_jobs(
-            &state.get_ctx(),
-            caller.auth.user_id,
-            cursor,
-            limit,
-            |record| filters.matches(record) && task_in_group(record, caller.credential_group),
-        )
-        .await
-        {
-            Ok(page) => page,
-            Err(error) => return TesError::internal(error).into_response(),
-        };
+    let (records, next_cursor) = match list_owned_jobs(
+        &state.get_ctx(),
+        caller.auth.user_id,
+        cursor,
+        limit,
+        |record| filters.matches(record) && task_in_group(record, caller.credential_group),
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => return TesError::internal(error).into_response(),
+    };
 
     let base_url = external_base_url(&headers);
     let tasks = records
@@ -1395,10 +1394,7 @@ mod tests {
     fn basic_headers(access: &UserAccess, secret: &str) -> HeaderMap {
         let encoded = STANDARD.encode(format!("{}:{secret}", access.access_key));
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        headers.insert(AUTHORIZATION, format!("Basic {encoded}").parse().unwrap());
         headers
     }
 
@@ -1429,7 +1425,10 @@ mod tests {
                 realm().as_bytes().to_vec(),
                 realm_auth.to_bytes(&actor).unwrap(),
             ),
-            (group_id.to_bytes().to_vec(), group_auth.to_bytes(&actor).unwrap()),
+            (
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
         ] {
             let _ = state
                 .get_ctx()
@@ -1822,8 +1821,7 @@ mod tests {
 
     #[test]
     fn view_projections() {
-        let (spec, _) =
-            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
         let queued = project_task(&record, TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
@@ -2062,8 +2060,7 @@ mod tests {
     async fn get_resolves() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) =
-            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
@@ -2100,8 +2097,7 @@ mod tests {
     async fn cancel_maps_through() {
         let (_dir, state) = build_state().await;
         let owner = user(2);
-        let (spec, _) =
-            map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
+        let (spec, _) = map_task_to_spec(&sample_task(Ulid::from_bytes([5u8; 16])), None).unwrap();
         let job_id = JobId::from_bytes([9u8; 16]);
         insert_job(
             &state.get_ctx().storage_handle,
