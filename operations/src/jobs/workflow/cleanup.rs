@@ -136,7 +136,10 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-    use aruna_core::structs::{JobProgress, RealmId, UserAccess};
+    use aruna_core::structs::{
+        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
+        RealmId, UserAccess,
+    };
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
@@ -146,6 +149,7 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
+    use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::s3::get_user_access::GetUserAccessOperation;
 
     struct StubBackend {
@@ -271,6 +275,52 @@ mod tests {
         }
     }
 
+    async fn seed_attempt(
+        storage: &StorageHandle,
+        job_id: JobId,
+        kind: &str,
+        token: Ulid,
+    ) -> AttemptIntent {
+        let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+            }),
+            UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id,
+            claim_token: token,
+            lease_expires_at_ms: 10_000,
+        });
+        insert_job(storage, &record).await.unwrap();
+        record_attempt_intent(storage, job_id, token, intent(job_id, kind), 2)
+            .await
+            .unwrap()
+            .record
+            .attempt_intent
+            .unwrap()
+    }
+
     async fn write_access(storage: &StorageHandle, access: &UserAccess) {
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
@@ -309,11 +359,11 @@ mod tests {
             })
             .await;
         let backend = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
-        let ctx = job_context(storage, std::slice::from_ref(&backend));
+        let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([5; 16]);
+        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
 
-        let outcome =
-            run_terminal_cleanup(&ctx, job_id, Some(&intent(job_id, "docker")), access_key).await;
+        let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), access_key).await;
 
         assert!(matches!(
             outcome,
@@ -371,16 +421,11 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let docker = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let slurm = StubBackend::new(ExecutorKind::Slurm, vec![Ok(())]);
-        let ctx = job_context(storage, &[docker.clone(), slurm.clone()]);
+        let ctx = job_context(storage.clone(), &[docker.clone(), slurm.clone()]);
         let job_id = JobId::from_bytes([8; 16]);
+        let intent = seed_attempt(&storage, job_id, "slurm", ctx.claim_token).await;
 
-        let outcome = run_terminal_cleanup(
-            &ctx,
-            job_id,
-            Some(&intent(job_id, "slurm")),
-            "missing-access",
-        )
-        .await;
+        let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await;
 
         assert!(matches!(
             outcome,
@@ -398,9 +443,9 @@ mod tests {
             ExecutorKind::Docker,
             vec![Err(BackendError::Unavailable("down".to_string())), Ok(())],
         );
-        let ctx = job_context(storage, std::slice::from_ref(&backend));
+        let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([9; 16]);
-        let intent = intent(job_id, "docker");
+        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
 
         assert!(matches!(
             run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await,
