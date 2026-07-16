@@ -1010,11 +1010,7 @@ impl ExecutorBackend for KubernetesBackend {
             &secret_name(&context.attempt.external_name()),
         )
         .await?;
-        delete_named(
-            self.markers(),
-            &logs_name(&context.attempt.external_name()),
-        )
-        .await?;
+        delete_named(self.markers(), &logs_name(&context.attempt.external_name())).await?;
         delete_named(
             self.markers(),
             &marker_name(&context.attempt.external_name()),

@@ -748,8 +748,7 @@ mod tests {
     #[test]
     fn normalizes_prefixes() {
         assert_eq!(
-            validate_output_prefixes(vec!["results/".to_string(), "results/".to_string()])
-                .unwrap(),
+            validate_output_prefixes(vec!["results/".to_string(), "results/".to_string()]).unwrap(),
             ["results/"]
         );
         assert!(validate_output_prefixes(vec![String::new()]).is_err());

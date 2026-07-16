@@ -11,10 +11,10 @@ use crate::s3::error::IntoS3Error;
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_algorithm_from_s3, checksum_response_hashes, convert_input,
-    multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source, parse_copy_source_range,
-    parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    reject_sse, s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart,
-    validate_object_key,
+    multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source,
+    parse_copy_source_range, parse_multipart_checksum_hint, parse_multipart_part_number,
+    parse_upload_id, parse_version_id, reject_sse, s3_checksum_algorithm_from_core,
+    s3_checksum_type_from_multipart, validate_object_key,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};

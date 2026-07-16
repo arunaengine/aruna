@@ -512,11 +512,9 @@ async fn build_docker(
         .parse::<std::net::SocketAddr>()
         .is_ok_and(|address| !address.ip().is_loopback())
     {
-        return Err(
-            "Docker executor requires a non-loopback S3_ADDRESS"
-                .to_string()
-                .into(),
-        );
+        return Err("Docker executor requires a non-loopback S3_ADDRESS"
+            .to_string()
+            .into());
     }
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
@@ -578,7 +576,9 @@ async fn build_apptainer(
 async fn build_apptainer(
     _config: &Config,
 ) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
-    Err("Apptainer executor feature is not compiled".to_string().into())
+    Err("Apptainer executor feature is not compiled"
+        .to_string()
+        .into())
 }
 
 #[cfg(feature = "kubernetes")]
@@ -624,7 +624,9 @@ async fn build_kubernetes(
 async fn build_kubernetes(
     _config: &Config,
 ) -> Result<aruna_compute::ExecutorRegistry, ComputeBuildError> {
-    Err("Kubernetes executor feature is not compiled".to_string().into())
+    Err("Kubernetes executor feature is not compiled"
+        .to_string()
+        .into())
 }
 
 fn env_true(name: &str) -> bool {

@@ -155,31 +155,35 @@ pub async fn run_execution_job(
             pinned_image,
             attempt_epoch: 0,
         };
-        let intent_commit =
-            match record_attempt_intent(storage, job_id, token, intent, unix_timestamp_millis())
-                .await
-            {
-                Ok(record) => record,
-                Err(JobMutationError::IntentConflict) => {
-                    if read_job_record(storage, job_id, None)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|record| record.cancel_requested)
+        let intent_commit = match record_attempt_intent(
+            storage,
+            job_id,
+            token,
+            intent,
+            unix_timestamp_millis(),
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(JobMutationError::IntentConflict) => {
+                if read_job_record(storage, job_id, None)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.cancel_requested)
+                {
+                    match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await
                     {
-                        match cancel_running_job(storage, job_id, token, unix_timestamp_millis())
-                            .await
-                        {
-                            Ok(_) => finalize_followups(&context, job_id).await,
-                            Err(error) => {
-                                warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
-                            }
+                        Ok(_) => finalize_followups(&context, job_id).await,
+                        Err(error) => {
+                            warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
                         }
                     }
-                    return None;
                 }
-                Err(_) => return None,
-            };
+                return None;
+            }
+            Err(_) => return None,
+        };
         if intent_commit.record.cancel_requested {
             match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
                 Ok(_) => finalize_followups(&context, job_id).await,
@@ -1336,8 +1340,8 @@ mod tests {
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::sync::Notify;
     use ulid::Ulid;
@@ -1926,6 +1930,9 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(spec.resources.max_walltime, Some(Duration::from_secs(86_400)));
+        assert_eq!(
+            spec.resources.max_walltime,
+            Some(Duration::from_secs(86_400))
+        );
     }
 }

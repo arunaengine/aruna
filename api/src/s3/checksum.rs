@@ -2,6 +2,7 @@ use aruna_blob::hash::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::Stream;
 use http::HeaderMap;
 use s3s::dto::{
     ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, CopyObjectResult, CopyPartResult,
@@ -11,7 +12,6 @@ use s3s::{S3Error, S3Result, TrailingHeaders, s3_error};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::Poll;
-use futures_util::Stream;
 
 const CONTENT_MD5: &str = "content-md5";
 const X_AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
@@ -186,7 +186,9 @@ pub fn validate_trailing_checksum(
     trailing_headers: Option<&TrailingHeaders>,
     hashes: &HashMap<String, Vec<u8>>,
 ) -> S3Result<()> {
-    let Some(algorithm) = algorithm else { return Ok(()) };
+    let Some(algorithm) = algorithm else {
+        return Ok(());
+    };
     let trailers = trailing_headers
         .and_then(|headers| headers.read(Clone::clone))
         .ok_or_else(|| s3_error!(InvalidRequest, "Missing checksum trailer"))?;
@@ -244,9 +246,7 @@ where
                 let hashes = hasher.to_map();
                 let result = trailing_headers()
                     .as_ref()
-                    .map(|headers| {
-                        validate_trailer_headers(algorithm, composite, headers, &hashes)
-                    })
+                    .map(|headers| validate_trailer_headers(algorithm, composite, headers, &hashes))
                     .unwrap_or_else(|| Err(s3_error!(InvalidRequest, "Missing checksum trailer")));
                 match result {
                     Ok(()) => Poll::Ready(None),
@@ -519,8 +519,8 @@ pub fn checksum_mismatch_error() -> S3Error {
 mod tests {
     use super::{
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
-        X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled,
-        encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+        X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
+        parse_complete_multipart_checksum_request, parse_upload_checksum_request,
         validate_composite_part_count, validate_delete_checksum, validate_trailer_headers,
         verify_trailer_stream,
     };
@@ -528,8 +528,8 @@ mod tests {
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use http::HeaderMap;
     use futures_util::{StreamExt, stream};
+    use http::HeaderMap;
     use hyper::body::Bytes;
     use s3s::dto::{ChecksumType, PutObjectOutput, StreamingBlob};
     use std::collections::HashMap;
@@ -652,12 +652,9 @@ mod tests {
         )]));
         let mut trailers = HeaderMap::new();
         trailers.insert(X_AMZ_CHECKSUM_CRC32, "AAAAAA==".parse().unwrap());
-        let mut body = verify_trailer_stream(
-            body,
-            ChecksumAlgorithm::Crc32,
-            false,
-            move || Some(trailers.clone()),
-        );
+        let mut body = verify_trailer_stream(body, ChecksumAlgorithm::Crc32, false, move || {
+            Some(trailers.clone())
+        });
 
         assert_eq!(
             body.next().await.unwrap().unwrap(),
