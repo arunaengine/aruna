@@ -259,9 +259,10 @@ impl ExecutorBackend for ApptainerBackend {
     }
 
     async fn health(&self) -> Result<(), BackendError> {
-        let output = Command::new("apptainer")
+        let output = TokioCommand::new("apptainer")
             .arg("version")
             .output()
+            .await
             .map_err(io_error)?;
         if !output.status.success() || output.stdout.is_empty() {
             return Err(BackendError::Unavailable(
@@ -281,7 +282,7 @@ impl ExecutorBackend for ApptainerBackend {
         if digest_pinned(image) {
             Ok(image.to_string())
         } else {
-            resolve_digest(image)
+            resolve_digest(image).await
         }
     }
 
@@ -771,14 +772,23 @@ fn find_strings(value: &serde_json::Value, key: &str) -> Option<Vec<String>> {
     }
 }
 
-fn resolve_digest(image: &str) -> Result<String, BackendError> {
-    let output = Command::new("apptainer")
+async fn resolve_digest(image: &str) -> Result<String, BackendError> {
+    let output = TokioCommand::new("apptainer")
         .args(["inspect", "--json"])
         .arg(format!("docker://{image}"))
         .output()
+        .await
         .map_err(io_error)?;
     if !output.status.success() {
-        return Err(BackendError::ImageNotFound(image.to_string()));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if image_missing(&stderr) {
+            return Err(BackendError::ImageNotFound(image.to_string()));
+        }
+        return Err(BackendError::Unavailable(format!(
+            "Apptainer image inspect failed with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| BackendError::Api(format!("decode Apptainer inspect: {error}")))?;
@@ -786,6 +796,13 @@ fn resolve_digest(image: &str) -> Result<String, BackendError> {
         BackendError::Api(format!("image `{image}` did not expose an OCI digest"))
     })?;
     Ok(format!("{}@{digest}", repository_name(image)))
+}
+
+fn image_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    ["image not found", "manifest unknown", "name unknown"]
+        .iter()
+        .any(|message| stderr.contains(message))
 }
 
 fn find_digest(value: &serde_json::Value) -> Option<String> {
@@ -1049,6 +1066,12 @@ mod tests {
         spec.security.run_as.uid = rustix::process::geteuid().as_raw() ^ 1;
         spec.security.run_as.gid = rustix::process::getegid().as_raw();
         assert!(validate_spec(&context, &spec).is_err());
+    }
+
+    #[test]
+    fn classifies_registry_failure() {
+        assert!(image_missing("MANIFEST_UNKNOWN: manifest unknown"));
+        assert!(!image_missing("dial tcp: connection timed out"));
     }
 
     #[test]
