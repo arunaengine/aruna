@@ -38,6 +38,11 @@ Tombstones are retained indefinitely:
 Automatic cleanup may remove accessories behind a tombstone, but never the
 tombstone itself.
 
+Kubernetes live Jobs retain an attempt-protection finalizer so an out-of-band
+delete cannot appear absent and trigger a duplicate run. Tombstoning removes
+that finalizer after the tombstone annotation is durable, allowing deletion of
+retired Jobs and their namespace without weakening live-attempt protection.
+
 ## Staging modes
 
 Files mode is the default. The controller streams authorized inputs into the

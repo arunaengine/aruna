@@ -467,6 +467,33 @@ impl KubernetesBackend {
             .map_err(kube_error)
     }
 
+    async fn strip_finalizer(
+        &self,
+        context: &FenceContext,
+        job: &Job,
+    ) -> Result<(), BackendError> {
+        if !job.metadata.finalizers.as_ref().is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|finalizer| finalizer == "aruna-engine.org/attempt-protection")
+        }) {
+            return Ok(());
+        }
+        let patch = cas_patch(
+            job,
+            vec![("/metadata/finalizers".to_string(), json!([]))],
+        )?;
+        self.jobs()
+            .patch(
+                &context.attempt.external_name(),
+                &PatchParams::default(),
+                &Patch::Json::<()>(patch),
+            )
+            .await
+            .map(|_| ())
+            .map_err(kube_error)
+    }
+
     async fn task_pods(&self, context: &FenceContext) -> Result<Vec<Pod>, BackendError> {
         let selector = format!("{},{}=task", attempt_selector(context), ROLE_LABEL);
         self.pods()
@@ -950,10 +977,11 @@ impl ExecutorBackend for KubernetesBackend {
         context: &FenceContext,
         _spec: &TombstoneSpec,
     ) -> Result<TombstoneEvidence, BackendError> {
-        let job = self.get_job(context).await?;
+        let mut job = self.get_job(context).await?;
         if job_state(&job) != Some("tombstone") {
-            self.patch_state(context, "tombstone", true).await?;
+            job = self.patch_state(context, "tombstone", true).await?;
         }
+        self.strip_finalizer(context, &job).await?;
         Ok(TombstoneEvidence {
             backend_ref: job_uid(&job)?,
             attempt_epoch: context.attempt_epoch,
@@ -961,6 +989,13 @@ impl ExecutorBackend for KubernetesBackend {
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
+        let job = self.get_job(context).await?;
+        if job_state(&job) != Some("tombstone") {
+            return Err(BackendError::Conflict(
+                "Kubernetes cleanup requires a tombstoned Job".to_string(),
+            ));
+        }
+        self.strip_finalizer(context, &job).await?;
         self.remove_helpers(context).await?;
         self.delete_tasks(context).await?;
         delete_named(
