@@ -224,9 +224,14 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
 }
 
 async fn dispatch_compute(effect: ComputeEffect, context: &DriverContext) -> ComputeEvent {
-    let unsupported = || BackendError::InvalidSpec("compute effect not implemented".to_string());
     match effect {
-        ComputeEffect::ResolveImage { .. } => ComputeEvent::ImageResolved(Err(unsupported())),
+        ComputeEffect::ResolveImage { backend, image } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.resolve_image(&image).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::ImageResolved(result)
+        }
         ComputeEffect::Fence {
             backend,
             context: fence,

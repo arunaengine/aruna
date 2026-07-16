@@ -23,6 +23,8 @@ pub trait ExecutorBackend: Send + Sync {
     /// Startup and advertisement gate.
     async fn health(&self) -> Result<(), BackendError>;
 
+    async fn resolve_image(&self, image: &str) -> Result<String, BackendError>;
+
     async fn fence(&self, context: &FenceContext) -> Result<(), BackendError>;
 
     /// Idempotent under the deterministic attempt name: a name collision MUST

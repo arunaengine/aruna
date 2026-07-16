@@ -133,10 +133,23 @@ pub async fn run_execution_job(
         let attempt_no = record.attempts;
         // Lowercased: attempt ids must be injective under the backend name mapping.
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
+        let pinned_image = match backend.resolve_image(&spec.image).await {
+            Ok(image) => image,
+            Err(error) => {
+                let job_error = if error.retryable() {
+                    JobError::retryable(format!("image resolution failed: {error}"))
+                } else {
+                    JobError::permanent(format!("image resolution failed: {error}"))
+                };
+                requeue_or_fail_pre_submit(&context, job_id, token, &record, job_error).await;
+                return None;
+            }
+        };
         let task_spec = build_task_spec(
             &context,
             &spec,
             &attempt,
+            &pinned_image,
             &credential,
             &bucket,
             node_id,
@@ -148,6 +161,7 @@ pub async fn run_execution_job(
             attempt_no,
             external_name: attempt.external_name(),
             executor_kind: backend.kind().as_wire(),
+            pinned_image,
             attempt_epoch: 0,
         };
         let intent_commit =
@@ -314,6 +328,7 @@ fn build_task_spec(
     context: &DriverContext,
     spec: &ExecutionSpec,
     attempt: &AttemptRef,
+    pinned_image: &str,
     credential: &workspace::WorkspaceCredential,
     bucket: &str,
     _node_id: NodeId,
@@ -348,7 +363,7 @@ fn build_task_spec(
     };
     TaskSpec {
         attempt: attempt.clone(),
-        image: spec.image.clone(),
+        image: pinned_image.to_string(),
         entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
         workdir: spec.workdir.clone(),
@@ -548,10 +563,17 @@ async fn retry_same_submit(
     let inputs = load_inputs(context, spec, record, bucket)
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
+    let pinned_image = record
+        .attempt_intent
+        .as_ref()
+        .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
+        .map(|intent| intent.pinned_image.as_str())
+        .ok_or_else(|| BackendError::Conflict("attempt intent mismatch".to_string()))?;
     let task_spec = build_task_spec(
         context,
         spec,
         &fence.attempt,
+        pinned_image,
         &credential,
         bucket,
         node_id,
@@ -1304,6 +1326,12 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
+        async fn resolve_image(&self, _image: &str) -> Result<String, BackendError> {
+            Ok(
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            )
+        }
         async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
             Ok(())
         }
@@ -1494,6 +1522,9 @@ mod tests {
             attempt_no: claimed.attempts,
             external_name: attempt.external_name(),
             executor_kind: "docker".to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 0,
         };
         let record = record_attempt_intent(storage, job_id, token, intent, 5)

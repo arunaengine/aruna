@@ -840,6 +840,23 @@ impl ExecutorBackend for DockerBackend {
         self.daemon_lock.verify()
     }
 
+    async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+        self.ensure_image(image, &CancellationToken::new()).await?;
+        let inspect = self
+            .docker
+            .inspect_image(image)
+            .await
+            .map_err(|error| classify(&error))?;
+        if digest_pinned(image) {
+            return Ok(image.to_string());
+        }
+        inspect
+            .repo_digests
+            .and_then(|digests| digests.into_iter().next())
+            .filter(|digest| digest_pinned(digest))
+            .ok_or_else(|| BackendError::Api(format!("image `{image}` has no repository digest")))
+    }
+
     async fn fence(&self, context: &FenceContext) -> Result<(), BackendError> {
         context
             .attempt
@@ -857,6 +874,11 @@ impl ExecutorBackend for DockerBackend {
         if context.attempt != spec.attempt {
             return Err(BackendError::InvalidSpec(
                 "fence and task attempt differ".to_string(),
+            ));
+        }
+        if !digest_pinned(&spec.image) {
+            return Err(BackendError::InvalidSpec(
+                "task image must be digest-pinned".to_string(),
             ));
         }
         let guard = self.daemon_lock.control(context)?;
@@ -1261,6 +1283,16 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
     }
 }
 
+fn digest_pinned(image: &str) -> bool {
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
 /// The container carries this attempt's `aruna-engine.org/*` labels; matching by the
 /// deterministic name alone would adopt (or remove) a same-named container
 /// created by another instance.
@@ -1571,6 +1603,15 @@ mod tests {
             split_image_ref("repo@sha256:abc"),
             ("repo".into(), Some("sha256:abc".into()))
         );
+    }
+
+    #[test]
+    fn validates_digest_pin() {
+        assert!(digest_pinned(
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!digest_pinned("alpine:3.24"));
+        assert!(!digest_pinned("@sha256:abcd"));
     }
 
     #[test]

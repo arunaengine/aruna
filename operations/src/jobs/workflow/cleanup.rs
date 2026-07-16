@@ -174,6 +174,10 @@ mod tests {
             Ok(())
         }
 
+        async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+            Ok(image.to_string())
+        }
+
         async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
             Ok(())
         }
@@ -260,6 +264,9 @@ mod tests {
             attempt_no: 1,
             external_name: attempt.external_name(),
             executor_kind: kind.to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 1,
         }
     }

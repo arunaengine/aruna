@@ -60,7 +60,32 @@ impl DockerTestExt for DockerBackend {
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), spec, cancel).await
+        let image = aruna_compute::ExecutorBackend::resolve_image(self, &spec.image).await?;
+        let inputs = spec
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .take_stream()
+                    .map(|stream| TaskInput::from_stream(input.path.clone(), input.size(), stream))
+                    .ok_or_else(|| BackendError::Unavailable("test input consumed".to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pinned = TaskSpec {
+            attempt: spec.attempt.clone(),
+            image,
+            entrypoint: spec.entrypoint.clone(),
+            command: spec.command.clone(),
+            workdir: spec.workdir.clone(),
+            inputs,
+            output_paths: spec.output_paths.clone(),
+            env: spec.env.clone(),
+            secret_env: spec.secret_env.clone(),
+            resources: spec.resources.clone(),
+            workspace: spec.workspace.clone(),
+            log_limits: spec.log_limits,
+        };
+        aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), &pinned, cancel).await
     }
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {

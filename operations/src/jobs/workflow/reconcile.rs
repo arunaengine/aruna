@@ -391,10 +391,19 @@ pub(super) async fn resume_attempt(
                         return false;
                     }
                 };
+                let Some(pinned_image) = record
+                    .attempt_intent
+                    .as_ref()
+                    .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
+                    .map(|intent| intent.pinned_image.as_str())
+                else {
+                    return false;
+                };
                 let task_spec = build_task_spec(
                     &context,
                     &spec,
                     &fence.attempt,
+                    pinned_image,
                     &credential,
                     &bucket,
                     node_id,

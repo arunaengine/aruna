@@ -830,6 +830,7 @@ pub async fn record_attempt_intent(
                 if intent.attempt_no != draft.attempt_no
                     || intent.external_name != draft.external_name
                     || intent.executor_kind != draft.executor_kind
+                    || intent.pinned_image != draft.pinned_image
                 {
                     return Err(JobMutationError::IntentConflict);
                 }
@@ -1748,6 +1749,9 @@ mod tests {
                 attempt_no: 0,
                 external_name: aruna_core::structs::attempt_external_name(job_id, 0),
                 executor_kind: "docker".to_string(),
+                pinned_image:
+                    "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
                 attempt_epoch: 0,
             },
             1_000,
@@ -2442,6 +2446,9 @@ mod tests {
             attempt_no: 2,
             external_name: aruna_core::structs::attempt_external_name(job_id, 2),
             executor_kind: "docker".to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 1,
         };
         let mut record = JobRecord::new(
@@ -2591,6 +2598,9 @@ mod tests {
             attempt_no: 1,
             external_name: aruna_core::structs::attempt_external_name(job_id, 1),
             executor_kind: "docker".to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 0,
         };
         let committed = record_attempt_intent(&storage, job_id, token, intent, 6_000)
@@ -2620,6 +2630,9 @@ mod tests {
             attempt_no: 0,
             external_name: aruna_core::structs::attempt_external_name(job_id, 0),
             executor_kind: "docker".to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 0,
         };
         let error = record_attempt_intent(&storage, job_id, token, intent, 6_000)
@@ -2641,6 +2654,9 @@ mod tests {
             attempt_no: 0,
             external_name: aruna_core::structs::attempt_external_name(job_id, 0),
             executor_kind: "docker".to_string(),
+            pinned_image:
+                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             attempt_epoch: 0,
         };
         let committed = record_attempt_intent(&storage, job_id, token, intent, 4_000)

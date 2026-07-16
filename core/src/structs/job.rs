@@ -279,6 +279,7 @@ pub struct AttemptIntent {
     pub attempt_no: u32,
     pub external_name: String,
     pub executor_kind: String,
+    pub pinned_image: String,
     pub attempt_epoch: u64,
 }
 
