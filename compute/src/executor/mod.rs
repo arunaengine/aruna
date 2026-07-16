@@ -46,7 +46,7 @@ pub fn dispatch_helper() -> Option<i32> {
     }
     #[cfg(feature = "apptainer")]
     {
-        return Some(apptainer::dispatch(&mode));
+        Some(apptainer::dispatch(mode))
     }
     #[cfg(not(feature = "apptainer"))]
     {
