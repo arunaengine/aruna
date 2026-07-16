@@ -2,7 +2,7 @@ use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
 use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload};
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{authorize_cleanup, record_attempt_tombstone};
+use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
 use crate::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 
@@ -45,7 +45,10 @@ async fn cleanup_attempt(
     };
     let fence = authorize_cleanup(&ctx.driver.storage_handle, for_job, intent, ctx.claim_token)
         .await
-        .map_err(|error| JobError::retryable(format!("cleanup fence claim failed: {error}")))?;
+        .map_err(|error| match error {
+            JobMutationError::NotFound => JobError::permanent("cleanup parent no longer exists"),
+            error => JobError::retryable(format!("cleanup fence claim failed: {error}")),
+        })?;
     if fence.attempt.external_name() != intent.external_name {
         return Err(JobError::permanent("cleanup attempt identity mismatch"));
     }
@@ -391,6 +394,25 @@ mod tests {
         assert!(matches!(
             outcome,
             JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_fails() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = job_context(storage, &[]);
+        let job_id = JobId::from_bytes([10; 16]);
+
+        let outcome =
+            run_terminal_cleanup(&ctx, job_id, Some(&intent(job_id, "docker")), "missing").await;
+
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Permanent,
+                ..
+            })
         ));
     }
 
