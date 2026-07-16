@@ -197,7 +197,11 @@ impl ApptainerBackend {
         }
     }
 
-    async fn ensure_sif(&self, image: &str) -> Result<(PathBuf, OciMetadata), BackendError> {
+    async fn ensure_sif(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(PathBuf, OciMetadata), BackendError> {
         let digest = image
             .rsplit_once("@sha256:")
             .map(|(_, digest)| digest)
@@ -221,14 +225,24 @@ impl ApptainerBackend {
         if sif.exists() && metadata_path.exists() {
             return Ok((sif, read_json(&metadata_path)?));
         }
+        if cancel.is_cancelled() {
+            return Err(BackendError::Cancelled);
+        }
         let temp = self.config.sif_cache.join(format!("{digest}.sif.tmp"));
-        let status = TokioCommand::new("apptainer")
+        let mut command = TokioCommand::new("apptainer");
+        command
             .args(["pull", "--disable-cache", "--force"])
             .arg(&temp)
             .arg(format!("docker://{image}"))
-            .status()
-            .await
-            .map_err(io_error)?;
+            .kill_on_drop(true);
+        let status = tokio::select! {
+            _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+            result = tokio::time::timeout(self.config.pull_deadline, command.status()) => {
+                result
+                    .map_err(|_| BackendError::Timeout("Apptainer image pull timed out".to_string()))?
+                    .map_err(io_error)?
+            }
+        };
         if !status.success() {
             return Err(BackendError::Api(format!(
                 "Apptainer image pull failed with {status}"
@@ -278,7 +292,11 @@ impl ExecutorBackend for ApptainerBackend {
         runtime::probe_cgroup(&self.config.cgroup_root)
     }
 
-    async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+    async fn resolve_image(
+        &self,
+        image: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<String, BackendError> {
         if digest_pinned(image) {
             Ok(image.to_string())
         } else {
@@ -328,7 +346,7 @@ impl ExecutorBackend for ApptainerBackend {
         if cancel.is_cancelled() {
             return Err(BackendError::Cancelled);
         }
-        let (sif, metadata) = self.ensure_sif(&spec.image).await?;
+        let (sif, metadata) = self.ensure_sif(&spec.image, cancel).await?;
         let directory = self.prepare_attempt(context, spec, sif, metadata).await?;
         self.spawn_supervisor(&directory, spec, cancel).await
     }
@@ -1005,6 +1023,7 @@ mod tests {
             sif_cache: root.path().join("cache"),
             cgroup_root: root.path().join("cgroup"),
             stop_grace: Duration::from_secs(1),
+            pull_deadline: Duration::from_secs(30),
         })
         .unwrap();
         let context = FenceContext {
@@ -1024,6 +1043,7 @@ mod tests {
             sif_cache: root.path().join("cache"),
             cgroup_root: root.path().join("cgroup"),
             stop_grace: Duration::from_secs(1),
+            pull_deadline: Duration::from_secs(30),
         })
         .unwrap();
         let context = FenceContext {
@@ -1072,6 +1092,30 @@ mod tests {
     fn classifies_registry_failure() {
         assert!(image_missing("MANIFEST_UNKNOWN: manifest unknown"));
         assert!(!image_missing("dial tcp: connection timed out"));
+    }
+
+    #[tokio::test]
+    async fn pull_observes_cancel() {
+        let root = tempdir().unwrap();
+        let backend = ApptainerBackend::with_config(ApptainerConfig {
+            state_root: root.path().join("state"),
+            sif_cache: root.path().join("cache"),
+            cgroup_root: root.path().join("cgroup"),
+            stop_grace: Duration::from_secs(1),
+            pull_deadline: Duration::from_secs(30),
+        })
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = backend
+            .ensure_sif(
+                "repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BackendError::Cancelled));
     }
 
     #[test]

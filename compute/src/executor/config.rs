@@ -42,6 +42,7 @@ pub struct ApptainerConfig {
     pub sif_cache: PathBuf,
     pub cgroup_root: PathBuf,
     pub stop_grace: Duration,
+    pub pull_deadline: Duration,
 }
 
 #[derive(Clone, Debug)]

@@ -133,7 +133,7 @@ pub async fn run_execution_job(
         let attempt_no = record.attempts;
         // Lowercased: attempt ids must be injective under the backend name mapping.
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no);
-        let pinned_image = match backend.resolve_image(&spec.image).await {
+        let pinned_image = match backend.resolve_image(&spec.image, &cancel).await {
             Ok(image) => image,
             Err(error) => {
                 let job_error = if error.retryable() {
@@ -1376,7 +1376,11 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
-        async fn resolve_image(&self, _image: &str) -> Result<String, BackendError> {
+        async fn resolve_image(
+            &self,
+            _image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
             Ok(
                 "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     .to_string(),

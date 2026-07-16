@@ -91,6 +91,8 @@ Required configuration:
   `./compute-state/apptainer`.
 - `ARUNA_COMPUTE_APPTAINER_SIF_CACHE`: SIF cache; defaults to
   `./compute-state/sif`.
+- `ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE`: image pull deadline in seconds;
+  defaults to `300`.
 - `ARUNA_COMPUTE_STOP_GRACE`: graceful stop interval in seconds; defaults to
   `10`.
 

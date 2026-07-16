@@ -683,7 +683,11 @@ impl ExecutorBackend for KubernetesBackend {
         Ok(())
     }
 
-    async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+    async fn resolve_image(
+        &self,
+        image: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<String, BackendError> {
         if digest_pinned(image) {
             Ok(image.to_string())
         } else {

@@ -1023,8 +1023,12 @@ impl ExecutorBackend for DockerBackend {
         Ok(())
     }
 
-    async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
-        self.ensure_image(image, &CancellationToken::new()).await?;
+    async fn resolve_image(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, BackendError> {
+        self.ensure_image(image, cancel).await?;
         let inspect = self
             .docker
             .inspect_image(image)

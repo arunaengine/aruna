@@ -121,7 +121,11 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
-        async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+        async fn resolve_image(
+            &self,
+            image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
             Ok(image.to_string())
         }
         async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {

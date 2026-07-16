@@ -178,7 +178,11 @@ mod tests {
             Ok(())
         }
 
-        async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
+        async fn resolve_image(
+            &self,
+            image: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<String, BackendError> {
             Ok(image.to_string())
         }
 

@@ -528,6 +528,7 @@ async fn build_apptainer(config: &Config) -> Result<aruna_compute::ExecutorRegis
             sif_cache,
             cgroup_root,
             stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
+            pull_deadline: env_duration("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE", 300)?,
         },
     )
     .map_err(|error| error.to_string())?;
