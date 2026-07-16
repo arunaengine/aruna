@@ -16,6 +16,7 @@ use std::ops::Range;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     Blob(BlobEffect),
     Compute(ComputeEffect),
