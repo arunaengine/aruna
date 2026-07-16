@@ -665,7 +665,7 @@ pub async fn supervise_and_finalize(
             )
             .await;
         } else {
-            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
+            finalize_walltime(&context, job_id, token, &backend, &fence, &bucket).await;
         }
     };
     if with_execution_heartbeat(storage, job_id, token, cancel.clone(), wait_and_finalize)
@@ -674,6 +674,48 @@ pub async fn supervise_and_finalize(
     {
         info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
     }
+}
+
+async fn finalize_walltime(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    bucket: &str,
+) {
+    let storage = &context.storage_handle;
+    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let logs = match backend.cancel(fence).await {
+        Ok(CancelEvidence::Stopped(_)) => {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
+                return;
+            };
+            logs
+        }
+        Ok(CancelEvidence::AlreadyGone) => LogTails::default(),
+        Ok(CancelEvidence::Requested) | Err(_) => {
+            let _ = mark_indeterminate(
+                storage,
+                job_id,
+                token,
+                JobError::retryable("walltime stop lacks evidence"),
+                unix_timestamp_millis(),
+            )
+            .await;
+            return;
+        }
+    };
+    let result = execution_result_for(bucket, None, Vec::new(), logs);
+    let record = terminal_fail(
+        storage,
+        job_id,
+        token,
+        JobError::permanent("walltime limit exceeded"),
+        result,
+    )
+    .await;
+    cleanup_and_crate(context, job_id, record).await;
 }
 
 pub(super) async fn with_execution_heartbeat<T>(
@@ -1294,6 +1336,7 @@ mod tests {
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::tempdir;
     use tokio::sync::Notify;
@@ -1302,6 +1345,7 @@ mod tests {
     enum StubReconcile {
         NotFound,
         Unavailable,
+        Waiting,
     }
 
     struct StubBackend {
@@ -1309,6 +1353,7 @@ mod tests {
         submits: Mutex<Vec<String>>,
         logs_started: Notify,
         logs_release: Notify,
+        cancels: AtomicUsize,
     }
 
     impl StubBackend {
@@ -1318,6 +1363,7 @@ mod tests {
                 submits: Mutex::new(Vec::new()),
                 logs_started: Notify::new(),
                 logs_release: Notify::new(),
+                cancels: AtomicUsize::new(0),
             })
         }
     }
@@ -1359,6 +1405,9 @@ mod tests {
             _context: &FenceContext,
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
+            if matches!(self.reconcile, StubReconcile::Waiting) {
+                std::future::pending::<()>().await;
+            }
             Ok(AttemptStatus {
                 phase: AttemptPhase::Exited { code: 0 },
                 backend_ref: "done".to_string(),
@@ -1367,6 +1416,7 @@ mod tests {
             })
         }
         async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+            self.cancels.fetch_add(1, Ordering::Relaxed);
             Ok(CancelEvidence::AlreadyGone)
         }
         async fn fetch_logs(
@@ -1392,6 +1442,7 @@ mod tests {
                 StubReconcile::Unavailable => {
                     ReconcileEvidence::Unavailable(BackendError::Unavailable("down".to_string()))
                 }
+                StubReconcile::Waiting => ReconcileEvidence::Absent,
             }
         }
         async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
@@ -1721,6 +1772,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn walltime_fails_job() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = context(storage.clone());
+        Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+        let (record, token, attempt) = ready_with_intent(&storage).await;
+        let job_id = record.job_id;
+        transition_external_to_running(&storage, job_id, token, Some(1), 6)
+            .await
+            .unwrap();
+        let backend = StubBackend::new(StubReconcile::Waiting);
+        let mut spec = execution_spec();
+        spec.resources.max_walltime_ms = Some(0);
+
+        supervise_and_finalize(
+            ctx,
+            job_id,
+            token,
+            backend.clone(),
+            fence(&attempt),
+            spec,
+            "ws-test".to_string(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.last_error.unwrap().message,
+            "walltime limit exceeded"
+        );
     }
 
     #[tokio::test]
