@@ -984,7 +984,11 @@ fn build_config(
     ContainerCreateBody {
         image: Some(spec.image.clone()),
         entrypoint: spec.entrypoint.clone(),
-        cmd: (!spec.command.is_empty()).then(|| spec.command.clone()),
+        cmd: if spec.entrypoint.is_some() || !spec.command.is_empty() {
+            Some(spec.command.clone())
+        } else {
+            None
+        },
         env: Some(env),
         working_dir: spec.workdir.clone(),
         user: Some(format!(
@@ -1791,6 +1795,17 @@ mod tests {
         assert_eq!(
             labels.get(WALLTIME_LABEL).unwrap(),
             &(24 * 60 * 60 * 1000).to_string()
+        );
+    }
+
+    #[test]
+    fn drops_image_command() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.entrypoint = Some(vec!["echo".to_string()]);
+
+        assert_eq!(
+            build_config(&DockerConfig::default(), &fence(), &spec).cmd,
+            Some(Vec::new())
         );
     }
 

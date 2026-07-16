@@ -713,7 +713,7 @@ fn command_argv(spec: &TaskSpec, metadata: &OciMetadata) -> Result<Vec<String>, 
         .entrypoint
         .clone()
         .unwrap_or_else(|| metadata.entrypoint.clone());
-    if spec.command.is_empty() {
+    if spec.command.is_empty() && spec.entrypoint.is_none() {
         argv.extend(metadata.command.clone());
     } else {
         argv.extend(spec.command.clone());
@@ -1047,6 +1047,21 @@ mod tests {
             command_argv(&spec, &metadata).unwrap(),
             vec!["/bin/tool", "argument"]
         );
+    }
+
+    #[test]
+    fn drops_oci_command() {
+        let mut spec = TaskSpec::new(
+            AttemptRef::new("job", 0),
+            "repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        spec.entrypoint = Some(vec!["/bin/tool".to_string()]);
+        let metadata = OciMetadata {
+            entrypoint: Vec::new(),
+            command: vec!["default".to_string()],
+        };
+
+        assert_eq!(command_argv(&spec, &metadata).unwrap(), vec!["/bin/tool"]);
     }
 
     #[test]
