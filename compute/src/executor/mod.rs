@@ -50,6 +50,7 @@ pub fn dispatch_helper() -> Option<i32> {
     }
     #[cfg(not(feature = "apptainer"))]
     {
+        eprintln!("Apptainer helper mode requires the apptainer feature");
         Some(78)
     }
 }
