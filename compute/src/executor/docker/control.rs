@@ -16,6 +16,7 @@ impl DaemonLock {
         std::fs::create_dir_all(root.join("attempts")).map_err(api_error)?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(root.join("daemon.lock"))
@@ -37,6 +38,7 @@ impl DaemonLock {
         std::fs::create_dir_all(&directory).map_err(api_error)?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(directory.join("control.lock"))
