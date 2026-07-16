@@ -18,6 +18,7 @@ pub mod create_metadata_document;
 pub mod create_onboarding_secret;
 pub mod create_realm;
 pub mod create_token;
+pub mod dashboard;
 pub mod delete_metadata_document;
 pub mod delete_onboarding_secret;
 pub mod document_repository;

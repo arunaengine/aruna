@@ -12,6 +12,7 @@ use aruna_core::structs::{
     NotificationRecord, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
     WatchSubscription,
 };
+use aruna_operations::dashboard::subscribe_dashboard_changes;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_watch_for_user,
@@ -36,10 +37,12 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::sync::watch;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -50,7 +53,7 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const NOTIFICATION_STREAM_COALESCE: Duration = Duration::from_millis(200);
 /// Remote-holder poll interval; emits only when the unread count changed.
 const NOTIFICATION_STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
-/// Keep-alive comment cadence so proxies do not cut an idle stream.
+/// State snapshot and keep-alive cadence so proxies do not cut an idle stream.
 const NOTIFICATION_STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
 /// Coarse holder re-resolve cadence on the local wake arm. If the inbox holder
 /// re-ranks to another node mid-stream, deliveries land there with no local wake,
@@ -69,7 +72,11 @@ const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
         list_watches,
         create_watch,
         delete_watch
-    )
+    ),
+    components(schemas(
+        NotificationStreamStateResponse,
+        UnreadCountApiResponse
+    ))
 )]
 pub struct NotificationsApiDoc;
 
@@ -129,10 +136,17 @@ pub struct NotificationListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UnreadCountApiResponse {
     pub count: u32,
     pub capped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationStreamStateResponse {
+    pub epoch: String,
+    pub revision: u64,
+    pub unread: UnreadCountApiResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -610,13 +624,123 @@ fn unread_count_stream(
     })
 }
 
-fn unread_stream_event(count: u64, capped: bool) -> Event {
-    let data = serde_json::to_string(&UnreadCountApiResponse {
-        count: count as u32,
-        capped,
+struct NotificationStateStream<S> {
+    unread: Pin<Box<S>>,
+    epoch: String,
+    revisions: watch::Receiver<u64>,
+    cadence: tokio::time::Interval,
+    current_unread: Option<UnreadCountApiResponse>,
+    last_revision: Option<u64>,
+    unread_open: bool,
+    revisions_open: bool,
+}
+
+impl<S> NotificationStateStream<S> {
+    fn state(&mut self) -> Option<NotificationStreamStateResponse> {
+        let unread = self.current_unread.clone()?;
+        let revision = *self.revisions.borrow_and_update();
+        self.last_revision = Some(revision);
+        Some(NotificationStreamStateResponse {
+            epoch: self.epoch.clone(),
+            revision,
+            unread,
+        })
+    }
+}
+
+enum NotificationStateStep {
+    Unread(Option<(u64, bool)>),
+    Revision(Result<(), watch::error::RecvError>),
+    Periodic,
+}
+
+fn notification_state_stream<S>(
+    unread: S,
+    epoch: String,
+    revisions: watch::Receiver<u64>,
+    cadence: Duration,
+) -> impl Stream<Item = NotificationStreamStateResponse> + Send
+where
+    S: Stream<Item = (u64, bool)> + Send,
+{
+    let mut interval = tokio::time::interval_at(Instant::now() + cadence, cadence);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let state = NotificationStateStream {
+        unread: Box::pin(unread),
+        epoch,
+        revisions,
+        cadence: interval,
+        current_unread: None,
+        last_revision: None,
+        unread_open: true,
+        revisions_open: true,
+    };
+    stream::unfold(state, |mut state| async move {
+        loop {
+            if state.current_unread.is_none() {
+                let (count, capped) = state.unread.next().await?;
+                state.current_unread = Some(UnreadCountApiResponse {
+                    count: count as u32,
+                    capped,
+                });
+                let response = state.state()?;
+                return Some((response, state));
+            }
+
+            let unread_open = state.unread_open;
+            let revisions_open = state.revisions_open;
+            let step = tokio::select! {
+                unread = state.unread.next(), if unread_open => {
+                    NotificationStateStep::Unread(unread)
+                }
+                revision = state.revisions.changed(), if revisions_open => {
+                    NotificationStateStep::Revision(revision)
+                }
+                _ = state.cadence.tick() => NotificationStateStep::Periodic,
+            };
+
+            match step {
+                NotificationStateStep::Unread(Some((count, capped))) => {
+                    let unread = UnreadCountApiResponse {
+                        count: count as u32,
+                        capped,
+                    };
+                    if state.current_unread.as_ref() == Some(&unread) {
+                        continue;
+                    }
+                    state.current_unread = Some(unread);
+                }
+                NotificationStateStep::Unread(None) => {
+                    state.unread_open = false;
+                    continue;
+                }
+                NotificationStateStep::Revision(Ok(())) => {
+                    let revision = *state.revisions.borrow_and_update();
+                    if state.last_revision == Some(revision) {
+                        continue;
+                    }
+                }
+                NotificationStateStep::Revision(Err(_)) => {
+                    state.revisions_open = false;
+                    continue;
+                }
+                NotificationStateStep::Periodic => {}
+            }
+
+            let response = state.state()?;
+            return Some((response, state));
+        }
     })
-    .unwrap_or_else(|_| format!("{{\"count\":{count}}}"));
-    Event::default().event("unread").data(data)
+}
+
+fn state_event(state: NotificationStreamStateResponse) -> Event {
+    let data = serde_json::to_string(&state).unwrap_or_else(|_| {
+        format!(
+            "{{\"epoch\":\"{}\",\"revision\":{},\"unread\":{{\"count\":{},\"capped\":{}}}}}",
+            state.epoch, state.revision, state.unread.count, state.unread.capped
+        )
+    });
+    Event::default().event("state").data(data)
 }
 
 #[utoipa::path(
@@ -624,7 +748,7 @@ fn unread_stream_event(count: u64, capped: bool) -> Event {
     path = "/notifications/stream",
     tag = "notifications",
     responses(
-        (status = 200, description = "Server-sent event stream of the recipient's unread count. Emits `event: unread` frames whose JSON data is `{\"count\": <u64>}` on connect and again whenever the count may have changed; the bell refetches the list on each wake and the stream itself never carries notification bodies. Keep-alive comments are sent about every 20s and the stream ends on client disconnect.", content_type = "text/event-stream"),
+        (status = 200, description = r#"Server-sent state stream. Every application frame is `event: state` with JSON `{"epoch": <string>, "revision": <u64>, "unread": {"count": <u32>, "capped": <bool>}}`. The current state is sent on connect, after a dashboard revision or unread-state change, and about every 20s without advancing the revision. The epoch changes when the retained counter is reset. The stream ends on client disconnect."#, body = NotificationStreamStateResponse, content_type = "text/event-stream"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 503, description = "No inbox holder available", body = ErrorResponse)
@@ -639,6 +763,8 @@ pub async fn stream_notifications(
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
+    let (dashboard_epoch, dashboard_revisions) =
+        subscribe_dashboard_changes(context.as_ref()).ok_or(ServerError::ServiceUnavailable)?;
 
     let holder = resolve_inbox_holder_for_user(context.as_ref(), recipient)
         .await
@@ -653,15 +779,22 @@ pub async fn stream_notifications(
         UnreadStreamMode::Remote
     };
 
-    let events = unread_count_stream(
+    let unread = unread_count_stream(
         context.clone(),
         local_node_id,
         recipient,
         mode,
         NOTIFICATION_STREAM_REMOTE_POLL,
         NOTIFICATION_STREAM_LOCAL_RECHECK,
+    );
+    let events = notification_state_stream(
+        unread,
+        dashboard_epoch,
+        dashboard_revisions,
+        NOTIFICATION_STREAM_KEEP_ALIVE,
     )
-    .map(|(count, capped)| Ok::<_, Infallible>(unread_stream_event(count, capped)));
+    .map(state_event)
+    .map(Ok::<_, Infallible>);
     Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(NOTIFICATION_STREAM_KEEP_ALIVE)))
 }
 
@@ -1273,6 +1406,94 @@ mod tests {
             .expect("stream open");
         assert_eq!(after_wake, 1);
         assert!(!after_wake_capped);
+    }
+
+    #[tokio::test]
+    async fn state_stream_initial() {
+        let (_changes, revisions) = watch::channel(3);
+        let unread = stream::iter([(4, false)]).chain(stream::pending());
+        let mut states = Box::pin(notification_state_stream(
+            unread,
+            "test-epoch".to_string(),
+            revisions,
+            Duration::from_secs(20),
+        ));
+
+        assert_eq!(
+            states.next().await,
+            Some(NotificationStreamStateResponse {
+                epoch: "test-epoch".to_string(),
+                revision: 3,
+                unread: UnreadCountApiResponse {
+                    count: 4,
+                    capped: false,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn state_stream_updates() {
+        let (changes, revisions) = watch::channel(3);
+        let unread = stream::iter([(4, false), (5, true)]).chain(stream::pending());
+        let mut states = Box::pin(notification_state_stream(
+            unread,
+            "test-epoch".to_string(),
+            revisions,
+            Duration::from_secs(20),
+        ));
+
+        assert_eq!(states.next().await.expect("initial state").revision, 3);
+        assert_eq!(
+            states.next().await.expect("unread state").unread,
+            UnreadCountApiResponse {
+                count: 5,
+                capped: true,
+            }
+        );
+        changes.send_replace(4);
+        assert_eq!(states.next().await.expect("dashboard state").revision, 4);
+    }
+
+    #[tokio::test]
+    async fn state_stream_periodic() {
+        tokio::time::pause();
+        let (_changes, revisions) = watch::channel(3);
+        let unread = stream::iter([(4, false)]).chain(stream::pending());
+        let mut states = Box::pin(notification_state_stream(
+            unread,
+            "test-epoch".to_string(),
+            revisions,
+            Duration::from_secs(20),
+        ));
+        let initial = states.next().await.expect("initial state");
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+
+        assert_eq!(states.next().await, Some(initial));
+    }
+
+    #[tokio::test]
+    async fn state_event_shape() {
+        use axum::response::IntoResponse;
+
+        let event = state_event(NotificationStreamStateResponse {
+            epoch: "test-epoch".to_string(),
+            revision: 3,
+            unread: UnreadCountApiResponse {
+                count: 4,
+                capped: false,
+            },
+        });
+        let response = Sse::new(stream::iter([Ok::<_, Infallible>(event)])).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("SSE body");
+
+        assert_eq!(
+            body.as_ref(),
+            b"event: state\ndata: {\"epoch\":\"test-epoch\",\"revision\":3,\"unread\":{\"count\":4,\"capped\":false}}\n\n"
+        );
     }
 
     // The recheck tick is the missed-wake backstop: with no wake fired, the local

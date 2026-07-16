@@ -45,10 +45,11 @@ use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
+use ulid::Ulid;
 
 pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
@@ -397,6 +398,8 @@ struct NetInner {
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
+    dashboard_epoch: Ulid,
+    dashboard_changes: watch::Sender<u64>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     document_sync: Arc<DocumentSyncService>,
@@ -521,6 +524,8 @@ impl NetHandle {
         let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let watch_interest = Arc::new(RwLock::new(WatchInterestTable::default()));
         let (notification_wakes, _) = broadcast::channel(NOTIFICATION_WAKE_CAPACITY);
+        let dashboard_epoch = Ulid::r#gen();
+        let (dashboard_changes, _) = watch::channel(0);
         let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
             &realm_peer_nodes,
@@ -794,6 +799,8 @@ impl NetHandle {
             watch_interest,
             notification_watch_metrics: NotificationWatchMetrics::default(),
             notification_wakes,
+            dashboard_epoch,
+            dashboard_changes,
             dht_signed_authorized_nodes,
             dht,
             document_sync,
@@ -1062,6 +1069,22 @@ impl NetHandle {
     /// no-op, never an error; nothing may fail through this path.
     pub fn notify_inbox_activity(&self, recipient: UserId) {
         let _ = self.inner.notification_wakes.send(recipient);
+    }
+
+    /// Subscribes to the retained dashboard revision for this node.
+    pub fn subscribe_dashboard_changes(&self) -> watch::Receiver<u64> {
+        self.inner.dashboard_changes.subscribe()
+    }
+
+    pub fn dashboard_epoch(&self) -> Ulid {
+        self.inner.dashboard_epoch
+    }
+
+    /// Advances the retained dashboard revision and wakes every subscriber.
+    pub fn notify_dashboard_change(&self) {
+        self.inner
+            .dashboard_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Replaces one realm's node map after a reconcile touched its digests,
@@ -2726,6 +2749,17 @@ mod tests {
             .expect("wake arrives")
             .expect("channel open");
         assert_eq!(woken, recipient);
+        handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_wake_arrives() -> Result<()> {
+        let (_dir, handle) = notification_wake_handle().await?;
+        let mut changes = handle.subscribe_dashboard_changes();
+        handle.notify_dashboard_change();
+        changes.changed().await.expect("channel open");
+        assert_eq!(*changes.borrow_and_update(), 1);
         handle.shutdown().await;
         Ok(())
     }

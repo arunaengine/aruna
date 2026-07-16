@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
+use crate::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::document_sync_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records,
     restore_document_sync_outbox_timers,
@@ -990,6 +991,8 @@ impl OperationsTaskHandler {
                 if let Err(error) = deleted {
                     warn!(key = ?retry_key, error = %error, "Failed to delete document sync outbox records");
                     outcome.retry_needed = true;
+                } else if targets_change_dashboard(&refresh_targets) {
+                    notify_dashboard_change(self.context.as_ref());
                 }
             }
             Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
@@ -2826,6 +2829,61 @@ mod tests {
         let jobs = read_graph_prune_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
+    }
+
+    #[tokio::test]
+    async fn drain_reconcile_wakes() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let realm_id = RealmId::from_bytes([44u8; 32]);
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+                realm_id,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .expect("net handle");
+        let mut revisions = net.subscribe_dashboard_changes();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                Vec::new(),
+                vec![DocumentSyncTarget::RealmConfig { realm_id }],
+                Event::Net(NetEvent::DocumentSync(
+                    DocumentSyncNetEvent::DocumentsReconciled {
+                        applied: 0,
+                        targets: Vec::new(),
+                        metadata_create_events: Vec::new(),
+                        metadata_graph_tombstones: Vec::new(),
+                    },
+                )),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(!outcome.retry_needed);
+        tokio::time::timeout(Duration::from_secs(2), revisions.changed())
+            .await
+            .expect("dashboard revision arrives")
+            .expect("channel open");
+        assert_eq!(*revisions.borrow_and_update(), 1);
+        net.shutdown().await;
     }
 
     #[tokio::test]
