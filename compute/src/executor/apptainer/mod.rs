@@ -581,8 +581,9 @@ impl ExecutorBackend for ApptainerBackend {
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
         let _guard = self.state.control(context)?;
-        if let Some(status) = self.existing_status(context)?
-            && status.is_terminal()
+        let status = self.existing_status(context)?;
+        if (status.as_ref().is_some_and(AttemptStatus::is_terminal)
+            || (status.is_none() && !self.state.attempt_dir(context).exists()))
             && runtime::cgroup_empty(&self.cgroup_path(context))?
         {
             return Ok(());
@@ -977,6 +978,26 @@ fn io_error(error: std::io::Error) -> BackendError {
 mod tests {
     use super::*;
     use aruna_core::compute::AttemptRef;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn absent_cleanup_passes() {
+        let root = tempdir().unwrap();
+        let backend = ApptainerBackend::with_config(ApptainerConfig {
+            state_root: root.path().join("state"),
+            sif_cache: root.path().join("cache"),
+            cgroup_root: root.path().join("cgroup"),
+            stop_grace: Duration::from_secs(1),
+        })
+        .unwrap();
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 1),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+
+        backend.cleanup(&context).await.unwrap();
+    }
 
     #[test]
     fn combines_oci_command() {
