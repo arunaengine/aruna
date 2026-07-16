@@ -61,9 +61,13 @@ Paths are normalized by components, so `/out` and `/output` remain distinct.
 
 Required configuration:
 
-- `ARUNA_COMPUTE_DOCKER_DISK_BYTES`: nonzero writable-layer ceiling in bytes.
 - `S3_PUBLIC_URL`: reachable from a container when task-side S3 is used.
 - `S3_ADDRESS`: non-loopback listener address.
+
+Optional configuration:
+
+- `ARUNA_COMPUTE_DOCKER_DISK_BYTES`: nonzero writable-layer ceiling in bytes.
+  When unset, `storage_opt` is omitted and task disk requests are unenforced.
 
 Docker uses `./compute-state` by default. The state root must be durable and
 exclusive to one controller for the Docker daemon. A daemon lock enforces that
@@ -71,13 +75,12 @@ contract, and a per-attempt lock serializes create, stage, and start.
 
 The backend uses non-root containers, drops all capabilities, sets
 `no-new-privileges`, uses runtime-default seccomp, and defaults to
-`network_mode=none`. File outputs remain in the quota-bounded container writable
-layer; named volumes are not used. Read-only root filesystems with file outputs
-are rejected.
+`network_mode=none`. File outputs remain in the container writable layer; named
+volumes are not used. Read-only root filesystems with file outputs are rejected.
 
-Startup health checks only daemon access and durable state-root writes. Storage
-driver enforcement of `storage_opt` is applied to each task and may fail clearly
-on the first job if the daemon or backing filesystem cannot enforce it.
+When a disk ceiling is configured, startup health creates and removes an unstarted
+probe container. The ceiling requires overlay2 over XFS with `pquota`; unsupported
+daemon or backing-filesystem configurations fail the compute health gate.
 
 ## Apptainer
 

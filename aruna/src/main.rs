@@ -490,7 +490,7 @@ async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry
         return Err("Docker executor requires a non-loopback S3_ADDRESS".to_string());
     }
     let docker_config = aruna_compute::DockerConfig {
-        default_disk_bytes: Some(disk_bytes),
+        default_disk_bytes: disk_bytes,
         ..aruna_compute::DockerConfig::default()
     };
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
@@ -610,15 +610,17 @@ fn env_duration(name: &str, default: u64) -> Result<std::time::Duration, String>
 }
 
 #[cfg(any(feature = "docker", test))]
-fn parse_disk_limit(value: Option<&str>) -> Result<u64, &'static str> {
-    let value = value.ok_or("disk ceiling is missing")?;
+fn parse_disk_limit(value: Option<&str>) -> Result<Option<u64>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
     let bytes = value
         .parse::<u64>()
         .map_err(|_| "disk ceiling must be an integer byte count")?;
     if bytes == 0 {
         return Err("disk ceiling must be greater than zero");
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 async fn seed_local_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
@@ -752,12 +754,15 @@ mod tests {
 
     #[test]
     fn accepts_disk_limit() {
-        assert_eq!(parse_disk_limit(Some("10737418240")), Ok(10_737_418_240));
+        assert_eq!(
+            parse_disk_limit(Some("10737418240")),
+            Ok(Some(10_737_418_240))
+        );
     }
 
     #[test]
     fn rejects_disk_limit() {
-        assert!(parse_disk_limit(None).is_err());
+        assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
     }

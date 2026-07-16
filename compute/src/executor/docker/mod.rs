@@ -19,7 +19,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     ContainerArchiveInfoOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
     DownloadFromContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
-    LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+    ListImagesOptions, LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use bollard::{Docker, body_try_stream};
@@ -91,6 +91,46 @@ impl DockerBackend {
         tokio::task::spawn_blocking(move || daemon_lock.control(&context))
             .await
             .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
+    }
+
+    async fn probe_disk_limit(&self, bytes: u64) -> Result<(), BackendError> {
+        let image = self
+            .docker
+            .list_images(None::<ListImagesOptions>)
+            .await
+            .map_err(|error| classify(&error))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                BackendError::Unavailable(
+                    "Docker disk ceiling probe requires a locally cached image; load one or disable the ceiling"
+                        .to_string(),
+                )
+            })?;
+        let body = ContainerCreateBody {
+            image: Some(image.id),
+            host_config: Some(HostConfig {
+                storage_opt: Some(HashMap::from([("size".to_string(), bytes.to_string())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = self
+            .docker
+            .create_container(Some(CreateContainerOptionsBuilder::new().build()), body)
+            .await
+            .map_err(|error| {
+                BackendError::InvalidSpec(format!(
+                    "Docker disk ceilings require overlay2 over XFS with pquota; disable the ceiling or reconfigure Docker: {error}"
+                ))
+            })?;
+        self.docker
+            .remove_container(
+                &created.id,
+                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+            )
+            .await
+            .map_err(|error| classify(&error))
     }
 
     /// Raw inspect by attempt name (backend-specific; used for resource assertions).
@@ -913,13 +953,10 @@ fn build_config(
         .cpu_cores
         .map(|c| c as i64 * 1_000_000_000)
         .or(config.default_nano_cpus);
-    // Forwarded verbatim: a daemon whose storage driver cannot enforce a disk
-    // quota rejects the create, which beats silently dropping the ceiling.
-    let storage_opt = spec
-        .resources
-        .disk_bytes
-        .or(config.default_disk_bytes)
-        .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
+    let storage_opt = config.default_disk_bytes.map(|default| {
+        let bytes = spec.resources.disk_bytes.unwrap_or(default);
+        HashMap::from([("size".to_string(), bytes.to_string())])
+    });
 
     let host_config = HostConfig {
         memory,
@@ -975,7 +1012,11 @@ impl ExecutorBackend for DockerBackend {
 
     async fn health(&self) -> Result<(), BackendError> {
         self.docker.ping().await.map_err(|e| classify(&e))?;
-        self.daemon_lock.verify()
+        self.daemon_lock.verify()?;
+        if let Some(bytes) = self.config.default_disk_bytes {
+            self.probe_disk_limit(bytes).await?;
+        }
+        Ok(())
     }
 
     async fn resolve_image(&self, image: &str) -> Result<String, BackendError> {
@@ -1553,6 +1594,15 @@ fn classify(err: &bollard::errors::Error) -> BackendError {
     use bollard::errors::Error;
     match err {
         Error::DockerResponseServerError {
+            status_code: _,
+            message,
+        } if message
+            .to_ascii_lowercase()
+            .contains("storage-opt is supported only for overlay over xfs") =>
+        {
+            BackendError::InvalidSpec(message.clone())
+        }
+        Error::DockerResponseServerError {
             status_code,
             message,
         } => match status_code {
@@ -1799,6 +1849,15 @@ mod tests {
     }
 
     #[test]
+    fn disk_request_unenforced() {
+        let config = DockerConfig::default();
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.resources.disk_bytes = Some(1 << 30);
+        let host = build_config(&config, &fence(), &spec).host_config.unwrap();
+        assert!(host.storage_opt.is_none());
+    }
+
+    #[test]
     fn freshness_gate() {
         let fresh = AttemptStatus {
             phase: AttemptPhase::Submitted,
@@ -1874,6 +1933,18 @@ mod tests {
         };
         let classified = classify_pull(&error);
         assert!(matches!(classified, BackendError::ImageNotFound(_)));
+        assert!(!classified.retryable());
+    }
+
+    #[test]
+    fn storage_opt_classification() {
+        let error = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "--storage-opt is supported only for overlay over xfs with 'pquota'"
+                .to_string(),
+        };
+        let classified = classify(&error);
+        assert!(matches!(classified, BackendError::InvalidSpec(_)));
         assert!(!classified.retryable());
     }
 
