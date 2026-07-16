@@ -80,7 +80,8 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
     let group_id = Ulid::from_string(&group.group_id)?;
     let creds = create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
 
-    // A source object the workflow snapshots into the workspace.
+    // A multi-chunk source object (~1 MiB) the workflow snapshots into the
+    // workspace, so staging, container upload, and output capture all stream.
     let source_bucket = format!("src-{}", Ulid::r#gen().to_string().to_lowercase());
     let client = s3_client(&endpoint, &creds);
     client.create_bucket().bucket(&source_bucket).send().await?;
@@ -88,7 +89,7 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
         .put_object()
         .bucket(&source_bucket)
         .key("data.txt")
-        .body(ByteStream::from_static(b"payload-from-source"))
+        .body(ByteStream::from(source_payload()))
         .send()
         .await?;
 
@@ -111,6 +112,10 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
         endpoint,
         source_bucket,
     })
+}
+
+fn source_payload() -> Vec<u8> {
+    b"payload-from-source\n".repeat(52_429)
 }
 
 fn execution_spec(
@@ -319,7 +324,9 @@ async fn execution_end_to_end() -> TestResult<()> {
         .await
         .expect("output object durable in workspace");
     let body = output.body.collect().await.unwrap().into_bytes();
-    assert_eq!(&body[..], b"PAYLOAD-FROM-SOURCE");
+    let expected = source_payload().to_ascii_uppercase();
+    assert_eq!(body.len(), expected.len(), "output size must match");
+    assert_eq!(&body[..], expected, "output bytes must match");
 
     // The staged input is durable too.
     client

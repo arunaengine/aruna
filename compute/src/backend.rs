@@ -1,4 +1,8 @@
+use std::pin::Pin;
+
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
 use thiserror::Error;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
@@ -6,6 +10,15 @@ use tokio_util::sync::CancellationToken;
 use crate::logs::{LogSink, LogTails};
 use crate::spec::{AttemptRef, LogLimits, TaskSpec};
 use crate::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
+
+/// Chunked byte stream of one fetched task output file.
+pub type OutputChunks = Pin<Box<dyn Stream<Item = Result<Bytes, BackendError>> + Send + Sync>>;
+
+/// Streamed task output: the size declared by the backend plus its byte stream.
+pub struct TaskOutput {
+    pub size: u64,
+    pub chunks: OutputChunks,
+}
 
 /// Executor kinds advertised on the Node Descriptor as a hard scheduling filter.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -132,8 +145,12 @@ pub trait ExecutorBackend: Send + Sync {
         sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError>;
 
-    async fn fetch_output(&self, attempt: &AttemptRef, path: &str)
-    -> Result<Vec<u8>, BackendError>;
+    /// Stream one declared output file out of the terminal attempt.
+    async fn fetch_output(
+        &self,
+        attempt: &AttemptRef,
+        path: &str,
+    ) -> Result<TaskOutput, BackendError>;
 
     /// Query by deterministic name after restart / lease loss. Never mutates.
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome;

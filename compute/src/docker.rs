@@ -1,10 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
-
-#[cfg(test)]
-use std::io::Cursor;
 
 use async_trait::async_trait;
 use bollard::models::{
@@ -16,14 +15,17 @@ use bollard::query_parameters::{
     RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
     UploadToContainerOptionsBuilder,
 };
-use bollard::{Docker, body_full};
-use bytes::{Buf, Bytes};
-use futures_util::StreamExt;
+use bollard::{Docker, body_try_stream};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{BackendError, ExecutorBackend, ExecutorKind};
+use crate::backend::{BackendError, ExecutorBackend, ExecutorKind, TaskOutput};
 use crate::logs::{BoundedTail, LogSink, LogStream, LogTails};
-use crate::spec::{AttemptRef, LogLimits, MAX_TRANSFER_BYTES, TaskInput, TaskSpec};
+use crate::spec::{AttemptRef, InputStream, LogLimits, MAX_TRANSFER_BYTES, TaskInput, TaskSpec};
 use crate::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
@@ -266,15 +268,54 @@ impl DockerBackend {
         }
     }
 
-    async fn upload_archive(&self, container: &str, archive: Vec<u8>) -> Result<(), BackendError> {
+    /// Stream the staging archive into the container: a blocking task builds the
+    /// tar into a bounded channel that feeds the request body chunk by chunk.
+    async fn upload_archive(
+        &self,
+        container: &str,
+        plan: &ArchivePlan<'_>,
+        directories: &BTreeMap<PathBuf, u32>,
+    ) -> Result<(), BackendError> {
+        let mut files = Vec::with_capacity(plan.inputs.len());
+        for (path, input) in &plan.inputs {
+            let stream = input.take_stream().ok_or_else(|| {
+                BackendError::Unavailable(format!(
+                    "input `{}` stream is already consumed",
+                    input.path
+                ))
+            })?;
+            files.push((path.clone(), input.size(), stream));
+        }
+        let directories = directories.clone();
+        let handle = Handle::current();
+        let (tx, rx) = mpsc::channel(4);
+        let builder = tokio::task::spawn_blocking(move || {
+            build_archive(tx, handle, &directories, files, MAX_TRANSFER_BYTES)
+        });
         let options = UploadToContainerOptionsBuilder::new()
             .path("/")
             .no_overwrite_dir_non_dir("true")
             .build();
-        self.docker
-            .upload_to_container(container, Some(options), body_full(Bytes::from(archive)))
-            .await
-            .map_err(|error| classify_archive(&error))
+        let uploaded = self
+            .docker
+            .upload_to_container(container, Some(options), body_try_stream(ChannelStream(rx)))
+            .await;
+        let built = match builder.await {
+            Ok(built) => built,
+            Err(join_error) => Err(BuildError::Failed(BackendError::Api(format!(
+                "archive build task failed: {join_error}"
+            )))),
+        };
+        // A build failure is authoritative even when the daemon accepted the
+        // truncated body; the container is never started on this path.
+        match (built, uploaded) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(BuildError::Failed(error)), _) => Err(error),
+            (_, Err(error)) => Err(classify_archive(&error)),
+            (Err(BuildError::Aborted), Ok(())) => Err(BackendError::Api(
+                "archive upload ended before the archive was complete".to_string(),
+            )),
+        }
     }
 
     async fn prepare_created(
@@ -297,9 +338,7 @@ impl DockerBackend {
             self.cancel_submission(attempt, cancel).await?;
             let directories = directories?;
             if !plan.inputs.is_empty() || !directories.is_empty() {
-                let archive = build_archive(plan, &directories);
-                self.cancel_submission(attempt, cancel).await?;
-                let uploaded = self.upload_archive(container_id, archive?).await;
+                let uploaded = self.upload_archive(container_id, plan, &directories).await;
                 self.cancel_submission(attempt, cancel).await?;
                 uploaded?;
             }
@@ -382,7 +421,6 @@ fn add_parents(path: &Path, mode: u32, directories: &mut BTreeMap<PathBuf, u32>)
 struct ArchivePlan<'a> {
     inputs: BTreeMap<PathBuf, &'a TaskInput>,
     directories: BTreeMap<PathBuf, u32>,
-    input_bytes: usize,
 }
 
 impl<'a> ArchivePlan<'a> {
@@ -390,7 +428,7 @@ impl<'a> ArchivePlan<'a> {
         let mut inputs = BTreeMap::new();
         let mut outputs = BTreeSet::new();
         let mut files = BTreeSet::new();
-        let mut input_bytes = 0usize;
+        let mut input_bytes = 0u64;
         for input in &spec.inputs {
             let path = container_path(&input.path)?;
             if inputs.insert(path.clone(), input).is_some() || !files.insert(path) {
@@ -400,7 +438,7 @@ impl<'a> ArchivePlan<'a> {
                 )));
             }
             input_bytes = input_bytes
-                .checked_add(input.contents.len())
+                .checked_add(input.size())
                 .filter(|total| *total <= MAX_TRANSFER_BYTES)
                 .ok_or_else(transfer_error)?;
         }
@@ -437,22 +475,58 @@ impl<'a> ArchivePlan<'a> {
         Ok(Self {
             inputs,
             directories,
-            input_bytes,
         })
     }
 }
 
-struct TransferBuffer {
-    bytes: Vec<u8>,
-    limit: usize,
+/// Marker smuggled through `io::Error` when a streaming transfer passes the
+/// aggregate byte guard.
+#[derive(Debug)]
+struct TransferLimitError;
+
+impl std::fmt::Display for TransferLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "task file transfer exceeds the {MAX_TRANSFER_BYTES}-byte limit"
+        )
+    }
 }
 
-impl Write for TransferBuffer {
+impl std::error::Error for TransferLimitError {}
+
+fn transfer_error() -> BackendError {
+    BackendError::InvalidSpec(TransferLimitError.to_string())
+}
+
+/// `mpsc::Receiver` as a `Stream`; carries archive chunks across task borders.
+struct ChannelStream<T>(mpsc::Receiver<T>);
+
+impl<T> Stream for ChannelStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// Byte-counting tar sink feeding the upload body channel.
+struct ChannelWriter {
+    tx: mpsc::Sender<io::Result<Bytes>>,
+    sent: u64,
+    limit: u64,
+}
+
+impl Write for ChannelWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
-            return Err(io::Error::other("task file transfer exceeds memory limit"));
-        }
-        self.bytes.extend_from_slice(bytes);
+        self.sent = self
+            .sent
+            .checked_add(bytes.len() as u64)
+            .filter(|total| *total <= self.limit)
+            .ok_or_else(|| io::Error::other(TransferLimitError))?;
+        self.tx
+            .blocking_send(Ok(Bytes::copy_from_slice(bytes)))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         Ok(bytes.len())
     }
 
@@ -461,33 +535,89 @@ impl Write for TransferBuffer {
     }
 }
 
-fn transfer_error() -> BackendError {
-    BackendError::InvalidSpec(format!(
-        "task file transfer exceeds the {MAX_TRANSFER_BYTES}-byte limit"
-    ))
+/// Guards a tar entry body: the stream must yield exactly the declared size or
+/// the archive would be silently corrupt.
+struct ExactReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for ExactReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "input is larger than its declared size",
+                ));
+            }
+            return Ok(0);
+        }
+        let cap = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buffer[..cap])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "input ended before its declared size",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+enum BuildError {
+    /// The body receiver went away; the upload error is authoritative.
+    Aborted,
+    Failed(BackendError),
+}
+
+fn input_error(error: io::Error) -> BuildError {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return BuildError::Aborted;
+    }
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<TransferLimitError>())
+    {
+        return BuildError::Failed(transfer_error());
+    }
+    BuildError::Failed(BackendError::Unavailable(format!(
+        "task input transfer failed: {error}"
+    )))
 }
 
 fn build_archive(
-    plan: &ArchivePlan<'_>,
+    tx: mpsc::Sender<io::Result<Bytes>>,
+    handle: Handle,
     directories: &BTreeMap<PathBuf, u32>,
-) -> Result<Vec<u8>, BackendError> {
-    build_limited(plan, directories, MAX_TRANSFER_BYTES)
+    files: Vec<(PathBuf, u64, InputStream)>,
+    limit: u64,
+) -> Result<(), BuildError> {
+    let writer = ChannelWriter {
+        tx: tx.clone(),
+        sent: 0,
+        limit,
+    };
+    let built = write_entries(writer, handle, directories, files);
+    // An explicit error chunk aborts the request; a clean close of a truncated
+    // body could otherwise be accepted by the daemon as a complete archive.
+    if let Err(BuildError::Failed(_)) = &built {
+        let _ = tx.blocking_send(Err(io::Error::other("task archive build failed")));
+    }
+    built
 }
 
-fn build_limited(
-    plan: &ArchivePlan<'_>,
+fn write_entries(
+    writer: ChannelWriter,
+    handle: Handle,
     directories: &BTreeMap<PathBuf, u32>,
-    limit: usize,
-) -> Result<Vec<u8>, BackendError> {
-    let archive_limit = limit
-        .checked_sub(plan.input_bytes)
-        .ok_or_else(transfer_error)?;
-    let buffer = TransferBuffer {
-        bytes: Vec::new(),
-        limit: archive_limit,
-    };
-
-    let mut builder = tar::Builder::new(buffer);
+    files: Vec<(PathBuf, u64, InputStream)>,
+) -> Result<(), BuildError> {
+    let mut builder = tar::Builder::new(writer);
     for (path, mode) in directories {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Directory);
@@ -497,25 +627,26 @@ fn build_limited(
         header.set_mtime(0);
         header.set_size(0);
         builder
-            .append_data(&mut header, path, std::io::empty())
-            .map_err(|_| transfer_error())?;
+            .append_data(&mut header, path, io::empty())
+            .map_err(input_error)?;
     }
-    for (path, input) in &plan.inputs {
+    for (path, size, stream) in files {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_mode(0o444);
         header.set_uid(0);
         header.set_gid(0);
         header.set_mtime(0);
-        header.set_size(input.contents.len() as u64);
+        header.set_size(size);
+        let reader = ExactReader {
+            inner: SyncIoBridge::new_with_handle(StreamReader::new(stream), handle.clone()),
+            remaining: size,
+        };
         builder
-            .append_data(&mut header, path, input.contents.as_slice())
-            .map_err(|_| transfer_error())?;
+            .append_data(&mut header, path, reader)
+            .map_err(input_error)?;
     }
-    builder
-        .into_inner()
-        .map(|buffer| buffer.bytes)
-        .map_err(|_| transfer_error())
+    builder.finish().map_err(input_error)
 }
 
 fn archive_api(error: impl std::fmt::Display) -> BackendError {
@@ -526,81 +657,130 @@ fn output_spec(message: impl Into<String>) -> BackendError {
     BackendError::InvalidSpec(format!("invalid Docker output: {}", message.into()))
 }
 
-fn parse_output(
-    archive: impl Read,
-    archive_bytes: usize,
-    expected: &Path,
-) -> Result<Vec<u8>, BackendError> {
-    parse_limited(archive, archive_bytes, expected, MAX_TRANSFER_BYTES)
+/// Recover the classification smuggled through the archive reader: transport
+/// faults keep their classified form, everything else is a malformed archive.
+fn archive_error(error: io::Error) -> BackendError {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<TransferLimitError>())
+    {
+        return transfer_error();
+    }
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<BackendError>())
+    {
+        Some(backend) => backend.clone(),
+        None => archive_api(error),
+    }
 }
 
-fn parse_limited(
-    archive: impl Read,
-    archive_bytes: usize,
+/// Enforce the aggregate byte guard on raw archive bytes as they stream.
+fn count_limited<S>(stream: S, limit: u64) -> impl Stream<Item = io::Result<Bytes>>
+where
+    S: Stream<Item = io::Result<Bytes>>,
+{
+    let mut total = 0u64;
+    stream.map(move |chunk| {
+        let chunk = chunk?;
+        total = total
+            .checked_add(chunk.len() as u64)
+            .filter(|total| *total <= limit)
+            .ok_or_else(|| io::Error::other(TransferLimitError))?;
+        Ok(chunk)
+    })
+}
+
+fn first_entry<'a, R: Read>(
+    entries: &mut tar::Entries<'a, R>,
     expected: &Path,
-    limit: usize,
-) -> Result<Vec<u8>, BackendError> {
-    if archive_bytes > limit {
-        return Err(transfer_error());
-    }
-    let expected = expected
-        .file_name()
-        .ok_or_else(|| output_spec("path has no file name"))?;
-    let mut archive = tar::Archive::new(archive);
-    let mut entries = archive.entries().map_err(archive_api)?;
-    let mut entry = entries
+) -> Result<tar::Entry<'a, R>, BackendError> {
+    let entry = entries
         .next()
         .ok_or_else(|| output_spec("archive is empty"))?
-        .map_err(archive_api)?;
-    let path = entry.path().map_err(archive_api)?;
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        .map_err(archive_error)?;
     {
-        return Err(output_spec("archive entry path is unsafe"));
-    }
-    if path != Path::new(expected) {
-        return Err(output_spec(format!(
-            "archive contains unexpected entry `{}`",
-            path.display()
-        )));
+        let path = entry.path().map_err(archive_api)?;
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(output_spec("archive entry path is unsafe"));
+        }
+        if path != expected {
+            return Err(output_spec(format!(
+                "archive contains unexpected entry `{}`",
+                path.display()
+            )));
+        }
     }
     if !entry.header().entry_type().is_file() || entry.link_name().map_err(archive_api)?.is_some() {
         return Err(output_spec("declared output is not a regular file"));
     }
-    let size = usize::try_from(entry.size()).map_err(archive_api)?;
-    if archive_bytes
-        .checked_add(size)
-        .is_none_or(|total| total > limit)
-    {
-        return Err(transfer_error());
-    }
-    let mut contents = vec![0; size];
-    entry.read_exact(&mut contents).map_err(archive_api)?;
-    drop(entry);
-    if entries.next().transpose().map_err(archive_api)?.is_some() {
-        return Err(output_spec("archive contains multiple entries"));
-    }
-    Ok(contents)
+    Ok(entry)
 }
 
-struct ArchiveChunks {
-    chunks: VecDeque<Bytes>,
-}
-
-impl Read for ArchiveChunks {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        while self.chunks.front().is_some_and(Bytes::is_empty) {
-            self.chunks.pop_front();
+/// Blocking tar parse: validate the single expected entry, hand its size to the
+/// header channel, then stream its bytes chunkwise.
+fn stream_output(
+    archive: impl Read,
+    expected: &Path,
+    header: oneshot::Sender<Result<u64, BackendError>>,
+    tx: mpsc::Sender<Result<Bytes, BackendError>>,
+) {
+    let mut archive = tar::Archive::new(archive);
+    let mut entries = match archive.entries().map_err(archive_error) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let _ = header.send(Err(error));
+            return;
         }
-        let Some(chunk) = self.chunks.front_mut() else {
-            return Ok(0);
-        };
-        let count = buffer.len().min(chunk.len());
-        buffer[..count].copy_from_slice(&chunk[..count]);
-        chunk.advance(count);
-        Ok(count)
+    };
+    let mut entry = match first_entry(&mut entries, expected) {
+        Ok(entry) => entry,
+        Err(error) => {
+            let _ = header.send(Err(error));
+            return;
+        }
+    };
+    let size = entry.size();
+    if header.send(Ok(size)).is_err() {
+        return;
+    }
+    let mut streamed = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match entry.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                streamed += read as u64;
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = tx.blocking_send(Err(archive_error(error)));
+                return;
+            }
+        }
+    }
+    if streamed != size {
+        let _ = tx.blocking_send(Err(output_spec("archive entry is truncated")));
+        return;
+    }
+    drop(entry);
+    match entries.next() {
+        None => {}
+        Some(Ok(_)) => {
+            let _ = tx.blocking_send(Err(output_spec("archive contains multiple entries")));
+        }
+        Some(Err(error)) => {
+            let _ = tx.blocking_send(Err(archive_error(error)));
+        }
     }
 }
 
@@ -864,9 +1044,13 @@ impl ExecutorBackend for DockerBackend {
         &self,
         attempt: &AttemptRef,
         path: &str,
-    ) -> Result<Vec<u8>, BackendError> {
+    ) -> Result<TaskOutput, BackendError> {
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         let output_path = container_path(path)?;
+        let expected = output_path
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| output_spec("path has no file name"))?;
         let inspect = self.inspect_matching_attempt(attempt).await?;
         let status = inspect_to_status(inspect.clone());
         if !status.is_terminal() {
@@ -878,39 +1062,33 @@ impl ExecutorBackend for DockerBackend {
         let options = DownloadFromContainerOptionsBuilder::new()
             .path(path)
             .build();
-        let mut stream = self
+        let raw = self
             .docker
-            .download_from_container(container_id, Some(options));
-        let mut archive = Vec::new();
-        let mut archive_bytes = 0usize;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    archive_bytes = archive_bytes
-                        .checked_add(chunk.len())
-                        .filter(|total| *total <= MAX_TRANSFER_BYTES)
-                        .ok_or_else(transfer_error)?;
-                    archive.push(chunk);
+            .download_from_container(container_id, Some(options))
+            .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
+        let counted = Box::pin(count_limited(raw, MAX_TRANSFER_BYTES));
+        let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
+        let (header_tx, header_rx) = oneshot::channel();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::task::spawn_blocking(move || stream_output(reader, &expected, header_tx, tx));
+        match header_rx.await {
+            Ok(Ok(size)) => Ok(TaskOutput {
+                size,
+                chunks: Box::pin(ChannelStream(rx)),
+            }),
+            Ok(Err(error)) => {
+                if matches!(&error, BackendError::NotFound(_)) {
+                    return match self.inspect_matching_attempt(attempt).await {
+                        Ok(_) => Err(output_spec(format!("path `{path}` does not exist"))),
+                        Err(error) => Err(error),
+                    };
                 }
-                Err(error) => {
-                    let classified = classify_archive(&error);
-                    if matches!(classified, BackendError::NotFound(_)) {
-                        return match self.inspect_matching_attempt(attempt).await {
-                            Ok(_) => Err(output_spec(format!("path `{path}` does not exist"))),
-                            Err(error) => Err(error),
-                        };
-                    }
-                    return Err(classified);
-                }
+                Err(error)
             }
+            Err(_) => Err(BackendError::Api(
+                "output parse stopped before the tar header".to_string(),
+            )),
         }
-        parse_output(
-            ArchiveChunks {
-                chunks: archive.into(),
-            },
-            archive_bytes,
-            &output_path,
-        )
     }
 
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome {
@@ -1416,20 +1594,58 @@ mod tests {
         assert!(!classified.retryable());
     }
 
-    #[test]
-    fn staging_archive() {
-        use crate::spec::TaskInput;
-
-        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
-        spec.inputs.push(TaskInput {
-            path: "/data/input.txt".to_string(),
-            contents: b"hello".to_vec(),
+    /// Drive the blocking archive builder over `plan` and collect the tar bytes.
+    async fn collect_archive(
+        plan: &ArchivePlan<'_>,
+        directories: &BTreeMap<PathBuf, u32>,
+        limit: u64,
+    ) -> Result<Vec<u8>, BackendError> {
+        let mut files = Vec::new();
+        for (path, input) in &plan.inputs {
+            files.push((path.clone(), input.size(), input.take_stream().unwrap()));
+        }
+        let directories = directories.clone();
+        let handle = Handle::current();
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = tokio::task::spawn_blocking(move || {
+            build_archive(tx, handle, &directories, files, limit)
         });
-        spec.output_paths.push("/results/output.txt".to_string());
-        let plan = ArchivePlan::new(&spec).unwrap();
-        let directories = BTreeMap::from([(PathBuf::from("results"), 0o777)]);
-        let bytes = build_archive(&plan, &directories).unwrap();
-        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            if let Ok(chunk) = chunk {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        match task.await.unwrap() {
+            Ok(()) => Ok(bytes),
+            Err(BuildError::Failed(error)) => Err(error),
+            Err(BuildError::Aborted) => panic!("archive build aborted"),
+        }
+    }
+
+    /// Run the streaming output parser over in-memory archive bytes.
+    async fn parse_bytes(
+        archive: Vec<u8>,
+        expected: &Path,
+        limit: u64,
+    ) -> Result<(u64, Vec<u8>), BackendError> {
+        let raw = futures_util::stream::iter([Ok::<_, io::Error>(Bytes::from(archive))]);
+        let counted = Box::pin(count_limited(raw, limit));
+        let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
+        let (header_tx, header_rx) = oneshot::channel();
+        let (tx, mut rx) = mpsc::channel(4);
+        let expected = expected.to_path_buf();
+        tokio::task::spawn_blocking(move || stream_output(reader, &expected, header_tx, tx));
+        let size = header_rx.await.expect("header result")?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        Ok((size, bytes))
+    }
+
+    fn read_entries(bytes: Vec<u8>) -> BTreeMap<PathBuf, (tar::EntryType, u32, Vec<u8>)> {
+        let mut archive = tar::Archive::new(io::Cursor::new(bytes));
         let mut found = BTreeMap::new();
         for entry in archive.entries().unwrap() {
             let mut entry = entry.unwrap();
@@ -1440,6 +1656,21 @@ mod tests {
             entry.read_to_end(&mut contents).unwrap();
             found.insert(path, (kind, mode, contents));
         }
+        found
+    }
+
+    #[tokio::test]
+    async fn staging_archive() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.inputs
+            .push(TaskInput::from_bytes("/data/input.txt", b"hello".to_vec()));
+        spec.output_paths.push("/results/output.txt".to_string());
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let directories = BTreeMap::from([(PathBuf::from("results"), 0o777)]);
+        let bytes = collect_archive(&plan, &directories, MAX_TRANSFER_BYTES)
+            .await
+            .unwrap();
+        let found = read_entries(bytes);
         assert!(!found.contains_key(Path::new("data")));
         assert_eq!(found[Path::new("results")].1 & 0o777, 0o777);
         assert_eq!(found[Path::new("data/input.txt")].1 & 0o777, 0o444);
@@ -1447,18 +1678,74 @@ mod tests {
         assert!(found[Path::new("data/input.txt")].0.is_file());
     }
 
+    #[tokio::test]
+    async fn chunked_input() {
+        // A multi-chunk input stream must land as one contiguous archive entry.
+        let mut contents = vec![b'a'; 700];
+        contents.extend_from_slice(&[b'b'; 300]);
+        contents.extend_from_slice(&[b'c'; 24]);
+        let chunks: Vec<io::Result<Bytes>> = vec![
+            Ok(Bytes::from(vec![b'a'; 700])),
+            Ok(Bytes::from(vec![b'b'; 300])),
+            Ok(Bytes::from(vec![b'c'; 24])),
+        ];
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.inputs.push(TaskInput::from_stream(
+            "/data/blob.bin",
+            contents.len() as u64,
+            Box::pin(futures_util::stream::iter(chunks)),
+        ));
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let bytes = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES)
+            .await
+            .unwrap();
+        let found = read_entries(bytes);
+        assert_eq!(found[Path::new("data/blob.bin")].2, contents);
+    }
+
+    #[tokio::test]
+    async fn size_mismatch_fails() {
+        // A stream shorter or longer than its declared size must not corrupt the tar.
+        for (declared, actual) in [(10u64, 5usize), (5, 10)] {
+            let chunk: Vec<io::Result<Bytes>> = vec![Ok(Bytes::from(vec![b'x'; actual]))];
+            let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+            spec.inputs.push(TaskInput::from_stream(
+                "/data/blob.bin",
+                declared,
+                Box::pin(futures_util::stream::iter(chunk)),
+            ));
+            let plan = ArchivePlan::new(&spec).unwrap();
+            let result = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES).await;
+            assert!(
+                matches!(result, Err(BackendError::Unavailable(_))),
+                "declared {declared} actual {actual} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_plan() {
+        // Declared sizes above the 4 GiB aggregate guard reject before any I/O.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.inputs.push(TaskInput::from_stream(
+            "/big.bin",
+            MAX_TRANSFER_BYTES + 1,
+            Box::pin(futures_util::stream::empty()),
+        ));
+        assert!(matches!(
+            ArchivePlan::new(&spec),
+            Err(BackendError::InvalidSpec(_))
+        ));
+    }
+
     #[test]
     fn path_safety() {
-        use crate::spec::TaskInput;
-
         for path in ["relative", "/", "/../secret", "/a/./b", "/a//b"] {
             assert!(container_path(path).is_err(), "accepted unsafe path {path}");
         }
         let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
-        spec.inputs.push(TaskInput {
-            path: "/data".to_string(),
-            contents: Vec::new(),
-        });
+        spec.inputs
+            .push(TaskInput::from_bytes("/data", Bytes::new()));
         spec.output_paths.push("/data/output".to_string());
         assert!(ArchivePlan::new(&spec).is_err());
     }
@@ -1478,53 +1765,39 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
-    #[test]
-    fn output_archive() {
+    #[tokio::test]
+    async fn output_archive() {
         let bytes = make_archive(&[("output.txt", tar::EntryType::Regular, b"done")]);
-        assert_eq!(
-            parse_output(
-                Cursor::new(bytes.as_slice()),
-                bytes.len(),
-                Path::new("results/output.txt")
-            )
-            .unwrap(),
-            b"done"
-        );
+        let (size, contents) = parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(size, 4);
+        assert_eq!(contents, b"done");
 
         let link = make_archive(&[("output.txt", tar::EntryType::Symlink, b"")]);
         assert!(matches!(
-            parse_output(
-                Cursor::new(link.as_slice()),
-                link.len(),
-                Path::new("output.txt")
-            ),
+            parse_bytes(link, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
             Err(BackendError::InvalidSpec(_))
         ));
         let unexpected = make_archive(&[("other.txt", tar::EntryType::Regular, b"x")]);
         assert!(
-            parse_output(
-                Cursor::new(unexpected.as_slice()),
-                unexpected.len(),
-                Path::new("output.txt")
-            )
-            .is_err()
+            parse_bytes(unexpected, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+                .await
+                .is_err()
         );
         let multiple = make_archive(&[
             ("output.txt", tar::EntryType::Regular, b"x"),
             ("other.txt", tar::EntryType::Regular, b"y"),
         ]);
         assert!(
-            parse_output(
-                Cursor::new(multiple.as_slice()),
-                multiple.len(),
-                Path::new("output.txt")
-            )
-            .is_err()
+            parse_bytes(multiple, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+                .await
+                .is_err()
         );
     }
 
-    #[test]
-    fn traversal_rejected() {
+    #[tokio::test]
+    async fn traversal_rejected() {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_mode(0o644);
@@ -1535,47 +1808,27 @@ mod tests {
         builder.append(&header, &b"x"[..]).unwrap();
         let bytes = builder.into_inner().unwrap();
         assert!(matches!(
-            parse_output(
-                Cursor::new(bytes.as_slice()),
-                bytes.len(),
-                Path::new("output.txt")
-            ),
+            parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
             Err(BackendError::InvalidSpec(_))
         ));
     }
 
-    #[test]
-    fn transfer_limits() {
-        use crate::spec::TaskInput;
-
+    #[tokio::test]
+    async fn transfer_limits() {
+        // The aggregate guard trips while bytes stream, on build and on parse.
         let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
-        spec.inputs.push(TaskInput {
-            path: "/input.txt".to_string(),
-            contents: b"data".to_vec(),
-        });
+        spec.inputs
+            .push(TaskInput::from_bytes("/input.txt", b"data".to_vec()));
         let plan = ArchivePlan::new(&spec).unwrap();
         assert!(matches!(
-            build_limited(&plan, &BTreeMap::new(), plan.input_bytes),
+            collect_archive(&plan, &BTreeMap::new(), 100).await,
             Err(BackendError::InvalidSpec(_))
         ));
 
         let bytes = make_archive(&[("output.txt", tar::EntryType::Regular, b"done")]);
+        let limit = (bytes.len() - 1) as u64;
         assert!(matches!(
-            parse_limited(
-                Cursor::new(bytes.as_slice()),
-                bytes.len(),
-                Path::new("output.txt"),
-                bytes.len() - 1,
-            ),
-            Err(BackendError::InvalidSpec(_))
-        ));
-        assert!(matches!(
-            parse_limited(
-                Cursor::new(bytes.as_slice()),
-                bytes.len(),
-                Path::new("output.txt"),
-                bytes.len() + 3,
-            ),
+            parse_bytes(bytes, Path::new("output.txt"), limit).await,
             Err(BackendError::InvalidSpec(_))
         ));
     }

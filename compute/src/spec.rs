@@ -1,12 +1,20 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io;
+use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
-/// Aggregate ceiling for in-memory task file-transfer payloads.
-// Real-file streaming is a follow-up; transfers remain memory-buffered for now.
-pub const MAX_TRANSFER_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Aggregate ceiling for task file-transfer payloads, enforced while bytes
+/// stream so peak memory stays bounded by a chunk, never the payload.
+pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// One-shot chunked byte source backing a [`TaskInput`].
+pub type InputStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 
 /// Fence identity of one attempt. Deterministically names the external object
 /// via [`AttemptRef::external_name`]; that name is the reconciliation key.
@@ -87,10 +95,50 @@ pub struct WorkspaceBinding {
     pub region: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One file staged into the container before start. The declared size names the
+/// tar entry length; the stream is one-shot and must yield exactly that many bytes.
 pub struct TaskInput {
     pub path: String,
-    pub contents: Vec<u8>,
+    size: u64,
+    stream: Mutex<Option<InputStream>>,
+}
+
+impl TaskInput {
+    pub fn from_stream(path: impl Into<String>, size: u64, stream: InputStream) -> Self {
+        Self {
+            path: path.into(),
+            size,
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+
+    pub fn from_bytes(path: impl Into<String>, bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        let size = bytes.len() as u64;
+        Self::from_stream(
+            path,
+            size,
+            Box::pin(futures_util::stream::iter([Ok(bytes)])),
+        )
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Take the one-shot stream; `None` when an earlier submit already consumed it.
+    pub fn take_stream(&self) -> Option<InputStream> {
+        self.stream.lock().ok()?.take()
+    }
+}
+
+impl fmt::Debug for TaskInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskInput")
+            .field("path", &self.path)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Zeroized secret wrapper. Redacts on `Debug`; serializes transparently so a
@@ -148,7 +196,7 @@ impl Default for LogLimits {
 
 /// Everything a backend needs to run one attempt. The reconciliation key is
 /// `attempt.external_name()`; the backend never reads any Aruna record.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct TaskSpec {
     pub attempt: AttemptRef,
     /// Digest-pinned form recorded for provenance.

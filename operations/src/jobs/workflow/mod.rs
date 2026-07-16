@@ -1214,7 +1214,7 @@ mod tests {
             &self,
             _attempt: &AttemptRef,
             _path: &str,
-        ) -> Result<Vec<u8>, BackendError> {
+        ) -> Result<aruna_compute::backend::TaskOutput, BackendError> {
             Err(BackendError::InvalidSpec("no output".to_string()))
         }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {

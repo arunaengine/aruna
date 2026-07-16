@@ -1,9 +1,6 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
-use aruna_compute::spec::{
-    AttemptRef, LogLimits, ResourceRequest, Secret, TaskSpec, WorkspaceBinding,
-};
+use aruna_compute::spec::{AttemptRef, Secret, TaskSpec, WorkspaceBinding};
 use aruna_compute::status::{AttemptPhase, AttemptStatus, TesState};
 
 #[test]
@@ -20,42 +17,15 @@ fn external_name() {
 }
 
 #[test]
-fn spec_roundtrip() {
-    // Full TaskSpec including secrets survives a serde round-trip.
-    let mut env = BTreeMap::new();
-    env.insert("FOO".to_string(), "bar".to_string());
+fn secret_roundtrip() {
+    // Secrets serialize transparently so a plan owner can persist them.
     let mut secret_env = BTreeMap::new();
     secret_env.insert("AWS_SECRET_ACCESS_KEY".to_string(), Secret::new("shh"));
 
-    let spec = TaskSpec {
-        attempt: AttemptRef::new("j1", 1),
-        image: "alpine:3.20".to_string(),
-        entrypoint: Some(vec!["/bin/sh".into()]),
-        command: vec!["sh".into(), "-c".into(), "true".into()],
-        workdir: Some("/work".to_string()),
-        inputs: Vec::new(),
-        output_paths: Vec::new(),
-        env,
-        secret_env,
-        resources: ResourceRequest {
-            cpu_cores: Some(2),
-            ram_bytes: Some(1 << 30),
-            disk_bytes: None,
-            max_walltime: Some(Duration::from_secs(600)),
-            preemptible: true,
-            backend_extensions: BTreeMap::new(),
-        },
-        workspace: Some(WorkspaceBinding {
-            s3_endpoint: "http://s3:9000".to_string(),
-            bucket_name: "ws-j1".to_string(),
-            region: "us-east-1".to_string(),
-        }),
-        log_limits: LogLimits::default(),
-    };
-
-    let json = serde_json::to_string(&spec).unwrap();
-    let back: TaskSpec = serde_json::from_str(&json).unwrap();
-    assert_eq!(spec, back);
+    let json = serde_json::to_string(&secret_env).unwrap();
+    assert_eq!(json, r#"{"AWS_SECRET_ACCESS_KEY":"shh"}"#);
+    let back: BTreeMap<String, Secret> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, secret_env);
 }
 
 #[test]

@@ -80,7 +80,7 @@ impl ExecutorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BackendError;
+    use crate::backend::{BackendError, TaskOutput};
     use crate::logs::{LogSink, LogTails};
     use crate::spec::{AttemptRef, LogLimits, TaskSpec};
     use crate::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
@@ -122,7 +122,7 @@ mod tests {
             &self,
             _attempt: &AttemptRef,
             _path: &str,
-        ) -> Result<Vec<u8>, BackendError> {
+        ) -> Result<TaskOutput, BackendError> {
             unimplemented!()
         }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {

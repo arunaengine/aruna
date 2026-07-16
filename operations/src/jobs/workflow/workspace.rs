@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use aruna_compute::backend::ExecutorBackend;
+use aruna_compute::backend::{BackendError, ExecutorBackend};
 use aruna_compute::spec::{AttemptRef, MAX_TRANSFER_BYTES, TaskInput};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
@@ -12,8 +12,7 @@ use aruna_core::structs::{
     blob_object_permission_path, workspace_credential_id,
 };
 use aruna_core::types::NodeId;
-use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -202,6 +201,8 @@ pub async fn stage_inputs(
     Ok(())
 }
 
+/// Open one un-consumed stream per staged input; bytes flow only when the
+/// backend uploads them, so peak memory stays bounded by a chunk.
 pub async fn load_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -209,7 +210,7 @@ pub async fn load_inputs(
     bucket: &str,
 ) -> Result<Vec<TaskInput>, JobError> {
     let mut files = Vec::new();
-    let mut total_bytes = 0usize;
+    let mut total_bytes = 0u64;
     for input in &spec.inputs {
         let Some(path) = input.container_path.clone() else {
             continue;
@@ -229,19 +230,24 @@ pub async fn load_inputs(
         .and_then(|result| result.transpose())
         .map_err(staged_input_error)?
         .ok_or_else(|| JobError::permanent(format!("staged input {} missing", input.dest_key)))?;
-        let mut contents = Vec::new();
-        let mut body = get.blob;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| {
-                JobError::retryable(format!("staged input stream failed: {error}"))
+        let size = get
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or_else(|| {
+                get.source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length)
+            })
+            .ok_or_else(|| {
+                JobError::retryable(format!("staged input {} has no size", input.dest_key))
             })?;
-            total_bytes = total_bytes
-                .checked_add(chunk.len())
-                .filter(|total| *total <= MAX_TRANSFER_BYTES)
-                .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
-            contents.extend_from_slice(&chunk);
-        }
-        files.push(TaskInput { path, contents });
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_TRANSFER_BYTES)
+            .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
+        let stream = get.blob.map(|chunk| chunk.map_err(std::io::Error::other));
+        files.push(TaskInput::from_stream(path, size, Box::pin(stream)));
     }
     Ok(files)
 }
@@ -256,28 +262,24 @@ pub async fn capture_outputs(
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut outputs = Vec::with_capacity(spec.file_outputs.len());
     for output in &spec.file_outputs {
-        let contents = backend
-            .fetch_output(attempt, &output.container_path)
-            .await
-            .map_err(|error| {
-                if error.retryable() {
-                    JobError::retryable(format!("container output read failed: {error}"))
-                } else {
-                    JobError::permanent(format!("container output read failed: {error}"))
-                }
-            })?;
-        outputs.push(put_file_output(context, spec, record, node_id, output, contents).await?);
+        outputs
+            .push(put_file_output(context, backend, attempt, spec, record, node_id, output).await?);
     }
     Ok(outputs)
 }
 
+/// Stream one declared container output into its S3 destination. When the
+/// destination already holds identical content (a retried finalize), the write
+/// is skipped after a streamed hash pass.
+#[allow(clippy::too_many_arguments)]
 async fn put_file_output(
     context: &DriverContext,
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
     output: &OutputSelection,
-    contents: Vec<u8>,
 ) -> Result<OutputObject, JobError> {
     let OutputDestination::S3 { bucket, key } = &output.destination;
     let bucket_info = drive(GetBucketInfoOperation::new(bucket.clone()), context)
@@ -316,7 +318,6 @@ async fn put_file_output(
         )));
     }
 
-    let expected_hash = blake3::hash(&contents);
     let existing = match drive(
         HeadObjectOperation::new(HeadObjectInput {
             bucket: bucket.clone(),
@@ -341,11 +342,12 @@ async fn put_file_output(
             )));
         }
     };
-    if existing.as_ref().is_some_and(|location| {
-        location.blob_size == contents.len() as u64
-            && location.get_blake3() == Some(expected_hash.as_bytes().as_slice())
-    }) {
-        return Ok(output_object(output, bucket, key, &contents));
+    if let Some(location) = &existing {
+        let (size, digest) = hash_output(backend, attempt, &output.container_path).await?;
+        if location.blob_size == size && location.get_blake3() == Some(digest.as_bytes().as_slice())
+        {
+            return Ok(output_object(output, bucket, key, size, &digest));
+        }
     }
 
     let realm_config = drive(
@@ -355,11 +357,30 @@ async fn put_file_output(
     .await
     .map_err(|error| JobError::retryable(format!("output quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
-    let output_object = output_object(output, bucket, key, &contents);
-    let content_length = contents.len() as u64;
-    let body = BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
-        Bytes::from(contents),
-    )]));
+
+    let fetched = backend
+        .fetch_output(attempt, &output.container_path)
+        .await
+        .map_err(|error| output_read_error(&error))?;
+    let size = fetched.size;
+    let hasher = Arc::new(std::sync::Mutex::new(blake3::Hasher::new()));
+    let stream_error = Arc::new(std::sync::Mutex::new(None));
+    let body_hasher = hasher.clone();
+    let body_error = stream_error.clone();
+    let body = BackendStream::new(fetched.chunks.map(move |chunk| match chunk {
+        Ok(chunk) => {
+            if let Ok(mut hasher) = body_hasher.lock() {
+                hasher.update(&chunk);
+            }
+            Ok(chunk)
+        }
+        Err(error) => {
+            if let Ok(mut slot) = body_error.lock() {
+                *slot = Some(error.clone());
+            }
+            Err(std::io::Error::other(error))
+        }
+    }));
     drive(
         PutObjectOperation::new(PutObjectConfig {
             user_id: record.created_by,
@@ -369,7 +390,7 @@ async fn put_file_output(
             request: PutObjectInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
-                content_length: Some(content_length),
+                content_length: Some(size),
                 body: Some(body),
             },
             expected_checksums: Vec::new(),
@@ -382,22 +403,64 @@ async fn put_file_output(
     )
     .await
     .and_then(|result| result.transpose())
-    .map_err(|error| put_object_error("output write", error))?;
-    Ok(output_object)
+    // A failure caused by the container-side stream keeps its own
+    // retryable/permanent classification instead of the put's.
+    .map_err(
+        |error| match stream_error.lock().ok().and_then(|mut e| e.take()) {
+            Some(backend_error) => output_read_error(&backend_error),
+            None => put_object_error("output write", error),
+        },
+    )?;
+    let digest = hasher
+        .lock()
+        .map(|hasher| hasher.finalize())
+        .map_err(|_| JobError::retryable("output digest lost"))?;
+    Ok(output_object(output, bucket, key, size, &digest))
+}
+
+/// Streamed size + blake3 of one container output, for the idempotent-retry check.
+async fn hash_output(
+    backend: &Arc<dyn ExecutorBackend>,
+    attempt: &AttemptRef,
+    path: &str,
+) -> Result<(u64, blake3::Hash), JobError> {
+    let fetched = backend
+        .fetch_output(attempt, path)
+        .await
+        .map_err(|error| output_read_error(&error))?;
+    let mut chunks = fetched.chunks;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| output_read_error(&error))?;
+        size += chunk.len() as u64;
+        hasher.update(&chunk);
+    }
+    Ok((size, hasher.finalize()))
+}
+
+fn output_read_error(error: &BackendError) -> JobError {
+    let message = format!("container output read failed: {error}");
+    if error.retryable() {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
 }
 
 fn output_object(
     output: &OutputSelection,
     bucket: &str,
     key: &str,
-    contents: &[u8],
+    size: u64,
+    digest: &blake3::Hash,
 ) -> OutputObject {
     OutputObject {
         bucket: bucket.to_string(),
         key: key.to_string(),
         container_path: output.container_path.clone(),
-        size: contents.len() as u64,
-        digest: Some(blake3::hash(contents).to_hex().to_string()),
+        size,
+        digest: Some(digest.to_hex().to_string()),
     }
 }
 

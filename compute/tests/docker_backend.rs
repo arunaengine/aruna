@@ -10,7 +10,21 @@ use aruna_compute::docker::{DockerBackend, DockerConfig};
 use aruna_compute::logs::{LogSink, LogStream};
 use aruna_compute::spec::{AttemptRef, LogLimits, TaskInput, TaskSpec};
 use aruna_compute::status::{AttemptPhase, CancelEvidence, ReconcileOutcome};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
+
+/// Fetch one output and collect its streamed chunks.
+async fn read_output(backend: &DockerBackend, attempt: &AttemptRef, path: &str) -> Vec<u8> {
+    let output = backend.fetch_output(attempt, path).await.unwrap();
+    let mut chunks = output.chunks;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(bytes.len() as u64, output.size, "declared size must match");
+    bytes
+}
 
 const IMAGE: &str = "alpine:3.24";
 
@@ -129,10 +143,10 @@ async fn file_transfer() {
         &unique("files"),
         "test \"$(stat -c %a /tmp)\" = 1777 && cat /tmp/aruna-input.txt > /tmp/aruna-output.txt",
     );
-    spec.inputs.push(TaskInput {
-        path: "/tmp/aruna-input.txt".to_string(),
-        contents: b"hello from aruna".to_vec(),
-    });
+    spec.inputs.push(TaskInput::from_bytes(
+        "/tmp/aruna-input.txt",
+        b"hello from aruna".to_vec(),
+    ));
     spec.output_paths.push("/tmp/aruna-output.txt".to_string());
     let attempt = spec.attempt.clone();
 
@@ -140,11 +154,47 @@ async fn file_transfer() {
     let status = backend.wait(&attempt, &cancel).await.unwrap();
     assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
     assert_eq!(
-        backend
-            .fetch_output(&attempt, "/tmp/aruna-output.txt")
-            .await
-            .unwrap(),
+        read_output(&backend, &attempt, "/tmp/aruna-output.txt").await,
         b"hello from aruna"
+    );
+
+    let _ = backend.cleanup(&attempt).await;
+}
+
+#[tokio::test]
+async fn chunked_transfer() {
+    // A multi-chunk input stream round-trips through the container and comes
+    // back as a multi-chunk output stream, byte for byte.
+    let backend = backend_or_skip!();
+    let cancel = CancellationToken::new();
+    let mut spec = sh(
+        &unique("chunks"),
+        "cat /tmp/aruna-input.bin > /tmp/aruna-output.bin",
+    );
+    let chunk_count = 16usize;
+    let chunk_len = 64 * 1024usize;
+    let mut payload = Vec::with_capacity(chunk_count * chunk_len);
+    let chunks: Vec<std::io::Result<Bytes>> = (0..chunk_count)
+        .map(|index| {
+            let chunk = vec![b'a' + index as u8; chunk_len];
+            payload.extend_from_slice(&chunk);
+            Ok(Bytes::from(chunk))
+        })
+        .collect();
+    spec.inputs.push(TaskInput::from_stream(
+        "/tmp/aruna-input.bin",
+        payload.len() as u64,
+        Box::pin(futures_util::stream::iter(chunks)),
+    ));
+    spec.output_paths.push("/tmp/aruna-output.bin".to_string());
+    let attempt = spec.attempt.clone();
+
+    backend.submit(&spec, &cancel).await.unwrap();
+    let status = backend.wait(&attempt, &cancel).await.unwrap();
+    assert_eq!(status.phase, AttemptPhase::Exited { code: 0 });
+    assert_eq!(
+        read_output(&backend, &attempt, "/tmp/aruna-output.bin").await,
+        payload
     );
 
     let _ = backend.cleanup(&attempt).await;
