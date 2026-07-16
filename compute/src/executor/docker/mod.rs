@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
-use super::{ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned};
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.
@@ -956,6 +956,13 @@ fn build_config(
 impl ExecutorBackend for DockerBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Docker
+    }
+
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            file_staging: true,
+            direct_s3: true,
+        }
     }
 
     async fn health(&self) -> Result<(), BackendError> {

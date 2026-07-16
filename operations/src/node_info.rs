@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::compute::ExecutorCapability;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -34,7 +35,7 @@ pub fn schedule_node_info_publish_effect(after: Duration) -> Effect {
     })
 }
 
-/// Assembles this node's info document from its compute capability, current
+/// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
 /// single-writer node-info key without queuing replication.
 pub async fn seed_node_info_document(
@@ -42,12 +43,12 @@ pub async fn seed_node_info_document(
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
-    compute_capable: bool,
+    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let document = NodeInfoDocument {
         node_id,
-        compute_capable,
+        executors,
         labels: current_placement_labels(ctx, node_id, realm_id).await?,
         urls,
         utilization: NodeUtilization {
@@ -70,9 +71,9 @@ pub async fn publish_node_info(
     node_id: NodeId,
     realm_id: RealmId,
     urls: NodeUrls,
-    compute_capable: bool,
+    executors: Vec<ExecutorCapability>,
 ) -> Result<(), String> {
-    seed_node_info_document(ctx, node_id, realm_id, urls, compute_capable).await?;
+    seed_node_info_document(ctx, node_id, realm_id, urls, executors).await?;
     replicate_node_info(ctx, node_id, realm_id).await
 }
 
@@ -321,7 +322,7 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
-            false,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -332,7 +333,7 @@ mod tests {
             .expect("seeded node info document");
         assert_eq!(stored.labels.get("tier").unwrap(), "hot");
         assert_eq!(stored.labels.get(KIND_LABEL_KEY).unwrap(), "server");
-        assert!(!stored.compute_capable);
+        assert!(stored.executors.is_empty());
         assert_eq!(stored.utilization.storage_bytes_used, 0);
         assert!(read_outbox(&ctx).await.is_empty());
     }
@@ -368,7 +369,7 @@ mod tests {
                 api: None,
                 s3: Some("s3.example".to_string()),
             },
-            false,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -427,7 +428,11 @@ mod tests {
                 api: None,
                 s3: None,
             },
-            true,
+            vec![ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
         )
         .await
         .unwrap();
@@ -454,7 +459,7 @@ mod tests {
         assert_eq!(second.labels, expected_labels);
         assert_eq!(second.labels.get("zone").unwrap(), "b");
         assert!(!second.labels.contains_key("stale"));
-        assert!(second.compute_capable);
+        assert_eq!(second.executors.len(), 1);
         assert!(second.updated_at_ms >= first.updated_at_ms);
         assert!(second.utilization.heartbeat_at_ms >= first.utilization.heartbeat_at_ms);
 

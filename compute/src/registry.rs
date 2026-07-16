@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use aruna_core::compute::ExecutorKind;
+use aruna_core::compute::{ExecutorCapability, ExecutorKind};
 
 use crate::executor::ExecutorBackend;
 
@@ -74,6 +74,20 @@ impl ExecutorRegistry {
         self.backends.keys().cloned().collect()
     }
 
+    pub fn capabilities(&self) -> Vec<ExecutorCapability> {
+        self.backends
+            .values()
+            .map(|backend| {
+                let capabilities = backend.capabilities();
+                ExecutorCapability {
+                    kind: backend.kind().as_wire(),
+                    file_staging: capabilities.file_staging,
+                    direct_s3: capabilities.direct_s3,
+                }
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.backends.is_empty()
     }
@@ -82,8 +96,8 @@ impl ExecutorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::ExecutorBackend;
     use crate::executor::logs::LogSink;
+    use crate::executor::{BackendCaps, ExecutorBackend};
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
         LogTails, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
@@ -97,6 +111,12 @@ mod tests {
     impl ExecutorBackend for StubBackend {
         fn kind(&self) -> ExecutorKind {
             self.0.clone()
+        }
+        fn capabilities(&self) -> BackendCaps {
+            BackendCaps {
+                file_staging: true,
+                direct_s3: false,
+            }
         }
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
@@ -180,5 +200,13 @@ mod tests {
         // A constraint the node cannot satisfy selects nothing.
         assert!(registry.select(Some(&ExecutorKind::Slurm)).is_none());
         assert_eq!(registry.kinds().len(), 1);
+        assert_eq!(
+            registry.capabilities(),
+            [ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: false,
+            }]
+        );
     }
 }

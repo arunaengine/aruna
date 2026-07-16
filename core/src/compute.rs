@@ -25,6 +25,13 @@ pub enum ExecutorKind {
     Ext(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorCapability {
+    pub kind: String,
+    pub file_staging: bool,
+    pub direct_s3: bool,
+}
+
 impl ExecutorKind {
     pub fn as_wire(&self) -> String {
         match self {

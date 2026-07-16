@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::ApptainerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::{StageLayout, StagePlan};
-use super::{ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned};
 
 mod runtime;
 mod state;
@@ -240,6 +240,13 @@ impl ApptainerBackend {
 impl ExecutorBackend for ApptainerBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Apptainer
+    }
+
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            file_staging: true,
+            direct_s3: true,
+        }
     }
 
     async fn health(&self) -> Result<(), BackendError> {

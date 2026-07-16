@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::KubernetesConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::{StageLayout, StagePlan};
-use super::{ExecutorBackend, digest_pinned};
+use super::{BackendCaps, ExecutorBackend, digest_pinned};
 
 mod manifest;
 
@@ -626,6 +626,13 @@ impl KubernetesBackend {
 impl ExecutorBackend for KubernetesBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Kubernetes
+    }
+
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            file_staging: true,
+            direct_s3: !self.config.s3_cidrs.is_empty(),
+        }
     }
 
     async fn health(&self) -> Result<(), BackendError> {

@@ -12252,7 +12252,7 @@ mod tests {
 
         let owned = NodeInfoDocument {
             node_id,
-            compute_capable: false,
+            executors: Vec::new(),
             labels: std::collections::BTreeMap::new(),
             urls: NodeUrls {
                 api: None,

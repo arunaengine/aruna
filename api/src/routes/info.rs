@@ -738,11 +738,18 @@ pub struct RealmNodePlacementResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmNodeInfoDocumentResponse {
-    pub compute_capable: bool,
+    pub executors: Vec<ExecutorCapabilityResponse>,
     pub labels: std::collections::BTreeMap<String, String>,
     pub urls: RealmNodeUrlsResponse,
     pub utilization: RealmNodeUtilizationResponse,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutorCapabilityResponse {
+    pub kind: String,
+    pub file_staging: bool,
+    pub direct_s3: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -888,7 +895,15 @@ fn map_node_info_document(
     document: &aruna_core::structs::NodeInfoDocument,
 ) -> RealmNodeInfoDocumentResponse {
     RealmNodeInfoDocumentResponse {
-        compute_capable: document.compute_capable,
+        executors: document
+            .executors
+            .iter()
+            .map(|executor| ExecutorCapabilityResponse {
+                kind: executor.kind.clone(),
+                file_staging: executor.file_staging,
+                direct_s3: executor.direct_s3,
+            })
+            .collect(),
         labels: document.labels.clone(),
         urls: RealmNodeUrlsResponse {
             api: document.urls.api.clone(),
@@ -2557,7 +2572,11 @@ mod tests {
         // the default location/weight. Publish a node info document for it too.
         let document = NodeInfoDocument {
             node_id,
-            compute_capable: true,
+            executors: vec![aruna_core::compute::ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
             labels: std::collections::BTreeMap::from([("tier".to_string(), "hot".to_string())]),
             urls: NodeUrls {
                 api: None,
@@ -2600,7 +2619,8 @@ mod tests {
         assert!(!placement.draining);
 
         let node_info = node.info.as_ref().expect("node info document present");
-        assert!(node_info.compute_capable);
+        assert_eq!(node_info.executors.len(), 1);
+        assert_eq!(node_info.executors[0].kind, "docker");
         assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
         assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
         assert_eq!(node_info.utilization.storage_bytes_used, 4_096);

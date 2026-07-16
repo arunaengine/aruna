@@ -1,4 +1,5 @@
 use crate::NodeId;
+use crate::compute::ExecutorCapability;
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ pub fn node_info_storage_key(node_id: NodeId) -> Vec<u8> {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct NodeInfoDocument {
     pub node_id: NodeId,
-    pub compute_capable: bool,
+    pub executors: Vec<ExecutorCapability>,
     pub labels: BTreeMap<String, String>,
     pub urls: NodeUrls,
     pub utilization: NodeUtilization,
@@ -58,7 +59,11 @@ mod tests {
     fn node_info_document_round_trips() {
         let document = NodeInfoDocument {
             node_id: node(1),
-            compute_capable: true,
+            executors: vec![ExecutorCapability {
+                kind: "docker".to_string(),
+                file_staging: true,
+                direct_s3: true,
+            }],
             labels: BTreeMap::from([(KIND_LABEL_KEY.to_string(), "server".to_string())]),
             urls: NodeUrls {
                 api: Some("https://api.example".to_string()),

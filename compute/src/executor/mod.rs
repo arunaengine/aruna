@@ -21,6 +21,12 @@ pub mod kubernetes;
 
 use logs::LogSink;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendCaps {
+    pub file_staging: bool,
+    pub direct_s3: bool,
+}
+
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]
 pub(crate) fn digest_pinned(image: &str) -> bool {
     image
@@ -53,6 +59,10 @@ pub fn dispatch_helper() -> Option<i32> {
 #[async_trait]
 pub trait ExecutorBackend: Send + Sync {
     fn kind(&self) -> ExecutorKind;
+
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps::default()
+    }
 
     /// Startup and advertisement gate.
     async fn health(&self) -> Result<(), BackendError>;
