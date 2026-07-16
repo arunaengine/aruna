@@ -85,8 +85,18 @@ impl ExternalReconciler for ComputeReconciler {
             .and_then(|registry| registry.get(&kind))
             .cloned()
         else {
-            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; releasing");
-            let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
+            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; parking");
+            let _ = mark_indeterminate(
+                storage,
+                job_id,
+                token,
+                JobError::retryable(format!(
+                    "reconcile backend unavailable: {}",
+                    intent.executor_kind
+                )),
+                unix_timestamp_millis(),
+            )
+            .await;
             return;
         };
 
