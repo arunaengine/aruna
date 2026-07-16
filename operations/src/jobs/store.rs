@@ -408,7 +408,7 @@ async fn cleanup_dedup_entry(
     Ok(())
 }
 
-/// Read a job record, deleting and skipping a malformed row per the outbox precedent.
+/// Read a job record, retaining malformed rows for offline recovery.
 pub async fn read_job_record(
     storage: &StorageHandle,
     job_id: JobId,
@@ -418,8 +418,7 @@ pub async fn read_job_record(
         Some(value) => match decode_job_record(&value) {
             Ok(record) => Ok(Some(record)),
             Err(error) => {
-                warn!(job_id = %job_id, error = %error, "Deleting malformed job record");
-                delete_raw(storage, JOB_KEYSPACE, job_record_key(job_id), None).await?;
+                warn!(job_id = %job_id, error = %error, "Malformed job record retained");
                 Ok(None)
             }
         },
@@ -2127,7 +2126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_deleted() {
+    async fn malformed_retained() {
         let (_dir, storage) = temp_storage();
         let job_id = JobId::from_bytes([3u8; 16]);
         batch_write(
@@ -2152,7 +2151,7 @@ mod tests {
             read_raw(&storage, JOB_KEYSPACE, job_record_key(job_id), None)
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 
