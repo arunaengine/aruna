@@ -285,7 +285,12 @@ pub async fn submit_job(
     if request.image.trim().is_empty() {
         return Err(ServerError::BadRequest);
     }
-    if request.cpu_cores == Some(0) || request.ram_bytes == Some(0) {
+    // RAM above i64::MAX would wrap negative in the Docker HostConfig cast.
+    if request.cpu_cores == Some(0)
+        || request
+            .ram_bytes
+            .is_some_and(|bytes| bytes == 0 || i64::try_from(bytes).is_err())
+    {
         return Err(ServerError::BadRequest);
     }
     ensure_permission(
@@ -691,6 +696,38 @@ mod tests {
         )
         .await;
         assert!(matches!(cancel, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn rejects_huge_ram() {
+        // ram_bytes above i64::MAX would wrap negative in the Docker backend.
+        let (_dir, state) = build_state().await;
+        for ram_bytes in [u64::MAX, i64::MAX as u64 + 1, 0] {
+            let request = SubmitExecutionRequest {
+                group_id: Ulid::from_bytes([5u8; 16]).to_string(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: vec!["true".to_string()],
+                env: BTreeMap::new(),
+                cpu_cores: None,
+                ram_bytes: Some(ram_bytes),
+                max_walltime_ms: None,
+                executor_constraint: None,
+                inputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                idempotency_key: None,
+            };
+            let result = submit_job(
+                State(state.clone()),
+                Extension(auth_for(user(2))),
+                Json(request),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ServerError::BadRequest)),
+                "ram_bytes {ram_bytes} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
