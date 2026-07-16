@@ -10,6 +10,7 @@ members = [
     "tasks",
     "operations",
     "aruna-doctor",
+    "scripts/compute-helper",
 ]
 # default-members = ["aruna"]
 resolver = "3"

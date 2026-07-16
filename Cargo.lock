@@ -344,6 +344,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-compute-helper"
+version = "3.0.0-alpha.34"
+dependencies = [
+ "rustix",
+ "serde_json",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "aruna-core"
 version = "3.0.0-alpha.34"
 dependencies = [
