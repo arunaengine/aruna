@@ -277,7 +277,9 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::{insert_job, read_job_record};
-    use aruna_core::structs::{JobClaim, JobExecutionClass, JobPayload, JobState, RealmId};
+    use aruna_core::structs::{
+        AttemptIntent, JobClaim, JobExecutionClass, JobPayload, JobState, RealmId,
+    };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;
@@ -379,6 +381,13 @@ mod tests {
         let mut record = queued_record(job_id, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
         record.state = JobState::Running;
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 1,
+            external_name: "attempt".to_string(),
+            executor_kind: "docker".to_string(),
+            pinned_image: "alpine@sha256:digest".to_string(),
+            attempt_epoch: 1,
+        });
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::r#gen(),
