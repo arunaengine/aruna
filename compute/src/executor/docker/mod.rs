@@ -15,6 +15,7 @@ use aruna_core::compute::{
 use async_trait::async_trait;
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ContainerStateStatusEnum, HostConfig,
+    HostConfigLogConfig,
 };
 use bollard::query_parameters::{
     ContainerArchiveInfoOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
@@ -963,6 +964,13 @@ fn build_config(
         memory_swap: memory,
         nano_cpus,
         storage_opt,
+        log_config: Some(HostConfigLogConfig {
+            typ: Some("json-file".to_string()),
+            config: Some(HashMap::from([
+                ("max-size".to_string(), "10m".to_string()),
+                ("max-file".to_string(), "3".to_string()),
+            ])),
+        }),
         pids_limit: Some(
             spec.security
                 .pids_limit
@@ -1811,6 +1819,20 @@ mod tests {
             build_config(&DockerConfig::default(), &fence(), &spec).cmd,
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn rotates_task_logs() {
+        let spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        let log = build_config(&DockerConfig::default(), &fence(), &spec)
+            .host_config
+            .unwrap()
+            .log_config
+            .unwrap();
+
+        assert_eq!(log.typ.as_deref(), Some("json-file"));
+        assert_eq!(log.config.as_ref().unwrap().get("max-size").unwrap(), "10m");
+        assert_eq!(log.config.unwrap().get("max-file").unwrap(), "3");
     }
 
     #[test]
