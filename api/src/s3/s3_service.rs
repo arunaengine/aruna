@@ -3,7 +3,7 @@
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
-    validate_composite_part_count, validate_delete_checksum,
+    validate_composite_part_count, validate_delete_checksum, validate_trailing_checksum,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
@@ -1117,6 +1117,7 @@ impl S3 for ArunaS3Service {
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: user_access.user_identity.realm_id,
@@ -1150,6 +1151,11 @@ impl S3 for ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process PUT request"))?;
+        validate_trailing_checksum(
+            &req.headers,
+            trailing_headers.as_ref(),
+            &result.location.hashes,
+        )?;
 
         self.put_object_response(
             &checksum_request,
@@ -1411,6 +1417,7 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let body = req
             .input
@@ -1439,6 +1446,11 @@ impl S3 for ArunaS3Service {
             .and_then(|result| result.transpose())
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to upload part"))?;
+        validate_trailing_checksum(
+            &req.headers,
+            trailing_headers.as_ref(),
+            &result.location.hashes,
+        )?;
 
         let mut output = UploadPartOutput {
             e_tag: result
