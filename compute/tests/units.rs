@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use aruna_compute::spec::{AttemptRef, Secret, TaskSpec, WorkspaceBinding};
-use aruna_compute::status::{AttemptPhase, AttemptStatus, TesState};
+use aruna_core::compute::{
+    AttemptPhase, AttemptRef, AttemptStatus, Secret, TaskSpec, TesState, WorkspaceBinding,
+};
 
 #[test]
 fn external_name() {

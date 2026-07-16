@@ -5,11 +5,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_compute::DockerConfig;
 use aruna_compute::backend::ExecutorBackend;
-use aruna_compute::docker::{DockerBackend, DockerConfig};
-use aruna_compute::logs::{LogSink, LogStream};
-use aruna_compute::spec::{AttemptRef, LogLimits, TaskInput, TaskSpec};
-use aruna_compute::status::{AttemptPhase, CancelEvidence, ReconcileOutcome};
+use aruna_compute::docker::DockerBackend;
+use aruna_compute::logs::LogSink;
+use aruna_core::compute::{
+    AttemptPhase, AttemptRef, BackendError, CancelEvidence, LogLimits, LogStream, ReconcileOutcome,
+    TaskInput, TaskSpec,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -209,7 +212,7 @@ async fn cancelled_submit() {
 
     assert!(matches!(
         backend.submit(&spec, &cancel).await,
-        Err(aruna_compute::BackendError::Cancelled)
+        Err(BackendError::Cancelled)
     ));
     assert!(matches!(
         backend.reconcile(&spec.attempt).await,

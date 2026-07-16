@@ -1,5 +1,4 @@
-use aruna_compute::backend::{BackendError, ExecutorKind};
-use aruna_compute::spec::AttemptRef;
+use aruna_core::compute::{AttemptRef, BackendError, ExecutorKind};
 use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload};
 
 use super::super::executor::{JobContext, JobRunOutcome};
@@ -106,9 +105,10 @@ mod tests {
 
     use aruna_compute::ExecutorRegistry;
     use aruna_compute::backend::ExecutorBackend;
-    use aruna_compute::logs::{LogSink, LogTails};
-    use aruna_compute::spec::{LogLimits, TaskSpec};
-    use aruna_compute::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
+    use aruna_compute::logs::LogSink;
+    use aruna_core::compute::{
+        AttemptStatus, CancelEvidence, LogLimits, LogTails, ReconcileOutcome, TaskOutput, TaskSpec,
+    };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
     use aruna_core::structs::{JobProgress, RealmId, UserAccess};
@@ -178,7 +178,7 @@ mod tests {
             &self,
             _attempt: &AttemptRef,
             _path: &str,
-        ) -> Result<aruna_compute::backend::TaskOutput, BackendError> {
+        ) -> Result<TaskOutput, BackendError> {
             Err(BackendError::InvalidSpec("no output".to_string()))
         }
 

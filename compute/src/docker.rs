@@ -5,6 +5,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use aruna_core::compute::{
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
+    InputStream, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, ReconcileOutcome, TaskInput,
+    TaskOutput, TaskSpec,
+};
 use async_trait::async_trait;
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ContainerStateStatusEnum, HostConfig,
@@ -23,11 +28,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{BackendError, ExecutorBackend, ExecutorKind, TaskOutput};
+use crate::backend::ExecutorBackend;
 use crate::config::DockerConfig;
-use crate::logs::{BoundedTail, LogSink, LogStream, LogTails};
-use crate::spec::{AttemptRef, InputStream, LogLimits, MAX_TRANSFER_BYTES, TaskInput, TaskSpec};
-use crate::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
+use crate::logs::{BoundedTail, LogSink};
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.

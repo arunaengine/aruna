@@ -1,11 +1,6 @@
 use std::collections::VecDeque;
 
-/// Which stream a chunk belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogStream {
-    Stdout,
-    Stderr,
-}
+use aruna_core::compute::LogStream;
 
 /// Optional full-stream copy target invoked for every captured chunk, in
 /// addition to the bounded tail. Backends call this before dropping bytes.
@@ -18,18 +13,6 @@ pub struct NullSink;
 
 impl LogSink for NullSink {
     fn write(&self, _stream: LogStream, _chunk: &[u8]) {}
-}
-
-/// Bounded tail captured per stream plus the true totals so truncation is
-/// observable rather than silent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LogTails {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub stdout_total: u64,
-    pub stderr_total: u64,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
 }
 
 /// Fixed-capacity ring retaining the last `cap` bytes seen while counting the

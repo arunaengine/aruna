@@ -6,12 +6,12 @@ pub mod workspace;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_compute::backend::{BackendError, ExecutorBackend, ExecutorKind};
-use aruna_compute::logs::{LogTails, NullSink};
-use aruna_compute::spec::{
-    AttemptRef, LogLimits, ResourceRequest, Secret, TaskSpec, WorkspaceBinding,
+use aruna_compute::backend::ExecutorBackend;
+use aruna_compute::logs::NullSink;
+use aruna_core::compute::{
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits,
+    LogTails, ReconcileOutcome, ResourceRequest, Secret, TaskInput, TaskSpec, WorkspaceBinding,
 };
-use aruna_compute::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::{
@@ -281,13 +281,7 @@ async fn prepare_workspace(
     node_id: NodeId,
     bucket: &str,
     token: ulid::Ulid,
-) -> Result<
-    (
-        workspace::WorkspaceCredential,
-        Vec<aruna_compute::spec::TaskInput>,
-    ),
-    JobError,
-> {
+) -> Result<(workspace::WorkspaceCredential, Vec<TaskInput>), JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
     ensure_workspace_bucket(context, spec, record, bucket).await?;
     set_workspace_bucket(
@@ -312,7 +306,7 @@ fn build_task_spec(
     credential: &workspace::WorkspaceCredential,
     bucket: &str,
     _node_id: NodeId,
-    inputs: Vec<aruna_compute::spec::TaskInput>,
+    inputs: Vec<TaskInput>,
 ) -> TaskSpec {
     let mut env = spec.env.clone();
     env.insert("ARUNA_WORKSPACE_BUCKET".to_string(), bucket.to_string());
@@ -600,7 +594,7 @@ pub(crate) async fn finalize_attempt(
     attempt: &AttemptRef,
     spec: &ExecutionSpec,
     bucket: &str,
-    result: Result<AttemptStatus, aruna_compute::backend::BackendError>,
+    result: Result<AttemptStatus, BackendError>,
 ) {
     let storage = &context.storage_handle;
     let cancel_requested = read_job_record(storage, job_id, None)
@@ -1148,8 +1142,8 @@ mod tests {
         ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
     };
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-    use aruna_compute::logs::{LogSink, LogTails};
-    use aruna_compute::spec::LogLimits;
+    use aruna_compute::logs::LogSink;
+    use aruna_core::compute::{LogTails, TaskOutput};
     use aruna_core::structs::{ComputeResources, JobErrorKind, JobState, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -1233,7 +1227,7 @@ mod tests {
             &self,
             _attempt: &AttemptRef,
             _path: &str,
-        ) -> Result<aruna_compute::backend::TaskOutput, BackendError> {
+        ) -> Result<TaskOutput, BackendError> {
             Err(BackendError::InvalidSpec("no output".to_string()))
         }
         async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {

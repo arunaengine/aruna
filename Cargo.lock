@@ -322,6 +322,7 @@ dependencies = [
 name = "aruna-compute"
 version = "3.0.0-alpha.34"
 dependencies = [
+ "aruna-core",
  "async-trait",
  "bollard",
  "bytes",

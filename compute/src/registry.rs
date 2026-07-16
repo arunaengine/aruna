@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::backend::{ExecutorBackend, ExecutorKind};
+use aruna_core::compute::ExecutorKind;
+
+use crate::backend::ExecutorBackend;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
 /// the attempt env so unconfigured tooling reaches the node's S3 plane.
@@ -80,10 +82,12 @@ impl ExecutorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendError, TaskOutput};
-    use crate::logs::{LogSink, LogTails};
-    use crate::spec::{AttemptRef, LogLimits, TaskSpec};
-    use crate::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
+    use crate::backend::ExecutorBackend;
+    use crate::logs::LogSink;
+    use aruna_core::compute::{
+        AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits, LogTails,
+        ReconcileOutcome, TaskOutput, TaskSpec,
+    };
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 

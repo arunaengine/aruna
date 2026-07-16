@@ -1,8 +1,6 @@
 use std::sync::{Arc, Weak};
 
-use aruna_compute::backend::ExecutorKind;
-use aruna_compute::spec::AttemptRef;
-use aruna_compute::status::{AttemptPhase, ReconcileOutcome};
+use aruna_core::compute::{AttemptPhase, AttemptRef, ExecutorKind, ReconcileOutcome};
 use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -353,7 +351,7 @@ pub(super) async fn resume_attempt(
                 );
                 let status = match backend.submit(&task_spec, &cancel).await {
                     Ok(status) => status,
-                    Err(aruna_compute::backend::BackendError::Cancelled) => {
+                    Err(aruna_core::compute::BackendError::Cancelled) => {
                         finalize_cancel(
                             &context, job_id, token, &backend, &attempt, &spec, &bucket,
                         )

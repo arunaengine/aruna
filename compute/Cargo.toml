@@ -13,6 +13,7 @@ apptainer = ["dep:nix", "dep:rustix", "dep:serde_json"]
 kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
+aruna-core = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true, optional = true, features = ["ssl"] }
 bytes = { workspace = true }

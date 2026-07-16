@@ -1,98 +1,12 @@
-use std::pin::Pin;
-
+use aruna_core::compute::{
+    AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits, LogTails,
+    ReconcileOutcome, TaskOutput, TaskSpec,
+};
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures_util::Stream;
-use thiserror::Error;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::logs::{LogSink, LogTails};
-use crate::spec::{AttemptRef, LogLimits, TaskSpec};
-use crate::status::{AttemptStatus, CancelEvidence, ReconcileOutcome};
-
-/// Chunked byte stream of one fetched task output file.
-pub type OutputChunks = Pin<Box<dyn Stream<Item = Result<Bytes, BackendError>> + Send + Sync>>;
-
-/// Streamed task output: the size declared by the backend plus its byte stream.
-pub struct TaskOutput {
-    pub size: u64,
-    pub chunks: OutputChunks,
-}
-
-/// Executor kinds advertised on the Node Descriptor as a hard scheduling filter.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ExecutorKind {
-    Docker,
-    Kubernetes,
-    Slurm,
-    /// Namespaced extension kind, e.g. `x-firecracker`.
-    Ext(String),
-}
-
-impl ExecutorKind {
-    /// Wire form used on the Node Descriptor.
-    pub fn as_wire(&self) -> String {
-        match self {
-            ExecutorKind::Docker => "docker".to_string(),
-            ExecutorKind::Kubernetes => "kubernetes".to_string(),
-            ExecutorKind::Slurm => "slurm".to_string(),
-            ExecutorKind::Ext(name) => name.clone(),
-        }
-    }
-
-    /// Parse a wire kind; unknown names become namespaced extensions.
-    pub fn from_wire(value: &str) -> Self {
-        match value {
-            "docker" => ExecutorKind::Docker,
-            "kubernetes" => ExecutorKind::Kubernetes,
-            "slurm" => ExecutorKind::Slurm,
-            other => ExecutorKind::Ext(other.to_string()),
-        }
-    }
-}
-
-/// Backend failure taxonomy. `retryable()` maps onto the Job error kind: a
-/// permanent failure needs a new plan, a retryable one may re-attempt.
-#[derive(Debug, Error, Clone)]
-pub enum BackendError {
-    #[error("image not found: {0}")]
-    ImageNotFound(String),
-    #[error("image access unauthorized: {0}")]
-    ImageUnauthorized(String),
-    #[error("invalid spec: {0}")]
-    InvalidSpec(String),
-    #[error("backend submission cancelled")]
-    Cancelled,
-    #[error("attempt not found: {0}")]
-    NotFound(String),
-    #[error("backend unavailable: {0}")]
-    Unavailable(String),
-    #[error("backend conflict: {0}")]
-    Conflict(String),
-    #[error("backend timeout: {0}")]
-    Timeout(String),
-    #[error("backend api error: {0}")]
-    Api(String),
-}
-
-impl BackendError {
-    /// Whether re-attempting the same plan could succeed. Bad input and missing
-    /// images are permanent; transport faults and conflicts are retryable.
-    pub fn retryable(&self) -> bool {
-        match self {
-            BackendError::ImageNotFound(_)
-            | BackendError::ImageUnauthorized(_)
-            | BackendError::InvalidSpec(_)
-            | BackendError::Cancelled => false,
-            BackendError::NotFound(_)
-            | BackendError::Unavailable(_)
-            | BackendError::Conflict(_)
-            | BackendError::Timeout(_)
-            | BackendError::Api(_) => true,
-        }
-    }
-}
+use crate::logs::LogSink;
 
 /// The single TES-shaped surface every backend is driven through. No backend
 /// introduces a second state machine or data model.

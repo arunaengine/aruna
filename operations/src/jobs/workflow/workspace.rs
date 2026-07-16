@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use aruna_compute::backend::{BackendError, ExecutorBackend};
-use aruna_compute::spec::{AttemptRef, MAX_TRANSFER_BYTES, TaskInput};
+use aruna_compute::backend::ExecutorBackend;
+use aruna_core::compute::{AttemptRef, BackendError, MAX_TRANSFER_BYTES, TaskInput};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
