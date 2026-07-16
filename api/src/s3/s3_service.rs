@@ -4,13 +4,14 @@ use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
     validate_composite_part_count, validate_delete_checksum, validate_trailing_checksum,
+    verify_trailer_stream,
 };
 use crate::s3::cors::{bucket_cors_to_get_output, dto_to_bucket_cors};
 use crate::s3::error::IntoS3Error;
 use crate::s3::s3_server::DeleteObjectsBody;
 use crate::s3::util::{
-    checked_size, checksum_response_hashes, convert_input, multipart_checksum_type_from_s3,
-    parse_completed_part, parse_copy_source, parse_copy_source_range,
+    checked_size, checksum_algorithm_from_s3, checksum_response_hashes, convert_input,
+    multipart_checksum_type_from_s3, parse_completed_part, parse_copy_source, parse_copy_source_range,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     reject_sse, s3_checksum_algorithm_from_core, s3_checksum_type_from_multipart,
     validate_object_key,
@@ -1091,7 +1092,7 @@ impl S3 for ArunaS3Service {
     #[allow(clippy::blocks_in_conditions)]
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         debug!(
             bucket = %req.input.bucket,
@@ -1116,7 +1117,13 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailer_algorithm = req
+            .trailing_headers
+            .as_ref()
+            .and(req.input.checksum_algorithm.as_ref())
+            .map(checksum_algorithm_from_s3)
+            .transpose()?;
+        let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
@@ -1131,6 +1138,16 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
+        if let (Some(algorithm), Some(headers)) = (trailer_algorithm, trailing_headers.clone())
+            && let Some(body) = req.input.body.take()
+        {
+            req.input.body = Some(verify_trailer_stream(
+                body,
+                algorithm,
+                checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                move || headers.read(Clone::clone),
+            ));
+        }
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
             user_id: user_access.user_identity,
@@ -1152,7 +1169,8 @@ impl S3 for ArunaS3Service {
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process PUT request"))?;
         validate_trailing_checksum(
-            &req.headers,
+            trailer_algorithm,
+            &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,
         )?;
@@ -1396,7 +1414,7 @@ impl S3 for ArunaS3Service {
     #[allow(clippy::blocks_in_conditions)]
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         debug!(
             bucket = %req.input.bucket,
@@ -1416,12 +1434,28 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let trailer_algorithm = req
+            .trailing_headers
+            .as_ref()
+            .and(req.input.checksum_algorithm.as_ref())
+            .map(checksum_algorithm_from_s3)
+            .transpose()?;
+        let checksum_request = parse_upload_checksum_request(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let body = req
             .input
             .body
+            .take()
+            .map(|body| match (trailer_algorithm, trailing_headers.clone()) {
+                (Some(algorithm), Some(headers)) => verify_trailer_stream(
+                    body,
+                    algorithm,
+                    checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                    move || headers.read(Clone::clone),
+                ),
+                _ => body,
+            })
             .map(BackendStream::new_from_boxed)
             .ok_or_else(|| s3_error!(InvalidRequest, "Missing body"))?;
 
@@ -1447,7 +1481,8 @@ impl S3 for ArunaS3Service {
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to upload part"))?;
         validate_trailing_checksum(
-            &req.headers,
+            trailer_algorithm,
+            &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,
         )?;

@@ -5,10 +5,13 @@ use base64::engine::general_purpose::STANDARD;
 use http::HeaderMap;
 use s3s::dto::{
     ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, CopyObjectResult, CopyPartResult,
-    GetObjectOutput, HeadObjectOutput, PutObjectOutput, UploadPartOutput,
+    GetObjectOutput, HeadObjectOutput, PutObjectOutput, StreamingBlob, UploadPartOutput,
 };
 use s3s::{S3Error, S3Result, TrailingHeaders, s3_error};
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::Poll;
+use futures_util::Stream;
 
 const CONTENT_MD5: &str = "content-md5";
 const X_AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
@@ -20,8 +23,6 @@ const X_AMZ_CHECKSUM_SHA1: &str = "x-amz-checksum-sha1";
 const X_AMZ_CHECKSUM_SHA256: &str = "x-amz-checksum-sha256";
 const X_AMZ_CHECKSUM_MODE: &str = "x-amz-checksum-mode";
 const X_AMZ_CHECKSUM_TYPE: &str = "x-amz-checksum-type";
-const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
-const X_AMZ_TRAILER: &str = "x-amz-trailer";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadChecksumRequest {
@@ -126,27 +127,29 @@ pub enum ChecksumSelection {
     AllStored,
 }
 
-pub fn parse_upload_checksum_request(headers: &HeaderMap) -> S3Result<UploadChecksumRequest> {
-    parse_checksum_request(headers, true)
+pub fn parse_upload_checksum_request(
+    headers: &HeaderMap,
+    trailer: Option<ChecksumAlgorithm>,
+) -> S3Result<UploadChecksumRequest> {
+    parse_checksum_request(headers, true, trailer)
 }
 
 pub fn parse_complete_multipart_checksum_request(
     headers: &HeaderMap,
 ) -> S3Result<UploadChecksumRequest> {
-    parse_checksum_request(headers, false)
+    parse_checksum_request(headers, false, None)
 }
 
 fn parse_checksum_request(
     headers: &HeaderMap,
     include_content_md5: bool,
+    trailer: Option<ChecksumAlgorithm>,
 ) -> S3Result<UploadChecksumRequest> {
     let (checksum_type, checksum_type_declared) = parse_checksum_type(headers)?;
     let composite = checksum_type.as_str() == ChecksumType::COMPOSITE;
     let (expected, composite_part_count) =
         parse_expected_checksums(headers, composite, include_content_md5)?;
     let declared = parse_declared_algorithm(headers)?;
-    let trailer = parse_trailer_algorithm(headers)?;
-
     if declared.is_some() && expected.is_empty() && trailer.is_none() {
         return Err(s3_error!(
             InvalidRequest,
@@ -178,27 +181,29 @@ fn parse_checksum_request(
 }
 
 pub fn validate_trailing_checksum(
-    headers: &HeaderMap,
+    algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: &ChecksumType,
     trailing_headers: Option<&TrailingHeaders>,
     hashes: &HashMap<String, Vec<u8>>,
 ) -> S3Result<()> {
-    if parse_trailer_algorithm(headers)?.is_none() {
-        return Ok(());
-    }
+    let Some(algorithm) = algorithm else { return Ok(()) };
     let trailers = trailing_headers
         .and_then(|headers| headers.read(Clone::clone))
         .ok_or_else(|| s3_error!(InvalidRequest, "Missing checksum trailer"))?;
-    validate_trailer_headers(headers, &trailers, hashes)
+    validate_trailer_headers(
+        algorithm,
+        checksum_type.as_str() == ChecksumType::COMPOSITE,
+        &trailers,
+        hashes,
+    )
 }
 
 fn validate_trailer_headers(
-    headers: &HeaderMap,
+    algorithm: ChecksumAlgorithm,
+    composite: bool,
     trailers: &HeaderMap,
     hashes: &HashMap<String, Vec<u8>>,
 ) -> S3Result<()> {
-    let algorithm = parse_trailer_algorithm(headers)?
-        .ok_or_else(|| s3_error!(InvalidRequest, "Missing checksum trailer declaration"))?;
-    let composite = parse_checksum_type(headers)?.0.as_str() == ChecksumType::COMPOSITE;
     let (expected, _) = parse_expected_checksums(trailers, composite, false)?;
     let expected = expected
         .iter()
@@ -208,6 +213,49 @@ fn validate_trailer_headers(
         return Err(checksum_mismatch_error());
     }
     Ok(())
+}
+
+pub fn verify_trailer_stream<F>(
+    mut body: StreamingBlob,
+    algorithm: ChecksumAlgorithm,
+    composite: bool,
+    trailing_headers: F,
+) -> StreamingBlob
+where
+    F: Fn() -> Option<HeaderMap> + Send + Sync + 'static,
+{
+    let mut hasher = Hasher::new();
+    let mut complete = false;
+    StreamingBlob::wrap::<_, std::io::Error>(futures_util::stream::poll_fn(move |context| {
+        if complete {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut body).poll_next(context) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                hasher.update(&bytes);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                complete = true;
+                Poll::Ready(Some(Err(std::io::Error::other(error))))
+            }
+            Poll::Ready(None) => {
+                complete = true;
+                let hashes = hasher.to_map();
+                let result = trailing_headers()
+                    .as_ref()
+                    .map(|headers| {
+                        validate_trailer_headers(algorithm, composite, headers, &hashes)
+                    })
+                    .unwrap_or_else(|| Err(s3_error!(InvalidRequest, "Missing checksum trailer")));
+                match result {
+                    Ok(()) => Poll::Ready(None),
+                    Err(error) => Poll::Ready(Some(Err(std::io::Error::other(error)))),
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }))
 }
 
 pub fn validate_composite_part_count(
@@ -221,7 +269,7 @@ pub fn validate_composite_part_count(
 }
 
 pub fn validate_delete_checksum(headers: &HeaderMap, body: &[u8]) -> S3Result<()> {
-    let request = parse_upload_checksum_request(headers)?;
+    let request = parse_upload_checksum_request(headers, None)?;
     if request.expected.is_empty() {
         return Err(s3_error!(
             MissingSecurityHeader,
@@ -393,39 +441,6 @@ fn parse_declared_algorithm(headers: &HeaderMap) -> S3Result<Option<ChecksumAlgo
     Ok(Some(parsed))
 }
 
-fn parse_trailer_algorithm(headers: &HeaderMap) -> S3Result<Option<ChecksumAlgorithm>> {
-    let trailer_payload = header_str(headers, X_AMZ_CONTENT_SHA256)?.is_some_and(|value| {
-        matches!(
-            value,
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" | "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
-        )
-    });
-    if !trailer_payload {
-        return Ok(None);
-    }
-    let Some(value) = header_str(headers, X_AMZ_TRAILER)? else {
-        return Ok(None);
-    };
-    let mut algorithms = value.split(',').filter_map(|name| match name.trim() {
-        name if name.eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC32) => Some(ChecksumAlgorithm::Crc32),
-        name if name.eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC32C) => Some(ChecksumAlgorithm::Crc32c),
-        name if name.eq_ignore_ascii_case(X_AMZ_CHECKSUM_CRC64NVME) => {
-            Some(ChecksumAlgorithm::Crc64Nvme)
-        }
-        name if name.eq_ignore_ascii_case(X_AMZ_CHECKSUM_SHA1) => Some(ChecksumAlgorithm::Sha1),
-        name if name.eq_ignore_ascii_case(X_AMZ_CHECKSUM_SHA256) => Some(ChecksumAlgorithm::Sha256),
-        _ => None,
-    });
-    let algorithm = algorithms.next();
-    if algorithms.next().is_some() {
-        return Err(s3_error!(
-            InvalidRequest,
-            "Multiple checksum trailers are not supported"
-        ));
-    }
-    Ok(algorithm)
-}
-
 fn parse_checksum_type(headers: &HeaderMap) -> S3Result<(ChecksumType, bool)> {
     let Some(value) = header_str(headers, X_AMZ_CHECKSUM_TYPE)? else {
         return Ok((ChecksumType::from_static(ChecksumType::FULL_OBJECT), false));
@@ -504,17 +519,19 @@ pub fn checksum_mismatch_error() -> S3Error {
 mod tests {
     use super::{
         ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
-        X_AMZ_CHECKSUM_TYPE, X_AMZ_CONTENT_SHA256, X_AMZ_SDK_CHECKSUM_ALGORITHM, X_AMZ_TRAILER,
-        checksum_mode_enabled, encode_checksums, parse_complete_multipart_checksum_request,
-        parse_upload_checksum_request, validate_composite_part_count, validate_delete_checksum,
-        validate_trailer_headers,
+        X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled,
+        encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
+        validate_composite_part_count, validate_delete_checksum, validate_trailer_headers,
+        verify_trailer_stream,
     };
     use aruna_blob::hash::Hasher;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use http::HeaderMap;
-    use s3s::dto::{ChecksumType, PutObjectOutput};
+    use futures_util::{StreamExt, stream};
+    use hyper::body::Bytes;
+    use s3s::dto::{ChecksumType, PutObjectOutput, StreamingBlob};
     use std::collections::HashMap;
 
     #[test]
@@ -524,7 +541,7 @@ mod tests {
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers).unwrap();
+        let request = parse_upload_checksum_request(&headers, None).unwrap();
 
         assert_eq!(request.expected.len(), 2);
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -565,7 +582,7 @@ mod tests {
 
     #[test]
     fn defaults_checksum_type_to_full_object() {
-        let request = parse_upload_checksum_request(&HeaderMap::new()).unwrap();
+        let request = parse_upload_checksum_request(&HeaderMap::new(), None).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::FULL_OBJECT);
         assert!(!request.checksum_type_declared);
@@ -576,7 +593,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers).unwrap();
+        let request = parse_upload_checksum_request(&headers, None).unwrap();
 
         assert_eq!(request.checksum_type.as_str(), ChecksumType::COMPOSITE);
         assert!(request.checksum_type_declared);
@@ -599,7 +616,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers).unwrap_err();
+        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidRequest");
     }
@@ -608,25 +625,19 @@ mod tests {
     fn validates_checksum_trailer() {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_SDK_CHECKSUM_ALGORITHM, "CRC32".parse().unwrap());
-        headers.insert(
-            X_AMZ_CONTENT_SHA256,
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
-                .parse()
-                .unwrap(),
-        );
-        headers.insert(X_AMZ_TRAILER, X_AMZ_CHECKSUM_CRC32.parse().unwrap());
-        let request = parse_upload_checksum_request(&headers).unwrap();
+        let request =
+            parse_upload_checksum_request(&headers, Some(ChecksumAlgorithm::Crc32)).unwrap();
         assert!(request.expected.is_empty());
         assert_eq!(request.response_algorithm, Some(ChecksumAlgorithm::Crc32));
 
         let mut trailers = HeaderMap::new();
         trailers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
         let hashes = HashMap::from([(HASH_CRC32.to_string(), vec![0xcb, 0xf4, 0x39, 0x26])]);
-        validate_trailer_headers(&headers, &trailers, &hashes).unwrap();
+        validate_trailer_headers(ChecksumAlgorithm::Crc32, false, &trailers, &hashes).unwrap();
 
         trailers.insert(X_AMZ_CHECKSUM_CRC32, "AAAAAA==".parse().unwrap());
         assert_eq!(
-            validate_trailer_headers(&headers, &trailers, &hashes)
+            validate_trailer_headers(ChecksumAlgorithm::Crc32, false, &trailers, &hashes)
                 .unwrap_err()
                 .code()
                 .as_str(),
@@ -634,12 +645,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn trailer_rejects_early() {
+        let body = StreamingBlob::wrap(stream::iter([Ok::<_, std::io::Error>(
+            Bytes::from_static(b"123456789"),
+        )]));
+        let mut trailers = HeaderMap::new();
+        trailers.insert(X_AMZ_CHECKSUM_CRC32, "AAAAAA==".parse().unwrap());
+        let mut body = verify_trailer_stream(
+            body,
+            ChecksumAlgorithm::Crc32,
+            false,
+            move || Some(trailers.clone()),
+        );
+
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"123456789")
+        );
+        assert!(body.next().await.unwrap().is_err());
+        assert!(body.next().await.is_none());
+    }
+
     #[test]
     fn rejects_malformed_md5() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_MD5, "nope".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers).unwrap_err();
+        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidDigest");
     }
@@ -710,7 +743,7 @@ mod tests {
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers).unwrap();
+        let request = parse_upload_checksum_request(&headers, None).unwrap();
 
         assert_eq!(request.expected.len(), 1);
         assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
@@ -731,7 +764,7 @@ mod tests {
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==".parse().unwrap());
 
-        let request = parse_upload_checksum_request(&headers).unwrap();
+        let request = parse_upload_checksum_request(&headers, None).unwrap();
 
         assert_eq!(request.expected[0].digest, vec![0xcb, 0xf4, 0x39, 0x26]);
         assert_eq!(request.composite_part_count, None);
@@ -744,7 +777,7 @@ mod tests {
         headers.insert(X_AMZ_CHECKSUM_TYPE, "COMPOSITE".parse().unwrap());
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-x".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers).unwrap_err();
+        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidDigest");
     }
@@ -754,7 +787,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(X_AMZ_CHECKSUM_CRC32, "y/Q5Jg==-2".parse().unwrap());
 
-        let err = parse_upload_checksum_request(&headers).unwrap_err();
+        let err = parse_upload_checksum_request(&headers, None).unwrap_err();
 
         assert_eq!(err.code().as_str(), "InvalidRequest");
     }
