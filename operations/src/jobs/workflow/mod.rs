@@ -242,8 +242,7 @@ pub async fn run_execution_job(
         Err((backend, fence, spec, bucket, cancel, error)) => {
             let resumed = {
                 let recovery = recover_failed_submit(
-                    &context, job_id, token, &backend, &fence, &spec, &bucket, &record, &cancel,
-                    error,
+                    &context, job_id, token, &backend, &fence, &spec, &bucket, &cancel, error,
                 );
                 tokio::pin!(recovery);
                 tokio::select! {
@@ -362,7 +361,6 @@ async fn recover_failed_submit(
     fence: &FenceContext,
     spec: &ExecutionSpec,
     bucket: &str,
-    record: &JobRecord,
     cancel: &CancellationToken,
     error: BackendError,
 ) -> bool {
@@ -378,6 +376,11 @@ async fn recover_failed_submit(
         finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
         return false;
     }
+    let record = match read_job_record(storage, job_id, None).await {
+        Ok(Some(record)) => record,
+        _ => return false,
+    };
+    let record = &record;
     let evidence = backend.reconcile(fence).await;
     match recovery_action(&evidence) {
         RecoveryAction::Observe => {
@@ -1504,7 +1507,6 @@ mod tests {
             &fence(&attempt),
             &execution_spec(),
             "ws-test",
-            &record,
             &CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
@@ -1705,10 +1707,9 @@ mod tests {
         assert_eq!(stored.state, JobState::Cancelled);
     }
 
-    // A submit error with the container confirmed absent keeps the pre-submit
-    // routing: requeue with backoff, intent cleared, attempt charged.
+    // Absence after intent retries the same name and retains the lineage.
     #[tokio::test]
-    async fn absent_submit_requeues() {
+    async fn absent_retries_same() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
@@ -1723,7 +1724,6 @@ mod tests {
             &fence(&attempt),
             &execution_spec(),
             "ws-test",
-            &record,
             &CancellationToken::new(),
             BackendError::Unavailable("io fault".to_string()),
         )
@@ -1733,9 +1733,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.state, JobState::Queued);
-        assert_eq!(stored.attempts, 1);
-        assert!(stored.attempt_intent.is_none());
+        assert_eq!(stored.state, JobState::Indeterminate);
+        assert_eq!(stored.attempts, 0);
+        assert!(stored.attempt_intent.is_some());
     }
 
     // A re-driven crate job must return the already-written resource instead of minting a

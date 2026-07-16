@@ -255,16 +255,16 @@ async fn execution_end_to_end() -> TestResult<()> {
     };
     let fixture = setup(backend).await?;
 
-    let script = "tr a-z A-Z < /data/input.txt > /data/result.txt";
+    let script = "tr a-z A-Z < /input/input.txt > /output/result.txt";
     let mut spec = execution_spec(
         &fixture,
         "busybox:latest",
         Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
         vec![script.to_string()],
     );
-    spec.inputs[0].container_path = Some("/data/input.txt".to_string());
+    spec.inputs[0].container_path = Some("/input/input.txt".to_string());
     spec.file_outputs = vec![OutputSelection {
-        container_path: "/data/result.txt".to_string(),
+        container_path: "/output/result.txt".to_string(),
         destination: OutputDestination::S3 {
             bucket: fixture.source_bucket.clone(),
             key: "outputs/result.txt".to_string(),
