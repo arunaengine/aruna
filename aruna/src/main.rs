@@ -116,7 +116,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let compute_handle = build_compute_registry(&config).await;
+    let compute_handle = build_compute_registry(&config)
+        .await
+        .map_err(std::io::Error::other)?;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
@@ -445,70 +447,166 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build the executor registry from config. The Docker backend is opt-in via
-/// `ARUNA_COMPUTE_DOCKER=true`; registration requires a healthy daemon and an
-/// explicit disk ceiling and container-reachable S3 endpoint.
-#[cfg(feature = "docker")]
-async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
-    let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-    if !docker_enabled {
-        return None;
+async fn build_compute_registry(
+    config: &Config,
+) -> Result<Option<Arc<aruna_compute::ExecutorRegistry>>, String> {
+    let selected = dotenvy::var("ARUNA_COMPUTE_EXECUTOR").unwrap_or_else(|_| "none".to_string());
+    let result = match selected.as_str() {
+        "none" => return Ok(None),
+        "docker" => build_docker(config).await,
+        "apptainer" => build_apptainer(config).await,
+        "kubernetes" => build_kubernetes(config).await,
+        other => Err(format!("unknown ARUNA_COMPUTE_EXECUTOR `{other}`")),
+    };
+    match result {
+        Ok(registry) => Ok(Some(Arc::new(registry))),
+        Err(error) if env_true("ARUNA_COMPUTE_OPTIONAL") => {
+            warn!(executor = %selected, reason = %error, "Compute executor unavailable; running without compute");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
-    let disk_bytes = match parse_disk_limit(
+}
+
+#[cfg(feature = "docker")]
+async fn build_docker(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    let disk_bytes = parse_disk_limit(
         dotenvy::var("ARUNA_COMPUTE_DOCKER_DISK_BYTES")
             .ok()
             .as_deref(),
-    ) {
-        Ok(disk_bytes) => disk_bytes,
-        Err(error) => {
-            warn!(reason = %error, "Docker executor requires ARUNA_COMPUTE_DOCKER_DISK_BYTES; running without compute");
-            return None;
-        }
-    };
-    let Some(endpoint) = config.s3_public_url.clone() else {
-        warn!("Docker executor requires S3_PUBLIC_URL; running without compute");
-        return None;
-    };
+    )?;
+    let endpoint = config
+        .s3_public_url
+        .clone()
+        .ok_or_else(|| "Docker executor requires S3_PUBLIC_URL".to_string())?;
     if container_local_endpoint(&endpoint) {
-        warn!(endpoint = %endpoint, "Docker executor requires a container-reachable S3_PUBLIC_URL; running without compute");
-        return None;
+        return Err("Docker executor requires a container-reachable S3_PUBLIC_URL".to_string());
     }
     if !config
         .s3_address
         .parse::<std::net::SocketAddr>()
         .is_ok_and(|address| !address.ip().is_loopback())
     {
-        warn!(address = %config.s3_address, "Docker executor requires a non-loopback S3_ADDRESS; running without compute");
-        return None;
+        return Err("Docker executor requires a non-loopback S3_ADDRESS".to_string());
     }
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: Some(disk_bytes),
         ..aruna_compute::DockerConfig::default()
     };
-    match aruna_compute::executor::docker::DockerBackend::with_config(docker_config) {
-        Ok(backend) => {
-            if let Err(error) = aruna_compute::ExecutorBackend::health(&backend).await {
-                warn!(error = %error, "Docker executor requested but unavailable; running without compute");
-                return None;
-            }
-            let registry = aruna_compute::ExecutorRegistry::new()
-                .with_backend(Arc::new(backend))
-                .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string());
-            info!("Docker executor backend enabled");
-            Some(Arc::new(registry))
-        }
-        Err(error) => {
-            warn!(error = %error, "Docker executor requested but unavailable; running without compute");
-            None
-        }
-    }
+    let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
+        .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| error.to_string())?;
+    info!("Docker executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(Some(endpoint), "eu-central-1".to_string()))
 }
 
 #[cfg(not(feature = "docker"))]
-async fn build_compute_registry(_config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
-    None
+async fn build_docker(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    Err("Docker executor feature is not compiled".to_string())
+}
+
+#[cfg(feature = "apptainer")]
+async fn build_apptainer(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    let cgroup_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| {
+            "Apptainer executor requires ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT".to_string()
+        })?;
+    let state_root = dotenvy::var("ARUNA_COMPUTE_APPTAINER_STATE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./compute-state/apptainer"));
+    let sif_cache = dotenvy::var("ARUNA_COMPUTE_APPTAINER_SIF_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./compute-state/sif"));
+    let backend = aruna_compute::executor::apptainer::ApptainerBackend::with_config(
+        aruna_compute::ApptainerConfig {
+            state_root,
+            sif_cache,
+            cgroup_root,
+            stop_grace: env_duration("ARUNA_COMPUTE_STOP_GRACE", 10)?,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| error.to_string())?;
+    info!("Apptainer executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+}
+
+#[cfg(not(feature = "apptainer"))]
+async fn build_apptainer(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    Err("Apptainer executor feature is not compiled".to_string())
+}
+
+#[cfg(feature = "kubernetes")]
+async fn build_kubernetes(config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    let storage_class = dotenvy::var("ARUNA_COMPUTE_K8S_STORAGE_CLASS")
+        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_STORAGE_CLASS".to_string())?;
+    let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE")
+        .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string())?;
+    let s3_cidrs = dotenvy::var("ARUNA_COMPUTE_K8S_S3_CIDRS")
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|cidr| !cidr.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let s3_port = dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT")
+        .map(|value| value.parse::<u16>())
+        .unwrap_or(Ok(443))
+        .map_err(|_| "ARUNA_COMPUTE_K8S_S3_PORT must be a valid port".to_string())?;
+    let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
+        aruna_compute::KubernetesConfig {
+            namespace: dotenvy::var("ARUNA_COMPUTE_K8S_NAMESPACE")
+                .unwrap_or_else(|_| "default".to_string()),
+            storage_class,
+            helper_image,
+            pull_deadline: env_duration("ARUNA_COMPUTE_K8S_PULL_DEADLINE", 300)?,
+            s3_cidrs,
+            s3_port,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    aruna_compute::ExecutorBackend::health(&backend)
+        .await
+        .map_err(|error| error.to_string())?;
+    info!("Kubernetes executor backend enabled");
+    Ok(aruna_compute::ExecutorRegistry::new()
+        .with_backend(Arc::new(backend))
+        .with_workspace_endpoint(config.s3_public_url.clone(), "eu-central-1".to_string()))
+}
+
+#[cfg(not(feature = "kubernetes"))]
+async fn build_kubernetes(_config: &Config) -> Result<aruna_compute::ExecutorRegistry, String> {
+    Err("Kubernetes executor feature is not compiled".to_string())
+}
+
+fn env_true(name: &str) -> bool {
+    dotenvy::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "apptainer", feature = "kubernetes"))]
+fn env_duration(name: &str, default: u64) -> Result<std::time::Duration, String> {
+    let seconds = dotenvy::var(name)
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(default))
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if seconds == 0 {
+        return Err(format!("{name} must be greater than zero"));
+    }
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 #[cfg(any(feature = "docker", test))]
@@ -567,7 +665,7 @@ async fn shutdown_runtime(
     }
 }
 
-#[cfg(any(feature = "docker", test))]
+#[cfg(feature = "docker")]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()

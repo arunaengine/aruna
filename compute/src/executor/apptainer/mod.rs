@@ -105,12 +105,13 @@ impl ApptainerBackend {
         remove_tree(&temp)?;
         std::fs::create_dir_all(temp.join("workspace/root")).map_err(io_error)?;
         std::fs::create_dir_all(temp.join("logs")).map_err(io_error)?;
+        let layout_digest = plan.layout.digest();
         let binds = stage_files(&temp, plan).await?;
         let argv = command_argv(spec, &metadata)?;
         let record = AttemptRecord {
             attempt_epoch: context.attempt_epoch,
             pinned_image: spec.image.clone(),
-            layout_digest: layout_digest(spec)?,
+            layout_digest,
             output_paths: spec.output_paths.clone(),
         };
         let launch = LaunchRecord {
@@ -780,39 +781,6 @@ fn repository_name(image: &str) -> &str {
     } else {
         without_digest
     }
-}
-
-fn layout_digest(spec: &TaskSpec) -> Result<String, BackendError> {
-    let layout = StageLayout::from_spec(spec)?;
-    let mut rows = layout
-        .files
-        .iter()
-        .map(|file| {
-            format!(
-                "i\0{}\0{}\0{}",
-                file.path.display(),
-                file.size,
-                file.workspace_key
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.extend(
-        layout
-            .output_parents
-            .iter()
-            .map(|path| format!("o\0{}", path.display())),
-    );
-    rows.sort();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(match layout.mode {
-        StagingMode::Files => b"files",
-        StagingMode::DirectS3 => b"direct-s3",
-    });
-    for row in rows {
-        hasher.update(row.as_bytes());
-        hasher.update(&[0]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 async fn read_log(

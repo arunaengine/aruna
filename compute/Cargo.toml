@@ -10,7 +10,7 @@ rust-version.workspace = true
 default = ["docker"]
 docker = ["dep:bollard"]
 apptainer = ["dep:nix", "dep:rustix"]
-kubernetes = ["dep:kube", "dep:k8s-openapi"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch"]
 
 [dependencies]
 aruna-core = { workspace = true }
@@ -30,6 +30,7 @@ nix = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
+json-patch = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

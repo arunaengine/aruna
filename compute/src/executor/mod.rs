@@ -21,6 +21,7 @@ pub mod kubernetes;
 
 use logs::LogSink;
 
+#[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]
 pub(crate) fn digest_pinned(image: &str) -> bool {
     image
         .rsplit_once("@sha256:")

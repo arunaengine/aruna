@@ -328,6 +328,7 @@ dependencies = [
  "bollard",
  "bytes",
  "futures-util",
+ "json-patch",
  "k8s-openapi",
  "kube",
  "nix",
