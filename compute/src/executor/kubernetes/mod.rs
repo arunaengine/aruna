@@ -988,11 +988,9 @@ impl ExecutorBackend for KubernetesBackend {
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
-        let job = self.get_job(context).await?;
+        let mut job = self.get_job(context).await?;
         if job_state(&job) != Some("tombstone") {
-            return Err(BackendError::Conflict(
-                "Kubernetes cleanup requires a tombstoned Job".to_string(),
-            ));
+            job = self.patch_state(context, "tombstone", true).await?;
         }
         self.strip_finalizer(context, &job).await?;
         self.remove_helpers(context).await?;
