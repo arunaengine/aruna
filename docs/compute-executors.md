@@ -131,6 +131,9 @@ with a UID precondition, waits until GET returns 404, writes the stage marker,
 and CAS-unsuspends the same Job by UID and resource version. Pods are never
 force-deleted.
 
+Kubernetes log capture reads only the task Pod's stdout stream. The `stderr_*`
+fields remain zero, so total captured log size is a lower bound.
+
 The PVC sentinel and ConfigMap marker contain the Job UID, attempt epoch,
 controller generation, and layout digest. A helper init container compares them
 before the task starts and installs the static probe into an `emptyDir`; the task
