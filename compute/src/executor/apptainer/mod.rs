@@ -300,7 +300,10 @@ impl ExecutorBackend for ApptainerBackend {
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
         validate_spec(context, spec)?;
-        let _guard = self.state.control(context)?;
+        let guard = self.state.control(context)?;
+        if guard.tombstone().is_some() {
+            return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
+        }
         if let Some(status) = self.existing_status(context)? {
             if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence"))
             {

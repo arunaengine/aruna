@@ -723,6 +723,9 @@ impl ExecutorBackend for KubernetesBackend {
         let layout = StageLayout::from_spec(spec)?;
         let job = self.ensure_job(context, spec, &layout).await?;
         validate_job(&job, context)?;
+        if job_state(&job) == Some("tombstone") {
+            return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
+        }
         let status = job_status(&job);
         if status.is_terminal()
             || job
@@ -788,6 +791,9 @@ impl ExecutorBackend for KubernetesBackend {
         _cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
         let job = self.get_job(context).await?;
+        if job_state(&job) == Some("tombstone") {
+            return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
+        }
         if job
             .spec
             .as_ref()
