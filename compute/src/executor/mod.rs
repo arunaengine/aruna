@@ -16,6 +16,9 @@ pub mod apptainer;
 #[cfg(feature = "docker")]
 pub mod docker;
 
+#[cfg(feature = "kubernetes")]
+pub mod kubernetes;
+
 use logs::LogSink;
 
 pub(crate) fn digest_pinned(image: &str) -> bool {

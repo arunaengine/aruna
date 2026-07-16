@@ -122,6 +122,37 @@ impl StageLayout {
             mode: spec.staging_mode,
         })
     }
+
+    pub fn digest(&self) -> String {
+        let mut rows = self
+            .files
+            .iter()
+            .map(|file| {
+                format!(
+                    "i\0{}\0{}\0{}",
+                    file.path.display(),
+                    file.size,
+                    file.workspace_key
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.output_parents
+                .iter()
+                .map(|path| format!("o\0{}", path.display())),
+        );
+        rows.sort();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(match self.mode {
+            StagingMode::Files => b"files",
+            StagingMode::DirectS3 => b"direct-s3",
+        });
+        for row in rows {
+            hasher.update(row.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 impl StagePlan {

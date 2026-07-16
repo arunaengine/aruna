@@ -50,4 +50,6 @@ pub struct KubernetesConfig {
     pub storage_class: String,
     pub helper_image: String,
     pub pull_deadline: Duration,
+    pub s3_cidrs: Vec<String>,
+    pub s3_port: u16,
 }
