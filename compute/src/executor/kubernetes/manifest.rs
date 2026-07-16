@@ -38,7 +38,7 @@ pub fn job_manifest(
     let name = context.attempt.external_name();
     let mut labels = labels(context, "task");
     labels.insert(
-        "aruna.io/network".to_string(),
+        "aruna-engine.org/network".to_string(),
         match spec.staging_mode {
             StagingMode::Files => "none",
             StagingMode::DirectS3 => "s3",
@@ -140,7 +140,7 @@ pub fn job_manifest(
             "namespace":config.namespace,
             "labels":labels,
             "annotations":annotations,
-            "finalizers":["aruna.io/attempt-protection"]
+            "finalizers":["aruna-engine.org/attempt-protection"]
         },
         "spec":{
             "suspend":true,
@@ -278,7 +278,7 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
         "kind":"NetworkPolicy",
         "metadata":{"name":"aruna-compute-deny","namespace":config.namespace},
         "spec":{
-            "podSelector":{"matchLabels":{"aruna.io/network":"none"}},
+            "podSelector":{"matchLabels":{"aruna-engine.org/network":"none"}},
             "policyTypes":["Ingress","Egress"],
             "ingress":[],
             "egress":[]
@@ -298,7 +298,7 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
         "kind":"NetworkPolicy",
         "metadata":{"name":"aruna-compute-s3","namespace":config.namespace},
         "spec":{
-            "podSelector":{"matchLabels":{"aruna.io/network":"s3"}},
+            "podSelector":{"matchLabels":{"aruna-engine.org/network":"s3"}},
             "policyTypes":["Ingress","Egress"],
             "ingress":[],
             "egress":[
@@ -333,19 +333,19 @@ fn labels(context: &FenceContext, role: &str) -> BTreeMap<String, String> {
     let network = if role == "task" { "task" } else { "none" };
     BTreeMap::from([
         (
-            "aruna.io/job-id".to_string(),
+            "aruna-engine.org/job-id".to_string(),
             context.attempt.job_id.clone(),
         ),
         (
-            "aruna.io/attempt".to_string(),
+            "aruna-engine.org/attempt".to_string(),
             context.attempt.attempt.to_string(),
         ),
         (ROLE_LABEL.to_string(), role.to_string()),
         (
-            "aruna.io/generation".to_string(),
+            "aruna-engine.org/generation".to_string(),
             context.controller_generation.to_string(),
         ),
-        ("aruna.io/network".to_string(), network.to_string()),
+        ("aruna-engine.org/network".to_string(), network.to_string()),
     ])
 }
 
@@ -356,9 +356,12 @@ fn annotations(
     spec: &TaskSpec,
 ) -> Result<BTreeMap<String, String>, BackendError> {
     let mut annotations = annotations_base(context, state);
-    annotations.insert("aruna.io/layout-digest".to_string(), layout.digest());
     annotations.insert(
-        "aruna.io/staging-mode".to_string(),
+        "aruna-engine.org/layout-digest".to_string(),
+        layout.digest(),
+    );
+    annotations.insert(
+        "aruna-engine.org/staging-mode".to_string(),
         match spec.staging_mode {
             StagingMode::Files => "files",
             StagingMode::DirectS3 => "direct-s3",
@@ -366,7 +369,7 @@ fn annotations(
         .to_string(),
     );
     annotations.insert(
-        "aruna.io/output-paths".to_string(),
+        "aruna-engine.org/output-paths".to_string(),
         serde_json::to_string(&spec.output_paths)
             .map_err(|error| BackendError::Api(format!("serialize output paths: {error}")))?,
     );

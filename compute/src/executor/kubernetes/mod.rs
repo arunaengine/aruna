@@ -45,10 +45,10 @@ use manifest::{
     network_policies, pvc_manifest, secret_manifest, secret_name, workspace_name,
 };
 
-pub const EPOCH_ANNOTATION: &str = "aruna.io/attempt-epoch";
-pub const GENERATION_ANNOTATION: &str = "aruna.io/controller-generation";
-pub const STATE_ANNOTATION: &str = "aruna.io/state";
-pub const ROLE_LABEL: &str = "aruna.io/role";
+pub const EPOCH_ANNOTATION: &str = "aruna-engine.org/attempt-epoch";
+pub const GENERATION_ANNOTATION: &str = "aruna-engine.org/controller-generation";
+pub const STATE_ANNOTATION: &str = "aruna-engine.org/state";
+pub const ROLE_LABEL: &str = "aruna-engine.org/role";
 const DEFAULT_WORKSPACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -772,7 +772,7 @@ impl ExecutorBackend for KubernetesBackend {
             .metadata
             .annotations
             .as_ref()
-            .and_then(|annotations| annotations.get("aruna.io/staging-mode"))
+            .and_then(|annotations| annotations.get("aruna-engine.org/staging-mode"))
             .map(String::as_str);
         if staging == Some("files") {
             let marker = self
@@ -1145,7 +1145,7 @@ fn validate_marker(
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get("aruna.io/layout-digest"))
+        .and_then(|annotations| annotations.get("aruna-engine.org/layout-digest"))
         .ok_or_else(|| BackendError::Conflict("Job layout digest is missing".to_string()))?;
     if marker.job_uid != job_uid(job)?
         || marker.attempt_epoch != context.attempt_epoch
@@ -1165,7 +1165,7 @@ fn validate_output(job: &Job, path: &str) -> Result<(), BackendError> {
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get("aruna.io/output-paths"))
+        .and_then(|annotations| annotations.get("aruna-engine.org/output-paths"))
         .ok_or_else(|| BackendError::Conflict("Job output declarations are missing".to_string()))?;
     let outputs: Vec<String> = serde_json::from_str(outputs)
         .map_err(|error| BackendError::Conflict(format!("invalid Job outputs: {error}")))?;
@@ -1286,7 +1286,7 @@ fn escape_pointer(value: &str) -> String {
 
 fn attempt_selector(context: &FenceContext) -> String {
     format!(
-        "aruna.io/job-id={},aruna.io/attempt={}",
+        "aruna-engine.org/job-id={},aruna-engine.org/attempt={}",
         context.attempt.job_id, context.attempt.attempt
     )
 }
@@ -1631,7 +1631,7 @@ mod tests {
     fn selector_is_stable() {
         assert_eq!(
             attempt_selector(&context()),
-            "aruna.io/job-id=job,aruna.io/attempt=1"
+            "aruna-engine.org/job-id=job,aruna-engine.org/attempt=1"
         );
     }
 }
