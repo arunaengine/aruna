@@ -205,6 +205,7 @@ impl ApptainerBackend {
         let metadata_path = self.config.sif_cache.join(format!("{digest}.json"));
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.config.sif_cache.join(format!("{digest}.lock")))

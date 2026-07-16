@@ -17,6 +17,7 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
     setsid().map_err(runtime_error)?;
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(attempt_dir.join("exec.lock"))

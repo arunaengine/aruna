@@ -89,6 +89,7 @@ impl StateRoot {
         std::fs::create_dir_all(&directory).map_err(state_error)?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(directory.join("control.lock"))
