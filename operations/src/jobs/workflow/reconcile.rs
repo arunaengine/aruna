@@ -386,6 +386,14 @@ pub(super) async fn resume_attempt(
                     .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
                     .map(|intent| intent.pinned_image.as_str())
                 else {
+                    let _ = mark_indeterminate(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        JobError::retryable("attempt intent mismatch"),
+                        unix_timestamp_millis(),
+                    )
+                    .await;
                     return false;
                 };
                 let task_spec = build_task_spec(&spec, &fence.attempt, pinned_image, inputs);
