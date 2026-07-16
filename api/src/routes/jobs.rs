@@ -26,6 +26,7 @@ use crate::server_state::ServerState;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
+const MAX_OUTPUT_PREFIXES: usize = 32;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -212,6 +213,19 @@ fn map_submit_error(error: aruna_operations::jobs::submit::SubmitJobError) -> Se
     }
 }
 
+fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> {
+    if prefixes.len() > MAX_OUTPUT_PREFIXES || prefixes.iter().any(String::is_empty) {
+        return Err(ServerError::BadRequest);
+    }
+    let mut deduplicated = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        if !deduplicated.contains(&prefix) {
+            deduplicated.push(prefix);
+        }
+    }
+    Ok(deduplicated)
+}
+
 #[utoipa::path(
     get,
     path = "/jobs/",
@@ -293,6 +307,7 @@ pub async fn submit_job(
     {
         return Err(ServerError::BadRequest);
     }
+    let output_prefixes = validate_output_prefixes(request.output_prefixes)?;
     ensure_permission(
         &state,
         &auth,
@@ -344,7 +359,7 @@ pub async fn submit_job(
         executor_constraint: request.executor_constraint,
         inputs,
         file_outputs: Vec::new(),
-        output_prefixes: request.output_prefixes,
+        output_prefixes,
     };
     let result = submit_execution_job(
         &state.get_ctx(),
@@ -728,6 +743,19 @@ mod tests {
                 "ram_bytes {ram_bytes} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn normalizes_prefixes() {
+        assert_eq!(
+            validate_output_prefixes(vec!["results/".to_string(), "results/".to_string()])
+                .unwrap(),
+            ["results/"]
+        );
+        assert!(validate_output_prefixes(vec![String::new()]).is_err());
+        assert!(
+            validate_output_prefixes(vec!["result".to_string(); MAX_OUTPUT_PREFIXES + 1]).is_err()
+        );
     }
 
     #[tokio::test]
