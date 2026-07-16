@@ -573,10 +573,9 @@ impl ExecutorBackend for ApptainerBackend {
                 ("external_name", context.attempt.external_name()),
             ]),
         )?;
-        let evidence = guard.seal(reference)?;
         remove_tree(&directory)?;
         remove_cgroup(&self.cgroup_path(context))?;
-        Ok(evidence)
+        guard.seal(reference)
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
@@ -997,6 +996,40 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_delete_unsealed() {
+        let root = tempdir().unwrap();
+        let backend = ApptainerBackend::with_config(ApptainerConfig {
+            state_root: root.path().join("state"),
+            sif_cache: root.path().join("cache"),
+            cgroup_root: root.path().join("cgroup"),
+            stop_grace: Duration::from_secs(1),
+        })
+        .unwrap();
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 2),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+        let cgroup = backend.cgroup_path(&context);
+        std::fs::create_dir_all(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), []).unwrap();
+
+        backend
+            .tombstone(&context, &TombstoneSpec { terminal_ref: None })
+            .await
+            .unwrap_err();
+        assert!(
+            backend
+                .state
+                .read(&context)
+                .unwrap()
+                .unwrap()
+                .tombstone_ref
+                .is_none()
+        );
     }
 
     #[test]
