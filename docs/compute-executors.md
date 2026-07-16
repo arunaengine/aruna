@@ -123,8 +123,9 @@ Required configuration:
 - `ARUNA_COMPUTE_K8S_S3_CIDRS`: comma-separated egress CIDRs for Direct-S3.
 - `ARUNA_COMPUTE_K8S_S3_PORT`: S3 TCP port; defaults to `443`.
 
-Files mode requires Kubernetes 1.29 or newer and a CSI driver that enforces
-`ReadWriteOncePod`. Each attempt creates a suspended Job first, then an RWOP PVC.
+The Kubernetes executor supports Kubernetes 1.32 or newer. Files mode requires a
+CSI driver that enforces `ReadWriteOncePod`. Each attempt creates a suspended Job
+first, then an RWOP PVC.
 The controller stages through an exec stream, gracefully deletes the stage Pod
 with a UID precondition, waits until GET returns 404, writes the stage marker,
 and CAS-unsuspends the same Job by UID and resource version. Pods are never
