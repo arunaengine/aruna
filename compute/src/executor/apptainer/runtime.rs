@@ -58,6 +58,7 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
             cgroup: launch.cgroup.clone(),
         },
     )?;
+    let started_at_ms = now_ms();
     stream.write_all(&[1]).map_err(io_error)?;
     drop(stream);
 
@@ -101,7 +102,7 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
         &attempt_dir.join("status.json"),
         &StatusRecord {
             phase,
-            started_at_ms: Some(now_ms()),
+            started_at_ms: Some(started_at_ms),
             finished_at_ms: now_ms(),
         },
     )?;
