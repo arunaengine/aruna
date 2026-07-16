@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -301,12 +302,7 @@ impl fmt::Debug for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        let bytes = unsafe { self.0.as_mut_vec() };
-        let capacity = bytes.capacity();
-        let ptr = bytes.as_mut_ptr();
-        for index in 0..capacity {
-            unsafe { std::ptr::write_volatile(ptr.add(index), 0) };
-        }
+        self.0.zeroize();
     }
 }
 

@@ -382,6 +382,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid 2.0.1",
+ "zeroize",
 ]
 
 [[package]]
