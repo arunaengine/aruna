@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use aruna_compute::ExecutorBackend;
-use aruna_core::compute::{AttemptRef, BackendError, MAX_TRANSFER_BYTES, TaskInput};
+use aruna_core::compute::{BackendError, FenceContext, MAX_TRANSFER_BYTES, TaskInput};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
@@ -255,7 +255,7 @@ pub async fn load_inputs(
 pub async fn capture_outputs(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
@@ -263,7 +263,7 @@ pub async fn capture_outputs(
     let mut outputs = Vec::with_capacity(spec.file_outputs.len());
     for output in &spec.file_outputs {
         outputs
-            .push(put_file_output(context, backend, attempt, spec, record, node_id, output).await?);
+            .push(put_file_output(context, backend, fence, spec, record, node_id, output).await?);
     }
     Ok(outputs)
 }
@@ -275,7 +275,7 @@ pub async fn capture_outputs(
 async fn put_file_output(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
@@ -343,7 +343,7 @@ async fn put_file_output(
         }
     };
     if let Some(location) = &existing {
-        let (size, digest) = hash_output(backend, attempt, &output.container_path).await?;
+        let (size, digest) = hash_output(backend, fence, &output.container_path).await?;
         if location.blob_size == size && location.get_blake3() == Some(digest.as_bytes().as_slice())
         {
             return Ok(output_object(output, bucket, key, size, &digest));
@@ -359,7 +359,7 @@ async fn put_file_output(
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
 
     let fetched = backend
-        .fetch_output(attempt, &output.container_path)
+        .fetch_output(fence, &output.container_path)
         .await
         .map_err(|error| output_read_error(&error))?;
     let size = fetched.size;
@@ -421,11 +421,11 @@ async fn put_file_output(
 /// Streamed size + blake3 of one container output, for the idempotent-retry check.
 async fn hash_output(
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     path: &str,
 ) -> Result<(u64, blake3::Hash), JobError> {
     let fetched = backend
-        .fetch_output(attempt, path)
+        .fetch_output(fence, path)
         .await
         .map_err(|error| output_read_error(&error))?;
     let mut chunks = fetched.chunks;

@@ -97,17 +97,25 @@ impl Operation for ComputeLifecycle {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::{AttemptRef, ComputeEffect, ExecutorKind};
+    use aruna_core::compute::{AttemptRef, ComputeEffect, ExecutorKind, FenceContext};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
 
     use super::*;
 
+    fn fence() -> FenceContext {
+        FenceContext {
+            attempt: AttemptRef::new("job", 1),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        }
+    }
+
     #[test]
     fn emits_compute_effect() {
         let effect = ComputeEffect::Status {
             backend: ExecutorKind::Docker,
-            attempt: AttemptRef::new("job", 1),
+            context: fence(),
         };
         let mut operation = ComputeLifecycle::new(effect);
         assert!(matches!(operation.start().as_slice(), [Effect::Compute(_)]));
@@ -117,7 +125,7 @@ mod tests {
     fn rejects_wrong_event() {
         let effect = ComputeEffect::Status {
             backend: ExecutorKind::Docker,
-            attempt: AttemptRef::new("job", 1),
+            context: fence(),
         };
         let mut operation = ComputeLifecycle::new(effect);
         operation.start();

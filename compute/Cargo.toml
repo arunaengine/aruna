@@ -9,7 +9,7 @@ rust-version.workspace = true
 [features]
 default = ["docker"]
 docker = ["dep:bollard"]
-apptainer = ["dep:nix", "dep:rustix", "dep:serde_json"]
+apptainer = ["dep:nix", "dep:rustix"]
 kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
@@ -19,7 +19,7 @@ bollard = { workspace = true, optional = true, features = ["ssl"] }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -32,4 +32,5 @@ k8s-openapi = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }

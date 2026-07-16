@@ -10,8 +10,9 @@ use std::time::Duration;
 use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits,
-    LogTails, ReconcileOutcome, ResourceRequest, Secret, TaskInput, TaskSpec, WorkspaceBinding,
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
+    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, Secret, TaskInput,
+    TaskSpec, WorkspaceBinding,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -165,15 +166,24 @@ pub async fn run_execution_job(
             return None;
         }
 
-        let submitted = match backend.submit(&task_spec, &cancel).await {
+        let fence = FenceContext {
+            attempt: attempt.clone(),
+            attempt_epoch: intent_commit.control.attempt_epoch,
+            controller_generation: intent_commit.control.controller_generation,
+        };
+        if backend.fence(&fence).await.is_err() {
+            return None;
+        }
+
+        let submitted = match backend.submit(&fence, &task_spec, &cancel).await {
             Ok(status) => status,
             Err(BackendError::Cancelled) => {
-                finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket).await;
+                finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
                 return None;
             }
             Err(error) => {
                 return Some(Err((
-                    backend, attempt, task_spec, spec, bucket, cancel, error,
+                    backend, fence, task_spec, spec, bucket, cancel, error,
                 )));
             }
         };
@@ -192,11 +202,11 @@ pub async fn run_execution_job(
             Err(_) => return None,
         };
         if running.cancel_requested {
-            finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket).await;
+            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket).await;
             return None;
         }
 
-        Some(Ok((backend, attempt, spec, bucket, cancel)))
+        Some(Ok((backend, fence, spec, bucket, cancel)))
     };
     tokio::pin!(prepare_and_submit);
 
@@ -210,7 +220,7 @@ pub async fn run_execution_job(
         return;
     };
     match prepared {
-        Ok((backend, attempt, spec, bucket, cancel)) => {
+        Ok((backend, fence, spec, bucket, cancel)) => {
             stop.cancel();
             let _ = (&mut heartbeat).await;
             supervise_and_finalize(
@@ -218,18 +228,18 @@ pub async fn run_execution_job(
                 job_id,
                 token,
                 backend,
-                attempt,
+                fence,
                 spec,
                 bucket,
                 cancel,
             )
             .await;
         }
-        Err((backend, attempt, task_spec, spec, bucket, cancel, error)) => {
+        Err((backend, fence, task_spec, spec, bucket, cancel, error)) => {
             let resumed = {
                 let recovery = recover_failed_submit(
-                    &context, job_id, token, &backend, &attempt, &task_spec, &spec, &bucket,
-                    &record, &cancel, error,
+                    &context, job_id, token, &backend, &fence, &task_spec, &spec, &bucket, &record,
+                    &cancel, error,
                 );
                 tokio::pin!(recovery);
                 tokio::select! {
@@ -247,7 +257,7 @@ pub async fn run_execution_job(
                     job_id,
                     token,
                     backend,
-                    attempt,
+                    fence,
                     spec,
                     bucket,
                     cancel,
@@ -367,7 +377,7 @@ async fn recover_failed_submit(
     job_id: JobId,
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     task_spec: &TaskSpec,
     spec: &ExecutionSpec,
     bucket: &str,
@@ -384,23 +394,19 @@ async fn recover_failed_submit(
             .flatten()
             .is_some_and(|record| record.cancel_requested)
     {
-        finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
         return false;
     }
-    match backend.reconcile(attempt).await {
+    match backend.reconcile(fence).await {
         // Confirmed absent: the submit failed before a container could exist, so
         // the pre-submit routing (requeue with backoff, or terminal fail) is safe.
-        ReconcileOutcome::NotFound => {
-            let job_error = if error.retryable() {
-                JobError::retryable(format!("submit failed: {error}"))
-            } else {
-                JobError::permanent(format!("submit failed: {error}"))
-            };
-            requeue_or_fail_pre_submit(context, job_id, token, record, job_error).await;
+        ReconcileEvidence::Absent => {
+            park_failed_submit(context, job_id, token, &error).await;
             false
         }
         // The attempt already finished: commit its evidence.
-        ReconcileOutcome::Found(status) if status.is_terminal() => {
+        ReconcileEvidence::Adoptable(evidence) if evidence.status.is_terminal() => {
+            let status = evidence.status;
             let running = match transition_external_to_running(
                 storage,
                 job_id,
@@ -414,7 +420,7 @@ async fn recover_failed_submit(
                 Err(_) => return false,
             };
             if running.cancel_requested {
-                finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+                finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
                 return false;
             }
             finalize_attempt(
@@ -422,7 +428,7 @@ async fn recover_failed_submit(
                 job_id,
                 token,
                 backend,
-                attempt,
+                fence,
                 spec,
                 bucket,
                 Ok(status),
@@ -433,14 +439,14 @@ async fn recover_failed_submit(
         // The container exists and is live: adopt it, never launch a second one.
         // A created-but-never-started container is completed in place; the name
         // collision makes the re-submit idempotent.
-        ReconcileOutcome::Found(status) => {
+        ReconcileEvidence::Adoptable(evidence) => {
+            let status = evidence.status;
             let mut started_at_ms = status.started_at_ms;
             if matches!(&status.phase, AttemptPhase::Submitted) {
-                match backend.submit(task_spec, cancel).await {
+                match backend.submit(fence, task_spec, cancel).await {
                     Ok(resubmitted) => started_at_ms = resubmitted.started_at_ms.or(started_at_ms),
                     Err(BackendError::Cancelled) => {
-                        finalize_cancel(context, job_id, token, backend, attempt, spec, bucket)
-                            .await;
+                        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
                         return false;
                     }
                     Err(resubmit_error) if resubmit_error.retryable() => {
@@ -473,14 +479,16 @@ async fn recover_failed_submit(
                 Err(_) => return false,
             };
             if running.cancel_requested {
-                finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+                finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
                 return false;
             }
             true
         }
         // Backend unobservable: park; the retained intent keeps the attempt
         // adoptable when the lease sweep routes the job to the reconciler.
-        ReconcileOutcome::Unavailable(_) => {
+        ReconcileEvidence::Unavailable(_)
+        | ReconcileEvidence::Unadoptable(_)
+        | ReconcileEvidence::Tombstoned(_) => {
             park_failed_submit(context, job_id, token, &error).await;
             false
         }
@@ -511,16 +519,16 @@ pub async fn supervise_and_finalize(
     job_id: JobId,
     token: ulid::Ulid,
     backend: Arc<dyn ExecutorBackend>,
-    attempt: AttemptRef,
+    fence: FenceContext,
     spec: ExecutionSpec,
     bucket: String,
     cancel: CancellationToken,
 ) {
     let storage = context.storage_handle.clone();
     let wait_and_finalize = async {
-        let result = backend.wait(&attempt, &cancel).await;
+        let result = backend.wait(&fence, &cancel).await;
         finalize_attempt(
-            &context, job_id, token, &backend, &attempt, &spec, &bucket, result,
+            &context, job_id, token, &backend, &fence, &spec, &bucket, result,
         )
         .await;
     };
@@ -593,7 +601,7 @@ pub(crate) async fn finalize_attempt(
     job_id: JobId,
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     spec: &ExecutionSpec,
     bucket: &str,
     result: Result<AttemptStatus, BackendError>,
@@ -631,7 +639,7 @@ pub(crate) async fn finalize_attempt(
     }
 
     if cancel_requested {
-        finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+        finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
         return;
     }
 
@@ -642,12 +650,12 @@ pub(crate) async fn finalize_attempt(
                 return;
             };
             let Some(captured) =
-                export_or_park(context, job_id, token, backend, attempt, spec, bucket).await
+                export_or_park(context, job_id, token, backend, fence, spec, bucket).await
             else {
                 return;
             };
             outputs.extend(captured);
-            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
                 return;
             };
             let result = execution_result_for(bucket, Some(0), outputs, logs);
@@ -656,7 +664,7 @@ pub(crate) async fn finalize_attempt(
                     cleanup_and_crate(context, job_id, Some(record)).await;
                 }
                 Some(ExecutionCompleteOutcome::CancelRequested(_)) => {
-                    finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+                    finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
                 }
                 None => {}
             }
@@ -665,7 +673,7 @@ pub(crate) async fn finalize_attempt(
             let Some(outputs) = collect_or_park(context, job_id, token, spec, bucket).await else {
                 return;
             };
-            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
                 return;
             };
             let result = execution_result_for(bucket, Some(code), outputs, logs);
@@ -680,7 +688,7 @@ pub(crate) async fn finalize_attempt(
             cleanup_and_crate(context, job_id, record).await;
         }
         AttemptPhase::Failed { reason } => {
-            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
                 return;
             };
             let result = execution_result_for(bucket, None, Vec::new(), logs);
@@ -695,7 +703,7 @@ pub(crate) async fn finalize_attempt(
             cleanup_and_crate(context, job_id, record).await;
         }
         AttemptPhase::Cancelled => {
-            finalize_cancel(context, job_id, token, backend, attempt, spec, bucket).await;
+            finalize_cancel(context, job_id, token, backend, fence, spec, bucket).await;
         }
         AttemptPhase::Submitted | AttemptPhase::Running => {
             let _ = mark_indeterminate(
@@ -715,17 +723,17 @@ async fn finalize_cancel(
     job_id: JobId,
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     spec: &ExecutionSpec,
     bucket: &str,
 ) {
     let storage = &context.storage_handle;
     // Running -> Cancelling (idempotent: a re-entry may already be Cancelling).
     let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
-    let evidence = backend.cancel(attempt).await;
+    let evidence = backend.cancel(fence).await;
     match evidence {
         Ok(CancelEvidence::Stopped(status)) => {
-            let Some(logs) = capture_or_park(context, job_id, token, backend, attempt).await else {
+            let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
                 return;
             };
             match status.phase {
@@ -736,8 +744,7 @@ async fn finalize_cancel(
                         return;
                     };
                     let Some(captured) =
-                        export_or_park(context, job_id, token, backend, attempt, spec, bucket)
-                            .await
+                        export_or_park(context, job_id, token, backend, fence, spec, bucket).await
                     else {
                         return;
                     };
@@ -1017,7 +1024,7 @@ async fn export_or_park(
     job_id: JobId,
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
     spec: &ExecutionSpec,
     bucket: &str,
 ) -> Option<Vec<OutputObject>> {
@@ -1046,7 +1053,7 @@ async fn export_or_park(
         cleanup_and_crate(context, job_id, terminal).await;
         return None;
     };
-    match capture_outputs(context, backend, attempt, spec, &record, node_id).await {
+    match capture_outputs(context, backend, fence, spec, &record, node_id).await {
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Retryable => {
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
@@ -1102,14 +1109,14 @@ async fn capture_or_park(
     job_id: JobId,
     token: ulid::Ulid,
     backend: &Arc<dyn ExecutorBackend>,
-    attempt: &AttemptRef,
+    fence: &FenceContext,
 ) -> Option<LogTails> {
     let default_limits = LogLimits::default();
     let limits = LogLimits {
         max_bytes_per_stream: default_limits.inline_tail_bytes,
         ..default_limits
     };
-    match backend.fetch_logs(attempt, &limits, &NullSink).await {
+    match backend.fetch_logs(fence, &limits, &NullSink).await {
         Ok(logs) => Some(logs),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Container log capture failed");
@@ -1186,8 +1193,12 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
         async fn submit(
             &self,
+            _context: &FenceContext,
             spec: &TaskSpec,
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
@@ -1197,12 +1208,12 @@ mod tests {
                 .push(spec.attempt.external_name());
             Err(BackendError::Unavailable("stub submit".to_string()))
         }
-        async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
             Err(BackendError::Unavailable("stub status".to_string()))
         }
         async fn wait(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
             Ok(AttemptStatus {
@@ -1212,12 +1223,12 @@ mod tests {
                 finished_at_ms: Some(2),
             })
         }
-        async fn cancel(&self, _attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+        async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
             Ok(CancelEvidence::AlreadyGone)
         }
         async fn fetch_logs(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _limits: &LogLimits,
             _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
@@ -1227,20 +1238,20 @@ mod tests {
         }
         async fn fetch_output(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _path: &str,
         ) -> Result<TaskOutput, BackendError> {
             Err(BackendError::InvalidSpec("no output".to_string()))
         }
-        async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
+        async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
             match self.reconcile {
-                StubReconcile::NotFound => ReconcileOutcome::NotFound,
+                StubReconcile::NotFound => ReconcileEvidence::Absent,
                 StubReconcile::Unavailable => {
-                    ReconcileOutcome::Unavailable(BackendError::Unavailable("down".to_string()))
+                    ReconcileEvidence::Unavailable(BackendError::Unavailable("down".to_string()))
                 }
             }
         }
-        async fn cleanup(&self, _attempt: &AttemptRef) -> Result<(), BackendError> {
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
             Ok(())
         }
     }
@@ -1249,6 +1260,14 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn fence(attempt: &AttemptRef) -> FenceContext {
+        FenceContext {
+            attempt: attempt.clone(),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        }
     }
 
     fn context(storage: StorageHandle) -> Arc<DriverContext> {
@@ -1389,7 +1408,7 @@ mod tests {
             record.job_id,
             token,
             &backend,
-            &attempt,
+            &fence(&attempt),
             &task_spec,
             &execution_spec(),
             "ws-test",
@@ -1449,7 +1468,7 @@ mod tests {
             job_id,
             token,
             &backend,
-            &attempt,
+            &fence(&attempt),
             &spec,
             "ws-test",
             Ok(AttemptStatus {
@@ -1487,7 +1506,7 @@ mod tests {
             job_id,
             token,
             backend.clone(),
-            attempt,
+            fence(&attempt),
             execution_spec(),
             "ws-test".to_string(),
             CancellationToken::new(),
@@ -1544,7 +1563,7 @@ mod tests {
             job_id,
             token,
             backend.clone(),
-            attempt,
+            fence(&attempt),
             execution_spec(),
             "ws-test".to_string(),
             CancellationToken::new(),
@@ -1577,7 +1596,7 @@ mod tests {
             job_id,
             token,
             backend.clone(),
-            attempt,
+            fence(&attempt),
             AttemptPhase::Submitted,
             execution_spec(),
             "ws-test".to_string(),
@@ -1610,7 +1629,7 @@ mod tests {
             record.job_id,
             token,
             &backend,
-            &attempt,
+            &fence(&attempt),
             &task_spec,
             &execution_spec(),
             "ws-test",
@@ -1636,7 +1655,7 @@ mod tests {
     async fn crate_write_idempotent() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let (record, _token, _attempt) = ready_with_intent(&storage).await;
+        let (record, token, _attempt) = ready_with_intent(&storage).await;
         let job_id = record.job_id;
 
         put_run_crate_status(
@@ -1651,6 +1670,7 @@ mod tests {
 
         let ctx = JobContext {
             driver: context(storage.clone()),
+            claim_token: token,
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),

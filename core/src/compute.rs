@@ -66,6 +66,8 @@ pub enum BackendError {
     Timeout(String),
     #[error("backend api error: {0}")]
     Api(String),
+    #[error("controller generation is fenced")]
+    Fenced,
 }
 
 impl BackendError {
@@ -74,7 +76,8 @@ impl BackendError {
             BackendError::ImageNotFound(_)
             | BackendError::ImageUnauthorized(_)
             | BackendError::InvalidSpec(_)
-            | BackendError::Cancelled => false,
+            | BackendError::Cancelled
+            | BackendError::Fenced => false,
             BackendError::NotFound(_)
             | BackendError::Unavailable(_)
             | BackendError::Conflict(_)
@@ -357,10 +360,37 @@ impl AttemptStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumePoint {
+    Observe,
+    Submit,
+    Stage,
+    Unsuspend,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptableEvidence {
+    pub status: AttemptStatus,
+    pub resume: ResumePoint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactEvidence {
+    pub artifact_kind: String,
+    pub backend_ref: Option<String>,
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+    pub exact_identity: bool,
+    pub multiple: bool,
+    pub foreign: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum ReconcileOutcome {
-    Found(AttemptStatus),
-    NotFound,
+pub enum ReconcileEvidence {
+    Adoptable(AdoptableEvidence),
+    Unadoptable(ArtifactEvidence),
+    Absent,
+    Tombstoned(TombstoneEvidence),
     Unavailable(BackendError),
 }
 
@@ -429,6 +459,7 @@ pub enum ComputeEffect {
     },
     Submit {
         backend: ExecutorKind,
+        context: FenceContext,
         spec: TaskSpec,
     },
     Stage {
@@ -442,29 +473,29 @@ pub enum ComputeEffect {
     },
     Status {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
     },
     Wait {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
     },
     Cancel {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
     },
     FetchLogs {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
         limits: LogLimits,
     },
     FetchOutput {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
         path: String,
     },
     Reconcile {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
     },
     Tombstone {
         backend: ExecutorKind,
@@ -473,7 +504,7 @@ pub enum ComputeEffect {
     },
     Cleanup {
         backend: ExecutorKind,
-        attempt: AttemptRef,
+        context: FenceContext,
     },
     Sweep {
         backend: ExecutorKind,
@@ -493,7 +524,7 @@ pub enum ComputeEvent {
     Cancelled(Result<CancelEvidence, BackendError>),
     LogsFetched(Result<LogTails, BackendError>),
     OutputFetched(Result<TaskOutput, BackendError>),
-    Reconciled(ReconcileOutcome),
+    Reconciled(ReconcileEvidence),
     Tombstoned(Result<TombstoneEvidence, BackendError>),
     Cleaned(Result<(), BackendError>),
     Swept(Result<(), BackendError>),

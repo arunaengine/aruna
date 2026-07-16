@@ -6,9 +6,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    InputStream, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, ReconcileOutcome, TaskInput,
-    TaskOutput, TaskSpec,
+    AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
+    CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
+    MAX_TRANSFER_BYTES, ReconcileEvidence, ResumePoint, TaskInput, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec,
 };
 use async_trait::async_trait;
 use bollard::models::{
@@ -16,9 +17,9 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     ContainerArchiveInfoOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    DownloadFromContainerOptionsBuilder, InspectContainerOptions, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
-    UploadToContainerOptionsBuilder,
+    DownloadFromContainerOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+    StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use bollard::{Docker, body_try_stream};
 use bytes::Bytes;
@@ -35,13 +36,20 @@ use super::logs::{BoundedTail, LogSink};
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
+const EPOCH_LABEL: &str = "aruna-engine.org/attempt-epoch";
+const GENERATION_LABEL: &str = "aruna-engine.org/controller-generation";
 /// Docker encodes directory type with Go's `os.ModeDir` bit.
 const DIRECTORY_MODE: u32 = 1 << 31;
+
+mod control;
+
+use control::{ControlRecord, DaemonLock};
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {
     docker: Docker,
     config: DockerConfig,
+    daemon_lock: DaemonLock,
 }
 
 enum RemoveOutcome {
@@ -58,11 +66,16 @@ impl DockerBackend {
 
     pub fn with_config(config: DockerConfig) -> Result<Self, BackendError> {
         let docker = Docker::connect_with_defaults().map_err(|e| classify(&e))?;
-        Ok(Self { docker, config })
+        Self::from_parts(docker, config)
     }
 
-    pub fn from_parts(docker: Docker, config: DockerConfig) -> Self {
-        Self { docker, config }
+    pub fn from_parts(docker: Docker, config: DockerConfig) -> Result<Self, BackendError> {
+        let daemon_lock = DaemonLock::acquire(&config.state_root)?;
+        Ok(Self {
+            docker,
+            config,
+            daemon_lock,
+        })
     }
 
     pub fn config(&self) -> &DockerConfig {
@@ -92,6 +105,13 @@ impl DockerBackend {
             )));
         }
         Ok(inspect)
+    }
+
+    async fn status_attempt(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        attempt.validate().map_err(BackendError::InvalidSpec)?;
+        Ok(inspect_to_status(
+            self.inspect_matching_attempt(attempt).await?,
+        ))
     }
 
     async fn ensure_image(
@@ -179,7 +199,7 @@ impl DockerBackend {
         if !cancel.is_cancelled() {
             return Ok(());
         }
-        match self.status(attempt).await {
+        match self.status_attempt(attempt).await {
             Ok(status) if status.is_terminal() => return Ok(()),
             Ok(_) => {}
             Err(BackendError::NotFound(_)) => return Err(BackendError::Cancelled),
@@ -306,7 +326,7 @@ impl DockerBackend {
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
-        let status = self.status(attempt).await;
+        let status = self.status_attempt(attempt).await;
         self.cancel_submission(attempt, cancel).await?;
         status
     }
@@ -743,13 +763,22 @@ fn stream_output(
     }
 }
 
-fn build_config(config: &DockerConfig, spec: &TaskSpec) -> ContainerCreateBody {
+fn build_config(
+    config: &DockerConfig,
+    context: &FenceContext,
+    spec: &TaskSpec,
+) -> ContainerCreateBody {
     let env: Vec<String> = spec
         .effective_env()
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     let mut labels: HashMap<String, String> = spec.attempt.labels().into_iter().collect();
+    labels.insert(EPOCH_LABEL.to_string(), context.attempt_epoch.to_string());
+    labels.insert(
+        GENERATION_LABEL.to_string(),
+        context.controller_generation.to_string(),
+    );
     if let Some(walltime) = spec.resources.max_walltime.or(config.default_max_walltime) {
         labels.insert(WALLTIME_LABEL.to_string(), walltime.as_millis().to_string());
     }
@@ -807,18 +836,33 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn health(&self) -> Result<(), BackendError> {
-        self.docker
-            .ping()
-            .await
-            .map(|_| ())
-            .map_err(|e| classify(&e))
+        self.docker.ping().await.map_err(|e| classify(&e))?;
+        self.daemon_lock.verify()
+    }
+
+    async fn fence(&self, context: &FenceContext) -> Result<(), BackendError> {
+        context
+            .attempt
+            .validate()
+            .map_err(BackendError::InvalidSpec)?;
+        self.daemon_lock.control(context).map(|_| ())
     }
 
     async fn submit(
         &self,
+        context: &FenceContext,
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
+        if context.attempt != spec.attempt {
+            return Err(BackendError::InvalidSpec(
+                "fence and task attempt differ".to_string(),
+            ));
+        }
+        let guard = self.daemon_lock.control(context)?;
+        if guard.tombstone().is_some() {
+            return Err(BackendError::Conflict("attempt is tombstoned".to_string()));
+        }
         spec.attempt.validate().map_err(BackendError::InvalidSpec)?;
         check_cancel(cancel)?;
         // Never accept a resource request this backend cannot honor.
@@ -836,7 +880,7 @@ impl ExecutorBackend for DockerBackend {
         let create_opts = CreateContainerOptionsBuilder::new().name(&name).build();
         let created = self
             .docker
-            .create_container(Some(create_opts), build_config(&self.config, spec))
+            .create_container(Some(create_opts), build_config(&self.config, context, spec))
             .await;
         self.cancel_submission(&spec.attempt, cancel).await?;
         match created {
@@ -865,55 +909,69 @@ impl ExecutorBackend for DockerBackend {
         }
     }
 
-    async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
-        attempt.validate().map_err(BackendError::InvalidSpec)?;
-        Ok(inspect_to_status(
-            self.inspect_matching_attempt(attempt).await?,
+    async fn stage(
+        &self,
+        _context: &FenceContext,
+        _spec: &TaskSpec,
+        _cancel: &CancellationToken,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::InvalidSpec(
+            "Docker stages during submit".to_string(),
         ))
+    }
+
+    async fn unsuspend(
+        &self,
+        _context: &FenceContext,
+        _cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        Err(BackendError::InvalidSpec(
+            "Docker starts during submit".to_string(),
+        ))
+    }
+
+    async fn status(&self, context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+        validate_control(self.daemon_lock.read(context)?, context)?;
+        let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+        validate_labels(&inspect, context)?;
+        Ok(inspect_to_status(inspect))
     }
 
     async fn wait(
         &self,
-        attempt: &AttemptRef,
+        context: &FenceContext,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        attempt.validate().map_err(BackendError::InvalidSpec)?;
+        context
+            .attempt
+            .validate()
+            .map_err(BackendError::InvalidSpec)?;
         // The daemon's wait endpoint (condition "not-running") answers instantly
         // for a created-but-never-started container, which would surface a
         // non-terminal status and break the wait contract. Poll inspect to
         // terminal evidence or the cancel token, like the trait default.
         loop {
-            let inspect = self.inspect_matching_attempt(attempt).await?;
-            let deadline_ms = walltime_deadline_ms(&inspect);
+            validate_control(self.daemon_lock.read(context)?, context)?;
+            let inspect = self.inspect_matching_attempt(&context.attempt).await?;
+            validate_labels(&inspect, context)?;
             let status = inspect_to_status(inspect);
             if status.is_terminal() {
                 return Ok(status);
             }
-            // Enforce the walltime ceiling recorded at submit.
-            if let Some(deadline_ms) = deadline_ms
-                && now_ms() >= deadline_ms
-            {
-                let _ = self.stop_attempt(attempt).await?;
-                let stopped = self.status(attempt).await?;
-                return Ok(AttemptStatus {
-                    phase: AttemptPhase::Failed {
-                        reason: "max walltime exceeded".to_string(),
-                    },
-                    ..stopped
-                });
-            }
             tokio::select! {
-                _ = cancel.cancelled() => return self.status(attempt).await,
+                _ = cancel.cancelled() => return self.status(context).await,
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
     }
 
-    async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+    async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+        let _guard = self.daemon_lock.control(context)?;
+        let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         // A container that had already exited on its own must keep its real exit evidence:
         // reporting Cancelled over it would fabricate a cancellation that never happened.
-        let status = match self.status(attempt).await {
+        let status = match self.status_attempt(attempt).await {
             Ok(status) => status,
             Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
             Err(other) => return Err(other),
@@ -937,7 +995,7 @@ impl ExecutorBackend for DockerBackend {
                 };
             }
         };
-        let status = match self.status(attempt).await {
+        let status = match self.status_attempt(attempt).await {
             Ok(status) => status,
             Err(BackendError::NotFound(_)) => return Ok(CancelEvidence::AlreadyGone),
             Err(other) => return Err(other),
@@ -958,10 +1016,12 @@ impl ExecutorBackend for DockerBackend {
 
     async fn fetch_logs(
         &self,
-        attempt: &AttemptRef,
+        context: &FenceContext,
         limits: &LogLimits,
         sink: &dyn LogSink,
     ) -> Result<LogTails, BackendError> {
+        validate_control(self.daemon_lock.read(context)?, context)?;
+        let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         let inspect = self.inspect_matching_attempt(attempt).await?;
         let container_id = inspect.id.as_deref().ok_or_else(|| {
@@ -1001,9 +1061,11 @@ impl ExecutorBackend for DockerBackend {
 
     async fn fetch_output(
         &self,
-        attempt: &AttemptRef,
+        context: &FenceContext,
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
+        let _guard = self.daemon_lock.control(context)?;
+        let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         let output_path = container_path(path)?;
         let expected = output_path
@@ -1050,23 +1112,129 @@ impl ExecutorBackend for DockerBackend {
         }
     }
 
-    async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileOutcome {
-        match self.inspect(attempt).await {
-            // A same-named container without this attempt's labels is foreign
-            // (another instance or an operator): not adoptable evidence.
-            Ok(inspect) if !labels_match(&inspect, attempt) => {
-                ReconcileOutcome::Unavailable(BackendError::Conflict(format!(
-                    "container `{}` exists but is not this attempt",
-                    attempt.external_name()
-                )))
+    async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
+        let control = match self.daemon_lock.read(context) {
+            Ok(control) => control,
+            Err(error) => return ReconcileEvidence::Unavailable(error),
+        };
+        if let Err(error) = validate_control(control.clone(), context) {
+            return ReconcileEvidence::Unavailable(error);
+        }
+        if let Some(record) = control
+            && record.tombstone
+        {
+            return ReconcileEvidence::Tombstoned(TombstoneEvidence {
+                backend_ref: record
+                    .tombstone_ref
+                    .unwrap_or_else(|| "control.json".to_string()),
+                attempt_epoch: record.attempt_epoch,
+            });
+        }
+        let labels = context.attempt.labels();
+        let filters = HashMap::from([(
+            "label".to_string(),
+            labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
+        )]);
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let summaries = match self.docker.list_containers(Some(options)).await {
+            Ok(summaries) => summaries,
+            Err(error) => return ReconcileEvidence::Unavailable(classify(&error)),
+        };
+        let mut matches = Vec::new();
+        let mut foreign = false;
+        for summary in summaries {
+            let Some(id) = summary.id else {
+                continue;
+            };
+            match self
+                .docker
+                .inspect_container(&id, None::<InspectContainerOptions>)
+                .await
+            {
+                Ok(inspect) if labels_epoch(&inspect) == Some(context.attempt_epoch) => {
+                    matches.push(inspect)
+                }
+                Ok(_) => foreign = true,
+                Err(error) => return ReconcileEvidence::Unavailable(classify(&error)),
             }
-            Ok(inspect) => ReconcileOutcome::Found(inspect_to_status(inspect)),
-            Err(BackendError::NotFound(_)) => ReconcileOutcome::NotFound,
-            Err(other) => ReconcileOutcome::Unavailable(other),
+        }
+        if matches.len() == 1 && !foreign {
+            let status = inspect_to_status(matches.remove(0));
+            let resume = if matches!(status.phase, AttemptPhase::Submitted) {
+                ResumePoint::Submit
+            } else {
+                ResumePoint::Observe
+            };
+            return ReconcileEvidence::Adoptable(AdoptableEvidence { status, resume });
+        }
+        if !matches.is_empty() || foreign {
+            return ReconcileEvidence::Unadoptable(ArtifactEvidence {
+                artifact_kind: "docker-container".to_string(),
+                backend_ref: matches.first().and_then(|inspect| inspect.id.clone()),
+                observed_epoch: matches.first().and_then(labels_epoch),
+                observed_generation: matches.first().and_then(labels_generation),
+                exact_identity: !matches.is_empty(),
+                multiple: matches.len() > 1,
+                foreign,
+            });
+        }
+        match self.inspect(&context.attempt).await {
+            Ok(inspect) => ReconcileEvidence::Unadoptable(ArtifactEvidence {
+                artifact_kind: "docker-container".to_string(),
+                backend_ref: inspect.id.clone(),
+                observed_epoch: labels_epoch(&inspect),
+                observed_generation: labels_generation(&inspect),
+                exact_identity: false,
+                multiple: false,
+                foreign: true,
+            }),
+            Err(BackendError::NotFound(_)) => ReconcileEvidence::Absent,
+            Err(error) => ReconcileEvidence::Unavailable(error),
         }
     }
 
-    async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError> {
+    async fn tombstone(
+        &self,
+        context: &FenceContext,
+        _spec: &TombstoneSpec,
+    ) -> Result<TombstoneEvidence, BackendError> {
+        let mut guard = self.daemon_lock.control(context)?;
+        if let Some(evidence) = guard.tombstone() {
+            return Ok(evidence);
+        }
+        match self.status_attempt(&context.attempt).await {
+            Ok(status) if !status.is_terminal() => {
+                return Err(BackendError::Conflict(
+                    "cannot tombstone a live attempt".to_string(),
+                ));
+            }
+            Ok(_) => match self.force_remove(&context.attempt).await? {
+                RemoveOutcome::Removed | RemoveOutcome::Gone => {}
+                RemoveOutcome::Foreign => {
+                    return Err(BackendError::Conflict(
+                        "cannot tombstone a foreign container".to_string(),
+                    ));
+                }
+            },
+            Err(BackendError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        guard.seal(format!(
+            "{}/docker/attempts/{}/control.json",
+            self.config.state_root.display(),
+            context.attempt.external_name()
+        ))
+    }
+
+    async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
+        let _guard = self.daemon_lock.control(context)?;
+        let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         if self.config.keep_failed {
             return Ok(());
@@ -1079,6 +1247,10 @@ impl ExecutorBackend for DockerBackend {
             ))),
         }
     }
+
+    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
@@ -1087,34 +1259,6 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
     } else {
         Ok(())
     }
-}
-
-/// Epoch-ms walltime deadline of a started container, from the ceiling label
-/// written at submit and the daemon-reported start time. `None` while the
-/// container has not started, or when the operator opted out of a ceiling.
-fn walltime_deadline_ms(inspect: &ContainerInspectResponse) -> Option<u64> {
-    let walltime_ms: u64 = inspect
-        .config
-        .as_ref()?
-        .labels
-        .as_ref()?
-        .get(WALLTIME_LABEL)?
-        .parse()
-        .ok()?;
-    let started_ms = inspect
-        .state
-        .as_ref()?
-        .started_at
-        .as_deref()
-        .and_then(parse_rfc3339_ms)?;
-    Some(started_ms.saturating_add(walltime_ms))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The container carries this attempt's `aruna-engine.org/*` labels; matching by the
@@ -1132,6 +1276,58 @@ fn labels_match(inspect: &ContainerInspectResponse, attempt: &AttemptRef) -> boo
         .labels()
         .iter()
         .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn labels_epoch(inspect: &ContainerInspectResponse) -> Option<u64> {
+    inspect
+        .config
+        .as_ref()?
+        .labels
+        .as_ref()?
+        .get(EPOCH_LABEL)?
+        .parse()
+        .ok()
+}
+
+fn labels_generation(inspect: &ContainerInspectResponse) -> Option<u64> {
+    inspect
+        .config
+        .as_ref()?
+        .labels
+        .as_ref()?
+        .get(GENERATION_LABEL)?
+        .parse()
+        .ok()
+}
+
+fn validate_labels(
+    inspect: &ContainerInspectResponse,
+    context: &FenceContext,
+) -> Result<(), BackendError> {
+    if labels_epoch(inspect) != Some(context.attempt_epoch) {
+        return Err(BackendError::Conflict(
+            "container attempt epoch mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_control(
+    record: Option<ControlRecord>,
+    context: &FenceContext,
+) -> Result<(), BackendError> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    if record.attempt_epoch != context.attempt_epoch {
+        return Err(BackendError::Conflict(
+            "Docker control epoch mismatch".to_string(),
+        ));
+    }
+    if context.controller_generation < record.highest_generation {
+        return Err(BackendError::Fenced);
+    }
+    Ok(())
 }
 
 /// A container created by a partial submit that never started a run: only such a
@@ -1344,6 +1540,14 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
 
+    fn fence() -> FenceContext {
+        FenceContext {
+            attempt: AttemptRef::new("j1", 0),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        }
+    }
+
     #[test]
     fn image_split() {
         // Tag, digest, registry-port, and bare-name references all parse.
@@ -1393,7 +1597,7 @@ mod tests {
         // Portable defaults cover CPU, memory and walltime; disk is operator configured.
         let config = DockerConfig::default();
         let spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
-        let body = build_config(&config, &spec);
+        let body = build_config(&config, &fence(), &spec);
         let host = body.host_config.unwrap();
         assert!(host.memory.is_some());
         assert_eq!(host.memory, config.default_mem_bytes);
@@ -1414,7 +1618,7 @@ mod tests {
             ..DockerConfig::default()
         };
         let spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
-        let host = build_config(&config, &spec).host_config.unwrap();
+        let host = build_config(&config, &fence(), &spec).host_config.unwrap();
         assert_eq!(
             host.storage_opt.unwrap().get("size").unwrap(),
             &(2u64 << 30).to_string()
@@ -1433,7 +1637,7 @@ mod tests {
             default_disk_bytes: Some(2u64 << 30),
             ..DockerConfig::default()
         };
-        let body = build_config(&config, &spec);
+        let body = build_config(&config, &fence(), &spec);
         let host = body.host_config.unwrap();
         assert_eq!(host.memory, Some(64 * 1024 * 1024));
         assert_eq!(host.nano_cpus, Some(1_000_000_000));
@@ -1442,36 +1646,6 @@ mod tests {
             &(1u64 << 30).to_string()
         );
         assert_eq!(body.labels.unwrap().get(WALLTIME_LABEL).unwrap(), "600000");
-    }
-
-    #[test]
-    fn walltime_deadline() {
-        use bollard::models::{ContainerConfig, ContainerState};
-        let inspect = ContainerInspectResponse {
-            config: Some(ContainerConfig {
-                labels: Some(HashMap::from([(
-                    WALLTIME_LABEL.to_string(),
-                    "1000".to_string(),
-                )])),
-                ..Default::default()
-            }),
-            state: Some(ContainerState {
-                started_at: Some("2024-01-01T00:00:00Z".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            walltime_deadline_ms(&inspect),
-            Some(1_704_067_200_000 + 1000)
-        );
-        // Not started yet (daemon zero value) or no ceiling label: no deadline.
-        let mut unstarted = inspect.clone();
-        unstarted.state.as_mut().unwrap().started_at = Some("0001-01-01T00:00:00Z".to_string());
-        assert_eq!(walltime_deadline_ms(&unstarted), None);
-        let mut unlimited = inspect;
-        unlimited.config.as_mut().unwrap().labels = Some(HashMap::new());
-        assert_eq!(walltime_deadline_ms(&unlimited), None);
     }
 
     #[test]

@@ -49,6 +49,7 @@ impl ProgressReporter {
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
+    pub claim_token: ulid::Ulid,
     /// User-initiated cancel: terminal `Cancelled` plus cleanup.
     pub cancel: CancellationToken,
     /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.

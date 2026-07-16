@@ -5,16 +5,105 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_compute::DockerConfig;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::executor::logs::LogSink;
-use aruna_compute::{DockerConfig, ExecutorBackend};
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, BackendError, CancelEvidence, LogLimits, LogStream, ReconcileOutcome,
-    TaskInput, TaskSpec,
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits,
+    LogStream, LogTails, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
+
+fn fence(attempt: &AttemptRef) -> FenceContext {
+    FenceContext {
+        attempt: attempt.clone(),
+        attempt_epoch: 1,
+        controller_generation: 1,
+    }
+}
+
+#[async_trait::async_trait]
+trait DockerTestExt {
+    async fn submit(
+        &self,
+        spec: &TaskSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError>;
+    async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError>;
+    async fn wait(
+        &self,
+        attempt: &AttemptRef,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError>;
+    async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError>;
+    async fn fetch_logs(
+        &self,
+        attempt: &AttemptRef,
+        limits: &LogLimits,
+        sink: &dyn LogSink,
+    ) -> Result<LogTails, BackendError>;
+    async fn fetch_output(
+        &self,
+        attempt: &AttemptRef,
+        path: &str,
+    ) -> Result<TaskOutput, BackendError>;
+    async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence;
+    async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError>;
+}
+
+#[async_trait::async_trait]
+impl DockerTestExt for DockerBackend {
+    async fn submit(
+        &self,
+        spec: &TaskSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), spec, cancel).await
+    }
+
+    async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        aruna_compute::ExecutorBackend::status(self, &fence(attempt)).await
+    }
+
+    async fn wait(
+        &self,
+        attempt: &AttemptRef,
+        cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        aruna_compute::ExecutorBackend::wait(self, &fence(attempt), cancel).await
+    }
+
+    async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+        aruna_compute::ExecutorBackend::cancel(self, &fence(attempt)).await
+    }
+
+    async fn fetch_logs(
+        &self,
+        attempt: &AttemptRef,
+        limits: &LogLimits,
+        sink: &dyn LogSink,
+    ) -> Result<LogTails, BackendError> {
+        aruna_compute::ExecutorBackend::fetch_logs(self, &fence(attempt), limits, sink).await
+    }
+
+    async fn fetch_output(
+        &self,
+        attempt: &AttemptRef,
+        path: &str,
+    ) -> Result<TaskOutput, BackendError> {
+        aruna_compute::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
+    }
+
+    async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence {
+        aruna_compute::ExecutorBackend::reconcile(self, &fence(attempt)).await
+    }
+
+    async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError> {
+        aruna_compute::ExecutorBackend::cleanup(self, &fence(attempt)).await
+    }
+}
 
 /// Fetch one output and collect its streamed chunks.
 async fn read_output(backend: &DockerBackend, attempt: &AttemptRef, path: &str) -> Vec<u8> {
@@ -34,11 +123,14 @@ const IMAGE: &str = "alpine:3.24";
 /// mode `none`: these containers need no egress and it keeps the tests hermetic.
 async fn daemon() -> Option<DockerBackend> {
     let config = DockerConfig {
+        state_root: std::env::temp_dir()
+            .join("aruna-compute-tests")
+            .join(unique("state")),
         network_mode: Some("none".to_string()),
         ..DockerConfig::default()
     };
     let backend = DockerBackend::with_config(config).ok()?;
-    match backend.health().await {
+    match aruna_compute::ExecutorBackend::health(&backend).await {
         Ok(()) => Some(backend),
         Err(e) => {
             eprintln!("skipping docker test: daemon unhealthy: {e}");
@@ -215,7 +307,7 @@ async fn cancelled_submit() {
     ));
     assert!(matches!(
         backend.reconcile(&spec.attempt).await,
-        ReconcileOutcome::NotFound
+        ReconcileEvidence::Absent
     ));
 }
 
@@ -275,7 +367,22 @@ async fn created_cancel_removes() {
             ContainerCreateBody {
                 image: Some(IMAGE.to_string()),
                 cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
-                labels: Some(attempt.labels().into_iter().collect()),
+                labels: Some(
+                    attempt
+                        .labels()
+                        .into_iter()
+                        .chain([
+                            (
+                                "aruna-engine.org/attempt-epoch".to_string(),
+                                "1".to_string(),
+                            ),
+                            (
+                                "aruna-engine.org/controller-generation".to_string(),
+                                "1".to_string(),
+                            ),
+                        ])
+                        .collect(),
+                ),
                 ..Default::default()
             },
         )
@@ -283,6 +390,9 @@ async fn created_cancel_removes() {
         .unwrap();
 
     let backend = DockerBackend::with_config(DockerConfig {
+        state_root: std::env::temp_dir()
+            .join("aruna-compute-tests")
+            .join(unique("state")),
         keep_failed: true,
         network_mode: Some("none".to_string()),
         ..DockerConfig::default()
@@ -298,7 +408,7 @@ async fn created_cancel_removes() {
     ));
     assert!(matches!(
         backend.reconcile(&attempt).await,
-        ReconcileOutcome::NotFound
+        ReconcileEvidence::Absent
     ));
 }
 
@@ -318,7 +428,8 @@ async fn reconcile_adopts() {
     drop(submitter);
     let recovered = backend_or_skip!();
     match recovered.reconcile(&attempt).await {
-        ReconcileOutcome::Found(status) => {
+        ReconcileEvidence::Adoptable(evidence) => {
+            let status = evidence.status;
             assert_eq!(status.phase, AttemptPhase::Running);
         }
         other => panic!("expected Found(Running) on adopt, got {other:?}"),
@@ -328,7 +439,7 @@ async fn reconcile_adopts() {
     let missing = AttemptRef::new(unique("ghost"), 0);
     assert!(matches!(
         recovered.reconcile(&missing).await,
-        ReconcileOutcome::NotFound
+        ReconcileEvidence::Absent
     ));
 
     let _ = recovered.cleanup(&attempt).await;
@@ -454,7 +565,7 @@ async fn foreign_not_adopted() {
         .unwrap();
 
     match backend.reconcile(&attempt).await {
-        ReconcileOutcome::Unavailable(_) => {}
+        ReconcileEvidence::Unadoptable(_) => {}
         other => panic!("foreign container must not reconcile, got {other:?}"),
     }
     assert!(

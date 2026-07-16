@@ -1245,7 +1245,7 @@ pub async fn cancel_execution(
 
 #[derive(Debug)]
 pub enum AdoptOutcome {
-    Adopted(JobRecord),
+    Adopted(JobRecord, AttemptControl),
     /// Terminal, or the lease is still live: leave the current holder alone.
     Skipped,
 }
@@ -1260,7 +1260,7 @@ pub async fn adopt_external_attempt(
     now_ms: u64,
 ) -> Result<AdoptOutcome, JobMutationError> {
     let mut adopted = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let (record, control) = mutate_attempt_control(storage, job_id, |record, control| {
         adopted = false;
         if record.state.is_terminal() {
             return Ok(JobMutation::Skip);
@@ -1274,18 +1274,21 @@ pub async fn adopt_external_attempt(
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
+        let claim_token = Ulid::r#gen();
         record.claim = Some(JobClaim {
             holder_node_id,
-            claim_token: Ulid::r#gen(),
+            claim_token,
             lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
+        bump_generation(control)?;
+        control.bound_token = Some(claim_token);
         adopted = true;
         Ok(JobMutation::Persist)
     })
     .await?;
 
     Ok(if adopted {
-        AdoptOutcome::Adopted(record)
+        AdoptOutcome::Adopted(record, control)
     } else {
         AdoptOutcome::Skipped
     })
@@ -1764,7 +1767,7 @@ mod tests {
         assert_eq!(stored.claim.unwrap().claim_token, live_token);
 
         // Once the lease really has expired, the attempt is adopted with a fresh token.
-        let AdoptOutcome::Adopted(adopted) =
+        let AdoptOutcome::Adopted(adopted, _) =
             adopt_external_attempt(&storage, job_id, node_id(4), 11_000)
                 .await
                 .unwrap()

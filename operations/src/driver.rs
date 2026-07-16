@@ -227,83 +227,154 @@ async fn dispatch_compute(effect: ComputeEffect, context: &DriverContext) -> Com
     let unsupported = || BackendError::InvalidSpec("compute effect not implemented".to_string());
     match effect {
         ComputeEffect::ResolveImage { .. } => ComputeEvent::ImageResolved(Err(unsupported())),
-        ComputeEffect::Fence { .. } => ComputeEvent::Fenced(Err(unsupported())),
-        ComputeEffect::Submit { backend, spec } => {
+        ComputeEffect::Fence {
+            backend,
+            context: fence,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.fence(&fence).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Fenced(result)
+        }
+        ComputeEffect::Submit {
+            backend,
+            context: fence,
+            spec,
+        } => {
             let result = match compute_backend(context, &backend) {
                 Ok(backend) => {
                     backend
-                        .submit(&spec, &tokio_util::sync::CancellationToken::new())
+                        .submit(&fence, &spec, &tokio_util::sync::CancellationToken::new())
                         .await
                 }
                 Err(error) => Err(error),
             };
             ComputeEvent::Submitted(result)
         }
-        ComputeEffect::Stage { .. } => ComputeEvent::Staged(Err(unsupported())),
-        ComputeEffect::Unsuspend { .. } => ComputeEvent::Unsuspended(Err(unsupported())),
-        ComputeEffect::Status { backend, attempt } => {
+        ComputeEffect::Stage {
+            backend,
+            context: fence,
+            spec,
+        } => {
             let result = match compute_backend(context, &backend) {
-                Ok(backend) => backend.status(&attempt).await,
+                Ok(backend) => {
+                    backend
+                        .stage(&fence, &spec, &tokio_util::sync::CancellationToken::new())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Staged(result)
+        }
+        ComputeEffect::Unsuspend {
+            backend,
+            context: fence,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => {
+                    backend
+                        .unsuspend(&fence, &tokio_util::sync::CancellationToken::new())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Unsuspended(result)
+        }
+        ComputeEffect::Status {
+            backend,
+            context: fence,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.status(&fence).await,
                 Err(error) => Err(error),
             };
             ComputeEvent::Status(result)
         }
-        ComputeEffect::Wait { backend, attempt } => {
+        ComputeEffect::Wait {
+            backend,
+            context: fence,
+        } => {
             let result = match compute_backend(context, &backend) {
                 Ok(backend) => {
                     backend
-                        .wait(&attempt, &tokio_util::sync::CancellationToken::new())
+                        .wait(&fence, &tokio_util::sync::CancellationToken::new())
                         .await
                 }
                 Err(error) => Err(error),
             };
             ComputeEvent::Waited(result)
         }
-        ComputeEffect::Cancel { backend, attempt } => {
+        ComputeEffect::Cancel {
+            backend,
+            context: fence,
+        } => {
             let result = match compute_backend(context, &backend) {
-                Ok(backend) => backend.cancel(&attempt).await,
+                Ok(backend) => backend.cancel(&fence).await,
                 Err(error) => Err(error),
             };
             ComputeEvent::Cancelled(result)
         }
         ComputeEffect::FetchLogs {
             backend,
-            attempt,
+            context: fence,
             limits,
         } => {
             let result = match compute_backend(context, &backend) {
-                Ok(backend) => backend.fetch_logs(&attempt, &limits, &NullSink).await,
+                Ok(backend) => backend.fetch_logs(&fence, &limits, &NullSink).await,
                 Err(error) => Err(error),
             };
             ComputeEvent::LogsFetched(result)
         }
         ComputeEffect::FetchOutput {
             backend,
-            attempt,
+            context: fence,
             path,
         } => {
             let result = match compute_backend(context, &backend) {
-                Ok(backend) => backend.fetch_output(&attempt, &path).await,
+                Ok(backend) => backend.fetch_output(&fence, &path).await,
                 Err(error) => Err(error),
             };
             ComputeEvent::OutputFetched(result)
         }
-        ComputeEffect::Reconcile { backend, attempt } => {
+        ComputeEffect::Reconcile {
+            backend,
+            context: fence,
+        } => {
             let evidence = match compute_backend(context, &backend) {
-                Ok(backend) => backend.reconcile(&attempt).await,
-                Err(error) => aruna_core::compute::ReconcileOutcome::Unavailable(error),
+                Ok(backend) => backend.reconcile(&fence).await,
+                Err(error) => aruna_core::compute::ReconcileEvidence::Unavailable(error),
             };
             ComputeEvent::Reconciled(evidence)
         }
-        ComputeEffect::Tombstone { .. } => ComputeEvent::Tombstoned(Err(unsupported())),
-        ComputeEffect::Cleanup { backend, attempt } => {
+        ComputeEffect::Tombstone {
+            backend,
+            context: fence,
+            spec,
+        } => {
             let result = match compute_backend(context, &backend) {
-                Ok(backend) => backend.cleanup(&attempt).await,
+                Ok(backend) => backend.tombstone(&fence, &spec).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Tombstoned(result)
+        }
+        ComputeEffect::Cleanup {
+            backend,
+            context: fence,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.cleanup(&fence).await,
                 Err(error) => Err(error),
             };
             ComputeEvent::Cleaned(result)
         }
-        ComputeEffect::Sweep { .. } => ComputeEvent::Swept(Err(unsupported())),
+        ComputeEffect::Sweep { backend, grace } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.sweep_orphans(grace).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Swept(result)
+        }
     }
 }
 

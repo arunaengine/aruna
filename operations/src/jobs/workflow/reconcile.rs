@@ -1,6 +1,8 @@
 use std::sync::{Arc, Weak};
 
-use aruna_core::compute::{AttemptPhase, AttemptRef, ExecutorKind, ReconcileOutcome};
+use aruna_core::compute::{
+    AttemptPhase, AttemptRef, ExecutorKind, FenceContext, ReconcileEvidence,
+};
 use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -43,7 +45,7 @@ impl ExternalReconciler for ComputeReconciler {
         };
 
         // Take over with a fresh claim token, but only if the old holder is really gone.
-        let adopted = match adopt_external_attempt(
+        let (adopted, control) = match adopt_external_attempt(
             storage,
             job_id,
             holder(&self.context),
@@ -51,7 +53,7 @@ impl ExternalReconciler for ComputeReconciler {
         )
         .await
         {
-            Ok(AdoptOutcome::Adopted(record)) => record,
+            Ok(AdoptOutcome::Adopted(record, control)) => (record, control),
             Ok(AdoptOutcome::Skipped) => {
                 info!(job_id = %job_id, "Attempt is terminal or still held; not adopting");
                 return;
@@ -92,6 +94,15 @@ impl ExternalReconciler for ComputeReconciler {
             .clone()
             .unwrap_or_else(|| JobRecord::workspace_bucket_name(job_id));
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
+        let fence = FenceContext {
+            attempt: attempt.clone(),
+            attempt_epoch: intent.attempt_epoch,
+            controller_generation: control.controller_generation,
+        };
+        if let Err(error) = backend.fence(&fence).await {
+            warn!(job_id = %job_id, error = %error, "Backend fence failed");
+            return;
+        }
 
         if adopted.cancel_requested {
             let _ = with_execution_heartbeat(
@@ -104,7 +115,7 @@ impl ExternalReconciler for ComputeReconciler {
                     job_id,
                     token,
                     &backend,
-                    &attempt,
+                    &fence,
                     &spec,
                     &bucket,
                 ),
@@ -113,9 +124,9 @@ impl ExternalReconciler for ComputeReconciler {
             return;
         }
 
-        let outcome = backend.reconcile(&attempt).await;
+        let outcome = backend.reconcile(&fence).await;
         let started_at_ms = match &outcome {
-            ReconcileOutcome::Found(status) => status.started_at_ms,
+            ReconcileEvidence::Adoptable(evidence) => evidence.status.started_at_ms,
             _ => None,
         };
         if let Some(started_at_ms) = started_at_ms
@@ -126,8 +137,8 @@ impl ExternalReconciler for ComputeReconciler {
         }
         if matches!(
             &outcome,
-            ReconcileOutcome::Found(status)
-                if !matches!(status.phase, AttemptPhase::Submitted)
+            ReconcileEvidence::Adoptable(evidence)
+                if !matches!(evidence.status.phase, AttemptPhase::Submitted)
         ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
         {
             let running = match transition_external_to_running(
@@ -153,7 +164,7 @@ impl ExternalReconciler for ComputeReconciler {
                         job_id,
                         token,
                         &backend,
-                        &attempt,
+                        &fence,
                         &spec,
                         &bucket,
                     ),
@@ -164,13 +175,13 @@ impl ExternalReconciler for ComputeReconciler {
         }
 
         match outcome {
-            ReconcileOutcome::Found(status) if !status.is_terminal() => {
+            ReconcileEvidence::Adoptable(evidence) if !evidence.status.is_terminal() => {
                 self.resume(
                     job_id,
                     token,
                     backend,
-                    attempt,
-                    status.phase,
+                    fence,
+                    evidence.status.phase,
                     spec,
                     bucket,
                     adopted,
@@ -178,7 +189,8 @@ impl ExternalReconciler for ComputeReconciler {
                 .await;
             }
             // Terminal evidence: commit it now (correlates the cancel intent).
-            ReconcileOutcome::Found(mut status) => {
+            ReconcileEvidence::Adoptable(evidence) => {
+                let mut status = evidence.status;
                 let max_walltime_ms = spec
                     .resources
                     .max_walltime_ms
@@ -200,7 +212,7 @@ impl ExternalReconciler for ComputeReconciler {
                         job_id,
                         token,
                         &backend,
-                        &attempt,
+                        &fence,
                         &spec,
                         &bucket,
                         Ok(status),
@@ -212,7 +224,7 @@ impl ExternalReconciler for ComputeReconciler {
                 }
             }
             // Post-submit absence is ambiguous: never requeue, park in Indeterminate.
-            ReconcileOutcome::NotFound => {
+            ReconcileEvidence::Absent => {
                 info!(job_id = %job_id, "Adopted attempt not found; parking Indeterminate");
                 let _ = mark_indeterminate(
                     storage,
@@ -223,12 +235,22 @@ impl ExternalReconciler for ComputeReconciler {
                 )
                 .await;
             }
-            ReconcileOutcome::Unavailable(error) => {
+            ReconcileEvidence::Unavailable(error) => {
                 let _ = mark_indeterminate(
                     storage,
                     job_id,
                     token,
                     JobError::retryable(format!("backend unavailable: {error}")),
+                    unix_timestamp_millis(),
+                )
+                .await;
+            }
+            ReconcileEvidence::Unadoptable(_) | ReconcileEvidence::Tombstoned(_) => {
+                let _ = mark_indeterminate(
+                    storage,
+                    job_id,
+                    token,
+                    JobError::retryable("backend artifact is not adoptable"),
                     unix_timestamp_millis(),
                 )
                 .await;
@@ -246,7 +268,7 @@ impl ComputeReconciler {
         job_id: aruna_core::structs::JobId,
         token: ulid::Ulid,
         backend: Arc<dyn aruna_compute::ExecutorBackend>,
-        attempt: AttemptRef,
+        fence: FenceContext,
         phase: AttemptPhase,
         spec: ExecutionSpec,
         bucket: String,
@@ -260,7 +282,7 @@ impl ComputeReconciler {
                 job_id,
                 token,
                 backend,
-                attempt,
+                fence,
                 phase,
                 spec,
                 bucket,
@@ -289,7 +311,7 @@ pub(super) async fn resume_attempt(
     job_id: aruna_core::structs::JobId,
     token: ulid::Ulid,
     backend: Arc<dyn aruna_compute::ExecutorBackend>,
-    attempt: AttemptRef,
+    fence: FenceContext,
     phase: AttemptPhase,
     spec: ExecutionSpec,
     bucket: String,
@@ -310,7 +332,7 @@ pub(super) async fn resume_attempt(
             job_id,
             token,
             cancel,
-            finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket),
+            finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket),
         )
         .await;
         return;
@@ -343,19 +365,17 @@ pub(super) async fn resume_attempt(
                 let task_spec = build_task_spec(
                     &context,
                     &spec,
-                    &attempt,
+                    &fence.attempt,
                     &credential,
                     &bucket,
                     node_id,
                     inputs,
                 );
-                let status = match backend.submit(&task_spec, &cancel).await {
+                let status = match backend.submit(&fence, &task_spec, &cancel).await {
                     Ok(status) => status,
                     Err(aruna_core::compute::BackendError::Cancelled) => {
-                        finalize_cancel(
-                            &context, job_id, token, &backend, &attempt, &spec, &bucket,
-                        )
-                        .await;
+                        finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket)
+                            .await;
                         return false;
                     }
                     Err(error) => {
@@ -388,7 +408,7 @@ pub(super) async fn resume_attempt(
                     Err(_) => return false,
                 };
                 if running.cancel_requested {
-                    finalize_cancel(&context, job_id, token, &backend, &attempt, &spec, &bucket)
+                    finalize_cancel(&context, job_id, token, &backend, &fence, &spec, &bucket)
                         .await;
                     return false;
                 }
@@ -400,10 +420,7 @@ pub(super) async fn resume_attempt(
             return;
         }
     }
-    supervise_and_finalize(
-        context, job_id, token, backend, attempt, spec, bucket, cancel,
-    )
-    .await;
+    supervise_and_finalize(context, job_id, token, backend, fence, spec, bucket, cancel).await;
 }
 
 async fn fail_or_park(

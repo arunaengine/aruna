@@ -85,8 +85,8 @@ mod tests {
     use crate::executor::ExecutorBackend;
     use crate::executor::logs::LogSink;
     use aruna_core::compute::{
-        AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, LogLimits, LogTails,
-        ReconcileOutcome, TaskOutput, TaskSpec,
+        AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
+        LogTails, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
     };
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
@@ -101,22 +101,41 @@ mod tests {
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
         }
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
         async fn submit(
             &self,
+            _context: &FenceContext,
             _spec: &TaskSpec,
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
             unimplemented!()
         }
-        async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        async fn stage(
+            &self,
+            _context: &FenceContext,
+            _spec: &TaskSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BackendError> {
             unimplemented!()
         }
-        async fn cancel(&self, _attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+        async fn unsuspend(
+            &self,
+            _context: &FenceContext,
+            _cancel: &CancellationToken,
+        ) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+            unimplemented!()
+        }
+        async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
             unimplemented!()
         }
         async fn fetch_logs(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _limits: &LogLimits,
             _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
@@ -124,15 +143,25 @@ mod tests {
         }
         async fn fetch_output(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _path: &str,
         ) -> Result<TaskOutput, BackendError> {
             unimplemented!()
         }
-        async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
-            ReconcileOutcome::NotFound
+        async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+            ReconcileEvidence::Absent
         }
-        async fn cleanup(&self, _attempt: &AttemptRef) -> Result<(), BackendError> {
+        async fn tombstone(
+            &self,
+            _context: &FenceContext,
+            _spec: &TombstoneSpec,
+        ) -> Result<TombstoneEvidence, BackendError> {
+            unimplemented!()
+        }
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn sweep_orphans(&self, _grace: std::time::Duration) -> Result<(), BackendError> {
             Ok(())
         }
     }

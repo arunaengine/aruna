@@ -1,7 +1,8 @@
-use aruna_core::compute::{AttemptRef, BackendError, ExecutorKind};
+use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
 use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload};
 
 use super::super::executor::{JobContext, JobRunOutcome};
+use super::super::store::{authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
 use crate::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 
@@ -11,8 +12,8 @@ pub async fn run_terminal_cleanup(
     intent: Option<&AttemptIntent>,
     access_key: &str,
 ) -> JobRunOutcome {
-    let revoke_error = revoke_credential(ctx, access_key).await.err();
     let backend_error = cleanup_attempt(ctx, for_job, intent).await.err();
+    let revoke_error = revoke_credential(ctx, access_key).await.err();
     match cleanup_error(revoke_error, backend_error) {
         Some(error) => JobRunOutcome::Failed(error),
         None => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
@@ -42,8 +43,10 @@ async fn cleanup_attempt(
     let Some(intent) = intent else {
         return Ok(());
     };
-    let attempt = AttemptRef::new(for_job.to_string().to_lowercase(), intent.attempt_no);
-    if attempt.external_name() != intent.external_name {
+    let fence = authorize_cleanup(&ctx.driver.storage_handle, for_job, intent, ctx.claim_token)
+        .await
+        .map_err(|error| JobError::retryable(format!("cleanup fence claim failed: {error}")))?;
+    if fence.attempt.external_name() != intent.external_name {
         return Err(JobError::permanent("cleanup attempt identity mismatch"));
     }
     let Some(registry) = ctx.driver.compute_handle.as_ref() else {
@@ -56,8 +59,29 @@ async fn cleanup_attempt(
             intent.executor_kind
         )));
     };
-    match backend.cleanup(&attempt).await {
-        Ok(()) | Err(BackendError::NotFound(_)) => Ok(()),
+    backend
+        .fence(&fence)
+        .await
+        .map_err(|error| JobError::retryable(format!("backend fence failed: {error}")))?;
+    match backend.cleanup(&fence).await {
+        Ok(()) | Err(BackendError::NotFound(_)) => {
+            let tombstone = backend
+                .tombstone(&fence, &TombstoneSpec { terminal_ref: None })
+                .await
+                .map_err(|error| {
+                    JobError::retryable(format!("backend tombstone failed: {error}"))
+                })?;
+            record_attempt_tombstone(
+                &ctx.driver.storage_handle,
+                for_job,
+                ctx.claim_token,
+                intent.attempt_epoch,
+                tombstone.backend_ref,
+            )
+            .await
+            .map_err(|error| JobError::retryable(format!("tombstone record failed: {error}")))?;
+            Ok(())
+        }
         Err(error) if error.retryable() => Err(JobError::retryable(format!(
             "backend cleanup failed: {error}"
         ))),
@@ -107,7 +131,8 @@ mod tests {
     use aruna_compute::ExecutorRegistry;
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{
-        AttemptStatus, CancelEvidence, LogLimits, LogTails, ReconcileOutcome, TaskOutput, TaskSpec,
+        AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails,
+        ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
@@ -149,25 +174,30 @@ mod tests {
             Ok(())
         }
 
+        async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         async fn submit(
             &self,
+            _context: &FenceContext,
             _spec: &TaskSpec,
             _cancel: &CancellationToken,
         ) -> Result<AttemptStatus, BackendError> {
             Err(BackendError::Unavailable("unused".to_string()))
         }
 
-        async fn status(&self, _attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
+        async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
             Err(BackendError::Unavailable("unused".to_string()))
         }
 
-        async fn cancel(&self, _attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
+        async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
             Err(BackendError::Unavailable("unused".to_string()))
         }
 
         async fn fetch_logs(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _limits: &LogLimits,
             _sink: &dyn LogSink,
         ) -> Result<LogTails, BackendError> {
@@ -176,17 +206,28 @@ mod tests {
 
         async fn fetch_output(
             &self,
-            _attempt: &AttemptRef,
+            _context: &FenceContext,
             _path: &str,
         ) -> Result<TaskOutput, BackendError> {
             Err(BackendError::InvalidSpec("no output".to_string()))
         }
 
-        async fn reconcile(&self, _attempt: &AttemptRef) -> ReconcileOutcome {
-            ReconcileOutcome::NotFound
+        async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+            ReconcileEvidence::Absent
         }
 
-        async fn cleanup(&self, _attempt: &AttemptRef) -> Result<(), BackendError> {
+        async fn tombstone(
+            &self,
+            context: &FenceContext,
+            _spec: &TombstoneSpec,
+        ) -> Result<TombstoneEvidence, BackendError> {
+            Ok(TombstoneEvidence {
+                backend_ref: "stub-tombstone".to_string(),
+                attempt_epoch: context.attempt_epoch,
+            })
+        }
+
+        async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.results.lock().unwrap().pop_front().unwrap_or(Ok(()))
         }
@@ -206,6 +247,7 @@ mod tests {
                 task_handle: None,
                 compute_handle: Some(Arc::new(registry)),
             }),
+            claim_token: Ulid::from_bytes([0xCC; 16]),
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
@@ -218,6 +260,7 @@ mod tests {
             attempt_no: 1,
             external_name: attempt.external_name(),
             executor_kind: kind.to_string(),
+            attempt_epoch: 1,
         }
     }
 
