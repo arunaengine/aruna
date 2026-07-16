@@ -951,10 +951,11 @@ fn project_task(record: &JobRecord, view: TesView, base_url: &str) -> TesTask {
         };
     };
 
-    let command = spec
-        .entrypoint
-        .clone()
-        .unwrap_or_else(|| spec.command.clone());
+    // Docker runs entrypoint + command together; project the full argv.
+    let command = match &spec.entrypoint {
+        Some(entrypoint) => entrypoint.iter().chain(&spec.command).cloned().collect(),
+        None => spec.command.clone(),
+    };
     let executors = vec![TesExecutor {
         image: spec.image.clone(),
         command,
@@ -1897,6 +1898,35 @@ mod tests {
         assert_eq!(full.logs[0].outputs.len(), 1);
         assert_eq!(full.logs[0].outputs[0].url, "s3://dest/out/r.txt");
         assert_eq!(full.logs[0].outputs[0].path, "/out/report.txt");
+    }
+
+    #[test]
+    fn projects_full_command() {
+        // Docker runs entrypoint + command together; the projection shows both.
+        let mut spec = ExecutionSpec {
+            group_id: Ulid::from_bytes([5u8; 16]),
+            name: None,
+            description: None,
+            tags: BTreeMap::new(),
+            image: "img".to_string(),
+            entrypoint: Some(vec!["/bin/tool".to_string()]),
+            command: vec!["--flag".to_string(), "x".to_string()],
+            workdir: None,
+            env: BTreeMap::new(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+        };
+        let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
+        let task = project_task(&record, TesView::Basic, "http://x");
+        assert_eq!(task.executors[0].command, vec!["/bin/tool", "--flag", "x"]);
+
+        spec.entrypoint = None;
+        let record = execution_record(JobId::from_bytes([4u8; 16]), user(2), spec);
+        let task = project_task(&record, TesView::Basic, "http://x");
+        assert_eq!(task.executors[0].command, vec!["--flag", "x"]);
     }
 
     #[tokio::test]
