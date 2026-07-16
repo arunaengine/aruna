@@ -529,7 +529,7 @@ async fn stage_one_input(
     )
     .await
     .and_then(|result| result.transpose())
-    .map_err(|error| JobError::permanent(format!("input read failed: {error}")))?
+    .map_err(source_input_error)?
     .ok_or_else(|| JobError::permanent(format!("input {src_bucket}/{src_key} not found")))?;
 
     let destination = match drive(
@@ -608,6 +608,15 @@ fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
 
 fn staged_input_error(error: GetObjectError) -> JobError {
     let message = format!("staged input read failed: {error}");
+    if matches!(&error, GetObjectError::StorageError(error) if storage_retryable(error)) {
+        JobError::retryable(message)
+    } else {
+        JobError::permanent(message)
+    }
+}
+
+fn source_input_error(error: GetObjectError) -> JobError {
+    let message = format!("input read failed: {error}");
     if matches!(&error, GetObjectError::StorageError(error) if storage_retryable(error)) {
         JobError::retryable(message)
     } else {
