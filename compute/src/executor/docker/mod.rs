@@ -1650,51 +1650,11 @@ fn split_image_ref(image: &str) -> (String, Option<String>) {
 /// Parse a Docker RFC3339 UTC timestamp to epoch milliseconds. Returns `None`
 /// for the daemon's zero value and anything unparseable.
 fn parse_rfc3339_ms(s: &str) -> Option<u64> {
-    if s.len() < 20 {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: i64 = s.get(5..7)?.parse().ok()?;
-    let day: i64 = s.get(8..10)?.parse().ok()?;
-    let hour: i64 = s.get(11..13)?.parse().ok()?;
-    let minute: i64 = s.get(14..16)?.parse().ok()?;
-    let second: i64 = s.get(17..19)?.parse().ok()?;
-    // Range-check the whole calendar, not just the year: a malformed daemon timestamp
-    // would otherwise produce a garbage epoch rather than being rejected.
-    if year <= 1
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=60).contains(&second)
-    {
-        return None;
-    }
-    let mut millis: i64 = 0;
-    if let Some(dot) = s.find('.') {
-        let digits: String = s[dot + 1..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .take(3)
-            .collect();
-        millis = digits.parse().unwrap_or(0);
-        for _ in digits.len()..3 {
-            millis *= 10;
-        }
-    }
-    let days = days_from_civil(year, month, day);
-    let total = (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000 + millis;
-    u64::try_from(total).ok()
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()?
+        .timestamp_millis()
+        .try_into()
+        .ok()
 }
 
 #[cfg(test)]
