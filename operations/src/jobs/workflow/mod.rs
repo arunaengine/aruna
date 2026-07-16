@@ -970,9 +970,9 @@ async fn requeue_or_fail_pre_submit(
     }
 }
 
-/// Inventory the declared outputs, or park the job `Indeterminate` for a retry:
-/// a transient listing failure must never terminalize the job with a
-/// false-empty output manifest.
+/// Inventory the declared outputs. A permanent inventory failure terminalizes
+/// the job so cleanup runs; a transient one parks it `Indeterminate` instead of
+/// terminalizing with a false-empty output manifest.
 async fn collect_or_park(
     context: &DriverContext,
     job_id: JobId,
@@ -982,6 +982,25 @@ async fn collect_or_park(
 ) -> Option<Vec<OutputObject>> {
     match collect_outputs(context, spec, bucket).await {
         Ok(outputs) => Some(outputs),
+        Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
+            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
+            match read_job_record(&context.storage_handle, job_id, None).await {
+                Ok(Some(record)) => {
+                    fail_and_crate(context, job_id, token, &record, error).await;
+                }
+                _ => {
+                    let _ = mark_indeterminate(
+                        &context.storage_handle,
+                        job_id,
+                        token,
+                        error,
+                        unix_timestamp_millis(),
+                    )
+                    .await;
+                }
+            }
+            None
+        }
         Err(error) => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed; parking");
             let _ = mark_indeterminate(
