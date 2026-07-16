@@ -617,8 +617,9 @@ fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendE
         ));
     }
     StageLayout::from_spec(spec)?;
-    if rustix::process::geteuid().as_raw() != spec.security.run_as.uid
-        || rustix::process::getegid().as_raw() != spec.security.run_as.gid
+    if (spec.security.run_as.uid != 65_534 || spec.security.run_as.gid != 65_534)
+        && (rustix::process::geteuid().as_raw() != spec.security.run_as.uid
+            || rustix::process::getegid().as_raw() != spec.security.run_as.gid)
     {
         return Err(BackendError::InvalidSpec(
             "Apptainer run_as must match the Aruna process user".to_string(),
@@ -1030,6 +1031,24 @@ mod tests {
                 .tombstone_ref
                 .is_none()
         );
+    }
+
+    #[test]
+    fn accepts_default_identity() {
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 3),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+        let mut spec = TaskSpec::new(
+            context.attempt.clone(),
+            "repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+
+        assert!(validate_spec(&context, &spec).is_ok());
+        spec.security.run_as.uid = rustix::process::geteuid().as_raw() ^ 1;
+        spec.security.run_as.gid = rustix::process::getegid().as_raw();
+        assert!(validate_spec(&context, &spec).is_err());
     }
 
     #[test]
