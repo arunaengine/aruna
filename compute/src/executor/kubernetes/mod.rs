@@ -846,6 +846,7 @@ impl ExecutorBackend for KubernetesBackend {
             return Ok(CancelEvidence::Stopped(status));
         }
         self.remove_helpers(context).await?;
+        self.save_logs(context).await?;
         for pod in self.task_pods(context).await? {
             self.delete_pod(&pod).await?;
         }
@@ -873,9 +874,9 @@ impl ExecutorBackend for KubernetesBackend {
             stored.into_bytes()
         } else {
             let pods = self.task_pods(context).await?;
-            let pod = pods
-                .first()
-                .ok_or_else(|| BackendError::NotFound("task Pod logs".to_string()))?;
+            let Some(pod) = pods.first() else {
+                return Ok(LogTails::default());
+            };
             self.pods()
                 .logs(
                     &pod.name_any(),
