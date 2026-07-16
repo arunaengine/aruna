@@ -403,9 +403,7 @@ pub fn normalize_container_path(path: &str) -> Result<PathBuf, String> {
 pub fn paths_overlap(input: &str, output_parent: &str) -> Result<bool, String> {
     let input = normalize_container_path(input)?;
     let output_parent = normalize_container_path(output_parent)?;
-    Ok(input == output_parent
-        || input.starts_with(&output_parent)
-        || output_parent.starts_with(&input))
+    Ok(input == output_parent || output_parent.starts_with(&input))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

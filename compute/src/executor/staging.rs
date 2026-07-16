@@ -99,6 +99,11 @@ impl StageLayout {
             output_parents.insert(parent.to_path_buf());
         }
         for input in &files {
+            if outputs.contains(&input.path) {
+                return Err(BackendError::InvalidSpec(
+                    "input and output paths overlap".to_string(),
+                ));
+            }
             for parent in &output_parents {
                 if paths_overlap(
                     input.path.to_str().ok_or_else(|| {
@@ -190,7 +195,7 @@ mod tests {
     #[test]
     fn rejects_path_overlap() {
         let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
-        spec.inputs = vec![TaskInput::from_bytes("/output/input", "data")];
+        spec.inputs = vec![TaskInput::from_bytes("/output/result", "data")];
         spec.output_paths = vec!["/output/result".to_string()];
         assert!(StageLayout::from_spec(&spec).is_err());
 
@@ -198,5 +203,13 @@ mod tests {
         spec.inputs = vec![TaskInput::from_bytes("/data", "data")];
         spec.output_paths = vec!["/data/output/result".to_string()];
         assert!(StageLayout::from_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn allows_shared_workdir() {
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+        spec.inputs = vec![TaskInput::from_bytes("/work/.command.sh", "data")];
+        spec.output_paths = vec!["/work/out.txt".to_string()];
+        assert!(StageLayout::from_spec(&spec).is_ok());
     }
 }

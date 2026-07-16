@@ -53,7 +53,8 @@ Direct-S3 mode supplies one least-privilege attempt credential to the task only.
 It does not stage container paths. Kubernetes stores the credential in the task
 Secret; stage and fetch Pods do not mount or reference that Secret.
 
-Input paths and output parents must not overlap in either ancestry direction.
+Input files may share a directory with outputs. Exact input/output collisions,
+input-file ancestors, duplicate paths, and root output parents are rejected.
 Paths are normalized by components, so `/out` and `/output` remain distinct.
 
 ## Docker

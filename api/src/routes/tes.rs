@@ -728,6 +728,15 @@ fn map_task_to_spec(
         {
             return Err(TesError::bad_request("duplicate input path"));
         }
+        if let Some(path) = input.container_path.as_deref()
+            && inputs.iter().any(|existing| {
+                existing.container_path.as_deref().is_some_and(|other| {
+                    FilePath::new(path).starts_with(other) || FilePath::new(other).starts_with(path)
+                })
+            })
+        {
+            return Err(TesError::bad_request("input paths overlap"));
+        }
         inputs.push(input);
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
@@ -752,10 +761,14 @@ fn map_task_to_spec(
             .parent()
             .and_then(FilePath::to_str)
             .ok_or_else(|| TesError::bad_request("invalid output parent path"))?;
+        if parent == "/" {
+            return Err(TesError::bad_request("root output parent is forbidden"));
+        }
         for input in &inputs {
             if let Some(path) = input.container_path.as_deref()
-                && paths_overlap(path, parent)
-                    .map_err(|_| TesError::bad_request("invalid input or output path"))?
+                && (path == output.container_path
+                    || paths_overlap(path, parent)
+                        .map_err(|_| TesError::bad_request("invalid input or output path"))?)
             {
                 return Err(TesError::bad_request("input and output paths overlap"));
             }
@@ -1771,6 +1784,14 @@ mod tests {
         task.outputs.truncate(1);
         task.outputs[0].path = task.inputs[0].path.clone();
         assert!(map_task_to_spec(&task, None).is_err());
+    }
+
+    #[test]
+    fn allows_shared_workdir() {
+        let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+        task.inputs[0].path = "/work/.command.sh".to_string();
+        task.outputs[0].path = "/work/out.txt".to_string();
+        assert!(map_task_to_spec(&task, None).is_ok());
     }
 
     #[test]
