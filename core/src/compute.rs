@@ -405,3 +405,96 @@ impl PartialEq for TaskOutput {
         self.size == other.size
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneSpec {
+    pub terminal_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneEvidence {
+    pub backend_ref: String,
+    pub attempt_epoch: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ComputeEffect {
+    ResolveImage {
+        backend: ExecutorKind,
+        image: String,
+    },
+    Fence {
+        backend: ExecutorKind,
+        context: FenceContext,
+    },
+    Submit {
+        backend: ExecutorKind,
+        spec: TaskSpec,
+    },
+    Stage {
+        backend: ExecutorKind,
+        context: FenceContext,
+        spec: TaskSpec,
+    },
+    Unsuspend {
+        backend: ExecutorKind,
+        context: FenceContext,
+    },
+    Status {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+    },
+    Wait {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+    },
+    Cancel {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+    },
+    FetchLogs {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+        limits: LogLimits,
+    },
+    FetchOutput {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+        path: String,
+    },
+    Reconcile {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+    },
+    Tombstone {
+        backend: ExecutorKind,
+        context: FenceContext,
+        spec: TombstoneSpec,
+    },
+    Cleanup {
+        backend: ExecutorKind,
+        attempt: AttemptRef,
+    },
+    Sweep {
+        backend: ExecutorKind,
+        grace: Duration,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ComputeEvent {
+    ImageResolved(Result<String, BackendError>),
+    Fenced(Result<(), BackendError>),
+    Submitted(Result<AttemptStatus, BackendError>),
+    Staged(Result<(), BackendError>),
+    Unsuspended(Result<AttemptStatus, BackendError>),
+    Status(Result<AttemptStatus, BackendError>),
+    Waited(Result<AttemptStatus, BackendError>),
+    Cancelled(Result<CancelEvidence, BackendError>),
+    LogsFetched(Result<LogTails, BackendError>),
+    OutputFetched(Result<TaskOutput, BackendError>),
+    Reconciled(ReconcileOutcome),
+    Tombstoned(Result<TombstoneEvidence, BackendError>),
+    Cleaned(Result<(), BackendError>),
+    Swept(Result<(), BackendError>),
+}

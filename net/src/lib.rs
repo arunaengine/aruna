@@ -2289,6 +2289,7 @@ fn net_handle_effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Blob(_) => "blob",
+        Effect::Compute(_) => "compute",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
         Effect::Metadata(_) => "metadata",

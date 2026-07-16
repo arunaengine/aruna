@@ -15,6 +15,7 @@ use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 pub(crate) fn describe_event(event: &Event) -> String {
     match event {
         Event::Blob(_) => "Event::Blob".to_string(),
+        Event::Compute(_) => "Event::Compute".to_string(),
         Event::StagingSource(staging_event) => match staging_event {
             StagingSourceEvent::HeadResult { .. } => {
                 "Event::StagingSource(StagingSourceEvent::HeadResult)".to_string()

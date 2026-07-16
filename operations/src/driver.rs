@@ -1,5 +1,7 @@
 use aruna_blob::blob::BlobHandle;
 use aruna_compute::ExecutorRegistry;
+use aruna_compute::logs::NullSink;
+use aruna_core::compute::{BackendError, ComputeEffect, ComputeEvent, ExecutorKind};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
@@ -75,6 +77,9 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             } else {
                 Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
             }
+        }
+        Effect::Compute(compute_effect) => {
+            Event::Compute(dispatch_compute(compute_effect, context).await)
         }
         Effect::StagingSource(staging_source_effect) => {
             if let Some(blob_handle) = &context.blob_handle {
@@ -218,6 +223,104 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     event
 }
 
+async fn dispatch_compute(effect: ComputeEffect, context: &DriverContext) -> ComputeEvent {
+    let unsupported = || BackendError::InvalidSpec("compute effect not implemented".to_string());
+    match effect {
+        ComputeEffect::ResolveImage { .. } => ComputeEvent::ImageResolved(Err(unsupported())),
+        ComputeEffect::Fence { .. } => ComputeEvent::Fenced(Err(unsupported())),
+        ComputeEffect::Submit { backend, spec } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => {
+                    backend
+                        .submit(&spec, &tokio_util::sync::CancellationToken::new())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Submitted(result)
+        }
+        ComputeEffect::Stage { .. } => ComputeEvent::Staged(Err(unsupported())),
+        ComputeEffect::Unsuspend { .. } => ComputeEvent::Unsuspended(Err(unsupported())),
+        ComputeEffect::Status { backend, attempt } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.status(&attempt).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Status(result)
+        }
+        ComputeEffect::Wait { backend, attempt } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => {
+                    backend
+                        .wait(&attempt, &tokio_util::sync::CancellationToken::new())
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Waited(result)
+        }
+        ComputeEffect::Cancel { backend, attempt } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.cancel(&attempt).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Cancelled(result)
+        }
+        ComputeEffect::FetchLogs {
+            backend,
+            attempt,
+            limits,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.fetch_logs(&attempt, &limits, &NullSink).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::LogsFetched(result)
+        }
+        ComputeEffect::FetchOutput {
+            backend,
+            attempt,
+            path,
+        } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.fetch_output(&attempt, &path).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::OutputFetched(result)
+        }
+        ComputeEffect::Reconcile { backend, attempt } => {
+            let evidence = match compute_backend(context, &backend) {
+                Ok(backend) => backend.reconcile(&attempt).await,
+                Err(error) => aruna_core::compute::ReconcileOutcome::Unavailable(error),
+            };
+            ComputeEvent::Reconciled(evidence)
+        }
+        ComputeEffect::Tombstone { .. } => ComputeEvent::Tombstoned(Err(unsupported())),
+        ComputeEffect::Cleanup { backend, attempt } => {
+            let result = match compute_backend(context, &backend) {
+                Ok(backend) => backend.cleanup(&attempt).await,
+                Err(error) => Err(error),
+            };
+            ComputeEvent::Cleaned(result)
+        }
+        ComputeEffect::Sweep { .. } => ComputeEvent::Swept(Err(unsupported())),
+    }
+}
+
+fn compute_backend(
+    context: &DriverContext,
+    kind: &ExecutorKind,
+) -> Result<std::sync::Arc<dyn aruna_compute::ExecutorBackend>, BackendError> {
+    context
+        .compute_handle
+        .as_ref()
+        .and_then(|registry| registry.get(kind))
+        .cloned()
+        .ok_or_else(|| {
+            BackendError::Unavailable(format!("executor {} unavailable", kind.as_wire()))
+        })
+}
+
 fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
     match effect {
         TaskEffect::ResetTimer { key, .. }
@@ -324,6 +427,7 @@ pub async fn drive<O: Operation>(
 fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
+        Effect::Compute(_) => "compute",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
@@ -338,6 +442,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Blob(_) => "blob",
+        Event::Compute(_) => "compute",
         Event::StagingSource(_) => "staging_source",
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
