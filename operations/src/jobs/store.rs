@@ -1,17 +1,19 @@
+use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE,
-    JOB_SCHEDULE_INDEX_KEYSPACE,
+    JOB_ATTEMPT_CONTROL_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+    JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
-    AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload, JobProgress,
-    JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus, UserAccess,
-    cleanup_dedup_key, cleanup_job_id, crate_job_id, encode_job_dedup_value, job_due_index_key,
-    job_lease_index_key, job_owner_cursor, job_owner_index_key, job_owner_index_prefix,
-    job_prune_index_key, job_record_key, job_run_crate_key, parse_job_dedup_value,
-    parse_job_owner_index_key, run_crate_dedup_key, validate_transition, workspace_credential_id,
+    AttemptControl, AttemptIntent, JobClaim, JobError, JobExecutionClass, JobId, JobPayload,
+    JobProgress, JobRecord, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
+    UserAccess, attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_job_id,
+    encode_job_dedup_value, job_due_index_key, job_lease_index_key, job_owner_cursor,
+    job_owner_index_key, job_owner_index_prefix, job_prune_index_key, job_record_key,
+    job_run_crate_key, parse_job_dedup_value, parse_job_owner_index_key, run_crate_dedup_key,
+    validate_transition, workspace_credential_id,
 };
 use aruna_core::types::{Key, KeySpace, NodeId, TxnId, UserId, Value};
 use aruna_storage::StorageHandle;
@@ -37,6 +39,16 @@ pub enum JobMutationError {
     NotFound,
     #[error("job claim token mismatch")]
     TokenMismatch,
+    #[error("attempt intent conflicts with the committed lineage")]
+    IntentConflict,
+    #[error("attempt epoch exhausted")]
+    EpochExhausted,
+    #[error("controller generation exhausted")]
+    GenerationExhausted,
+    #[error("attempt control record is missing")]
+    MissingControl,
+    #[error("attempt control epoch mismatch")]
+    EpochMismatch,
     #[error(transparent)]
     IllegalTransition(#[from] JobTransitionError),
     #[error("{0}")]
@@ -759,7 +771,7 @@ pub async fn handoff_external_attempt(
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     let mut released = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let (record, _) = mutate_attempt_control(storage, job_id, |record, control| {
         released = false;
         guard_token(record, token)?;
         if record.execution_class != JobExecutionClass::ExternalAttempt
@@ -771,6 +783,8 @@ pub async fn handoff_external_attempt(
             claim.claim_token = Ulid::r#gen();
             claim.lease_expires_at_ms = now_ms;
         }
+        bump_generation(control)?;
+        control.bound_token = None;
         record.updated_at_ms = now_ms;
         released = true;
         Ok(JobMutation::Persist)
@@ -787,23 +801,260 @@ pub async fn handoff_external_attempt(
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
 /// external submit so a lost attempt can be adopted by name. A committed cancellation
 /// wins this gate, so no new attempt is submitted afterward.
+#[derive(Debug)]
+pub struct AttemptCommit {
+    pub record: JobRecord,
+    pub control: AttemptControl,
+}
+
 pub async fn record_attempt_intent(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,
-    intent: AttemptIntent,
+    draft: AttemptIntent,
     now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
-        guard_token(record, token)?;
-        if record.cancel_requested {
-            return Ok(JobMutation::Skip);
+) -> Result<AttemptCommit, JobMutationError> {
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let Some(mut record) = read_job_record(storage, job_id, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?
+            else {
+                return Err(JobMutationError::NotFound);
+            };
+            guard_token(&record, token)?;
+            if let Some(intent) = &record.attempt_intent {
+                if intent.attempt_no != draft.attempt_no
+                    || intent.external_name != draft.external_name
+                    || intent.executor_kind != draft.executor_kind
+                {
+                    return Err(JobMutationError::IntentConflict);
+                }
+                let control =
+                    read_attempt_control(storage, job_id, intent.attempt_epoch, Some(txn_id))
+                        .await?
+                        .ok_or(JobMutationError::MissingControl)?;
+                return Ok(AttemptCommit { record, control });
+            }
+            if record.cancel_requested {
+                return Err(JobMutationError::IntentConflict);
+            }
+            let epoch = record.next_attempt_epoch;
+            record.next_attempt_epoch = epoch
+                .checked_add(1)
+                .ok_or(JobMutationError::EpochExhausted)?;
+            let intent = AttemptIntent {
+                attempt_epoch: epoch,
+                ..draft.clone()
+            };
+            let control = AttemptControl {
+                attempt_epoch: epoch,
+                controller_generation: 1,
+                bound_token: Some(token),
+                tombstone_ref: None,
+            };
+            let old = record.clone();
+            record.attempt_intent = Some(intent);
+            record.updated_at_ms = now_ms;
+            let (mut writes, deletes) = index_deltas(&old, &record)
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            writes.push((
+                JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+                ByteView::from(attempt_control_key(job_id, epoch)),
+                ByteView::from(
+                    control
+                        .to_bytes()
+                        .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+                ),
+            ));
+            batch_write(storage, writes, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?;
+            batch_delete(storage, deletes, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?;
+            Ok(AttemptCommit { record, control })
         }
-        record.attempt_intent = Some(intent.clone());
-        record.updated_at_ms = now_ms;
+        .await;
+        match result {
+            Ok(commit) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(commit),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "attempt commit exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "attempt commit exhausted conflict retries".to_string(),
+    ))
+}
+
+pub async fn read_attempt_control(
+    storage: &StorageHandle,
+    job_id: JobId,
+    attempt_epoch: u64,
+    txn_id: Option<TxnId>,
+) -> Result<Option<AttemptControl>, JobMutationError> {
+    let value = read_raw(
+        storage,
+        JOB_ATTEMPT_CONTROL_KEYSPACE,
+        ByteView::from(attempt_control_key(job_id, attempt_epoch)),
+        txn_id,
+    )
+    .await
+    .map_err(JobMutationError::Storage)?;
+    value
+        .map(|bytes| {
+            AttemptControl::from_bytes(bytes.as_ref())
+                .map_err(|error| JobMutationError::Storage(error.to_string()))
+        })
+        .transpose()
+}
+
+async fn mutate_attempt_control<F>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    mut mutate: F,
+) -> Result<(JobRecord, AttemptControl), JobMutationError>
+where
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+{
+    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let Some(mut record) = read_job_record(storage, job_id, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?
+            else {
+                return Err(JobMutationError::NotFound);
+            };
+            let epoch = record
+                .attempt_intent
+                .as_ref()
+                .map(|intent| intent.attempt_epoch)
+                .ok_or(JobMutationError::MissingControl)?;
+            let mut control = read_attempt_control(storage, job_id, epoch, Some(txn_id))
+                .await?
+                .ok_or(JobMutationError::MissingControl)?;
+            if control.attempt_epoch != epoch {
+                return Err(JobMutationError::EpochMismatch);
+            }
+            let old = record.clone();
+            if matches!(mutate(&mut record, &mut control)?, JobMutation::Skip) {
+                return Ok((old, control));
+            }
+            if old.state != record.state {
+                validate_transition(old.execution_class, old.state, record.state)?;
+            }
+            let (mut writes, deletes) = index_deltas(&old, &record)
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            writes.push((
+                JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+                ByteView::from(attempt_control_key(job_id, epoch)),
+                ByteView::from(
+                    control
+                        .to_bytes()
+                        .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+                ),
+            ));
+            batch_write(storage, writes, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?;
+            batch_delete(storage, deletes, Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?;
+            Ok((record, control))
+        }
+        .await;
+        match result {
+            Ok(value) => match commit_txn(storage, txn_id).await {
+                CommitResult::Committed => return Ok(value),
+                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => continue,
+                CommitResult::Conflict => {
+                    return Err(JobMutationError::Storage(
+                        "attempt mutation exhausted conflict retries".to_string(),
+                    ));
+                }
+                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "attempt mutation exhausted conflict retries".to_string(),
+    ))
+}
+
+fn bump_generation(control: &mut AttemptControl) -> Result<(), JobMutationError> {
+    control.controller_generation = control
+        .controller_generation
+        .checked_add(1)
+        .ok_or(JobMutationError::GenerationExhausted)?;
+    Ok(())
+}
+
+pub async fn authorize_cleanup(
+    storage: &StorageHandle,
+    job_id: JobId,
+    intent: &AttemptIntent,
+    token: Ulid,
+) -> Result<FenceContext, JobMutationError> {
+    let (_, control) = mutate_attempt_control(storage, job_id, |record, control| {
+        if record
+            .attempt_intent
+            .as_ref()
+            .is_none_or(|stored| stored.attempt_epoch != intent.attempt_epoch)
+        {
+            return Err(JobMutationError::EpochMismatch);
+        }
+        bump_generation(control)?;
+        control.bound_token = Some(token);
         Ok(JobMutation::Persist)
     })
-    .await
+    .await?;
+    Ok(FenceContext {
+        attempt: AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no),
+        attempt_epoch: intent.attempt_epoch,
+        controller_generation: control.controller_generation,
+    })
+}
+
+pub async fn record_attempt_tombstone(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    attempt_epoch: u64,
+    tombstone_ref: String,
+) -> Result<AttemptControl, JobMutationError> {
+    let (_, control) = mutate_attempt_control(storage, job_id, |_, control| {
+        if control.attempt_epoch != attempt_epoch {
+            return Err(JobMutationError::EpochMismatch);
+        }
+        if control.bound_token != Some(token) {
+            return Err(JobMutationError::TokenMismatch);
+        }
+        control.tombstone_ref = Some(tombstone_ref.clone());
+        Ok(JobMutation::Persist)
+    })
+    .await?;
+    Ok(control)
 }
 
 /// Advance a claimed execution job to `Preparing`, renewing the lease. The
@@ -1486,6 +1737,20 @@ mod tests {
             lease_expires_at_ms: 10_000,
         });
         insert_job(&storage, &record).await.unwrap();
+        record_attempt_intent(
+            &storage,
+            job_id,
+            live_token,
+            AttemptIntent {
+                attempt_no: 0,
+                external_name: aruna_core::structs::attempt_external_name(job_id, 0),
+                executor_kind: "docker".to_string(),
+                attempt_epoch: 0,
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
 
         // The holder renewed: its lease outlives `now`, so adoption must skip.
         let outcome = adopt_external_attempt(&storage, job_id, node_id(4), 9_000)
@@ -2174,6 +2439,7 @@ mod tests {
             attempt_no: 2,
             external_name: aruna_core::structs::attempt_external_name(job_id, 2),
             executor_kind: "docker".to_string(),
+            attempt_epoch: 1,
         };
         let mut record = JobRecord::new(
             job_id,
@@ -2322,8 +2588,9 @@ mod tests {
             attempt_no: 1,
             external_name: aruna_core::structs::attempt_external_name(job_id, 1),
             executor_kind: "docker".to_string(),
+            attempt_epoch: 0,
         };
-        record_attempt_intent(&storage, job_id, token, intent.clone(), 6_000)
+        let committed = record_attempt_intent(&storage, job_id, token, intent, 6_000)
             .await
             .unwrap();
 
@@ -2331,7 +2598,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.attempt_intent, Some(intent));
+        assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
+        assert_eq!(committed.control.attempt_epoch, 1);
     }
 
     #[tokio::test]
@@ -2349,13 +2617,13 @@ mod tests {
             attempt_no: 0,
             external_name: aruna_core::structs::attempt_external_name(job_id, 0),
             executor_kind: "docker".to_string(),
+            attempt_epoch: 0,
         };
-        let stored = record_attempt_intent(&storage, job_id, token, intent, 6_000)
+        let error = record_attempt_intent(&storage, job_id, token, intent, 6_000)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(stored.cancel_requested);
-        assert!(stored.attempt_intent.is_none());
+        assert!(matches!(error, JobMutationError::IntentConflict));
     }
 
     #[tokio::test]
@@ -2370,8 +2638,9 @@ mod tests {
             attempt_no: 0,
             external_name: aruna_core::structs::attempt_external_name(job_id, 0),
             executor_kind: "docker".to_string(),
+            attempt_epoch: 0,
         };
-        record_attempt_intent(&storage, job_id, token, intent.clone(), 4_000)
+        let committed = record_attempt_intent(&storage, job_id, token, intent, 4_000)
             .await
             .unwrap();
         set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
@@ -2382,7 +2651,7 @@ mod tests {
 
         assert_eq!(stored.state, JobState::Ready);
         assert!(stored.cancel_requested);
-        assert_eq!(stored.attempt_intent, Some(intent));
+        assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
         assert!(stored.started_at_ms.is_none());
         assert!(stored.claim.is_some());
     }

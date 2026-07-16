@@ -146,15 +146,16 @@ pub async fn run_execution_job(
             attempt_no,
             external_name: attempt.external_name(),
             executor_kind: backend.kind().as_wire(),
+            attempt_epoch: 0,
         };
-        let intent_record =
+        let intent_commit =
             match record_attempt_intent(storage, job_id, token, intent, unix_timestamp_millis())
                 .await
             {
                 Ok(record) => record,
                 Err(_) => return None,
             };
-        if intent_record.cancel_requested {
+        if intent_commit.record.cancel_requested {
             match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
                 Ok(_) => finalize_followups(&context, job_id).await,
                 Err(error) => {
@@ -1363,11 +1364,12 @@ mod tests {
             attempt_no: claimed.attempts,
             external_name: attempt.external_name(),
             executor_kind: "docker".to_string(),
+            attempt_epoch: 0,
         };
         let record = record_attempt_intent(storage, job_id, token, intent, 5)
             .await
             .unwrap();
-        (record, token, attempt)
+        (record.record, token, attempt)
     }
 
     // A submit error with an unobservable backend parks the job Indeterminate and

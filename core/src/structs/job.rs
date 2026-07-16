@@ -279,6 +279,32 @@ pub struct AttemptIntent {
     pub attempt_no: u32,
     pub external_name: String,
     pub executor_kind: String,
+    pub attempt_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptControl {
+    pub attempt_epoch: u64,
+    pub controller_generation: u64,
+    pub bound_token: Option<Ulid>,
+    pub tombstone_ref: Option<String>,
+}
+
+impl AttemptControl {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn attempt_control_key(job_id: JobId, attempt_epoch: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(24);
+    key.extend_from_slice(&job_id.to_bytes());
+    key.extend_from_slice(&attempt_epoch.to_be_bytes());
+    key
 }
 
 /// Reconciliation key: the container name, K8s Job name, or Slurm job-name an
@@ -503,6 +529,7 @@ pub struct JobRecord {
     pub due_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub attempts: u32,
+    pub next_attempt_epoch: u64,
     pub has_run: bool,
     pub last_error: Option<JobError>,
     pub progress: JobProgress,
@@ -543,6 +570,7 @@ impl JobRecord {
             due_at_ms,
             finished_at_ms: None,
             attempts: 0,
+            next_attempt_epoch: 1,
             has_run: false,
             last_error: None,
             progress: JobProgress::new(unit),
