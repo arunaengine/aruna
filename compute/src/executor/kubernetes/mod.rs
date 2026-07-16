@@ -467,11 +467,7 @@ impl KubernetesBackend {
             .map_err(kube_error)
     }
 
-    async fn strip_finalizer(
-        &self,
-        context: &FenceContext,
-        job: &Job,
-    ) -> Result<(), BackendError> {
+    async fn strip_finalizer(&self, context: &FenceContext, job: &Job) -> Result<(), BackendError> {
         if !job.metadata.finalizers.as_ref().is_some_and(|finalizers| {
             finalizers
                 .iter()
@@ -479,10 +475,7 @@ impl KubernetesBackend {
         }) {
             return Ok(());
         }
-        let patch = cas_patch(
-            job,
-            vec![("/metadata/finalizers".to_string(), json!([]))],
-        )?;
+        let patch = cas_patch(job, vec![("/metadata/finalizers".to_string(), json!([]))])?;
         self.jobs()
             .patch(
                 &context.attempt.external_name(),
