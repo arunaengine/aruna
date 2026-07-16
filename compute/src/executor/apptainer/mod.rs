@@ -70,7 +70,7 @@ impl ApptainerBackend {
             if runtime::process_live(&supervisor)? {
                 return Ok(submitted_status(&directory));
             }
-            return Ok(submitted_status(&directory));
+            return Ok(lost_status(&directory));
         }
         Err(BackendError::NotFound(context.attempt.external_name()))
     }
