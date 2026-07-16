@@ -44,8 +44,15 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+fn main() {
+    if let Some(code) = aruna_compute::dispatch_helper() {
+        std::process::exit(code);
+    }
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     dotenvy::dotenv().expect("Failed to load .env file");
     init_tracing();
 

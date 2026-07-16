@@ -29,10 +29,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
-use super::ExecutorBackend;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
 use super::staging::StageLayout;
+use super::{ExecutorBackend, digest_pinned};
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.
@@ -1405,16 +1405,6 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), BackendError> {
     } else {
         Ok(())
     }
-}
-
-fn digest_pinned(image: &str) -> bool {
-    image
-        .rsplit_once("@sha256:")
-        .is_some_and(|(repository, digest)| {
-            !repository.is_empty()
-                && digest.len() == 64
-                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
 }
 
 /// The container carries this attempt's `aruna-engine.org/*` labels; matching by the

@@ -18,6 +18,32 @@ pub mod docker;
 
 use logs::LogSink;
 
+pub(crate) fn digest_pinned(image: &str) -> bool {
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+pub fn dispatch_helper() -> Option<i32> {
+    let mode = std::env::args_os().nth(1)?;
+    let mode = mode.to_str()?;
+    if !matches!(mode, "apptainer-supervisor" | "payload-launcher") {
+        return None;
+    }
+    #[cfg(feature = "apptainer")]
+    {
+        return Some(apptainer::dispatch(&mode));
+    }
+    #[cfg(not(feature = "apptainer"))]
+    {
+        Some(78)
+    }
+}
+
 /// The single TES-shaped surface every backend is driven through. No backend
 /// introduces a second state machine or data model.
 #[async_trait]
