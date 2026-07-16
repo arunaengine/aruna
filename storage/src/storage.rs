@@ -1798,7 +1798,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Storage(storage_effect) => storage_effect_kind(storage_effect),
         Effect::Blob(_) => "blob",
-        Effect::Compute(_) => "compute",
         Effect::StagingSource(_) => "staging_source",
         Effect::Net(_) => "net",
         Effect::Metadata(_) => "metadata",

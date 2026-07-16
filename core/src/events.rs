@@ -1,4 +1,3 @@
-use crate::compute::ComputeEvent;
 use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
@@ -19,7 +18,6 @@ use ulid::Ulid;
 #[derive(Debug, PartialEq)]
 pub enum Event {
     Blob(BlobEvent),
-    Compute(ComputeEvent),
     StagingSource(StagingSourceEvent),
     Storage(StorageEvent),
     Net(NetEvent),

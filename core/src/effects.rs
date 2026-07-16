@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
-use crate::compute::ComputeEffect;
 use crate::document::DocumentSyncEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::metadata::MetadataEffect;
@@ -16,10 +15,8 @@ use std::ops::Range;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     Blob(BlobEffect),
-    Compute(ComputeEffect),
     StagingSource(StagingSourceEffect),
     Storage(StorageEffect),
     Net(NetEffect),
