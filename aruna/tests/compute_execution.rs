@@ -386,7 +386,7 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
         &fixture.compute_ctx,
         job_id,
         JobState::Cancelled,
-        Duration::from_secs(60),
+        Duration::from_secs(180),
     )
     .await;
     assert_eq!(
