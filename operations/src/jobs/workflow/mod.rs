@@ -160,6 +160,24 @@ pub async fn run_execution_job(
                 .await
             {
                 Ok(record) => record,
+                Err(JobMutationError::IntentConflict) => {
+                    if read_job_record(storage, job_id, None)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record.cancel_requested)
+                    {
+                        match cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                            .await
+                        {
+                            Ok(_) => finalize_followups(&context, job_id).await,
+                            Err(error) => {
+                                warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
+                            }
+                        }
+                    }
+                    return None;
+                }
                 Err(_) => return None,
             };
         if intent_commit.record.cancel_requested {
