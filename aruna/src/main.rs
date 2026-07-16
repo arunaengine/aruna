@@ -590,13 +590,9 @@ async fn build_kubernetes(
     let helper_image = dotenvy::var("ARUNA_COMPUTE_K8S_HELPER_IMAGE")
         .map_err(|_| "Kubernetes executor requires ARUNA_COMPUTE_K8S_HELPER_IMAGE".to_string())?;
     let s3_cidrs = dotenvy::var("ARUNA_COMPUTE_K8S_S3_CIDRS")
-        .map(|value| {
-            value
-                .split(',')
-                .filter(|cidr| !cidr.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
+        .ok()
+        .map(|value| parse_s3_cidrs(&value))
+        .transpose()?
         .unwrap_or_default();
     let s3_port = dotenvy::var("ARUNA_COMPUTE_K8S_S3_PORT")
         .map(|value| value.parse::<u16>())
@@ -635,6 +631,31 @@ fn env_true(name: &str) -> bool {
     dotenvy::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+#[cfg(feature = "kubernetes")]
+fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|cidr| !cidr.is_empty())
+        .map(|cidr| {
+            let (address, prefix) = cidr
+                .split_once('/')
+                .ok_or_else(|| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let address = address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let prefix = prefix
+                .parse::<u8>()
+                .map_err(|_| format!("invalid Kubernetes S3 CIDR `{cidr}`"))?;
+            let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+            if prefix > max_prefix {
+                return Err(format!("invalid Kubernetes S3 CIDR `{cidr}`"));
+            }
+            Ok(cidr.to_string())
+        })
+        .collect()
 }
 
 #[cfg(any(feature = "apptainer", feature = "kubernetes"))]
@@ -805,6 +826,18 @@ mod tests {
         assert_eq!(parse_disk_limit(None), Ok(None));
         assert!(parse_disk_limit(Some("invalid")).is_err());
         assert!(parse_disk_limit(Some("0")).is_err());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn validates_k8s_cidrs() {
+        assert_eq!(
+            parse_s3_cidrs(" 10.0.0.0/8, 2001:db8::/32 ").unwrap(),
+            ["10.0.0.0/8", "2001:db8::/32"]
+        );
+        assert!(parse_s3_cidrs("10.0.0.0/33").is_err());
+        assert!(parse_s3_cidrs("2001:db8::/129").is_err());
+        assert!(parse_s3_cidrs("invalid/8").is_err());
     }
 
     #[tokio::test]
