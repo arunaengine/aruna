@@ -13,6 +13,8 @@ use super::state::{
     ControlRecord, LaunchRecord, PayloadRecord, ProcessRecord, StatusRecord, read_json, write_json,
 };
 
+const LOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+
 pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
     setsid().map_err(runtime_error)?;
     let lock = OpenOptions::new()
@@ -65,7 +67,17 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
     let started = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
+    let mut log_limited = false;
     let status = loop {
+        if log_limit_exceeded(attempt_dir)? {
+            log_limited = true;
+            terminate(
+                &launch.cgroup,
+                Some(&read_json(&attempt_dir.join("payload.json"))?),
+                Duration::from_millis(launch.stop_grace_ms),
+            )?;
+            break child.wait().map_err(io_error)?;
+        }
         if let Some(status) = child.try_wait().map_err(io_error)? {
             break status;
         }
@@ -97,7 +109,13 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
         kill_cgroup(&launch.cgroup)?;
         wait_empty(&launch.cgroup, Duration::from_secs(5))?;
     }
-    let phase = exit_phase(status, cancelled, timed_out);
+    let phase = if log_limited {
+        AttemptPhase::Failed {
+            reason: "log limit exceeded".to_string(),
+        }
+    } else {
+        exit_phase(status, cancelled, timed_out)
+    };
     write_json(
         &attempt_dir.join("status.json"),
         &StatusRecord {
@@ -346,6 +364,22 @@ fn exit_phase(status: ExitStatus, cancelled: bool, timed_out: bool) -> AttemptPh
     }
 }
 
+fn log_limit_exceeded(attempt_dir: &Path) -> Result<bool, BackendError> {
+    for name in ["stdout", "stderr"] {
+        if attempt_dir
+            .join("logs")
+            .join(name)
+            .metadata()
+            .map_err(io_error)?
+            .len()
+            > LOG_FILE_LIMIT
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn remove_socket(path: &Path) -> Result<(), BackendError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -385,5 +419,17 @@ mod tests {
         fields.extend((4..=22).map(|field| field.to_string()));
         let stat = format!("123 (name with spaces) {}", fields.join(" "));
         assert_eq!(parse_start_ticks(&stat).unwrap(), 22);
+    }
+
+    #[test]
+    fn detects_log_limit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("logs")).unwrap();
+        File::create(root.path().join("logs/stdout")).unwrap();
+        let stderr = File::create(root.path().join("logs/stderr")).unwrap();
+        assert!(!log_limit_exceeded(root.path()).unwrap());
+
+        stderr.set_len(LOG_FILE_LIMIT + 1).unwrap();
+        assert!(log_limit_exceeded(root.path()).unwrap());
     }
 }
