@@ -360,6 +360,14 @@ impl ExecutorBackend for ApptainerBackend {
     async fn cancel(&self, context: &FenceContext) -> Result<CancelEvidence, BackendError> {
         let mut guard = self.state.control(context)?;
         let status = match self.existing_status(context)? {
+            Some(status) if matches!(status.phase, AttemptPhase::Failed { ref reason } if reason.contains("lost evidence")) =>
+            {
+                guard.mark_cancel()?;
+                return Ok(CancelEvidence::Stopped(AttemptStatus {
+                    phase: AttemptPhase::Cancelled,
+                    ..status
+                }));
+            }
             Some(status) if status.is_terminal() => return Ok(CancelEvidence::Stopped(status)),
             Some(status) => status,
             None => return Ok(CancelEvidence::AlreadyGone),
