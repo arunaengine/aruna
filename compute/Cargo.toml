@@ -9,6 +9,8 @@ rust-version.workspace = true
 [features]
 default = ["docker"]
 docker = ["dep:bollard"]
+apptainer = ["dep:nix", "dep:rustix", "dep:serde_json"]
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -16,11 +18,16 @@ bollard = { workspace = true, optional = true, features = ["ssl"] }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+nix = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

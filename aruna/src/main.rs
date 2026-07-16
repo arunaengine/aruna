@@ -40,7 +40,6 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -442,6 +441,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the executor registry from config. The Docker backend is opt-in via
 /// `ARUNA_COMPUTE_DOCKER=true`; registration requires a healthy daemon and an
 /// explicit disk ceiling and container-reachable S3 endpoint.
+#[cfg(feature = "docker")]
 async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
     let docker_enabled = dotenvy::var("ARUNA_COMPUTE_DOCKER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
@@ -476,9 +476,9 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
         warn!(address = %config.s3_address, "Docker executor requires a non-loopback S3_ADDRESS; running without compute");
         return None;
     }
-    let docker_config = aruna_compute::docker::DockerConfig {
+    let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: Some(disk_bytes),
-        ..aruna_compute::docker::DockerConfig::default()
+        ..aruna_compute::DockerConfig::default()
     };
     match aruna_compute::docker::DockerBackend::with_config(docker_config) {
         Ok(backend) => {
@@ -499,6 +499,12 @@ async fn build_compute_registry(config: &Config) -> Option<Arc<aruna_compute::Ex
     }
 }
 
+#[cfg(not(feature = "docker"))]
+async fn build_compute_registry(_config: &Config) -> Option<Arc<aruna_compute::ExecutorRegistry>> {
+    None
+}
+
+#[cfg(any(feature = "docker", test))]
 fn parse_disk_limit(value: Option<&str>) -> Result<u64, &'static str> {
     let value = value.ok_or("disk ceiling is missing")?;
     let bytes = value
@@ -554,6 +560,7 @@ async fn shutdown_runtime(
     }
 }
 
+#[cfg(any(feature = "docker", test))]
 fn container_local_endpoint(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
@@ -563,7 +570,7 @@ fn container_local_endpoint(endpoint: &str) -> bool {
     };
     host.eq_ignore_ascii_case("localhost")
         || host
-            .parse::<IpAddr>()
+            .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
 }
 

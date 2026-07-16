@@ -6,11 +6,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["docker"]
+docker = ["aruna-compute/docker"]
+apptainer = ["aruna-compute/apptainer"]
+kubernetes = ["aruna-compute/kubernetes"]
+
 [dependencies]
 # Aruna modules
 aruna-api = { workspace = true }
 aruna-blob = { workspace = true }
-aruna-compute = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
 aruna-net = { workspace = true }
 aruna-operations = { workspace = true }

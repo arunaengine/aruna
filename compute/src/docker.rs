@@ -24,6 +24,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{BackendError, ExecutorBackend, ExecutorKind, TaskOutput};
+use crate::config::DockerConfig;
 use crate::logs::{BoundedTail, LogSink, LogStream, LogTails};
 use crate::spec::{AttemptRef, InputStream, LogLimits, MAX_TRANSFER_BYTES, TaskInput, TaskSpec};
 use crate::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcome};
@@ -33,51 +34,6 @@ use crate::status::{AttemptPhase, AttemptStatus, CancelEvidence, ReconcileOutcom
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
 /// Docker encodes directory type with Go's `os.ModeDir` bit.
 const DIRECTORY_MODE: u32 = 1 << 31;
-
-/// Security and default-limit configuration for the Docker backend. Per the
-/// ceiling contract a request without a limit is filled from these defaults;
-/// an explicit `None` is an operator's deliberate opt-out.
-#[derive(Clone, Debug)]
-pub struct DockerConfig {
-    /// Graceful stop timeout before SIGKILL, in seconds.
-    pub stop_grace_secs: i32,
-    /// Retain the container after terminal evidence for debugging.
-    pub keep_failed: bool,
-    /// Memory ceiling applied when a request omits one (default 2 GiB).
-    pub default_mem_bytes: Option<i64>,
-    /// nano-CPU ceiling applied when a request omits one (default 2 cores).
-    pub default_nano_cpus: Option<i64>,
-    /// Writable-layer ceiling applied when a request omits one.
-    pub default_disk_bytes: Option<u64>,
-    /// Walltime ceiling applied when a request omits one (default 24 h);
-    /// enforced by `wait`, which stops the container past the deadline.
-    pub default_max_walltime: Option<Duration>,
-    pub pids_limit: i64,
-    pub drop_all_caps: bool,
-    pub no_new_privileges: bool,
-    /// Container network mode; `None` keeps the daemon default (egress allowed).
-    pub network_mode: Option<String>,
-    /// Non-root user (`uid[:gid]`); `None` lets the image decide.
-    pub user: Option<String>,
-}
-
-impl Default for DockerConfig {
-    fn default() -> Self {
-        Self {
-            stop_grace_secs: 10,
-            keep_failed: false,
-            default_mem_bytes: Some(2 * 1024 * 1024 * 1024),
-            default_nano_cpus: Some(2_000_000_000),
-            default_disk_bytes: None,
-            default_max_walltime: Some(Duration::from_secs(24 * 60 * 60)),
-            pids_limit: 2048,
-            drop_all_caps: true,
-            no_new_privileges: true,
-            network_mode: None,
-            user: None,
-        }
-    }
-}
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {

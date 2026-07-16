@@ -36,6 +36,59 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets --locked
 
+  compute-features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: aruna-compute
+            features: ""
+          - package: aruna-compute
+            features: docker
+          - package: aruna-compute
+            features: apptainer
+          - package: aruna-compute
+            features: kubernetes
+          - package: aruna
+            features: ""
+          - package: aruna
+            features: docker
+          - package: aruna
+            features: apptainer
+          - package: aruna
+            features: kubernetes
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+          components: clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Test feature row
+        run: cargo test -p ${{ matrix.package }} --no-default-features --features "${{ matrix.features }}" --locked
+
+      - name: Lint feature row
+        run: cargo clippy -p ${{ matrix.package }} --no-default-features --features "${{ matrix.features }}" --locked -- -D warnings
+
+      - name: Test all features
+        if: matrix.package == 'aruna-compute' && matrix.features == 'docker'
+        run: cargo test --workspace --all-features --locked
+
+      - name: Lint all features
+        if: matrix.package == 'aruna-compute' && matrix.features == 'docker'
+        run: cargo clippy --workspace --all-features --locked -- -D warnings
+
   fmt:
     runs-on: ubuntu-latest
 
