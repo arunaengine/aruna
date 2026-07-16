@@ -818,7 +818,7 @@ mod tests {
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, set_cancel_requested,
     };
-    use aruna_core::structs::{JobClaim, JobPayload, JobResultPayload, RealmId};
+    use aruna_core::structs::{AttemptIntent, JobClaim, JobPayload, JobResultPayload, RealmId};
     use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -1537,6 +1537,13 @@ mod tests {
             holder_node_id: node_id(3),
             claim_token: Ulid::r#gen(),
             lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        });
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 1,
+            external_name: "attempt".to_string(),
+            executor_kind: "docker".to_string(),
+            pinned_image: "alpine@sha256:digest".to_string(),
+            attempt_epoch: 1,
         });
         insert_job(&storage, &record).await.unwrap();
 
