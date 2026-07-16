@@ -11,8 +11,8 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, Secret, TaskInput,
-    TaskSpec, TombstoneSpec, WorkspaceBinding,
+    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, StagingMode, TaskInput,
+    TaskSpec, TombstoneSpec,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -39,7 +39,7 @@ use crate::driver::DriverContext;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
-    mint_workspace_credential, stage_inputs,
+    stage_inputs,
 };
 
 /// Drive a claimed execution job through prepare -> submit -> supervise -> finalize.
@@ -113,7 +113,7 @@ pub async fn run_execution_job(
 
     let prepare_and_submit = async {
         let bucket = JobRecord::workspace_bucket_name(job_id);
-        let (credential, inputs) =
+        let inputs =
             match prepare_workspace(&context, &spec, &record, node_id, &bucket, token).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -145,16 +145,7 @@ pub async fn run_execution_job(
                 return None;
             }
         };
-        let task_spec = build_task_spec(
-            &context,
-            &spec,
-            &attempt,
-            &pinned_image,
-            &credential,
-            &bucket,
-            node_id,
-            inputs,
-        );
+        let task_spec = build_task_spec(&spec, &attempt, &pinned_image, inputs);
 
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
@@ -306,7 +297,7 @@ async fn prepare_workspace(
     node_id: NodeId,
     bucket: &str,
     token: ulid::Ulid,
-) -> Result<(workspace::WorkspaceCredential, Vec<TaskInput>), JobError> {
+) -> Result<Vec<TaskInput>, JobError> {
     ensure_group_write(context, spec, record, node_id).await?;
     ensure_workspace_bucket(context, spec, record, bucket).await?;
     set_workspace_bucket(
@@ -319,40 +310,15 @@ async fn prepare_workspace(
     .await
     .map_err(|error| JobError::retryable(format!("workspace bucket record failed: {error}")))?;
     stage_inputs(context, spec, record, bucket, node_id).await?;
-    let inputs = load_inputs(context, spec, record, bucket).await?;
-    let credential = mint_workspace_credential(context, spec, record, node_id, bucket).await?;
-    Ok((credential, inputs))
+    load_inputs(context, spec, record, bucket).await
 }
 
 fn build_task_spec(
-    context: &DriverContext,
     spec: &ExecutionSpec,
     attempt: &AttemptRef,
     pinned_image: &str,
-    credential: &workspace::WorkspaceCredential,
-    bucket: &str,
-    _node_id: NodeId,
     inputs: Vec<TaskInput>,
 ) -> TaskSpec {
-    let mut env = spec.env.clone();
-    env.insert("ARUNA_WORKSPACE_BUCKET".to_string(), bucket.to_string());
-    let mut secret_env = std::collections::BTreeMap::new();
-    secret_env.insert(
-        "AWS_ACCESS_KEY_ID".to_string(),
-        Secret::new(credential.access_key.clone()),
-    );
-    secret_env.insert(
-        "AWS_SECRET_ACCESS_KEY".to_string(),
-        Secret::new(credential.secret.clone()),
-    );
-    let workspace_binding = context.compute_handle.as_ref().and_then(|registry| {
-        let endpoint = registry.workspace_endpoint();
-        endpoint.endpoint.clone().map(|url| WorkspaceBinding {
-            s3_endpoint: url,
-            bucket_name: bucket.to_string(),
-            region: endpoint.region.clone(),
-        })
-    });
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
         ram_bytes: spec.resources.ram_bytes,
@@ -367,12 +333,13 @@ fn build_task_spec(
         entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
         workdir: spec.workdir.clone(),
-        env,
-        secret_env,
+        env: spec.env.clone(),
+        secret_env: std::collections::BTreeMap::new(),
         resources,
-        workspace: workspace_binding,
+        workspace: None,
         log_limits: Default::default(),
         inputs,
+        staging_mode: StagingMode::Files,
         output_paths: spec
             .file_outputs
             .iter()
@@ -552,14 +519,6 @@ async fn retry_same_submit(
     record: &JobRecord,
     cancel: &CancellationToken,
 ) -> Result<AttemptStatus, BackendError> {
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or_else(|| BackendError::Unavailable("retry needs a net handle".to_string()))?;
-    let credential = mint_workspace_credential(context, spec, record, node_id, bucket)
-        .await
-        .map_err(|error| BackendError::Unavailable(error.message))?;
     let inputs = load_inputs(context, spec, record, bucket)
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
@@ -569,16 +528,7 @@ async fn retry_same_submit(
         .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
         .map(|intent| intent.pinned_image.as_str())
         .ok_or_else(|| BackendError::Conflict("attempt intent mismatch".to_string()))?;
-    let task_spec = build_task_spec(
-        context,
-        spec,
-        &fence.attempt,
-        pinned_image,
-        &credential,
-        bucket,
-        node_id,
-        inputs,
-    );
+    let task_spec = build_task_spec(spec, &fence.attempt, pinned_image, inputs);
     backend.submit(fence, &task_spec, cancel).await
 }
 
@@ -1283,6 +1233,7 @@ mod tests {
     use crate::jobs::store::{
         ClaimOutcome, claim_job, insert_job, put_run_crate_status, set_cancel_requested,
     };
+    use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{LogTails, TaskOutput};

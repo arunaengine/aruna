@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod config;
 pub mod logs;
+pub mod staging;
 
 #[cfg(feature = "docker")]
 pub mod docker;

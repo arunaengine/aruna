@@ -16,7 +16,7 @@ use super::super::store::{
     read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
     transition_external_to_running,
 };
-use super::workspace::{load_inputs, mint_workspace_credential};
+use super::workspace::load_inputs;
 use super::{
     build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel, requeue_after_tombstone,
     supervise_and_finalize, with_execution_heartbeat,
@@ -373,17 +373,6 @@ pub(super) async fn resume_attempt(
             token,
             cancel.clone(),
             async {
-                let node_id = holder(&context);
-                let credential =
-                    match mint_workspace_credential(&context, &spec, &record, node_id, &bucket)
-                        .await
-                    {
-                        Ok(credential) => credential,
-                        Err(error) => {
-                            fail_or_park(&context, job_id, token, &record, error).await;
-                            return false;
-                        }
-                    };
                 let inputs = match load_inputs(&context, &spec, &record, &bucket).await {
                     Ok(inputs) => inputs,
                     Err(error) => {
@@ -399,16 +388,7 @@ pub(super) async fn resume_attempt(
                 else {
                     return false;
                 };
-                let task_spec = build_task_spec(
-                    &context,
-                    &spec,
-                    &fence.attempt,
-                    pinned_image,
-                    &credential,
-                    &bucket,
-                    node_id,
-                    inputs,
-                );
+                let task_spec = build_task_spec(&spec, &fence.attempt, pinned_image, inputs);
                 let status = match backend.submit(&fence, &task_spec, &cancel).await {
                     Ok(status) => status,
                     Err(aruna_core::compute::BackendError::Cancelled) => {

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, AttemptStatus, Secret, TaskSpec, TesState, WorkspaceBinding,
+    AttemptPhase, AttemptRef, AttemptStatus, Secret, StagingMode, TaskSpec, TesState,
+    WorkspaceBinding,
 };
 
 #[test]
@@ -39,7 +40,7 @@ fn secret_redacts() {
 
 #[test]
 fn effective_env() {
-    // Workspace binding and secrets are folded into the injected env.
+    // Files mode excludes credentials; DirectS3 injects its workspace binding.
     let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
     spec.workspace = Some(WorkspaceBinding {
         s3_endpoint: "http://s3:9000".to_string(),
@@ -48,6 +49,11 @@ fn effective_env() {
     });
     spec.secret_env
         .insert("AWS_SECRET_ACCESS_KEY".to_string(), Secret::new("k"));
+    let env = spec.effective_env();
+    assert!(!env.contains_key("AWS_ENDPOINT_URL"));
+    assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
+
+    spec.staging_mode = StagingMode::DirectS3;
     let env = spec.effective_env();
     assert_eq!(env.get("AWS_ENDPOINT_URL").unwrap(), "http://s3:9000");
     assert_eq!(env.get("ARUNA_WORKSPACE_BUCKET").unwrap(), "ws-j1");

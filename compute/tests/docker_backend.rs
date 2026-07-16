@@ -67,7 +67,14 @@ impl DockerTestExt for DockerBackend {
             .map(|input| {
                 input
                     .take_stream()
-                    .map(|stream| TaskInput::from_stream(input.path.clone(), input.size(), stream))
+                    .map(|stream| {
+                        TaskInput::from_workspace(
+                            input.path.clone(),
+                            input.workspace_key.clone(),
+                            input.size(),
+                            stream,
+                        )
+                    })
                     .ok_or_else(|| BackendError::Unavailable("test input consumed".to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -78,6 +85,7 @@ impl DockerTestExt for DockerBackend {
             command: spec.command.clone(),
             workdir: spec.workdir.clone(),
             inputs,
+            staging_mode: spec.staging_mode,
             output_paths: spec.output_paths.clone(),
             env: spec.env.clone(),
             secret_env: spec.secret_env.clone(),

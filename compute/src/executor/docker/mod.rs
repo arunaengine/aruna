@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use super::ExecutorBackend;
 use super::config::DockerConfig;
 use super::logs::{BoundedTail, LogSink};
+use super::staging::StageLayout;
 
 /// Label carrying the effective walltime ceiling in milliseconds so `wait` can
 /// enforce it against the daemon-reported start time.
@@ -404,6 +405,7 @@ struct ArchivePlan<'a> {
 
 impl<'a> ArchivePlan<'a> {
     fn new(spec: &'a TaskSpec) -> Result<Self, BackendError> {
+        StageLayout::from_spec(spec)?;
         let mut inputs = BTreeMap::new();
         let mut outputs = BTreeSet::new();
         let mut files = BTreeSet::new();
@@ -811,7 +813,10 @@ fn build_config(
         security_opt: config
             .no_new_privileges
             .then(|| vec!["no-new-privileges".to_string()]),
-        network_mode: config.network_mode.clone(),
+        network_mode: match spec.staging_mode {
+            aruna_core::compute::StagingMode::Files => Some("none".to_string()),
+            aruna_core::compute::StagingMode::DirectS3 => config.network_mode.clone(),
+        },
         auto_remove: Some(false),
         ..Default::default()
     };

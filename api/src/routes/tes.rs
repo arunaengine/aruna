@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::path::Path as FilePath;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aruna_core::compute::paths_overlap;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     AuthContext, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
@@ -745,12 +747,19 @@ fn map_task_to_spec(
         }
         file_outputs.push(output);
     }
-    if file_outputs.iter().any(|output| {
-        inputs
-            .iter()
-            .any(|input| input.container_path.as_deref() == Some(output.container_path.as_str()))
-    }) {
-        return Err(TesError::bad_request("input and output paths overlap"));
+    for output in &file_outputs {
+        let parent = FilePath::new(&output.container_path)
+            .parent()
+            .and_then(FilePath::to_str)
+            .ok_or_else(|| TesError::bad_request("invalid output parent path"))?;
+        for input in &inputs {
+            if let Some(path) = input.container_path.as_deref()
+                && paths_overlap(path, parent)
+                    .map_err(|_| TesError::bad_request("invalid input or output path"))?
+            {
+                return Err(TesError::bad_request("input and output paths overlap"));
+            }
+        }
     }
 
     let cpu_cores = task.resources.as_ref().and_then(|r| r.cpu_cores);

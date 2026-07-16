@@ -247,7 +247,12 @@ pub async fn load_inputs(
             .filter(|total| *total <= MAX_TRANSFER_BYTES)
             .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
         let stream = get.blob.map(|chunk| chunk.map_err(std::io::Error::other));
-        files.push(TaskInput::from_stream(path, size, Box::pin(stream)));
+        files.push(TaskInput::from_workspace(
+            path,
+            input.dest_key.clone(),
+            size,
+            Box::pin(stream),
+        ));
     }
     Ok(files)
 }

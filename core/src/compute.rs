@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -157,16 +158,39 @@ pub struct WorkspaceBinding {
     pub region: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagingMode {
+    Files,
+    DirectS3,
+}
+
 pub struct TaskInput {
     pub path: String,
+    pub workspace_key: String,
     size: u64,
     stream: Mutex<Option<InputStream>>,
 }
 
 impl TaskInput {
     pub fn from_stream(path: impl Into<String>, size: u64, stream: InputStream) -> Self {
+        let path = path.into();
+        Self {
+            workspace_key: path.clone(),
+            path,
+            size,
+            stream: Mutex::new(Some(stream)),
+        }
+    }
+
+    pub fn from_workspace(
+        path: impl Into<String>,
+        workspace_key: impl Into<String>,
+        size: u64,
+        stream: InputStream,
+    ) -> Self {
         Self {
             path: path.into(),
+            workspace_key: workspace_key.into(),
             size,
             stream: Mutex::new(Some(stream)),
         }
@@ -191,6 +215,7 @@ impl fmt::Debug for TaskInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskInput")
             .field("path", &self.path)
+            .field("workspace_key", &self.workspace_key)
             .field("size", &self.size)
             .finish_non_exhaustive()
     }
@@ -198,7 +223,9 @@ impl fmt::Debug for TaskInput {
 
 impl PartialEq for TaskInput {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.size == other.size
+        self.path == other.path
+            && self.workspace_key == other.workspace_key
+            && self.size == other.size
     }
 }
 
@@ -258,6 +285,7 @@ pub struct TaskSpec {
     pub command: Vec<String>,
     pub workdir: Option<String>,
     pub inputs: Vec<TaskInput>,
+    pub staging_mode: StagingMode,
     pub output_paths: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub secret_env: BTreeMap<String, Secret>,
@@ -275,6 +303,7 @@ impl TaskSpec {
             command: Vec::new(),
             workdir: None,
             inputs: Vec::new(),
+            staging_mode: StagingMode::Files,
             output_paths: Vec::new(),
             env: BTreeMap::new(),
             secret_env: BTreeMap::new(),
@@ -286,23 +315,51 @@ impl TaskSpec {
 
     pub fn effective_env(&self) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
-        if let Some(workspace) = &self.workspace {
-            env.insert(
-                "AWS_ENDPOINT_URL".to_string(),
-                workspace.s3_endpoint.clone(),
-            );
-            env.insert("AWS_REGION".to_string(), workspace.region.clone());
-            env.insert(
-                "ARUNA_WORKSPACE_BUCKET".to_string(),
-                workspace.bucket_name.clone(),
-            );
-        }
         env.insert("ARUNA_JOB_ID".to_string(), self.attempt.job_id.clone());
-        for (key, value) in &self.secret_env {
-            env.insert(key.clone(), value.expose().to_string());
+        if self.staging_mode == StagingMode::DirectS3 {
+            if let Some(workspace) = &self.workspace {
+                env.insert(
+                    "AWS_ENDPOINT_URL".to_string(),
+                    workspace.s3_endpoint.clone(),
+                );
+                env.insert("AWS_REGION".to_string(), workspace.region.clone());
+                env.insert(
+                    "ARUNA_WORKSPACE_BUCKET".to_string(),
+                    workspace.bucket_name.clone(),
+                );
+            }
+            for (key, value) in &self.secret_env {
+                env.insert(key.clone(), value.expose().to_string());
+            }
         }
         env
     }
+}
+
+pub fn normalize_container_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    if !path.is_absolute() || path == Path::new("/") {
+        return Err("container path must be absolute and non-root".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push("/"),
+            Component::Normal(part) if !part.as_encoded_bytes().contains(&0) => {
+                normalized.push(part)
+            }
+            _ => return Err("container path contains an unsafe component".to_string()),
+        }
+    }
+    Ok(normalized)
+}
+
+pub fn paths_overlap(input: &str, output_parent: &str) -> Result<bool, String> {
+    let input = normalize_container_path(input)?;
+    let output_parent = normalize_container_path(output_parent)?;
+    Ok(input == output_parent
+        || input.starts_with(&output_parent)
+        || output_parent.starts_with(&input))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
