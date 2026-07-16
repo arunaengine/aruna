@@ -15,7 +15,7 @@ use aruna_core::compute::{
 use async_trait::async_trait;
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ContainerStateStatusEnum, HostConfig,
-    HostConfigLogConfig,
+    HostConfigLogConfig, ImageInspect,
 };
 use bollard::query_parameters::{
     ContainerArchiveInfoOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
@@ -1009,6 +1009,24 @@ fn build_config(
     }
 }
 
+fn validate_image_volumes(
+    config: &DockerConfig,
+    inspect: &ImageInspect,
+) -> Result<(), BackendError> {
+    if config.default_disk_bytes.is_some()
+        && inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.volumes.as_ref())
+            .is_some_and(|volumes| !volumes.is_empty())
+    {
+        return Err(BackendError::InvalidSpec(
+            "image-declared volumes are incompatible with Docker disk limits".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ExecutorBackend for DockerBackend {
     fn kind(&self) -> ExecutorKind {
@@ -1042,6 +1060,7 @@ impl ExecutorBackend for DockerBackend {
             .inspect_image(image)
             .await
             .map_err(|error| classify(&error))?;
+        validate_image_volumes(&self.config, &inspect)?;
         if digest_pinned(image) {
             return Ok(image.to_string());
         }
@@ -1847,6 +1866,27 @@ mod tests {
             host.storage_opt.unwrap().get("size").unwrap(),
             &(2u64 << 30).to_string()
         );
+    }
+
+    #[test]
+    fn rejects_volume_images() {
+        let inspect = ImageInspect {
+            config: Some(bollard::models::ImageConfig {
+                volumes: Some(vec!["/data".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let limited = DockerConfig {
+            default_disk_bytes: Some(2u64 << 30),
+            ..DockerConfig::default()
+        };
+
+        assert!(matches!(
+            validate_image_volumes(&limited, &inspect),
+            Err(BackendError::InvalidSpec(_))
+        ));
+        assert!(validate_image_volumes(&DockerConfig::default(), &inspect).is_ok());
     }
 
     #[test]
