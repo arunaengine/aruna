@@ -303,7 +303,9 @@ pub fn network_policies(config: &KubernetesConfig) -> Result<Vec<NetworkPolicy>,
             "ingress":[],
             "egress":[
                 {"to":cidrs,"ports":[{"protocol":"TCP","port":config.s3_port}]},
-                {"to":[{"ipBlock":{"cidr":"0.0.0.0/0"}}],"ports":[
+                {"to":[{"namespaceSelector":{"matchLabels":{
+                    "kubernetes.io/metadata.name":"kube-system"
+                }}}],"ports":[
                     {"protocol":"UDP","port":53},{"protocol":"TCP","port":53}
                 ]}
             ]
@@ -492,5 +494,21 @@ mod tests {
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.init_containers.unwrap().len(), 1);
         assert!(pod.containers[0].startup_probe.is_some());
+    }
+
+    #[test]
+    fn restricts_dns_egress() {
+        let mut config = config();
+        config.s3_cidrs.push("10.0.0.0/8".to_string());
+
+        let policies = network_policies(&config).unwrap();
+        let policy = serde_json::to_value(&policies[1]).unwrap();
+        let peer = &policy["spec"]["egress"][1]["to"][0];
+
+        assert_eq!(
+            peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "kube-system"
+        );
+        assert!(peer.get("ipBlock").is_none());
     }
 }
