@@ -10,6 +10,9 @@ pub mod config;
 pub mod logs;
 pub mod staging;
 
+#[cfg(feature = "apptainer")]
+pub mod apptainer;
+
 #[cfg(feature = "docker")]
 pub mod docker;
 
