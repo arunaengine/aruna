@@ -4154,6 +4154,49 @@ mod tests {
         assert_eq!(total_pages, 2);
     }
 
+    #[test]
+    fn marker_resumes_past_group() {
+        // A delimited marker names an already returned common prefix, so the
+        // next page must skip that whole group instead of re-listing it.
+        let token = marker_continuation_token("bucket", Some("a/"), None, Some("/"))
+            .unwrap()
+            .expect("delimited marker must resume past its group");
+        assert_eq!(token.last_common_prefix.as_deref(), Some("a/"));
+        assert_eq!(
+            BlobHeadKey::from_bytes(&token.last_key).unwrap().key,
+            "a/".to_string()
+        );
+    }
+
+    #[test]
+    fn marker_without_delimiter_is_plain() {
+        assert!(
+            marker_continuation_token("bucket", Some("a/b.txt"), None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            marker_continuation_token("bucket", None, None, Some("/"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn next_marker_prefers_group() {
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "a/z.txt").unwrap(),
+            last_common_prefix: Some("a/".to_string()),
+        };
+        assert_eq!(next_marker_of(&token).as_deref(), Some("a/"));
+
+        let token = ListObjectsV2ContinuationToken {
+            last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
+            last_common_prefix: None,
+        };
+        assert_eq!(next_marker_of(&token).as_deref(), Some("b.txt"));
+    }
+
     #[tokio::test]
     async fn test_list_objects_v2_prefix_only_page_is_not_truncated() {
         let storage_dir = tempfile::tempdir().unwrap();
