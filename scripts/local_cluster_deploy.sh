@@ -19,6 +19,11 @@ KEYCLOAK_OIDC_USERNAME="${ARUNA_TEST_DEPLOY_OIDC_USERNAME:-aruna-admin}"
 KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 PORTAL_DIR="${ARUNA_TEST_DEPLOY_PORTAL_DIR:-}"
 PORTAL_CORS_ORIGINS=""
+COMPUTE_EXECUTOR="${ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR:-docker}"
+# Containers must reach the host's S3 listener; loopback endpoints are rejected
+# by the docker executor, so advertise the primary host address instead.
+HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+[[ -n "$HOST_IP" ]] || HOST_IP="172.17.0.1"
 WITH_KEYCLOAK=0
 AUTO_PORTAL_DIR=0
 AUTO_PORTAL_DOWNLOAD=0
@@ -70,6 +75,7 @@ Environment overrides:
   ARUNA_TEST_DEPLOY_OIDC_USERNAME
   ARUNA_TEST_DEPLOY_OIDC_PASSWORD
   ARUNA_TEST_DEPLOY_PORTAL_DIR
+  ARUNA_TEST_DEPLOY_COMPUTE_EXECUTOR   docker (default) | apptainer | kubernetes | none
 EOF
 }
 
@@ -155,9 +161,17 @@ write_node_env() {
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
     printf 'OPS_SOCKET_ADDRESS=127.0.0.1:%s\n' "$ops_port"
     printf 'API_PUBLIC_URL=http://127.0.0.1:%s\n' "$http_port"
-    printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
-    printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
-    printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
+    if [[ "$COMPUTE_EXECUTOR" != "none" ]]; then
+      printf 'S3_HOST=%s:%s\n' "$HOST_IP" "$s3_port"
+      printf 'S3_PUBLIC_URL=http://%s:%s\n' "$HOST_IP" "$s3_port"
+      printf 'S3_ADDRESS=0.0.0.0:%s\n' "$s3_port"
+      printf 'ARUNA_COMPUTE_EXECUTOR=%s\n' "$COMPUTE_EXECUTOR"
+      printf 'ARUNA_COMPUTE_OPTIONAL=true\n'
+    else
+      printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
+      printf 'S3_PUBLIC_URL=http://127.0.0.1:%s\n' "$s3_port"
+      printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
+    fi
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ -n "$PORTAL_DIR" ]]; then
