@@ -426,7 +426,8 @@ pub async fn service_info(State(state): State<Arc<ServerState>>, headers: Header
         (status = 200, body = TesCreateTaskResponse),
         (status = 400, body = TesErrorPayload),
         (status = 401, body = TesErrorPayload),
-        (status = 403, body = TesErrorPayload)
+        (status = 403, body = TesErrorPayload),
+        (status = 409, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
@@ -491,6 +492,8 @@ pub async fn create_task(
     ),
     responses(
         (status = 200, body = TesTask),
+        (status = 400, body = TesErrorPayload),
+        (status = 401, body = TesErrorPayload),
         (status = 404, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
@@ -613,6 +616,7 @@ pub async fn list_tasks(
     params(("id" = String, Path, description = "TES task id (the JobId)")),
     responses(
         (status = 200, description = "Cancellation requested"),
+        (status = 401, body = TesErrorPayload),
         (status = 404, body = TesErrorPayload)
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
