@@ -190,7 +190,7 @@ pub type PatchUserInfoRequest = UpdateUserRequest;
 
 const DEFAULT_LIST_USERS_LIMIT: usize = 100;
 const MAX_LIST_USERS_LIMIT: usize = 1_000;
-const MIN_SEARCH_QUERY_CHARS: usize = 2;
+pub(crate) const MIN_SEARCH_QUERY_CHARS: usize = 2;
 const MAX_SEARCH_USERS_LIMIT: usize = 20;
 const MAX_RESOLVE_USER_IDS: usize = 100;
 

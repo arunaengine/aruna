@@ -1381,7 +1381,7 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
     }
 }
 
-fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
+pub(crate) fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
     match error {
         MetadataApiError::BadRequest => ServerError::BadRequest,
         MetadataApiError::Unauthorized => ServerError::Unauthorized,
@@ -1393,7 +1393,7 @@ fn map_metadata_api_error(error: MetadataApiError) -> ServerError {
     }
 }
 
-fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
+pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<MetadataApiQueryMode> {
     mode.map(|mode| match mode {
         MetadataQueryMode::Local => MetadataApiQueryMode::Local,
         MetadataQueryMode::Distributed => MetadataApiQueryMode::Distributed,
@@ -1644,7 +1644,7 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     Ok(load_metadata_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
-fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
+pub(crate) fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
     MetadataSearchHitResponse {
         document_id: hit.document_id,
         group_id: hit.group_id,
