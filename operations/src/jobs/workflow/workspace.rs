@@ -737,6 +737,30 @@ pub async fn collect_outputs(
     Ok(outputs)
 }
 
+/// Fold the exported manifest into the inventoried one under the same keyed limit
+/// inventory enforces. A retried finalize inventories objects a previous export already
+/// wrote; the export row wins, because it names a container path inventory cannot know.
+pub(super) fn merge_outputs(
+    inventoried: Vec<OutputObject>,
+    captured: Vec<OutputObject>,
+) -> Result<Vec<OutputObject>, JobError> {
+    let exported: HashSet<(&str, &str)> = captured
+        .iter()
+        .map(|output| (output.bucket.as_str(), output.key.as_str()))
+        .collect();
+    let retained: Vec<OutputObject> = inventoried
+        .into_iter()
+        .filter(|output| !exported.contains(&(output.bucket.as_str(), output.key.as_str())))
+        .collect();
+
+    let mut outputs = Vec::new();
+    let mut keys = HashSet::new();
+    for output in retained.into_iter().chain(captured) {
+        insert_output(&mut outputs, &mut keys, output)?;
+    }
+    Ok(outputs)
+}
+
 fn insert_output(
     outputs: &mut Vec<OutputObject>,
     keys: &mut HashSet<(String, String)>,
@@ -956,6 +980,44 @@ mod tests {
         insert_output(&mut outputs, &mut keys, output("result")).unwrap();
         insert_output(&mut outputs, &mut keys, output("result")).unwrap();
         assert_eq!(outputs.len(), 1);
+    }
+
+    #[test]
+    fn merge_deduplicates() {
+        // A retried finalize inventories the object its own export already wrote;
+        // the manifest must name it once, with the export's container path.
+        let mut inventoried = output("result");
+        inventoried.container_path.clear();
+        let captured = output("result");
+
+        let outputs = merge_outputs(vec![inventoried], vec![captured.clone()]).unwrap();
+
+        assert_eq!(outputs, vec![captured]);
+    }
+
+    #[test]
+    fn merge_keeps_order() {
+        let inventoried = vec![output("a"), output("b")];
+        let captured = vec![output("c")];
+
+        let outputs = merge_outputs(inventoried, captured).unwrap();
+
+        let keys: Vec<_> = outputs.iter().map(|output| output.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_enforces_limit() {
+        let inventoried: Vec<_> = (0..MAX_OUTPUT_MANIFEST_OBJECTS)
+            .map(|index| output(&index.to_string()))
+            .collect();
+
+        // A duplicate is absorbed, so a full inventory still merges.
+        let merged = merge_outputs(inventoried.clone(), vec![output("0")]).unwrap();
+        assert_eq!(merged.len(), MAX_OUTPUT_MANIFEST_OBJECTS);
+
+        let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
+        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
     }
 
     #[test]

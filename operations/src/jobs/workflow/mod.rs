@@ -39,7 +39,7 @@ use crate::driver::DriverContext;
 use compute::{RecoveryAction, recovery_action};
 use workspace::{
     capture_outputs, collect_outputs, ensure_group_write, ensure_workspace_bucket, load_inputs,
-    stage_inputs,
+    merge_outputs, stage_inputs,
 };
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
@@ -832,7 +832,7 @@ pub(crate) async fn finalize_attempt(
 
     match status.phase {
         AttemptPhase::Exited { code: 0 } => {
-            let Some(mut outputs) = collect_or_park(context, job_id, token, spec, bucket).await
+            let Some(inventoried) = collect_or_park(context, job_id, token, spec, bucket).await
             else {
                 return;
             };
@@ -841,7 +841,11 @@ pub(crate) async fn finalize_attempt(
             else {
                 return;
             };
-            outputs.extend(captured);
+            let Some(outputs) =
+                merge_or_park(context, job_id, token, bucket, inventoried, captured).await
+            else {
+                return;
+            };
             let Some(logs) = capture_or_park(context, job_id, token, backend, fence).await else {
                 return;
             };
@@ -925,7 +929,7 @@ async fn finalize_cancel(
             };
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
-                    let Some(mut outputs) =
+                    let Some(inventoried) =
                         collect_or_park(context, job_id, token, spec, bucket).await
                     else {
                         return;
@@ -935,7 +939,11 @@ async fn finalize_cancel(
                     else {
                         return;
                     };
-                    outputs.extend(captured);
+                    let Some(outputs) =
+                        merge_or_park(context, job_id, token, bucket, inventoried, captured).await
+                    else {
+                        return;
+                    };
                     let result = execution_result_for(bucket, Some(0), outputs, logs);
                     let record = terminal_complete(storage, job_id, token, result).await;
                     cleanup_and_crate(context, job_id, record).await;
@@ -1174,21 +1182,7 @@ async fn collect_or_park(
         Ok(outputs) => Some(outputs),
         Err(error) if error.kind == aruna_core::structs::JobErrorKind::Permanent => {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
-            match read_job_record(&context.storage_handle, job_id, None).await {
-                Ok(Some(record)) => {
-                    fail_and_crate(context, job_id, token, &record, error).await;
-                }
-                _ => {
-                    let _ = mark_indeterminate(
-                        &context.storage_handle,
-                        job_id,
-                        token,
-                        error,
-                        unix_timestamp_millis(),
-                    )
-                    .await;
-                }
-            }
+            fail_or_park(context, job_id, token, error).await;
             None
         }
         Err(error) => {
@@ -1201,6 +1195,44 @@ async fn collect_or_park(
                 unix_timestamp_millis(),
             )
             .await;
+            None
+        }
+    }
+}
+
+/// Terminalize on a permanent output error so cleanup runs; a job record that
+/// cannot be read is parked instead, leaving the terminal write to a later pass.
+async fn fail_or_park(context: &DriverContext, job_id: JobId, token: ulid::Ulid, error: JobError) {
+    match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => fail_and_crate(context, job_id, token, &record, error).await,
+        _ => {
+            let _ = mark_indeterminate(
+                &context.storage_handle,
+                job_id,
+                token,
+                error,
+                unix_timestamp_millis(),
+            )
+            .await;
+        }
+    }
+}
+
+/// Merge the inventoried and exported manifests. Overflowing the keyed limit is a
+/// permanent error, exactly as it is during inventory.
+async fn merge_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    bucket: &str,
+    inventoried: Vec<OutputObject>,
+    captured: Vec<OutputObject>,
+) -> Option<Vec<OutputObject>> {
+    match merge_outputs(inventoried, captured) {
+        Ok(outputs) => Some(outputs),
+        Err(error) => {
+            warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output manifest merge failed permanently; failing");
+            fail_or_park(context, job_id, token, error).await;
             None
         }
     }
