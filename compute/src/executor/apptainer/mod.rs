@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_uses_process_identity() {
+    fn spec_uses_identity() {
         // Wiring check: a foreign run_as is rejected under any runner uid.
         let context = identity_context();
         let mut spec = identity_spec(&context);
