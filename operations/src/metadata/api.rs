@@ -600,7 +600,7 @@ async fn load_metadata_realm_nodes_with_status(
                 error = %error,
                 "realm node discovery failed, using best-effort local-only metadata results"
             );
-            (HashSet::new(), context.net_handle.is_some())
+            (HashSet::new(), true)
         }
     };
     let (nodes, failed) = nodes;
