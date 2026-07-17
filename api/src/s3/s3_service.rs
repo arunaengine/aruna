@@ -1257,7 +1257,7 @@ impl S3 for ArunaS3Service {
         Ok(S3Response::new(ListObjectsOutput {
             name: Some(bucket),
             prefix: prefix.map(&encode_field),
-            marker,
+            marker: marker.map(&encode_field),
             max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
             is_truncated: Some(is_truncated),
             next_marker,
