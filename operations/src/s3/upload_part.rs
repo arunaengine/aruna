@@ -1,5 +1,5 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -58,6 +58,8 @@ pub enum UploadPartError {
     ChecksumMismatch(&'static str),
     #[error("blob write failed: {0}")]
     WriteFailed(String),
+    #[error("blob backend write failed: {0}")]
+    BlobWriteFailed(String),
     #[error("UploadPart failed")]
     UploadPartFailed,
 }
@@ -163,10 +165,14 @@ impl UploadPartOperation {
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            // A failed body stream (e.g. trailer checksum mismatch) must map
-            // to a client error, not an invalid-state 500.
+            // Only a client-sourced stream fault may become a client error; a
+            // server-side write fault must stay retryable, never a bad digest.
+            Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
+                return self.cleanup_failed_write(UploadPartError::WriteFailed(message));
+            }
             Event::Blob(BlobEvent::Error(error)) => {
-                return self.cleanup_failed_write(UploadPartError::WriteFailed(error.to_string()));
+                return self
+                    .cleanup_failed_write(UploadPartError::BlobWriteFailed(error.to_string()));
             }
             _ => return self.emit_error(UploadPartError::InvalidOperationState),
         };
@@ -438,15 +444,44 @@ mod test {
         });
         op.state = UploadPartState::WritePart;
 
-        let effects = op.step(Event::Blob(BlobEvent::Error(
-            aruna_core::errors::BlobError::WriteError("checksum mismatch".to_string()),
-        )));
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::StreamFailed(
+            "checksum mismatch".to_string(),
+        ))));
 
         assert!(effects.is_empty());
         assert!(op.is_complete());
         assert!(matches!(
             op.finalize(),
             Err(UploadPartError::WriteFailed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_server_write() {
+        // A full or flapping disk must never be reported as a client bad digest.
+        let mut op = UploadPartOperation::new(UploadPartInput {
+            bucket: "mybucket".to_string(),
+            key: "object.txt".to_string(),
+            upload_id: Ulid::r#gen(),
+            part_number: 1,
+            content_length: None,
+            body: None,
+            created_by: test_user_id(),
+            compressed: false,
+            encrypted: false,
+            expected_checksums: Vec::new(),
+        });
+        op.state = UploadPartState::WritePart;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+            "No space left on device".to_string(),
+        ))));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(UploadPartError::BlobWriteFailed(_))
         ));
     }
 

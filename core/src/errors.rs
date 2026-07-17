@@ -50,8 +50,12 @@ pub enum BlobError {
     OutboardCreationFailed(String),
     #[error("Failed to open connection: {0}")]
     ConnectionFailed(String),
+    /// Server-side write fault: backend writer, close, or operator failure.
     #[error("Write error: {0}")]
     WriteError(String),
+    /// Client-sourced body stream fault; the request, not the node, is at fault.
+    #[error("Stream failed: {0}")]
+    StreamFailed(String),
     #[error("Read error: {0}")]
     ReadError(String),
     #[error("Delete error: {0}")]

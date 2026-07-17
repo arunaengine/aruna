@@ -40,7 +40,7 @@ impl BlobHandler {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     abort_partial_writer(&mut writer, &operator, &storage_path).await;
-                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                    return BlobEvent::Error(BlobError::StreamFailed(err.to_string()));
                 }
             };
             hasher.update(&bytes);

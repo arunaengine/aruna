@@ -8,7 +8,7 @@ use crate::usage_stats::{
     schedule_usage_snapshot_publish_effect,
 };
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -71,6 +71,8 @@ pub enum PutObjectError {
     ChecksumMismatch(&'static str),
     #[error("blob write failed: {0}")]
     WriteFailed(String),
+    #[error("blob backend write failed: {0}")]
+    BlobWriteFailed(String),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
@@ -167,10 +169,14 @@ impl PutObjectOperation {
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         let location = match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            // A failed body stream (e.g. trailer checksum mismatch) must map
-            // to a client error, not an invalid-state 500.
+            // Only a client-sourced stream fault may become a client error; a
+            // server-side write fault must stay retryable, never a bad digest.
+            Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
+                return self.cleanup_failed_write(PutObjectError::WriteFailed(message));
+            }
             Event::Blob(BlobEvent::Error(error)) => {
-                return self.cleanup_failed_write(PutObjectError::WriteFailed(error.to_string()));
+                return self
+                    .cleanup_failed_write(PutObjectError::BlobWriteFailed(error.to_string()));
             }
             _ => return self.emit_error(PutObjectError::InvalidOperationState),
         };
@@ -833,7 +839,7 @@ mod test {
     use crate::usage_stats::{QuotaGate, UsageCounterUpdate};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
+    use aruna_core::errors::{BlobError, StorageError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
@@ -936,13 +942,36 @@ mod test {
         ));
         op.state = PutObjectState::WriteBlob;
 
-        let effects = op.step(Event::Blob(BlobEvent::Error(
-            aruna_core::errors::BlobError::WriteError("checksum mismatch".to_string()),
-        )));
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::StreamFailed(
+            "checksum mismatch".to_string(),
+        ))));
 
         assert!(effects.is_empty());
         assert!(op.is_complete());
         assert!(matches!(op.finalize(), Err(PutObjectError::WriteFailed(_))));
+    }
+
+    #[test]
+    fn rejects_server_write() {
+        // A full or flapping disk must never be reported as a client bad digest.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(put_config(
+            realm_id,
+            Ulid::r#gen(),
+            iroh::SecretKey::generate().public(),
+        ));
+        op.state = PutObjectState::WriteBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+            "No space left on device".to_string(),
+        ))));
+
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+        assert!(matches!(
+            op.finalize(),
+            Err(PutObjectError::BlobWriteFailed(_))
+        ));
     }
 
     #[test]

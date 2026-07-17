@@ -453,6 +453,18 @@ mod tests {
         );
     }
 
+    // A server-side write fault (full or flapping disk) must stay a retryable
+    // InternalError; reporting BadDigest would tell SDKs the data was corrupt.
+    #[test]
+    fn maps_backend_write() {
+        for error in [
+            PutObjectError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+            UploadPartError::BlobWriteFailed("No space left on device".to_string()).into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::InternalError);
+        }
+    }
+
     // UploadNotOpen from upload/complete/abort maps to NoSuchUpload (404).
     #[test]
     fn maps_not_open() {
