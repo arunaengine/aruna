@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   report:
     name: Generate Coverage Report
@@ -16,7 +20,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-      RUSTFLAGS: -Cinstrument-coverage
+      # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
+      # dead weight that OOM-kills the 16 GB runner during linking.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_BUILD_JOBS: 2
+      RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
       LLVM_PROFILE_FILE: cargo-test-%p-%m.profraw
 
     steps:
