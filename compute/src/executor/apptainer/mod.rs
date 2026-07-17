@@ -63,15 +63,10 @@ impl ApptainerBackend {
             if !runtime::cgroup_empty(&payload.cgroup)? {
                 return Ok(running_status(&directory));
             }
-            return Ok(lost_status(&directory));
+            return settle_status(&directory, running_status(&directory));
         }
-        if let Some(supervisor) =
-            read_optional::<ProcessRecord>(&directory.join("supervisor.json"))?
-        {
-            if runtime::process_live(&supervisor)? {
-                return Ok(submitted_status(&directory));
-            }
-            return Ok(lost_status(&directory));
+        if directory.join("supervisor.json").exists() {
+            return settle_status(&directory, submitted_status(&directory));
         }
         Err(BackendError::NotFound(context.attempt.external_name()))
     }
@@ -999,6 +994,24 @@ fn lost_status(directory: &Path) -> AttemptStatus {
     }
 }
 
+/// The supervisor writes `status.json` only after reaping the payload, so a live
+/// supervisor means the terminal record is still pending rather than lost.
+fn settle_status(directory: &Path, pending: AttemptStatus) -> Result<AttemptStatus, BackendError> {
+    let supervisor = read_optional::<ProcessRecord>(&directory.join("supervisor.json"))?;
+    if supervisor
+        .map(|record| runtime::process_live(&record))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Ok(pending);
+    }
+    // Re-read: the supervisor may have written the record and exited since.
+    if let Some(status) = read_optional::<StatusRecord>(&directory.join("status.json"))? {
+        return Ok(to_status(directory, status));
+    }
+    Ok(lost_status(directory))
+}
+
 fn host_path(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
 }
@@ -1069,6 +1082,102 @@ mod tests {
         };
 
         backend.cleanup(&context).await.unwrap();
+    }
+
+    fn test_backend(root: &Path) -> ApptainerBackend {
+        ApptainerBackend::with_config(ApptainerConfig {
+            state_root: root.join("state"),
+            sif_cache: root.join("cache"),
+            cgroup_root: root.join("cgroup"),
+            stop_grace: Duration::from_secs(1),
+            pull_deadline: Duration::from_secs(30),
+        })
+        .unwrap()
+    }
+
+    fn live_record() -> ProcessRecord {
+        runtime::process_record(std::process::id()).unwrap()
+    }
+
+    /// Own pid with foreign start ticks: the pidfd opens but identity mismatches.
+    fn dead_record() -> ProcessRecord {
+        ProcessRecord {
+            pid: std::process::id(),
+            start_ticks: u64::MAX,
+        }
+    }
+
+    fn reaped_attempt(backend: &ApptainerBackend, context: &FenceContext) -> PathBuf {
+        let directory = backend.state.attempt_dir(context);
+        std::fs::create_dir_all(&directory).unwrap();
+        write_json(
+            &directory.join("payload.json"),
+            &PayloadRecord {
+                process: dead_record(),
+                cgroup: backend.cgroup_path(context),
+            },
+        )
+        .unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    async fn pending_stays_running() {
+        // Payload reaped and cgroup drained, but the supervisor has not written
+        // status.json yet: a success must never latch as terminally Failed.
+        let root = tempdir().unwrap();
+        let backend = test_backend(root.path());
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 6),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+        drop(backend.state.control(&context).unwrap());
+        let directory = reaped_attempt(&backend, &context);
+        write_json(&directory.join("supervisor.json"), &live_record()).unwrap();
+
+        let status = backend.attempt_status(&context).unwrap();
+
+        assert!(!status.is_terminal(), "got {status:?}");
+    }
+
+    #[tokio::test]
+    async fn lost_supervisor_fails() {
+        // Same evidence, but with the supervisor gone the record can never land.
+        let root = tempdir().unwrap();
+        let backend = test_backend(root.path());
+        let context = FenceContext {
+            attempt: AttemptRef::new("job", 7),
+            attempt_epoch: 1,
+            controller_generation: 1,
+        };
+        drop(backend.state.control(&context).unwrap());
+        let directory = reaped_attempt(&backend, &context);
+        write_json(&directory.join("supervisor.json"), &dead_record()).unwrap();
+
+        let status = backend.attempt_status(&context).unwrap();
+
+        assert!(matches!(status.phase, AttemptPhase::Failed { .. }));
+    }
+
+    #[test]
+    fn reads_late_status() {
+        // The record may land between the caller's first read and this check.
+        let root = tempdir().unwrap();
+        write_json(&root.path().join("supervisor.json"), &dead_record()).unwrap();
+        write_json(
+            &root.path().join("status.json"),
+            &StatusRecord {
+                phase: AttemptPhase::Exited { code: 0 },
+                started_at_ms: Some(1),
+                finished_at_ms: 2,
+            },
+        )
+        .unwrap();
+
+        let status = settle_status(root.path(), running_status(root.path())).unwrap();
+
+        assert!(matches!(status.phase, AttemptPhase::Exited { code: 0 }));
     }
 
     #[tokio::test]
