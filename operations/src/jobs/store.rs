@@ -772,7 +772,7 @@ pub async fn handoff_external_attempt(
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     let mut released = false;
-    let (record, _) = mutate_attempt_control(storage, job_id, |record, control| {
+    let result = mutate_attempt_control(storage, job_id, |record, control| {
         released = false;
         guard_token(record, token)?;
         if record.execution_class != JobExecutionClass::ExternalAttempt
@@ -790,13 +790,28 @@ pub async fn handoff_external_attempt(
         released = true;
         Ok(JobMutation::Persist)
     })
-    .await?;
+    .await;
 
-    Ok(if released {
-        ReleaseOutcome::Released(record)
-    } else {
-        ReleaseOutcome::Skipped
-    })
+    match result {
+        Ok((record, _)) => Ok(if released {
+            ReleaseOutcome::Released(record)
+        } else {
+            ReleaseOutcome::Skipped
+        }),
+        // A job interrupted while still staging has no attempt intent; release
+        // its lease instead of leaving it to the sweep's attempt charge.
+        Err(JobMutationError::MissingControl) => {
+            let record = read_job_record(storage, job_id, None)
+                .await
+                .map_err(JobMutationError::Storage)?;
+            if record.is_some_and(|record| record.attempt_intent.is_none()) {
+                release_job(storage, job_id, token, now_ms).await
+            } else {
+                Err(JobMutationError::MissingControl)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
@@ -1782,6 +1797,34 @@ mod tests {
         let claim = adopted.claim.unwrap();
         assert_ne!(claim.claim_token, live_token);
         assert_eq!(claim.holder_node_id, node_id(4));
+    }
+
+    #[tokio::test]
+    async fn handoff_releases_preintent() {
+        // Shutdown while staging: no attempt intent exists yet, so the lease
+        // must be released instead of failing with MissingControl.
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x21; 16]);
+        let mut record = queued_record(job_id);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Preparing;
+        let token = Ulid::r#gen();
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: token,
+            lease_expires_at_ms: 10_000,
+        });
+        insert_job(&storage, &record).await.unwrap();
+
+        let outcome = handoff_external_attempt(&storage, job_id, token, 2_000)
+            .await
+            .unwrap();
+
+        let ReleaseOutcome::Released(released) = outcome else {
+            panic!("pre-intent handoff must release the job");
+        };
+        assert_eq!(released.state, JobState::Queued);
+        assert!(released.claim.is_none());
     }
 
     #[tokio::test]
