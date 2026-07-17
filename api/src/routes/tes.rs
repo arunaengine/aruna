@@ -191,13 +191,15 @@ pub struct TesOutputFileLog {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct TesTaskLog {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Required by TES 1.1: always serialized, empty until the task is terminal.
+    #[serde(default)]
     pub logs: Vec<TesExecutorLog>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_time: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Required by TES 1.1: always serialized, empty until outputs exist.
+    #[serde(default)]
     pub outputs: Vec<TesOutputFileLog>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_logs: Vec<String>,
@@ -1132,8 +1134,15 @@ fn build_task_log(record: &JobRecord, _base_url: &str) -> TesTaskLog {
         .map(|error| vec![error.message.clone()])
         .unwrap_or_default();
 
+    // Executor logs are emitted only once the task is terminal; a running task
+    // has no meaningful (and TES-required) exit_code yet.
+    let logs = if record.state.is_terminal() {
+        vec![executor_log]
+    } else {
+        Vec::new()
+    };
     TesTaskLog {
-        logs: vec![executor_log],
+        logs,
         start_time,
         end_time: record.finished_at_ms.map(rfc3339),
         outputs,
@@ -1574,6 +1583,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn emits_required_logs() {
+        // TES 1.1 requires taskLog.logs and taskLog.outputs to be present;
+        // executor logs appear only once the task is terminal.
+        let group = Ulid::from_bytes([5u8; 16]);
+        let (spec, _) = map_task_to_spec(&sample_task(group), None).unwrap();
+        let mut record = execution_record(JobId::from_bytes([9u8; 16]), user(2), spec);
+
+        let running = build_task_log(&record, "");
+        assert!(running.logs.is_empty());
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(json["outputs"], serde_json::json!([]));
+        assert_eq!(json["logs"], serde_json::json!([]));
+
+        record.state = JobState::Succeeded;
+        record.result = Some(JobResultPayload::Execution {
+            exit_code: Some(0),
+            workspace_bucket: "ws".to_string(),
+            outputs: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        let terminal = build_task_log(&record, "");
+        assert_eq!(terminal.logs.len(), 1);
+        assert_eq!(terminal.logs[0].exit_code, Some(0));
+    }
+
     #[tokio::test]
     async fn redacts_internal_detail() {
         // Raw server error text must never reach a TES client on 500.
@@ -1944,7 +1980,7 @@ mod tests {
         let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
         let queued = project_task(&record, TesView::Full, "http://x");
         assert!(queued.logs[0].start_time.is_none());
-        assert!(queued.logs[0].logs[0].start_time.is_none());
+        assert!(queued.logs[0].logs.is_empty());
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(2_000);
         record.workspace_bucket = Some("ws-x".to_string());
