@@ -100,7 +100,8 @@ mod tests {
     use crate::executor::{BackendCaps, ExecutorBackend};
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
-        LogTails, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+        LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
+        TombstoneSpec, UserSpec,
     };
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
@@ -117,6 +118,9 @@ mod tests {
                 file_staging: true,
                 direct_s3: false,
             }
+        }
+        fn run_identity(&self) -> UserSpec {
+            NOBODY
         }
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())

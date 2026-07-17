@@ -407,7 +407,13 @@ pub(super) async fn resume_attempt(
                     .await;
                     return false;
                 };
-                let task_spec = build_task_spec(&spec, &fence.attempt, pinned_image, inputs);
+                let task_spec = build_task_spec(
+                    &spec,
+                    &fence.attempt,
+                    pinned_image,
+                    inputs,
+                    backend.run_identity(),
+                );
                 let status = match backend.submit(&fence, &task_spec, &cancel).await {
                     Ok(status) => status,
                     Err(aruna_core::compute::BackendError::Cancelled) => {

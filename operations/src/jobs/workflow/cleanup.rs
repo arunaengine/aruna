@@ -134,8 +134,8 @@ mod tests {
     use aruna_compute::ExecutorRegistry;
     use aruna_compute::executor::logs::LogSink;
     use aruna_core::compute::{
-        AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails,
-        ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
+        AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
+        ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
@@ -175,6 +175,10 @@ mod tests {
     impl ExecutorBackend for StubBackend {
         fn kind(&self) -> ExecutorKind {
             self.kind.clone()
+        }
+
+        fn run_identity(&self) -> UserSpec {
+            NOBODY
         }
 
         async fn health(&self) -> Result<(), BackendError> {

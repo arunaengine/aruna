@@ -96,9 +96,12 @@ Required configuration:
 - `ARUNA_COMPUTE_STOP_GRACE`: graceful stop interval in seconds; defaults to
   `10`.
 
-The Aruna service must run as non-root user and group `65534:65534`. Apptainer
-does not expose root, fakeroot, or a configurable task user. Per-attempt disk
-ceilings are not supported and requests containing one are rejected.
+Apptainer performs no user switch at launch, so tasks run as the Aruna service's
+own identity and the task manifest reports that identity rather than a fixed
+`65534:65534`. The service must run as a non-root user; root is rejected.
+Apptainer does not expose root, fakeroot, or a configurable task user.
+Per-attempt disk ceilings are not supported and requests containing one are
+rejected.
 
 Launch uses two already-execed internal modes. The supervisor creates its own
 session and holds `exec.lock`; the launcher creates its own process group,
@@ -112,8 +115,10 @@ does not empty. A recorded launch with a dead supervisor, an empty cgroup, and
 no exit record is LOST terminal evidence and is never relaunched. A free
 `exec.lock` alone is not launch permission.
 
-Health checks the Apptainer binary and version, state-root durability, and the
-ability to create and kill an empty child under the delegated cgroup root. Crash
+Health checks the Apptainer binary and version, that the service process is not
+root, state-root durability, and the ability to create and kill an empty child
+under the delegated cgroup root. A task whose `run_as` is root, or is not the
+process identity, is rejected, because no user switch happens at launch. Crash
 survival still depends on the service manager preserving the delegated cgroup;
 configure its kill mode accordingly.
 

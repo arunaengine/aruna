@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES,
+    ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NOBODY,
     ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, normalize_container_path,
+    TombstoneSpec, UserSpec, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -655,6 +655,11 @@ impl ExecutorBackend for KubernetesBackend {
         }
     }
 
+    /// The pod securityContext switches users at launch, so the identity is pinned.
+    fn run_identity(&self) -> UserSpec {
+        NOBODY
+    }
+
     async fn health(&self) -> Result<(), BackendError> {
         let namespaces: Api<Namespace> = Api::all(self.client.clone());
         namespaces
@@ -1113,7 +1118,7 @@ fn validate_spec(
         ));
     }
     StageLayout::from_spec(spec)?;
-    if spec.security.run_as.uid != 65_534 || spec.security.run_as.gid != 65_534 {
+    if spec.security.run_as != NOBODY {
         return Err(BackendError::InvalidSpec(
             "Kubernetes tasks must run as 65534:65534".to_string(),
         ));

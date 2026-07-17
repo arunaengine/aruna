@@ -178,6 +178,12 @@ pub struct UserSpec {
     pub gid: u32,
 }
 
+/// The unprivileged identity backends pin when they perform a real user switch.
+pub const NOBODY: UserSpec = UserSpec {
+    uid: 65_534,
+    gid: 65_534,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkAccess {
     Isolated,
@@ -199,10 +205,7 @@ pub struct SecurityContext {
 impl Default for SecurityContext {
     fn default() -> Self {
         Self {
-            run_as: UserSpec {
-                uid: 65_534,
-                gid: 65_534,
-            },
+            run_as: NOBODY,
             drop_all_caps: true,
             no_new_privileges: true,
             network: NetworkAccess::Isolated,

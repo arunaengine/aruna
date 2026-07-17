@@ -11,7 +11,7 @@ use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, LogLimits, LogStream, LogTails, MAX_TRANSFER_BYTES, NetworkAccess,
     ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, normalize_container_path,
+    TombstoneSpec, UserSpec, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -272,6 +272,11 @@ impl ExecutorBackend for ApptainerBackend {
         }
     }
 
+    /// Apptainer performs no user switch, so tasks inherit the service identity.
+    fn run_identity(&self) -> UserSpec {
+        process_identity()
+    }
+
     async fn health(&self) -> Result<(), BackendError> {
         let output = TokioCommand::new("apptainer")
             .arg("version")
@@ -283,7 +288,7 @@ impl ExecutorBackend for ApptainerBackend {
                 "Apptainer version check failed".to_string(),
             ));
         }
-        if rustix::process::geteuid().as_raw() == 0 {
+        if is_root(process_identity()) {
             return Err(BackendError::Unavailable(
                 "Apptainer executor must run as a non-root user".to_string(),
             ));
@@ -624,6 +629,35 @@ pub fn dispatch(mode: &str) -> i32 {
     if result.is_ok() { 0 } else { 1 }
 }
 
+/// Read live rather than cached so the manifest identity can never disagree
+/// with the identity `validate_spec` checks at launch.
+fn process_identity() -> UserSpec {
+    UserSpec {
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+    }
+}
+
+fn is_root(user: UserSpec) -> bool {
+    user.uid == 0 || user.gid == 0
+}
+
+/// Apptainer performs no user switch, so a `run_as` other than the process
+/// identity would make the manifest lie about who the task ran as.
+fn check_identity(run_as: UserSpec, process: UserSpec) -> Result<(), BackendError> {
+    if is_root(run_as) {
+        return Err(BackendError::InvalidSpec(
+            "Apptainer tasks must not run as root".to_string(),
+        ));
+    }
+    if run_as != process {
+        return Err(BackendError::InvalidSpec(
+            "Apptainer run_as must match the Aruna process user".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendError> {
     if context.attempt != spec.attempt {
         return Err(BackendError::InvalidSpec(
@@ -636,14 +670,7 @@ fn validate_spec(context: &FenceContext, spec: &TaskSpec) -> Result<(), BackendE
         ));
     }
     StageLayout::from_spec(spec)?;
-    if (spec.security.run_as.uid != 65_534 || spec.security.run_as.gid != 65_534)
-        && (rustix::process::geteuid().as_raw() != spec.security.run_as.uid
-            || rustix::process::getegid().as_raw() != spec.security.run_as.gid)
-    {
-        return Err(BackendError::InvalidSpec(
-            "Apptainer run_as must match the Aruna process user".to_string(),
-        ));
-    }
+    check_identity(spec.security.run_as, process_identity())?;
     match (spec.staging_mode, spec.security.network) {
         (StagingMode::Files, NetworkAccess::Isolated)
         | (StagingMode::DirectS3, NetworkAccess::Open) => {}
@@ -1021,7 +1048,7 @@ fn io_error(error: std::io::Error) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::compute::AttemptRef;
+    use aruna_core::compute::{AttemptRef, NOBODY};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1079,21 +1106,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepts_default_identity() {
-        let context = FenceContext {
+    fn identity_spec(context: &FenceContext) -> TaskSpec {
+        TaskSpec::new(
+            context.attempt.clone(),
+            "repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+    }
+
+    fn identity_context() -> FenceContext {
+        FenceContext {
             attempt: AttemptRef::new("job", 3),
             attempt_epoch: 1,
             controller_generation: 1,
-        };
-        let mut spec = TaskSpec::new(
-            context.attempt.clone(),
-            "repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        }
+    }
+
+    #[test]
+    fn accepts_matching_identity() {
+        // Identities are injected: the check must hold whatever uid the runner has.
+        let user = UserSpec { uid: 1234, gid: 56 };
+
+        assert!(check_identity(user, user).is_ok());
+    }
+
+    #[test]
+    fn rejects_foreign_identity() {
+        let process = UserSpec { uid: 1234, gid: 56 };
+        let foreign = UserSpec { uid: 1235, gid: 56 };
+
+        assert!(check_identity(foreign, process).is_err());
+        assert!(check_identity(NOBODY, process).is_err());
+    }
+
+    #[test]
+    fn rejects_root_identity() {
+        // Root must lose even when it matches a root service, which is health's gate.
+        let root = UserSpec { uid: 0, gid: 0 };
+        let root_group = UserSpec { uid: 1234, gid: 0 };
+
+        assert!(check_identity(root, root).is_err());
+        assert!(check_identity(root_group, root_group).is_err());
+        assert!(is_root(root) && is_root(root_group));
+        assert!(!is_root(UserSpec { uid: 1234, gid: 56 }));
+    }
+
+    #[test]
+    fn spec_uses_process_identity() {
+        // Wiring check: a foreign run_as is rejected under any runner uid.
+        let context = identity_context();
+        let mut spec = identity_spec(&context);
+        spec.security.run_as = process_identity();
+        assert_eq!(
+            validate_spec(&context, &spec).is_ok(),
+            !is_root(spec.security.run_as)
         );
 
-        assert!(validate_spec(&context, &spec).is_ok());
-        spec.security.run_as.uid = rustix::process::geteuid().as_raw() ^ 1;
-        spec.security.run_as.gid = rustix::process::getegid().as_raw();
+        spec.security.run_as.uid ^= 1;
         assert!(validate_spec(&context, &spec).is_err());
     }
 

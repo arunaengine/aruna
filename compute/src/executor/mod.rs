@@ -1,6 +1,6 @@
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
-    ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+    ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
 };
 use async_trait::async_trait;
 use tokio::time::{Duration, sleep};
@@ -64,6 +64,11 @@ pub trait ExecutorBackend: Send + Sync {
     fn capabilities(&self) -> BackendCaps {
         BackendCaps::default()
     }
+
+    /// The identity tasks actually run as, which the task manifest reports.
+    /// Backends that perform a real user switch pin it; backends that perform
+    /// none MUST report the service's own identity rather than a wish.
+    fn run_identity(&self) -> UserSpec;
 
     /// Startup and advertisement gate.
     async fn health(&self) -> Result<(), BackendError>;

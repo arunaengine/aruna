@@ -11,8 +11,8 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::executor::logs::NullSink;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind,
-    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, StagingMode, TaskInput,
-    TaskSpec, TombstoneSpec,
+    FenceContext, LogLimits, LogTails, ReconcileEvidence, ResourceRequest, SecurityContext,
+    StagingMode, TaskInput, TaskSpec, TombstoneSpec, UserSpec,
 };
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -150,7 +150,13 @@ pub async fn run_execution_job(
                 return None;
             }
         };
-        let task_spec = build_task_spec(&spec, &attempt, &pinned_image, inputs);
+        let task_spec = build_task_spec(
+            &spec,
+            &attempt,
+            &pinned_image,
+            inputs,
+            backend.run_identity(),
+        );
 
         // Write-ahead the attempt intent BEFORE submit so a lost attempt is adoptable.
         let intent = AttemptIntent {
@@ -344,6 +350,7 @@ fn build_task_spec(
     attempt: &AttemptRef,
     pinned_image: &str,
     inputs: Vec<TaskInput>,
+    run_as: UserSpec,
 ) -> TaskSpec {
     let resources = ResourceRequest {
         cpu_cores: spec.resources.cpu_cores,
@@ -367,7 +374,10 @@ fn build_task_spec(
         secret_env: std::collections::BTreeMap::new(),
         resources,
         workspace: None,
-        security: Default::default(),
+        security: SecurityContext {
+            run_as,
+            ..Default::default()
+        },
         log_limits: Default::default(),
         inputs,
         staging_mode: StagingMode::Files,
@@ -563,7 +573,13 @@ async fn retry_same_submit(
         .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
         .map(|intent| intent.pinned_image.as_str())
         .ok_or_else(|| BackendError::Conflict("attempt intent mismatch".to_string()))?;
-    let task_spec = build_task_spec(spec, &fence.attempt, pinned_image, inputs);
+    let task_spec = build_task_spec(
+        spec,
+        &fence.attempt,
+        pinned_image,
+        inputs,
+        backend.run_identity(),
+    );
     backend.submit(fence, &task_spec, cancel).await
 }
 
@@ -1372,7 +1388,7 @@ mod tests {
     use crate::jobs::workflow::workspace::mint_workspace_credential;
     use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
     use aruna_compute::executor::logs::LogSink;
-    use aruna_core::compute::{LogTails, TaskOutput};
+    use aruna_core::compute::{LogTails, NOBODY, TaskOutput};
     use aruna_core::structs::{ComputeResources, JobErrorKind, JobState, RealmId};
     use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -1413,6 +1429,9 @@ mod tests {
     impl ExecutorBackend for StubBackend {
         fn kind(&self) -> ExecutorKind {
             ExecutorKind::Docker
+        }
+        fn run_identity(&self) -> UserSpec {
+            NOBODY
         }
         async fn health(&self) -> Result<(), BackendError> {
             Ok(())
@@ -1966,11 +1985,30 @@ mod tests {
             &AttemptRef::new("job", 1),
             "alpine@sha256:digest",
             Vec::new(),
+            NOBODY,
         );
 
         assert_eq!(
             spec.resources.max_walltime,
             Some(Duration::from_secs(86_400))
         );
+    }
+
+    #[test]
+    fn carries_backend_identity() {
+        // The manifest must report the backend's real identity, not the 65534 default.
+        let run_as = UserSpec {
+            uid: NOBODY.uid ^ 1,
+            gid: NOBODY.gid ^ 1,
+        };
+        let spec = build_task_spec(
+            &execution_spec(),
+            &AttemptRef::new("job", 1),
+            "alpine@sha256:digest",
+            Vec::new(),
+            run_as,
+        );
+
+        assert_eq!(spec.security.run_as, run_as);
     }
 }

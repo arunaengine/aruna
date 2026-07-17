@@ -9,8 +9,8 @@ use std::time::Duration;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
     CancelEvidence, ExecutorKind, FenceContext, InputStream, LogLimits, LogStream, LogTails,
-    MAX_TRANSFER_BYTES, NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskInput,
-    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+    MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskInput, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec,
 };
 use async_trait::async_trait;
 use bollard::models::{
@@ -1038,6 +1038,11 @@ impl ExecutorBackend for DockerBackend {
             file_staging: true,
             direct_s3: true,
         }
+    }
+
+    /// Docker switches users at launch via `--user`, so the identity is pinned.
+    fn run_identity(&self) -> UserSpec {
+        NOBODY
     }
 
     async fn health(&self) -> Result<(), BackendError> {
