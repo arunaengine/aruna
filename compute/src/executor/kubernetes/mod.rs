@@ -984,7 +984,17 @@ impl ExecutorBackend for KubernetesBackend {
         context: &FenceContext,
         _spec: &TombstoneSpec,
     ) -> Result<TombstoneEvidence, BackendError> {
-        let mut job = self.get_job(context).await?;
+        // A cancel racing submit leaves no Job; the absence itself is terminal.
+        let mut job = match self.get_job(context).await {
+            Ok(job) => job,
+            Err(BackendError::NotFound(_)) => {
+                return Ok(TombstoneEvidence {
+                    backend_ref: context.attempt.external_name(),
+                    attempt_epoch: context.attempt_epoch,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if job_state(&job) != Some("tombstone") {
             job = self.patch_state(context, "tombstone", true).await?;
         }
@@ -1695,6 +1705,24 @@ mod tests {
                 }
             }]
         })
+    }
+
+    #[tokio::test]
+    async fn tombstones_absent_job() {
+        // Cancel between ready and submit leaves no Job; terminal cleanup
+        // must still converge instead of retrying forever.
+        let backend = KubernetesBackend {
+            client: fake_client(|_, _| (404, status_json(404))),
+            config: test_config(),
+        };
+
+        let evidence = backend
+            .tombstone(&context(), &TombstoneSpec { terminal_ref: None })
+            .await
+            .unwrap();
+
+        assert_eq!(evidence.backend_ref, "aruna-job-a1");
+        assert_eq!(evidence.attempt_epoch, 7);
     }
 
     #[tokio::test]
