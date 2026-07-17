@@ -1352,11 +1352,18 @@ impl TesError {
 
 impl IntoResponse for TesError {
     fn into_response(self) -> Response {
+        // Internal detail is logged, never returned to the client.
+        let message = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(detail = %self.message, "TES internal error");
+            "Internal server error".to_string()
+        } else {
+            self.message
+        };
         tes_json_response(
             self.status,
             TesErrorPayload {
                 status_code: self.status.as_u16(),
-                msg: self.message,
+                msg: message,
             },
         )
     }
@@ -1541,6 +1548,25 @@ mod tests {
             1_000,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn redacts_internal_detail() {
+        // Raw server error text must never reach a TES client on 500.
+        let response = TesError::internal("secret backend detail").into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["msg"], "Internal server error");
+
+        let response = TesError::bad_request("visible reason").into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["msg"], "visible reason");
     }
 
     #[test]
