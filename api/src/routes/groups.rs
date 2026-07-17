@@ -26,6 +26,7 @@ use aruna_operations::remove_group_role::{
 use aruna_operations::remove_user_from_group::{
     RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
 };
+use aruna_operations::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -144,6 +145,8 @@ pub struct GroupMemberRoleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupMemberResponse {
     pub user_id: String,
+    /// Display name from the user directory; None when the user is unresolvable.
+    pub name: Option<String>,
     pub roles: Vec<GroupMemberRoleResponse>,
 }
 
@@ -685,14 +688,14 @@ pub async fn list_group_members(
         return Err(ServerError::Forbidden);
     }
 
-    let mut members: HashMap<String, Vec<GroupMemberRoleResponse>> = HashMap::new();
+    let mut roles_by_user: HashMap<UserId, Vec<GroupMemberRoleResponse>> = HashMap::new();
     for (role_id, role) in &auth_doc.roles {
         for user in &role.assigned_users {
             if user.is_nil() {
                 continue;
             }
-            members
-                .entry(user.to_string())
+            roles_by_user
+                .entry(*user)
                 .or_default()
                 .push(GroupMemberRoleResponse {
                     role_id: role_id.to_string(),
@@ -700,16 +703,49 @@ pub async fn list_group_members(
                 });
         }
     }
-    let mut members: Vec<GroupMemberResponse> = members
+
+    let names = resolve_member_names(&state, roles_by_user.keys().copied().collect()).await;
+    let mut members: Vec<GroupMemberResponse> = roles_by_user
         .into_iter()
         .map(|(user_id, mut roles)| {
             roles.sort_by(|a, b| a.name.cmp(&b.name));
-            GroupMemberResponse { user_id, roles }
+            GroupMemberResponse {
+                name: names.get(&user_id).cloned(),
+                user_id: user_id.to_string(),
+                roles,
+            }
         })
         .collect();
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
     Ok((StatusCode::OK, Json(GroupMembersResponse { members })))
+}
+
+/// Best-effort name lookup: a resolve failure leaves every member unnamed
+/// rather than failing the members listing.
+async fn resolve_member_names(
+    state: &ServerState,
+    user_ids: Vec<UserId>,
+) -> HashMap<UserId, String> {
+    match drive(
+        ResolveUsersOperation::new(ResolveUsersInput {
+            realm_id: state.get_realm_id(),
+            user_ids,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(output) => output
+            .users
+            .into_iter()
+            .map(|user| (user.user_id, user.name))
+            .collect(),
+        Err(error) => {
+            trace!(event = "group.members.resolve_failed", error = %error);
+            HashMap::new()
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1010,15 +1046,102 @@ mod tests {
     use crate::error::ServerError;
     use crate::server_state::ServerState;
     use aruna_core::UserId;
-    use aruna_core::structs::{AuthContext, NodeCapabilities, RealmId};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::structs::{
+        Actor, AuthContext, Group, GroupAuthorizationDocument, NodeCapabilities, RealmId, User,
+    };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
-    use axum::Extension;
     use axum::extract::{Path, Query, State};
+    use axum::{Extension, Json};
+    use byteview::ByteView;
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
+
+    async fn store_bytes(state: &ServerState, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
+        match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: keyspace.to_string(),
+                key: ByteView::from(key),
+                value: ByteView::from(value),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected write result: {other:?}"),
+        }
+    }
+
+    async fn seed_group(state: &ServerState, owner: UserId) -> Ulid {
+        let realm_id = state.get_realm_id();
+        let group_id = Ulid::r#gen();
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group = Group {
+            display_name: "Test".to_string(),
+            group_id,
+            realm_id,
+            roles: auth_doc.roles.keys().copied().collect(),
+            owner,
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id,
+        };
+        store_bytes(
+            state,
+            GROUP_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            group.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        store_bytes(
+            state,
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+            auth_doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+        group_id
+    }
+
+    async fn store_user(state: &ServerState, user_id: UserId, name: &str) {
+        let user = User {
+            user_id,
+            name: name.to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: Default::default(),
+        };
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id,
+            realm_id: user_id.realm_id,
+        };
+        store_bytes(
+            state,
+            USER_KEYSPACE,
+            user_id.to_bytes(),
+            user.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    fn member_auth(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+        }
+    }
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
@@ -1121,5 +1244,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn joins_member_names() {
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+        store_user(&state, owner, "Owner").await;
+
+        let (status, Json(body)) = list_group_members(
+            State(state.clone()),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let member = body
+            .members
+            .iter()
+            .find(|member| member.user_id == owner.to_string())
+            .unwrap();
+        assert_eq!(member.name.as_deref(), Some("Owner"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_member_none() {
+        // A member without a stored user record still lists, with name None.
+        let (state, _tempdir) = setup_state().await;
+        let owner = UserId::local(Ulid::r#gen(), state.get_realm_id());
+        let group_id = seed_group(&state, owner).await;
+
+        let (status, Json(body)) = list_group_members(
+            State(state),
+            Extension(Some(member_auth(owner))),
+            Path(group_id.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let member = body
+            .members
+            .iter()
+            .find(|member| member.user_id == owner.to_string())
+            .unwrap();
+        assert_eq!(member.name, None);
     }
 }
