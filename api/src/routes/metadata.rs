@@ -2946,8 +2946,8 @@ mod tests {
     async fn setup_search_pagination_cluster(node_count: usize) -> SearchPaginationCluster {
         let realm_signing_key = test_realm_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
-        let group_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
+        let group_id = Ulid::r#gen();
 
         let mut nodes = Vec::new();
         for _ in 0..node_count {
@@ -3120,6 +3120,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3175,6 +3176,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3267,6 +3269,7 @@ mod tests {
             let _ = create_metadata_document(
                 State(test.state.clone()),
                 Extension(Some(test.auth.clone())),
+                Extension(None),
                 Json(CreateMetadataRequest::Scaffold(
                     CreateMetadataScaffoldRequest {
                         group_id: test.group_id.to_string(),
@@ -3310,6 +3313,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3373,6 +3377,7 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3408,6 +3413,7 @@ mod tests {
         let _ = replace_metadata_rocrate(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
                 rocrate: serde_json::from_str(&rocrate).unwrap(),
@@ -3450,6 +3456,7 @@ mod tests {
         let _ = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
+            Extension(None),
             Json(CreateMetadataRequest::Scaffold(
                 CreateMetadataScaffoldRequest {
                     group_id: test.group_id.to_string(),
@@ -3972,7 +3979,7 @@ mod tests {
         .await
         .unwrap();
         let node_id = net.node_id();
-        let user_id = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let user_id = aruna_core::UserId::local(Ulid::r#gen(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -3994,6 +4001,7 @@ mod tests {
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: Some(task_handle),
+            compute_handle: None,
         });
         // Single-node realm config so the holder proxy serves mutations locally.
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -4012,7 +4020,7 @@ mod tests {
                 .into(),
         )
         .await;
-        let group_id = Ulid::new();
+        let group_id = Ulid::r#gen();
         let group_auth =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {
@@ -4054,6 +4062,7 @@ mod tests {
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
+                aruna_operations::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
