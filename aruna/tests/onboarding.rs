@@ -90,8 +90,8 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
     assert_eq!(issuer_info.node_id, seed.net.node_id());
     assert_eq!(issuer_info.urls.api, None);
     assert_eq!(issuer_info.urls.s3, None);
-    assert_eq!(issuer_info.utilization.documents_held, None);
-    assert_eq!(issuer_info.utilization.load_permille, None);
+    assert_eq!(issuer_info.utilization.documents_held, Some(0));
+    assert!(issuer_info.utilization.load_permille.is_some());
     let realm_config = drive(
         GetRealmConfigOperation::new(joiner.config.realm_id),
         joiner.context.as_ref(),
@@ -118,8 +118,8 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
         joiner_info.urls.s3.as_deref(),
         Some("https://s3.joiner.example.test")
     );
-    assert_eq!(joiner_info.utilization.documents_held, None);
-    assert_eq!(joiner_info.utilization.load_permille, None);
+    assert_eq!(joiner_info.utilization.documents_held, Some(0));
+    assert!(joiner_info.utilization.load_permille.is_some());
 
     wait_for_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],
