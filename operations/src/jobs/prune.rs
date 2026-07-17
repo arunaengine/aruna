@@ -4,7 +4,9 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{JOB_PRUNE_INDEX_PREFIX, parse_job_schedule_index_key};
+use aruna_core::structs::{
+    JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, cleanup_job_id, parse_job_schedule_index_key,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace};
 use aruna_core::util::unix_timestamp_millis;
@@ -71,7 +73,15 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                 break 'scan;
             }
             match read_job_record(storage, job_id, None).await? {
-                Some(record) => deletes.extend(job_prune_delete_entries(&record)),
+                Some(record) => {
+                    // The fence state a queued cleanup still needs outlives retention:
+                    // deleting it now would fail that cleanup permanently and strand
+                    // the backend attempt.
+                    if cleanup_pending(storage, &record).await? {
+                        continue;
+                    }
+                    deletes.extend(job_prune_delete_entries(&record));
+                }
                 None => deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key)),
             }
             pruned = pruned.saturating_add(1);
@@ -93,6 +103,20 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
         has_more,
         next_due_after,
     })
+}
+
+/// Whether an execution job still owes a terminal cleanup. Only `Execution` takes a
+/// cleanup obligation, and cleanup retries are not capped, so it can outlive the
+/// retention window.
+async fn cleanup_pending(storage: &StorageHandle, record: &JobRecord) -> Result<bool, String> {
+    if !matches!(&record.payload, JobPayload::Execution(_)) {
+        return Ok(false);
+    }
+    Ok(
+        read_job_record(storage, cleanup_job_id(record.job_id), None)
+            .await?
+            .is_some_and(|cleanup| !cleanup.state.is_terminal()),
+    )
 }
 
 /// ShortenTimer restore keyed off the earliest `prune/` entry.
@@ -124,7 +148,9 @@ mod tests {
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::insert_job;
     use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE};
-    use aruna_core::structs::{JobId, JobPayload, JobRecord, JobState, RealmId};
+    use aruna_core::structs::{
+        ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, JobState, RealmId,
+    };
     use aruna_core::types::{NodeId, UserId};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -166,6 +192,53 @@ mod tests {
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(finished_at_ms);
         record
+    }
+
+    fn execution_record(job_id: JobId, finished_at_ms: u64) -> JobRecord {
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+            }),
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(finished_at_ms);
+        record
+    }
+
+    fn cleanup_record(for_job: JobId) -> JobRecord {
+        JobRecord::new(
+            cleanup_job_id(for_job),
+            JobPayload::TerminalCleanup {
+                for_job,
+                attempt: None,
+                access_key: "workspace-access".to_string(),
+            },
+            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+            node_id(7),
+            1,
+            1,
+            None,
+        )
     }
 
     async fn count(storage: &StorageHandle, key_space: &str) -> usize {
@@ -214,6 +287,62 @@ mod tests {
         assert_eq!(outcome.pruned, 0);
         assert!(outcome.next_due_after.is_some());
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_holds_prune() {
+        // Cleanup retries are uncapped, so a queued cleanup can outlive retention. Its
+        // parent carries the fence state `authorize_cleanup` reads, and deleting that
+        // would fail the cleanup permanently and strand the backend attempt.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([4u8; 16]);
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
+        insert_job(&storage, &execution_record(job_id, finished))
+            .await
+            .unwrap();
+        insert_job(&storage, &cleanup_record(job_id)).await.unwrap();
+
+        let outcome = process_job_prune_batch(&context(storage.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.pruned, 0);
+        assert!(!outcome.has_more, "a retained row must not re-arm at zero");
+        assert!(
+            read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the cleanup still needs its parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_cleanup_prunes() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([5u8; 16]);
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
+        insert_job(&storage, &execution_record(job_id, finished))
+            .await
+            .unwrap();
+        let mut cleanup = cleanup_record(job_id);
+        cleanup.state = JobState::Succeeded;
+        cleanup.finished_at_ms = Some(finished);
+        insert_job(&storage, &cleanup).await.unwrap();
+
+        let outcome = process_job_prune_batch(&context(storage.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.pruned, 2, "parent and cleanup both expired");
+        assert!(
+            read_job_record(&storage, job_id, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
