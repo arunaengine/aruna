@@ -1033,7 +1033,10 @@ impl ExecutorBackend for KubernetesBackend {
             self.markers(),
             &marker_name(&context.attempt.external_name()),
         )
-        .await
+        .await?;
+        // The Job goes last: deleting it earlier makes a cleanup retry observe
+        // NotFound, which discharges the obligation and leaks the PVC and Secret.
+        delete_named(self.jobs(), &context.attempt.external_name()).await
     }
 
     async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
@@ -1703,6 +1706,13 @@ mod tests {
         })
     }
 
+    fn core_object(kind: &str, name: &str) -> Value {
+        json!({
+            "apiVersion": "v1", "kind": kind,
+            "metadata": {"name": name, "namespace": "compute", "uid": "acc-uid"}
+        })
+    }
+
     fn pod_list() -> Value {
         json!({
             "apiVersion": "v1", "kind": "PodList", "metadata": {},
@@ -1732,6 +1742,63 @@ mod tests {
 
         assert_eq!(evidence.backend_ref, "aruna-job-a1");
         assert_eq!(evidence.attempt_epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn deletes_job_last() {
+        // Deleting the Job before the accessories would make a cleanup retry
+        // observe NotFound, discharging the obligation and leaking the PVC.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("GET", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                ("GET", "/api/v1/namespaces/compute/pods") => (200, pod_list()),
+                ("DELETE", "/api/v1/namespaces/compute/pods/task-pod") => {
+                    (200, core_object("Pod", "task-pod"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-ws") => {
+                    (200, core_object("PersistentVolumeClaim", "aruna-job-a1-ws"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/secrets/aruna-job-a1-env") => {
+                    (200, core_object("Secret", "aruna-job-a1-env"))
+                }
+                ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-logs")
+                | ("DELETE", "/api/v1/namespaces/compute/configmaps/aruna-job-a1-staged") => {
+                    (200, core_object("ConfigMap", "marker"))
+                }
+                ("DELETE", "/apis/batch/v1/namespaces/compute/jobs/aruna-job-a1") => {
+                    (200, job_json("tombstone"))
+                }
+                _ => (404, status_json(404)),
+            }
+        });
+        let backend = KubernetesBackend {
+            client,
+            config: test_config(),
+        };
+
+        backend.cleanup(&context()).await.unwrap();
+
+        let seen = seen.lock().expect("read requests").clone();
+        for accessory in [
+            "DELETE /api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-ws",
+            "DELETE /api/v1/namespaces/compute/secrets/aruna-job-a1-env",
+            "DELETE /api/v1/namespaces/compute/configmaps/aruna-job-a1-logs",
+            "DELETE /api/v1/namespaces/compute/configmaps/aruna-job-a1-staged",
+        ] {
+            assert!(seen.iter().any(|entry| entry == accessory), "{accessory}");
+        }
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("DELETE /apis/batch/v1/namespaces/compute/jobs/aruna-job-a1")
+        );
     }
 
     #[tokio::test]
