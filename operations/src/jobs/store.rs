@@ -125,7 +125,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
 
 /// Deletes for a pruned terminal job (its dedup entry is already gone).
 pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
-    vec![
+    let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
         (
             JOB_RUN_CRATE_KEYSPACE.to_string(),
@@ -139,7 +139,15 @@ pub fn job_prune_delete_entries(record: &JobRecord) -> JobDeletes {
             JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
             schedule_index_key_for(record),
         ),
-    ]
+    ];
+    // Epochs are handed out from 1; every used epoch left a control row.
+    for epoch in 1..record.next_attempt_epoch {
+        deletes.push((
+            JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+            ByteView::from(attempt_control_key(record.job_id, epoch)),
+        ));
+    }
+    deletes
 }
 
 fn index_deltas(
@@ -1797,6 +1805,28 @@ mod tests {
         let claim = adopted.claim.unwrap();
         assert_ne!(claim.claim_token, live_token);
         assert_eq!(claim.holder_node_id, node_id(4));
+    }
+
+    #[test]
+    fn prune_covers_controls() {
+        // Every attempt epoch handed out must have its control row pruned.
+        let mut record = queued_record(JobId::from_bytes([0x55; 16]));
+        record.next_attempt_epoch = 3;
+
+        let deletes = job_prune_delete_entries(&record);
+
+        let controls: Vec<_> = deletes
+            .iter()
+            .filter(|(space, _)| space == JOB_ATTEMPT_CONTROL_KEYSPACE)
+            .map(|(_, key)| key.as_ref().to_vec())
+            .collect();
+        assert_eq!(
+            controls,
+            vec![
+                attempt_control_key(record.job_id, 1),
+                attempt_control_key(record.job_id, 2),
+            ]
+        );
     }
 
     #[tokio::test]
