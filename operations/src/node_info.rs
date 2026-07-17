@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::structs::{
-    NodeInfoDocument, NodeUrls, NodeUtilization, RealmConfigDocument, RealmId,
+    NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmConfigDocument, RealmId,
     node_info_storage_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -183,7 +183,11 @@ async fn count_held_documents(
         let (page, next) = parse_registry_iter(event)
             .map_err(|error| format!("metadata registry iteration failed: {error:?}"))?;
         for record in &page {
-            if held.contains(&(record.placement.strategy_id, record.placement.shard)) {
+            // NIL placements predate any strategy and are held by every local
+            // node, matching holds_placement; count them alongside held buckets.
+            if record.placement == PlacementRef::NIL
+                || held.contains(&(record.placement.strategy_id, record.placement.shard))
+            {
                 count += 1;
             }
         }
@@ -676,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn counts_held_documents() {
-        // Only records whose placement bucket the node holds are counted.
+        // Records whose placement bucket the node holds, plus NIL placements, count.
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -697,9 +701,10 @@ mod tests {
         write_registry(&ctx, &registry_record(realm_id, 1, placed(held[0]))).await;
         write_registry(&ctx, &registry_record(realm_id, 2, placed(held[0]))).await;
         write_registry(&ctx, &registry_record(realm_id, 3, placed(unheld))).await;
+        write_registry(&ctx, &registry_record(realm_id, 4, PlacementRef::NIL)).await;
 
         let count = count_held_documents(&ctx, local, &config).await.unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]
