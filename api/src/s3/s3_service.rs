@@ -20,8 +20,8 @@ use aruna_core::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, UserAccess, WatchEvent, WatchEventDetail,
-    WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
+    AuthContext, BlobHeadKey, BucketInfo, Permission, RealmId, UserAccess, WatchEvent,
+    WatchEventDetail, WatchEventKind, blob_bucket_permission_path, blob_object_permission_path,
     data_watch_resource_path,
 };
 use aruna_core::types::UserId;
@@ -75,6 +75,7 @@ use aruna_operations::s3::list_object_versions::{
 use aruna_operations::s3::list_objects_v2::{
     ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
 };
+use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::list_parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
@@ -106,7 +107,8 @@ use s3s::dto::{
     GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
     Initiator, LastModified, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
     ListMultipartUploadsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
+    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ListPartsInput,
+    ListPartsOutput, MetadataDirective,
     MultipartUpload as S3MultipartUpload, Object, ObjectAttributes, ObjectPart, ObjectVersion,
     ObjectVersionStorageClass, Owner, Part, PutBucketCorsInput, PutBucketCorsOutput,
     PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketVersioningInput,
@@ -660,6 +662,102 @@ impl ArunaS3Service {
             })
             .transpose()
     }
+
+    /// Runs one listing page shared by ListObjects and ListObjectsV2.
+    async fn run_object_listing(
+        &self,
+        input: LOV2I,
+        owner: Option<Owner>,
+        url_encoded: bool,
+    ) -> S3Result<ObjectListingPage> {
+        let result = drive(ListObjectsV2Operation::new(input), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let contents: Vec<Object> = result
+            .objects
+            .into_iter()
+            .map(|object| {
+                let response_fields = self.build_object_response_fields(
+                    object.location.as_ref(),
+                    object.source_metadata.as_ref(),
+                    object.last_refresh,
+                    object.version_created_at,
+                );
+                Object {
+                    e_tag: response_fields.e_tag,
+                    key: Some(encode_field(object.head.key)),
+                    last_modified: response_fields.last_modified,
+                    owner: owner.clone(),
+                    size: response_fields.content_length,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(encode_field(prefix)),
+            })
+            .collect();
+
+        Ok(ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result.continuation_token,
+        })
+    }
+}
+
+/// One page of a shared object listing before protocol-specific mapping.
+struct ObjectListingPage {
+    contents: Vec<Object>,
+    common_prefixes: Vec<CommonPrefix>,
+    continuation_token: Option<ListObjectsV2ContinuationToken>,
+}
+
+/// Resumes a delimited ListObjects page past the group the marker collapses
+/// into, because such a marker names an already returned common prefix.
+fn marker_continuation_token(
+    bucket: &str,
+    marker: Option<&str>,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
+    let Some(marker) = marker.filter(|marker| !marker.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(group) = common_prefix_of(marker, prefix, delimiter) else {
+        return Ok(None);
+    };
+    let last_key = BlobHeadKey::object_prefix(bucket, marker)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid marker"))?;
+    Ok(Some(ListObjectsV2ContinuationToken {
+        last_key,
+        last_common_prefix: Some(group),
+    }))
+}
+
+/// Names the last entry of a truncated page, preferring the common prefix the
+/// page stopped inside.
+fn next_marker_of(token: &ListObjectsV2ContinuationToken) -> Option<String> {
+    if let Some(group) = token.last_common_prefix.clone() {
+        return Some(group);
+    }
+    BlobHeadKey::from_bytes(&token.last_key)
+        .ok()
+        .map(|head| head.key)
 }
 
 fn reference_metadata_refresh(
@@ -1005,23 +1103,6 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
 
-        let result = drive(
-            ListObjectsV2Operation::new(LOV2I {
-                bucket: bucket.clone(),
-                group_id,
-                continuation_token,
-                max_keys: Some(max_keys),
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                start_after: start_after.clone(),
-            }),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        .map_err(IntoS3Error::into_s3_error)?
-        .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
-
         let owner = req.input.fetch_owner.unwrap_or(false).then(|| Owner {
             display_name: None,
             id: Some(group_id.to_string()),
@@ -1039,36 +1120,30 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let contents: Vec<Object> = result
-            .objects
-            .into_iter()
-            .map(|object| {
-                let response_fields = self.build_object_response_fields(
-                    object.location.as_ref(),
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                    object.version_created_at,
-                );
-                Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(encode_field(object.head.key)),
-                    last_modified: response_fields.last_modified,
-                    owner: owner.clone(),
-                    size: response_fields.content_length,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
-            .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
-            })
-            .collect();
+        let page = self
+            .run_object_listing(
+                LOV2I {
+                    bucket: bucket.clone(),
+                    group_id,
+                    continuation_token,
+                    max_keys: Some(max_keys),
+                    prefix: prefix.clone(),
+                    delimiter: delimiter.clone(),
+                    start_after: start_after.clone(),
+                },
+                owner,
+                url_encoded,
+            )
+            .await?;
+
+        let ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result_token,
+        } = page;
         let key_count = contents.len() + common_prefixes.len();
         let next_continuation_token =
-            Self::encode_list_objects_v2_continuation_token(result.continuation_token.as_ref())?;
+            Self::encode_list_objects_v2_continuation_token(result_token.as_ref())?;
         let is_truncated = next_continuation_token.is_some();
 
         Ok(S3Response::new(ListObjectsV2Output {
@@ -1084,6 +1159,113 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.map(&encode_field),
             encoding_type: req.input.encoding_type,
             start_after: start_after.map(&encode_field),
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        debug!(
+            bucket = %req.input.bucket,
+            prefix = ?req.input.prefix,
+            max_keys = ?req.input.max_keys,
+            "Received LIST OBJECTS Request"
+        );
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let max_keys = match req.input.max_keys {
+            None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
+            Some(max_keys) => usize::try_from(max_keys)
+                .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
+                .min(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+        };
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let marker = req.input.marker.clone();
+
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+
+        let continuation_token =
+            marker_continuation_token(
+                &bucket,
+                marker.as_deref(),
+                prefix.as_deref(),
+                delimiter.as_deref(),
+            )?;
+        let start_after = continuation_token
+            .is_none()
+            .then(|| marker.clone())
+            .flatten();
+
+        let owner = Some(Owner {
+            display_name: None,
+            id: Some(group_id.to_string()),
+        });
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
+        let page = self
+            .run_object_listing(
+                LOV2I {
+                    bucket: bucket.clone(),
+                    group_id,
+                    continuation_token,
+                    max_keys: Some(max_keys),
+                    prefix: prefix.clone(),
+                    delimiter: delimiter.clone(),
+                    start_after,
+                },
+                owner,
+                url_encoded,
+            )
+            .await?;
+
+        let ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: result_token,
+        } = page;
+        let is_truncated = result_token.is_some();
+        // A truncated delimited listing must report the resume marker, because
+        // a trailing common prefix is absent from `Contents`.
+        let next_marker = match (delimiter.as_ref(), result_token.as_ref()) {
+            (Some(_), Some(token)) => next_marker_of(token).map(&encode_field),
+            _ => None,
+        };
+
+        Ok(S3Response::new(ListObjectsOutput {
+            name: Some(bucket),
+            prefix: prefix.map(&encode_field),
+            marker,
+            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+            is_truncated: Some(is_truncated),
+            next_marker,
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            delimiter: delimiter.map(&encode_field),
+            encoding_type: req.input.encoding_type,
             ..Default::default()
         }))
     }
