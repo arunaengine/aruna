@@ -353,7 +353,7 @@ async fn search_graph_iris(
 ) -> Result<Vec<String>, BoxError> {
     let hits = harness
         .handle
-        .search_authorized_local(auth, graph_iris, query.to_string(), limit)
+        .search_authorized_local(auth, graph_iris, query.to_string(), limit, None)
         .await?;
     Ok(hits.into_iter().map(|hit| hit.graph_iri).collect())
 }

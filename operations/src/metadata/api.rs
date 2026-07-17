@@ -174,6 +174,7 @@ pub struct MetadataSearchRequest {
     pub graph_iris: Option<Vec<String>>,
     pub query: String,
     pub conforms_to: Option<String>,
+    pub group_id: Option<GroupId>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
     pub mode: Option<MetadataApiQueryMode>,
@@ -463,6 +464,7 @@ pub async fn search_metadata(
         request.graph_iris.as_deref(),
         request.mode,
         request.conforms_to.as_deref(),
+        request.group_id,
     );
     let mut cursor_discovery = None;
     let (watermark, resume) = match request.cursor.as_deref() {
@@ -530,6 +532,7 @@ pub async fn search_metadata(
         request.graph_iris,
         request.query,
         request.conforms_to,
+        request.group_id,
         resume,
         watermark,
         page_size,
@@ -1658,6 +1661,7 @@ async fn run_search_distributed(
     graph_iris: Option<Vec<String>>,
     query: String,
     conforms_to: Option<String>,
+    group_id: Option<GroupId>,
     resume: HashMap<NodeId, u32>,
     watermark: Option<SearchWatermark>,
     page_size: usize,
@@ -1687,10 +1691,11 @@ async fn run_search_distributed(
             graph_iris.clone(),
             query.clone(),
             conforms_to.clone(),
+            group_id,
             resume.clone(),
             page_size,
         ),
-        |(handle, auth, graph_iris, query, conforms_to, resume, page_size), node_id| async move {
+        |(handle, auth, graph_iris, query, conforms_to, group_id, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(
                 &resume,
                 node_id,
@@ -1707,12 +1712,13 @@ async fn run_search_distributed(
                             limit,
                             super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
                             object_iri,
+                            group_id,
                         )
                         .await?
                 }
                 None => {
                     handle
-                        .search_authorized_local(auth, graph_iris, query, limit)
+                        .search_authorized_local(auth, graph_iris, query, limit, group_id)
                         .await?
                 }
             };
@@ -1726,10 +1732,12 @@ async fn run_search_distributed(
             graph_iris.clone(),
             query.clone(),
             conforms_to,
+            group_id,
             resume.clone(),
             page_size,
         ),
-        |(handle, auth_token, graph_iris, query, conforms_to, resume, page_size), node_id| async move {
+        |(handle, auth_token, graph_iris, query, conforms_to, group_id, resume, page_size),
+         node_id| async move {
             let limit = resume_fetch_limit(
                 &resume,
                 node_id,
@@ -1747,12 +1755,15 @@ async fn run_search_distributed(
                             limit,
                             super::iri_index::SCHEMA_CONFORMS_TO_IRI.to_string(),
                             object_iri,
+                            group_id,
                         )
                         .await?
                 }
                 None => {
                     handle
-                        .request_remote_search_graphs(node_id, auth_token, graph_iris, query, limit)
+                        .request_remote_search_graphs(
+                            node_id, auth_token, graph_iris, query, limit, group_id,
+                        )
                         .await?
                 }
             };

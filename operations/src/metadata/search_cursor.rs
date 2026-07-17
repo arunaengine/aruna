@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataSearchHit;
+use aruna_core::types::GroupId;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -165,6 +166,7 @@ pub fn query_fingerprint(
     graph_iris: Option<&[String]>,
     mode: Option<MetadataApiQueryMode>,
     conforms_to: Option<&str>,
+    group_id: Option<GroupId>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(query.as_bytes());
@@ -184,6 +186,15 @@ pub fn query_fingerprint(
             hasher.update(&[0x01]);
             hasher.update(iri.as_bytes());
             hasher.update(&[0x00]);
+        }
+        None => {
+            hasher.update(&[0x00]);
+        }
+    }
+    match group_id {
+        Some(group_id) => {
+            hasher.update(&[0x01]);
+            hasher.update(&group_id.to_bytes());
         }
         None => {
             hasher.update(&[0x00]);
@@ -518,14 +529,32 @@ mod tests {
 
     #[test]
     fn fingerprint_binds_query_graphs_and_mode() {
-        let base = query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed), None);
+        let base = query_fingerprint(
+            "alpha",
+            None,
+            Some(MetadataApiQueryMode::Distributed),
+            None,
+            None,
+        );
         assert_eq!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Distributed), None)
+            query_fingerprint(
+                "alpha",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                None,
+                None
+            )
         );
         assert_ne!(
             base,
-            query_fingerprint("beta", None, Some(MetadataApiQueryMode::Distributed), None)
+            query_fingerprint(
+                "beta",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                None,
+                None
+            )
         );
         assert_ne!(
             base,
@@ -533,12 +562,13 @@ mod tests {
                 "alpha",
                 Some(&["g".to_string()]),
                 Some(MetadataApiQueryMode::Distributed),
+                None,
                 None
             )
         );
         assert_ne!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local), None)
+            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local), None, None)
         );
         assert_ne!(
             base,
@@ -546,7 +576,35 @@ mod tests {
                 "alpha",
                 None,
                 Some(MetadataApiQueryMode::Distributed),
-                Some("https://w3id.org/ro/crate/1.2")
+                Some("https://w3id.org/ro/crate/1.2"),
+                None
+            )
+        );
+        let group = GroupId::from_bytes([7u8; 16]);
+        assert_ne!(
+            base,
+            query_fingerprint(
+                "alpha",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                None,
+                Some(group)
+            )
+        );
+        assert_ne!(
+            query_fingerprint(
+                "alpha",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                None,
+                Some(group)
+            ),
+            query_fingerprint(
+                "alpha",
+                None,
+                Some(MetadataApiQueryMode::Distributed),
+                None,
+                Some(GroupId::from_bytes([8u8; 16]))
             )
         );
     }

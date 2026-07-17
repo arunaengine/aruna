@@ -847,7 +847,7 @@ impl MetadataHandle {
                 limit,
             } => Event::Metadata(
                 match self
-                    .search_authorized_local(auth_context, graph_iris, query, limit)
+                    .search_authorized_local(auth_context, graph_iris, query, limit, None)
                     .await
                 {
                     Ok(hits) => MetadataEvent::SearchResult { hits },
@@ -1056,6 +1056,7 @@ impl MetadataHandle {
                 graph_iris,
                 query,
                 limit,
+                group_id,
             } => match authorize_remote_metadata_peer(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
@@ -1072,6 +1073,7 @@ impl MetadataHandle {
                     graph_iris,
                     query,
                     clamp_remote_search_graph_limit(limit),
+                    group_id,
                     None,
                 )
                 .await
@@ -1088,6 +1090,7 @@ impl MetadataHandle {
                 limit,
                 predicate_iri,
                 object_iri,
+                group_id,
             } => match authorize_remote_metadata_peer(
                 &self.inner.auth_validation,
                 &self.inner.storage_handle,
@@ -1104,6 +1107,7 @@ impl MetadataHandle {
                     graph_iris,
                     query,
                     clamp_remote_search_graph_limit(limit),
+                    group_id,
                     Some((predicate_iri, object_iri)),
                 )
                 .await
@@ -1219,6 +1223,7 @@ impl MetadataHandle {
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         search_local_graphs(
             self.inner.clone(),
@@ -1226,11 +1231,13 @@ impl MetadataHandle {
             graph_iris,
             query,
             limit,
+            group_id,
             None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_authorized_local_filtered(
         &self,
         auth_context: Option<AuthContext>,
@@ -1239,6 +1246,7 @@ impl MetadataHandle {
         limit: usize,
         predicate_iri: String,
         object_iri: String,
+        group_id: Option<GroupId>,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         search_local_graphs(
             self.inner.clone(),
@@ -1246,6 +1254,7 @@ impl MetadataHandle {
             graph_iris,
             query,
             limit,
+            group_id,
             Some((predicate_iri, object_iri)),
         )
         .await
@@ -1386,6 +1395,7 @@ impl MetadataHandle {
             hit_count = field::Empty,
         )
     )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_remote_search_graphs(
         &self,
         node_id: NodeId,
@@ -1393,9 +1403,10 @@ impl MetadataHandle {
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         self.request_remote_search_graphs_with_filter(
-            node_id, auth_token, graph_iris, query, limit, None,
+            node_id, auth_token, graph_iris, query, limit, group_id, None,
         )
         .await
     }
@@ -1410,6 +1421,7 @@ impl MetadataHandle {
         limit: usize,
         predicate_iri: String,
         object_iri: String,
+        group_id: Option<GroupId>,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         self.request_remote_search_graphs_with_filter(
             node_id,
@@ -1417,11 +1429,13 @@ impl MetadataHandle {
             graph_iris,
             query,
             limit,
+            group_id,
             Some((predicate_iri, object_iri)),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_remote_search_graphs_with_filter(
         &self,
         node_id: NodeId,
@@ -1429,6 +1443,7 @@ impl MetadataHandle {
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
+        group_id: Option<GroupId>,
         iri_filter: Option<(String, String)>,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
         let started = Instant::now();
@@ -1441,12 +1456,14 @@ impl MetadataHandle {
                 limit,
                 predicate_iri,
                 object_iri,
+                group_id,
             },
             None => MetadataTransportMessage::SearchGraphs {
                 auth_token,
                 graph_iris,
                 query,
                 limit,
+                group_id,
             },
         };
         let result = match send_remote_metadata_request(&self.inner, &span, node_id, message)
@@ -4469,12 +4486,14 @@ fn snapshot_iri_references(
         hit_count = field::Empty,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn search_local_graphs(
     inner: Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
     graph_iris: Option<Vec<String>>,
     query: String,
     limit: usize,
+    group_id: Option<GroupId>,
     iri_filter: Option<(String, String)>,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let span = Span::current();
@@ -4506,7 +4525,8 @@ async fn search_local_graphs(
 
     let authorization_started = Instant::now();
     let allowed_records =
-        select_authorized_records(inner.clone(), auth_context, records, graph_iris).await?;
+        select_authorized_records(inner.clone(), auth_context, records, graph_iris, group_id)
+            .await?;
     record_elapsed_ms(&span, "authorization_ms", authorization_started);
     span.record("authorized_graphs", allowed_records.len() as u64);
 
@@ -4710,7 +4730,7 @@ async fn select_authorized_graphs(
     graph_filter: Option<Vec<String>>,
 ) -> Result<Vec<String>, MetadataError> {
     Ok(
-        select_authorized_records(inner, auth_context, records, graph_filter)
+        select_authorized_records(inner, auth_context, records, graph_filter, None)
             .await?
             .into_iter()
             .map(|record| record.graph_iri)
@@ -4742,6 +4762,7 @@ async fn select_authorized_records(
     auth_context: Option<AuthContext>,
     records: Arc<Vec<MetadataRegistryRecord>>,
     graph_filter: Option<Vec<String>>,
+    group_id: Option<GroupId>,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
     let span = Span::current();
     let started = Instant::now();
@@ -4757,6 +4778,12 @@ async fn select_authorized_records(
     for record in records.iter() {
         if let Some(filter) = allowed_graphs.as_ref()
             && !filter.contains(&record.graph_iri)
+        {
+            filtered_count += 1;
+            continue;
+        }
+        if let Some(group_id) = group_id
+            && record.group_id != group_id
         {
             filtered_count += 1;
             continue;
