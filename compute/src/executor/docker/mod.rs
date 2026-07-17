@@ -186,7 +186,19 @@ impl DockerBackend {
         }
     }
 
+    /// A tarpitting registry must not pin the supervision slot forever, so the
+    /// pull is bounded even while the stream itself stays open.
     async fn pull_image(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), BackendError> {
+        tokio::time::timeout(self.config.pull_deadline, self.pull_stream(image, cancel))
+            .await
+            .map_err(|_| BackendError::Timeout("Docker image pull timed out".to_string()))?
+    }
+
+    async fn pull_stream(
         &self,
         image: &str,
         cancel: &CancellationToken,
@@ -1970,6 +1982,44 @@ mod tests {
             phase: AttemptPhase::Running,
             ..fresh
         }));
+    }
+
+    #[tokio::test]
+    async fn pull_deadline_expires() {
+        // A registry that accepts but never answers must yield a retryable
+        // timeout instead of pinning the supervision slot forever.
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _tarpit = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let docker = Docker::connect_with_http(
+            &format!("http://127.0.0.1:{port}"),
+            3600,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let backend = DockerBackend::from_parts(
+            docker,
+            DockerConfig {
+                state_root: root.path().to_path_buf(),
+                pull_deadline: Duration::from_millis(100),
+                ..DockerConfig::default()
+            },
+        )
+        .unwrap();
+
+        let error = backend
+            .pull_image("alpine:3.20", &CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, BackendError::Timeout(_)), "got {error:?}");
+        assert!(error.retryable());
     }
 
     #[test]

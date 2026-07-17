@@ -518,6 +518,7 @@ async fn build_docker(
     }
     let docker_config = aruna_compute::DockerConfig {
         default_disk_bytes: disk_bytes,
+        pull_deadline: env_duration("ARUNA_COMPUTE_DOCKER_PULL_DEADLINE", 300)?,
         ..aruna_compute::DockerConfig::default()
     };
     let backend = aruna_compute::executor::docker::DockerBackend::with_config(docker_config)
@@ -660,7 +661,7 @@ fn parse_s3_cidrs(value: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-#[cfg(any(feature = "apptainer", feature = "kubernetes"))]
+#[cfg(any(feature = "docker", feature = "apptainer", feature = "kubernetes"))]
 fn env_duration(name: &str, default: u64) -> Result<std::time::Duration, String> {
     let seconds = dotenvy::var(name)
         .map(|value| value.parse::<u64>())

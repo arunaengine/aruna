@@ -68,6 +68,8 @@ Optional configuration:
 
 - `ARUNA_COMPUTE_DOCKER_DISK_BYTES`: nonzero writable-layer ceiling in bytes.
   When unset, `storage_opt` is omitted and task disk requests are unenforced.
+- `ARUNA_COMPUTE_DOCKER_PULL_DEADLINE`: image pull deadline in seconds;
+  defaults to `300`.
 
 Docker uses `./compute-state` by default. The state root must be durable and
 exclusive to one controller for the Docker daemon. A daemon lock enforces that
