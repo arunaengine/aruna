@@ -6,8 +6,8 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::{
-    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobId, JobRecord, job_due_index_key,
-    job_lease_index_key,
+    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
+    job_lease_index_key, parse_job_schedule_index_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, NodeId};
@@ -20,9 +20,37 @@ use tracing::warn;
 use super::reconcile::ExternalReconciler;
 use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, requeue_job,
+    iter_prefix_page, read_job_record, requeue_job,
 };
 use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
+
+/// Per-class claim budget. Both classes share one due index, so a saturated class
+/// must be skipped during the scan rather than claimed and released again.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobClassBudget {
+    pub in_process: usize,
+    pub external: usize,
+}
+
+impl JobClassBudget {
+    fn remaining(&self, class: JobExecutionClass) -> usize {
+        match class {
+            JobExecutionClass::InProcess => self.in_process,
+            JobExecutionClass::ExternalAttempt => self.external,
+        }
+    }
+
+    fn take(&mut self, class: JobExecutionClass) {
+        match class {
+            JobExecutionClass::InProcess => self.in_process = self.in_process.saturating_sub(1),
+            JobExecutionClass::ExternalAttempt => self.external = self.external.saturating_sub(1),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.in_process == 0 && self.external == 0
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct JobDrainResult {
@@ -35,48 +63,24 @@ pub struct JobDrainResult {
     /// A per-job error stopped the batch early; the caller should re-drive after a
     /// backoff. Set so `claimed` is never discarded by a later failure.
     pub retry_after_error: bool,
+    /// A due job was left for a later pass because its execution class has no free
+    /// slot. Re-arming at zero would busy-loop until a slot opens.
+    pub deferred_saturated: bool,
 }
 
-/// Claim up to `capacity` due jobs and re-queue expired leases; claimed records are
-/// returned. An expired external attempt is routed to `reconciler` instead of requeued.
+/// Claim due jobs within each class's `budget` and re-queue expired leases; claimed
+/// records are returned. An expired external attempt is routed to `reconciler`
+/// instead of requeued.
 pub async fn process_job_queue_batch(
     storage: &StorageHandle,
     holder_node_id: NodeId,
-    capacity: usize,
+    budget: JobClassBudget,
     reconciler: Option<&Arc<dyn ExternalReconciler>>,
 ) -> Result<JobDrainResult, String> {
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    let (due_ready, _, _) =
-        scan_ready(storage, JOB_DUE_INDEX_PREFIX, now_ms, capacity, None).await?;
-    for (ts, job_id) in due_ready {
-        match claim_job(storage, job_id, holder_node_id, now_ms).await {
-            Ok(ClaimOutcome::Claimed(record)) => result.claimed.push(record),
-            Ok(ClaimOutcome::CancelledFresh(_)) => {
-                result.cancelled_fresh = result.cancelled_fresh.saturating_add(1)
-            }
-            Ok(ClaimOutcome::NotEligible) => {}
-            // Orphaned index row (record gone/quarantined): drop it so it cannot
-            // pin the drain timer at zero forever.
-            Err(JobMutationError::NotFound) => {
-                if let Err(error) =
-                    delete_schedule_row(storage, job_due_index_key(ts, job_id)).await
-                {
-                    warn!(error = %error, "Failed to drop orphaned job due index row");
-                    result.retry_after_error = true;
-                    break;
-                }
-            }
-            // Never discard jobs already claimed in this batch: stop here, hand them off,
-            // and let the caller re-drive the remainder after a backoff.
-            Err(error) => {
-                warn!(job_id = %job_id, error = %error, "Failed to claim due job");
-                result.retry_after_error = true;
-                break;
-            }
-        }
-    }
+    claim_due_jobs(storage, holder_node_id, now_ms, budget, &mut result).await?;
 
     if !result.retry_after_error {
         let mut start_after = None;
@@ -158,6 +162,119 @@ pub async fn process_job_queue_batch(
         }
     }
     Ok(result)
+}
+
+/// Walk the due head, claiming each job against its own class budget. A job whose
+/// class is saturated is skipped without a write: claiming it would only release it
+/// again, churning storage while the drain re-arms at zero.
+async fn claim_due_jobs(
+    storage: &StorageHandle,
+    holder_node_id: NodeId,
+    now_ms: u64,
+    mut budget: JobClassBudget,
+    result: &mut JobDrainResult,
+) -> Result<(), String> {
+    if budget.is_empty() {
+        result.deferred_saturated = true;
+        return Ok(());
+    }
+    let mut start_after = None;
+    'pages: loop {
+        let (values, next) = match iter_prefix_page(
+            storage,
+            JOB_SCHEDULE_INDEX_KEYSPACE,
+            Some(ByteView::from(JOB_DUE_INDEX_PREFIX.to_vec())),
+            start_after.take(),
+            JOB_DRAIN_BATCH_SIZE,
+            None,
+        )
+        .await
+        {
+            Ok(page) => page,
+            // Nothing to hand off yet, so a plain failure is enough.
+            Err(error) if result.claimed.is_empty() => return Err(error),
+            Err(error) => {
+                warn!(error = %error, "Failed to page due jobs");
+                result.retry_after_error = true;
+                break 'pages;
+            }
+        };
+        if values.is_empty() {
+            break 'pages;
+        }
+        for (key, _) in values {
+            let (ts, job_id) = match parse_job_schedule_index_key(key.as_ref()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(error = %error, "Deleting malformed job due index row");
+                    if let Err(error) = delete_schedule_row(storage, key).await {
+                        warn!(error = %error, "Failed to drop malformed job due index row");
+                        result.retry_after_error = true;
+                        break 'pages;
+                    }
+                    continue;
+                }
+            };
+            // The index is timestamp-ordered, so the first future row ends the scan.
+            if ts > now_ms {
+                break 'pages;
+            }
+            let class = match read_job_record(storage, job_id, None).await {
+                Ok(Some(record)) => record.execution_class,
+                // Orphaned index row (record gone/quarantined): drop it so it cannot
+                // pin the drain timer at zero forever.
+                Ok(None) => {
+                    if let Err(error) = delete_schedule_row(storage, key).await {
+                        warn!(error = %error, "Failed to drop orphaned job due index row");
+                        result.retry_after_error = true;
+                        break 'pages;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Failed to read due job");
+                    result.retry_after_error = true;
+                    break 'pages;
+                }
+            };
+            if budget.remaining(class) == 0 {
+                result.deferred_saturated = true;
+                continue;
+            }
+            match claim_job(storage, job_id, holder_node_id, now_ms).await {
+                Ok(ClaimOutcome::Claimed(record)) => {
+                    budget.take(record.execution_class);
+                    result.claimed.push(record);
+                    if budget.is_empty() {
+                        break 'pages;
+                    }
+                }
+                Ok(ClaimOutcome::CancelledFresh(_)) => {
+                    result.cancelled_fresh = result.cancelled_fresh.saturating_add(1)
+                }
+                Ok(ClaimOutcome::NotEligible) => {}
+                Err(JobMutationError::NotFound) => {
+                    if let Err(error) = delete_schedule_row(storage, key).await {
+                        warn!(error = %error, "Failed to drop orphaned job due index row");
+                        result.retry_after_error = true;
+                        break 'pages;
+                    }
+                }
+                // Never discard jobs already claimed in this batch: stop here, hand them off,
+                // and let the caller re-drive the remainder after a backoff.
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Failed to claim due job");
+                    result.retry_after_error = true;
+                    break 'pages;
+                }
+            }
+        }
+        match next {
+            Some(next) => start_after = Some(next),
+            None => break 'pages,
+        }
+    }
+    Ok(())
 }
 
 async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {
@@ -254,7 +371,7 @@ async fn scan_ready(
     let mut ready = Vec::new();
     let mut next_at = None;
     for (key, _) in values {
-        match aruna_core::structs::parse_job_schedule_index_key(key.as_ref()) {
+        match parse_job_schedule_index_key(key.as_ref()) {
             Ok((ts, job_id)) => {
                 if ts <= now_ms {
                     ready.push((ts, job_id));
@@ -276,9 +393,9 @@ async fn scan_ready(
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::store::{insert_job, read_job_record};
+    use crate::jobs::store::insert_job;
     use aruna_core::structs::{
-        AttemptIntent, JobClaim, JobExecutionClass, JobPayload, JobState, RealmId,
+        AttemptIntent, JobClaim, JobPayload, JobState, RealmId, job_due_index_key,
     };
     use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
@@ -302,6 +419,13 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn budget_of(slots: usize) -> JobClassBudget {
+        JobClassBudget {
+            in_process: slots,
+            external: slots,
+        }
     }
 
     fn queued_record(job_id: JobId, due_at_ms: u64) -> JobRecord {
@@ -335,12 +459,89 @@ mod tests {
             .unwrap();
         }
 
-        let result = process_job_queue_batch(&storage, node_id(3), 2, None)
+        let budget = JobClassBudget {
+            in_process: 2,
+            external: 0,
+        };
+        let result = process_job_queue_batch(&storage, node_id(3), budget, None)
             .await
             .unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
         // A due job remains, so the re-arm is immediate.
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn skips_saturated_class() {
+        // External slots are gone while in-process slots are free: the shared due
+        // index must not claim and release the external row it cannot run.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let external = JobId(Ulid::from_parts(1, 0));
+        let mut record = queued_record(external, 1);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        insert_job(&storage, &record).await.unwrap();
+        let internal = JobId(Ulid::from_parts(2, 0));
+        insert_job(&storage, &queued_record(internal, 1))
+            .await
+            .unwrap();
+
+        let budget = JobClassBudget {
+            in_process: 4,
+            external: 0,
+        };
+        let result = process_job_queue_batch(&storage, node_id(3), budget, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .claimed
+                .iter()
+                .map(|record| record.job_id)
+                .collect::<Vec<_>>(),
+            vec![internal],
+            "a saturated class must not starve the free one"
+        );
+        assert!(
+            result.deferred_saturated,
+            "the skipped row must be reported"
+        );
+        assert_eq!(result.next_due_after, Some(Duration::ZERO));
+        let stored = read_job_record(&storage, external, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued, "no claim/release churn");
+        assert!(stored.claim.is_none());
+        assert_eq!(stored.updated_at_ms, 1, "the record was never rewritten");
+        assert_eq!(stored.due_at_ms, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_budget_defers() {
+        // Both classes saturated with a due row present: the caller must be told to
+        // back off instead of re-arming the drain at zero.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId(Ulid::from_parts(1, 0));
+        insert_job(&storage, &queued_record(job_id, 1))
+            .await
+            .unwrap();
+
+        let result = process_job_queue_batch(&storage, node_id(3), JobClassBudget::default(), None)
+            .await
+            .unwrap();
+
+        assert!(result.claimed.is_empty());
+        assert!(result.deferred_saturated);
+        assert_eq!(result.next_due_after, Some(Duration::ZERO));
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert_eq!(stored.updated_at_ms, 1);
     }
 
     #[tokio::test]
@@ -357,7 +558,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
+        let result = process_job_queue_batch(&storage, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert_eq!(result.swept, 1);
@@ -397,7 +598,7 @@ mod tests {
 
         let recorder = Arc::new(RecordingReconciler::default());
         let reconciler: Arc<dyn ExternalReconciler> = recorder.clone();
-        let result = process_job_queue_batch(&storage, node_id(3), 8, Some(&reconciler))
+        let result = process_job_queue_batch(&storage, node_id(3), budget_of(8), Some(&reconciler))
             .await
             .unwrap();
         assert_eq!(result.swept, 0, "external attempt is not swept");
@@ -433,7 +634,7 @@ mod tests {
         });
         insert_job(&storage, &record).await.unwrap();
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
+        let result = process_job_queue_batch(&storage, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert_eq!(result.swept, 0);
@@ -501,7 +702,7 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = process_job_queue_batch(&storage, node_id(3), 8, None)
+        let result = process_job_queue_batch(&storage, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert!(result.claimed.is_empty());

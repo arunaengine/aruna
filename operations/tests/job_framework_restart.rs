@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use aruna_core::structs::{JobId, JobPayload, JobRecord, JobState, RealmId};
 use aruna_core::types::{NodeId, UserId};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::drain::process_job_queue_batch;
+use aruna_operations::jobs::drain::{JobClassBudget, process_job_queue_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{claim_job, insert_job, read_job_record, set_cancel_requested};
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle};
@@ -120,7 +120,16 @@ async fn drive_until_terminal(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let batch = process_job_queue_batch(&context.storage_handle, node_id(9), 8, None).await?;
+        let batch = process_job_queue_batch(
+            &context.storage_handle,
+            node_id(9),
+            JobClassBudget {
+                in_process: 8,
+                external: 8,
+            },
+            None,
+        )
+        .await?;
         for record in batch.claimed {
             runtime.spawn(context.clone(), record);
         }

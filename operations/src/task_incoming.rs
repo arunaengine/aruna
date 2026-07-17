@@ -27,7 +27,7 @@ use crate::document_sync_outbox::{
     restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
-use crate::jobs::drain::{process_job_queue_batch, restore_job_queue_timer};
+use crate::jobs::drain::{JobClassBudget, process_job_queue_batch, restore_job_queue_timer};
 use crate::jobs::prune::{process_job_prune_batch, restore_job_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::release_job;
@@ -1579,19 +1579,22 @@ impl OperationsTaskHandler {
         let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
             return;
         };
-        let capacity = self
-            .jobs_runtime
-            .available_slots_for(JobExecutionClass::InProcess)
-            .saturating_add(
-                self.jobs_runtime
-                    .available_slots_for(JobExecutionClass::ExternalAttempt),
-            );
+        // Per class: one aggregate would claim rows of a saturated class only to
+        // release them again on every pass.
+        let budget = JobClassBudget {
+            in_process: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::InProcess),
+            external: self
+                .jobs_runtime
+                .available_slots_for(JobExecutionClass::ExternalAttempt),
+        };
 
         let reconciler = self.jobs_runtime.reconciler();
         let result = match process_job_queue_batch(
             &self.context.storage_handle,
             node_id,
-            capacity,
+            budget,
             reconciler.as_ref(),
         )
         .await
@@ -1639,19 +1642,10 @@ impl OperationsTaskHandler {
             return;
         }
 
-        // At capacity with work due, wait for a completion kick, not a ZERO hot-loop.
+        // Due work left behind by a saturated class: wait for a completion kick, not
+        // a ZERO hot-loop.
         match result.next_due_after {
-            Some(after)
-                if after.is_zero()
-                    && self
-                        .jobs_runtime
-                        .available_slots_for(JobExecutionClass::InProcess)
-                        == 0
-                    && self
-                        .jobs_runtime
-                        .available_slots_for(JobExecutionClass::ExternalAttempt)
-                        == 0 =>
-            {
+            Some(after) if after.is_zero() && result.deferred_saturated => {
                 self.reschedule_timer(TaskKey::DrainJobQueue, JOB_DRAIN_RETRY_AFTER)
                     .await;
             }
