@@ -1670,7 +1670,11 @@ mod tests {
     }
 
     fn status_json(code: u16) -> Value {
-        let reason = if code == 404 { "NotFound" } else { "BadRequest" };
+        let reason = if code == 404 {
+            "NotFound"
+        } else {
+            "BadRequest"
+        };
         json!({
             "kind": "Status", "apiVersion": "v1", "status": "Failure",
             "message": "fake error", "reason": reason, "code": code

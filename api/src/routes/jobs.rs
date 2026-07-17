@@ -393,8 +393,7 @@ pub async fn submit_job(
     for output in request.outputs {
         let output = native_output(output)?;
         if workspace_outputs.iter().any(|existing| {
-            existing.dest_key == output.dest_key
-                || existing.container_path == output.container_path
+            existing.dest_key == output.dest_key || existing.container_path == output.container_path
         }) {
             return Err(ServerError::BadRequest);
         }

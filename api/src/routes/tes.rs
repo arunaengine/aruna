@@ -671,10 +671,7 @@ pub async fn cancel_task(
 
 /// Resolve the effective group from the tag or credential alone, without
 /// touching the rest of the untrusted task payload.
-fn resolve_task_group(
-    task: &TesTask,
-    credential_group: Option<Ulid>,
-) -> Result<Ulid, TesError> {
+fn resolve_task_group(task: &TesTask, credential_group: Option<Ulid>) -> Result<Ulid, TesError> {
     let group_id = match task.tags.get(GROUP_TAG_KEY) {
         Some(group) => Ulid::from_string(group).map_err(|_| {
             TesError::bad_request(format!("`{GROUP_TAG_KEY}` is not a valid group id"))
