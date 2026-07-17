@@ -13,7 +13,9 @@ ignore = [
     "RUSTSEC-2025-0052", # async-std discontinued (transitive)
     "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
     "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
-    "RUSTSEC-2026-0204", # crossbeam-utils fmt::Pointer deref (transitive)
+    # Yanked for a macOS-only build break (apache/opendal#7923); Linux is
+    # unaffected and 0.57 lacks the raw APIs we use. Drop this on 0.58.1.
+    { crate = "opendal@0.58.0", reason = "yanked for a macOS-only issue, apache/opendal#7923" },
 ]
 
 [licenses]
